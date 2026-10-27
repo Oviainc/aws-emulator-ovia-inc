@@ -440,7 +440,10 @@ struct OperationRow {
 /// they decide nothing yet, and the `@optionalAuth` identity flow is covered by its own
 /// test below. `DescribeIdentity` is left out for a different reason: every row here is
 /// driven with a POOL id, and that operation addresses an IDENTITY, so the resource its
-/// decision is made against is the pool of an identity a row would first have to mint.
+/// decision is made against is the pool of an identity a row would first have to mint —
+/// which is why it has a case of its own
+/// ([`describe_identity_is_authorized_on_the_pool_its_identity_belongs_to`]) rather than a
+/// row here.
 fn operation_rows(pool_id: &str) -> Vec<OperationRow> {
     let pool_arn = identity_pool_arn(pool_id);
     let named = |operation: &'static str, request: Value| OperationRow {
@@ -957,5 +960,166 @@ async fn the_unauthenticated_identity_flow_is_not_judged_on_iam_policies() {
         status, 200,
         "case \"GetCredentialsForIdentity\": the unauthenticated flow must be served, got \
          {status} with {vended}"
+    );
+}
+
+/// A well-formed `IdentityId` that nothing ever minted: `len 1..55`, `^[\w-]+:[0-9a-f-]+$`,
+/// from this service's `IdentityId` shape
+/// (`smithy_query(query="shape",shape="IdentityId")`), so the request reaches the handler
+/// rather than being refused at the boundary.
+const ABSENT_IDENTITY_ID: &str = "us-east-1:44444444-4444-4444-4444-444444444444";
+
+/// `DescribeIdentity` is a developer-credentials call like every row of the table above,
+/// and the resource its decision is made against is the pool of the IDENTITY the request
+/// names — the account's identity pools in the request's region when this service holds no
+/// such identity, so a caller no policy allows is refused BEFORE the identity is read and
+/// learns nothing about whether it exists.
+///
+/// It is its own case rather than a row of [`operation_rows`] because the request has to
+/// name an identity a pool has first minted.
+#[tokio::test]
+async fn describe_identity_is_authorized_on_the_pool_its_identity_belongs_to() {
+    let emulator = Emulator::new();
+    let pool_id = emulator.pool("authorization-described-identity").await;
+    let elsewhere_pool_id = emulator.pool("authorization-described-elsewhere").await;
+    let pool_arn = identity_pool_arn(&pool_id);
+    let action = action_of("DescribeIdentity");
+
+    // The identity every row describes, minted through the `@optionalAuth` identity flow
+    // with the account's own credential.
+    let (status, got) = emulator
+        .call(ACCOUNT_KEY, "GetId", &json!({ "IdentityPoolId": &pool_id }))
+        .await;
+    assert_eq!(
+        status, 200,
+        "the setup GetId must succeed, got {status} with {got}"
+    );
+    let identity_id = got["IdentityId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("GetId answers an IdentityId: {got}"))
+        .to_string();
+
+    let bare = emulator.user("cognito-authz-describe-bare", None).await;
+    let granted = emulator
+        .user(
+            "cognito-authz-describe-granted",
+            Some(&allow(&action, &pool_arn)),
+        )
+        .await;
+    let other_pool = emulator
+        .user(
+            "cognito-authz-describe-other-pool",
+            Some(&allow(&action, &identity_pool_arn(&elsewhere_pool_id))),
+        )
+        .await;
+    let other_action = emulator
+        .user(
+            "cognito-authz-describe-other-action",
+            Some(&allow(&action_of("DescribeIdentityPool"), &pool_arn)),
+        )
+        .await;
+    let account_wide = emulator
+        .user(
+            "cognito-authz-describe-account-wide",
+            Some(&allow(&action, &any_pool_arn())),
+        )
+        .await;
+
+    // One row: the case, the principal the call is signed as, the identity it names, and
+    // the resource the refusal must be made about — `None` for a call that must be served.
+    let rows: Vec<(&str, &Principal, &str, Option<String>)> = vec![
+        (
+            "a principal holding no policy at all",
+            &bare,
+            identity_id.as_str(),
+            Some(pool_arn.clone()),
+        ),
+        (
+            "a grant for this action on this identity's pool",
+            &granted,
+            identity_id.as_str(),
+            None,
+        ),
+        (
+            "a grant for this action on another pool",
+            &other_pool,
+            identity_id.as_str(),
+            Some(pool_arn.clone()),
+        ),
+        (
+            "a grant for another action on this identity's pool",
+            &other_action,
+            identity_id.as_str(),
+            Some(pool_arn.clone()),
+        ),
+        (
+            "a grant covering the account's identity pools",
+            &account_wide,
+            identity_id.as_str(),
+            None,
+        ),
+        // The identity does not exist, and a caller no policy allows is told only that:
+        // the decision is made against the account's pools, so the refusal reveals no pool
+        // and no identity.
+        (
+            "a principal holding no policy at all, on an identity nothing minted",
+            &bare,
+            ABSENT_IDENTITY_ID,
+            Some(any_pool_arn()),
+        ),
+    ];
+
+    for (case, principal, named_identity, refused_about) in rows {
+        let (status, body) = emulator
+            .call(
+                &principal.access_key_id,
+                "DescribeIdentity",
+                &json!({ "IdentityId": named_identity }),
+            )
+            .await;
+        match refused_about {
+            None => assert_eq!(
+                (status, body["IdentityId"].as_str()),
+                (200, Some(named_identity)),
+                "case {case:?}: a principal whose documents allow the action must be served \
+                 the identity it named, got {status} with {body}"
+            ),
+            Some(resource) => {
+                assert_eq!(
+                    (status, code_of(&body).as_str()),
+                    ACCESS_DENIED,
+                    "case {case:?}: a principal whose documents do not allow the action must \
+                     be refused, got {status} with {body}"
+                );
+                assert_eq!(
+                    message_of(&body),
+                    no_policy_allows(&principal.arn, &action, &resource),
+                    "case {case:?}: AWS's wording, naming the resource the decision was made \
+                     about, got {body}"
+                );
+                assert!(
+                    !message_of(&body).contains(named_identity)
+                        || resource.contains(named_identity),
+                    "case {case:?}: a refusal must not report the identity it was not \
+                     authorized to read, got {body}"
+                );
+            }
+        }
+    }
+
+    // The 404 the refusal above withheld: a caller the decision DOES allow reaches the read
+    // itself, where an identity this service does not hold is the modelled not-found.
+    let (status, body) = emulator
+        .call(
+            &account_wide.access_key_id,
+            "DescribeIdentity",
+            &json!({ "IdentityId": ABSENT_IDENTITY_ID }),
+        )
+        .await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (404, "ResourceNotFoundException"),
+        "case \"an allowed principal, on an identity nothing minted\": expected the modelled \
+         not-found, got {status} with {body}"
     );
 }

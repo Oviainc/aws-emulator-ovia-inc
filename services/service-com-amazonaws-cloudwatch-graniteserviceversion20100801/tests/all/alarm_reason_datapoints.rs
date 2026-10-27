@@ -146,7 +146,7 @@ async fn an_evaluated_state_reason_names_the_datapoints_it_graded() {
             vec![
                 "Threshold Crossed: 1 out of the last 1 datapoints [137.0 (",
                 "was greater than the threshold (10.0)",
-                "(minimum 1 datapoint for INSUFFICIENT_DATA -> ALARM transition).",
+                "(minimum 1 datapoint for OK -> ALARM transition).",
             ],
         ),
         row(
@@ -196,7 +196,7 @@ async fn an_evaluated_state_reason_names_the_datapoints_it_graded() {
             vec![
                 "Threshold Crossed: 1 out of the last 1 datapoints [1.0 (",
                 "was not greater than the threshold (10.0)",
-                "(minimum 1 datapoint for INSUFFICIENT_DATA -> OK transition).",
+                "(minimum 1 datapoint for ALARM -> OK transition).",
             ],
         ),
         row(

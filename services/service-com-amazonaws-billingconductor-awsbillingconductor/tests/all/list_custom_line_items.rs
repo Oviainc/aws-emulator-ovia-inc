@@ -231,6 +231,36 @@ fn bare_id(arn: &str) -> String {
     arn.rsplit('/').next().unwrap_or(arn).to_string()
 }
 
+/// The `BillingPeriod` `months` after the CURRENT billing period (negative for
+/// earlier), in the zero-padded spelling the modelled `BillingPeriod` pattern
+/// `^\d{4}-(0?[1-9]|1[012])$` allows.
+///
+/// A create may put an item only into the current or the previous billing period, which
+/// the wall clock decides, so every span a fixture here is created with is named
+/// relative to the service's own current billing period rather than by a fixed month.
+fn period(months: i64) -> String {
+    let current =
+        service_com_amazonaws_billingconductor_awsbillingconductor::state::current_billing_period();
+    let (year, month) = current
+        .split_once('-')
+        .expect("the current billing period is spelled YYYY-MM");
+    let total = year.parse::<i64>().expect("a four-digit year") * 12
+        + month.parse::<i64>().expect("a month")
+        - 1
+        + months;
+    format!("{:04}-{:02}", total.div_euclid(12), total.rem_euclid(12) + 1)
+}
+
+/// The same billing period with its month spelled without a leading zero — the other
+/// spelling the modelled `BillingPeriod` pattern allows. A month from October on has
+/// only the one spelling, so for those this is the value it was given.
+fn one_digit_month(billing_period: &str) -> String {
+    let (year, month) = billing_period
+        .split_once('-')
+        .expect("a billing period is spelled YYYY-MM");
+    format!("{year}-{}", month.trim_start_matches('0'))
+}
+
 /// Four custom line items across two billing groups, differing in the attributes the
 /// filter members select on: their names, their billing group, their ARN and the account
 /// each applies to.
@@ -646,6 +676,11 @@ async fn the_reported_currency_is_the_one_the_items_partition_bills_in() {
 /// inclusive start is in it, the exclusive end is not, an absent bound is open, and an
 /// item created with no range at all is reported for every period — including the
 /// current one, which is what a request naming no `BillingPeriod` asks for.
+///
+/// A create may put an item only into the current or the previous billing period, so
+/// every span here STARTS in that window ([`period`] counts from the current one) while
+/// its exclusive end, which is free, puts the item's last period before, at and after
+/// the period the read asks for.
 #[tokio::test]
 async fn the_requested_billing_period_selects_the_items_effective_in_it() {
     let emulator = Emulator::new();
@@ -654,20 +689,31 @@ async fn the_requested_billing_period_selects_the_items_effective_in_it() {
     let items: [(&str, Value); 5] = [
         ("always", Value::Null),
         (
-            "firstquarter",
-            json!({ "InclusiveStartBillingPeriod": "2026-1", "ExclusiveEndBillingPeriod": "2026-4" }),
+            "previousonly",
+            json!({
+                "InclusiveStartBillingPeriod": period(-1),
+                "ExclusiveEndBillingPeriod": period(0),
+            }),
         ),
         (
-            "fromjuly",
-            json!({ "InclusiveStartBillingPeriod": "2026-7" }),
+            "previousquarter",
+            json!({
+                "InclusiveStartBillingPeriod": period(-1),
+                "ExclusiveEndBillingPeriod": period(2),
+            }),
         ),
         (
-            "longover",
-            json!({ "InclusiveStartBillingPeriod": "1970-1", "ExclusiveEndBillingPeriod": "1971-1" }),
+            "fromcurrent",
+            json!({ "InclusiveStartBillingPeriod": period(0) }),
         ),
+        // The same window, both bounds spelled with a one-digit month: both forms the
+        // `BillingPeriod` pattern admits name one month.
         (
-            "faraway",
-            json!({ "InclusiveStartBillingPeriod": "2999-1" }),
+            "currentonly",
+            json!({
+                "InclusiveStartBillingPeriod": one_digit_month(&period(0)),
+                "ExclusiveEndBillingPeriod": one_digit_month(&period(1)),
+            }),
         ),
     ];
     for (name, range) in &items {
@@ -679,27 +725,33 @@ async fn the_requested_billing_period_selects_the_items_effective_in_it() {
         emulator.custom_line_item(&group, name, request).await;
     }
 
+    // The items reported for the CURRENT billing period, which is also what a request
+    // naming no `BillingPeriod` asks for.
+    let current: Vec<&str> = vec!["always", "previousquarter", "fromcurrent", "currentonly"];
     // (the BillingPeriod the read asks for, the names expected in response order)
-    let cases: Vec<(&str, Vec<&str>)> = vec![
-        ("2025-12", vec!["always"]),
-        ("2026-01", vec!["always", "firstquarter"]),
-        // The same period, spelled with a one-digit month: both forms the
-        // `BillingPeriod` pattern admits name one month.
-        ("2026-1", vec!["always", "firstquarter"]),
-        ("2026-03", vec!["always", "firstquarter"]),
-        // The end is EXCLUSIVE, so the item is gone the month it names.
-        ("2026-04", vec!["always"]),
-        ("2026-06", vec!["always"]),
-        ("2026-07", vec!["always", "fromjuly"]),
-        ("2030-11", vec!["always", "fromjuly"]),
-        ("1970-01", vec!["always", "longover"]),
-        ("1970-12", vec!["always", "longover"]),
-        ("1971-01", vec!["always"]),
-        ("2999-12", vec!["always", "fromjuly", "faraway"]),
+    let cases: Vec<(String, Vec<&str>)> = vec![
+        // Before every span: only the item created with no range at all.
+        ("1970-01".to_string(), vec!["always"]),
+        (period(-2), vec!["always"]),
+        (
+            period(-1),
+            vec!["always", "previousonly", "previousquarter"],
+        ),
+        // The same period, spelled with a one-digit month.
+        (
+            one_digit_month(&period(-1)),
+            vec!["always", "previousonly", "previousquarter"],
+        ),
+        // The end is EXCLUSIVE, so `previousonly` is gone the month it names.
+        (period(0), current.clone()),
+        (period(1), vec!["always", "previousquarter", "fromcurrent"]),
+        (period(2), vec!["always", "fromcurrent"]),
+        (period(12), vec!["always", "fromcurrent"]),
+        ("2999-12".to_string(), vec!["always", "fromcurrent"]),
     ];
     for (billing_period, expected) in cases {
         let listed = emulator
-            .listed_names(billing_period, json!({ "BillingPeriod": billing_period }))
+            .listed_names(&billing_period, json!({ "BillingPeriod": billing_period }))
             .await;
         assert_eq!(
             listed, expected,
@@ -707,21 +759,14 @@ async fn the_requested_billing_period_selects_the_items_effective_in_it() {
         );
     }
 
-    // No `BillingPeriod`: the CURRENT billing period, which is neither inside the range
-    // that ended in 1971 nor at or after the one that opens in 2999, and is covered by
-    // the item stored with no range.
+    // No `BillingPeriod`: the CURRENT billing period, which the span that ended with it
+    // does not cover and the item stored with no range does.
     let listed = emulator.listed_names("no billing period", json!({})).await;
-    assert!(
-        listed.contains(&"always".to_string()),
-        "case \"no billing period\": expected the item effective in every period, got {listed:?}"
+    assert_eq!(
+        listed, current,
+        "case \"no billing period\": expected the items effective in the current billing \
+         period {current:?}, got {listed:?}"
     );
-    for over in ["longover", "faraway"] {
-        assert!(
-            !listed.contains(&over.to_string()),
-            "case \"no billing period\": expected {over:?} to be outside the current billing \
-             period, got {listed:?}"
-        );
-    }
 }
 
 /// A page holds at most the `MaxResults` the caller asked for (the service's own default

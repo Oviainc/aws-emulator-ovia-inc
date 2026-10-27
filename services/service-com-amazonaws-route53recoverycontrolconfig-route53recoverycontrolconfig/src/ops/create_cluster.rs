@@ -9,6 +9,9 @@
 //! reads `PENDING` right after this call and `DEPLOYED` once that instant has passed
 //! without any operation writing it.
 //!
+//! `ClusterName` is a label and not an identity: two live clusters may carry the same
+//! name, each with its own ARN.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -219,21 +222,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::TokenOutcome::Fresh => {}
         }
 
-        // A cluster name identifies the cluster within the account that owns it.
-        if guard
-            .clusters
-            .values()
-            .any(|cluster| cluster.name == input.cluster_name)
-        {
-            return Err(CreateClusterErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "a cluster named \"{}\" already exists in this account",
-                    input.cluster_name
-                ),
-            })
-            .into());
-        }
-
+        // A `ClusterName` is a label, NOT an identity: nothing in this service resolves a
+        // cluster by name (every other operation takes its ARN), and the model declares
+        // no uniqueness constraint on the member, so a second create under a name a live
+        // cluster already carries mints a SECOND, independent cluster with its own ARN.
+        //
         // The store is bounded, so a repeated create cannot grow it without limit. This
         // call stores two records — the cluster and its default control panel — so both
         // ceilings have to have room.

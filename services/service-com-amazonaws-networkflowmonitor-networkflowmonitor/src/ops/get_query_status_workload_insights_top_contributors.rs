@@ -210,13 +210,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) else {
             return Err(
                 GetQueryStatusWorkloadInsightsTopContributorsErrorModeled::ValidationException(
-                    crate::state::field_validation(
-                        "queryId",
-                        format!(
-                            "query {} was not found for scope {}",
-                            input.query_id, input.scope_id
-                        ),
-                    ),
+                    crate::state::unknown_query(&input.query_id),
                 )
                 .into(),
             );

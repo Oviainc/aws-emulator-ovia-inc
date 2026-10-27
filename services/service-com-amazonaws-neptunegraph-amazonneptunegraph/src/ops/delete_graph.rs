@@ -230,6 +230,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let final_snapshot = if input.skip_snapshot {
             None
         } else {
+            // The name a snapshot reserves is released, and the room it takes given
+            // back, when its deletion completes, so the removals the clock has already
+            // made due are materialised before the ceiling and the name are checked
+            // against what the store holds.
+            store.materialise_snapshots(now);
             // The snapshot store grows by one entry per final snapshot, so it has the
             // same ceiling `CreateGraphSnapshot` enforces. This operation models no
             // quota error, so a store with no room for the snapshot the caller asked

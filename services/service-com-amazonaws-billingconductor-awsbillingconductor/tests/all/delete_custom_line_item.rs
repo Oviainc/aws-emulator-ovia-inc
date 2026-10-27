@@ -29,8 +29,8 @@
 //! The rows span what the rule generalises over rather than one recorded call: the form
 //! the `Arn` takes (full ARN / bare resource id), the charge kind of the item (flat /
 //! percentage, with and without associated resources), the span the stored item was
-//! created with (none / open-ended / bounded, before / around / after the window), where
-//! the request's span falls relative to it (disjoint before, disjoint after, abutting,
+//! created with (none / open-ended / bounded, ending inside the window / past it), where
+//! the request's span falls relative to it (disjoint after, abutting,
 //! overlapping the head, overlapping the tail, strictly inside, equal, covering), how the
 //! request's span
 //! is bounded (open end / bounded), how many bounded deletes the item has taken (one /
@@ -336,7 +336,7 @@ const PROBE_PERIODS: &[&str] = &[
 async fn a_delete_naming_no_billing_period_range_removes_the_item_from_every_period() {
     // (case, the create members beyond the ones every create needs, whether the request
     // addresses the item by its bare id, a billing period the item is readable at)
-    let rows: Vec<(&str, Value, bool, Option<&str>)> = vec![
+    let rows: Vec<(&str, Value, bool, Option<String>)> = vec![
         ("a flat item with no span, by full ARN", json!({}), false, None),
         ("a flat item with no span, by bare id", json!({}), true, None),
         (
@@ -349,24 +349,28 @@ async fn a_delete_naming_no_billing_period_range_removes_the_item_from_every_per
             "an item with a bounded span, by full ARN",
             json!({
                 "BillingPeriodRange": {
-                    "InclusiveStartBillingPeriod": "2026-03",
-                    "ExclusiveEndBillingPeriod": "2026-09",
+                    "InclusiveStartBillingPeriod": period(-1),
+                    "ExclusiveEndBillingPeriod": period(6),
                 },
             }),
             false,
-            Some("2026-05"),
+            Some(period(0)),
         ),
         (
             "an item with an open-ended span, by bare id",
-            json!({ "BillingPeriodRange": { "InclusiveStartBillingPeriod": "2026-03" } }),
+            json!({ "BillingPeriodRange": { "InclusiveStartBillingPeriod": period(-1) } }),
             true,
-            Some("2026-07"),
+            Some(period(3)),
         ),
         (
             "an item whose span is spelled with a one-digit month",
-            json!({ "BillingPeriodRange": { "InclusiveStartBillingPeriod": "2026-3" } }),
+            json!({
+                "BillingPeriodRange": {
+                    "InclusiveStartBillingPeriod": one_digit_month(&period(0)),
+                },
+            }),
             false,
-            Some("2026-07"),
+            Some(period(2)),
         ),
     ];
 
@@ -375,7 +379,7 @@ async fn a_delete_naming_no_billing_period_range_removes_the_item_from_every_per
         let group = emulator.billing_group("payer").await;
         let item = emulator.custom_line_item(&group, "deleted", create).await;
         assert!(
-            emulator.reports(case, &item, readable_at).await,
+            emulator.reports(case, &item, readable_at.as_deref()).await,
             "case {case:?}: expected the created item to be readable before the delete"
         );
 
@@ -420,10 +424,10 @@ type SpanRow = (&'static str, Option<Value>, Value, Vec<String>, Vec<String>);
 /// from the half-open span that range covers, so a later read reports it exactly for the
 /// periods the delete did not cover.
 ///
-/// Every span the DELETE names starts in the window the operation may act in (the
+/// Every span either call names starts in the window those operations may act in (the
 /// current billing period or the one before it — [`period`] counts from the current
-/// one); the span the item was CREATED with is free, so the rows still put the
-/// request's span before, after, over and across the item's.
+/// one), while the exclusive end of each is free, so the rows still put the request's
+/// span after, over and across the item's.
 #[tokio::test]
 async fn a_delete_naming_a_billing_period_range_removes_the_item_only_from_those_periods() {
     // (case, the span the item is created with, the span the delete names, the periods
@@ -473,10 +477,10 @@ async fn a_delete_naming_a_billing_period_range_removes_the_item_only_from_those
         ),
         (
             "a delete overlapping the tail of a bounded span",
-            Some(range(&period(-3), Some(&period(3)))),
+            Some(range(&period(-1), Some(&period(3)))),
             range(&period(0), None),
-            vec![period(-3), period(-1)],
-            vec![period(0), period(2), period(3)],
+            vec![period(-1)],
+            vec![period(-2), period(0), period(2), period(3)],
         ),
         (
             "a delete covering a bounded span exactly",
@@ -507,18 +511,18 @@ async fn a_delete_naming_a_billing_period_range_removes_the_item_only_from_those
             vec![period(-1), period(3)],
         ),
         (
-            "a delete whose span lies entirely before the item's",
-            Some(range(&period(3), Some(&period(6)))),
+            "a delete of the previous period alone keeps the current one",
+            Some(range(&period(-1), Some(&period(1)))),
             range(&period(-1), Some(&period(0))),
-            vec![period(3), period(5)],
-            vec![period(-1), period(0), period(6)],
+            vec![period(0)],
+            vec![period(-1), period(1)],
         ),
         (
             "a delete whose span lies entirely after the item's",
-            Some(range(&period(-6), Some(&period(-3)))),
+            Some(range(&period(-1), Some(&period(0)))),
             range(&period(0), None),
-            vec![period(-6), period(-4)],
-            vec![period(-3), period(0), period(1)],
+            vec![period(-1)],
+            vec![period(-2), period(0), period(1)],
         ),
         (
             "a one-digit month names the same period as its zero-padded spelling",
@@ -598,14 +602,14 @@ async fn narrowing_an_item_advances_last_modified_time_and_changing_nothing_leav
         ),
         (
             "a delete whose span lies entirely after the item's",
-            range(&period(-6), Some(&period(-3))),
+            range(&period(-1), Some(&period(0))),
             range(&period(0), None),
             false,
-            period(-5),
+            period(-1),
         ),
         (
-            "a delete whose span lies entirely before the item's",
-            range(&period(3), Some(&period(6))),
+            "a delete whose span abuts the start of the item's",
+            range(&period(0), Some(&period(6))),
             range(&period(-1), Some(&period(0))),
             false,
             period(4),
