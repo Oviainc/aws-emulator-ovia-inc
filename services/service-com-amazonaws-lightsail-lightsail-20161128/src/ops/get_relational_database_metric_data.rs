@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRelationalDatabaseMetricData
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRelationalDatabaseMetricData`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Answers the metric series the store holds for the managed relational database
+//! the request names, over the window and at the granularity the request asks
+//! for.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRelationalDatabaseMetricData::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A reporting read: it looks up the database, refuses a request whose values
+//! cannot describe a series, and reports the datapoints the store has for that
+//! metric — it writes nothing, so a later caller sees exactly what it would have
+//! seen had this call never happened.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -128,6 +129,53 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// Every metric a managed relational database publishes, each with the `unit` its
+/// data is published in.
+///
+/// The list is the modelled `GetRelationalDatabaseMetricDataRequest$metricName`
+/// documentation — "Valid relational database metric names are listed below,
+/// along with the most useful `statistics` to include in your request, and the
+/// published `unit` value" — and the `unit` of each row is the "published unit"
+/// that entry states. Source:
+/// `smithy_query(query="doc",shape="GetRelationalDatabaseMetricDataRequest",member="metricName")`.
+///
+/// It covers every member of the modelled `RelationalDatabaseMetricName` enum,
+/// which is what this operation's boundary walk admits. That enum carries two
+/// members the documentation's list leaves out, `FreeableMemory` and `SwapUsage`:
+/// both are amounts of MEMORY — the memory available to the database engine, and
+/// the swap space it is using — so each is published in `Bytes`, the unit this
+/// service reports every other amount of memory or storage in (`FreeStorageSpace`
+/// here, and the instance disk metrics of
+/// `crate::state::INSTANCE_METRIC_UNITS`).
+///
+/// The six rows the documentation does state agree with the relational database
+/// rows of `crate::state::ALARM_METRICS`, which carries the `unit` an alarm
+/// watching one of them reports; this catalog is WIDER, because an alarm can
+/// watch only the metrics `PutAlarm` documents.
+///
+/// It lives beside the one operation that reads it, the way
+/// `super::get_bucket_metric_data::BUCKET_METRIC_UNITS` and
+/// `super::get_distribution_metric_data::DISTRIBUTION_METRIC_UNITS` do.
+pub const RELATIONAL_DATABASE_METRIC_UNITS: &[(&str, &str)] = &[
+    ("CPUUtilization", "Percent"),
+    ("DatabaseConnections", "Count"),
+    ("DiskQueueDepth", "Count"),
+    ("FreeStorageSpace", "Bytes"),
+    ("NetworkReceiveThroughput", "Bytes/Second"),
+    ("NetworkTransmitThroughput", "Bytes/Second"),
+    ("FreeableMemory", "Bytes"),
+    ("SwapUsage", "Bytes"),
+];
+
+/// The unit the relational database metric `metric_name` is published in, or
+/// `None` when this catalog does not know the metric.
+pub fn relational_database_metric_unit(metric_name: &str) -> Option<&'static str> {
+    RELATIONAL_DATABASE_METRIC_UNITS
+        .iter()
+        .find(|(name, _)| *name == metric_name)
+        .map(|(_, unit)| *unit)
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -203,18 +251,146 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRelationalDatabaseMetricData` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRelationalDatabaseMetricDataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRelationalDatabaseMetricData"))
+        // `ctx` carries request metadata only, and nothing this operation
+        // reports comes from it: the metrics of one database are the metrics of
+        // that database's own record, which is addressed by name alone.
+        let _ = ctx;
+
+        // `relationalDatabaseName`, `metricName`, `period`, `startTime`,
+        // `endTime`, `unit` and `statistics` are modelled `@required` members;
+        // the name's pattern, the `MetricPeriod` range (60..=86400) and every
+        // enum this input reaches (`RelationalDatabaseMetricName`, `MetricUnit`
+        // and the `MetricStatistic` entries of `statistics`) are modelled
+        // constraints, so the centralized walk refused anything outside them
+        // before this body ran. What is left is what the model cannot express:
+        // the window has to be a window, the unit has to be the one the metric
+        // is published in, and the request has to ask for at least one
+        // statistic.
+
+        // "The start of the time interval from which to get metric data" / "The
+        // end of the time interval": an interval whose end does not follow its
+        // start spans no instant, so no data of it could be returned. The
+        // refusal is [`crate::state::inverted_window_refusal`], which names both
+        // bounds as the instants they are — this service answers that pair the
+        // same way wherever it takes one.
+        if let Some(message) =
+            crate::state::inverted_window_refusal(input.start_time, input.end_time)
+        {
+            return Err(invalid(message));
+        }
+
+        // `unit` is "The unit for the metric data request. Valid units depend on
+        // the metric data being requested. For the valid units with each
+        // available metric, see the metricName parameter" — and each database
+        // metric's own entry states the ONE unit it is published in
+        // ([`RELATIONAL_DATABASE_METRIC_UNITS`]). A request asking for a metric
+        // in a unit it is not published in names no series, so it is refused as
+        // the invalid input it is rather than answered as if the series existed.
+        let Some(published_unit) = relational_database_metric_unit(&input.metric_name) else {
+            // Unreachable while the catalog covers the modelled
+            // `RelationalDatabaseMetricName` enum, which the boundary walk
+            // restricts `metricName` to. A metric the model gains and the
+            // catalog does not know yet has no published unit here, so it is
+            // honestly "not written yet" rather than refused or answered.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                "GetRelationalDatabaseMetricData for the relational database metric {}",
+                input.metric_name
+            )));
+        };
+        if input.unit != published_unit {
+            return Err(invalid(format!(
+                "unit '{}' is not a valid unit for the relational database metric {}: its \
+                 published unit is {published_unit}",
+                input.unit, input.metric_name
+            )));
+        }
+
+        // `statistics` is "The statistic for the metric": a request that names
+        // none asks for no statistic of the metric, so there is nothing it could
+        // be answered with.
+        if input.statistics.is_empty() {
+            return Err(invalid(
+                "statistics must name at least one statistic of the metric to return".to_string(),
+            ));
+        }
+
+        let metric_name = input.metric_name;
+        let database_name = input.relational_database_name;
+        crate::state::with_state(&*self.engine, |store| {
+            // Metrics are reported for a database this account HOLDS: a name no
+            // database record answers to earns the service's `DoesNotExist`
+            // envelope, not an authoritative-looking empty series.
+            if store.relational_database(&database_name).is_none() {
+                return Err(not_found(&database_name));
+            }
+            Ok(GetRelationalDatabaseMetricDataOutput {
+                // "The name of the metric returned" — the metric whose series
+                // this answer is, which is the one the request named.
+                metric_name: Some(metric_name.clone()),
+                // The datapoints the store holds for that metric over the
+                // requested window: NONE, for every window and every database.
+                //
+                // Every relational database metric is a measurement taken on a
+                // RUNNING database engine — the share of the database's compute
+                // units in use, the connections open to it, the input/output
+                // requests queued against its disk, the storage still free on
+                // it, the memory and swap its engine is using, and the bytes its
+                // interfaces carried
+                // (`GetRelationalDatabaseMetricDataRequest$metricName`). This
+                // emulator runs no database engine and monitors none, so no
+                // observation was ever made in any of the period windows the
+                // request spans, whatever its `period` and whichever
+                // granularity the metric is published at ("All relational
+                // database metric data is available in 1-minute (60 seconds)
+                // granularity", from the modelled `metricName` member).
+                //
+                // An empty `metricData` says exactly that, and is what the
+                // service itself answers for a window it holds no data for — a
+                // window before the database existed, say. A plausible-looking
+                // number per window would be invented telemetry a client could
+                // not tell from a measured one, and would contradict the rest of
+                // this store, where every alarm stays `INSUFFICIENT_DATA`
+                // because no metric of it has data
+                // (`crate::state::ALARM_STATE_INSUFFICIENT_DATA`) and
+                // `GetInstanceMetricData`, `GetContainerServiceMetricData` and
+                // `GetDistributionMetricData` report the same empty series. The
+                // `statistics` the request asked for select members OF a
+                // datapoint, so with no datapoints they have nothing to fill.
+                metric_data: Some(Vec::new()),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the rule it broke.
+fn invalid(message: String) -> GetRelationalDatabaseMetricDataError {
+    GetRelationalDatabaseMetricDataErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// No managed relational database of that name is stored: Lightsail's
+/// `DoesNotExist` rejection — HTTP 400, wire error `NotFoundException`, body
+/// `code` `DoesNotExist` and a message naming the resource type and the requested
+/// name.
+fn not_found(name: &str) -> GetRelationalDatabaseMetricDataError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(
+        crate::state::RESOURCE_TYPE_RELATIONAL_DATABASE,
+        name,
+    )
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> GetRelationalDatabaseMetricDataError {
+    GetRelationalDatabaseMetricDataErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail relational database store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

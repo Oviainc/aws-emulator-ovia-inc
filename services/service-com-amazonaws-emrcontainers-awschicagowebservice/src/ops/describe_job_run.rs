@@ -3,7 +3,9 @@
 //! @op DescribeJobRun
 //! Reports the stored job run: every member comes from the record `StartJobRun`
 //! persisted, after [`crate::state`] materialises any status transition the clock has
-//! made due.
+//! made due — the admission of a waiting run, and the outcome of one that has been
+//! running, which is what gives a polled run its terminal `state`, its `finishedAt`,
+//! its `stateDetails` and its `failureReason`.
 //!
 //! ## Shape of an operation
 //!
