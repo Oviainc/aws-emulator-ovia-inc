@@ -2,9 +2,15 @@
 
 //! @op CreateModelCustomizationJob
 //!
-//! Starts the asynchronous customization of a base model: the job is minted `InProgress`
-//! and the clock owes it its terminal status, which is what brings the custom model named
-//! by `customModelName` into being. The record this operation writes is the one
+//! Hands Amazon Bedrock a role and asks it to customize a base model, so the request is
+//! decided by the `iam:PassRole` step for `roleArn` BEFORE anything it names is resolved
+//! ([`crate::state::customization_pass_role_denial`] compares the role's account against the
+//! account of the principal that would take it on): a role the service may not be passed is
+//! the modelled `AccessDeniedException`, and such a refusal writes nothing at all.
+//!
+//! Where that comparison admits the pass the customization starts: the job is minted
+//! `InProgress` and the clock owes it its terminal status, which is what brings the custom
+//! model named by `customModelName` into being. The record this operation writes is the one
 //! `ops/get_model_customization_job.rs` reads and `ops/stop_model_customization_job.rs`
 //! winds down, so the job this call mints is the job every later request sees.
 //!
@@ -200,6 +206,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The `iam:PassRole` step for `roleArn`, ahead of the store and ahead of every
+        // resource this request names: the role is one Amazon Bedrock takes on to run the
+        // customization, so whether this caller may pass it is settled before
+        // `baseModelIdentifier` is resolved — a denied pass is an authorization refusal
+        // rather than a report about a model — and it leaves no job and no custom model
+        // behind. See `crate::state::customization_pass_role_denial` for the decision.
+        if let Some(denial) = crate::state::customization_pass_role_denial(&input.role_arn) {
+            return Err(
+                CreateModelCustomizationJobErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: Some(denial),
+                    },
+                )
+                .into(),
+            );
+        }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 CreateModelCustomizationJobErrorModeled::InternalServerException(
