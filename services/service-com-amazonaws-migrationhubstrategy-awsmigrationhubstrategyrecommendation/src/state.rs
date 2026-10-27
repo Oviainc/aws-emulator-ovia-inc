@@ -29,7 +29,9 @@
 //! produced: an assessment that reaches `COMPLETE` has analysed the portfolio it covered,
 //! so at that instant every resource it covered is given the recommendation the account's
 //! saved preferences select for it and the instant it was analysed
-//! ([`RegionState::analyze_portfolio`], and [`analysis`] for what the preferences select).
+//! ([`RegionState::analyze_covered_resources`], and [`analysis`] for what the preferences
+//! select). WHICH resources an assessment covers is what its criteria select
+//! ([`RegionState::servers_covered_by`]).
 //!
 //! Beside the servers sit the **data collectors** installed in the account's environment
 //! ([`CollectorRecord`]), which `ListCollectors` reports a page at a time: each one is
@@ -234,6 +236,19 @@ pub const REPORT_QUOTA: usize = 1_000;
 /// silently truncated — the same treatment a `maxResults` past its documented maximum
 /// gets ([`MAX_LIST_PAGE_SIZE`]).
 pub const MAX_GROUP_FILTER_ENTRIES: usize = 100;
+
+/// How many criterion VALUES `StartAssessment` accepts across the criteria of one
+/// assessment.
+///
+/// `AssessmentTargets` bounds the criteria at ten, but `AssessmentTargetValues` declares no
+/// `@length`, so the boundary validator admits a criterion listing values without end —
+/// and every one of them is compared to every server of the portfolio when the scope is
+/// resolved ([`RegionState::servers_covered_by`]). This is the emulator's OWN bound on that
+/// work, the same bound and the same refusal [`MAX_GROUP_FILTER_ENTRIES`] gives the other
+/// selection a start call carries: past it the request is refused with the service's
+/// invalid-request-body sentence, decided before the inventory is read, rather than
+/// silently truncated.
+pub const MAX_ASSESSMENT_TARGET_VALUES: usize = 100;
 
 /// One import file task, as this emulator persists it.
 #[derive(Debug, Clone)]
@@ -612,6 +627,15 @@ pub fn filter_pair<'a>(
     Ok(Some((criteria, value)))
 }
 
+/// A counted number of servers or resources as this service's `Integer` members report it.
+///
+/// Narrowing a stored collection's length to the modelled width saturates rather than
+/// wrapping, so a counter reports the maximum the member can carry instead of a negative
+/// number.
+pub fn count_of(counted: usize) -> i32 {
+    i32::try_from(counted).unwrap_or(i32::MAX)
+}
+
 /// One assessment of an on-premises environment, as this emulator persists it.
 #[derive(Debug, Clone)]
 pub struct Assessment {
@@ -620,7 +644,9 @@ pub struct Assessment {
     pub id: String,
     /// One of `AssessmentStatus`'s values.
     pub status: String,
-    /// `StartAssessmentRequest$assessmentTargets`, reported back verbatim.
+    /// `StartAssessmentRequest$assessmentTargets` — the criteria of this assessment,
+    /// reported back verbatim by `GetAssessment` and resolved into the scope below when
+    /// the assessment started ([`RegionState::servers_covered_by`]).
     pub assessment_targets: Vec<AssessmentTarget>,
     pub assessment_data_source_type: Option<String>,
     pub s3bucket_for_analysis_data: Option<String>,
@@ -628,9 +654,17 @@ pub struct Assessment {
     pub start_time: SystemTime,
     pub completion_time: Option<SystemTime>,
     pub status_message: Option<String>,
-    /// How many servers this assessment covers: the servers of the portfolio it was
-    /// started in (see [`RegionState::server_count`]).
-    pub servers: i32,
+    /// WHICH servers of the portfolio this assessment covers, by id: the ones its criteria
+    /// selected out of the inventory the portfolio held when it started
+    /// ([`RegionState::servers_covered_by`]).
+    ///
+    /// It is the assessment's scope, so it is what every counter it reports is counted off
+    /// ([`Self::servers`]) and what the collection it runs and the analysis its completion
+    /// records apply to — and to nothing else
+    /// ([`RegionState::finish_assessment`]). Resolved once, at the start, because the
+    /// counters report the assessment that was started rather than the portfolio as it is
+    /// read.
+    pub covered_servers: BTreeSet<String>,
     pub success: i32,
     pub failed: i32,
     pub in_progress: i32,
@@ -639,6 +673,14 @@ pub struct Assessment {
 }
 
 impl Assessment {
+    /// `DataCollectionDetails$servers` — "The total number of servers in the assessment".
+    ///
+    /// Counted off the scope itself, so the counter and the servers the assessment
+    /// actually collects for cannot drift apart.
+    pub fn servers(&self) -> i32 {
+        count_of(self.covered_servers.len())
+    }
+
     /// Materialise the completion the clock owes this assessment, if `now` is past its
     /// due instant: every server still in progress has finished collecting by then.
     ///
@@ -658,7 +700,8 @@ impl Assessment {
         self.completion_due = None;
         self.status_message = Some(format!(
             "Data collection completed for {} of {} servers.",
-            self.success, self.servers
+            self.success,
+            self.servers()
         ));
         Some(due)
     }
@@ -683,7 +726,8 @@ impl Assessment {
         self.completion_time = Some(now);
         self.status_message = Some(format!(
             "Data collection stopped with {} of {} servers collected.",
-            self.success, self.servers
+            self.success,
+            self.servers()
         ));
         self.in_progress = 0;
         self.completion_due = None;
@@ -695,7 +739,7 @@ impl Assessment {
     pub fn to_data_collection_details(&self) -> DataCollectionDetails {
         DataCollectionDetails {
             status: Some(self.status.clone()),
-            servers: Some(self.servers),
+            servers: Some(self.servers()),
             failed: Some(self.failed),
             success: Some(self.success),
             in_progress: Some(self.in_progress),
@@ -924,7 +968,7 @@ fn components_with_strategy(
     let counted = running
         .filter(|component| component.strategy.as_deref() == Some(strategy))
         .count();
-    Some(i32::try_from(counted).unwrap_or(i32::MAX))
+    Some(count_of(counted))
 }
 
 /// The `RecommendationSet` a stored preference names.
@@ -1094,7 +1138,7 @@ pub struct ServerRecord {
     pub error_category: Option<String>,
     /// `ServerDetail$lastAnalyzedTimestamp` — "the timestamp of when the server was
     /// assessed", which is the instant the assessment covering it reached `COMPLETE` and
-    /// the analysis above was recorded ([`RegionState::analyze_portfolio`]).
+    /// the analysis above was recorded ([`RegionState::analyze_covered_resources`]).
     pub last_analyzed: Option<SystemTime>,
     /// The import groups this server came in with — `StartImportFileTaskRequest$groupId`
     /// of the import that brought it in. Not a member of `ServerDetail`: it is what
@@ -1197,16 +1241,60 @@ impl ServerRecord {
     /// value `ServerCriteria` does not declare selects none; a caller never sees that,
     /// because the handler refuses an undeclared criteria before it gets here.
     pub fn matches_criteria(&self, criteria: &str, value: &str) -> bool {
-        match criteria {
-            SERVER_CRITERIA_NOT_DEFINED => true,
-            "SERVER_ID" => self.id == value,
-            "OS_NAME" => {
-                self.os_type.as_deref() == Some(value) || self.os_version.as_deref() == Some(value)
-            }
-            "STRATEGY" => self.strategy.as_deref() == Some(value),
-            "DESTINATION" => self.target_destination.as_deref() == Some(value),
-            "ANALYSIS_STATUS" => self.data_collection_status.as_deref() == Some(value),
-            "ERROR_CATEGORY" => self.error_category.as_deref() == Some(value),
+        criteria == SERVER_CRITERIA_NOT_DEFINED || self.attribute_values(criteria).contains(&value)
+    }
+
+    /// EVERY value this server holds for the attribute `name` names, in the names
+    /// `ServerCriteria` gives this service's server attributes.
+    ///
+    /// One value per attribute, except the one the model splits in two: `OS_NAME` is
+    /// carried by `SystemInfo$osInfo`'s `OSType` and by its free-text version, so both are
+    /// values of that attribute. An attribute the record holds nothing for, and a `name`
+    /// that is not one of the catalog's, yield no value at all \u2014 which is what makes a
+    /// criterion over them select nothing.
+    ///
+    /// It is the one place a criteria name is resolved to the member it names, so the
+    /// filter a list applies ([`Self::matches_criteria`]) and the criteria an assessment
+    /// is scoped by ([`Self::matches_target`]) cannot read different members for the same
+    /// name.
+    fn attribute_values(&self, name: &str) -> Vec<&str> {
+        match name {
+            "SERVER_ID" => vec![self.id.as_str()],
+            "OS_NAME" => [self.os_type.as_deref(), self.os_version.as_deref()]
+                .into_iter()
+                .flatten()
+                .collect(),
+            "STRATEGY" => self.strategy.as_deref().into_iter().collect(),
+            "DESTINATION" => self.target_destination.as_deref().into_iter().collect(),
+            "ANALYSIS_STATUS" => self.data_collection_status.as_deref().into_iter().collect(),
+            "ERROR_CATEGORY" => self.error_category.as_deref().into_iter().collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// True when this server satisfies one criterion of an assessment.
+    ///
+    /// `AssessmentTarget` is documented "Defines the criteria of assessment" and carries a
+    /// `name`, the `values` to compare against and the `condition` to compare them under,
+    /// so the criterion compares the values of the attribute `name` names
+    /// ([`Self::attribute_values`]) to the values it lists: `EQUALS` holds when a held
+    /// value IS one of them and `CONTAINS` when a held value contains one of them as
+    /// text, and the two negated conditions are exactly their complements \u2014 so a server
+    /// holding no value for the attribute satisfies `NOT_EQUALS` and `NOT_CONTAINS` and
+    /// fails the other two. A `condition` outside the `Condition` catalog compares
+    /// nothing, so it selects no server; a caller never sees that, because the handler
+    /// refuses an undeclared condition before anything is stored.
+    pub fn matches_target(&self, target: &AssessmentTarget) -> bool {
+        let held = self.attribute_values(&target.name);
+        let matched = |compare: fn(&str, &str) -> bool| -> bool {
+            held.iter()
+                .any(|value| target.values.iter().any(|wanted| compare(value, wanted)))
+        };
+        match target.condition.as_str() {
+            "EQUALS" => matched(|value, wanted| value == wanted),
+            "NOT_EQUALS" => !matched(|value, wanted| value == wanted),
+            "CONTAINS" => matched(|value, wanted| value.contains(wanted)),
+            "NOT_CONTAINS" => !matched(|value, wanted| value.contains(wanted)),
             _ => false,
         }
     }
@@ -1345,7 +1433,7 @@ pub struct ApplicationComponentRecord {
     pub os_driver: Option<String>,
     /// `ApplicationComponentDetail$lastAnalyzedTimestamp` — the instant the assessment
     /// covering this component reached `COMPLETE` and the analysis above was recorded
-    /// ([`RegionState::analyze_portfolio`]).
+    /// ([`RegionState::analyze_covered_resources`]).
     pub last_analyzed: Option<SystemTime>,
     /// `DatabaseConfigDetail$secretName` — the Secrets Manager secret the component's
     /// database is reached with, for a component that has one.
@@ -1535,6 +1623,21 @@ impl ApplicationComponentRecord {
     pub fn in_any_group(&self, groups: &[Group]) -> bool {
         in_any_group(&self.group_id, groups)
     }
+
+    /// Whether an assessment covering the servers `covered` covers this component too.
+    ///
+    /// A component runs ON a server (`ApplicationComponentDetail$associatedServerId` —
+    /// "the ID of the server that the application component is running on"), so an
+    /// assessment that collects data for a server collects it for the components running
+    /// there, and for no others: a component is in scope exactly when one of the servers it
+    /// runs on is. A component no server association was recorded for therefore runs
+    /// nowhere an assessment reaches, so no assessment covers it — an assessment covering
+    /// no server covers no component at all.
+    pub fn runs_on_any(&self, covered: &BTreeSet<String>) -> bool {
+        self.associated_server_ids
+            .iter()
+            .any(|server| covered.contains(server))
+    }
 }
 
 /// One data collector installed in the account's environment, as this emulator persists
@@ -1720,11 +1823,27 @@ impl RegionState {
     }
 
     /// The assessment `id` names, with any completion the clock owes it already
-    /// materialised — on the assessment AND on the portfolio it covered.
+    /// materialised — on the assessment AND on the resources it covered.
+    ///
+    /// Every completion the clock owes an IMPORT is materialised first
+    /// ([`Self::settle_imports`]), so the inventory the completion is materialised over is
+    /// the one the clock has already produced: the analysis a completion records covers the
+    /// records a due import brought in, which it could not if they were still held by the
+    /// task. Materialising a completion is a one-time write ([`Assessment::settle`] clears
+    /// the due instant), so an inventory that arrived afterwards would never be analysed by
+    /// it at all.
     pub fn settled_assessment_mut(&mut self, id: &str, now: SystemTime) -> Option<&mut Assessment> {
-        let completed = self.assessments.get_mut(id)?.settle(now);
+        if !self.assessments.contains_key(id) {
+            return None;
+        }
+        self.settle_imports(now);
+        let assessment = self.assessments.get_mut(id)?;
+        let completed = assessment.settle(now);
         if let Some(at) = completed {
-            self.finish_assessment(at);
+            // What the completion owes the portfolio is owed to the servers this
+            // assessment covered, so its own scope is what it is materialised over.
+            let covered = assessment.covered_servers.clone();
+            self.finish_assessment(&covered, at);
         }
         self.assessments.get_mut(id)
     }
@@ -1738,32 +1857,59 @@ impl RegionState {
     /// Any completion the clock already owed the assessment is materialised first, so a
     /// stop that arrives after the assessment finished finds it terminal.
     pub fn stop_assessment(&mut self, id: &str, now: SystemTime) -> Option<bool> {
-        let stopped = self.settled_assessment_mut(id, now)?.stop(now);
+        let assessment = self.settled_assessment_mut(id, now)?;
+        let stopped = assessment.stop(now);
+        let covered = assessment.covered_servers.clone();
         if stopped {
-            self.finish_server_collection(COLLECTION_STOPPED);
+            self.finish_server_collection(&covered, COLLECTION_STOPPED);
         }
         Some(stopped)
     }
 
-    /// Put every server of this portfolio into [`COLLECTION_STARTED`]: an assessment just
+    /// The servers of this portfolio an assessment whose criteria are `targets` covers, by
+    /// id.
+    ///
+    /// `StartAssessmentRequest$assessmentTargets` is "List of criteria for assessment"
+    /// over `AssessmentTarget` ("Defines the criteria of assessment"), so the criteria are
+    /// what SELECT the servers the assessment collects data for: a server is covered when
+    /// every criterion holds for it ([`ServerRecord::matches_target`]), and criteria that
+    /// select nothing give an assessment of no server at all. A request naming NO
+    /// criterion scopes nothing, so the whole inventory is covered — which is the
+    /// environment `StartAssessment` "starts the assessment of".
+    ///
+    /// The inventory is the one the portfolio holds when the assessment starts, so call
+    /// [`Self::settle_all`] first: a server an import whose completion is already due
+    /// brought in is part of that inventory.
+    pub fn servers_covered_by(&self, targets: &[AssessmentTarget]) -> BTreeSet<String> {
+        self.servers
+            .values()
+            .filter(|server| targets.iter().all(|target| server.matches_target(target)))
+            .map(|server| server.id.clone())
+            .collect()
+    }
+
+    /// Put every server of `covered` into [`COLLECTION_STARTED`]: an assessment just
     /// started covering them, so the collection task is running on each one.
     ///
-    /// It overwrites whatever status an earlier assessment left, because the status
-    /// reports the collection that is running NOW; a portfolio holding no server has
-    /// nothing to move.
-    pub fn begin_server_collection(&mut self) {
-        for server in self.servers.values_mut() {
+    /// A server the assessment does not cover is not collecting for it, so it keeps the
+    /// status it has. It overwrites whatever status an earlier assessment left on a
+    /// covered server, because the status reports the collection that is running NOW; an
+    /// assessment covering no server has nothing to move.
+    pub fn begin_server_collection(&mut self, covered: &BTreeSet<String>) {
+        for server in self.covered_servers_mut(covered) {
             server.data_collection_status = Some(COLLECTION_STARTED.to_string());
         }
     }
 
-    /// Move every server whose collection task is still running ([`COLLECTION_RUNNING`])
-    /// to `status`, the per-server face of the terminal status its assessment reached.
+    /// Move every server of `covered` whose collection task is still running
+    /// ([`COLLECTION_RUNNING`]) to `status`, the per-server face of the terminal status its
+    /// assessment reached.
     ///
     /// A server that is not collecting keeps the status it has: a terminal assessment
-    /// status says nothing about a collection that was never running.
-    pub fn finish_server_collection(&mut self, status: &str) {
-        for server in self.servers.values_mut() {
+    /// status says nothing about a collection that was never running, and none about a
+    /// server the assessment never covered.
+    pub fn finish_server_collection(&mut self, covered: &BTreeSet<String>, status: &str) {
+        for server in self.covered_servers_mut(covered) {
             if server
                 .data_collection_status
                 .as_deref()
@@ -1774,34 +1920,54 @@ impl RegionState {
         }
     }
 
+    /// The records of the servers `covered` names that this portfolio still holds, to
+    /// write through.
+    ///
+    /// An id the inventory no longer holds names no record, so it is skipped rather than
+    /// resurrected; the scope is read against the inventory in one place, so the two
+    /// writes an assessment makes over its scope cannot disagree about what it covers.
+    fn covered_servers_mut<'a>(
+        &'a mut self,
+        covered: &'a BTreeSet<String>,
+    ) -> impl Iterator<Item = &'a mut ServerRecord> {
+        self.servers
+            .iter_mut()
+            .filter(|(id, _)| covered.contains(id.as_str()))
+            .map(|(_, server)| server)
+    }
+
     /// Materialise on the PORTFOLIO what an assessment reaching `COMPLETE` at `at` owes
-    /// it: every server that was still collecting has finished, and the analysis that
-    /// completion stands for is recorded on every resource the assessment covered.
+    /// it: every server of `covered` that was still collecting has finished, and the
+    /// analysis that completion stands for is recorded on the resources the assessment
+    /// covered.
     ///
     /// One site for both, so no caller can materialise the terminal status of an
     /// assessment without the analysis output that status means the service produced.
-    pub fn finish_assessment(&mut self, at: SystemTime) {
-        self.finish_server_collection(COLLECTION_SUCCESS);
-        self.analyze_portfolio(at);
+    pub fn finish_assessment(&mut self, covered: &BTreeSet<String>, at: SystemTime) {
+        self.finish_server_collection(covered, COLLECTION_SUCCESS);
+        self.analyze_covered_resources(covered, at);
     }
 
-    /// Record the analysis a completed assessment produced, on every resource of this
-    /// portfolio.
+    /// Record the analysis a completed assessment produced, on the resources it covered:
+    /// the servers `covered` names and the application components running on them
+    /// ([`ApplicationComponentRecord::runs_on_any`]).
     ///
     /// `StartAssessment` "starts the assessment of an on-premises environment", so an
-    /// assessment that reached `COMPLETE` has analysed that environment: each server and
-    /// each application component the assessment covered carries from here on the
-    /// recommendation the account's saved preferences select for it
-    /// ([`analysis::server_recommendation`], [`analysis::component_recommendation`]) and
-    /// the instant it was analysed — `at`, the instant the assessment completed, so the
-    /// same analysis is reported however late it is first read.
+    /// assessment that reached `COMPLETE` has analysed the part of that environment its
+    /// criteria selected: each server and each application component the assessment
+    /// covered carries from here on the recommendation the account's saved preferences
+    /// select for it ([`analysis::server_recommendation`],
+    /// [`analysis::component_recommendation`]) and the instant it was analysed — `at`, the
+    /// instant the assessment completed, so the same analysis is reported however late it
+    /// is first read.
     ///
-    /// A component the analysis does not cover (one kept out of the assessment, or one
-    /// outside the `applicationMode` the preferences name) is left exactly as it was,
-    /// rather than being given a recommendation nothing computed for it.
-    pub fn analyze_portfolio(&mut self, at: SystemTime) {
+    /// A resource the analysis does not cover — one outside the assessment's scope, a
+    /// component kept out of the assessment, or one outside the `applicationMode` the
+    /// preferences name — is left exactly as it was, rather than being given a
+    /// recommendation nothing computed for it.
+    pub fn analyze_covered_resources(&mut self, covered: &BTreeSet<String>, at: SystemTime) {
         let preferences = self.portfolio_preferences.clone();
-        for server in self.servers.values_mut() {
+        for server in self.covered_servers_mut(covered) {
             let recommendation = analysis::server_recommendation(preferences.as_ref(), server);
             server.strategy = recommendation.strategy;
             server.target_destination = recommendation.target_destination;
@@ -1809,6 +1975,9 @@ impl RegionState {
             server.last_analyzed = Some(at);
         }
         for component in self.application_components.values_mut() {
+            if !component.runs_on_any(covered) {
+                continue;
+            }
             let Some(recommendation) =
                 analysis::component_recommendation(preferences.as_ref(), component)
             else {
@@ -1859,7 +2028,7 @@ impl RegionState {
     /// inventory and one over the filter rather than the product of the two.
     pub fn servers_in_groups(&self, groups: &[Group]) -> i32 {
         if groups.is_empty() {
-            return i32::try_from(self.servers.len()).unwrap_or(i32::MAX);
+            return count_of(self.servers.len());
         }
         let wanted: BTreeSet<(Option<&str>, Option<&str>)> = groups
             .iter()
@@ -1875,7 +2044,7 @@ impl RegionState {
                     .any(|held| wanted.contains(&(held.name.as_deref(), held.value.as_deref())))
             })
             .count();
-        i32::try_from(covered).unwrap_or(i32::MAX)
+        count_of(covered)
     }
 
     /// The task of this account that has not reached a terminal status at `now`, if there
@@ -1923,28 +2092,24 @@ impl RegionState {
 
     /// Materialise every completion the clock owes, for a caller about to read across
     /// all of the records — including what the completion of an assessment owes the
-    /// portfolio it covered ([`Self::finish_assessment`]).
+    /// servers it covered ([`Self::finish_assessment`]).
     ///
-    /// An assessment's analysis is PORTFOLIO-wide by construction: the analysis a
-    /// completion stands for is the one the whole portfolio then holds, so several
-    /// assessments coming due at once produce one analysis, recorded at the latest of
-    /// their completion instants, rather than one per assessment. Narrowing an assessment
-    /// to the resources its `assessmentTargets` select is filed separately (the
-    /// `StartAssessment` parameter-ignored issue); that work is what turns this one
-    /// analysis per sweep into one per assessment, and it does not change that the
-    /// completion is what records the analysis.
+    /// Each completion records the analysis of the scope ITS assessment covered, so
+    /// several assessments coming due at once produce one analysis each rather than one
+    /// over the whole portfolio. They are materialised in the order they fell due, so a
+    /// resource two of their scopes share carries the analysis of the one that completed
+    /// last.
     pub fn settle_all(&mut self, now: SystemTime) {
         self.settle_imports(now);
-        let mut completed: Option<SystemTime> = None;
+        let mut completed: Vec<(SystemTime, BTreeSet<String>)> = Vec::new();
         for assessment in self.assessments.values_mut() {
             if let Some(at) = assessment.settle(now) {
-                // Several assessments can come due at once; the LATEST completion is the
-                // analysis the portfolio holds, because it is the one that ran last.
-                completed = Some(completed.map_or(at, |held: SystemTime| held.max(at)));
+                completed.push((at, assessment.covered_servers.clone()));
             }
         }
-        if let Some(at) = completed {
-            self.finish_assessment(at);
+        completed.sort_by_key(|(at, _)| *at);
+        for (at, covered) in completed {
+            self.finish_assessment(&covered, at);
         }
         for report in self.recommendation_reports.values_mut() {
             report.settle(now);
@@ -2053,16 +2218,6 @@ impl RegionState {
             collectors,
             next_token,
         })
-    }
-
-    /// How many servers an assessment started now would cover.
-    ///
-    /// Every server of this Region's inventory: an assessment "starts the assessment of an
-    /// on-premises environment", so what it covers is the portfolio the service holds when
-    /// it starts. Call [`Self::settle_all`] first so a server brought in by an import whose
-    /// completion is already due is counted.
-    pub fn server_count(&self) -> i32 {
-        i32::try_from(self.servers.len()).unwrap_or(i32::MAX)
     }
 
     /// Whether this account has a data source for an assessment to collect from in this
