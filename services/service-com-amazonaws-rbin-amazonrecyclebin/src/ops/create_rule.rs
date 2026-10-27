@@ -209,6 +209,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A tag key in the namespace AWS reserves for its own tags is one the caller may
+        // not create, so a create naming one is a parameter fault answered before
+        // anything is minted. The rule's resource SELECTION (`ResourceTags`,
+        // `ExcludeResourceTags`) is not held to it: those members name tags the retained
+        // resources already carry.
+        let reserved_tag_key = crate::state::names_reserved_tag_key(
+            input.tags.iter().flatten().map(|tag| tag.key.as_str()),
+        );
+        if reserved_tag_key {
+            return Err(CreateRuleErrorModeled::ValidationException(
+                crate::state::reserved_tag_key_not_allowed(crate::state::TAGS_MEMBER),
+            )
+            .into());
+        }
+
         let resource_tags = input.resource_tags.unwrap_or_default();
         let exclude_resource_tags = input.exclude_resource_tags.unwrap_or_default();
         // The model cannot express this: `ResourceTags` makes the rule tag-level, and

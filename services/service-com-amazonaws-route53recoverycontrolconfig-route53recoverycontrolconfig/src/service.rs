@@ -46,8 +46,9 @@
 //!
 //! The FRONT DOOR validates the request's JSON BODY against the operation's modelled
 //! input before this service's code sees it, and reports a value outside a declared
-//! `@pattern`/`@length` as the clause its body-schema validator states for that
-//! constraint class, in brackets after [`INVALID_REQUEST_BODY`], under
+//! `@pattern`/`@length`, or outside the set an enumerated type admits, as the clause its
+//! body-schema validator states for that constraint class, in brackets after
+//! [`INVALID_REQUEST_BODY`], under
 //! [`BAD_REQUEST_EXCEPTION`] — a shape this model declares for no operation, because the
 //! layer is not the service. That is [`service_common::front_door`], which every
 //! modelled operation is served behind: the clause has to tell a BODY member from one
@@ -63,7 +64,8 @@
 use service_common::front_door::{FrontDoorTable, BAD_REQUEST_EXCEPTION, INVALID_REQUEST_BODY};
 use service_common::validation::SubmittedEcho;
 use service_common::validation_message::{
-    bracketed_findings, pattern_mismatch, string_too_long, string_too_short,
+    bracketed_findings, enum_value_not_found, pattern_mismatch, string_too_long,
+    string_too_short,
 };
 use smithy_server_runtime::{
     http, ErasedOperation, OperationRoutingTable, Refusal, Refused, Service, Violation,
@@ -75,12 +77,12 @@ use std::sync::Arc;
 /// states none.
 ///
 /// It reports a value it READ and then measured against the declared rule: a regex it
-/// does not match, or a string length outside the declared bounds — each sentence through
+/// does not match, a string length outside the declared bounds, or a value outside the set
+/// its enumerated type admits — each sentence through
 /// [`service_common::validation_message`], which is their home for the whole tree. Every
-/// other class (a `@range`, an enumerated set, an absent `@required` member) has no
-/// recorded sentence here and keeps the framework's own wording rather than being given
-/// one. A value with no text rendering is left alone for the same reason: no recorded
-/// clause quotes one.
+/// other class (a `@range`, an absent `@required` member) has no recorded sentence here and
+/// keeps the framework's own wording rather than being given one. A value with no text
+/// rendering is left alone for the same reason: no recorded clause quotes one.
 fn clause(violation: &Violation, echo: &SubmittedEcho) -> Option<String> {
     let SubmittedEcho::Rendered(value) = echo else {
         return None;
@@ -94,6 +96,12 @@ fn clause(violation: &Violation, echo: &SubmittedEcho) -> Option<String> {
         // here always describes a string.
         ViolationKind::MinLength(min) => Some(string_too_short(value, value.chars().count(), *min)),
         ViolationKind::MaxLength(max) => Some(string_too_long(value, value.chars().count(), *max)),
+        // The values the MODEL declares for the enumerated type, in its declared order —
+        // which is the order the validating walk carries them in — and the string the
+        // caller submitted. The type is reached through the member, so a member at any
+        // depth of the body (`AssertionRule.RuleConfig.Type` as much as `NetworkType`) is
+        // stated the same way.
+        ViolationKind::EnumValue(permitted) => Some(enum_value_not_found(value, permitted)),
         _ => None,
     }
 }
@@ -147,10 +155,10 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
     /// The same modelled operations the generated table holds, each served behind this
     /// service's front door ([`FrontDoorTable`]) so a request BODY that breaks a modelled
-    /// `@pattern`/`@length` is refused by that layer, in its words, before the operation
-    /// runs. Keyed by the routing key the protocol resolves — the key the generated table
-    /// uses — and built from the SAME shared engine, so a wrapped operation reads and
-    /// writes the one store.
+    /// `@pattern`/`@length` or enumerated set is refused by that layer, in its words,
+    /// before the operation runs. Keyed by the routing key the protocol resolves — the key
+    /// the generated table uses — and built from the SAME shared engine, so a wrapped
+    /// operation reads and writes the one store.
     front_door: OperationRoutingTable,
 }
 
@@ -238,8 +246,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     ) -> Option<&dyn ErasedOperation> {
         // NOT a re-route: the key is the one the generated table's own protocol
         // resolves, and the operation it names is the one served — behind this service's
-        // front door, so a request BODY outside a modelled `@pattern`/`@length` is
-        // refused by that layer, in its words, before the operation runs. A key the
+        // front door, so a request BODY outside a modelled `@pattern`/`@length` or
+        // enumerated set is refused by that layer, in its words, before the operation
+        // runs. A key the
         // model does not name resolves to `None` here exactly as it does in the
         // generated table, so the router's routing-error path is unchanged.
         let key = self.entry.protocol().routing_key(req).ok()?;

@@ -30,9 +30,9 @@
 //! about a member's length. [`property_count_refusal`] states that one, for a service
 //! whose recordings show it, and is asked before the envelope.
 //!
-//! [`too_many_properties`], [`pattern_mismatch`], [`string_too_long`] and
-//! [`string_too_short`] are the SENTENCES that layer states for the constraint classes it
-//! reports on a member it read from the request BODY. A service whose front door words
+//! [`too_many_properties`], [`pattern_mismatch`], [`string_too_long`],
+//! [`string_too_short`] and [`enum_value_not_found`] are the SENTENCES that layer states
+//! for the constraint classes it reports on a member it read from the request BODY. A service whose front door words
 //! those findings itself — because it has to tell a body member from one bound to the URI,
 //! which the refusal seam cannot — builds them from here, so the sentences do not drift
 //! per crate. [`expected_vendor`] is the one sentence here that is not a schema finding:
@@ -158,6 +158,30 @@ pub fn string_too_long(value: &str, length: usize, max: i64) -> String {
 #[must_use]
 pub fn string_too_short(value: &str, length: usize, min: i64) -> String {
     format!("string \"{value}\" is too short (length: {length}, required minimum: {min})")
+}
+
+/// The finding that layer states for a value outside the set its schema enumerates: the
+/// value the caller submitted, then every value the schema admits, each quoted and
+/// separated by a bare comma.
+///
+/// `permitted` is stated in the order it is handed over — the order the MODEL declares the
+/// enumerated type's members in, which is the order the validating walk carries — so the
+/// finding lists the type as its definition reads. An emulated service that validates a
+/// DOCUMENT it was handed (rather than a modelled member) states the same sentence about
+/// the values that document's format defines;
+/// `services/service-com-amazonaws-ecr-amazonec2containerregistry-v20150921/src/state.rs`
+/// carries its own copy for that layer, written before this module had the sentence, and
+/// is to be migrated onto this one rather than copied again.
+#[must_use]
+pub fn enum_value_not_found<S: AsRef<str>>(value: &str, permitted: &[S]) -> String {
+    let quoted: Vec<String> = permitted
+        .iter()
+        .map(|admitted| format!("\"{}\"", admitted.as_ref()))
+        .collect();
+    format!(
+        "instance value (\"{value}\") not found in enum (possible values: [{}])",
+        quoted.join(",")
+    )
 }
 
 /// The findings of one refusal as that layer LISTS them: `[<finding>, <finding>]`.
@@ -310,8 +334,8 @@ pub fn aws_validation_refusal_with(
 #[cfg(test)]
 mod tests {
     use super::{
-        aws_validation_refusal, aws_validation_refusal_with, pattern_mismatch,
-        property_count_refusal, string_too_long, string_too_short,
+        aws_validation_refusal, aws_validation_refusal_with, enum_value_not_found,
+        pattern_mismatch, property_count_refusal, string_too_long, string_too_short,
     };
     use crate::validation::unanchored_grouping_alternation;
     use aws_smithy_schema_server::{Violation, ViolationKind};
@@ -734,6 +758,57 @@ mod tests {
                 r#"string "{value}" is too short (length: {length}, required minimum: {min})"#
             );
             let actual = string_too_short(value, length, min);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// RULE: the enumerated-set finding states the value the caller submitted and every
+    /// value the schema admits, in the order they were declared, with nothing of the member
+    /// or the envelope around them.
+    ///
+    /// The rows differ along what the sentence generalises over: how many values the set
+    /// holds, their order, and the form of the value that missed it (another spelling, a
+    /// different case, the empty string).
+    #[test]
+    fn the_enumerated_set_finding_states_the_submitted_value_and_every_admitted_one() {
+        // (case, the value, the values the schema admits, the finding expected)
+        let rows: [(&str, &str, &[&str], &str); 5] = [
+            (
+                "a value of no admitted spelling",
+                "NOTAVALIDTYPE",
+                &["IPV4", "DUALSTACK"],
+                r#"instance value ("NOTAVALIDTYPE") not found in enum (possible values: ["IPV4","DUALSTACK"])"#,
+            ),
+            (
+                "an admitted value in another case",
+                "ipv4",
+                &["IPV4", "DUALSTACK"],
+                r#"instance value ("ipv4") not found in enum (possible values: ["IPV4","DUALSTACK"])"#,
+            ),
+            (
+                "a set of three, in its declared order",
+                "MAYBE",
+                &["ATLEAST", "AND", "OR"],
+                r#"instance value ("MAYBE") not found in enum (possible values: ["ATLEAST","AND","OR"])"#,
+            ),
+            (
+                "a set of one",
+                "ARCHIVE",
+                &["EXPIRE"],
+                r#"instance value ("ARCHIVE") not found in enum (possible values: ["EXPIRE"])"#,
+            ),
+            (
+                "the empty string",
+                "",
+                &["IPV4", "DUALSTACK"],
+                r#"instance value ("") not found in enum (possible values: ["IPV4","DUALSTACK"])"#,
+            ),
+        ];
+        for (case, value, permitted, expected) in rows {
+            let actual = enum_value_not_found(value, permitted);
             assert_eq!(
                 actual, expected,
                 "case {case:?}: expected {expected:?}, got {actual:?}"

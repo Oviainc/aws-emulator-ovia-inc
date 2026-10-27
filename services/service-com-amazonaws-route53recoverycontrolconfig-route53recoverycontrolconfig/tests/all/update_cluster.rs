@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 
 // The HTTP harness every suite in this target shares, and the facts about this
 // service's resources the lifecycle suite already states.
+use super::body_enum_refusals::{enum_clause, NETWORK_TYPE_VALUES};
 use super::common::{call, create_cluster, enc, error_code, router};
 use super::recovery_control_lifecycle::{
     ACCOUNT, ARN_PREFIX, ENDPOINT_REGIONS, PAST_DEPLOYMENT, STATUS_DEPLOYED, STATUS_PENDING,
@@ -356,8 +357,10 @@ async fn updating_an_unknown_cluster_is_not_found() {
     );
 }
 
-/// A `NetworkType` the model does not declare is refused with `ValidationException`
-/// (400), and the cluster keeps the network type it had.
+/// A `NetworkType` the model does not declare never reaches this operation: the
+/// request-body validator refuses it with `BadRequestException` (400) — the class and the
+/// clause `tests/all/body_enum_refusals.rs` states the rule for — and the cluster keeps
+/// the network type it had.
 #[tokio::test]
 async fn a_network_type_outside_the_modelled_values_is_refused() {
     let router = router();
@@ -382,8 +385,14 @@ async fn a_network_type_outside_the_modelled_values_is_refused() {
         );
         assert_eq!(
             error_code(&answer),
-            "ValidationException",
-            "case NetworkType {case:?}: expected ValidationException, got {answer:?}"
+            "BadRequestException",
+            "case NetworkType {case:?}: expected BadRequestException, got {answer:?}"
+        );
+        let actual = answer["message"].as_str().unwrap_or_default();
+        let expected = enum_clause(case, NETWORK_TYPE_VALUES);
+        assert_eq!(
+            actual, expected,
+            "case NetworkType {case:?}: expected {expected:?}, got {actual:?}"
         );
         let read = describe_cluster(&router, &arn).await;
         assert_eq!(
