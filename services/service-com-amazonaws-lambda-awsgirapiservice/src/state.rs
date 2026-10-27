@@ -120,7 +120,9 @@
 //! the ARN of a configuration this store already holds, never one the request invented.
 //! `CreateFunction` sets the same value from its own `CodeSigningConfigArn` member, and
 //! `GetFunctionCodeSigningConfig` reports exactly what is stored there, so one function
-//! has ONE association however it was set. The association is also what makes a stored
+//! has ONE association however it was set. `DeleteFunctionCodeSigningConfig` "Removes the
+//! code signing configuration from the function", so it clears that same single value and
+//! the function then holds none. The association is also what makes a stored
 //! configuration IN USE: `DeleteCodeSigningConfig` can remove a configuration "only if no
 //! function is using it", so it removes the record out of
 //! [`ComAmazonawsLambdaAwsgirapiserviceState::code_signing_configs`] only when
