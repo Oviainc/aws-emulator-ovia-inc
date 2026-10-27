@@ -166,7 +166,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     async fn handle(
         &self,
-        input: Self::Input,
+        mut input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
@@ -245,24 +245,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
                 );
             }
-
-            // A `PolicyDetails` on an update REPLACES the stored configuration
-            // wholesale, so the replacement must be as complete as the one a
-            // create would have had to state: the members the kind of policy it
-            // describes is built from. Judged after the lookup (the policy has
-            // to exist before its kind can be read) and before the first write,
-            // so a refused update leaves the stored policy exactly as it was.
-            if let Some(details) = input.policy_details.as_ref() {
-                let omitted = crate::state::omitted_configuration_members(details);
-                if !omitted.is_empty() {
-                    return Err(
-                        UpdateLifecyclePolicyErrorModeled::InvalidRequestException(
-                            crate::state::configuration_members_omitted(&omitted),
-                        )
-                        .into(),
-                    );
-                }
-            }
         }
 
         // The one cross-member rule a default policy's configuration follows
@@ -284,40 +266,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // The KIND of policy this update addresses is the one it was created
-        // as: `PolicyDetails$PolicyLanguage` is the member that says which kind a
-        // configuration describes, and a configuration naming the other kind asks
-        // for the one change `UpdateLifecyclePolicyRequest$PolicyDetails` rules
-        // out ("You cannot update the policy type or the resource type"). Judged
-        // before the first write, so a refused update leaves the stored policy
-        // exactly as it was.
+        // The members of the policy's IDENTITY a replacement configuration may
+        // not CHANGE: `UpdateLifecyclePolicyRequest$PolicyDetails` is "the
+        // configuration of the lifecycle policy. You cannot update the policy
+        // type or the resource type". A configuration restating the value the
+        // policy already holds for one of them states the configuration it has,
+        // so it is accepted and changes nothing; one naming a different value
+        // asks for the change the model rules out, whichever member states it
+        // (`PolicyLanguage`, `PolicyType`, a default policy's `ResourceType` or
+        // a custom policy's `ResourceTypes`). Judged before the first write, so
+        // a refused update leaves the stored policy exactly as it was.
         if let Some(refusal) =
-            crate::state::policy_language_violation(policy, input.policy_details.as_ref())
+            crate::state::immutable_configuration_violation(policy, input.policy_details.as_ref())
         {
             return Err(
                 UpdateLifecyclePolicyErrorModeled::InvalidRequestException(refusal).into(),
             );
         }
 
-        // The one member of that configuration an update may not CHANGE:
-        // `UpdateLifecyclePolicyRequest$PolicyDetails` is "the configuration of
-        // the lifecycle policy. You cannot update the policy type or the resource
-        // type". A configuration restating the type the policy already holds
-        // states the configuration it has, so it is accepted and changes nothing;
-        // one naming a different type asks for the change the model rules out.
-        // A policy holding no resource type at all has none to change, so a
-        // configuration stating one fills in the single stored copy. Refused
-        // before the first write, so the stored policy is left exactly as it was.
-        if let Some(stated) = input
-            .policy_details
-            .as_ref()
-            .and_then(|details| details.resource_type.as_deref())
-        {
-            if let Some(stored) = policy.default_policy_type.as_deref() {
-                if stored != stated {
+        // By that same sentence, a replacement configuration stating NO policy
+        // type asks for no change of type, so the policy's own type is carried
+        // onto it here — before the rules below read what kind of policy the
+        // replacement configures, and before it is stored — rather than the
+        // create-time default being stamped over the stored type.
+        if let Some(details) = input.policy_details.as_mut() {
+            crate::state::carry_over_policy_type(policy, details);
+        }
+
+        // A `PolicyDetails` on an update REPLACES the stored configuration
+        // wholesale, so the replacement must be as complete as the one a create
+        // would have had to state: the members the kind of policy it describes
+        // is built from. Judged after the lookup (the policy has to exist before
+        // its kind can be read) and before the first write, so a refused update
+        // leaves the stored policy exactly as it was. A DEFAULT policy is
+        // configured from members that each document a value the service fills
+        // in, so it requires none of them.
+        if !policy.default_policy {
+            if let Some(details) = input.policy_details.as_ref() {
+                let omitted = crate::state::omitted_configuration_members(details);
+                if !omitted.is_empty() {
                     return Err(
                         UpdateLifecyclePolicyErrorModeled::InvalidRequestException(
-                            crate::state::resource_type_cannot_be_updated(stated, stored),
+                            crate::state::configuration_members_omitted(&omitted),
                         )
                         .into(),
                     );

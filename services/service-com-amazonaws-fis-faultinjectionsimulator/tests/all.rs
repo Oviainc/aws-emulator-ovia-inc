@@ -57,6 +57,8 @@ mod modelled_map_key_bounds;
 mod resource_tagging;
 #[path = "all/safety_lever.rs"]
 mod safety_lever;
+#[path = "all/start_experiment_replay.rs"]
+mod start_experiment_replay;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/target_account_configuration_description.rs"]

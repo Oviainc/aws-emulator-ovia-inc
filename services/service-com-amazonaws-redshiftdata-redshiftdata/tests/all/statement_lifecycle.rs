@@ -27,7 +27,7 @@ use service_com_amazonaws_redshiftdata_redshiftdata::state::{
 
 // The harness every suite in this crate drives the emulator through.
 use super::emulator::{
-    error_code, flag, id_of, list, number, timestamp, Emulator, ABSENT_ID,
+    error_code, flag, id_of, list, number, timestamp, wait_for_terminal, Emulator, ABSENT_ID,
     LONGER_THAN_A_QUICK_STATEMENT, RUN_TIME_LOWER_BOUND_SECONDS, SLOW_SQL, UNBOUNDED_SQL,
     WAIT_SECONDS,
 };
@@ -1943,9 +1943,10 @@ async fn statements_outside_the_engine_s_bounds_are_interrupted_or_refused() {
                 }),
             )
             .await;
-        let described = emulator
-            .ok("DescribeStatement", &json!({"Id": id_of(&submitted)}))
-            .await;
+        // The verdict is the ENGINE's and arrives on the engine's own bound, so
+        // it is polled for rather than read once and assumed to have arrived
+        // inside this request's wait.
+        let described = wait_for_terminal(&emulator, label, &id_of(&submitted)).await;
         assert_eq!(
             described["Status"], "FAILED",
             "case {label}: must end FAILED rather than run unbounded, got {described}"

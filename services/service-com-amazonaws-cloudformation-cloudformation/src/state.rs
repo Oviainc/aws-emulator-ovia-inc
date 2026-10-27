@@ -759,6 +759,32 @@ pub mod status {
     /// or resources. The stack will be in the REVIEW_IN_PROGRESS state until you execute
     /// the change set").
     pub const REVIEW_IN_PROGRESS: &str = "REVIEW_IN_PROGRESS";
+    /// The terminal status of a completed resource import. Nothing in this service puts a
+    /// stack into it yet; it is named because it is one of the statuses a stack is STABLE
+    /// in ([`super::is_stable_status`]).
+    pub const IMPORT_COMPLETE: &str = "IMPORT_COMPLETE";
+    /// The terminal status of an import that was rolled back, stable for the same reason
+    /// [`IMPORT_COMPLETE`] is.
+    pub const IMPORT_ROLLBACK_COMPLETE: &str = "IMPORT_ROLLBACK_COMPLETE";
+}
+
+/// Whether a stack carrying `status` is in a STABLE state — one a rollback can put it back
+/// to.
+///
+/// `RollbackStack` says which those are: "a last known stable state includes any status in a
+/// *_COMPLETE", and then lists them — the completed create, the completed update, the
+/// completed update rollback and the two completed import statuses. Every other status is a
+/// stack that was never settled in a configuration a later operation could return it to: an
+/// operation still in flight, a failure, and a deletion.
+pub fn is_stable_status(status: &str) -> bool {
+    matches!(
+        status,
+        status::CREATE_COMPLETE
+            | status::UPDATE_COMPLETE
+            | status::UPDATE_ROLLBACK_COMPLETE
+            | status::IMPORT_COMPLETE
+            | status::IMPORT_ROLLBACK_COMPLETE
+    )
 }
 
 /// `ResourceStatus` values this service leaves a stack's resource in, and records a
@@ -838,6 +864,9 @@ pub mod operation_type {
     pub const UPDATE_STACK: &str = "UPDATE_STACK";
     pub const DELETE_STACK: &str = "DELETE_STACK";
     pub const CREATE_CHANGESET: &str = "CREATE_CHANGESET";
+    /// The rollback of a stack whose last operation failed, which `RollbackStack` is the
+    /// call that asks for.
+    pub const ROLLBACK: &str = "ROLLBACK";
 }
 
 /// The `OperationType` of the stack operation that moves a stack into `in_progress`, or
@@ -1199,6 +1228,26 @@ pub struct OwedRollback {
     pub applied: Vec<StoredResource>,
 }
 
+/// What a ROLLBACK a client ASKED for ([`StoredStack::begin_requested_rollback`]) has to do
+/// in the services that own the stack's resources.
+///
+/// `RollbackStack` "rolls back the specified stack to the last known stable state", and
+/// "will delete a stack if it doesn't contain a last known stable state": which of the two
+/// this is depends on whether the stack HAS such a state, and the work itself is the
+/// caller's to drive with the store unlocked — exactly as a failed operation's own unwind is.
+#[derive(Debug, Clone)]
+pub enum RequestedRollback {
+    /// The stack holds no last known stable state, so there is nothing to go back TO: the
+    /// resources the operation that failed had provisioned are removed again
+    /// ([`provisioning::unwind`]) and the stack settles in [`status::ROLLBACK_COMPLETE`].
+    Discard(Vec<StoredResource>),
+    /// The stack holds one: the configuration in force before the failed operation is
+    /// declared again in those services, against what that operation left there
+    /// ([`provisioning::reconcile`]), and the stack settles in
+    /// [`status::UPDATE_ROLLBACK_COMPLETE`].
+    Revert(OwedRollback),
+}
+
 /// One client request token an operation on a stack was started under, with the operation
 /// that claimed it.
 ///
@@ -1285,6 +1334,15 @@ pub struct StoredStack {
     pub resource_types: Vec<String>,
     pub status: String,
     pub status_reason: Option<String>,
+    /// The last status this stack SETTLED in that is a stable one
+    /// ([`is_stable_status`]), or `None` for a stack that has never completed an operation.
+    ///
+    /// `RollbackStack` rolls a stack back "to the last known stable state", and "will delete
+    /// a stack if it doesn't contain a last known stable state", so this is what decides
+    /// which of those a requested rollback is ([`StoredStack::begin_requested_rollback`]).
+    /// Written by [`StoredStack::settle`] alone, since that is the one place a terminal
+    /// status is installed.
+    pub last_stable_status: Option<String>,
     pub pending: Option<PendingStatus>,
     /// The resources the stack's last COMPLETED create or update materialised (see
     /// [`StoredStack::deploy_template`]), each with the status that operation left it in.
@@ -1456,6 +1514,8 @@ impl StoredStack {
             resource_types: Vec::new(),
             status: status::CREATE_IN_PROGRESS.to_string(),
             status_reason: None,
+            // Nothing has settled yet, so the stack has no stable state to go back to.
+            last_stable_status: None,
             pending: None,
             resources: Vec::new(),
             outputs: Vec::new(),
@@ -2362,6 +2422,13 @@ impl StoredStack {
         // only event still owed is the stack's own terminal one, which closes the operation
         // after them.
         self.status = pending.status;
+        // "A last known stable state includes any status in a *_COMPLETE": the operation
+        // that just concluded settled the stack in one, so that status is what a later
+        // rollback has to go back to ([`Self::last_stable_status`]). Recorded here, the one
+        // place a terminal status is installed.
+        if is_stable_status(&self.status) {
+            self.last_stable_status = Some(self.status.clone());
+        }
         // The reason the terminal status carries: the one the operation failed with, and
         // nothing for one that completed.
         self.status_reason = pending.status_reason.clone();
@@ -2844,7 +2911,14 @@ impl StoredStack {
     /// caller that asked for the failed state to be kept (`DisableRollback`), which is the
     /// same rule [`crate::ops::update_stack`]'s failure path follows.
     pub fn begin_owed_update_rollback(&mut self, now: SystemTime, reason: String) -> bool {
-        let Some(plan) = self.rollback_plan.take().filter(|_| !self.disable_rollback) else {
+        if self.disable_rollback {
+            // The caller asked for the failed state to be KEPT, so nothing is put back now
+            // — and the plan is kept with it: `RollbackStack` is the call that clears such a
+            // stack up, and it is the only record of what the failed update changed in the
+            // owning services.
+            return false;
+        }
+        let Some(plan) = self.rollback_plan.take() else {
             return false;
         };
         self.begin_update_rollback(now, reason);
@@ -3376,6 +3450,94 @@ impl StoredStack {
             operation_id: Some(operation_id),
             client_request_token,
         });
+    }
+
+    /// The LAST KNOWN STABLE STATE this stack settled in, if it has one.
+    ///
+    /// Recorded by [`Self::settle`], the one writer of a terminal status, and judged by the
+    /// one rule that says which statuses are stable ([`is_stable_status`]): a stack whose
+    /// create never completed has no such state, while one whose later operation failed
+    /// settled in the status its last completed operation left, which names the
+    /// configuration a rollback puts back. Kept on the stack rather than read back off the
+    /// event log, which is bounded and evicts oldest-first
+    /// ([`MAX_EVENTS_PER_STACK`]) — a busy stack must not forget that it was ever stable.
+    pub fn last_stable_status(&self) -> Option<&str> {
+        self.last_stable_status.as_deref()
+    }
+
+    /// Open the ROLLBACK a client asked for on a stack whose last operation FAILED, and
+    /// answer the work it owes the services that own the stack's resources.
+    ///
+    /// `RollbackStack` "rolls back the specified stack to the last known stable state", and
+    /// "will delete a stack if it doesn't contain a last known stable state", so what the
+    /// rollback is depends on whether this stack HAS one ([`Self::last_stable_status`]):
+    ///
+    /// * with none, there is nothing to go back to — the resources the failed operation had
+    ///   provisioned are removed again and the stack heads for
+    ///   [`status::ROLLBACK_COMPLETE`], exactly as the rollback of a failed create does;
+    /// * with one, the configuration in force before the failed operation is put back and
+    ///   the stack heads for [`status::UPDATE_ROLLBACK_COMPLETE`] — the plan being the one
+    ///   the operation that failed held ([`Self::rollback_plan`], kept for this call where
+    ///   that operation preserved its failed state), or, for a stack this service holds no
+    ///   plan for, the resources in force declared against themselves, which asks the owning
+    ///   services for no change.
+    ///
+    /// The calls themselves are the caller's to drive with the store unlocked
+    /// ([`RequestedRollback`]), before the terminal status falls due; a revert an owning
+    /// service refuses leaves the stack `UPDATE_ROLLBACK_FAILED` and a delete it refuses
+    /// `ROLLBACK_FAILED`, the same as for a rollback no client asked for.
+    pub fn begin_requested_rollback(
+        &mut self,
+        now: SystemTime,
+        operation_id: String,
+        client_request_token: String,
+    ) -> RequestedRollback {
+        // "A unique identifier for this rollback operation that can be used to track the
+        // operation's progress and events": the rollback is the stack's own operation, of
+        // the type the model names for it, so that is what the stack reports as its last and
+        // what the events of this rollback carry.
+        self.record_operation(operation_type::ROLLBACK, &operation_id);
+        // What the operation that failed worked out it would have to put back, read BEFORE
+        // the transition below retires it.
+        let held = self
+            .rollback_plan
+            .take()
+            .or_else(|| self.unreverted_rollback.clone());
+        if self.last_stable_status().is_none() {
+            let discarded = self.current_resources();
+            self.begin_transition(
+                now,
+                status::ROLLBACK_IN_PROGRESS,
+                status::ROLLBACK_COMPLETE,
+                Some(operation_id),
+                Some(client_request_token),
+            );
+            return RequestedRollback::Discard(discarded);
+        }
+        let in_force: Vec<StoredResource> = self
+            .resources
+            .iter()
+            .map(|deployed| deployed.resource.clone())
+            .collect();
+        let plan = held.unwrap_or_else(|| OwedRollback {
+            previous: in_force.clone(),
+            applied: in_force,
+        });
+        // The failed operation's own deployment is ABANDONED, as it is for a rollback the
+        // failure itself owed ([`Self::begin_update_rollback`]): the stack keeps the
+        // resources, outputs and template stage its last completed operation left.
+        self.pending_deployment = None;
+        self.begin_transition(
+            now,
+            status::UPDATE_ROLLBACK_IN_PROGRESS,
+            status::UPDATE_ROLLBACK_COMPLETE,
+            Some(operation_id),
+            Some(client_request_token),
+        );
+        // This rollback is now the outstanding one: whatever an earlier one left unreverted
+        // is what it is about to ask for again.
+        self.unreverted_rollback = None;
+        RequestedRollback::Revert(plan)
     }
 }
 
@@ -5340,6 +5502,27 @@ pub fn status_takes_an_update(status: &str) -> bool {
     )
 }
 
+/// Whether a stack whose last operation left it in `status` can be ROLLED BACK on request,
+/// or whether the call is the refusal [`stack_cannot_be_rolled_back`] words.
+///
+/// `RollbackStack` "rolls back the specified stack to the last known stable state from
+/// CREATE_FAILED or UPDATE_FAILED stack statuses": those are the two statuses of an
+/// operation that failed and PRESERVED what it had provisioned
+/// (`DisableRollback`/`OnFailure=DO_NOTHING`), which is the state this call exists to clear
+/// up. Every other status is a stack with nothing of that kind outstanding — one already
+/// stable, one whose own rollback or deletion another operation resolves, or one with an
+/// operation still in flight.
+pub fn status_takes_a_rollback(status: &str) -> bool {
+    matches!(status, status::CREATE_FAILED | status::UPDATE_FAILED)
+}
+
+/// The message CloudFormation answers when `RollbackStack` names a stack whose current
+/// status is not one a rollback can be started from — the same form
+/// [`stack_cannot_be_updated`] words the analogous refusal in.
+pub fn stack_cannot_be_rolled_back(stack_id: &str, status: &str) -> String {
+    format!("Stack:{stack_id} is in {status} state and can not be rolled back.")
+}
+
 /// The message CloudFormation answers when `ContinueUpdateRollback` names a stack whose
 /// current status is not one a rollback can be continued from.
 ///
@@ -5424,10 +5607,27 @@ pub fn resource_failure_summary<'a>(
     )
 }
 
-/// The message CloudFormation answers when a request names a stack that is not
-/// addressable: no live stack has that name and no stack has that id.
+/// The message CloudFormation answers when a request READS a stack that is not addressable:
+/// no live stack has that name and no stack has that id.
 pub fn stack_does_not_exist(name_or_id: &str) -> String {
     format!("Stack with id {name_or_id} does not exist")
+}
+
+/// The message CloudFormation answers when a request that would CHANGE a stack names one
+/// that is not addressable — a stack that was deleted, or never created.
+///
+/// A stack operation words this refusal differently from a read ([`stack_does_not_exist`]):
+/// the stack the request named appears in SQUARE BRACKETS, and that name is the message's
+/// only variable part. Worded once, so the operations that ASK A STACK TO CHANGE cannot
+/// drift apart about it.
+///
+/// Which operations those are is decided per operation rather than by the kind of call:
+/// `UpdateStack`, `UpdateTerminationProtection` and `RollbackStack` word it this way, while
+/// every read — and `SignalResource`, whose own refusal is the read wording — keeps
+/// [`stack_does_not_exist`]. An operation this emulator has no evidence for keeps the
+/// wording it has rather than being moved on a guess.
+pub fn changed_stack_does_not_exist(name_or_id: &str) -> String {
+    format!("Stack [{name_or_id}] does not exist")
 }
 
 /// The message answered when a stack IS addressable but carries no template: a stack a

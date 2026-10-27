@@ -17,6 +17,13 @@
 //! `GetLifecyclePolicy`'s `Policy.PolicyDetails.PolicyType` and
 //! `GetLifecyclePolicies`' `Policies[*].PolicyType`.
 //!
+//! The documented default is a CREATE-time default: on the update path
+//! `UpdateLifecyclePolicyRequest$PolicyDetails` adds "You cannot update the
+//! policy type or the resource type", so a replacement configuration that states
+//! no type keeps the type the policy already has
+//! (`policy_identity_immutability.rs` owns the refusal of one that states
+//! another).
+//!
 //! The rows span what the rule generalises over: whether the configuration states
 //! a type at all, which type it states, which resource type it targets, custom
 //! against default policy, which way a default policy's type was stated, the
@@ -441,10 +448,14 @@ async fn a_multi_volume_snapshot_policy_is_not_reported_as_an_ami_policy() {
     );
 }
 
-/// The rule holds on the UPDATE path too: a replacement configuration is reported
-/// with the type IT states, or the documented default when it states none.
+/// The rule holds on the UPDATE path too, where `UpdateLifecyclePolicyRequest$PolicyDetails`
+/// adds that "You cannot update the policy type or the resource type": a
+/// replacement configuration is reported with the type the POLICY states —
+/// restated by the replacement or left unstated by it — and never with the
+/// create-time default stamped over it. `policy_identity_immutability.rs` owns
+/// the refusal of a replacement that states another type.
 #[tokio::test]
-async fn a_replaced_configuration_reports_the_type_it_states() {
+async fn a_replaced_configuration_keeps_the_policys_own_type() {
     let router = emulator();
 
     let cases: &[(&str, Value, Value, &str)] = &[
@@ -452,18 +463,24 @@ async fn a_replaced_configuration_reports_the_type_it_states() {
             "an AMI policy replaced by a configuration stating no type",
             json!(custom_details(Some(IMAGE_POLICY_TYPE), "INSTANCE")),
             json!(custom_details(None, "INSTANCE")),
-            SNAPSHOT_POLICY_TYPE,
+            IMAGE_POLICY_TYPE,
         ),
         (
-            "a snapshot policy replaced by a configuration stating IMAGE_MANAGEMENT",
-            json!(custom_details(None, "VOLUME")),
+            "an AMI policy replaced by a configuration restating its type",
+            json!(custom_details(Some(IMAGE_POLICY_TYPE), "INSTANCE")),
             json!(custom_details(Some(IMAGE_POLICY_TYPE), "INSTANCE")),
             IMAGE_POLICY_TYPE,
         ),
         (
+            "a snapshot policy stating no type replaced by one restating the default",
+            json!(custom_details(None, "VOLUME")),
+            json!(custom_details(Some(SNAPSHOT_POLICY_TYPE), "VOLUME")),
+            SNAPSHOT_POLICY_TYPE,
+        ),
+        (
             "a snapshot policy replaced by another stating no type",
             json!(custom_details(None, "INSTANCE")),
-            json!(custom_details(None, "VOLUME")),
+            json!(custom_details(None, "INSTANCE")),
             SNAPSHOT_POLICY_TYPE,
         ),
     ];

@@ -360,6 +360,11 @@ pub fn materialized_policy_details(
     // from, so there is no accepted event-based policy whose type was left
     // unstated, and guessing the type from which members a configuration
     // happens to carry is the very inference this default replaces.
+    //
+    // It is a default for a policy whose type nothing has stated YET, so it is
+    // reached on the create path alone: an update cannot change the type a
+    // policy already holds, and carries that type onto a replacement
+    // configuration stating none ([`carry_over_policy_type`]) before this runs.
     details
         .policy_type
         .get_or_insert_with(|| DEFAULT_POLICY_TYPE.to_string());
@@ -1106,6 +1111,14 @@ pub const DEFAULT_POLICY_MEMBER: &str = "DefaultPolicy";
 /// a configuration describes.
 pub const POLICY_LANGUAGE_MEMBER: &str = "PolicyLanguage";
 
+/// The wire name of the `PolicyDetails` member that states what a policy
+/// manages: `PolicyDetails$PolicyType`.
+pub const POLICY_TYPE_MEMBER: &str = "PolicyType";
+
+/// The wire name of the `PolicyDetails` member that states what a CUSTOM
+/// snapshot or AMI policy targets: `PolicyDetails$ResourceTypes`.
+pub const RESOURCE_TYPES_MEMBER: &str = "ResourceTypes";
+
 /// The `InvalidRequestException` for an update whose configuration states a
 /// value for a member of the policy's identity other than the one the policy
 /// holds.
@@ -1160,6 +1173,109 @@ pub fn policy_language_violation(
             stored,
         )
     })
+}
+
+/// Why `details` cannot be applied to `policy` as its new configuration, or
+/// `None` when it asks for no change this operation rules out.
+///
+/// `UpdateLifecyclePolicyRequest$PolicyDetails` is "the configuration of the
+/// lifecycle policy. You cannot update the policy type or the resource type", so
+/// the members of a policy's IDENTITY are fixed when it is created: a
+/// replacement configuration may restate the value the policy already holds for
+/// one of them (which asks for no change) but naming a different value is
+/// refused with the modelled client error, whichever of those members it names
+/// and whichever kind of policy holds it.
+///
+/// Which members those are, from `smithy_query(query="shape",
+/// shape="PolicyDetails")`:
+///
+/// * `PolicyLanguage` — which KIND of policy the configuration describes,
+///   `SIMPLIFIED` "To create a default policy" against `STANDARD` "To create a
+///   custom policy" ([`policy_language_violation`]).
+/// * `PolicyType` — what the policy manages, "the type of policy": the policy
+///   type the sentence names, compared against the one this policy reports
+///   ([`LifecyclePolicyRecord::policy_type`]).
+/// * `ResourceType` — "[Default policies only] ... the type of default policy",
+///   the resource type of a DEFAULT policy.
+/// * `ResourceTypes` — "[Custom snapshot policies only] The target resource type
+///   for snapshot and AMI lifecycle policies", the resource type of a CUSTOM
+///   one, compared against the types the policy targets
+///   ([`LifecyclePolicyRecord::target_resource_types`]) so the `resourceTypes`
+///   filter cannot start selecting a policy under another type.
+///
+/// A policy holding no value for one of them has none to change, so a
+/// configuration stating one fills in the single stored copy instead of being
+/// refused.
+pub fn immutable_configuration_violation(
+    policy: &LifecyclePolicyRecord,
+    details: Option<&PolicyDetails>,
+) -> Option<InvalidRequestException> {
+    let details = details?;
+
+    if let Some(refusal) = policy_language_violation(policy, Some(details)) {
+        return Some(refusal);
+    }
+
+    if let Some(stated) = details.policy_type.as_deref() {
+        let stored = policy.policy_type();
+        if stated != stored {
+            return Some(configuration_member_cannot_be_updated(
+                POLICY_TYPE_MEMBER,
+                "policy type",
+                stated,
+                &stored,
+            ));
+        }
+    }
+
+    if let Some(stated) = details.resource_type.as_deref() {
+        if let Some(stored) = policy.default_policy_type.as_deref() {
+            if stated != stored {
+                return Some(resource_type_cannot_be_updated(stated, stored));
+            }
+        }
+    }
+
+    if let Some(stated) = details.resource_types.as_ref() {
+        // `ResourceTypeValuesList` is `@length(min: 1, max: 1)`, so the member
+        // states exactly one type and the lists are compared as they stand.
+        let stored = policy.target_resource_types();
+        if !stored.is_empty() && *stated != stored {
+            return Some(configuration_member_cannot_be_updated(
+                RESOURCE_TYPES_MEMBER,
+                "target resource type",
+                &stated.join(", "),
+                &stored.join(", "),
+            ));
+        }
+    }
+
+    None
+}
+
+/// Carry the type `policy` holds onto a replacement configuration that states
+/// none, so the rest of the write path reads the policy's own type from it.
+///
+/// By the same sentence [`immutable_configuration_violation`] enforces, a
+/// configuration that states no `PolicyType` asks for no change of type, so the
+/// stored one stands. Without this the create-time default
+/// ([`DEFAULT_POLICY_TYPE`], "The default is `EBS_SNAPSHOT_MANAGEMENT`") would
+/// be stamped onto the replacement by [`materialized_policy_details`] and an AMI
+/// or event-based policy would be converted to a snapshot one by an update that
+/// asked for nothing of the kind.
+///
+/// A DEFAULT policy carries no type of its own — the kind of default policy it
+/// is decides the type its reads report ([`LifecyclePolicyRecord::policy_type`]),
+/// from the resource type this operation cannot change either — so there is
+/// nothing to carry onto its configuration and no second copy of the type is
+/// written into it.
+pub fn carry_over_policy_type(policy: &LifecyclePolicyRecord, details: &mut PolicyDetails) {
+    if policy.default_policy {
+        return;
+    }
+    details
+        .policy_type
+        .get_or_insert_with(|| policy.policy_type());
 }
 
 /// The `InvalidRequestException` for `[Default policies only]` parameters stated

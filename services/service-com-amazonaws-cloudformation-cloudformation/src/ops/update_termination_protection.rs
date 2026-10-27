@@ -146,9 +146,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // protection": a stack id resolves a deleted stack too, and a stack that is gone
         // has no protection to set.
         let not_found = || {
-            crate::scaffolded::Scaffolded::validation_error(crate::state::stack_does_not_exist(
-                &input.stack_name,
-            ))
+            crate::scaffolded::Scaffolded::validation_error(
+                crate::state::changed_stack_does_not_exist(&input.stack_name),
+            )
         };
         let region = crate::state::request_region(ctx.parts());
         let stack = store

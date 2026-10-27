@@ -55,7 +55,7 @@ use crate::api_mapping_lifecycle::{
 };
 
 /// Patch one api mapping, addressing it the way the model binds the operation.
-async fn update_api_mapping(
+pub(crate) async fn update_api_mapping(
     emulator: &MultiServiceRouter,
     domain: &str,
     api_mapping_id: &str,
@@ -74,7 +74,7 @@ async fn update_api_mapping(
 /// each optional member is carried only when the row names one. `Some("")` is the empty
 /// base path — the root of the domain — written out, which is NOT the same request as one
 /// that carries no key at all.
-fn body(api_id: &str, key: Option<&str>, stage: Option<&str>) -> Value {
+pub(crate) fn body(api_id: &str, key: Option<&str>, stage: Option<&str>) -> Value {
     let mut request = json!({ "apiId": api_id });
     if let Some(key) = key {
         request["apiMappingKey"] = json!(key);
