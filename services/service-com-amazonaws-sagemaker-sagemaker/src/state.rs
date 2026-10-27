@@ -5803,6 +5803,15 @@ impl ComAmazonawsSagemakerSagemakerState {
 /// named once here so the create and the describe mint and match the same ARN.
 pub const TRIAL_COMPONENT_KIND: &str = "experiment-trial-component";
 
+/// The kind label [`could_not_find`] names a trial component by.
+///
+/// The trial-component operations quote the identifier RESOLVED TO ITS ARN rather than the
+/// name the caller sent, the way the lineage family does ([`does_not_exist`]), so every
+/// operation that cannot resolve a component reports the identifier a successful call
+/// would have answered. Stated once here so the reader, the disassociate and the delete
+/// cannot word the same fact differently.
+pub const TRIAL_COMPONENT_KIND_LABEL: &str = "trial component";
+
 /// See [`MODEL_QUOTA`]. Bounds the trial-component store the same way, and is what
 /// `CreateTrialComponent` answers `ResourceLimitExceeded` past.
 pub const TRIAL_COMPONENT_QUOTA: usize = 1_000;
@@ -5919,6 +5928,20 @@ impl ComAmazonawsSagemakerSagemakerState {
             .iter()
             .filter(|(member_of, _)| member_of == &trial)
             .map(|(_, component)| component.clone())
+            .collect()
+    }
+
+    /// The [`entity_key`]s of the trials the trial component `component_key` ([`entity_key`]
+    /// of its name) is part of, read out of [`Self::trial_component_trials`].
+    ///
+    /// The other direction of the same index as [`Self::trial_component_keys_in_trial`]:
+    /// what `DeleteTrialComponent` tests the documented "must be disassociated from all
+    /// trials" precondition by.
+    pub fn trial_keys_holding_trial_component(&self, component_key: &str) -> BTreeSet<String> {
+        self.trial_component_trials
+            .iter()
+            .filter(|(_, component)| component == component_key)
+            .map(|(member_of, _)| member_of.clone())
             .collect()
     }
 
