@@ -50,10 +50,15 @@ use crate::recommendation_loop::{
     call, emulator_on_plan, error_code, field_of_each, label, recommendation_arn, timestamp_secs,
 };
 
-/// One seeded check, the lifecycle stage the seed left on the member account's
-/// recommendation for it, and when that recommendation was last updated.
-/// Source: the `SEED` table in `src/state.rs` (one day apart in SEED order,
-/// which is not check-id order).
+/// One seeded check with an organization recommendation, the lifecycle stage
+/// the seed left on the member account's recommendation for it, and when that
+/// recommendation was last updated. Source: the `SEED` table in `src/state.rs`
+/// (one day apart in SEED order, which is not check-id order).
+///
+/// Only a check whose recommendation is prioritized has an organization
+/// recommendation — every organization operation supports only prioritized
+/// recommendations, a rule pinned in
+/// `tests/all/organization_prioritized_only.rs`.
 struct Seeded {
     check_id: &'static str,
     lifecycle_stage: Option<&'static str>,
@@ -61,16 +66,6 @@ struct Seeded {
 }
 
 const SEEDED: &[Seeded] = &[
-    Seeded {
-        check_id: "amazon-ebs-snapshots",
-        lifecycle_stage: None,
-        last_updated_at: "2024-01-03T00:00:00Z",
-    },
-    Seeded {
-        check_id: "iam-access-key-rotation",
-        lifecycle_stage: None,
-        last_updated_at: "2024-01-04T00:00:00Z",
-    },
     Seeded {
         check_id: "low-utilization-ec2-instances",
         lifecycle_stage: Some("pending_response"),
@@ -88,9 +83,9 @@ const SEEDED: &[Seeded] = &[
 /// account can move.
 const PRIORITY_CHECK: &str = "low-utilization-ec2-instances";
 
-/// A `standard` check, left with its seeded single member so a row can assert
-/// the untouched case beside the grown one.
-const UNTOUCHED_CHECK: &str = "amazon-ebs-snapshots";
+/// The OTHER prioritized check, left with its seeded single member so a row can
+/// assert the untouched case beside the grown one.
+const UNTOUCHED_CHECK: &str = "rds-idle-db-instances";
 
 /// A mounted emulator on a plan that includes the Trusted Advisor API, with the
 /// engine it was built on so a test can enrol organization member accounts the
@@ -198,8 +193,7 @@ async fn the_accounts_list_reports_the_member_recommendation_of_every_seeded_che
     let account = engine::EMULATOR_ACCOUNT_ID;
 
     // Rows: every seeded organization recommendation, which differ along the
-    // member recommendation's lifecycle stage (two carry one, two carry none)
-    // and its `lastUpdatedAt`.
+    // member recommendation's lifecycle stage and its `lastUpdatedAt`.
     for row in SEEDED {
         let case = row.check_id;
         let body = summaries(&router, case, &accounts_path(case)).await;
