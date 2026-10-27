@@ -877,9 +877,11 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
             .last_analysis_refresh()
             .map(|generated| generated.as_secs_f64());
         let mut rows = match plan.resource_type.as_str() {
-            RESOURCE_TYPE_AUTO_SCALING_GROUP => {
-                self.auto_scaling_group_export_rows(&plan.cpu_vendor_architectures, last_refresh)
-            }
+            RESOURCE_TYPE_AUTO_SCALING_GROUP => self.auto_scaling_group_export_rows(
+                &plan.region,
+                &plan.cpu_vendor_architectures,
+                last_refresh,
+            ),
             RESOURCE_TYPE_IDLE => self.idle_export_rows(&plan.region, last_refresh),
             RESOURCE_TYPE_LICENSE => self.license_export_rows(&plan.region, last_refresh),
             RESOURCE_TYPE_RDS_DB_INSTANCE => self.rds_database_export_rows(
@@ -902,17 +904,23 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     /// every analysed group that the request's CPU vendor architecture preference admits, since
     /// each `RecommendationOptions*` field names ONE option's value — and one row carrying the
     /// group's own columns for a group the preference leaves no candidate of.
+    ///
+    /// A row names each group by the ARN the endpoint the export request addressed reports it
+    /// under ([`AnalyzedAutoScalingGroup::arn_in`]), the same ARN the recommendation reader
+    /// answers that region with.
     fn auto_scaling_group_export_rows(
         &self,
+        region: &str,
         requested_architectures: &[String],
         last_refresh: Option<f64>,
     ) -> Vec<ExportRow> {
         let mut rows: Vec<ExportRow> = Vec::new();
         for group in self.visible_auto_scaling_group_analyses() {
-            let Some(parsed) = parse_resource_arn(&group.arn) else {
+            let arn = group.arn_in(region);
+            let Some(parsed) = parse_resource_arn(&arn) else {
                 continue;
             };
-            let preferences = self.effective_preferences(&group.arn, parsed);
+            let preferences = self.effective_preferences(&arn, parsed);
             // The candidates the preference admits, and "the CPU vendor and architecture for an
             // instance or Auto Scaling group recommendations" the exported options then consist
             // of: the crate's one rule for both ([`architecture_admitted`]), which is what the
@@ -932,6 +940,7 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
             if options.is_empty() {
                 rows.push(auto_scaling_group_row(
                     group,
+                    &arn,
                     &preferences,
                     None,
                     &architectures,
@@ -942,6 +951,7 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
             for option in options {
                 rows.push(auto_scaling_group_row(
                     group,
+                    &arn,
                     &preferences,
                     Some(option),
                     &architectures,
@@ -1117,6 +1127,7 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
 /// analysis records no scaling policy).
 fn auto_scaling_group_row(
     group: &AnalyzedAutoScalingGroup,
+    arn: &str,
     preferences: &EffectivePreferences,
     option: Option<&GroupConfiguration>,
     architectures: &[String],
@@ -1124,7 +1135,7 @@ fn auto_scaling_group_row(
 ) -> ExportRow {
     let mut row = ExportRow::new();
     put(&mut row, "AccountId", group.account_id.clone());
-    put(&mut row, "AutoScalingGroupArn", group.arn.clone());
+    put(&mut row, "AutoScalingGroupArn", arn.to_string());
     put(&mut row, "AutoScalingGroupName", group.name.clone());
     put(&mut row, "Finding", group.finding());
     put(

@@ -40,12 +40,12 @@ use serde_json::{json, Value};
 use service_com_amazonaws_migrationhubstrategy_awsmigrationhubstrategyrecommendation::ops::types::Group;
 use service_com_amazonaws_migrationhubstrategy_awsmigrationhubstrategyrecommendation::state::{
     ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState, ImportFileTask,
-    ServerDiscovery, ServerRecord, COMPLETION_SPAN,
+    ServerDiscovery, ServerRecord,
 };
 use service_com_amazonaws_migrationhubstrategy_awsmigrationhubstrategyrecommendation::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::import_and_assess::{call, Answer, TEST_REGION};
+use crate::import_and_assess::{bring_every_completion_forward, call, Answer, TEST_REGION};
 
 /// Every value `GroupName` admits, from `smithy_query(query="shape",shape="GroupName")`.
 const GROUP_NAMES: &[&str] = &["ExternalId", "ExternalSourceType"];
@@ -196,23 +196,6 @@ fn portfolio_with_pending_import(due: bool) -> (Arc<engine::InMemoryEngine>, Mul
     (engine, router)
 }
 
-/// Move the instant the clock owes every report generation task of this portfolio its
-/// terminal status into the PAST, so the next read materialises it.
-///
-/// The same thing the passing of the completion span does — the due instant is what the
-/// store compares `now` against — without a case spending that span asleep.
-fn complete_the_report_span(engine: &Arc<engine::InMemoryEngine>) {
-    let state =
-        engine.state::<ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState>();
-    let mut store = state.lock();
-    let region = store.region_entry(TEST_REGION);
-    for report in region.recommendation_reports.values_mut() {
-        if let Some(due) = report.completion_due {
-            report.completion_due = Some(due - COMPLETION_SPAN - Duration::from_millis(100));
-        }
-    }
-}
-
 /// How many servers the settled task reports were in scope: the count the task kept opens
 /// its status message, which is where the service reports it.
 fn scope_reported(case: &str, message: &str) -> usize {
@@ -302,7 +285,7 @@ async fn started_scope(case: &str, filter: Value, due: bool, read_first: bool) -
 
     // Nothing sleeps: the instant the clock owes the task its terminal status is moved
     // into the past, which is what the passing of the span does.
-    complete_the_report_span(&engine);
+    bring_every_completion_forward(&engine);
     let settled = report_details(&router, &id).await;
     assert_eq!(
         settled.status, 200,

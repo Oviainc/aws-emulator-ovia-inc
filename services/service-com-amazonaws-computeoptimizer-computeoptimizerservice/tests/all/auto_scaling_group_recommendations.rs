@@ -19,7 +19,10 @@ use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{auto_scaling_group_arn, call, emulator, error_code, opt_in, put_preference};
+use crate::harness::{
+    auto_scaling_group_arn, call, call_in_region, emulator, error_code, opt_in, put_preference,
+    ACCOUNT, REGION,
+};
 
 /// The analysis the running store holds: the same rows every emulator starts with.
 fn analysis() -> Vec<AnalyzedAutoScalingGroup> {
@@ -43,7 +46,7 @@ async fn put_group_preference(router: &MultiServiceRouter, preference: &Value) {
     for group in analysis() {
         let mut request = preference.clone();
         request["resourceType"] = json!("AutoScalingGroup");
-        request["scope"] = json!({"name": "ResourceArn", "value": group.arn});
+        request["scope"] = json!({"name": "ResourceArn", "value": group.arn_in(REGION)});
         put_preference(router, &request).await;
     }
 }
@@ -167,9 +170,11 @@ async fn each_group_reports_its_configuration_and_the_figures_derived_from_it() 
         let entry = reported(&body, &case);
 
         assert_eq!(
-            entry["autoScalingGroupArn"], group.arn,
-            "case {case:?}: expected the stored ARN {}, got {entry}",
-            group.arn
+            entry["autoScalingGroupArn"],
+            group.arn_in(REGION),
+            "case {case:?}: expected the group's ARN in the Region the request addressed {}, \
+             got {entry}",
+            group.arn_in(REGION)
         );
         assert_eq!(
             entry["accountId"], group.account_id,
@@ -720,7 +725,8 @@ async fn requested_identifiers_are_selected_reported_as_errors_or_refused() {
     let unknown = auto_scaling_group_arn("not-analysed-asg");
 
     // One known ARN: that group, and no error.
-    let body = recommendations(&router, json!({"autoScalingGroupArns": [known.arn]})).await;
+    let body =
+        recommendations(&router, json!({"autoScalingGroupArns": [known.arn_in(REGION)]})).await;
     assert_eq!(
         reported_names(&body),
         vec![known.name.clone()],
@@ -736,7 +742,7 @@ async fn requested_identifiers_are_selected_reported_as_errors_or_refused() {
     // the analysis holds no recommendation for.
     let body = recommendations(
         &router,
-        json!({"autoScalingGroupArns": [known.arn, unknown.clone()]}),
+        json!({"autoScalingGroupArns": [known.arn_in(REGION), unknown.clone()]}),
     )
     .await;
     assert_eq!(
@@ -1010,4 +1016,139 @@ async fn the_auto_scaling_group_summary_agrees_with_the_recommendations() {
         "the summary must total the top-ranked option of each group ({expected_savings}), \
          got {summary}"
     );
+}
+
+/// Compute Optimizer is a regional service: the endpoint a request addresses is the Region
+/// whose resources it answers for, so the account's groups are reported at EVERY Region's
+/// endpoint, each under that Region's own ARN — and an `autoScalingGroupArns` entry selects a
+/// group exactly at the endpoint of the Region its ARN names.
+///
+/// The Regions below are rows of the same rule, not a catalog: any Region a client can sign
+/// for behaves this way, which is why the expected ARN is computed per row from the stored
+/// analysis rather than written out.
+#[tokio::test]
+async fn the_arns_reported_name_the_region_the_request_addressed() {
+    let router = emulator();
+    analysed(&router).await;
+
+    let regions = ["us-east-1", "us-west-2", "eu-central-1", "ap-southeast-2"];
+    let mut identities_per_region: Vec<Vec<String>> = Vec::new();
+    for region in regions {
+        let (status, body) = call_in_region(
+            &router,
+            region,
+            "GetAutoScalingGroupRecommendations",
+            json!({}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {region}: expected 200, got {status}: {body}"
+        );
+        let prefix = format!("arn:aws:autoscaling:{region}:{ACCOUNT}:");
+        let mut identities: Vec<String> = Vec::new();
+        for group in analysis() {
+            let case = format!("{region}/{}", group.name);
+            let entry = reported(&body, &group.name);
+            let arn = entry["autoScalingGroupArn"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            assert_eq!(
+                arn,
+                group.arn_in(region),
+                "case {case:?}: expected the group's ARN at this endpoint {}, got {arn:?}",
+                group.arn_in(region)
+            );
+            let identity = arn.strip_prefix(&prefix).map(str::to_string);
+            identities.push(identity.unwrap_or_else(|| {
+                panic!("case {case:?}: expected an ARN under {prefix}, got {arn:?}")
+            }));
+        }
+        assert!(
+            !identities.is_empty(),
+            "case {region}: the Region's analysis is reported: {body}"
+        );
+        identities_per_region.push(identities);
+    }
+    for (region, identities) in regions.iter().zip(&identities_per_region) {
+        assert_eq!(
+            identities, &identities_per_region[0],
+            "case {region}: the same groups are reported in every Region, each under its own \
+             ARN, got {identities:?}"
+        );
+    }
+
+    // (the endpoint the request addresses, the Region whose ARN it is asked about instead)
+    let rows = [
+        ("us-west-2", "us-east-1"),
+        ("eu-central-1", "us-west-2"),
+        ("us-east-1", "ap-southeast-2"),
+    ];
+    let group = analysis()
+        .into_iter()
+        .next()
+        .expect("the analysis holds at least one group");
+    for (region, other) in rows {
+        // This endpoint's own ARN of the group selects it.
+        let case = format!("{region} asked about its own ARN");
+        let (status, body) = call_in_region(
+            &router,
+            region,
+            "GetAutoScalingGroupRecommendations",
+            json!({"autoScalingGroupArns": [group.arn_in(region)]}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200, got {status}: {body}"
+        );
+        assert_eq!(
+            reported_names(&body),
+            vec![group.name.clone()],
+            "case {case:?}: expected exactly that group, got {body}"
+        );
+        assert_eq!(
+            body["errors"],
+            json!([]),
+            "case {case:?}: expected no error, got {body}"
+        );
+
+        // Another Region's ARN of the same group names no group this endpoint analyses, so
+        // it selects nothing and comes back as an identifier with no recommendation.
+        let case = format!("{region} asked about the {other} ARN");
+        let foreign = group.arn_in(other);
+        let (status, body) = call_in_region(
+            &router,
+            region,
+            "GetAutoScalingGroupRecommendations",
+            json!({"autoScalingGroupArns": [foreign.clone()]}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200, got {status}: {body}"
+        );
+        assert_eq!(
+            reported_names(&body),
+            Vec::<String>::new(),
+            "case {case:?}: an ARN of another Region selects nothing here, got {body}"
+        );
+        let errors = body["errors"].as_array().cloned().unwrap_or_default();
+        assert_eq!(
+            errors.len(),
+            1,
+            "case {case:?}: expected exactly one error entry, got {body}"
+        );
+        assert_eq!(
+            errors[0]["identifier"],
+            json!(foreign),
+            "case {case:?}: the error must name the identifier it is about, got {body}"
+        );
+        assert_eq!(
+            errors[0]["code"], "ResourceNotFound",
+            "case {case:?}: the error code must say the recommendation does not exist, got \
+             {body}"
+        );
+    }
 }

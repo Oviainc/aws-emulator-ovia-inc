@@ -128,6 +128,41 @@ pub(crate) fn register_collector_in(engine: &Arc<engine::InMemoryEngine>, region
     }
 }
 
+/// Move the instant the clock owes EVERY completion of the Region's portfolio — each
+/// import file task's, each assessment's and each recommendation report task's — one span
+/// further into the past, so the next call finds them all already due.
+///
+/// It is the same thing the passing of those spans does: the due instant is what the store
+/// compares the instant of the call against, and what each record then reports is still the
+/// stored completion, timestamps included. Every pending instant moves by the SAME amount,
+/// so the order the completions fall due in is left exactly as the calls that started them
+/// put it — and no case spends a span asleep.
+///
+/// `pub(crate)` because it is one harness for every suite that drives a completion: a
+/// per-suite copy would be a second rule about what the clock owes.
+pub(crate) fn bring_every_completion_forward(engine: &Arc<engine::InMemoryEngine>) {
+    let by = COMPLETION_SPAN + Duration::from_millis(100);
+    let state =
+        engine.state::<ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState>();
+    let mut store = state.lock();
+    let region = store.region_entry(TEST_REGION);
+    for task in region.import_tasks.values_mut() {
+        if let Some(due) = task.completion_due {
+            task.completion_due = Some(due - by);
+        }
+    }
+    for assessment in region.assessments.values_mut() {
+        if let Some(due) = assessment.completion_due {
+            assessment.completion_due = Some(due - by);
+        }
+    }
+    for report in region.recommendation_reports.values_mut() {
+        if let Some(due) = report.completion_due {
+            report.completion_due = Some(due - by);
+        }
+    }
+}
+
 /// One emulator whose account holds a registered data collector in each of `regions`.
 ///
 /// An assessment is made of the data a collector collects from the environment, so an

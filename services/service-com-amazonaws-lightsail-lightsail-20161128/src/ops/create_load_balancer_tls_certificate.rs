@@ -268,54 +268,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // tag-based access control via resource tags applied to the resource
             // identified by load balancer name"), so a name this account holds no
             // load balancer of in this Region creates nothing.
-            let balancer = store
+            //
+            // The load balancer is READ for as long as the refusals it owns
+            // take, so the id this call mints below is minted from the store
+            // itself rather than through a borrow of one record of it.
+            let location = {
+                let balancer = store
+                    .load_balancer(&region, &load_balancer_name)
+                    .ok_or_else(|| {
+                        not_found(
+                            crate::state::RESOURCE_TYPE_LOAD_BALANCER,
+                            &load_balancer_name,
+                        )
+                    })?;
+                // A certificate name addresses one of this load balancer's
+                // certificates, so asking for one it already holds is refused
+                // rather than silently replacing the record — which would take
+                // the domains the first request asked for away from a
+                // certificate something may already have attached.
+                if balancer.certificate(&certificate_name).is_some() {
+                    return Err(invalid(format!(
+                        "a certificate named '{certificate_name}' is already associated with the \
+                         load balancer '{load_balancer_name}'"
+                    )));
+                }
+                if balancer.certificates.len() >= crate::state::MAX_CERTIFICATES_PER_LOAD_BALANCER
+                {
+                    return Err(invalid(format!(
+                        "the load balancer '{load_balancer_name}' already has the {} certificates \
+                         one Lightsail load balancer may have associated with it at one time",
+                        crate::state::MAX_CERTIFICATES_PER_LOAD_BALANCER
+                    )));
+                }
+                if held >= crate::state::MAX_LOAD_BALANCER_TLS_CERTIFICATES {
+                    return Err(invalid(format!(
+                        "this account already has the {} certificates it may have at one time",
+                        crate::state::MAX_LOAD_BALANCER_TLS_CERTIFICATES
+                    )));
+                }
+                balancer.location.clone()
+            };
+
+            // Every refusal above has been cleared, so the certificate's own id
+            // — what its ARN, its support code and its serial number are
+            // computed from — is minted here and a refused request mints
+            // nothing.
+            let id = store.mint_uuid();
+            // The certificate is not valid yet: Lightsail validates its domains
+            // before the certificate authority issues it, so the record is
+            // stored `PENDING_VALIDATION` and the clock owes it `ISSUED`, which
+            // is why a read straight after this call still reports the pending
+            // status and no issuance date.
+            let due = crate::state::DueNamedState::after(
+                now,
+                crate::state::LOAD_BALANCER_TLS_CERTIFICATE_STATUS_ISSUED,
+            );
+            // The certificate exists from here on — the load balancer reports a
+            // summary for it, and `GetLoadBalancerTlsCertificates` reports it in
+            // full — but it is NOT attached: Lightsail validates it first and
+            // `AttachLoadBalancerTlsCertificate` is what attaches it, which is
+            // why a load balancer that just got a certificate still serves plain
+            // `HTTP` on port 80 alone.
+            let certificate = crate::state::StoredLoadBalancerCertificate {
+                name: certificate_name.clone(),
+                arn: crate::state::load_balancer_tls_certificate_arn(&region, &id),
+                support_code: crate::state::support_code(&id),
+                created_at_ms: now,
+                domain_name,
+                alternative_names,
+                is_attached: false,
+                tags,
+                serial: crate::state::certificate_serial_number(&id),
+                status: crate::state::LOAD_BALANCER_TLS_CERTIFICATE_STATUS_PENDING_VALIDATION,
+                due: Some(due),
+                issued_at_ms: due.at_ms,
+            };
+            store
                 .load_balancer_mut(&region, &load_balancer_name)
                 .ok_or_else(|| {
                     not_found(
                         crate::state::RESOURCE_TYPE_LOAD_BALANCER,
                         &load_balancer_name,
                     )
-                })?;
-            let location = balancer.location.clone();
-            // A certificate name addresses one of this load balancer's
-            // certificates, so asking for one it already holds is refused rather
-            // than silently replacing the record — which would take the domains
-            // the first request asked for away from a certificate something may
-            // already have attached.
-            if balancer.certificate(&certificate_name).is_some() {
-                return Err(invalid(format!(
-                    "a certificate named '{certificate_name}' is already associated with the \
-                     load balancer '{load_balancer_name}'"
-                )));
-            }
-            if balancer.certificates.len() >= crate::state::MAX_CERTIFICATES_PER_LOAD_BALANCER {
-                return Err(invalid(format!(
-                    "the load balancer '{load_balancer_name}' already has the {} certificates \
-                     one Lightsail load balancer may have associated with it at one time",
-                    crate::state::MAX_CERTIFICATES_PER_LOAD_BALANCER
-                )));
-            }
-            if held >= crate::state::MAX_LOAD_BALANCER_TLS_CERTIFICATES {
-                return Err(invalid(format!(
-                    "this account already has the {} certificates it may have at one time",
-                    crate::state::MAX_LOAD_BALANCER_TLS_CERTIFICATES
-                )));
-            }
-
-            // The certificate exists from here on — the load balancer reports a
-            // summary for it — but it is NOT attached: Lightsail validates it
-            // first and `AttachLoadBalancerTlsCertificate` is what attaches it,
-            // which is why a load balancer that just got a certificate still
-            // serves plain `HTTP` on port 80 alone.
-            balancer
+                })?
                 .certificates
-                .push(crate::state::StoredLoadBalancerCertificate {
-                    name: certificate_name.clone(),
-                    domain_name,
-                    alternative_names,
-                    is_attached: false,
-                    tags,
-                });
+                .push(certificate);
 
             // `operations` is a list because a Lightsail call can act on several
             // resources at once; this one adds exactly one certificate, so it

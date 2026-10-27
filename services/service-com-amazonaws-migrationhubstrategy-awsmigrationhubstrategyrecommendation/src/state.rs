@@ -1882,6 +1882,30 @@ pub struct RegionState {
     pub portfolio_preferences: Option<PortfolioPreferences>,
 }
 
+/// One completion the clock owes a portfolio, and the record it is owed to.
+///
+/// What the settlement of a whole portfolio is a list of
+/// ([`RegionState::completions_due_by`]): the instant is what orders them, so each
+/// completion is materialised over the records the clock had already produced when it fell
+/// due.
+#[derive(Debug)]
+struct OwedCompletion {
+    /// The instant this completion fell due at.
+    due: SystemTime,
+    /// The record it is owed to, by id.
+    record: OwedRecord,
+}
+
+/// Which record of a portfolio a completion is owed to — the two kinds whose completion
+/// changes what another one is materialised over.
+#[derive(Debug)]
+enum OwedRecord {
+    /// An import file task: its completion puts the records it ingested into the inventory.
+    Import(String),
+    /// An assessment: its completion records the analysis of the resources it covered.
+    Assessment(String),
+}
+
 impl RegionState {
     /// The import file task `id` names, with any completion the clock owes it already
     /// materialised.
@@ -1898,20 +1922,43 @@ impl RegionState {
     /// terminal status the task reaches, and the records it ingested entering the
     /// inventory the read path reports.
     ///
-    /// One site for both, so no caller can materialise an import's terminal status
-    /// without the records that status means the import brought in. The records were
-    /// built by the start call, so this only moves them — and it moves each one once,
-    /// because a completed task no longer holds any.
+    /// One task at a time ([`Self::settle_import`]), so the one site that moves an import's
+    /// records is the one that gives it its terminal status whichever caller reaches it:
+    /// no caller can materialise an import's terminal status without the records that
+    /// status means the import brought in. Each record moves once, because a completed task
+    /// no longer holds any.
     pub fn settle_imports(&mut self, now: SystemTime) {
-        let mut servers: Vec<ServerRecord> = Vec::new();
-        let mut components: Vec<ApplicationComponentRecord> = Vec::new();
-        for task in self.import_tasks.values_mut() {
-            task.settle(now);
-            if task.is_complete() {
-                servers.append(&mut task.pending_servers);
-                components.append(&mut task.pending_components);
-            }
+        let due: Vec<String> = self
+            .import_tasks
+            .values()
+            .filter(|task| task.completion_due.is_some_and(|at| at <= now))
+            .map(|task| task.id.clone())
+            .collect();
+        for id in due {
+            self.settle_import(&id, now);
         }
+    }
+
+    /// Materialise what the clock owes the ONE import file task `id` names: its terminal
+    /// status, and the records it ingested entering the inventory.
+    ///
+    /// The records were built by the start call, so this only moves them — out of the task
+    /// and into the inventory in the same step that completes it. A task the clock owes
+    /// nothing yet, and one this portfolio does not hold, are left exactly as they are.
+    fn settle_import(&mut self, id: &str, now: SystemTime) {
+        let (servers, components) = {
+            let Some(task) = self.import_tasks.get_mut(id) else {
+                return;
+            };
+            task.settle(now);
+            if !task.is_complete() {
+                return;
+            }
+            (
+                ::std::mem::take(&mut task.pending_servers),
+                ::std::mem::take(&mut task.pending_components),
+            )
+        };
         for record in servers {
             self.servers.insert(record.id.clone(), record);
         }
@@ -1921,29 +1968,21 @@ impl RegionState {
         }
     }
 
-    /// The assessment `id` names, with any completion the clock owes it already
-    /// materialised — on the assessment AND on the resources it covered.
+    /// The assessment `id` names, with every completion the clock owes this portfolio
+    /// already materialised — on the assessment AND on the resources it covered.
     ///
-    /// Every completion the clock owes an IMPORT is materialised first
-    /// ([`Self::settle_imports`]), so the inventory the completion is materialised over is
-    /// the one the clock has already produced: the analysis a completion records covers the
-    /// records a due import brought in, which it could not if they were still held by the
-    /// task. Materialising a completion is a one-time write ([`Assessment::settle`] clears
-    /// the due instant), so an inventory that arrived afterwards would never be analysed by
-    /// it at all.
+    /// The WHOLE portfolio is settled ([`Self::settle_all`]) rather than this one record,
+    /// because a completion records the analysis of the inventory the clock had already
+    /// produced when that completion fell due: the records an import whose completion fell
+    /// due first brought in are part of that inventory, and the records of one that fell due
+    /// later are not. Materialising a completion is a one-time write
+    /// ([`Assessment::settle`] clears the due instant), so a caller that settled a subset
+    /// would record an analysis over the wrong inventory once and for all.
     pub fn settled_assessment_mut(&mut self, id: &str, now: SystemTime) -> Option<&mut Assessment> {
         if !self.assessments.contains_key(id) {
             return None;
         }
-        self.settle_imports(now);
-        let assessment = self.assessments.get_mut(id)?;
-        let completed = assessment.settle(now);
-        if let Some(at) = completed {
-            // What the completion owes the portfolio is owed to the servers this
-            // assessment covered, so its own scope is what it is materialised over.
-            let covered = assessment.covered_servers.clone();
-            self.finish_assessment(&covered, at);
-        }
+        self.settle_all(now);
         self.assessments.get_mut(id)
     }
 
@@ -2200,26 +2239,87 @@ impl RegionState {
     /// all of the records — including what the completion of an assessment owes the
     /// servers it covered ([`Self::finish_assessment`]).
     ///
+    /// The completions are materialised in the order they FELL DUE, each one over the
+    /// records the clock had already produced at its own due instant: an import whose
+    /// completion fell due before an assessment's has brought its records into the
+    /// inventory that assessment's completion is analysed over, and one that fell due after
+    /// it brings them in afterwards, so no completion records work over a record that had
+    /// not arrived when the work was owed.
+    ///
     /// Each completion records the analysis of the scope ITS assessment covered, so
     /// several assessments coming due at once produce one analysis each rather than one
-    /// over the whole portfolio. They are materialised in the order they fell due, so a
-    /// resource two of their scopes share carries the analysis of the one that completed
-    /// last.
+    /// over the whole portfolio, and a resource two of their scopes share carries the
+    /// analysis of the one that completed last.
+    ///
+    /// A portfolio with nothing due has nothing to materialise, and that is all it has:
+    /// the records an import ingested are emptied out of the task at the same moment its
+    /// due instant is cleared ([`Self::settle_import`]), so a record waiting to enter the
+    /// inventory is always a record whose task still carries a due instant and is always
+    /// reached from here.
+    ///
+    /// Each owed completion is materialised on the ONE record it is owed to, so the work is
+    /// linear in the records this portfolio holds rather than the product of those records
+    /// and the instants they fell due at.
     pub fn settle_all(&mut self, now: SystemTime) {
-        self.settle_imports(now);
-        let mut completed: Vec<(SystemTime, BTreeSet<String>)> = Vec::new();
-        for assessment in self.assessments.values_mut() {
-            if let Some(at) = assessment.settle(now) {
-                completed.push((at, assessment.covered_servers.clone()));
+        for owed in self.completions_due_by(now) {
+            match owed.record {
+                OwedRecord::Import(id) => self.settle_import(&id, now),
+                OwedRecord::Assessment(id) => self.settle_assessment(&id, now),
             }
-        }
-        completed.sort_by_key(|(at, _)| *at);
-        for (at, covered) in completed {
-            self.finish_assessment(&covered, at);
         }
         for report in self.recommendation_reports.values_mut() {
             report.settle(now);
         }
+    }
+
+    /// Every completion the clock owes this portfolio at or before `now`, in the order they
+    /// fell due.
+    ///
+    /// Collected before anything is settled, because materialising a completion clears the
+    /// due instant it was owed at. The sort is stable and the import file tasks are
+    /// collected first, so two completions owed at the very same instant put the import's
+    /// records into the inventory before the analysis an assessment's completion records
+    /// over them.
+    fn completions_due_by(&self, now: SystemTime) -> Vec<OwedCompletion> {
+        let mut owed: Vec<OwedCompletion> = self
+            .import_tasks
+            .values()
+            .filter_map(|task| {
+                task.completion_due.map(|due| OwedCompletion {
+                    due,
+                    record: OwedRecord::Import(task.id.clone()),
+                })
+            })
+            .chain(self.assessments.values().filter_map(|assessment| {
+                assessment.completion_due.map(|due| OwedCompletion {
+                    due,
+                    record: OwedRecord::Assessment(assessment.id.clone()),
+                })
+            }))
+            .filter(|owed| owed.due <= now)
+            .collect();
+        owed.sort_by_key(|owed| owed.due);
+        owed
+    }
+
+    /// Materialise the completion the clock owes the ONE assessment `id` names, and what
+    /// that completion owes the servers it covered ([`Self::finish_assessment`]).
+    ///
+    /// What the completion owes the portfolio is owed to the servers this assessment
+    /// covered, so its own scope is what it is materialised over — several assessments
+    /// coming due at once therefore produce one analysis each rather than one over the
+    /// whole portfolio, and a resource two of their scopes share carries the analysis of
+    /// the one that completed last. An assessment the clock owes nothing yet, and one this
+    /// portfolio does not hold, are left exactly as they are.
+    fn settle_assessment(&mut self, id: &str, now: SystemTime) {
+        let Some(assessment) = self.assessments.get_mut(id) else {
+            return;
+        };
+        let Some(at) = assessment.settle(now) else {
+            return;
+        };
+        let covered = assessment.covered_servers.clone();
+        self.finish_assessment(&covered, at);
     }
 
     /// One page of this store's import file tasks, continuing after the task a
