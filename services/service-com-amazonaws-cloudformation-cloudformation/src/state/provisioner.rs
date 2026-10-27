@@ -155,7 +155,9 @@
 //!   name. The two declare the same document under different member and action names, so one
 //!   arm serves both. Their `Parameters` MAP is no member of either create: a group's
 //!   parameter values are written by the modify a client makes next, so the arm makes that
-//!   second call ([`modify_parameters`]) in the batches that request's own bound admits.
+//!   second call ([`modify_parameters`]) in the batches that request's own bound admits —
+//!   which is also this type's UPDATE, the modify being the one call of either group's API
+//!   that writes a parameter value ([`update_parameter_group`]).
 //! * `AWS::Events::Rule`'s are `PutRule`'s own members, spelled identically, with two
 //!   exceptions: `EventPattern` is a template DOCUMENT where the request takes the JSON
 //!   TEXT of one, and `Targets` is no `PutRule` member at all — a rule's targets are
@@ -1035,6 +1037,25 @@ impl Provisioner {
             // the stack created — under the ARN its `Ref` resolves to — rather than
             // replacing it ([`update_topic`]).
             Self::SnsTopic => update_topic(ctx, region, resource, declared).await.map(Some),
+            // A parameter group's `Parameters` map is the one property of either group type
+            // Amazon RDS can change on a group that exists, and the modify is the call that
+            // changes it — the same call the create makes for the values a template declares
+            // — so a changed declaration is applied to the group the stack created rather
+            // than dropped ([`update_parameter_group`]).
+            Self::RdsDbParameterGroup => {
+                update_parameter_group(ctx, region, resource, declared, DB_PARAMETER_GROUP_CALLS)
+                    .await
+            }
+            Self::RdsDbClusterParameterGroup => {
+                update_parameter_group(
+                    ctx,
+                    region,
+                    resource,
+                    declared,
+                    DB_CLUSTER_PARAMETER_GROUP_CALLS,
+                )
+                .await
+            }
             // Every other type's in-place update is its own entry here, exactly as its
             // create and delete are: until one is written, nothing is asked of the owning
             // service and the deployment says so.
@@ -8463,7 +8484,7 @@ async fn create_parameter_group(
         ctx,
         region,
         &resource.physical_resource_id,
-        &resource.properties,
+        &declared_parameters(&resource.properties),
         calls,
     )
     .await?;
@@ -8496,12 +8517,9 @@ async fn modify_parameters(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     physical_resource_id: &str,
-    properties: &Value,
+    declared: &Map<String, Value>,
     calls: ParameterGroupCalls,
 ) -> Result<(), Refusal> {
-    let Some(declared) = properties.get("Parameters").and_then(Value::as_object) else {
-        return Ok(());
-    };
     let settings: Vec<(&String, &Value)> = declared.iter().collect();
     for batch in settings.chunks(PARAMETERS_PER_MODIFY) {
         let mut parameters = vec![(
@@ -8530,6 +8548,98 @@ async fn modify_parameters(
         .await?;
     }
     Ok(())
+}
+
+/// The parameter settings a declaration of either parameter-group type carries: its
+/// `Parameters` MAP, or an empty one where it declares none.
+fn declared_parameters(properties: &Value) -> Map<String, Value> {
+    properties
+        .get("Parameters")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The part of either parameter-group declaration that is NOT its parameter settings:
+/// everything but the `Parameters` map and the tag list, which travel on their own
+/// ([`modify_parameters`], [`Provisioner::retag`]).
+fn parameter_group_configuration(properties: &Value) -> Map<String, Value> {
+    properties
+        .as_object()
+        .map(|properties| {
+            properties
+                .iter()
+                .filter(|(property, _)| !matches!(property.as_str(), "Parameters" | "Tags"))
+                .map(|(property, value)| (property.clone(), value.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Apply a CHANGED declaration of either parameter-group type to the group the stack
+/// already has.
+///
+/// A group's `Parameters` are the one part of either declaration Amazon RDS can change on a
+/// group that exists, and the modify is the call that changes it — the same call the create
+/// makes for the values a template declares — so a deployment that states a parameter
+/// differently, or states one more, reaches that service as that call, carrying only what it
+/// changed. The group keeps its name, so it keeps the handle a DB instance names it by and
+/// the ARN the create reported: this reports no attribute of its own.
+///
+/// Two changes Amazon RDS will not make to a group that exists are REFUSED rather than
+/// quietly dropped, so the stack never reports a group configured differently from its
+/// declaration:
+///
+/// * a change to any other property — the group's family or its description, neither of
+///   which is a member of either modify at all, so AWS applies such a change by creating a
+///   new group and this emulator creates no replacement;
+/// * a parameter the new declaration DROPS, which AWS puts back to the engine's default.
+///   Taking a value off a group is the reset call of the group's own API
+///   (`ResetDBParameterGroup`), which this emulator does not serve yet, so the removal is
+///   answered with `NotImplemented` naming the parameter.
+async fn update_parameter_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+    calls: ParameterGroupCalls,
+) -> Result<Option<Created>, Refusal> {
+    if parameter_group_configuration(&resource.properties)
+        != parameter_group_configuration(declared)
+    {
+        return Err(Refusal {
+            code: NOT_IMPLEMENTED.to_string(),
+            message: format!(
+                "this emulator does not replace an existing {} whose declaration changes a \
+                 property Amazon RDS cannot change on a group that exists; the resource was \
+                 left as it is.",
+                calls.resource_type
+            ),
+        });
+    }
+
+    let before = declared_parameters(&resource.properties);
+    let after = declared_parameters(declared);
+    if let Some(dropped) = before.keys().find(|name| !after.contains_key(*name)) {
+        return Err(Refusal {
+            code: NOT_IMPLEMENTED.to_string(),
+            message: format!(
+                "this emulator does not put the {dropped} parameter of an existing {} back to \
+                 the engine's default when an update no longer declares it; the resource was \
+                 left as it is.",
+                calls.resource_type
+            ),
+        });
+    }
+    // Only the settings this deployment states differently are written: a parameter neither
+    // revision changed already carries the value the group holds.
+    let changed: Map<String, Value> = after
+        .iter()
+        .filter(|(name, value)| before.get(*name) != Some(value))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    modify_parameters(ctx, region, &resource.physical_resource_id, &changed, calls).await?;
+    Ok(Some(Created::attributes(BTreeMap::new())))
 }
 
 /// Delete the parameter group a stack created, addressed by its name — this resource's
