@@ -6,8 +6,8 @@
 //! Every assertion goes over the wire: a request is built and dispatched through the same
 //! [`MultiServiceRouter`] the production emulator mounts. The store is read directly in
 //! exactly one place — the bytes a `PUT` to an upload URL persisted — because this model
-//! binds no operation that reads an upload back (`CreateContent`, which consumes the
-//! `uploadId`, is still a scaffold stub with its own issue).
+//! binds no operation that reads an upload back: `CreateContent` consumes the
+//! `uploadId` and reports the CONTENT it finalized, not the upload.
 //!
 //! The rules under test, each asserted over a TABLE of inputs rather than one recorded
 //! request:

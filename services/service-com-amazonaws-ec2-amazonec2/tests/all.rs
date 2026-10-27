@@ -365,6 +365,8 @@ mod spot_datafeed_subscription;
 mod spot_instance_requests;
 #[path = "all/spot_placement_scores.rs"]
 mod spot_placement_scores;
+#[path = "all/spot_price_history.rs"]
+mod spot_price_history;
 #[path = "all/stale_security_groups.rs"]
 mod stale_security_groups;
 #[path = "all/state_roundtrip.rs"]

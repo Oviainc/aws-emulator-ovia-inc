@@ -279,7 +279,7 @@ fn project(record: &crate::state::ScalingPlanRecord) -> ScalingPlan {
         application_source: record.application_source.clone(),
         scaling_instructions: record.scaling_instructions.clone(),
         status_code: record.status_code.clone(),
-        status_message: record.status_message.clone(),
+        status_message: Some(record.status_message().to_string()),
         status_start_time: Some(crate::state::to_date_time(record.status_start_time)),
         creation_time: Some(crate::state::to_date_time(record.creation_time)),
     }

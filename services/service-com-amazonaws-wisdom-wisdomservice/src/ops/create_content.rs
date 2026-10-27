@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateContent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateContent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateContent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: finalizes the asset a `StartContentUpload` URL received into a content
+//! of the knowledge base the route names — the record every later `GetContent`,
+//! `ListContents` and the `contentArn` a tagging call addresses is answered out of. The
+//! `uploadId` is the receipt: one this service never issued, one another content already
+//! consumed, or one whose URL has expired is refused with the modelled
+//! `ValidationException` (400).
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +171,209 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateContent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateContentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateContent"))
+        // Every modelled constraint — `knowledgeBaseId`'s `UuidOrArn` pattern, `name`'s
+        // length and pattern, `uploadId`'s `len 1..1200`, `metadata`'s `len 0..10` — is
+        // refused before this handler runs, so what is left here is the store's own rules.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Mounted on an engine that holds no state: nothing can be persisted, and
+            // this operation models no error that says so.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("CreateContent"));
+        };
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let host = crate::state::request_endpoint_host(&ctx.parts().headers, &region);
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+
+        // The model puts no bound on the `tags` map, so the store does, as every other
+        // create of this service does: AWS's tagging restrictions allow at most 50 tags on
+        // a resource. The count is taken from what the caller sent, before anything is
+        // stored.
+        let requested_tags = input.tags.clone().unwrap_or_default();
+        if requested_tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(CreateContentErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "tags must have at most {} entries, but {} were given.",
+                        crate::state::MAX_TAGS_PER_RESOURCE,
+                        requested_tags.len()
+                    )),
+                },
+            )
+            .into());
+        }
+        let tags: ::std::collections::BTreeMap<String, String> =
+            requested_tags.into_iter().collect();
+        let metadata: ::std::collections::BTreeMap<String, String> =
+            input.metadata.clone().unwrap_or_default().into_iter().collect();
+
+        // What this create's `clientToken` identifies: every member the record below is
+        // built from, with both maps fingerprinted in key order
+        // (`crate::state::tags_fingerprint`). The `knowledgeBaseId` label is NOT part of
+        // it — it is part of the token's scope instead, so the same token under another
+        // knowledge base is another create rather than a conflict.
+        let fingerprint = crate::state::request_fingerprint(&[
+            input.name.clone(),
+            input.title.clone().unwrap_or_default(),
+            input.override_link_out_uri.clone().unwrap_or_default(),
+            input.upload_id.clone(),
+            crate::state::tags_fingerprint(&metadata),
+            crate::state::tags_fingerprint(&tags),
+        ]);
+
+        // The content lives INSIDE a knowledge base this account holds, in either label
+        // form the model's `UuidOrArn` admits. A label that names none is the modelled
+        // not-found.
+        let Some(knowledge_base) = state.knowledge_base(&input.knowledge_base_id) else {
+            return Err(CreateContentErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::MESSAGE_KNOWLEDGE_BASE_NOT_FOUND.to_string()),
+                    resource_name: Some(input.knowledge_base_id.clone()),
+                },
+            )
+            .into());
+        };
+        let knowledge_base_id = knowledge_base.knowledge_base_id.clone();
+        let knowledge_base_arn = knowledge_base.knowledge_base_arn.clone();
+
+        // A retried create carrying the same `clientToken` answers with the content it
+        // already created under THIS knowledge base, rather than finalizing a second one
+        // — while the same token carrying a DIFFERENT request is the modelled idempotency
+        // conflict rather than a record the caller did not ask for.
+        match state.replayed_create(
+            Self::NAME,
+            &knowledge_base_id,
+            input.client_token.as_deref(),
+            &fingerprint,
+        ) {
+            crate::state::Replay::Conflict => {
+                return Err(CreateContentErrorModeled::ConflictException(ConflictException {
+                    message: Some(crate::state::MESSAGE_IDEMPOTENCY_CONFLICT.to_string()),
+                })
+                .into())
+            }
+            crate::state::Replay::Retry(created) => {
+                if let Some(content) = state
+                    .content(&knowledge_base_id, &created)
+                    .map(|content| content.to_data(now))
+                {
+                    return Ok(CreateContentOutput {
+                        content: Some(content),
+                    });
+                }
+                // The token names a content this knowledge base no longer holds, so there
+                // is nothing to replay: the create runs as a fresh one, and the receipt it
+                // carries is judged below exactly as any other create's is.
+            }
+            crate::state::Replay::Fresh => {}
+        }
+
+        // The model's own words for `name`: "Each piece of content in a knowledge base
+        // must have a unique name", so a create under a name this knowledge base already
+        // holds is the modelled conflict (409) rather than a second record.
+        if state
+            .contents_of(&knowledge_base_id)
+            .iter()
+            .any(|content| content.name == input.name)
+        {
+            return Err(CreateContentErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "A content with the name {} already exists in this knowledge base.",
+                    input.name
+                )),
+            })
+            .into());
+        }
+
+        // The `uploadId` is a receipt THIS service issued (`StartContentUpload`), and it
+        // names an upload of the knowledge base this content is being created in. An id no
+        // upload of it holds — one never issued, one a previous create already consumed,
+        // or one whose URL expired and was reclaimed — points at no asset, so the create
+        // is refused with the modelled input failure instead of storing a content with
+        // nothing behind it.
+        let upload = state
+            .content_upload(&input.upload_id)
+            .filter(|upload| upload.knowledge_base_id == knowledge_base_id)
+            .filter(|upload| !upload.has_expired(now))
+            .cloned();
+        let Some(upload) = upload else {
+            return Err(CreateContentErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::MESSAGE_INVALID_UPLOAD_ID.to_string()),
+                },
+            )
+            .into());
+        };
+
+        let Some(content_id) = state.mint_content_id() else {
+            return Err(CreateContentErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        "could not mint a unique contentId; retry the request".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let stored = state.insert_content(crate::state::Content {
+            content_arn: crate::state::content_arn(&region, &knowledge_base_id, &content_id),
+            content_id: content_id.clone(),
+            knowledge_base_id: knowledge_base_id.clone(),
+            knowledge_base_arn,
+            name: input.name.clone(),
+            // The model's own words for `title`: "If not set, the title is equal to the
+            // name".
+            title: input.title.clone().unwrap_or_else(|| input.name.clone()),
+            revision_id: crate::state::new_resource_id(),
+            // The media type is the one the upload was STARTED for, so the content reports
+            // the type of the asset it actually holds rather than one the create claims.
+            content_type: upload.content_type.clone(),
+            metadata,
+            tags,
+            // `overrideLinkOutUri` is the URI the article is reached at, overriding the
+            // knowledge base's `templateUri` for this content when the create names one.
+            link_out_uri: input.override_link_out_uri.clone(),
+            url: crate::state::content_asset_url(&host, &knowledge_base_id, &content_id),
+            url_expiry: now
+                + ::std::time::Duration::from_secs(
+                    crate::state::DEFAULT_PRESIGNED_URL_TIME_TO_LIVE_MINUTES * 60,
+                ),
+            // The asset the upload plane received. An upload nothing was written to holds
+            // no bytes, which is an empty asset rather than a refusal: what the caller PUT
+            // is what the content holds.
+            body: upload.body.clone().unwrap_or_default(),
+            created_at: now,
+            // The create answers `CREATE_IN_PROGRESS`, so the move to `ACTIVE` is a
+            // transition the CLOCK owes: the instant it falls due is stored and nothing
+            // sleeps for it.
+            active_at: now + crate::state::CONTENT_ACTIVATION_DELAY,
+        });
+        if !stored {
+            // The knowledge base holds as many contents as this emulator keeps, or the
+            // store holds as many asset bytes (`state::MAX_CONTENTS_PER_KNOWLEDGE_BASE`,
+            // `state::MAX_STORED_CONTENT_BYTES`); the service models this refusal.
+            return Err(CreateContentErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(crate::state::message_content_store_full()),
+                },
+            )
+            .into());
+        }
+        // The receipt is SPENT: the asset it named now belongs to this content, so the
+        // same `uploadId` cannot be finalized into a second content.
+        state.content_uploads.remove(&input.upload_id);
+        state.remember_client_token(
+            Self::NAME,
+            &knowledge_base_id,
+            input.client_token.as_deref(),
+            &fingerprint,
+            &content_id,
+        );
+
+        // Answer from what was just persisted, so this response and a later `GetContent`
+        // cannot disagree.
+        let content = state
+            .content(&knowledge_base_id, &content_id)
+            .map(|content| content.to_data(now));
+        Ok(CreateContentOutput { content })
     }
 }
