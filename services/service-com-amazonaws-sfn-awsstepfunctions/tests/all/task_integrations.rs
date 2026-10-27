@@ -66,12 +66,15 @@ const PAST_THE_TABLE_TRANSITION: Duration = STATUS_TRANSITION.saturating_add(Dur
 
 /// Step Functions and DynamoDB over ONE engine, so the call a task makes is served
 /// by the same store the test reads back through DynamoDB's own API.
-struct Chain {
+///
+/// `pub(crate)`, not private: a sibling suite that needs a task whose integration
+/// really answers drives this one rather than standing up a second copy of it.
+pub(crate) struct Chain {
     router: MultiServiceRouter,
 }
 
 impl Chain {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -125,7 +128,7 @@ impl Chain {
     }
 
     /// Call one Step Functions operation, requiring a 200.
-    async fn sfn(&self, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn sfn(&self, operation: &str, body: &Value) -> Value {
         let (status, parsed) = self.call(&SFN, operation, body).await;
         assert_eq!(
             status, 200,
@@ -146,7 +149,7 @@ impl Chain {
 
     /// Create a table keyed by a single string partition key `pk`, and wait for it
     /// to serve items.
-    async fn create_table(&self, name: &str) {
+    pub(crate) async fn create_table(&self, name: &str) {
         self.ddb(
             "CreateTable",
             &json!({
@@ -173,7 +176,7 @@ impl Chain {
 
     /// Create a state machine and start one execution of it, and report what the
     /// execution ended as once the clock has made the outcome due.
-    async fn run(&self, name: &str, definition: &Value, input: &Value) -> Value {
+    pub(crate) async fn run(&self, name: &str, definition: &Value, input: &Value) -> Value {
         self.run_after(name, definition, input, Duration::ZERO).await
     }
 
