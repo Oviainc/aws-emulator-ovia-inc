@@ -217,6 +217,66 @@ pub fn upsert_tags(held: &mut Vec<Tag>, tags: Vec<Tag>) {
     }
 }
 
+/// The tag-key prefix AWS reserves for its own tags: a caller may not create, change or
+/// remove a tag whose key claims it, and a tagging API refuses such a request with its
+/// parameter-fault error.
+///
+/// Source: AWS General Reference, "Tag naming limits and requirements" — the `aws:`
+/// prefix is reserved for AWS use, and tag keys and values carrying it can be neither
+/// created nor edited nor deleted through a tagging API.
+///
+/// The model cannot express the rule — `TagKey`'s pattern admits a colon anywhere — so
+/// the boundary validator passes such a key through and every door a caller names a tag
+/// key of its OWN through is held to it here: `CreateRule$Tags`, `TagResource$Tags` and
+/// `UntagResource$TagKeys`. A rule's resource selection (`ResourceTags`,
+/// `ExcludeResourceTags`) is NOT held to it: those members select the resources a rule
+/// retains by tags those resources already carry, which creates, changes and deletes
+/// nothing.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether `key` claims the reserved namespace.
+///
+/// Compared case-INSENSITIVELY: what AWS reserves is the namespace, not one spelling of
+/// it, so a key may not claim it in any casing. The comparison is over BYTES, so a key
+/// whose leading characters are multi-byte answers `false` rather than slicing a string
+/// inside a character — correct, since a key whose leading bytes are not the prefix does
+/// not claim the namespace.
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    key.as_bytes()
+        .get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX.as_bytes()))
+}
+
+/// Whether any of `keys` claims the reserved namespace — what the tag-writing operations
+/// check before they write anything, so a refused call leaves the rule's tags untouched
+/// however many well-formed keys travelled beside the reserved one.
+pub fn names_reserved_tag_key<'a>(keys: impl IntoIterator<Item = &'a str>) -> bool {
+    keys.into_iter().any(is_reserved_tag_key)
+}
+
+/// The member path a refused `Tags` is named by.
+pub const TAGS_MEMBER: &str = "tags";
+
+/// The member path a refused `TagKeys` is named by.
+pub const TAG_KEYS_MEMBER: &str = "tagKeys";
+
+/// The modelled 400 for a request naming a tag key in the reserved namespace, in the
+/// envelope every member-level refusal of this service takes.
+///
+/// `member` is the member that carried the key — the tag list a write assigns, or the key
+/// list a removal names. The offending key is NOT echoed back, as no other validation
+/// clause of this service echoes the value it refused; the clause states the prefix a tag
+/// key may not claim, which is the fact the caller can act on.
+pub fn reserved_tag_key_not_allowed(member: &str) -> ValidationException {
+    member_validation_failed(
+        member,
+        &format!(
+            "Member must not contain a tag key beginning with {RESERVED_TAG_KEY_PREFIX}, \
+             which is reserved for AWS use"
+        ),
+    )
+}
+
 /// The two states `RuleStatus` models, kept here so every status-aware operation
 /// names one spelling. "The state of the retention rule. Only retention rules that
 /// are in the `available` state retain resources."
