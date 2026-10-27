@@ -186,12 +186,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // nothing in the model or in AWS's documentation normalises it, so the template a
         // later Get/Update/Delete addresses is the one whose name matches byte for byte.
         // A nameless resource is the one thing that cannot be stored, and that is the
-        // modelled bad request.
+        // modelled bad request — the same test every named resource in this service takes,
+        // in `crate::state::carries_no_characters`.
         let name = input.name.clone();
-        if name.is_empty() {
+        if crate::state::carries_no_characters(&name) {
             return Err(CreateJobTemplateErrorModeled::BadRequestException(
                 BadRequestException {
-                    message: Some("Name must not be empty.".to_string()),
+                    message: Some(crate::state::blank_member_message("Name")),
                 },
             )
             .into());
@@ -204,16 +205,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // than a template pointing at nothing, and an EMPTY one is the modelled 400
         // rather than a value quietly dropped. An absent queue stays absent: the default
         // is applied by `CreateJob`, so nothing is invented here.
-        let queue = match input.queue.as_deref().map(str::trim) {
-            Some("") => {
+        let queue = match input.queue.as_deref() {
+            Some(reference) if crate::state::carries_no_characters(reference) => {
                 return Err(CreateJobTemplateErrorModeled::BadRequestException(
                     BadRequestException {
-                        message: Some("Queue must not be empty.".to_string()),
+                        message: Some(crate::state::blank_member_message("Queue")),
                     },
                 )
                 .into())
             }
-            Some(reference) => Some(crate::state::queue_name_from_reference(reference).to_string()),
+            Some(reference) => {
+                Some(crate::state::queue_name_from_reference(reference.trim()).to_string())
+            }
             None => None,
         };
 
