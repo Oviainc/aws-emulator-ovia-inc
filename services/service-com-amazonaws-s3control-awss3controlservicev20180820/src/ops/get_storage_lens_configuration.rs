@@ -145,7 +145,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let key = (input.account_id, input.config_id);
         let store = state.lock();
         let Some(record) = store.storage_lens_configurations.get(&key) else {
-            return Err(crate::state::no_such_storage_lens_configuration(&key.1));
+            return Err(crate::state::no_such_storage_lens_configuration());
         };
 
         Ok(GetStorageLensConfigurationOutput {

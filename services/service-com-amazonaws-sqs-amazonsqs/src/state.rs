@@ -615,26 +615,34 @@ pub const LIST_DEAD_LETTER_SOURCE_QUEUES_MAX_RESULTS_RANGE: (i32, i32) =
 pub const LIST_DEAD_LETTER_SOURCE_QUEUES_DEFAULT_RESULTS: usize =
     LIST_DEAD_LETTER_SOURCE_QUEUES_MAX_RESULTS_RANGE.1 as usize;
 
+/// How every paged listing of this service refuses a pagination token it did not issue,
+/// or one that no longer continues anything.
+///
+/// Amazon SQS states this refusal as WHOLLY FIXED text: it names neither the parameter
+/// that carried the token nor the token itself, so a client (or an SDK paginator) that
+/// recognises the sentence to restart a listing from its first page matches it exactly,
+/// and nothing a caller supplied comes back in the message. It is therefore a constant
+/// rather than one of the `Value … for parameter …` templates below, which exist for the
+/// refusals that DO report the value they rejected.
+pub const INVALID_NEXT_TOKEN_MESSAGE: &str = "Invalid or expired next token.";
+
 /// Where in a listing the `NextToken` a request carried continues it, or the text of the
 /// refusal a token this listing never issued is answered with.
 ///
 /// Every paged listing of this service carries its cursor the same way: the COUNT of
 /// entries already handed over. `total` is how many entries the listing holds now, and a
 /// token that is not such a count — unparseable, or past the end of the listing it claims
-/// to continue — is refused rather than silently treated as "start again", which would
-/// loop a paging client forever. A request carrying no token starts at the beginning.
+/// to continue — is refused with [`INVALID_NEXT_TOKEN_MESSAGE`] rather than silently
+/// treated as "start again", which would loop a paging client forever. A request carrying
+/// no token starts at the beginning.
 ///
 /// One place for the rule and its wording, so two listings cannot drift on either.
-pub fn count_cursor(parameter: &str, token: Option<&str>, total: usize) -> Result<usize, String> {
+pub fn count_cursor(token: Option<&str>, total: usize) -> Result<usize, String> {
     match token {
         None => Ok(0),
         Some(token) => match token.parse() {
             Ok(start) if start <= total => Ok(start),
-            _ => Err(invalid_parameter_message(
-                token,
-                parameter,
-                "it was not issued by this listing.",
-            )),
+            _ => Err(INVALID_NEXT_TOKEN_MESSAGE.to_string()),
         },
     }
 }

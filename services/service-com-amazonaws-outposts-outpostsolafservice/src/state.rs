@@ -409,11 +409,15 @@ pub struct OutpostRecord {
     /// Outpost's own record: the create writes it here, the read answers it from
     /// here, and deleting the Outpost takes it with the Outpost.
     pub private_connectivity: Option<PrivateConnectivityConfig>,
-    /// When this Outpost's `PENDING` -> `ACTIVE` transition falls due, or `None`
-    /// once it has been materialised and the status is terminal. Stored as an
-    /// instant so nothing ever sleeps for it: the transition is applied by the
-    /// first call made at or after it, which reports exactly the status the
-    /// Outpost would hold had nobody called at all.
+    /// When the install this Outpost is owed falls due — its `PENDING` -> `ACTIVE`
+    /// transition for the one `CreateOutpost` starts — or `None` while it is owed
+    /// none. Stored as an instant so nothing ever sleeps for it: the transition is
+    /// applied by the first call made at or after it, which reports exactly the
+    /// status the Outpost would hold had nobody called at all.
+    ///
+    /// An install is what puts the hardware of the Outpost's configuration on it
+    /// ([`Self::set_supported_hardware_type`]), so one is owed again whenever the
+    /// form factor that names that configuration changes.
     pub active_at: Option<std::time::Instant>,
     /// When `StartOutpostDecommission` started the decommission of this Outpost,
     /// or `None` for an Outpost nobody has asked to decommission.
@@ -442,7 +446,10 @@ pub struct OutpostRecord {
     /// provisioning ([`ComAmazonawsOutpostsOutpostsolafserviceState::settle_outposts`],
     /// [`installed_hardware`]) — the transition it reaches a settled lifecycle status
     /// by. An Outpost whose form factor names no configuration this service holds is
-    /// installed with nothing and reported as holding no asset.
+    /// installed with nothing and reported as holding no asset. What is installed here
+    /// is always the configuration the Outpost's CURRENT form factor names: a form
+    /// factor recorded on it later names different hardware, which is installed in its
+    /// turn ([`OutpostRecord::set_supported_hardware_type`]).
     pub assets: Vec<AssetInfo>,
     /// The Amazon EC2 instances RUNNING on this Outpost — what
     /// `ListBlockingInstancesForCapacityTask` weighs a capacity task against, and what
@@ -477,6 +484,35 @@ pub struct OutpostRecord {
     /// `CreateOutpost` leaves this empty, and `CreateRenewal` is the call that
     /// records a contract here.
     pub renewals: Vec<RenewalRecord>,
+}
+
+impl OutpostRecord {
+    /// Record `form_factor` as this Outpost's hardware type, and with it the install
+    /// of the hardware that form factor names.
+    ///
+    /// `SupportedHardwareType` is not a label on an Outpost: it is the one input that
+    /// selects WHICH configuration Amazon Web Services installs on it
+    /// ([`installed_hardware`]), so the form factor an Outpost reports and the
+    /// hardware it holds are recorded together and never apart. Naming the form
+    /// factor the Outpost already carries names the configuration it already holds,
+    /// so nothing is installed again; naming another one means the hardware on the
+    /// Outpost is no longer the hardware it names, so that hardware comes out and the
+    /// newly named configuration is installed in its turn — due
+    /// [`OUTPOST_PROVISIONING`] from now, the span installing an Outpost's hardware
+    /// takes, and materialised by
+    /// [`ComAmazonawsOutpostsOutpostsolafserviceState::settle_outposts`] exactly as
+    /// the install `CreateOutpost` owes is. Until that instant the Outpost holds no
+    /// asset, which is what an Outpost whose hardware is being installed holds. Its
+    /// `LifeCycleStatus` is left where it stands: this installs hardware, and
+    /// [`LIFE_CYCLE_STATUS_ACTIVE`] is terminal.
+    pub fn set_supported_hardware_type(&mut self, form_factor: String) {
+        if self.outpost.supported_hardware_type.as_deref() == Some(form_factor.as_str()) {
+            return;
+        }
+        self.outpost.supported_hardware_type = Some(form_factor);
+        self.assets.clear();
+        self.active_at = Some(std::time::Instant::now() + OUTPOST_PROVISIONING);
+    }
 }
 
 /// A renewal contract recorded against an Outpost: the client token the request
@@ -3487,8 +3523,12 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
     /// Provisioning an Outpost is Amazon Web Services installing its hardware, so the
     /// transition that ends it is also when that hardware arrives: the Outpost's
     /// configuration is installed on it ([`installed_hardware`]) as it settles, and an
-    /// Outpost that already holds hardware keeps exactly the hardware it holds —
-    /// hardware is installed once.
+    /// Outpost that already holds hardware keeps exactly the hardware it holds — one
+    /// configuration is installed once. The configuration read here is the one the
+    /// Outpost's form factor names at this instant, so an install the Outpost was owed
+    /// by a later form factor ([`OutpostRecord::set_supported_hardware_type`]) places
+    /// that form factor's hardware, exactly as the create's install places the form
+    /// factor the create recorded.
     pub fn settle_outposts(&mut self) {
         let now = std::time::Instant::now();
         // What the clock owes each Outpost whose provisioning has come due: the hardware

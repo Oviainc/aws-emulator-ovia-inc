@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTableVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTableVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTableVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reads the version history of ONE table: every version the catalog holds of it — the
+//! live definition, which is the version the table's `VersionId` names, and every earlier
+//! definition an update archived — each as the `TableVersion` the single-version read
+//! (`crate::ops::get_table_version`) serves for it, so a table that has never been updated
+//! lists exactly one version and that version is the live table. The listing walks the
+//! table's counters in the order they were minted and pages over them with `MaxResults`
+//! and `NextToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -83,9 +82,35 @@
 //! * `InternalServiceException` (HTTP 500) — An internal service error occurred.
 //! * `InvalidInputException` (HTTP 400) — The input provided was not valid.
 //! * `OperationTimeoutException` (HTTP 400) — The operation timed out.
+//! * `AccessDeniedException` (HTTP 400) — widened in through `extra_errors` (see below):
+//!   "Access to a resource was denied." A `CatalogId` naming another account's Data
+//!   Catalog is reachable only through that catalog's resource-based policy, so a caller
+//!   with no grant on it is refused here before any entity is looked up.
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The largest page this operation serves, and the page size it uses when the request
+/// names no `MaxResults`. Source: the model's `MaxResults` target `CatalogGetterPageSize`,
+/// whose range is 1..100.
+const MAX_PAGE_SIZE: i32 = 100;
+
+/// How many digits a version counter is padded to in a continuation token, so the token
+/// orders as a string the way the counter it names orders as a number. Twenty digits hold
+/// any counter this crate can mint.
+const CURSOR_COUNTER_DIGITS: usize = 20;
+
+/// One version's place in this listing, as the continuation token renders it: the version
+/// counter, zero-padded so the token compares as a string exactly as the counter compares
+/// as a number.
+///
+/// Comparing a token against this key is what resumes a page — the same cursor convention
+/// this crate's other listings use (`crate::state::history_page_cursor`) — so any string a
+/// request sends names a well-defined place in the order, and a page stays correct across
+/// versions archived between two calls.
+fn page_cursor(counter: u64) -> String {
+    format!("{counter:0CURSOR_COUNTER_DIGITS$}")
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -98,9 +123,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-glue-awsglue.json");
 // here — hence the `GetTableVersionsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.glue#GetTableVersions")]
+//
+// `AccessDeniedException` — "Access to a resource was denied." — is widened in through
+// `extra_errors`: this SERVICE models the shape, but this operation's own `errors` list
+// omits it, and a cross-account read of a Data Catalog the caller holds no grant on is
+// refused as unauthorized rather than as a missing entity, exactly as the single-version
+// read refuses it (`crate::ops::get_table_version`).
+#[smithy_macros::operation_error(
+    "com.amazonaws.glue#GetTableVersions",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum GetTableVersionsErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     EntityNotFoundException(EntityNotFoundException),
     GlueEncryptionException(GlueEncryptionException),
     InternalServiceException(InternalServiceException),
@@ -159,18 +194,129 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTableVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTableVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTableVersions"))
+        // `AuditContext` is "a structure containing the Lake Formation audit context":
+        // metadata about the caller's request for Lake Formation's audit log, not a
+        // selector over what is read — it names no version and filters no part of the
+        // definitions returned — so it does not change this answer.
+        let _ = &input.audit_context;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetTableVersionsErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue Data Catalog store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        let region = crate::state::request_region(ctx.parts());
+        // Whether the caller may read this catalog at all is decided BEFORE the entity
+        // lookup: a `CatalogId` of another account is reachable only through that
+        // catalog's own resource policy (see `crate::state::foreign_catalog_refusal`).
+        if let Some(message) =
+            crate::state::foreign_catalog_refusal(&catalog_id, &region, Self::NAME)
+        {
+            return Err(GetTableVersionsErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // Absent `MaxResults`, page at the largest value the model accepts for it
+        // (`CatalogGetterPageSize`, range 1..100). The clamp re-states that range in the
+        // handler so the page size is never 0 even if the boundary validator ever stops
+        // enforcing it.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(MAX_PAGE_SIZE as usize)
+            .clamp(1, MAX_PAGE_SIZE as usize);
+
+        // The page is built under the store's guard and the guard released before KMS is
+        // asked anything: the key material of the versions on the page travels out with it.
+        let (table_versions, next_token, encryptions) = {
+            let store = state.lock();
+            let Some(database) = store.database(&catalog_id, &input.database_name) else {
+                return Err(GetTableVersionsErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(crate::state::messages::database_not_found(
+                            &input.database_name,
+                        )),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            };
+            let Some(entry) = database
+                .tables
+                .get(&crate::state::fold_name(&input.table_name))
+            else {
+                return Err(GetTableVersionsErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(crate::state::messages::TABLE_ENTITY_NOT_FOUND.to_string()),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            };
+
+            // Every version of the table, in the order its counters were minted.
+            let counters = entry.version_counters();
+            // The token is the cursor of the last version of the previous page, so the
+            // page resumes at the first version strictly after it.
+            let start = match input.next_token.as_deref() {
+                Some(cursor) => {
+                    counters.partition_point(|counter| page_cursor(*counter).as_str() <= cursor)
+                }
+                None => 0,
+            };
+            let end = start.saturating_add(page_size).min(counters.len());
+
+            let page = &counters[start..end];
+            // Each element is the SAME projection the single-version read serves for that
+            // version (`crate::ops::get_table_version`), so a client that works from this
+            // listing is never less informed than one that re-reads each version. Every
+            // counter here is one this table holds, so each one projects.
+            let table_versions: Vec<TableVersion> = page
+                .iter()
+                .filter_map(|counter| entry.table_version(Some(*counter), &database.database_id))
+                .collect();
+            // The key material of every version ON THE PAGE: this read answers each of
+            // them, so each has to be decrypted before any is served.
+            let encryptions: Vec<crate::state::catalog_encryption::ObjectEncryption> = page
+                .iter()
+                .filter_map(|counter| entry.version_encryption(Some(*counter)))
+                .collect();
+            // The token names the last version of the page, taken from the page itself so
+            // there is no index arithmetic to underflow on an empty page.
+            let next_token = if end < counters.len() {
+                page.last().copied().map(page_cursor)
+            } else {
+                None
+            };
+            (table_versions, next_token, encryptions)
+        };
+
+        // A version written while its catalog encrypted catalog writes under a KMS key is
+        // listed only while that key is usable, exactly as the single-version read serves
+        // it (`crate::ops::get_table_version`): the page is answered once KMS has opened
+        // the data key of every version on it, and KMS's own refusal about the key is
+        // relayed as this operation's `GlueEncryptionException`.
+        if let Err(message) =
+            crate::state::catalog_encryption::unseal_all(ctx, &region, &encryptions).await
+        {
+            return Err(GetTableVersionsErrorModeled::GlueEncryptionException(
+                GlueEncryptionException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        Ok(GetTableVersionsOutput {
+            table_versions: Some(table_versions),
+            next_token,
+        })
     }
 }

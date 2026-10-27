@@ -563,8 +563,13 @@ fn resolve_table(
             return Err(missing_table_configurations(spec.name).into());
         }
     }
-    let properties =
-        spec.effective_properties(requested.and_then(|configured| configured.get(table)))?;
+    // The refusals a property map earns name the member the SUBMITTED definition carried
+    // it at, which on this path is `Export.DataQuery.TableConfigurations` and not the
+    // member `GetTable` reads one at.
+    let properties = spec.effective_properties(
+        requested.and_then(|configured| configured.get(table)),
+        TABLE_CONFIGURATIONS_FIELD,
+    )?;
     Ok((spec, properties))
 }
 

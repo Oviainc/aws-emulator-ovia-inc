@@ -1586,8 +1586,11 @@ async fn the_store_charges_the_caller_chosen_bytes_each_authorised_rule_retains(
         let before = engine.state::<Ec2State>().lock().stored_bytes();
 
         // Every stored record costs the fixed per-record overhead this store charges, plus
-        // the caller-chosen strings the rule retains.
+        // the caller-chosen strings the rule retains — its protocol among them, which every
+        // rule of the permission keeps a copy of.
+        let protocol = "tcp";
         let expected = ec2::state::STORED_RECORD_OVERHEAD_BYTES
+            + protocol.len()
             + destination.stored.len()
             + destination.description.as_deref().map_or(0, str::len)
             + tags
@@ -1596,7 +1599,7 @@ async fn the_store_charges_the_caller_chosen_bytes_each_authorised_rule_retains(
                 .sum::<usize>();
 
         let permissions = vec![Permission::new(
-            "tcp",
+            protocol,
             Some((443, 443)),
             vec![destination.clone()],
         )];

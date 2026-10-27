@@ -31,9 +31,36 @@ sha2 = { workspace = true }
 # by the crate rather than by a calendar of this service's own. 0.4.31 is where
 # `DateTime::from_timestamp` landed, which is the entry point used here.
 chrono = { version = "0.4.31", default-features = false, features = ["std"] }
+# `service-common` carries the two readings an order's resource members are resolved
+# through: the workspace's ONE caller-supplied-ARN parse (`arn`) and the ONE reading of
+# which IAM role of this account a role ARN names (`iam_role`).
+service-common = { path = "../common" }
+# The clients an order's resources are resolved through, each driven over this emulator's
+# OWN in-process callback transport (no network client feature is enabled): the Amazon S3
+# buckets, the Key Management Service key, the Amazon EC2 images, the Lambda functions and
+# the Amazon SNS topics a Snow order names are resolved by asking the service that holds
+# each of them. The IAM client an order's `RoleARN` is resolved through is the shared one in
+# `service-common`, so no `aws-sdk-iam` is declared here.
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+aws-sdk-ec2 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+aws-sdk-lambda = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+aws-sdk-sns = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
+
+[dev-dependencies]
+# The order-resource suite mounts each service that holds a resource a Snow order names
+# beside Snowball on one engine, because the order operations resolve those resources by
+# calling the service that holds them in process, and the suite creates each resource
+# through that service's own API before naming it in an order.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+service-com-amazonaws-kms-trentservice = { workspace = true }
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
+service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
+service-com-amazonaws-sns-amazonsimplenotificationservice = { workspace = true }
 
 [lints]
 workspace = true

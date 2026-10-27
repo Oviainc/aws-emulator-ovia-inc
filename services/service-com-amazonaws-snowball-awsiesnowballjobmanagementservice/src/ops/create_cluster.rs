@@ -314,7 +314,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // A cluster order is placed AGAINST resources that already exist, exactly as a job
+        // order is: each resource it names is resolved against the service that holds it
+        // before anything is written, and one that service answers it does not hold is
+        // refused rather than stored (`crate::state::named_resources`). Awaited before this
+        // service's store is locked, so no lock is held across the in-process calls it
+        // makes.
+        if let Some(refusal) = crate::state::named_resources::first_unresolvable(
+            ctx,
+            Self::NAME,
+            crate::state::named_resources::NamedResources {
+                role_arn: input.role_arn.as_deref(),
+                kms_key_arn: input.kms_key_arn.as_deref(),
+                resources: input.resources.as_ref(),
+                notification: input.notification.as_ref(),
+            },
+        )
+        .await
+        {
+            return Err(match refusal {
+                crate::state::named_resources::NamedResourceRefusal::InvalidResource(error) => {
+                    CreateClusterErrorModeled::InvalidResourceException(error)
+                }
+                crate::state::named_resources::NamedResourceRefusal::KmsRequestFailed(error) => {
+                    CreateClusterErrorModeled::KMSRequestFailedException(error)
+                }
+                crate::state::named_resources::NamedResourceRefusal::Ec2RequestFailed(error) => {
+                    CreateClusterErrorModeled::Ec2RequestFailedException(error)
+                }
+            }
+            .into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::validation(
                 crate::state::STATE_UNAVAILABLE,

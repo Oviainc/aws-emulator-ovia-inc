@@ -127,6 +127,21 @@
 //! outbound rule every group carries, the default group's self-referencing inbound rule)
 //! are stored through that same writer, so every rule the store holds has an id.
 //!
+//! A security group can also be made usable in a VPC it was not created in:
+//! [`ComAmazonawsEc2Amazonec2State::security_group_vpc_associations`] holds those
+//! associations, keyed by the (`GroupId`, `VpcId`) pair an association IS, as a
+//! [`SecurityGroupVpcAssociationRecord`] — the one fact the modelled
+//! `SecurityGroupVpcAssociation` shape carries no member for, the instant its `associating`
+//! -> `associated` move falls due, on the same monotonic clock and the same
+//! [`TRANSITION_DELAY`] as every other move this store owes. The two accounts the shape
+//! reports are NOT copied onto the record: they are the owners of the group and of the VPC,
+//! which this store already holds, so
+//! [`ComAmazonawsEc2Amazonec2State::security_group_vpc_association_view`] derives them on
+//! read and `AssociateSecurityGroupVpc` and `DescribeSecurityGroupVpcAssociations` cannot
+//! report one association differently. An association cannot outlive either side of the
+//! pair, so [`ComAmazonawsEc2Amazonec2State::remove_security_group`] and
+//! [`ComAmazonawsEc2Amazonec2State::remove_vpc`] drop the ones they orphan.
+//!
 //! A fact of a VPC that the modelled [`Vpc`] shape carries no member for is stored beside
 //! it under the same id rather than on it:
 //! [`ComAmazonawsEc2Amazonec2State::vpc_attributes`] holds the `VpcAttributeName`
@@ -1391,7 +1406,7 @@ use crate::ops::types::{
     OperatorResponse, PathFilter, PeeringAttachmentStatus, Placement,
     PlacementGroup, PrefixListId, PtrUpdateStatus,
     PrivateDnsDetails, PrivateDnsNameOptionsOnLaunch, ReferencedSecurityGroup,
-    SecurityGroupRule,
+    SecurityGroupRule, SecurityGroupVpcAssociation,
     DnsEntry, PayerResponsibilityEntry, ProductCode,
     Region, ReplaceRootVolumeTask, RequestLaunchTemplateData, RevokedSecurityGroupRule,
     RouteServer, RouteServerBfdStatus,
@@ -2910,6 +2925,16 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// of a group gives back. Ordered by id, which is the order
     /// `DescribeSecurityGroupRules` reports and pages over.
     pub security_group_rules: BTreeMap<String, SecurityGroupRuleRecord>,
+    /// Every association between one of the account's security groups and a VPC it was not
+    /// created in, by the (`GroupId`, `VpcId`) pair the association IS — see
+    /// [`SecurityGroupVpcAssociationRecord`] and the module docs. One entry per pair,
+    /// because a pair is either associated or not; ordered by group and then by VPC, which
+    /// is the order `DescribeSecurityGroupVpcAssociations` reports and pages over.
+    ///
+    /// Starts EMPTY: a group is usable in the VPC it was created in without any association,
+    /// so one exists only because `AssociateSecurityGroupVpc` made it.
+    pub security_group_vpc_associations:
+        BTreeMap<(String, String), SecurityGroupVpcAssociationRecord>,
     /// Every launch template the account holds, by `LaunchTemplateId`, each with its
     /// versions — see the module docs.
     pub launch_templates: BTreeMap<String, LaunchTemplateRecord>,
@@ -3688,6 +3713,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             network_interface_permissions: BTreeMap::new(),
             network_interface_permission_granted_at: BTreeMap::new(),
             security_group_rules: BTreeMap::new(),
+            // A fresh account has associated no security group with a second VPC.
+            security_group_vpc_associations: BTreeMap::new(),
             launch_templates: BTreeMap::new(),
             launch_template_client_tokens: HashMap::new(),
             id_counter: 0,
@@ -5585,8 +5612,13 @@ pub fn security_group_rules_charge(permissions: &[IpPermission], tags: &[Tag]) -
     let tag_bytes = tag_list_bytes(tags);
     let mut charge = 0usize;
     for permission in permissions {
+        // The protocol is a fact of the PERMISSION that every rule it describes keeps a copy
+        // of ([`security_group_rule_grants`] clones it onto each), so it is weighed once here
+        // and counted per rule, the way the tags above are.
+        let protocol_bytes = text(&permission.ip_protocol);
         for range in permission.ip_ranges.iter().flatten() {
             charge = charge.saturating_add(security_group_rule_charge(
+                protocol_bytes,
                 text(&range.cidr_ip),
                 text(&range.description),
                 0,
@@ -5595,6 +5627,7 @@ pub fn security_group_rules_charge(permissions: &[IpPermission], tags: &[Tag]) -
         }
         for range in permission.ipv6_ranges.iter().flatten() {
             charge = charge.saturating_add(security_group_rule_charge(
+                protocol_bytes,
                 text(&range.cidr_ipv6),
                 text(&range.description),
                 0,
@@ -5603,6 +5636,7 @@ pub fn security_group_rules_charge(permissions: &[IpPermission], tags: &[Tag]) -
         }
         for entry in permission.prefix_list_ids.iter().flatten() {
             charge = charge.saturating_add(security_group_rule_charge(
+                protocol_bytes,
                 text(&entry.prefix_list_id),
                 text(&entry.description),
                 0,
@@ -5611,16 +5645,19 @@ pub fn security_group_rules_charge(permissions: &[IpPermission], tags: &[Tag]) -
         }
         for pair in permission.user_id_group_pairs.iter().flatten() {
             charge = charge.saturating_add(security_group_rule_charge(
+                protocol_bytes,
                 0,
                 text(&pair.description),
-                text(&pair.group_name)
-                    .saturating_add(referenced_group_bytes(
-                        &pair.group_id,
-                        &pair.user_id,
-                        &pair.vpc_id,
-                        &pair.vpc_peering_connection_id,
-                        &pair.peering_status,
-                    )),
+                // The name the grant referenced its group by, plus every member of the
+                // reference itself through the one definition of that term, so a member
+                // added to the shape is added to this charge and to the stored one at once.
+                text(&pair.group_name).saturating_add(referenced_group_bytes(
+                    &pair.group_id,
+                    &pair.user_id,
+                    &pair.vpc_id,
+                    &pair.vpc_peering_connection_id,
+                    &pair.peering_status,
+                )),
                 tag_bytes,
             ));
         }
@@ -5656,21 +5693,28 @@ fn referenced_group_bytes(
 }
 
 /// What ONE stored security group rule costs the store: the fixed per-record overhead plus
-/// the caller-chosen bytes it retains, grouped as the destination it names, its description,
-/// the group it references (every member of that reference, counted by
+/// the caller-chosen bytes it retains, grouped as the protocol it carries, the destination it
+/// names, its description, the group it references (every member of that reference, counted by
 /// [`referenced_group_bytes`], plus the name the grant named it by) and its tags.
+///
+/// Every term is a string the REQUEST chooses the length of and the RECORD retains: one left
+/// out is bytes the store holds against no budget, so a member added to the stored rule
+/// belongs in a term here. Taking them as separate parameters is what makes that addition a
+/// compile error at both call sites rather than a silent undercount at one.
 ///
 /// The ONE definition of a rule's charge, shared by [`security_group_rule_payload_bytes`],
 /// which weighs a record that exists, and by [`security_group_rules_charge`], which weighs
 /// the rules a request describes before any of them is built — so a request cannot be
 /// admitted under one arithmetic and charged under another.
 fn security_group_rule_charge(
+    protocol: usize,
     destination: usize,
     description: usize,
     referenced_group: usize,
     tags: usize,
 ) -> usize {
     STORED_RECORD_OVERHEAD_BYTES
+        .saturating_add(protocol)
         .saturating_add(destination)
         .saturating_add(description)
         .saturating_add(referenced_group)
@@ -5679,8 +5723,8 @@ fn security_group_rule_charge(
 
 /// The bytes one stored security group rule holds: the fixed
 /// [`STORED_RECORD_OVERHEAD_BYTES`] every stored record costs, plus every string the record
-/// retains — the grant it names, its description, every member of the group it references
-/// ([`referenced_group_bytes`]) and its tags.
+/// retains — the protocol it carries, the grant it names, its description, every member of
+/// the group it references ([`referenced_group_bytes`]) and its tags.
 ///
 /// The fixed overhead is charged here for the same reason every other store of this module
 /// charges it ([`host_payload_bytes`]'s caller, the launch-template and IPAM-pool inserts):
@@ -5700,6 +5744,7 @@ pub fn security_group_rule_payload_bytes(record: &SecurityGroupRuleRecord) -> us
     let text = |value: &Option<String>| value.as_deref().map_or(0, str::len);
     let referenced = rule.referenced_group_info.as_ref();
     security_group_rule_charge(
+        text(&rule.ip_protocol),
         text(&rule.cidr_ipv4)
             .saturating_add(text(&rule.cidr_ipv6))
             .saturating_add(text(&rule.prefix_list_id)),
@@ -16951,6 +16996,139 @@ pub fn security_group_limit_exceeded<E>() -> Scaffolded<E> {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Security group VPC associations
+// ---------------------------------------------------------------------------
+//
+// "Associates a security group with another VPC in the same Region. This enables you to use
+// the same security group with network interfaces and instances in the specified VPC"
+// (`AssociateSecurityGroupVpc`). The association is therefore the (group, VPC) PAIR and
+// nothing else: it carries no id of its own and no caller-chosen bytes, which is why the
+// store below is keyed by the pair and why an association costs the byte budget nothing.
+
+/// An association that is being established: the `associating` member of
+/// `SecurityGroupVpcAssociationState`
+/// (`smithy_query(query="shape",shape="SecurityGroupVpcAssociationState")`).
+pub const SECURITY_GROUP_VPC_ASSOCIATION_STATE_ASSOCIATING: &str = "associating";
+
+/// An association that is established: that same enum's `associated` member.
+pub const SECURITY_GROUP_VPC_ASSOCIATION_STATE_ASSOCIATED: &str = "associated";
+
+/// The largest number of security group VPC associations this in-memory store holds.
+///
+/// A capacity bound in the same style as [`MAX_SECURITY_GROUPS`], not an AWS quota: each
+/// association is a record in this process's memory and nothing but a delete of one of its
+/// two sides reclaims it, so the number a caller can create has to be finite.
+/// [`ComAmazonawsEc2Amazonec2State::has_security_group_vpc_association_capacity`] is the
+/// predicate a writer asks first; an associate past it is refused with
+/// [`RESOURCE_LIMIT_EXCEEDED`], the code this service answers for a ceiling it publishes no
+/// resource-specific code for.
+pub const MAX_SECURITY_GROUP_VPC_ASSOCIATIONS: usize = 2_500;
+
+/// One stored security group VPC association: the instant the clock owes it its
+/// `associating` -> `associated` move.
+///
+/// The pair is the key of
+/// [`ComAmazonawsEc2Amazonec2State::security_group_vpc_associations`] and is not repeated on
+/// the record. `State` is a fact of the record's age, so [`Self::state_at`] derives it on
+/// read rather than letting two writers store two different words for one association, and
+/// the owning accounts the modelled shape reports are derived from the group and the VPC
+/// themselves ([`ComAmazonawsEc2Amazonec2State::security_group_vpc_association_view`]).
+#[derive(Debug, Clone)]
+pub struct SecurityGroupVpcAssociationRecord {
+    /// The instant from which this association's `associating` -> `associated` move is due.
+    /// Monotonic ([`Instant`]) for the reason every other owed move of this store is: it is
+    /// only ever compared against the clock, never reported, so a wall-clock adjustment
+    /// cannot move an association back to `associating`.
+    pub associated_at: Instant,
+}
+
+impl SecurityGroupVpcAssociationRecord {
+    /// The association's `SecurityGroupVpcAssociationState` at `now`.
+    pub fn state_at(&self, now: Instant) -> &'static str {
+        if now < self.associated_at {
+            SECURITY_GROUP_VPC_ASSOCIATION_STATE_ASSOCIATING
+        } else {
+            SECURITY_GROUP_VPC_ASSOCIATION_STATE_ASSOCIATED
+        }
+    }
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another security group VPC association fits inside the store's record
+    /// ceiling ([`MAX_SECURITY_GROUP_VPC_ASSOCIATIONS`]).
+    pub fn has_security_group_vpc_association_capacity(&self) -> bool {
+        self.security_group_vpc_associations.len() < MAX_SECURITY_GROUP_VPC_ASSOCIATIONS
+    }
+
+    /// The association of `group_id` with `vpc_id` as of `now`, as the modelled shape every
+    /// reader of it reports.
+    ///
+    /// "The Amazon Web Services account ID of the owner of the security group" /
+    /// "\u2026 of the owner of the VPC" (`SecurityGroupVpcAssociation$GroupOwnerId`,
+    /// `$VpcOwnerId`) are facts of the group and of the VPC, so they are read from those
+    /// records rather than copied onto the association: a report of one association can
+    /// never disagree with a report of either side of it. `StateReason` is "the
+    /// association's state reason" (`$StateReason`), which an association that has not
+    /// failed has none of.
+    pub fn security_group_vpc_association_view(
+        &self,
+        group_id: &str,
+        vpc_id: &str,
+        record: &SecurityGroupVpcAssociationRecord,
+        now: Instant,
+    ) -> SecurityGroupVpcAssociation {
+        SecurityGroupVpcAssociation {
+            group_id: Some(group_id.to_string()),
+            vpc_id: Some(vpc_id.to_string()),
+            group_owner_id: self
+                .security_groups
+                .get(group_id)
+                .and_then(|group| group.owner_id.clone()),
+            vpc_owner_id: self.vpcs.get(vpc_id).and_then(|vpc| vpc.owner_id.clone()),
+            state: Some(record.state_at(now).to_string()),
+            state_reason: None,
+        }
+    }
+
+    /// Associate `group_id` with `vpc_id` from `now`, and answer the association as of that
+    /// instant.
+    ///
+    /// The association is written in the non-terminal `associating` state with the clock
+    /// owing it `associated` one [`TRANSITION_DELAY`] later, the same span every other
+    /// clock-owed move of this crate takes, so a caller reading straight after the write
+    /// still sees `associating`.
+    pub fn insert_security_group_vpc_association(
+        &mut self,
+        group_id: &str,
+        vpc_id: &str,
+        now: Instant,
+    ) -> SecurityGroupVpcAssociation {
+        let record = SecurityGroupVpcAssociationRecord {
+            associated_at: now + TRANSITION_DELAY,
+        };
+        let view = self.security_group_vpc_association_view(group_id, vpc_id, &record, now);
+        self.security_group_vpc_associations
+            .insert((group_id.to_string(), vpc_id.to_string()), record);
+        view
+    }
+
+    /// Every security group VPC association the account holds as of `now`, in (`GroupId`,
+    /// `VpcId`) order \u2014 the order the store itself is kept in, which is the order
+    /// `DescribeSecurityGroupVpcAssociations` pages over.
+    pub fn security_group_vpc_associations_at(
+        &self,
+        now: Instant,
+    ) -> Vec<SecurityGroupVpcAssociation> {
+        self.security_group_vpc_associations
+            .iter()
+            .map(|((group_id, vpc_id), record)| {
+                self.security_group_vpc_association_view(group_id, vpc_id, record, now)
+            })
+            .collect()
+    }
+}
+
 /// The id of the security group a request names, whether it named it by `GroupId` or by
 /// `GroupName`.
 ///
@@ -18144,6 +18322,13 @@ impl ComAmazonawsEc2Amazonec2State {
         if !was_default {
             self.release_stored_bytes(security_group_payload_bytes(&group));
         }
+        // An association IS this group being usable in another VPC
+        // (`SecurityGroupVpcAssociation`), so it cannot outlive the group: it goes here
+        // rather than being left behind for `DescribeSecurityGroupVpcAssociations` to
+        // report a group that no longer exists. The record holds no caller-supplied bytes,
+        // so there is nothing to give back to the budget.
+        self.security_group_vpc_associations
+            .retain(|(associated_group, _), _| associated_group != group_id);
         Some(group)
     }
 
@@ -18182,6 +18367,12 @@ impl ComAmazonawsEc2Amazonec2State {
         // exists. The record holds no caller-supplied bytes, so there is nothing to give
         // back to the budget.
         self.route_server_associations
+            .retain(|(_, associated_vpc), _| associated_vpc != vpc_id);
+        // A security group VPC association names THIS VPC as the VPC the group is usable
+        // in, so it cannot outlive it either — on the same terms as the route server
+        // associations above. The associations of the groups removed with the VPC have
+        // already gone with those groups.
+        self.security_group_vpc_associations
             .retain(|(_, associated_vpc), _| associated_vpc != vpc_id);
         Some(vpc)
     }

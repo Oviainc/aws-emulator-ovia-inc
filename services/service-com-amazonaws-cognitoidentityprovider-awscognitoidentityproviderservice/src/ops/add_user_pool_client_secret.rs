@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddUserPoolClientSecret
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddUserPoolClientSecret`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddUserPoolClientSecret::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores one more client secret on an existing app client — the one the request
+//! supplied, or one this emulator generated — and answers with the STORED secret's
+//! descriptor.
 //!
 //! ## Shape of an operation
 //!
@@ -158,20 +152,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddUserPoolClientSecret` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddUserPoolClientSecretErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+
+        // The request names both the pool and the app client of it the secret is
+        // created for, so a `ClientId` that names a client of ANOTHER pool is as
+        // absent as one no create minted.
+        let pool = guard
+            .pool_mut(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+        let client = pool
+            .clients
+            .get_mut(&input.client_id)
+            .ok_or_else(|| client_not_found(&input.client_id))?;
+
+        // "Supports up to 2 active secrets per app client for zero-downtime
+        // credential rotation workflows" (this operation's own doc), so an app
+        // client already holding that many is refused instead of growing: the
+        // caller deletes one of the two before it creates the next.
+        if client.client_secrets_at_limit() {
+            return Err(limit_exceeded(format!(
+                "Client secrets cannot exceed limit of {} secrets.",
+                crate::state::MAX_CLIENT_SECRETS_PER_CLIENT
+            )));
+        }
+
+        // "The client secret value you want to use. If you don't provide this
+        // parameter, Amazon Cognito generates a secure secret for you"
+        // (`ClientSecret`). The modelled constraints on a supplied value are
+        // already refused before this handler runs, and a generated one is minted
+        // the way every other client secret of this emulator is.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddUserPoolClientSecret"))
+        // An app client that holds NO secret yet is served the same way: this is
+        // the operation that gives an app client a secret, and the model declares
+        // no refusal for a client that holds none — the one count-based refusal it
+        // declares is the limit asked above.
+        let supplied = input.client_secret;
+        let generated = supplied.is_none();
+        let value = supplied.unwrap_or_else(crate::state::new_client_secret);
+        let stored = client.add_client_secret(value, now);
+
+        // Rendered from the STORED secret, so the descriptor is what a later read
+        // of the same app client reports. "The ClientSecretValue is only returned
+        // when Amazon Cognito generates the secret. For custom secrets that you
+        // provide, the ClientSecretValue is not included in the response"
+        // (`ClientSecretDescriptor`), so the one call that can tell a caller a
+        // value it does not already hold is the one that generated it.
+        let mut descriptor = stored.to_client_secret_descriptor_type();
+        if generated {
+            descriptor.client_secret_value = Some(stored.value);
+        }
+        Ok(AddUserPoolClientSecretOutput {
+            client_secret_descriptor: Some(descriptor),
+        })
     }
+}
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> AddUserPoolClientSecretError {
+    AddUserPoolClientSecretErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `ResourceNotFoundException` for a `ClientId` the named pool
+/// holds no app client for.
+fn client_not_found(client_id: &str) -> AddUserPoolClientSecretError {
+    AddUserPoolClientSecretErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool client {client_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `LimitExceededException` for an app client that already holds
+/// every secret it may hold at once.
+fn limit_exceeded(message: String) -> AddUserPoolClientSecretError {
+    AddUserPoolClientSecretErrorModeled::LimitExceededException(LimitExceededException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> AddUserPoolClientSecretError {
+    AddUserPoolClientSecretErrorModeled::InternalServerException(InternalServerException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

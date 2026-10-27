@@ -36,12 +36,16 @@ use crate::wire::{
 
 /// The table every history in these suites writes. One name, so a case is identified by
 /// its history and not by a name the rule does not generalise over.
-const TABLE: &str = "events";
+///
+/// `pub(crate)` because the version LISTING suite
+/// ([`crate::table_version_listing`]) reads the same histories back through
+/// `GetTableVersions`, so both suites write their tables through the one harness below.
+pub(crate) const TABLE: &str = "events";
 
 /// Create `database`, create the table the history's FIRST definition submits, then
 /// apply every later definition with `UpdateTable` — so the table ends up with one
 /// version per submitted definition, numbered from the first.
-async fn write_history(router: &MultiServiceRouter, database: &str, history: &[Value]) {
+pub(crate) async fn write_history(router: &MultiServiceRouter, database: &str, history: &[Value]) {
     ok(
         router,
         "CreateDatabase",
@@ -69,7 +73,7 @@ async fn write_history(router: &MultiServiceRouter, database: &str, history: &[V
 
 /// The `TableVersion` body `GetTableVersion` reports for the version `version_id` names,
 /// or for the table's current version when it names none.
-async fn get_table_version(
+pub(crate) async fn get_table_version(
     router: &MultiServiceRouter,
     database: &str,
     version_id: Option<&str>,
@@ -83,7 +87,7 @@ async fn get_table_version(
 }
 
 /// The stored `Table` body `GetTable` reports — the table as it stands now.
-async fn get_table(router: &MultiServiceRouter, database: &str) -> Value {
+pub(crate) async fn get_table(router: &MultiServiceRouter, database: &str) -> Value {
     let answer = ok(
         router,
         "GetTable",
@@ -154,13 +158,13 @@ fn parameters(entries: usize) -> Value {
 
 /// One row: the case name, the database it is written in, and the definitions the table
 /// is written with, oldest first.
-type HistoryCase = (&'static str, &'static str, Vec<Value>);
+pub(crate) type HistoryCase = (&'static str, &'static str, Vec<Value>);
 
 /// The histories the suites below read back. The rows differ along what the rule
 /// generalises over: how many writes the table has had, which member set each write
 /// submits (a map added, a map dropped, a map replaced, a nested structure replaced),
 /// and how many entries a map carries.
-fn histories() -> Vec<HistoryCase> {
+pub(crate) fn histories() -> Vec<HistoryCase> {
     vec![
         (
             "a table that has never been updated",

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateSourceToS3TableIntegration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateSourceToS3TableIntegration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateSourceToS3TableIntegration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: gives ONE data source query access through the S3 Table Integration the
+//! request's `integrationArn` names, stores that association ACTIVE and hands back the
+//! unique identifier it is stored under — the stored one when the pair already has access,
+//! because an association IS that pairing. Refuses an `integrationArn` that is not an ARN,
+//! and an associate past this emulator's association cap. This is the ONLY file to touch
+//! for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +148,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateSourceToS3TableIntegration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateSourceToS3TableIntegrationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries only request metadata: the integration this association is made
+        // against is the one the request's own ARN names, and the identifier handed back is
+        // minted from the store, so nothing here is read from the request's Region.
+        let _ = ctx;
+
+        // "The Amazon Resource Name (ARN) of the S3 Table Integration to associate the data
+        // source with": the member is modelled as an `Arn`, so a value that is not an ARN at
+        // all names no integration and is refused with the validation-error template this
+        // service words an unparsable ARN with, naming the member.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateSourceToS3TableIntegration"))
+        // It is held to nothing further. `PutIntegration`'s `integrationType` admits only
+        // `OPENSEARCH`, so no operation of this service creates an S3 Table Integration:
+        // the integration is a resource of another service, and a well-formed ARN naming
+        // one is all this service can know about it.
+        if let Some(message) =
+            crate::state::unparsable_arn_message("integrationArn", &input.integration_arn)
+        {
+            return Err(AssociateSourceToS3TableIntegrationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            AssociateSourceToS3TableIntegrationError::from(
+                AssociateSourceToS3TableIntegrationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let mut store = state.lock();
+
+        // An association whose data the clock has finished deleting is gone, so the pair it
+        // held is free again: materialised before this write, never moved on by it.
+        let now_ms = crate::state::now_ms();
+        store.materialize_due_s3_table_integration_source_removals(now_ms);
+
+        // An association IS one data source's query access through one integration, so a
+        // request naming a pair that already has it names the association that has it: the
+        // identifier handed back is the stored one, and nothing is written.
+        if let Some(associated) =
+            store.associated_s3_table_integration_source(&input.integration_arn, &input.data_source)
+        {
+            return Ok(AssociateSourceToS3TableIntegrationOutput {
+                identifier: Some(associated.identifier.clone()),
+            });
+        }
+
+        // The store holds only so many associations, whatever a caller does: the cap is
+        // checked BEFORE a record is allocated, so an associate past it retains nothing.
+        if store.s3_table_integration_sources.len()
+            >= crate::state::MAX_S3_TABLE_INTEGRATION_SOURCES
+        {
+            return Err(
+                AssociateSourceToS3TableIntegrationErrorModeled::ThrottlingException(
+                    ThrottlingException {
+                        message: Some(crate::state::s3_table_integration_sources_cap_message()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let seq = store.take_s3_table_integration_source_seq();
+        let identifier = crate::state::mint_s3_table_integration_source_identifier(seq);
+        store.s3_table_integration_sources.insert(
+            identifier.clone(),
+            crate::state::S3TableIntegrationSourceRecord::new(
+                &identifier,
+                &input.integration_arn,
+                &input.data_source,
+                now_ms,
+            ),
+        );
+
+        // "The unique identifier for the association between the data source and S3 Table
+        // Integration" — the one the association is stored under, so the identifier this
+        // call hands back is what a read of the integration's sources reports.
+        Ok(AssociateSourceToS3TableIntegrationOutput {
+            identifier: Some(identifier),
+        })
     }
 }

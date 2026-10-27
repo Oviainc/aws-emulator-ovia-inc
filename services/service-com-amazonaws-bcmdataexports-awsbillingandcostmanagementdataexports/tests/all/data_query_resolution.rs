@@ -70,7 +70,10 @@ struct Row {
 
 /// The `Export` a row submits: a definition that satisfies every modelled constraint,
 /// with the name and the data query substituted.
-fn export_body(name: &str, statement: &str, configurations: Option<Value>) -> Value {
+///
+/// `pub(crate)` so a suite that submits a definition to BOTH operations that accept one
+/// builds it the same way this one does, rather than growing a second copy of it.
+pub(crate) fn export_body(name: &str, statement: &str, configurations: Option<Value>) -> Value {
     let mut export = cases().remove(0).create_request()["Export"].clone();
     let object = export
         .as_object_mut()

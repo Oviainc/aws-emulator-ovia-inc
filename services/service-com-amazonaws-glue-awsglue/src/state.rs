@@ -2975,6 +2975,24 @@ impl TableEntry {
         self.archived_versions.len() < MAX_ARCHIVED_TABLE_VERSIONS_PER_TABLE
     }
 
+    /// The counters of every version of this table the catalog holds, ASCENDING.
+    ///
+    /// A version of a table is either the live definition — the version
+    /// [`Self::version_id`] names — or one the catalog archived
+    /// ([`Self::archived_versions`]), so the two together are the whole history a version
+    /// listing walks, in the order the counters were minted ("Each version is incremented
+    /// by 1", `GetTableVersionRequest$VersionId`). Each counter is readable through
+    /// [`Self::table_version`], so the list is exactly the versions that answer.
+    pub fn version_counters(&self) -> Vec<u64> {
+        let mut counters: Vec<u64> = self.archived_versions.keys().copied().collect();
+        if let Some(current) = parse_version_counter(&self.version_id) {
+            counters.push(current);
+        }
+        counters.sort_unstable();
+        counters.dedup();
+        counters
+    }
+
     /// This table as of one of its versions, as the modelled `TableVersion` shape, or
     /// `None` when the catalog holds no such version of it.
     ///

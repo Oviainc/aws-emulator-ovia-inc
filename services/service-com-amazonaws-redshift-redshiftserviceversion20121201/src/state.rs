@@ -2077,7 +2077,7 @@ pub const EVENT_CATALOG: &[CatalogEvent] = &[
              was created at [time] UTC.",
     },
     CatalogEvent {
-        event_id: "REDSHIFT-EVENT-3101",
+        event_id: EVENT_ID_SNAPSHOT_DELETED,
         source_type: EVENT_SOURCE_TYPE_SNAPSHOT,
         event_categories: &[EVENT_CATEGORY_MONITORING],
         severity: EVENT_SEVERITY_INFO,
@@ -2147,6 +2147,9 @@ pub const EVENT_ID_MASTER_PASSWORD_UPDATED: &str = "REDSHIFT-EVENT-4000";
 
 /// The identifier of the event a cluster snapshot's creation raises.
 pub const EVENT_ID_SNAPSHOT_CREATED: &str = "REDSHIFT-EVENT-3100";
+
+/// The identifier of the event a cluster snapshot's deletion raises.
+pub const EVENT_ID_SNAPSHOT_DELETED: &str = "REDSHIFT-EVENT-3101";
 
 /// The published catalog as `DescribeEventCategories` reports it: one entry per
 /// published source type, in the order the model's `SourceType` enum lists them,

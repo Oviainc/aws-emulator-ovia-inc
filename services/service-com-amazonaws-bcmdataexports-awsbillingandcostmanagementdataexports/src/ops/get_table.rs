@@ -168,8 +168,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // names it and at the catalog default otherwise — so the response says which
         // configuration the reported schema belongs to, including the defaults the
         // request left unsaid.
+        // A refusal from this path names this operation's OWN input member, which is
+        // where the invalid entry was detected: this request carries its property map at
+        // `GetTableRequest$TableProperties`.
         let properties = table
-            .effective_properties(input.table_properties.as_ref())
+            .effective_properties(
+                input.table_properties.as_ref(),
+                crate::state::TABLE_PROPERTIES_FIELD,
+            )
             .map_err(GetTableErrorModeled::ValidationException)?;
         let schema = table.schema(&properties);
 

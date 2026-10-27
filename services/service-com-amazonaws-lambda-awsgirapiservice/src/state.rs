@@ -518,11 +518,40 @@ pub fn provisioned_above_unreserved_message(unreserved: i32) -> String {
 /// reservation, so the two are weighed against each other per function rather than
 /// against the account — a different rule again from
 /// [`provisioned_above_unreserved_message`] and [`unreserved_floor_message`], and the one
-/// signal a caller has for which limit to raise. The sentence is a CONSTANT: it has no
-/// slot, so neither the reservation nor the requested amount is interpolated into it.
+/// signal a caller has for which limit to raise. That one rule is violable from either
+/// side, and each side states what IT asked for: this sentence answers the call that
+/// ALLOCATES provisioned concurrency past the reservation, so it names the provisioned
+/// request and is a CONSTANT with no slot; the call that LOWERS the reservation below
+/// what is already provisioned is answered by [`reserved_below_provisioned_message`]
+/// instead.
 pub const PROVISIONED_ABOVE_RESERVED_MESSAGE: &str =
     "Requested Provisioned Concurrency should not be greater than the \
      reservedConcurrentExecution for function";
+
+/// Lambda's sentence for a reservation lower than the provisioned concurrency the
+/// FUNCTION has already committed across its versions and aliases.
+///
+/// The other side of the rule [`PROVISIONED_ABOVE_RESERVED_MESSAGE`] states: the capacity
+/// a function keeps initialised is drawn from its reservation, so a reservation may not be
+/// set below that total. The remedy differs from the allocating side's — release
+/// provisioned concurrency first, rather than raise the reservation — so the sentence
+/// names what the caller actually asked to do and both values it is weighed against:
+/// `requested` is the reservation the request carries and `provisioned` the function's
+/// total provisioned concurrency read from its record, so a caller can compute the
+/// smallest reservation that would be admitted without reading the function back.
+/// `specified` is how the sentence names the member the request carried the reservation
+/// in.
+#[must_use]
+pub fn reserved_below_provisioned_message(
+    specified: &str,
+    requested: i32,
+    provisioned: i32,
+) -> String {
+    format!(
+        " {specified}  {requested} should not be lower than function's total provisioned \
+         concurrency [{provisioned}]."
+    )
+}
 
 /// The IAM policy language version a resource-based policy document carries.
 /// `2012-10-17` is the current version of the language every AWS policy document is
