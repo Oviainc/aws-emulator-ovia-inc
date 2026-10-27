@@ -150,3 +150,5 @@ mod remediation_runs_its_runbook;
 mod batch_get_resource_config;
 #[path = "all/conformance_pack_compliance_details.rs"]
 mod conformance_pack_compliance_details;
+#[path = "all/recorder_discovers_other_service_resources.rs"]
+mod recorder_discovers_other_service_resources;
