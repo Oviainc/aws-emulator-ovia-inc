@@ -80,6 +80,13 @@
 //! the one derivation, so `DescribePrefixLists` and `DescribeManagedPrefixLists` cannot
 //! disagree about one published list's id.
 //!
+//! An endpoint SERVICE is split the same way, by who offers it:
+//! [`ComAmazonawsEc2Amazonec2State::vpc_endpoint_services`] holds the service configurations
+//! the ACCOUNT created, while the services Amazon Web Services offers in a Region are NOT
+//! stored — no EC2 operation creates or withdraws one — so [`endpoint_services_in_region`]
+//! derives them from the Region. Both are projected into one [`EndpointServiceRecord`], so
+//! `DescribeVpcEndpointServices` reports whichever source a service came from the same way.
+//!
 //! [`ComAmazonawsEc2Amazonec2State::local_gateway_virtual_interface_groups`] holds the
 //! account's local gateway virtual interface groups the same way, keyed by
 //! `LocalGatewayVirtualInterfaceGroupId`, so a pagination token can name the id the next
@@ -1293,7 +1300,8 @@ use crate::ops::types::{
     NetworkInterfacePermissionState, NetworkInterfacePrivateIpAddress,
     OperatorResponse, PeeringAttachmentStatus, Placement,
     PlacementGroup, PrefixListId, PtrUpdateStatus,
-    PrivateDnsNameOptionsOnLaunch, ReferencedSecurityGroup, SecurityGroupRule,
+    PrivateDnsDetails, PrivateDnsNameOptionsOnLaunch, ReferencedSecurityGroup,
+    SecurityGroupRule,
     DnsEntry, PayerResponsibilityEntry, ProductCode,
     Region, ReplaceRootVolumeTask, RequestLaunchTemplateData, RevokedSecurityGroupRule,
     RouteServer, RouteServerBfdStatus,
@@ -1302,6 +1310,8 @@ use crate::ops::types::{
     RunInstancesOutput, SecondaryNetwork,
     SecondaryNetworkIpv4CidrBlockAssociation, SecondarySubnet,
     SecondarySubnetIpv4CidrBlockAssociation, SecurityGroup, ServiceConfiguration,
+    ServiceDetail, ServiceTypeDetail,
+
     SnapshotTaskDetail, SpotDatafeedSubscription, SpotPlacementScore, StateReason,
     Subnet, SubnetAssociation, SubnetCidrBlockState, SubnetCidrReservation,
     SubnetIpv6CidrBlockAssociation, Subscription, Tag,
@@ -23194,7 +23204,7 @@ pub fn service_prefix_lists_in_region(region: &str) -> Vec<ServicePrefixList> {
 ///
 /// AWS mints an opaque id of the form `pl-` followed by hexadecimal digits for every prefix
 /// list and keeps it for the life of the list, so the id here is DERIVED from the list's name
-/// — a pure function of it through [`stable_prefix_list_hash`] — which gives the same two
+/// — a pure function of it through [`stable_derived_id_hash`] — which gives the same two
 /// properties without storing anything: every read of one Region's prefix list reports the
 /// same id, and two lists with different names get different ids. It carries 8 digits where
 /// [`ComAmazonawsEc2Amazonec2State::next_id`] mints 17, so a derived id can never collide with
@@ -23202,7 +23212,7 @@ pub fn service_prefix_lists_in_region(region: &str) -> Vec<ServicePrefixList> {
 fn service_prefix_list_id(prefix_list_name: &str) -> String {
     format!(
         "{PREFIX_LIST_ID_PREFIX}-{:08x}",
-        stable_prefix_list_hash(prefix_list_name) & 0xffff_ffff
+        stable_derived_id_hash(prefix_list_name) & 0xffff_ffff
     )
 }
 
@@ -23238,17 +23248,17 @@ fn service_prefix_list_cidrs(service_index: u32) -> Vec<String> {
     )]
 }
 
-/// A deterministic digest of `value`, for deriving a service prefix list's id from its name
-/// rather than storing it.
+/// A deterministic digest of `value`, for deriving the id of a resource this emulator does not
+/// store — a published prefix list, an endpoint service of a Region — from its name.
 ///
 /// The standard library's hasher, seeded by its own default rather than randomly, so a digest
 /// is a pure function of its input: every read of one name answers the same value, which is
 /// what makes the derived id stable across calls. `DefaultHasher`'s output is not guaranteed
-/// stable ACROSS Rust versions, so a derived `pl-` id is stable within one build of the
+/// stable ACROSS Rust versions, so a derived id is stable within one build of the
 /// emulator, not across toolchains — which is all an opaque id a caller reads back from the
 /// same running emulator needs. Nothing here is a secret and nothing depends on a digest being
 /// unforgeable.
-fn stable_prefix_list_hash(value: &str) -> u64 {
+fn stable_derived_id_hash(value: &str) -> u64 {
     use ::std::hash::{Hash, Hasher};
 
     let mut hasher = ::std::hash::DefaultHasher::new();
@@ -24182,6 +24192,391 @@ pub fn parse_endpoint_service_name(service_name: &str) -> Option<EndpointService
     Some(EndpointServiceName {
         region: region.to_string(),
         service: service.to_string(),
+    })
+}
+
+// =============================================================================
+// The endpoint services available in a Region
+// =============================================================================
+//
+// Nothing in the EC2 API creates, renames or withdraws an endpoint service Amazon Web
+// Services offers: it offers the services a Region HAS, exactly as a Region HAS its
+// Availability Zones ([`availability_zones_in_region`]) and its published prefix lists
+// ([`service_prefix_lists_in_region`]). So the catalog below is DERIVED from the Region a
+// request asks about rather than kept in [`ComAmazonawsEc2Amazonec2State`], and the describe
+// that reports it writes nothing at all: two calls asking about one Region report the same
+// services, and a read can never change what a later caller sees.
+//
+// The services the ACCOUNT offers are a different thing and ARE stored
+// ([`ComAmazonawsEc2Amazonec2State::vpc_endpoint_services`]). Both are projected into the
+// same [`EndpointServiceRecord`], so one reading of "an endpoint service a caller can create
+// an endpoint to" serves whichever of the two it came from.
+
+/// The owner reported for an endpoint service Amazon Web Services offers itself, rather than
+/// the account id a service the account created reports: the ALIAS the `owner` filter selects
+/// such a service by ("`owner` - The ID or alias of the Amazon Web Services account that owns
+/// the service" — `DescribeVpcEndpointServicesRequest$Filters`).
+pub const AWS_ENDPOINT_SERVICE_OWNER_ALIAS: &str = "amazon";
+
+/// A private DNS name whose ownership is settled: the `DnsNameState` enum's `verified` member
+/// ([`crate::ops::types::DNS_NAME_STATE_VALUES`]). "Consumers of the endpoint service cannot
+/// use the private name when the state is not `verified`"
+/// (`ServiceDetail$PrivateDnsNameVerificationState`), and the default public name of a service
+/// of a Region is the service's own — there is no third party whose ownership of it could
+/// still be pending — so a service out of the catalog below reports exactly this state.
+pub const DNS_NAME_STATE_VERIFIED: &str = "verified";
+
+/// The one member of the `PayerResponsibility` enum
+/// ([`crate::ops::types::PAYER_RESPONSIBILITY_VALUES`]): the service's owner pays.
+pub const PAYER_RESPONSIBILITY_SERVICE_OWNER: &str = "ServiceOwner";
+
+/// One service of the catalog: the label it sits under in a Region, and the endpoint types it
+/// is reachable through.
+struct AwsEndpointService {
+    /// The service's label under the Region, as an endpoint service name carries it — `logs`
+    /// in `com.amazonaws.us-west-2.logs`, and the label [`parse_endpoint_service_name`] reads
+    /// back out of that name.
+    label: &'static str,
+    /// The `ServiceType` enum members this service is reachable through
+    /// ([`crate::ops::types::SERVICE_TYPE_VALUES`]). A LIST, because `ServiceDetail$ServiceType`
+    /// is one: Amazon S3 is reachable both through a gateway endpoint and through an interface
+    /// endpoint under the one service name.
+    types: &'static [&'static str],
+}
+
+/// A service reachable only through an interface endpoint, which is what an endpoint service
+/// of Amazon Web Services is unless it is one of the two gateway services.
+const INTERFACE_ONLY: &[&str] = &[VPC_ENDPOINT_TYPE_INTERFACE];
+
+/// A service reachable only through a gateway endpoint.
+const GATEWAY_ONLY: &[&str] = &[VPC_ENDPOINT_TYPE_GATEWAY];
+
+/// A service reachable through either, reported in the order the `ServiceType` enum declares
+/// its members.
+const GATEWAY_AND_INTERFACE: &[&str] = &[VPC_ENDPOINT_TYPE_GATEWAY, VPC_ENDPOINT_TYPE_INTERFACE];
+
+/// The endpoint services Amazon Web Services offers in every Region.
+///
+/// The source is the Amazon Web Services PrivateLink User Guide's own list of the services
+/// that integrate with PrivateLink, taking each service's endpoint service label and the kind
+/// of endpoint it is reached through; the two gateway services are the ones the guide's
+/// "Gateway endpoints" page names (Amazon S3 and Amazon DynamoDB), which is the same pair
+/// [`AWS_SERVICE_PREFIX_LIST_SERVICES`] publishes a prefix list for. Sorted by label, which
+/// [`endpoint_services_in_region`] relies on for the order it reports in.
+///
+/// Every Region offers every entry: which Regions a given service has reached is a fact of
+/// that service's own rollout, which neither this model nor a request carries and this
+/// emulator holds no copy of, so nothing here distinguishes Regions by catalog.
+const AWS_ENDPOINT_SERVICES: [AwsEndpointService; 46] = [
+    AwsEndpointService { label: "appstream.api", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "appstream.streaming", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "athena", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "autoscaling", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "cloudformation", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "cloudtrail", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "codebuild", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "codedeploy", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "config", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "dynamodb", types: GATEWAY_ONLY },
+    AwsEndpointService { label: "ec2", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "ec2messages", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "ecr.api", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "ecr.dkr", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "ecs", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "ecs-agent", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "ecs-telemetry", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "elasticbeanstalk", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "elasticfilesystem", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "elasticloadbalancing", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "elasticmapreduce", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "email-smtp", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "events", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "execute-api", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "git-codecommit", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "glue", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "iot.data", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "kinesis-firehose", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "kinesis-streams", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "kms", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "lambda", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "logs", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "monitoring", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "rds", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "rds-data", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "redshift", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "s3", types: GATEWAY_AND_INTERFACE },
+    AwsEndpointService { label: "sagemaker.api", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "secretsmanager", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "servicecatalog", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "sns", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "sqs", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "ssm", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "ssmmessages", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "states", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "sts", types: INTERFACE_ONLY },
+];
+
+/// One endpoint service a caller can create a VPC endpoint to, whichever of the two sources it
+/// came from: a service of the Region's catalog, or one of the account's own stored service
+/// configurations.
+///
+/// The members are the ones `ServiceDetail` reports, held as the types they are reported as
+/// rather than as the modelled optionals, so the projection
+/// ([`EndpointServiceRecord::to_service_detail`]) is the only place that decides which members
+/// a reported service carries and both sources are reported the same way.
+#[derive(Debug, Clone)]
+pub struct EndpointServiceRecord {
+    /// "The name of the service" (`ServiceDetail$ServiceName`):
+    /// `com.amazonaws.<region>.<label>` for a service of the catalog, and the name the
+    /// configuration carries for one of the account's own.
+    pub service_name: String,
+    /// "The ID of the endpoint service" (`ServiceDetail$ServiceId`).
+    pub service_id: String,
+    /// "The type of service" (`ServiceDetail$ServiceType`), as `ServiceType` enum members.
+    pub service_types: Vec<String>,
+    /// "The Region where the service is hosted" (`ServiceDetail$ServiceRegion`), which is the
+    /// Region the service's own NAME carries.
+    pub service_region: String,
+    /// "The Amazon Web Services account ID of the service owner" (`ServiceDetail$Owner`), or
+    /// [`AWS_ENDPOINT_SERVICE_OWNER_ALIAS`] for a service Amazon Web Services owns.
+    pub owner: String,
+    /// "The Availability Zones in which the service is available"
+    /// (`ServiceDetail$AvailabilityZones`).
+    pub availability_zones: Vec<String>,
+    /// "The IDs of the Availability Zones in which the service is available"
+    /// (`ServiceDetail$AvailabilityZoneIds`) — the same zones, by id.
+    pub availability_zone_ids: Vec<String>,
+    /// "The DNS names for the service" (`ServiceDetail$BaseEndpointDnsNames`).
+    pub base_endpoint_dns_names: Vec<String>,
+    /// "The private DNS name for the service" (`ServiceDetail$PrivateDnsName`), or `None` for
+    /// a service that has none.
+    pub private_dns_name: Option<String>,
+    /// "Indicates whether the service supports endpoint policies"
+    /// (`ServiceDetail$VpcEndpointPolicySupported`).
+    pub vpc_endpoint_policy_supported: bool,
+    /// "Indicates whether VPC endpoint connection requests to the service must be accepted by
+    /// the service owner" (`ServiceDetail$AcceptanceRequired`).
+    pub acceptance_required: bool,
+    /// "Indicates whether the service manages its VPC endpoints"
+    /// (`ServiceDetail$ManagesVpcEndpoints`).
+    pub manages_vpc_endpoints: bool,
+    /// "The payer responsibility" (`ServiceDetail$PayerResponsibility`), as a
+    /// `PayerResponsibility` enum member.
+    pub payer_responsibility: Option<String>,
+    /// "The verification state of the VPC endpoint service"
+    /// (`ServiceDetail$PrivateDnsNameVerificationState`), as a `DnsNameState` enum member;
+    /// `None` for a service carrying no private DNS name to verify.
+    pub private_dns_name_verification_state: Option<String>,
+    /// "The supported IP address types" (`ServiceDetail$SupportedIpAddressTypes`).
+    pub supported_ip_address_types: Vec<String>,
+    /// "The tags assigned to the service" (`ServiceDetail$Tags`).
+    pub tags: Vec<Tag>,
+}
+
+impl EndpointServiceRecord {
+    /// This service as `DescribeVpcEndpointServices` reports it.
+    pub fn to_service_detail(&self) -> ServiceDetail {
+        ServiceDetail {
+            service_name: Some(self.service_name.clone()),
+            service_id: Some(self.service_id.clone()),
+            service_type: Some(
+                self.service_types
+                    .iter()
+                    .map(|service_type| ServiceTypeDetail {
+                        service_type: Some(service_type.clone()),
+                    })
+                    .collect(),
+            ),
+            service_region: Some(self.service_region.clone()),
+            availability_zone_ids: Some(self.availability_zone_ids.clone()),
+            availability_zones: Some(self.availability_zones.clone()),
+            owner: Some(self.owner.clone()),
+            base_endpoint_dns_names: Some(self.base_endpoint_dns_names.clone()),
+            private_dns_name: self.private_dns_name.clone(),
+            // "The private DNS names assigned to the VPC endpoint service"
+            // (`ServiceDetail$PrivateDnsNames`): the same name the member above carries, so a
+            // service with none reports neither rather than an empty list beside an absent
+            // name.
+            private_dns_names: self.private_dns_name.as_ref().map(|private_dns_name| {
+                vec![PrivateDnsDetails {
+                    private_dns_name: Some(private_dns_name.clone()),
+                }]
+            }),
+            vpc_endpoint_policy_supported: Some(self.vpc_endpoint_policy_supported),
+            acceptance_required: Some(self.acceptance_required),
+            manages_vpc_endpoints: Some(self.manages_vpc_endpoints),
+            payer_responsibility: self.payer_responsibility.clone(),
+            tags: Some(self.tags.clone()),
+            private_dns_name_verification_state: self
+                .private_dns_name_verification_state
+                .clone(),
+            supported_ip_address_types: Some(self.supported_ip_address_types.clone()),
+        }
+    }
+}
+
+/// The endpoint services Amazon Web Services offers in Region `region`, in `ServiceName`
+/// order — the order a `NextToken` walk of `DescribeVpcEndpointServices` resumes in, and
+/// unique by construction, one name per entry of [`AWS_ENDPOINT_SERVICES`].
+///
+/// Every reported value is derived from the Region and the entry: the zones come from
+/// [`availability_zones_in_region`], so the service is available in exactly the zones the
+/// Region has, and the DNS names are built the way `CreateVpcEndpoint` builds the names of an
+/// endpoint TO this service — the endpoint-specific names it mints extend
+/// [`ENDPOINT_DNS_SUFFIX`] under this service's base name, and the name its private hosted
+/// zone answers on is this service's private DNS name — so the catalog and a created endpoint
+/// cannot disagree about what the service is called.
+pub fn endpoint_services_in_region(region: &str) -> Vec<EndpointServiceRecord> {
+    let zones = availability_zones_in_region(region);
+    let records: Vec<EndpointServiceRecord> = AWS_ENDPOINT_SERVICES
+        .iter()
+        .map(|service| {
+            let service_name = format!("{AWS_ENDPOINT_SERVICE_PREFIX}{region}.{}", service.label);
+            let interface = service.types.contains(&VPC_ENDPOINT_TYPE_INTERFACE);
+            let gateway = service.types.contains(&VPC_ENDPOINT_TYPE_GATEWAY);
+            // "The DNS names for the service": the base name an endpoint's own names sit
+            // under. An interface endpoint answers on
+            // `<endpoint>.<service>.<region>.vpce.amazonaws.com`, so the service's base name
+            // under that suffix is what a consumer resolves; a gateway endpoint mints no names
+            // of its own and is reached through the service's default public name.
+            let mut base_endpoint_dns_names = Vec::new();
+            if interface {
+                base_endpoint_dns_names.push(format!(
+                    "{label}.{region}.{ENDPOINT_DNS_SUFFIX}",
+                    label = service.label,
+                ));
+            }
+            if gateway {
+                base_endpoint_dns_names.push(format!(
+                    "{label}.{region}.{SERVICE_DNS_SUFFIX}",
+                    label = service.label,
+                ));
+            }
+            EndpointServiceRecord {
+                service_id: endpoint_service_id(&service_name),
+                service_name,
+                service_types: service
+                    .types
+                    .iter()
+                    .map(|service_type| (*service_type).to_string())
+                    .collect(),
+                service_region: region.to_string(),
+                owner: AWS_ENDPOINT_SERVICE_OWNER_ALIAS.to_string(),
+                availability_zones: zones
+                    .iter()
+                    .map(|zone| zone.zone_name.clone())
+                    .collect(),
+                availability_zone_ids: zones.iter().map(|zone| zone.zone_id.clone()).collect(),
+                base_endpoint_dns_names,
+                // "The default public DNS name for the service for the Region (for example,
+                // kinesis.us-east-1.amazonaws.com)" (`CreateVpcEndpointRequest$PrivateDnsEnabled`),
+                // which is the name a private hosted zone resolves inside the VPC — so only an
+                // interface endpoint has one, a private hosted zone being an interface
+                // endpoint's option.
+                private_dns_name: interface
+                    .then(|| format!("{label}.{region}.{SERVICE_DNS_SUFFIX}", label = service.label)),
+                // "(Interface and gateway endpoints) A policy to attach to the endpoint that
+                // controls access to the service" (`CreateVpcEndpointRequest$PolicyDocument`):
+                // both kinds of endpoint to a service of this catalog take one.
+                vpc_endpoint_policy_supported: true,
+                // Nothing has to accept a connection to a service Amazon Web Services offers,
+                // and it does not manage the endpoints consumers create to it: the endpoint a
+                // caller creates is the caller's.
+                acceptance_required: false,
+                manages_vpc_endpoints: false,
+                payer_responsibility: Some(PAYER_RESPONSIBILITY_SERVICE_OWNER.to_string()),
+                private_dns_name_verification_state: interface
+                    .then(|| DNS_NAME_STATE_VERIFIED.to_string()),
+                // The one address type an endpoint to this service can be created with: this
+                // slice's subnets carry an IPv4 range only, so an endpoint network interface
+                // has an IPv4 address and the endpoint's DNS records are IPv4 records
+                // ([`DNS_RECORD_IP_TYPE_IPV4`]).
+                supported_ip_address_types: vec![IP_ADDRESS_TYPE_IPV4.to_string()],
+                // Nobody can tag a service Amazon Web Services offers, there being no resource
+                // of the account to tag.
+                tags: Vec::new(),
+            }
+        })
+        .collect();
+    // `ServiceNames` selects by name and the page cursor names the service the next page
+    // starts at, so two services of one Region sharing a name would make both ambiguous. The
+    // catalog's labels are distinct, which keeps the names distinct; the assertion pins that
+    // invariant if the catalog grows.
+    debug_assert!(
+        records
+            .windows(2)
+            .all(|pair| pair[0].service_name < pair[1].service_name),
+        "the endpoint services of one Region must be distinct and sorted by name"
+    );
+    records
+}
+
+/// The id of the endpoint service named `service_name`.
+///
+/// Derived from the name rather than stored, exactly as [`service_prefix_list_id`] derives a
+/// published prefix list's id: every read of one Region's service reports the same id, and two
+/// services with different names get different ids, without a store holding either. It carries
+/// 8 hexadecimal digits where [`ComAmazonawsEc2Amazonec2State::next_id`] mints 17, so a
+/// derived id can never collide with the id of a service configuration the account created.
+pub fn endpoint_service_id(service_name: &str) -> String {
+    format!(
+        "{VPC_ENDPOINT_SERVICE_ID_PREFIX}-{:08x}",
+        stable_derived_id_hash(service_name) & 0xffff_ffff
+    )
+}
+
+/// One of the account's own stored service configurations as an endpoint service a caller can
+/// create an endpoint to — `None` when the stored name is not an endpoint service name at all,
+/// since the Region the service is hosted in is the one its NAME carries.
+///
+/// What differs from a service of the catalog is what the OWNER decided, so each member is
+/// read off the stored configuration: the account owns it, and
+/// [`EndpointServiceRecord::to_service_detail`] then reports both sources identically.
+pub fn account_endpoint_service_record(
+    configuration: &ServiceConfiguration,
+) -> Option<EndpointServiceRecord> {
+    let service_name = configuration.service_name.clone()?;
+    let parsed = parse_endpoint_service_name(&service_name)?;
+    // A configuration carrying no id names no service a consumer could select: every one
+    // this store holds was given its id by [`ComAmazonawsEc2Amazonec2State::insert_vpc_endpoint_service`].
+    let service_id = configuration.service_id.clone()?;
+    Some(EndpointServiceRecord {
+        service_name,
+        service_id,
+        service_types: configuration
+            .service_type
+            .iter()
+            .flatten()
+            .filter_map(|detail| detail.service_type.clone())
+            .collect(),
+        service_region: parsed.region,
+        owner: ::engine::emulator_account_id().to_string(),
+        availability_zones: configuration.availability_zones.clone().unwrap_or_default(),
+        availability_zone_ids: configuration
+            .availability_zone_ids
+            .clone()
+            .unwrap_or_default(),
+        base_endpoint_dns_names: configuration
+            .base_endpoint_dns_names
+            .clone()
+            .unwrap_or_default(),
+        private_dns_name: configuration.private_dns_name.clone(),
+        // "You can create an endpoint policy for interface endpoints to Amazon Web Services
+        // services" (the PrivateLink User Guide's endpoint policies): a service another account
+        // offers is not one of them, so an endpoint to it carries no policy.
+        vpc_endpoint_policy_supported: false,
+        acceptance_required: configuration.acceptance_required.unwrap_or(false),
+        manages_vpc_endpoints: configuration.manages_vpc_endpoints.unwrap_or(false),
+        payer_responsibility: configuration.payer_responsibility.clone(),
+        private_dns_name_verification_state: configuration
+            .private_dns_name_configuration
+            .as_ref()
+            .and_then(|private_dns| private_dns.state.clone()),
+        supported_ip_address_types: configuration
+            .supported_ip_address_types
+            .clone()
+            .unwrap_or_default(),
+        tags: configuration.tags.clone().unwrap_or_default(),
     })
 }
 
