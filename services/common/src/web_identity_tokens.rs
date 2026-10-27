@@ -38,7 +38,8 @@ pub const MAX_ISSUED_TOKENS: usize = 10_000;
 
 /// What one issued web identity token stands for: the three claims a redeemer reports back
 /// (`AssumeRoleWithWebIdentityResponse$Provider`, `$Audience`,
-/// `$SubjectFromWebIdentityToken`) and the instant the issuance stops being valid.
+/// `$SubjectFromWebIdentityToken`), the authentication methods the issuance was made under,
+/// and the instant the issuance stops being valid.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssuedWebIdentity {
     /// The `iss` the token carries: the issuing authority, as the redeemer reports it.
@@ -47,6 +48,12 @@ pub struct IssuedWebIdentity {
     pub audience: String,
     /// The `sub` the token carries: the identity it names.
     pub subject: String,
+    /// What authenticated the identity this token names, as the issuing call recorded it —
+    /// the `amr` claim of the token (RFC 8176's authentication methods references). The
+    /// redeemer publishes one condition key per method to the trust policy it decides
+    /// against, so an issuer that records none publishes none and a clause written over
+    /// that key stays undecided.
+    pub authentication_methods: Vec<String>,
     /// When the issuance stops being valid, which is the token's own `exp`.
     pub expires_at: SystemTime,
 }
@@ -148,6 +155,7 @@ mod tests {
             issuer: "https://cognito-identity.amazonaws.com".to_string(),
             audience: "us-east-1:pool".to_string(),
             subject: subject.to_string(),
+            authentication_methods: vec!["authenticated".to_string()],
             expires_at,
         }
     }

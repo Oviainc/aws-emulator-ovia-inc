@@ -200,16 +200,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Everything the clock already owed this workflow's runs is materialised before
-        // they are counted, so a run the clock has already finished does not count as one
-        // in flight.
-        workflow.settle_due_runs(now);
-        // "You can use this parameter to prevent unwanted multiple updates to data … If
-        // you leave this parameter blank, there is no limit to the number of concurrent
-        // workflow runs": a start past a ceiling the workflow named is refused with this
-        // operation's own modelled error.
-        if let Some(ceiling) = workflow.concurrent_run_ceiling() {
-            let in_flight = workflow.runs_in_flight();
-            if in_flight >= usize::try_from(ceiling).unwrap_or(usize::MAX) {
+        // they are counted, and a run past the ceiling the workflow named is refused with
+        // this operation's own modelled error — both inside the one place a run of a
+        // workflow is recorded ([`crate::state::WorkflowEntry::begin_run`]), so a run a
+        // trigger begins is counted against the same ceiling as one a caller starts.
+        let run_id = match workflow.begin_run(
+            input.run_properties.as_ref(),
+            now,
+            i32::try_from(total_actions).unwrap_or(i32::MAX),
+        ) {
+            Ok(run_id) => run_id,
+            // "You can use this parameter to prevent unwanted multiple updates to data … If
+            // you leave this parameter blank, there is no limit to the number of concurrent
+            // workflow runs": a start past a ceiling the workflow named is refused with this
+            // operation's own modelled error.
+            Err(_ceiling) => {
                 return Err(
                     StartWorkflowRunErrorModeled::ConcurrentRunsExceededException(
                         ConcurrentRunsExceededException {
@@ -223,17 +228,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
                 );
             }
-        }
-
-        let run_id = crate::state::new_workflow_run_id();
-        let run = crate::state::WorkflowRunEntry::start(
-            workflow,
-            &input,
-            run_id.clone(),
-            now,
-            i32::try_from(total_actions).unwrap_or(i32::MAX),
-        );
-        workflow.record_run(run);
+        };
         ::tracing::info!(
             operation = "StartWorkflowRun",
             workflow = %input.name,

@@ -440,10 +440,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         match outcome {
             crate::state::PartUpload::Stored { .. } => {}
-            // "The specified multipart upload does not exist. The upload ID might be
-            // invalid, or the multipart upload might have been aborted or completed" —
-            // which is also what an id named under another key reports, because an upload
-            // is addressed by both.
+            // "The specified multipart upload does not exist" (`NoSuchUpload`'s own
+            // documentation) — which is also what an id named under another key reports,
+            // because an upload is addressed by both.
             crate::state::PartUpload::NoSuchUpload => {
                 return Err(UploadPartErrorModeled::NoSuchUpload(NoSuchUpload {}).into());
             }

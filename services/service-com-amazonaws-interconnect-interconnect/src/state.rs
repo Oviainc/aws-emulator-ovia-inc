@@ -30,8 +30,8 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use crate::ops::types::{
-    AttachPoint, Bandwidths, Connection, ConnectionSummary, Environment, Provider,
-    RemoteAccountIdentifier,
+    AttachPoint, Bandwidths, Connection, ConnectionSummary, CreateConnectionInput, Environment,
+    Provider, RemoteAccountIdentifier,
 };
 
 /// The region an ARN carries when the request is unsigned, so no SigV4 credential
@@ -156,8 +156,12 @@ pub struct StoredConnection {
     /// allocated it was signed for, which its ARN also carries. Only a request
     /// signed for this Region sees the record ([`visible_in`]).
     pub region: String,
-    /// The remote-account identifier the creator supplied, which the partner
-    /// verifies; `DescribeConnectionProposal` reads it.
+    /// The remote-account identifier the creator supplied, which the partner of the
+    /// Environment verifies the remote side by. Judged at create time against the
+    /// kind that Environment declares ([`remote_account_violation`]) and kept with
+    /// the record because it is part of the connection that was requested; no
+    /// response shape reports it back (`Connection` models no such member), so
+    /// nothing reads it out again.
     pub remote_account: Option<RemoteAccountIdentifier>,
     /// The transition the clock owes this connection, if any.
     pub pending_transition: Option<PendingTransition>,
@@ -169,10 +173,19 @@ pub struct StoredConnection {
 /// token but a DIFFERENT request is told so instead of being handed an unrelated
 /// connection.
 ///
+/// EVERY member of the create the caller owns is kept, because every one of them is
+/// part of the request the token names — including the identifier of the remote
+/// party, which is the one member a retry must not be able to swap silently. The
+/// record is built from the input in [`Self::of`] and compared against a repeat in
+/// [`Self::matches`], both taking the input shape itself, so the members the store
+/// holds and the members a replay is judged on cannot drift apart.
+///
 /// The request-owned members are kept here rather than read back off the stored
 /// connection, because `UpdateConnection` may since have changed the record's
 /// description or bandwidth: idempotency is about the request that was made, not
-/// about the resource's current shape.
+/// about the resource's current shape. (`remoteAccount` is not on the resource at
+/// all — `Connection` models no such member — so the request is the only place it
+/// could be compared from.)
 #[derive(Debug)]
 pub struct IdempotentCreate {
     /// The connection that first call allocated.
@@ -185,6 +198,8 @@ pub struct IdempotentCreate {
     pub attach_point: AttachPoint,
     /// `CreateConnection$description` as it was sent, absent included.
     pub description: Option<String>,
+    /// `CreateConnection$remoteAccount` as it was sent, absent included.
+    pub remote_account: Option<RemoteAccountIdentifier>,
     /// `CreateConnection$tags` as they were sent, absent included.
     pub tags: Option<std::collections::HashMap<String, String>>,
 }
@@ -201,21 +216,30 @@ pub fn visible_in(stored: &StoredConnection, region: &str) -> bool {
 }
 
 impl IdempotentCreate {
+    /// What `connection_id`'s create carried, taken straight off the request that
+    /// made it: the one place a caller-owned member enters the replay index.
+    pub fn of(connection_id: String, input: &CreateConnectionInput) -> Self {
+        Self {
+            connection_id,
+            environment_id: input.environment_id.clone(),
+            bandwidth: input.bandwidth.clone(),
+            attach_point: input.attach_point.clone(),
+            description: input.description.clone(),
+            remote_account: input.remote_account.clone(),
+            tags: input.tags.clone(),
+        }
+    }
+
     /// Whether a repeated request is the SAME request this token created a
-    /// connection for.
-    pub fn matches(
-        &self,
-        environment_id: &str,
-        bandwidth: &str,
-        attach_point: &AttachPoint,
-        description: Option<&String>,
-        tags: Option<&std::collections::HashMap<String, String>>,
-    ) -> bool {
-        self.environment_id == environment_id
-            && self.bandwidth == bandwidth
-            && attach_point_eq(&self.attach_point, attach_point)
-            && self.description.as_ref() == description
-            && self.tags.as_ref() == tags
+    /// connection for: every member of the create the caller owns compared, absence
+    /// included, so a repeat differing in any one of them is a different request.
+    pub fn matches(&self, input: &CreateConnectionInput) -> bool {
+        self.environment_id == input.environment_id
+            && self.bandwidth == input.bandwidth
+            && attach_point_eq(&self.attach_point, &input.attach_point)
+            && self.description == input.description
+            && remote_account_eq(self.remote_account.as_ref(), input.remote_account.as_ref())
+            && self.tags == input.tags
     }
 }
 
@@ -471,6 +495,27 @@ pub fn attach_point_eq(left: &AttachPoint, right: &AttachPoint) -> bool {
     match (left, right) {
         (AttachPoint::directConnectGateway(a), AttachPoint::directConnectGateway(b))
         | (AttachPoint::Arn(a), AttachPoint::Arn(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Two optional `RemoteAccountIdentifier` values carry the same identifying
+/// information, absence included — which is what a replayed `clientToken` compares
+/// the remote party on.
+///
+/// The union has no derived equality (a variant per kind of identifier the service
+/// accepts), so the comparison is per variant, the way [`attach_point_eq`] and
+/// [`provider_eq`] compare theirs.
+pub fn remote_account_eq(
+    left: Option<&RemoteAccountIdentifier>,
+    right: Option<&RemoteAccountIdentifier>,
+) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (
+            Some(RemoteAccountIdentifier::Identifier(a)),
+            Some(RemoteAccountIdentifier::Identifier(b)),
+        ) => a == b,
         _ => false,
     }
 }

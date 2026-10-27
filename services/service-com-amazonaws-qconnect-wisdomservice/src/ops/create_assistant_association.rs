@@ -248,38 +248,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let tags = input.tags.clone().unwrap_or_default();
-        // The fingerprint is taken from the REQUEST, before the target is resolved, so a
-        // retry whose token is known is answered out of the record the first call made
-        // even when the resource it named has since been deleted.
-        let fingerprint = crate::state::association_fingerprint(
-            &input.association_type,
-            &crate::state::input_target_key(&input.association),
-            &tags,
-        );
+        // What this create's `@idempotencyToken` identifies: every member the record
+        // below is built from. It is taken from the REQUEST, before the target is
+        // resolved, so a retry whose token is known is answered out of the record the
+        // first call made even when the resource it named has since been deleted.
+        let fingerprint = crate::state::request_fingerprint(&[
+            input.association_type.clone(),
+            crate::state::input_target_key(&input.association),
+            crate::state::tags_fingerprint(&tags),
+        ]);
 
         // A replayed `@idempotencyToken` answers with the association it already created
-        // under THIS assistant rather than creating a second one. The token is scoped to
-        // this operation and this parent, so the same token on another create is another
-        // resource. An idempotency token identifies ONE request, so the SAME token
-        // carrying a different request is a conflict, not a retry.
-        let replay_key = input.client_token.as_deref().map(|token| {
-            crate::state::idempotency_key(
-                &format!("CreateAssistantAssociation/{assistant_id}"),
-                token,
-            )
-        });
-        if let Some(created) = replay_key
-            .as_ref()
-            .and_then(|key| store.idempotency.get(key).cloned())
-        {
-            if let Some(association) = store.assistant_association(&assistant_id, &created) {
-                if association.fingerprint != fingerprint {
-                    return Err(conflict(crate::state::MESSAGE_IDEMPOTENCY_CONFLICT));
-                }
-                return Ok(CreateAssistantAssociationOutput {
-                    assistant_association: Some(association.to_assistant_association_data()),
-                });
+        // under THIS assistant rather than creating a second one, while the same token
+        // carrying a DIFFERENT request is the modelled idempotency conflict rather than a
+        // record the caller did not ask for. The token is scoped to this operation and
+        // this parent, so the same token on another create is another resource.
+        let token_scope = format!("{}/{assistant_id}", Self::NAME);
+        match store.replayed_create(&token_scope, input.client_token.as_deref(), &fingerprint) {
+            crate::state::Replay::Conflict => {
+                return Err(conflict(crate::state::MESSAGE_IDEMPOTENCY_CONFLICT))
             }
+            crate::state::Replay::Retry(created) => {
+                if let Some(association) = store.assistant_association(&assistant_id, &created) {
+                    return Ok(CreateAssistantAssociationOutput {
+                        assistant_association: Some(association.to_assistant_association_data()),
+                    });
+                }
+            }
+            crate::state::Replay::Fresh => {}
         }
 
         // The target, resolved: a knowledge base is one THIS account holds, so an id it
@@ -361,14 +357,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             association_type: input.association_type.clone(),
             target,
             tags,
-            fingerprint,
             created_at: now,
         });
-        if let Some(key) = replay_key {
-            store
-                .idempotency
-                .insert(key, assistant_association_id.clone());
-        }
+        store.remember_create(
+            &token_scope,
+            input.client_token.as_deref(),
+            &fingerprint,
+            &assistant_association_id,
+        );
 
         // Render out of the INSERTED record rather than out of the request: what this
         // call answers is what a later `GetAssistantAssociation` answers.

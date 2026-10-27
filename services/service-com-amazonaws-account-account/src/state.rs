@@ -38,7 +38,9 @@
 //! account has been opted into or out of, which `EnableRegion` and
 //! `DisableRegion` write and `GetRegionOptStatus` and `ListRegions` report.
 //! [`REGION_CATALOG`] is what decides whether a Region has an opt status at all
-//! and what it reports before any opt call.
+//! and what it reports before any opt call, and [`region_opt_target`] is the one
+//! place that reads it to answer whether a Region can be the TARGET of an opt
+//! call — the question `EnableRegion` and `DisableRegion` both decide by.
 
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
@@ -459,6 +461,24 @@ pub fn region_kind(region_name: &str) -> Option<RegionKind> {
             RegionKind::OptIn
         }
     })
+}
+
+/// Whether `region_name` can be the target of a Region-opt call, and the
+/// refusal it earns when it cannot: `Ok(())` for an opt-in Region, the
+/// [`unknown_region`] payload for a value [`REGION_CATALOG`] does not hold, and
+/// the [`region_not_opt_target`] payload for a Region the catalog turns on by
+/// default, which neither opt call can act on.
+///
+/// The ONE statement of that rule. `EnableRegion` and `DisableRegion` both
+/// decide through it, before either resolves an account or touches the store,
+/// so which Regions count as opt targets — and which refusal every other case
+/// earns — changes here alone and cannot drift between the two operations.
+pub fn region_opt_target(region_name: &str) -> Result<(), ValidationException> {
+    match region_kind(region_name) {
+        None => Err(unknown_region(region_name)),
+        Some(RegionKind::EnabledByDefault) => Err(region_not_opt_target(region_name)),
+        Some(RegionKind::OptIn) => Ok(()),
+    }
 }
 
 /// How long this emulator takes to carry a Region from a transient opt status

@@ -213,22 +213,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The tags the create persists, read once from the request: the same map goes
+        // into the fingerprint below and onto the stored record.
+        let tags = input.tags.clone().unwrap_or_default();
+
+        // What this create's `@idempotencyToken` identifies: every member the record
+        // below is built from. The configuration members carry no map, so their `Debug`
+        // rendering is stable for one request, while the tag map is fingerprinted in key
+        // order (`crate::state::tags_fingerprint`) so the same tag set written in another
+        // order is one request.
+        let fingerprint = crate::state::request_fingerprint(&[
+            input.name.clone(),
+            input.knowledge_base_type.clone(),
+            input.description.clone().unwrap_or_default(),
+            format!("{:?}", input.source_configuration),
+            format!("{:?}", input.rendering_configuration),
+            format!("{:?}", input.vector_ingestion_configuration),
+            format!("{:?}", input.server_side_encryption_configuration),
+            crate::state::tags_fingerprint(&tags),
+        ]);
+
         // A replayed `@idempotencyToken` answers with the knowledge base it already
-        // created rather than creating a second one. The token is scoped to this
-        // operation, so the same token on another create is another resource.
-        let replay_key = input
-            .client_token
-            .as_deref()
-            .map(|token| crate::state::idempotency_key("CreateKnowledgeBase", token));
-        if let Some(created) = replay_key
-            .as_ref()
-            .and_then(|key| store.idempotency.get(key).cloned())
-        {
-            if let Some(knowledge_base) = store.knowledge_base(&created) {
-                return Ok(CreateKnowledgeBaseOutput {
-                    knowledge_base: Some(knowledge_base.to_knowledge_base_data()),
-                });
+        // created rather than creating a second one, while the same token carrying a
+        // DIFFERENT request is the modelled idempotency conflict rather than a record the
+        // caller did not ask for. The token is scoped to this operation, so the same token
+        // on another create is another resource.
+        match store.replayed_create(
+            Self::NAME,
+            input.client_token.as_deref(),
+            &fingerprint,
+        ) {
+            crate::state::Replay::Conflict => {
+                return Err(CreateKnowledgeBaseErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(crate::state::MESSAGE_IDEMPOTENCY_CONFLICT.to_string()),
+                    },
+                )
+                .into())
             }
+            crate::state::Replay::Retry(created) => {
+                if let Some(knowledge_base) = store.knowledge_base(&created) {
+                    return Ok(CreateKnowledgeBaseOutput {
+                        knowledge_base: Some(knowledge_base.to_knowledge_base_data()),
+                    });
+                }
+            }
+            crate::state::Replay::Fresh => {}
         }
 
         // A knowledge base's name identifies it, so a create under a name this account
@@ -275,7 +305,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // there is no transition the clock owes it afterwards.
             status: crate::state::KNOWLEDGE_BASE_STATUS_ACTIVE.to_string(),
             description: input.description.clone(),
-            tags: input.tags.clone().unwrap_or_default(),
+            tags: tags.clone(),
             source_configuration: input.source_configuration.clone(),
             rendering_configuration: input.rendering_configuration.clone(),
             vector_ingestion_configuration: input.vector_ingestion_configuration.clone(),
@@ -285,9 +315,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at: ::std::time::SystemTime::now(),
         };
         store.insert_knowledge_base(knowledge_base);
-        if let Some(key) = replay_key {
-            store.idempotency.insert(key, knowledge_base_id.clone());
-        }
+        store.remember_create(
+            Self::NAME,
+            input.client_token.as_deref(),
+            &fingerprint,
+            &knowledge_base_id,
+        );
 
         // Render out of the INSERTED record rather than out of the request: what this
         // call answers is what a later read of the knowledge base answers.

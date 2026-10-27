@@ -180,26 +180,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // region's inventory and of no other's, so that is where the identifier is
         // resolved.
         let region = crate::state::request_region(ctx.parts());
-        // `OutpostId` accepts the bare id or the full Outpost ARN; both name the
-        // same stored record.
-        let outpost_id = crate::state::resolve_outpost_id(&input.outpost_id).ok_or_else(|| {
-            CreatePrivateConnectivityConfigErrorModeled::ValidationException(ValidationException {
-                message: Some(crate::state::outpost_id_pattern_report()),
-            })
-        })?;
-
-        let mut store = state.lock();
-        // Private connectivity belongs to an Outpost, so an Outpost that does not
-        // exist cannot be configured: the not-found error this call models, worded
-        // by the identifier echo of the value AS SUPPLIED.
-        let record = store.outpost_mut(&region, &outpost_id).ok_or_else(|| {
+        // `OutpostId` accepts the bare id or the full Outpost ARN. A bare id names an
+        // Outpost of the inventory this endpoint serves; an ARN carries a partition, a
+        // Region and an account of its own, and one that is not this endpoint's names
+        // no Outpost it holds — so there is no Outpost here to configure.
+        let not_found = || {
             CreatePrivateConnectivityConfigErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::identifier_not_found(
                     crate::state::OUTPOST_ID_MEMBER,
                     &input.outpost_id,
                 )),
             })
-        })?;
+        };
+        let outpost_id = crate::state::resolve_outpost_id(&input.outpost_id, &region)
+            .ok_or_else(|| {
+                CreatePrivateConnectivityConfigErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::state::outpost_id_pattern_report()),
+                    },
+                )
+            })?
+            .here()
+            .ok_or_else(not_found)?
+            .to_string();
+
+        let mut store = state.lock();
+        // Private connectivity belongs to an Outpost, so an Outpost that does not
+        // exist cannot be configured: the not-found error this call models, worded
+        // by the identifier echo of the value AS SUPPLIED.
+        let record = store
+            .outpost_mut(&region, &outpost_id)
+            .ok_or_else(not_found)?;
         // The configuration establishes the Outpost's service link over the
         // caller's VPC, and this API models no call that updates or removes it, so
         // re-creating one that already exists is exactly the inconsistent state its

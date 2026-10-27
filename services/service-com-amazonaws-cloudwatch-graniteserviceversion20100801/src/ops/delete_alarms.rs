@@ -194,6 +194,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // so the notifications those re-evaluations owe go out here — whether or not some
         // name in the request matched no alarm.
         crate::state::alarm_actions::settle_alarms(&*self.engine, ctx).await;
+        // The re-evaluations this deletion makes due for the composite alarms downstream of it
+        // are owed a span from here, and their actions deliver on their own targets rather
+        // than in this answer, so the clock that materialises them is started here.
+        crate::state::alarm_actions::drive_alarm_clock(&self.engine, ctx);
         deleted?;
 
         Ok(DeleteAlarmsOutput)

@@ -77,6 +77,8 @@ mod function_lifecycle;
 mod function_recursion_config;
 #[path = "all/function_scaling_config.rs"]
 mod function_scaling_config;
+#[path = "all/function_scaling_config_default.rs"]
+mod function_scaling_config_default;
 #[path = "all/function_url_config.rs"]
 mod function_url_config;
 #[path = "all/function_url_deletion.rs"]

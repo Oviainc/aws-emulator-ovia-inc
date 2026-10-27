@@ -5,6 +5,11 @@
 //! half of the classic (basic) authentication flow, which a caller then exchanges with STS
 //! for a session of the pool's role.
 //!
+//! Being that flow's entry point, the call is served only by a pool whose configuration
+//! serves the flow: a pool whose stored `AllowClassicFlow` disables it, and one whose roles
+//! are chosen by a role mapping the flow would bypass, mint no token and are answered the
+//! modelled `InvalidParameterException`, with nothing linked and nothing minted.
+//!
 //! The identity is the one the request names, so the token is minted from STORED state:
 //! the identity's own pool is its audience and the identity is its subject. The `Logins`
 //! the call presents are additional logins OF that identity ("Supplying multiple logins
@@ -267,6 +272,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetOpenIdToken<En
             )
             .into());
         };
+        // This operation IS the entry point of the basic (classic) authentication flow (its
+        // token is what a client then exchanges with STS itself), and it is served only by a
+        // pool whose stored configuration serves that flow — the flag that enables it, and
+        // roles the flow can honour ([`crate::state::classic_flow_refusal`]). A call into a
+        // flow the pool does not serve is refused as the bad parameter it is BEFORE anything
+        // is linked or minted, so the refusal leaves the pool's own configuration and the
+        // identity exactly as they were.
+        let roles = store.identity_pool_roles.get(&identity_pool_id);
+        if let Some(refusal) = crate::state::classic_flow_refusal(pool, roles) {
+            return Err(GetOpenIdTokenErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(refusal.message().to_string()),
+                },
+            )
+            .into());
+        }
         if logins
             .keys()
             .any(|provider| !pool.accepts_login_provider(provider))
@@ -378,6 +399,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetOpenIdToken<En
             identity_pool_id,
             issued_at: now,
             expiration,
+            authenticated_by: providers.clone(),
             principal_tags: None,
         };
         store.record_open_id_token(token.clone(), issued.clone(), now);

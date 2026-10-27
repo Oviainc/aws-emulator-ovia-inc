@@ -2357,6 +2357,12 @@ fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // Amazon SNS `CreateTopic.Name`: topic names "must be between 1 and 256 characters
         // long" (Amazon SNS API reference) — SNS's model carries no `@length` for it.
         SNS_TOPIC => rules(256, Characters::AsGenerated),
+        // Amazon SES `CreateConfigurationSet.ConfigurationSet.Name`: that member's own rule
+        // is "Contain only letters (a-z, A-Z), numbers (0-9), underscores (_), or dashes
+        // (-)" and "Contain 64 characters or fewer" (`ConfigurationSet$Name`, Amazon SES's
+        // own Smithy model) — a generated name is already inside that character set, since
+        // letters, digits and the hyphen are all admitted, but may be longer than the bound.
+        SES_CONFIGURATION_SET => rules(64, Characters::AsGenerated),
         // Amazon ECS `CreateCluster.clusterName`: "Up to 255 letters (uppercase and
         // lowercase), numbers, underscores, and hyphens are allowed" (Amazon ECS API
         // reference) — ECS's model carries no `@length` for it.
@@ -4192,6 +4198,18 @@ pub const CLOUDWATCH_DASHBOARD: &str = "AWS::CloudWatch::Dashboard";
 /// The same for an Amazon SNS topic: the SNS model carries
 /// `awsService.cloudFormationName: SNS`.
 pub const SNS_TOPIC: &str = "AWS::SNS::Topic";
+
+/// An Amazon SES configuration set's resource type (the SES model:
+/// `awsService.cloudFormationName: SES`). This is the type `super::provisioning` creates
+/// in Amazon SES itself, through that service's own `CreateConfigurationSet`.
+///
+/// It deliberately carries NO [`return_values`] arm, so the default applies and its
+/// physical resource id is the set's NAME — which is that type's published return value
+/// ("Ref returns the configuration set name") and the identifier every operation of the
+/// owning service addresses a configuration set by (`ConfigurationSetName`, on
+/// `DescribeConfigurationSet` and `DeleteConfigurationSet` alike). The type publishes no
+/// `Fn::GetAtt` attribute, so it carries no entry in [`published_attribute_names`] either.
+pub const SES_CONFIGURATION_SET: &str = "AWS::SES::ConfigurationSet";
 
 /// The `AWS::ECR::PublicRepository` resource type: an Amazon ECR Public repository.
 ///

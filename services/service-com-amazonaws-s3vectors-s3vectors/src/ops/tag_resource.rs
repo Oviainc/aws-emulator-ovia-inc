@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
+//! IMPLEMENTED: merges the `tags` it names into the tag map of the vector bucket or
+//! vector index its `resourceArn` names, under that resource's own optimistic lock — so a
+//! mutation that overlaps another mutation of the SAME resource is refused
+//! `ConflictException` (409) — and refuses a key in the reserved `aws:` namespace, a write
+//! past the tag ceiling, and a call the bucket's resource policy denies.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -84,11 +90,12 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3vectors-s3vectors.jso
 // to construct until the model says otherwise.
 #[smithy_macros::operation_error(
     "com.amazonaws.s3vectors#TagResource",
-    extra_errors = ["ValidationException"]
+    extra_errors = ["ValidationException", "AccessDeniedException"]
 )]
 #[derive(Debug)]
 pub enum TagResourceErrorModeled {
     ValidationException(ValidationException),
+    AccessDeniedException(AccessDeniedException),
     ConflictException(ConflictException),
     NotFoundException(NotFoundException),
     ServiceUnavailableException(ServiceUnavailableException),
@@ -145,9 +152,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Nothing about the write depends on request metadata: the resource is named
-        // by an ARN, which already carries its region and account.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(TagResourceErrorModeled::ServiceUnavailableException(
                 ServiceUnavailableException {
@@ -159,36 +163,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The `aws:` tag-key namespace is AWS's own, so a key in it is refused
         // before anything is resolved or stored.
-        crate::state::validate_tag_keys("tags", input.tags.keys().map(String::as_str))
-            .map_err(refusal)?;
+        crate::state::validate_tag_keys(input.tags.keys().map(String::as_str)).map_err(refusal)?;
+
+        // Who the request speaks for, resolved before this service's own store is
+        // locked, so only one store is ever held at a time.
+        let caller = crate::state::authorization::caller(&*self.engine, ctx);
+        // The read-modify-write this call makes is taken under the resource's own
+        // optimistic lock, which the guard is dropped before the commit span is waited
+        // out so another caller can reach the store and be told about the conflict.
+        let arn = {
+            let mut store = state.lock();
+            // The resource must exist to be tagged: an ARN naming a vector bucket or
+            // vector index this store does not hold is the modelled 404.
+            let arn = store
+                .tagged_resource_arn("resourceArn", &input.resource_arn)
+                .map_err(refusal)?;
+
+            // The resource policy of the vector bucket the ARN names decides this call
+            // before it writes anything: an explicit Deny of the action refuses it.
+            if let Some(message) = store
+                .authorization_target_for_arn("resourceArn", &input.resource_arn)
+                .map_err(refusal)?
+                .refusal(&caller, &[Self::NAME])
+            {
+                return Err(TagResourceErrorModeled::AccessDeniedException(
+                    AccessDeniedException { message },
+                )
+                .into());
+            }
+
+            // "You can add up to 50 tags for each resource", counted over what the
+            // resource would carry AFTER the write: a key it already holds is updated in
+            // place rather than added. The model declares no quota error here, so the
+            // refusal travels on the `ValidationException` channel.
+            let existing = store.tags.get(&arn);
+            let after = existing.map_or(input.tags.len(), |existing| {
+                existing.len()
+                    + input
+                        .tags
+                        .keys()
+                        .filter(|key| !existing.contains_key(*key))
+                        .count()
+            });
+            if let Some(message) = crate::state::tag_count_exceeded(after) {
+                return Err(TagResourceErrorModeled::ValidationException(ValidationException {
+                    message,
+                    field_list: None,
+                })
+                .into());
+            }
+
+            store
+                .begin_tag_write(&arn, ::std::time::Instant::now())
+                .map_err(conflict)?;
+            arn
+        };
+
+        // The write takes the span it takes to commit, and its own caller is answered
+        // only once it has: a caller that waits for its response therefore reads and
+        // writes against committed state, while a caller whose mutation overlaps this
+        // one is told about the conflict rather than silently serialised behind it.
+        ::tokio::time::sleep(crate::state::TAG_WRITE_COMMIT).await;
 
         let mut store = state.lock();
-        // The resource must exist to be tagged: an ARN naming a vector bucket or
-        // vector index this store does not hold is the modelled 404.
-        let arn = store
-            .tagged_resource_arn("resourceArn", &input.resource_arn)
-            .map_err(refusal)?;
-
-        // "You can add up to 50 tags for each resource", counted over what the
-        // resource would carry AFTER the write: a key it already holds is updated in
-        // place rather than added. The model declares no quota error here, so the
-        // refusal travels on the `ValidationException` channel.
-        let existing = store.tags.get(&arn);
-        let after = existing.map_or(input.tags.len(), |existing| {
-            existing.len()
-                + input
-                    .tags
-                    .keys()
-                    .filter(|key| !existing.contains_key(*key))
-                    .count()
-        });
-        if let Some(message) = crate::state::tag_count_exceeded(after) {
-            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
-                message,
-                field_list: None,
-            })
-            .into());
-        }
+        // The resource may have been deleted while this write was committing, in which
+        // case there is nothing left to tag.
+        let resolved = store.tagged_resource_arn("resourceArn", &input.resource_arn);
+        store.end_tag_write(&arn);
+        resolved.map_err(refusal)?;
 
         // "Applies one or more user-defined tags … or updates existing tags": a key
         // the resource already carries takes the request's value, and the keys the
@@ -211,4 +253,9 @@ fn refusal(error: crate::state::LookupError) -> TagResourceError {
     } else {
         TagResourceErrorModeled::ValidationException(error.validation_exception()).into()
     }
+}
+
+/// The modelled 409 for a write that raced another mutation of the same resource.
+fn conflict(message: String) -> TagResourceError {
+    TagResourceErrorModeled::ConflictException(ConflictException { message }).into()
 }

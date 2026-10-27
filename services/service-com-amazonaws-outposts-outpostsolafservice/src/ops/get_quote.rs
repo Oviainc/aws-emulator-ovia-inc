@@ -147,13 +147,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // region's inventory and of no other's, so that is where the identifier is
         // resolved.
         let region = crate::state::request_region(ctx.parts());
-        // `QuoteIdentifier` accepts the bare id or the full quote ARN; both name the
-        // same stored record.
-        let quote_id = crate::state::resolve_quote_id(&input.quote_identifier).ok_or_else(|| {
-            GetQuoteErrorModeled::ValidationException(ValidationException {
-                message: Some(crate::state::quote_identifier_pattern_report()),
+        // `QuoteIdentifier` accepts the bare id or the full quote ARN. A bare id names
+        // a quote of the inventory this endpoint serves; an ARN carries a partition, a
+        // Region and an account of its own, and one that is not this endpoint's names
+        // no quote it holds.
+        let not_found = || {
+            GetQuoteErrorModeled::NotFoundException(NotFoundException {
+                // The identifier echo, of the value AS SUPPLIED — not of
+                // `quote_id`, which is the bare id an ARN resolved to.
+                message: Some(crate::state::identifier_not_found(
+                    crate::state::QUOTE_IDENTIFIER_MEMBER,
+                    &input.quote_identifier,
+                )),
             })
-        })?;
+        };
+        let quote_id = crate::state::resolve_quote_id(&input.quote_identifier, &region)
+            .ok_or_else(|| {
+                GetQuoteErrorModeled::ValidationException(ValidationException {
+                    message: Some(crate::state::quote_identifier_pattern_report()),
+                })
+            })?
+            .here()
+            .ok_or_else(not_found)?
+            .to_string();
 
         let mut store = state.lock();
         // Report the status the quote holds NOW: a quote whose own
@@ -164,16 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let quote = store
             .quote(&region, &quote_id)
             .map(|record| record.quote.clone())
-            .ok_or_else(|| {
-                GetQuoteErrorModeled::NotFoundException(NotFoundException {
-                    // The identifier echo, of the value AS SUPPLIED — not of
-                    // `quote_id`, which is the bare id an ARN resolved to.
-                    message: Some(crate::state::identifier_not_found(
-                        crate::state::QUOTE_IDENTIFIER_MEMBER,
-                        &input.quote_identifier,
-                    )),
-                })
-            })?;
+            .ok_or_else(not_found)?;
 
         Ok(GetQuoteOutput { quote: Some(quote) })
     }
