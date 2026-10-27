@@ -154,13 +154,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.delete.unwrap_or(false) {
             store.remove_tunnel(&region, &input.tunnel_id);
         } else if let Some(tunnel) = store.tunnel_mut(&region, &input.tunnel_id) {
-            tunnel.status = crate::state::TunnelStatus::Closed;
-            // "we close the WebSocket connections between the client and proxy
-            // server": neither end is connected to a closed tunnel.
-            tunnel.source_connection_state = crate::state::StoredConnectionState::disconnected(now);
-            tunnel.destination_connection_state =
-                crate::state::StoredConnectionState::disconnected(now);
-            tunnel.last_updated_at = now;
+            // The one writer of the transition, shared with the clock-owed
+            // expiry sweep: it moves the tunnel to `CLOSED` and disconnects both
+            // ends ONLY when the resolved record is still `OPEN`. A tunnel that
+            // is already closed — by an earlier call or by its lifetime running
+            // out — has nothing left for this call to change, so its record and
+            // the stamps of the close that actually happened stay as they are
+            // and a repeated close is idempotent.
+            tunnel.close(now);
         }
         drop(store);
 
