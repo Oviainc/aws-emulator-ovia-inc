@@ -289,7 +289,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that are configured as dead-letter queues (DLQs) of other Amazon SQS queues
         // only": the source queue is a DLQ exactly when another queue's RedrivePolicy
         // names it as its dead-letter target. The queue the caller NAMED is what does
-        // not satisfy the rule, so the fault is in that parameter's value.
+        // not satisfy the rule, so the fault is in that parameter's value, and the
+        // refusal states that pre-condition in its own sentence rather than borrowing
+        // the documentation sentence of the `UnsupportedOperation` class above.
         let dead_letter_sources = state.dead_letter_source_queue_names(&source_name);
         if dead_letter_sources.is_empty() {
             return Err(Scaffolded::invalid_parameter_value(

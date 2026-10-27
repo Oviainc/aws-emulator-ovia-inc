@@ -237,14 +237,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let attributes = input.attributes.unwrap_or_default();
         // SNS defines a closed set of topic attribute names and refuses any other; the
-        // closed set is also what keeps one topic record from growing for ever.
-        if attributes
-            .keys()
-            .any(|name| !state::is_topic_attribute(name))
+        // closed set is also what keeps one topic record from growing for ever. The
+        // refusal is built from the request — the member the map arrived in, and the
+        // key that was not recognised — so the caller can find the entry it has to fix.
+        if let Some(unknown) =
+            state::unknown_attribute_name(&attributes, state::is_topic_attribute)
         {
             return Err(CreateTopicErrorModeled::InvalidParameterException(
                 InvalidParameterException {
-                    message: Some(state::INVALID_ATTRIBUTE_NAME_REFUSAL.to_string()),
+                    message: Some(state::unknown_attribute_refusal(
+                        state::ATTRIBUTES_MEMBER,
+                        unknown,
+                    )),
                 },
             )
             .into());
