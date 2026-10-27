@@ -6,7 +6,10 @@
 //! conditional-update contract `UpdateChannel` does: `x-amzn-update-if-match` is a
 //! precondition compared against committed state under one hold of the store lock, so N
 //! concurrent racers on one entity tag resolve to exactly one winner and the rest get
-//! `ConflictException` (409, `CONFLICTING_OPERATION`).
+//! `ConflictException` (409, `CONFLICTING_OPERATION`). A commit is what rotates the tag,
+//! and only a write that CHANGED the group commits: an update that stored exactly the
+//! description the group already held leaves `ModifiedAt` and the ETag alone, so the tag
+//! the caller just read stays usable as the precondition of its next update.
 //!
 //! ## Shape of an operation
 //!
@@ -103,6 +106,9 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+// The write-only-commits-a-change rule lives on the state module's `VersionedRecord`,
+// which every `Update*` handler in this crate decides its commit through.
+use crate::state::VersionedRecord;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -218,8 +224,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `UpdateChannelGroupRequest` binds, so a request that omits it clears it; the
         // name, the ARN and the egress domain are immutable, and the creation stamp and
         // the tags are not this operation's input.
+        //
+        // A write that CHANGED the group commits a new version of it, and the ETag is a
+        // function of that version as well as of the group's content: the tag this update
+        // answers with then differs from the one the caller held — which is what makes
+        // `x-amzn-update-if-match` detect a lost update — and a following
+        // `GetChannelGroup` reports exactly this tag. An update that stored what was
+        // already there changed nothing, so it commits nothing: neither the tag nor
+        // `ModifiedAt` moves, and the tag the caller holds stays usable as the
+        // precondition of the update it is entitled to make.
+        let before = group.configuration_fingerprint();
         group.description = input.description;
-        group.commit(crate::state::now());
+        group.commit_if_changed(&before, crate::state::now());
 
         Ok(UpdateChannelGroupOutput {
             channel_group_name: group.name.clone(),

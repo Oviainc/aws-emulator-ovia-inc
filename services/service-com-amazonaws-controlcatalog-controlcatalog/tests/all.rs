@@ -23,6 +23,8 @@ mod control_catalog;
 mod control_mappings;
 #[path = "all/framework_cross_walk.rs"]
 mod framework_cross_walk;
+#[path = "all/global_catalog_arn_reading.rs"]
+mod global_catalog_arn_reading;
 #[path = "all/ontology_listing.rs"]
 mod ontology_listing;
 #[path = "all/published_controls.rs"]
