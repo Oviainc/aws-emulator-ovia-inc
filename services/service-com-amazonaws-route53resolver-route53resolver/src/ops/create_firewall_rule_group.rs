@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFirewallRuleGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFirewallRuleGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFirewallRuleGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! SCAFFOLD REPLACED: implemented. The DNS Firewall rule-group slice
+//! (`CreateFirewallRuleGroup`, `GetFirewallRuleGroup`) computes every response
+//! from the records in [`crate::state`]. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +153,117 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFirewallRuleGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFirewallRuleGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFirewallRuleGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateFirewallRuleGroupErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some("the Route 53 Resolver store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `Name`'s pattern (`^(?!^[0-9]+$)([a-zA-Z0-9\-_' ']+)$`) admits only
+        // letters, digits, hyphens, underscores, apostrophes and spaces, and at
+        // least one of them, and excludes a name made of digits alone. Its
+        // negative lookahead is outside what the boundary validator's regex
+        // engine accepts, so the rule is enforced here, with the
+        // `ValidationException` this operation models, before the store is
+        // locked — so nothing is written.
+        if !crate::state::name_satisfies_pattern(&input.name) {
+            return Err(CreateFirewallRuleGroupErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::name_pattern_violation(&input.name)),
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::Instant::now();
+        let mut store = state.lock();
+
+        // `CreatorRequestId` is "a unique string defined by you to identify the
+        // request. This allows you to retry failed requests without the risk of
+        // running the operation twice": a repeat of a request id that already
+        // created a rule group resolves to THAT group and creates nothing.
+        if let Some(existing_id) = store
+            .firewall_rule_group_creator_request_ids
+            .get(&input.creator_request_id)
+        {
+            if let Some(record) = store.firewall_rule_groups.get(existing_id) {
+                return Ok(CreateFirewallRuleGroupOutput {
+                    firewall_rule_group: Some(record.to_rule_group(now)),
+                });
+            }
+        }
+
+        // The store is bounded: a new rule group past the cap is refused with
+        // the `LimitExceededException` this operation models, BEFORE anything is
+        // written. The retry path above is unaffected — it allocates no record.
+        if !store.can_store_another_firewall_rule_group() {
+            return Err(CreateFirewallRuleGroupErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "This emulator stores at most {} firewall rule groups; delete one before creating another",
+                        crate::state::MAX_STORED_FIREWALL_RULE_GROUPS
+                    )),
+                    resource_type: Some(
+                        crate::state::RESOURCE_TYPE_FIREWALL_RULE_GROUP.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let timestamp = crate::state::now_rfc3339();
+        let seq = store.next_seq();
+        let id = crate::state::mint_firewall_rule_group_id(seq);
+        let arn = ::engine::emulator_arn(
+            crate::state::ARN_NAMESPACE,
+            &region,
+            &format!("firewall-rule-group/{id}"),
+        );
+
+        let record = crate::state::FirewallRuleGroupRecord {
+            seq,
+            id: id.clone(),
+            arn,
+            name: input.name.clone(),
+            owner_id: ::engine::emulator_account_id().to_string(),
+            creator_request_id: input.creator_request_id.clone(),
+            // "Whether the rule group is shared with other Amazon Web Services
+            // accounts": sharing is configured through Resource Access Manager,
+            // and a group this account has just created is shared with nobody.
+            share_status: crate::state::SHARE_STATUS_NOT_SHARED.to_string(),
+            // "Creates an EMPTY DNS Firewall rule group": the rules arrive
+            // later, through `CreateFirewallRule`, so a group that was just
+            // created reports `RuleCount` 0.
+            rules: Vec::new(),
+            status: crate::state::FIREWALL_RULE_GROUP_STATUS_COMPLETE.to_string(),
+            // `StatusMessage` is "additional information about the status of the
+            // rule group, IF AVAILABLE", and the model states no text for it; a
+            // group that reached its settled status with nothing to report adds
+            // nothing, so it is left unset rather than carrying an invented
+            // sentence.
+            status_message: None,
+            tags: input.tags.clone().unwrap_or_default(),
+            creation_time: timestamp.clone(),
+            modification_time: timestamp,
+            // A group created empty has no change in flight, so the clock owes
+            // it no transition: the status it reports is already the settled one.
+            settled_at: None,
+        };
+
+        let rule_group = record.to_rule_group(now);
+        store
+            .firewall_rule_group_creator_request_ids
+            .insert(input.creator_request_id.clone(), id.clone());
+        store.firewall_rule_groups.insert(id, record);
+
+        Ok(CreateFirewallRuleGroupOutput {
+            firewall_rule_group: Some(rule_group),
+        })
     }
 }

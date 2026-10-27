@@ -372,13 +372,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         while pool.clients.contains_key(&client_id) {
             client_id = crate::state::new_client_id();
         }
-        let client_secret = input
+        // A confidential app client starts out holding the ONE secret the create
+        // supplied or generated; a public one holds none, and
+        // `AddUserPoolClientSecret` is what gives a client a further secret.
+        let client_secrets = input
             .client_secret
             .clone()
-            .or_else(|| input.generate_secret.then(crate::state::new_client_secret));
+            .or_else(|| input.generate_secret.then(crate::state::new_client_secret))
+            .map(|value| vec![crate::state::ClientSecret::new(&client_id, value, now)])
+            .unwrap_or_default();
         let client = crate::state::UserPoolClient {
             client_id: client_id.clone(),
-            client_secret,
+            client_secrets,
             user_pool_id: pool.id.clone(),
             client_name: input.client_name.clone(),
             creation_date: now,

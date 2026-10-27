@@ -31,8 +31,10 @@
 //! metric. This emulator ingests no metric data, so it has no history to predict FROM and
 //! the baseline load it forecasts around is read off the stored instruction instead. What
 //! the model itself defines holds exactly: the hourly granularity, the relation between
-//! the load forecast and the capacity forecast, and how the two scheduled-action
-//! capacities follow from the capacity forecast and the instruction. Every value is a
+//! the load forecast and the capacity forecast, how the two scheduled-action capacities
+//! follow from the capacity forecast and the instruction, and the run time each scheduled
+//! scaling action is reported at, which the instruction's buffer time moves ahead of the
+//! forecast interval that action provisions for. Every value is a
 //! deterministic function of stored state, so a second read of the same window never
 //! contradicts the first.
 //!
@@ -499,16 +501,25 @@ fn ceil_secs(at: ::aws_smithy_types::DateTime) -> i64 {
 
 /// The instants a forecast carries a data point at, over the requested window.
 ///
-/// Forecast data exists at [`FORECAST_INTERVAL_SECONDS`] granularity, so the points sit on
-/// the interval boundaries inside the half-open window `[StartTime, EndTime)` — the start
-/// is "inclusive" and the end "exclusive" — intersected with the span over which the
-/// service has forecast data at all: no further back than [`MAX_FORECAST_HISTORY_DAYS`]
-/// ("Data points are available for up to 56 days") and no further ahead than
-/// [`FORECAST_HORIZON_DAYS`].
+/// Forecast data exists at [`FORECAST_INTERVAL_SECONDS`] granularity, so each data point
+/// belongs to one forecast interval; `shift_secs` is how far BEFORE its interval's
+/// boundary the quantity being reported happens, which is zero for a quantity the interval
+/// itself carries and the instruction's buffer time for the run time of a scheduled
+/// scaling action (see [`ResourceForecast::reported_shift`]).
+///
+/// The instants returned are the ones the data points are REPORTED at — interval boundary
+/// minus `shift_secs` — so the window and the span forecast data exists over both select
+/// by the instant a `Datapoint` actually carries: inside the half-open window
+/// `[StartTime, EndTime)` — the start is "inclusive" and the end "exclusive" — and inside
+/// the span over which the service has forecast data at all, no further back than
+/// [`MAX_FORECAST_HISTORY_DAYS`] ("Data points are available for up to 56 days") and no
+/// further ahead than [`FORECAST_HORIZON_DAYS`]. A window therefore carries the same NUMBER
+/// of data points whatever the shift; only where inside each interval they sit moves.
 fn forecast_instants(
     start_time: ::aws_smithy_types::DateTime,
     end_time: ::aws_smithy_types::DateTime,
     now: ::std::time::SystemTime,
+    shift_secs: i64,
 ) -> Vec<i64> {
     let now_secs = clock_secs(now);
     let earliest = now_secs.saturating_sub(MAX_FORECAST_HISTORY_DAYS * SECONDS_PER_DAY);
@@ -519,10 +530,15 @@ fn forecast_instants(
     // second before an `EndTime` inside a second — strictly earlier than it — stays in.
     let end = ceil_secs(end_time);
 
-    let mut at = first.div_euclid(FORECAST_INTERVAL_SECONDS) * FORECAST_INTERVAL_SECONDS;
-    if at < first {
-        at = at.saturating_add(FORECAST_INTERVAL_SECONDS);
+    // The first interval boundary whose reported instant (boundary - shift) is at or after
+    // the start of the served span.
+    let first_boundary = first.saturating_add(shift_secs);
+    let mut boundary =
+        first_boundary.div_euclid(FORECAST_INTERVAL_SECONDS) * FORECAST_INTERVAL_SECONDS;
+    if boundary < first_boundary {
+        boundary = boundary.saturating_add(FORECAST_INTERVAL_SECONDS);
     }
+    let mut at = boundary.saturating_sub(shift_secs);
     let mut instants = Vec::new();
     while at < end && at <= latest {
         instants.push(at);
@@ -622,6 +638,16 @@ struct ResourceForecast {
     /// Whether the instruction creates scheduled scaling actions from the capacity
     /// forecast — true unless its `PredictiveScalingMode` is `ForecastOnly`.
     creates_scheduled_actions: bool,
+    /// `ScheduledActionBufferTime` — "the amount of time, in seconds, to buffer the run
+    /// time of scheduled scaling actions when scaling out": the scheduled scaling action
+    /// belonging to a forecast interval runs that many seconds BEFORE the interval it
+    /// provisions for ("if the forecast says to add capacity at 10:00 AM, and the buffer
+    /// time is 5 minutes, then the run time of the corresponding scheduled scaling action
+    /// will be 9:55 AM"), so it is what shifts the instants the two scheduled-action
+    /// capacities are reported at. Zero where the instruction carries no buffer time: the
+    /// member is held and reported back exactly as it was stored, so an instruction
+    /// carrying none buffers none.
+    scheduled_action_buffer_seconds: i64,
 }
 
 impl ResourceForecast {
@@ -660,6 +686,9 @@ impl ResourceForecast {
                 / 100.0,
             creates_scheduled_actions: instruction.predictive_scaling_mode.as_deref()
                 != Some(MODE_FORECAST_ONLY),
+            scheduled_action_buffer_seconds: instruction
+                .scheduled_action_buffer_time
+                .map_or(0, i64::from),
         })
     }
 
@@ -709,6 +738,21 @@ impl ResourceForecast {
         }
     }
 
+    /// How far before the forecast interval it belongs to a data point of `kind` is
+    /// reported.
+    ///
+    /// A load or capacity forecast is a quantity OF the interval, so it is reported at the
+    /// interval's own instant. The two scheduled-action capacities describe "each scheduled
+    /// scaling action", whose run time the instruction's buffer time moves earlier than the
+    /// interval it provisions for — so they are reported at that run time.
+    fn reported_shift(&self, kind: ForecastKind) -> i64 {
+        if kind.is_scheduled_action() {
+            self.scheduled_action_buffer_seconds
+        } else {
+            0
+        }
+    }
+
     /// The value one data point of `kind` carries at `hour`.
     fn value_at(&self, kind: ForecastKind, hour: i64) -> f64 {
         match kind {
@@ -742,11 +786,15 @@ fn forecast(
     if kind.is_scheduled_action() && !forecast.creates_scheduled_actions {
         return Vec::new();
     }
-    forecast_instants(start_time, end_time, now)
+    // The instants a data point of this kind is reported at, and the value each carries:
+    // the value is always the quantity of the forecast INTERVAL the point belongs to, which
+    // sits `shift` seconds after the instant the point is reported at.
+    let shift = forecast.reported_shift(kind);
+    forecast_instants(start_time, end_time, now, shift)
         .into_iter()
         .map(|at| Datapoint {
             timestamp: Some(::aws_smithy_types::DateTime::from_secs(at)),
-            value: Some(forecast.value_at(kind, hour_of_day(at))),
+            value: Some(forecast.value_at(kind, hour_of_day(at.saturating_add(shift)))),
         })
         .collect()
 }

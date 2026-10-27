@@ -17,6 +17,8 @@ mod configuration_set_delete;
 mod configuration_set_tracking_options;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/identity_mail_from_domain.rs"]
+mod identity_mail_from_domain;
 #[path = "all/identity_notification_topics.rs"]
 mod identity_notification_topics;
 #[path = "all/ses_account_sending_and_legacy_addresses.rs"]
