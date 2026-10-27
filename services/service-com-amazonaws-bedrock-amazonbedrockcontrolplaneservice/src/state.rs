@@ -30,7 +30,8 @@
 //! data source and key live, so there is only ever one copy of either.
 //!
 //! And it holds the evaluation jobs `ops/create_evaluation_job.rs` mints and
-//! `ops/get_evaluation_job.rs` reads back, together with the instant each job
+//! `ops/get_evaluation_job.rs` reads back, together with the instant each job's
+//! non-terminal status is owed its move to a terminal one and the instant each job
 //! `ops/batch_delete_evaluation_job.rs` accepted for deletion is owed its removal.
 //!
 //! And it holds the advanced prompt optimization jobs
@@ -450,12 +451,13 @@ pub const MAX_MODEL_COPY_JOBS_PER_ACCOUNT: usize = 100;
 /// (`smithy_query(query="shape",shape="EvaluationJobStatus")`). An accepted evaluation job
 /// runs asynchronously, so this is the status it carries from the call that starts it.
 ///
-/// It is also the only status `CreateEvaluationJob` mints. Reaching `Completed` or
-/// `Failed` means the inference and the metric computation over the caller's dataset ran
-/// and the results were written to the request's `outputDataConfig` — work this emulator
-/// does not perform, so no call here mints either, and no clock transition leads to them.
-/// `Stopping` and `Stopped` are reached by a caller's own `StopEvaluationJob` (see
-/// [`EVALUATION_JOB_STATUS_STOPPING`]) and `Deleting` by `BatchDeleteEvaluationJob`.
+/// It is a NON-TERMINAL status: the run it names ends, so the clock owes the job its move
+/// to [`EVALUATION_JOB_STATUS_COMPLETED`] after [`EVALUATION_JOB_COMPLETE_AFTER`], the way
+/// an accepted model import job is owed [`IMPORT_JOB_STATUS_COMPLETED`]. `Failed` names a
+/// run that ended without its results; nothing here makes an accepted evaluation fail, so
+/// no call mints it. `Stopping` and `Stopped` are reached by a caller's own
+/// `StopEvaluationJob` (see [`EVALUATION_JOB_STATUS_STOPPING`]) and `Deleting` by
+/// `BatchDeleteEvaluationJob`.
 pub const EVALUATION_JOB_STATUS_IN_PROGRESS: &str = "InProgress";
 
 /// `EvaluationJobStatus` — the job is winding down because a caller stopped it.
@@ -482,13 +484,27 @@ pub const EVALUATION_JOB_STATUS_STOPPED: &str = "Stopped";
 /// on, so no handler sleeps.
 pub const EVALUATION_JOB_STOPPED_AFTER: Duration = Duration::from_millis(500);
 
-/// `EvaluationJobStatus` — the job ran to completion. See
-/// [`EVALUATION_JOB_STATUS_IN_PROGRESS`] for the value list and for why no call here mints
-/// it; it is named because a job that carries it is one a batch delete accepts.
+/// `EvaluationJobStatus` — the job ran to completion: the terminal status the non-terminal
+/// [`EVALUATION_JOB_STATUS_IN_PROGRESS`] is owed its move to, after
+/// [`EVALUATION_JOB_COMPLETE_AFTER`]. It is also one of the statuses a batch delete accepts
+/// a job in.
 pub const EVALUATION_JOB_STATUS_COMPLETED: &str = "Completed";
 
-/// `EvaluationJobStatus` — the job ended without producing its results. Named for the same
-/// reason [`EVALUATION_JOB_STATUS_COMPLETED`] is.
+/// How long after `CreateEvaluationJob` an accepted job's non-terminal `status` is owed its
+/// move to [`EVALUATION_JOB_STATUS_COMPLETED`].
+///
+/// CHOSEN, not documented: AWS publishes no duration for running an evaluation (the real
+/// run depends on the dataset, the metrics and the models being evaluated), so this is the
+/// emulator's span, the one [`MODEL_COPY_JOB_COMPLETE_AFTER`] uses for the same kind of
+/// accepted-then-finishes job. It is non-zero, so a caller that reads the job straight
+/// after creating it still observes the `InProgress` status the real service reports — and
+/// can still stop it; and it is materialised from the stored due instant on the next call
+/// that touches the record rather than waited on, so no handler sleeps.
+pub const EVALUATION_JOB_COMPLETE_AFTER: Duration = Duration::from_secs(3);
+
+/// `EvaluationJobStatus` — the job ended without producing its results. Nothing here makes
+/// an accepted evaluation fail, so no call mints it; it is named because a job that carries
+/// it is one a batch delete accepts.
 pub const EVALUATION_JOB_STATUS_FAILED: &str = "Failed";
 
 /// `EvaluationJobStatus` — the job a batch delete accepted is being deleted.
@@ -1311,6 +1327,12 @@ pub struct EvaluationJobRecord {
     pub job_type: &'static str,
     /// `EvaluationJobStatus`.
     pub status: &'static str,
+    /// When [`Self::status`] is owed its move to [`EVALUATION_JOB_STATUS_COMPLETED`], or
+    /// `None` once the run has ended or a caller has stopped or deleted the job.
+    ///
+    /// The due INSTANT, not a timer, for the same reason
+    /// [`ModelImportJobRecord::completed_due_at`] is one.
+    pub completed_due_at: Option<SystemTime>,
     /// When [`Self::status`] is owed its move to [`EVALUATION_JOB_STATUS_STOPPED`], or
     /// `None` while no stop is in flight.
     ///
@@ -1343,9 +1365,12 @@ impl EvaluationJobRecord {
     /// its move to [`EVALUATION_JOB_STATUS_STOPPED`].
     ///
     /// The caller's own write, asked for by `StopEvaluationJob` — not a clock transition:
-    /// [`Self::settle`] is what materialises the one the clock owes.
+    /// [`Self::settle`] is what materialises the one the clock owes. The completion the
+    /// clock owed a running job is no longer owed once the run is being wound down, so it
+    /// is dropped here.
     pub fn stop(&mut self, now: SystemTime) {
         self.status = EVALUATION_JOB_STATUS_STOPPING;
+        self.completed_due_at = None;
         self.stopped_due_at = Some(now + EVALUATION_JOB_STOPPED_AFTER);
         self.last_modified_at = now;
     }
@@ -1381,13 +1406,20 @@ impl EvaluationJobRecord {
         self.deleted_due_at.is_some_and(|due| now >= due)
     }
 
-    /// Materialise the move to [`EVALUATION_JOB_STATUS_STOPPED`] the clock has already made
-    /// due at `now`.
+    /// Materialise the status move the clock has already made due at `now`: a running job's
+    /// move to [`EVALUATION_JOB_STATUS_COMPLETED`], or a stopping job's to
+    /// [`EVALUATION_JOB_STATUS_STOPPED`].
     ///
     /// The only write a reporting operation on this resource makes: it was owed at the due
     /// instant even if nobody had called, which is why that instant — not `now` — is the
-    /// one the job reports as its last modification.
+    /// one the job reports as its last modification. At most one of the two is pending,
+    /// since a stop drops the completion the clock owed the run it wound down.
     pub fn settle(&mut self, now: SystemTime) {
+        if let Some(due) = self.completed_due_at.filter(|due| now >= *due) {
+            self.status = EVALUATION_JOB_STATUS_COMPLETED;
+            self.completed_due_at = None;
+            self.last_modified_at = due;
+        }
         if let Some(due) = self.stopped_due_at.filter(|due| now >= *due) {
             self.status = EVALUATION_JOB_STATUS_STOPPED;
             self.stopped_due_at = None;
