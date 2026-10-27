@@ -536,6 +536,30 @@
 //! [`ComAmazonawsEc2Amazonec2State::vpc_endpoint_connection_moves`] holds the instant the
 //! clock owes it `Available`.
 //!
+//! ## VPC endpoint associations
+//!
+//! [`ComAmazonawsEc2Amazonec2State::vpc_endpoint_associations`] holds the resources
+//! associated with the account's VPC endpoints — "the VPC resources, VPC endpoint services,
+//! Lattice services, or service networks associated with the VPC endpoint"
+//! (`DescribeVpcEndpointAssociations`) — as the modelled [`VpcEndpointAssociation`] shape
+//! itself, keyed by that shape's `Id` in a [`BTreeMap`], for the same reasons the
+//! connection store above holds [`VpcEndpointConnection`]s: the id names the resource, every
+//! member a writer sets round-trips through the describe, and the map's order is the one
+//! order that describe reports and pages over.
+//! [`ComAmazonawsEc2Amazonec2State::insert_vpc_endpoint_association`] is the one way one is
+//! stored — it mints the association id itself rather than taking it from a caller, answers
+//! `None` past [`MAX_STORED_RECORDS_PER_STORE`]
+//! ([`ComAmazonawsEc2Amazonec2State::has_vpc_endpoint_association_capacity`] is the gate a
+//! writer asks first) and charges [`vpc_endpoint_association_payload_bytes`] against the
+//! byte budget, so repeated writes cannot grow the store for free.
+//!
+//! The store starts EMPTY, like the local gateway stores above and for the same kind of
+//! reason: an association exists only for an endpoint that points at a resource
+//! configuration or a service network, and `CreateVpcEndpoint` holds no store for either
+//! today (it answers 501 for an endpoint of those types), so an account has no association
+//! to report until it does. The insert is the seam that writer must go through when it
+//! lands, not dead code.
+//!
 //! ## Connection notifications for endpoints and endpoint services
 //!
 //! [`ComAmazonawsEc2Amazonec2State::vpc_endpoint_connection_notifications`] holds the
@@ -1269,7 +1293,7 @@ use crate::ops::types::{
     TransitGatewayVpcAttachment,
     UserIdGroupPair, Vpc, VpcBlockPublicAccessExclusion, VpcCidrBlockAssociation,
     VpcCidrBlockState, VpcEndpoint,
-    VpcEndpointConnection, VpnConnection, VpnGateway, VpnStaticRoute,
+    VpcEndpointAssociation, VpcEndpointConnection, VpnConnection, VpnGateway, VpnStaticRoute,
 };
 use crate::scaffolded::Scaffolded;
 
@@ -3045,6 +3069,11 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// by that id, which is the order `DescribeVpcEndpointConnectionNotifications` reports
     /// and pages over.
     pub vpc_endpoint_connection_notifications: BTreeMap<String, ConnectionNotification>,
+    /// Every VPC endpoint association the account holds, by `VpcEndpointAssociation$Id`, as
+    /// the modelled [`VpcEndpointAssociation`] shape itself — see the module docs. Ordered
+    /// by that id, which is the order `DescribeVpcEndpointAssociations` reports and pages
+    /// over.
+    pub vpc_endpoint_associations: BTreeMap<String, VpcEndpointAssociation>,
     /// Every Site-to-Site VPN connection the account holds, by `VpnConnectionId`, as
     /// [`VpnConnectionRecord`]s — the modelled [`VpnConnection`] every operation that reports
     /// one answers with, plus the move the clock owes each static route that is not in a
@@ -3483,6 +3512,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             vpc_endpoint_moves: BTreeMap::new(),
             vpc_endpoint_client_tokens: HashMap::new(),
             vpc_endpoint_connection_notifications: BTreeMap::new(),
+            vpc_endpoint_associations: BTreeMap::new(),
             vpn_connections: BTreeMap::new(),
             transit_gateway_attachments: BTreeMap::new(),
             transit_gateway_multicast_domains: BTreeMap::new(),
@@ -23961,6 +23991,189 @@ pub fn dns_entry_list_bytes(entries: &[DnsEntry]) -> usize {
                 + entry.hosted_zone_id.as_deref().unwrap_or_default().len()
         })
         .sum()
+}
+
+// =============================================================================
+// VPC endpoint associations
+// =============================================================================
+
+/// The id prefix a stored VPC endpoint association is minted with.
+///
+/// `vpce-assoc-` rather than `vpce-`: an association and the endpoint it belongs to are
+/// different resources, the way a service id and an endpoint id are
+/// ([`VPC_ENDPOINT_SERVICE_ID_PREFIX`]). The model publishes no pattern for
+/// `VpcEndpointAssociation$Id` (it is a plain `String` —
+/// `smithy_query(query="shape",shape="VpcEndpointAssociation")`), so the id takes EC2's own
+/// `<prefix>-<hex>` form through [`ComAmazonawsEc2Amazonec2State::next_id`] and is minted by
+/// the store rather than taken from a request.
+pub const VPC_ENDPOINT_ASSOCIATION_ID_PREFIX: &str = "vpce-assoc";
+
+/// An association whose associated resource configuration is in service: "The resource is
+/// accessible if the associated resource configuration is `AVAILABLE`"
+/// (`VpcEndpointAssociation$AssociatedResourceAccessibility`).
+pub const ASSOCIATED_RESOURCE_AVAILABLE: &str = "AVAILABLE";
+
+/// An association whose associated resource configuration is not in service yet, so the
+/// resource is not reachable through the endpoint: "When the state is `inaccessible`, it
+/// returns `PENDING` or `FAILED`" (`DescribeVpcEndpointAssociationsRequest$Filters`).
+pub const ASSOCIATED_RESOURCE_PENDING: &str = "PENDING";
+
+/// An association whose associated resource configuration could not be reached at all — the
+/// other value the `inaccessible` state of the filter above returns, and the one an
+/// association's `FailureCode`/`FailureReason` explain.
+pub const ASSOCIATED_RESOURCE_FAILED: &str = "FAILED";
+
+/// Every accessibility an association can report, as the `associated-resource-accessibility`
+/// FILTER spells it paired with the value
+/// `VpcEndpointAssociation$AssociatedResourceAccessibility` carries for it.
+///
+/// Two sources spell one state two ways and both are part of the contract, exactly as
+/// [`VPC_ENDPOINT_STATE_FILTER_VALUES`] holds for an endpoint's state: the filter documents
+/// "`associated-resource-accessibility` - The association state. When the state is
+/// `accessible`, it returns `AVAILABLE`. When the state is `inaccessible`, it returns
+/// `PENDING` or `FAILED`" (`DescribeVpcEndpointAssociationsRequest$Filters`), while the
+/// reported member carries the accessibility of the resource configuration itself. A stored
+/// association therefore holds the REPORTED value, and this table is what lets the
+/// documented filter value select it — `inaccessible` naming two reported values, which is
+/// why the pairs are a list rather than a map.
+pub const ASSOCIATED_RESOURCE_ACCESSIBILITY_FILTER_VALUES: [(&str, &str); 3] = [
+    ("accessible", ASSOCIATED_RESOURCE_AVAILABLE),
+    ("inaccessible", ASSOCIATED_RESOURCE_PENDING),
+    ("inaccessible", ASSOCIATED_RESOURCE_FAILED),
+];
+
+/// What one stored VPC endpoint association is written with, beside the association id the
+/// store mints itself.
+///
+/// The spec of the resource, in the same shape [`VpcEndpointConnectionSpec`] has for a
+/// connection: the writer that associates a resource with an endpoint fills this in and
+/// [`ComAmazonawsEc2Amazonec2State::insert_vpc_endpoint_association`] turns it into the
+/// modelled [`VpcEndpointAssociation`] the describe reports, so the id, the stored key and
+/// the byte charge are decided in exactly one place.
+#[derive(Debug, Clone)]
+pub struct VpcEndpointAssociationSpec {
+    /// "The ID of the VPC endpoint" the association belongs to
+    /// (`VpcEndpointAssociation$VpcEndpointId`).
+    pub vpc_endpoint_id: String,
+    /// "The Amazon Resource Name (ARN) of the service network"
+    /// (`VpcEndpointAssociation$ServiceNetworkArn`), for an endpoint of type service
+    /// network; `None` for one that points at a resource configuration instead.
+    pub service_network_arn: Option<String>,
+    /// "The name of the service network" (`VpcEndpointAssociation$ServiceNetworkName`) —
+    /// the name of the resource [`Self::service_network_arn`] names, which the ARN does not
+    /// carry, so it comes from the writer that resolved it.
+    pub service_network_name: Option<String>,
+    /// "The Amazon Resource Name (ARN) of the associated resource"
+    /// (`VpcEndpointAssociation$AssociatedResourceArn`).
+    pub associated_resource_arn: Option<String>,
+    /// "The Amazon Resource Name (ARN) of the resource configuration group"
+    /// (`VpcEndpointAssociation$ResourceConfigurationGroupArn`), for a resource
+    /// configuration that belongs to one of type `GROUP`.
+    pub resource_configuration_group_arn: Option<String>,
+    /// "The connectivity status of the resources associated to a VPC endpoint"
+    /// (`VpcEndpointAssociation$AssociatedResourceAccessibility`), one of the reported
+    /// values of [`ASSOCIATED_RESOURCE_ACCESSIBILITY_FILTER_VALUES`].
+    pub associated_resource_accessibility: String,
+    /// "An error code related to why an VPC endpoint association failed"
+    /// (`VpcEndpointAssociation$FailureCode`), for an association that did.
+    pub failure_code: Option<String>,
+    /// "A message related to why an VPC endpoint association failed"
+    /// (`VpcEndpointAssociation$FailureReason`).
+    pub failure_reason: Option<String>,
+    /// "The DNS entry of the VPC endpoint association"
+    /// (`VpcEndpointAssociation$DnsEntry`).
+    pub dns_entry: Option<DnsEntry>,
+    /// "The private DNS entry of the VPC endpoint association"
+    /// (`VpcEndpointAssociation$PrivateDnsEntry`).
+    pub private_dns_entry: Option<DnsEntry>,
+    /// "The tags to apply to the VPC endpoint association"
+    /// (`VpcEndpointAssociation$Tags`).
+    pub tags: Vec<Tag>,
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another VPC endpoint association fits inside the store's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]), on the contract of
+    /// [`Self::has_vpc_endpoint_connection_capacity`]: a writer asks this BEFORE storing
+    /// anything and refuses the request with EC2's own quota code when it answers `false`.
+    /// [`Self::insert_vpc_endpoint_association`] asks it again for itself, so no path can
+    /// get past the ceiling by forgetting to.
+    pub fn has_vpc_endpoint_association_capacity(&self) -> bool {
+        self.vpc_endpoint_associations.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
+    /// Store one association between a VPC endpoint and the resource it reaches, and answer
+    /// the `Id` it was given — or `None` when the store is at its ceiling and NOTHING was
+    /// stored.
+    ///
+    /// The association id is minted here rather than taken from `spec`, the way
+    /// [`Self::insert_vpc_endpoint_connection`] mints a connection id, and the bytes the
+    /// record holds are charged here ([`vpc_endpoint_association_payload_bytes`]) so no path
+    /// can store them uncharged. A writer that sees `None` refuses the request with EC2's
+    /// own quota code rather than reporting an association this store does not hold.
+    pub fn insert_vpc_endpoint_association(
+        &mut self,
+        spec: VpcEndpointAssociationSpec,
+    ) -> Option<String> {
+        if !self.has_vpc_endpoint_association_capacity() {
+            return None;
+        }
+        let association_id = self.next_id(VPC_ENDPOINT_ASSOCIATION_ID_PREFIX);
+        let association = VpcEndpointAssociation {
+            id: Some(association_id.clone()),
+            vpc_endpoint_id: Some(spec.vpc_endpoint_id),
+            service_network_arn: spec.service_network_arn,
+            service_network_name: spec.service_network_name,
+            associated_resource_accessibility: Some(spec.associated_resource_accessibility),
+            failure_reason: spec.failure_reason,
+            failure_code: spec.failure_code,
+            dns_entry: spec.dns_entry,
+            private_dns_entry: spec.private_dns_entry,
+            associated_resource_arn: spec.associated_resource_arn,
+            resource_configuration_group_arn: spec.resource_configuration_group_arn,
+            tags: Some(spec.tags),
+        };
+        self.add_stored_bytes(vpc_endpoint_association_payload_bytes(&association));
+        self.vpc_endpoint_associations
+            .insert(association_id.clone(), association);
+        Some(association_id)
+    }
+}
+
+/// The bytes one stored VPC endpoint association holds: the fixed overhead of the record
+/// and the key it is stored under, plus the caller-chosen parts — the ARNs of the service
+/// network, the associated resource and its configuration group, the name of the service
+/// network, the failure code and reason, the two DNS entries and the tags. The association
+/// id and the accessibility are derived by this module or bounded by the model, so they are
+/// fixed-size, which is what the overhead constant stands for.
+///
+/// The overhead is charged so that an association carrying no ARN, no DNS entry and no tag
+/// is NOT free against the byte budget: every stored record costs something, so repeated
+/// writes advance the budget whatever they carry.
+///
+/// The ONE definition of that charge, the way [`vpc_endpoint_connection_payload_bytes`] is
+/// for a connection: a writer charges exactly it, and a removal path must give back the same
+/// number.
+pub fn vpc_endpoint_association_payload_bytes(association: &VpcEndpointAssociation) -> usize {
+    let text_bytes = |value: Option<&String>| -> usize { value.map_or(0, String::len) };
+    let entry_bytes = |entry: Option<&DnsEntry>| -> usize {
+        entry.map_or(0, |entry| dns_entry_list_bytes(::std::slice::from_ref(entry)))
+    };
+    STORED_RECORD_OVERHEAD_BYTES
+        .saturating_add(text_bytes(association.vpc_endpoint_id.as_ref()))
+        .saturating_add(text_bytes(association.service_network_arn.as_ref()))
+        .saturating_add(text_bytes(association.service_network_name.as_ref()))
+        .saturating_add(text_bytes(association.associated_resource_arn.as_ref()))
+        .saturating_add(text_bytes(
+            association.resource_configuration_group_arn.as_ref(),
+        ))
+        .saturating_add(text_bytes(association.failure_code.as_ref()))
+        .saturating_add(text_bytes(association.failure_reason.as_ref()))
+        .saturating_add(entry_bytes(association.dns_entry.as_ref()))
+        .saturating_add(entry_bytes(association.private_dns_entry.as_ref()))
+        .saturating_add(tag_list_bytes(
+            association.tags.as_deref().unwrap_or_default(),
+        ))
 }
 
 // =============================================================================

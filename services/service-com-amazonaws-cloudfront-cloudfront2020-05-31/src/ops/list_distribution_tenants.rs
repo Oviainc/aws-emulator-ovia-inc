@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDistributionTenants
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDistributionTenants`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Enumerates the persisted distribution tenants of this account, a page at a time:
+//! `MaxItems` is the page size, `Marker` is the tenant id the previous page ended at, and
+//! `NextMarker` arrives exactly when tenants remain.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDistributionTenants::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `AssociationFilter` narrows the listing to the tenants ASSOCIATED with the resources it
+//! names — "the distribution ID to filter by" and "the ID of the connection group to
+//! filter by" — so every summary, and the filter decision behind it, is read from the
+//! record the create or the last update persisted rather than from the request being
+//! served.
 //!
 //! ## Shape of an operation
 //!
@@ -74,6 +74,9 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::ops::Bound;
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -143,20 +146,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDistributionTenants` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDistributionTenantsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDistributionTenants"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+
+        // "The maximum number of distribution tenants to return" — a page holds at least one
+        // item, so a non-positive size names no page at all. The size served is bounded
+        // above by this emulator's own page ceiling, the same one every listing of this
+        // service is bounded by.
+        let Some(page_size) = crate::state::page_size(input.max_items) else {
+            return Err(ListDistributionTenantsErrorModeled::InvalidArgument(
+                crate::state::invalid_max_items(),
+            )
+            .into());
+        };
+
+        // "Filter by the associated distribution ID or connection group ID": each member the
+        // filter names is a resource a tenant is associated with, and a member carrying no
+        // value names no resource, so it narrows nothing.
+        let association_filter = input.association_filter.as_ref();
+        let distribution_filter = association_filter
+            .and_then(|filter| filter.distribution_id.as_deref())
+            .filter(|id| !id.is_empty());
+        let connection_group_filter = association_filter
+            .and_then(|filter| filter.connection_group_id.as_deref())
+            .filter(|id| !id.is_empty());
+
+        let mut store = state.lock();
+        // Materialise the propagation the clock already owes, so no summary this listing
+        // reports carries a stale status.
+        store.settle(SystemTime::now());
+
+        // The filter names resources of this account, so an id this service cannot resolve
+        // to one is an invalid argument rather than an empty page over a filter that matched
+        // nothing — the same answer every `AssociationFilter` of this service gives such an
+        // id. The sentence is the filter's own, so it says nothing about the value submitted.
+        let unresolvable = distribution_filter.is_some_and(|id| store.distribution(id).is_none())
+            || connection_group_filter.is_some_and(|id| !store.holds_connection_group(id));
+        if unresolvable {
+            return Err(ListDistributionTenantsErrorModeled::InvalidArgument(
+                crate::state::invalid_association_filter(),
+            )
+            .into());
+        }
+
+        // "The marker for the next set of results" is the tenant id the previous page ended
+        // at: a value that is not one was never a resume point this service handed out
+        // (`InvalidArgument`), and one that is but names no stored tenant names no entity,
+        // which is what this listing's `EntityNotFound` is about.
+        if let Some(marker) = input.marker.as_deref() {
+            if !crate::state::is_distribution_tenant_id(marker) {
+                return Err(ListDistributionTenantsErrorModeled::InvalidArgument(
+                    InvalidArgument {
+                        message: Some(format!(
+                            "Marker {marker} is not a distribution tenant id returned by \
+                             ListDistributionTenants"
+                        )),
+                    },
+                )
+                .into());
+            }
+            if !store.distribution_tenants.contains_key(marker) {
+                return Err(ListDistributionTenantsErrorModeled::EntityNotFound(
+                    crate::state::distribution_tenant_not_found(),
+                )
+                .into());
+            }
+        }
+
+        // `Marker` names where the previous page ENDED, so this page starts after it:
+        // walking the pages enumerates every tenant that passes the filter exactly once. The
+        // store is ordered by tenant id, so the resume point is a range bound rather than a
+        // scan.
+        let start = match input.marker.as_deref() {
+            Some(marker) => Bound::Excluded(marker),
+            None => Bound::Unbounded,
+        };
+        let mut tenants: Vec<DistributionTenantSummary> = Vec::new();
+        let mut more_remain = false;
+        for (_, stored) in store
+            .distribution_tenants
+            .range::<str, _>((start, Bound::Unbounded))
+        {
+            // A tenant is part of this listing when its OWN record names every resource the
+            // filter names: each member the filter carries narrows the listing to the
+            // tenants associated with that one resource, so a tenant created under another
+            // distribution, or routed through another connection group, is not part of it.
+            if distribution_filter.is_some_and(|wanted| stored.distribution_id != wanted)
+                || connection_group_filter
+                    .is_some_and(|wanted| stored.connection_group_id != wanted)
+            {
+                continue;
+            }
+            if tenants.len() >= page_size {
+                more_remain = true;
+                break;
+            }
+            tenants.push(stored.to_summary());
+        }
+
+        Ok(ListDistributionTenantsOutput {
+            // The resume point the next request carries as its `Marker`: present exactly
+            // when tenants remain, carrying the id this page ended at. A page that left
+            // tenants behind is a FULL page, so it has a last summary to name.
+            next_marker: tenants
+                .last()
+                .filter(|_| more_remain)
+                .map(|summary| summary.id.clone()),
+            // "The list of distribution tenants that you retrieved" — every one of them read
+            // from its stored record.
+            distribution_tenant_list: Some(tenants),
+        })
     }
 }
+

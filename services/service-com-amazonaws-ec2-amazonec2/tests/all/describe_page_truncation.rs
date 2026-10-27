@@ -11,8 +11,8 @@
 //! answer the token the same way for every describe, which is why the operation is a
 //! column of the table rather than an assumption:
 //!
-//! * `DescribeSubnets` and `DescribeVolumes` answer a token while a further item follows
-//!   the page, so the last page of a walk carries none
+//! * `DescribeSubnets`, `DescribeVolumes` and `DescribeFlowLogs` answer a token while a
+//!   further item follows the page, so the last page of a walk carries none
 //!   ([`ec2::state::PageTokenRule::WhenAnotherItemFollows`]);
 //! * `DescribeSecurityGroups` answers a token on every page that held groups, whether or
 //!   not `MaxResults` filled it, and the walk ends on the trailing EMPTY page that token
@@ -302,6 +302,40 @@ async fn seed_security_groups(
     (router, scope)
 }
 
+/// `DescribeFlowLogs`: `count` flow logs monitoring a VPC of this row's own, every one of
+/// them publishing to the row's own CloudWatch Logs log group and selected by
+/// `log-group-name`.
+///
+/// A create mints one flow log per monitored resource, so the row's set is built one call at
+/// a time on the same VPC; the log group is what gives the row a scope of its own, flow logs
+/// being an account's rather than a VPC's.
+async fn seed_flow_logs(
+    router: MultiServiceRouter,
+    row: usize,
+    count: usize,
+) -> (MultiServiceRouter, Vec<(String, String)>) {
+    let case = format!("seeding {count} flow logs");
+    let vpc_cidr = format!("10.{}.0.0/16", row + 200);
+    let vpc_id = minted(
+        &case,
+        &router,
+        "CreateVpc",
+        &[p("CidrBlock", vpc_cidr)],
+        "vpcId",
+    )
+    .await;
+    let log_group_name = format!("/aws/vpc/page-row-{row}-flow-logs");
+    for _ in 0..count {
+        // `CreateFlowLogs` answers its minted ids in a `flowLogIdSet`, whose entries are
+        // `item` elements; a create that minted none would answer no `item` at all, which
+        // `minted` refuses.
+        let params = super::flow_logs::cloud_watch_logs_params("VPC", &vpc_id, &log_group_name);
+        minted(&case, &router, "CreateFlowLogs", &params, "item").await;
+    }
+    let scope = filters(&[("log-group-name", &[log_group_name.as_str()])]);
+    (router, scope)
+}
+
 /// `DescribeVolumes`: `count` volumes of a size of this row's own, selected by `size` —
 /// volumes are not VPC-scoped, so the size is what gives each row a scope of its own.
 async fn seed_volumes(
@@ -342,6 +376,17 @@ async fn describe_volumes_ends_a_walk_when_no_volume_follows_the_page() {
         "volumeId",
         ec2::state::PageTokenRule::WhenAnotherItemFollows,
         seed_volumes,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn describe_flow_logs_ends_a_walk_when_no_flow_log_follows_the_page() {
+    assert_table(
+        "DescribeFlowLogs",
+        "flowLogId",
+        ec2::state::PageTokenRule::WhenAnotherItemFollows,
+        seed_flow_logs,
     )
     .await;
 }
