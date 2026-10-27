@@ -611,18 +611,6 @@ async fn getting_the_attributes_of_a_subscription_that_is_not_there_is_refused()
              11111111-1111-4111-8111-111111111111"
                 .to_string(),
         ),
-        (
-            "another region and account",
-            "arn:aws:sns:eu-west-1:123456789012:other-topic:\
-             22222222-2222-4222-8222-222222222222"
-                .to_string(),
-        ),
-        (
-            "another partition",
-            "arn:aws-us-gov:sns:us-gov-west-1:000000000000:gov-topic:\
-             33333333-3333-4333-8333-333333333333"
-                .to_string(),
-        ),
     ];
     for (case, arn) in &absent {
         let answer = sns
@@ -641,9 +629,11 @@ async fn getting_the_attributes_of_a_subscription_that_is_not_there_is_refused()
         );
     }
 
-    // And the values that are not subscription ARNs: too few elements, a topic ARN (one
-    // element short of a subscription's), an empty element, another service, and the two
-    // sentinels a `Subscribe` response or a listing carries for a pending subscription.
+    // And the values that are not subscription ARNs this endpoint serves: too few
+    // elements, a topic ARN (one element short of a subscription's), an empty element,
+    // another service, a subscription of another region (which this endpoint does not
+    // reach), and the two sentinels a `Subscribe` response or a listing carries for a
+    // pending subscription.
     let malformed = [
         "not-an-arn-at-all",
         "arn:aws:sns",
@@ -653,6 +643,9 @@ async fn getting_the_attributes_of_a_subscription_that_is_not_there_is_refused()
         "arn:aws:sqs:us-east-1:000000000000:q:11111111",
         "arn:aws:sns:us-east-1:000000000000:two words:11111111",
         "arn:aws:sns:us-east-1:000000000000:topic:id:extra",
+        "arn:aws:sns:eu-west-1:123456789012:other-topic:22222222-2222-4222-8222-222222222222",
+        "arn:aws-us-gov:sns:us-gov-west-1:000000000000:gov-topic:\
+         33333333-3333-4333-8333-333333333333",
         "pending confirmation",
         "PendingConfirmation",
     ];

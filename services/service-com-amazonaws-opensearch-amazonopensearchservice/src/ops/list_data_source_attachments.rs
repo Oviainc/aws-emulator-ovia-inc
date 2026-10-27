@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDataSourceAttachments
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDataSourceAttachments`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Returns a paginated list of all data source attachments for an OpenSearch
+//! application. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDataSourceAttachments::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The set belongs to the application, so an id naming none is the modelled
+//! missing-resource refusal rather than an empty page.
 //!
 //! ## Shape of an operation
 //!
@@ -84,6 +80,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    application_not_found, invalid_next_token, negative_max_results, service_state,
+    state_unavailable, DataSourceAttachment, ATTACHMENT_PAGE,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -156,18 +157,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDataSourceAttachments` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDataSourceAttachmentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDataSourceAttachments"))
+        let _ = ctx;
+        let state = service_state(&*self.engine).ok_or_else(state_unavailable)?;
+
+        // `maxResults` publishes no range at all, so the only value that is not a page
+        // size is a negative one, and that is refused rather than reinterpreted. The
+        // modelled default of 0 stays the request that asks for no particular page
+        // size.
+        if input.max_results < 0 {
+            return Err(ListDataSourceAttachmentsErrorModeled::ValidationException(
+                negative_max_results(input.max_results),
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The ONLY writes this report makes, and each writes only what the clock
+        // already owed a record at this instant had nobody called: an application whose
+        // provisioning has landed is active, and a pending attachment that has fallen
+        // due is reported in the status it is then in.
+        store.settle_for_attachments(now);
+
+        // The set belongs to the application, so an id the store holds no application
+        // for has no set to report: the modelled missing-resource refusal rather than an
+        // empty page.
+        let application = store.applications.get(&input.id).ok_or_else(|| {
+            ListDataSourceAttachmentsErrorModeled::ResourceNotFoundException(
+                application_not_found(&input.id),
+            )
+        })?;
+
+        // The order the attachments were made in, oldest first, and total — so the same
+        // request reports the same order twice, which is what lets a token name a place
+        // in the set. "Including attachments in all states", so no status is filtered
+        // out. Bounded by the store itself — an application holds at most one attachment
+        // per data source, and at most `ATTACHMENT_QUOTA` of them.
+        let attachments: Vec<&DataSourceAttachment> = application.attachments_in_creation_order();
+
+        // A token names the attachment the next page starts at, so paging resumes from a
+        // place in the set rather than from an offset an attach or a detach would have
+        // shifted. A token naming no attachment of the set — one this service never
+        // handed out, or one whose attachment has since been detached — names no such
+        // place, which is a malformed request rather than an empty page.
+        let start = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
+            None => 0,
+            Some(token) => attachments
+                .iter()
+                .position(|attachment| attachment.attachment_id == token)
+                .ok_or_else(|| {
+                    ListDataSourceAttachmentsErrorModeled::ValidationException(invalid_next_token())
+                })?,
+        };
+
+        // "The maximum number of results to return per page. The default is 50": a
+        // request that asks for no particular page size gets that default rather than an
+        // empty page. Every other value reaching here is positive, the check above
+        // having refused the rest.
+        let page_size = match input.max_results.unsigned_abs() as usize {
+            0 => ATTACHMENT_PAGE,
+            size => size,
+        };
+        let end = start.saturating_add(page_size).min(attachments.len());
+
+        Ok(ListDataSourceAttachmentsOutput {
+            attachments: Some(
+                attachments[start..end]
+                    .iter()
+                    .map(|attachment| attachment.to_summary())
+                    .collect(),
+            ),
+            // "The pagination token to use in a subsequent call to retrieve the next set
+            // of results": the attachment the next page starts at, and nothing once this
+            // page ended the set.
+            next_token: attachments
+                .get(end)
+                .map(|attachment| attachment.attachment_id.clone()),
+        })
     }
 }

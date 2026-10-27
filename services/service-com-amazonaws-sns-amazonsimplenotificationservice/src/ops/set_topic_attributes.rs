@@ -243,7 +243,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let invalid_parameter = |message: String| -> Self::Error {
             SetTopicAttributesErrorModeled::InvalidParameterException(InvalidParameterException {
@@ -252,6 +252,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into()
         };
 
+        // A `TopicArn` naming another region names a topic this endpoint does not
+        // serve, so the write is refused as bad input rather than applied to — or
+        // reported as missing from — another region's state.
+        let region = crate::state::request_region(ctx.parts());
+        if let Some(message) =
+            state::foreign_region_refusal("TopicArn", &input.topic_arn, &region)
+        {
+            return Err(invalid_parameter(message));
+        }
         // SNS defines a closed set of topic attribute names and refuses any other.
         if !state::is_topic_attribute(&input.attribute_name)
             || CREATE_ONLY_ATTRIBUTES.contains(&input.attribute_name.as_str())

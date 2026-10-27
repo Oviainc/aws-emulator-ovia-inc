@@ -20,7 +20,10 @@
 //!   call started the transition. It is also where a job run's start waits for a running
 //!   slot when its virtual cluster configures a `maxConcurrentJobRuns`, so the counts
 //!   [`ComAmazonawsEmrcontainersAwschicagowebserviceState::cluster_scheduler_status`]
-//!   reports never exceed the capacity the cluster was created with.
+//!   reports never exceed the capacity the cluster was created with. A run's walk does
+//!   not stop at that start: the admission owes the run its OUTCOME in turn, so a client
+//!   that polls a run reaches a terminal state with a `finishedAt` without anybody
+//!   cancelling it ([`JobRunRecord`]).
 //!
 //! Every record carries the region it was created in, and every lookup here takes that
 //! region: EMR on EKS is a regional service, so a resource exists only at the endpoint
@@ -38,8 +41,8 @@ use sha2::{Digest, Sha256};
 use crate::ops::types::{
     ConfigurationOverrides, ContainerInfo, ContainerProvider, Credentials, Endpoint,
     GetManagedEndpointSessionCredentialsOutput, JobDriver, JobRun, JobTemplate, JobTemplateData,
-    RetryPolicyConfiguration, SchedulerConfiguration, SchedulerStatus, SecurityConfiguration,
-    SecurityConfigurationData, VirtualCluster,
+    RetryPolicyConfiguration, RetryPolicyExecution, SchedulerConfiguration, SchedulerStatus,
+    SecurityConfiguration, SecurityConfigurationData, VirtualCluster,
 };
 
 /// The ARN namespace this service's ARNs carry (`OPERATIONS.md`: ARN namespace
@@ -66,6 +69,16 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// (see [`ComAmazonawsEmrcontainersAwschicagowebserviceState::settle`]).
 pub const TRANSITION_SPAN: Duration = Duration::from_millis(400);
 
+/// How long a job run this service has admitted stays `RUNNING` before the outcome of
+/// its driver comes due.
+///
+/// This is not a status step a resource takes by itself ([`TRANSITION_SPAN`]) but the
+/// span a run spends executing, so it is deliberately long enough that a client which
+/// polls `DescribeJobRun` observes the run `RUNNING` over several reads and still sees it
+/// reach a terminal state in seconds. EMR on EKS documents no duration for a job run —
+/// it is the submitted work's own — so this span is the emulator's own choice.
+pub const JOB_OUTCOME_SPAN: Duration = Duration::from_secs(5);
+
 /// `VirtualClusterState` members this slice uses. Each is a value of the generated
 /// `VIRTUAL_CLUSTER_STATE_VALUES` catalog in `ops::types::shared_types`.
 pub const CLUSTER_RUNNING: &str = "RUNNING";
@@ -75,11 +88,17 @@ pub const CLUSTER_TERMINATED: &str = "TERMINATED";
 /// `JobRunState` members this slice uses. Each is a value of the generated
 /// `JOB_RUN_STATE_VALUES` catalog in `ops::types::shared_types`.
 ///
-/// `JOB_SUBMITTED` is the one state no handler here writes: EMR on EKS reports it for a
-/// run handed to the scheduler, and this slice accepts a run `PENDING` and admits it to
-/// `RUNNING` from there. It is named because `job_state_is_terminal` and
+/// `JOB_SUBMITTED` is one of the two states no handler here writes: EMR on EKS reports it
+/// for a run handed to the scheduler, and this slice accepts a run `PENDING` and admits it
+/// to `RUNNING` from there. It is named because `job_state_is_terminal` and
 /// [`job_state_is_in_queue`] are written against the whole catalog, so a run in either
 /// waiting state is counted as queued.
+///
+/// `JOB_COMPLETED` is the other: it reports a driver that ran to completion, and this
+/// slice executes no Spark workload, so the outcome every admitted run reaches is the
+/// modelled failure state ([`JOB_NOT_EXECUTED_STATE_DETAILS`]) rather than a success
+/// nothing produced. It is named because `job_state_is_terminal` covers the whole
+/// catalog, so a `COMPLETED` value a caller FILTERS on is still classified.
 pub const JOB_PENDING: &str = "PENDING";
 pub const JOB_SUBMITTED: &str = "SUBMITTED";
 pub const JOB_RUNNING: &str = "RUNNING";
@@ -130,6 +149,51 @@ pub const JOB_IN_QUEUE_STATES: &[&str] = &[JOB_PENDING, JOB_SUBMITTED];
 /// Whether a `JobRunState` is one a run waiting in the scheduler queue is in.
 pub fn job_state_is_in_queue(state: &str) -> bool {
     JOB_IN_QUEUE_STATES.contains(&state)
+}
+
+/// `JobRun$stateDetails` for a run this service has admitted to its virtual cluster.
+pub const JOB_RUNNING_STATE_DETAILS: &str = "Job run admitted to the virtual cluster.";
+
+/// `JobRun$stateDetails` for a run whose cancellation has been accepted but not yet
+/// carried out.
+pub const JOB_CANCEL_PENDING_STATE_DETAILS: &str = "Job run cancellation requested.";
+
+/// `JobRun$stateDetails` for a run a cancellation ended.
+pub const JOB_CANCELLED_STATE_DETAILS: &str = "Job run cancelled before it finished.";
+
+/// `JobRun$stateDetails` for the outcome an admitted run reaches here.
+///
+/// This service is a control plane: it records a job run faithfully, but it executes no
+/// Spark workload, so the driver a run names never runs and the run ends in the modelled
+/// failure state with a detail that says exactly that. Reporting such a run as having
+/// succeeded would state an outcome nothing produced.
+pub const JOB_NOT_EXECUTED_STATE_DETAILS: &str =
+    "The job driver was not executed: this emulator records job runs and runs no Spark \
+     workload, so the job run ended without running.";
+
+/// `JobRun$failureReason` for that outcome, a value of the modelled `FailureReason` enum
+/// (`INTERNAL_ERROR`, `USER_ERROR`, `VALIDATION_ERROR`, `CLUSTER_UNAVAILABLE`).
+///
+/// Nothing the submission carried is at fault — the two caller-facing values do not
+/// apply — and the reason the driver never ran is that there is no Kubernetes cluster
+/// behind the virtual cluster's container provider to run it on, which is the one this
+/// value names.
+pub const JOB_NOT_EXECUTED_FAILURE_REASON: &str = "CLUSTER_UNAVAILABLE";
+
+/// The `JobRun$stateDetails` — "additional details of the job run state" — a run reports
+/// once it has settled into `state`.
+///
+/// One mapping for every state this service moves a run INTO, so a run's detail always
+/// describes the state it is reported in rather than an earlier one. A state a run merely
+/// waits in carries no detail beyond the state itself.
+pub fn job_run_state_details(state: &str) -> Option<&'static str> {
+    match state {
+        JOB_RUNNING => Some(JOB_RUNNING_STATE_DETAILS),
+        JOB_CANCEL_PENDING => Some(JOB_CANCEL_PENDING_STATE_DETAILS),
+        JOB_CANCELLED => Some(JOB_CANCELLED_STATE_DETAILS),
+        JOB_FAILED => Some(JOB_NOT_EXECUTED_STATE_DETAILS),
+        _ => None,
+    }
 }
 
 /// The scheduler limits a submitted `SchedulerConfiguration` actually configures.
@@ -663,9 +727,17 @@ pub struct PendingTransition {
 impl PendingTransition {
     /// A transition to `next_state`, due [`TRANSITION_SPAN`] from now.
     pub fn due(next_state: &'static str) -> Self {
+        Self::due_in(next_state, TRANSITION_SPAN)
+    }
+
+    /// A transition to `next_state`, due `span` from now — for a change the service owes
+    /// on a span of its own rather than on the status-step span every resource takes.
+    pub fn due_in(next_state: &'static str, span: Duration) -> Self {
         Self {
-            due_at: Instant::now() + TRANSITION_SPAN,
-            due_at_millis: now_millis() + i64::try_from(TRANSITION_SPAN.as_millis()).unwrap_or(0),
+            due_at: Instant::now()
+                .checked_add(span)
+                .unwrap_or_else(Instant::now),
+            due_at_millis: now_millis() + i64::try_from(span.as_millis()).unwrap_or(0),
             next_state,
         }
     }
@@ -795,6 +867,19 @@ pub struct JobRunRecord {
     pub created_at_millis: i64,
     pub finished_at_millis: Option<i64>,
     pub state_details: Option<String>,
+    /// Why this run failed, a value of the modelled `FailureReason` enum, recorded when
+    /// the run settles into `FAILED` and absent for every other state.
+    pub failure_reason: Option<String>,
+    /// How many attempts this service has made on the run's driver — what
+    /// `RetryPolicyExecution$currentAttemptCount` ("the current number of attempts made
+    /// on the driver of the job") reports.
+    ///
+    /// `0` while the run is still waiting for a slot: a waiting run has had no attempt
+    /// made on it. The admission that starts the run counts one, and the driver is not
+    /// re-driven past that — nothing executes it, so there is no further attempt to count.
+    /// A run that configured no retry policy reports no execution at all; the count is
+    /// still kept, so the one rule serves both.
+    pub attempt_count: i32,
     pub tags: HashMap<String, String>,
     /// The principal that submitted this run ([`caller_identity_arn`]), recorded at
     /// `StartJobRun` so every later read attributes the run to the same identity.
@@ -806,9 +891,17 @@ pub struct JobRunRecord {
 }
 
 impl JobRunRecord {
-    /// Materialise this job run's transition if the clock has made it due. A transition
-    /// into a terminal state is what sets `finishedAt`, and it reports the instant the
-    /// transition was owed at.
+    /// Materialise this job run's transition if the clock has made it due.
+    ///
+    /// Every state a run is moved into brings the detail of that state with it
+    /// ([`job_run_state_details`]), and a transition into a terminal state is what sets
+    /// `finishedAt`, which reports the instant the transition was owed at.
+    ///
+    /// The admission that starts a run is also what makes its OUTCOME due: a run AWS
+    /// hands back in a non-terminal state reaches a terminal one, so once this run is
+    /// `RUNNING` the clock owes it the end of its driver [`JOB_OUTCOME_SPAN`] later. That
+    /// end is the modelled failure state: this service executes no Spark workload, so the
+    /// driver never runs and the run says so in its `stateDetails` and `failureReason`.
     fn settle(&mut self, now: Instant) {
         let Some(pending) = self.pending.take() else {
             return;
@@ -818,16 +911,35 @@ impl JobRunRecord {
             return;
         }
         self.state = pending.next_state.to_string();
+        self.state_details = job_run_state_details(pending.next_state).map(str::to_string);
+        if pending.next_state == JOB_RUNNING {
+            // The admission starts an attempt on the driver, and owes its outcome.
+            self.attempt_count = self.attempt_count.saturating_add(1);
+            self.pending = Some(PendingTransition::due_in(JOB_FAILED, JOB_OUTCOME_SPAN));
+        }
         if job_state_is_terminal(pending.next_state) {
             self.finished_at_millis = Some(pending.due_at_millis);
+            if pending.next_state == JOB_FAILED {
+                self.failure_reason = Some(JOB_NOT_EXECUTED_FAILURE_REASON.to_string());
+            }
         }
     }
 
-    /// The modelled `JobRun` this record represents.
+    /// How the retry policy this run carries has been executed, as
+    /// `JobRun$retryPolicyExecution` reports it: the attempts made on its driver.
     ///
-    /// `failureReason` and `retryPolicyExecution` stay absent: nothing failed, and no
-    /// attempt was executed — this emulator runs no Spark job, so reporting an attempt
-    /// count would be fabricated.
+    /// Absent for a run submitted without a `retryPolicyConfiguration` — the member is
+    /// "the current status of the retry policy executed on the job", and a run that
+    /// configured no retry policy has none to report a status for.
+    fn retry_policy_execution(&self) -> Option<RetryPolicyExecution> {
+        self.retry_policy_configuration
+            .as_ref()
+            .map(|_| RetryPolicyExecution {
+                current_attempt_count: self.attempt_count,
+            })
+    }
+
+    /// The modelled `JobRun` this record represents.
     pub fn to_job_run(&self) -> JobRun {
         JobRun {
             id: Some(self.id.clone()),
@@ -844,10 +956,10 @@ impl JobRunRecord {
             created_by: Some(self.created_by.clone()),
             finished_at: self.finished_at_millis.map(date_time),
             state_details: self.state_details.clone(),
-            failure_reason: None,
+            failure_reason: self.failure_reason.clone(),
             tags: Some(self.tags.clone()),
             retry_policy_configuration: self.retry_policy_configuration.clone(),
-            retry_policy_execution: None,
+            retry_policy_execution: self.retry_policy_execution(),
         }
     }
 }
@@ -2230,7 +2342,7 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
     }
 
     /// Move a stored job run of this region into `now_state` with `next_state` owed to
-    /// the clock.
+    /// the clock. The run reports the detail of the state it is moved into.
     pub fn move_job_run(
         &mut self,
         region: &str,
@@ -2244,6 +2356,7 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
             .filter(|record| record.region == region)
         {
             record.state = now_state.to_string();
+            record.state_details = job_run_state_details(now_state).map(str::to_string);
             record.pending = Some(PendingTransition::due(next_state));
             self.pending_job_runs.insert(id.to_string());
         }

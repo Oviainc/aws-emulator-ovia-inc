@@ -326,15 +326,6 @@ async fn deleting_an_endpoint_the_account_does_not_hold_changes_nothing() {
         })
         .collect();
     cases.push((
-        "the held endpoint's ARN in another region".to_string(),
-        platform_endpoint_arn(
-            "eu-west-1",
-            endpoints[0].platform,
-            endpoints[0].application,
-            endpoints[0].id,
-        ),
-    ));
-    cases.push((
         "the held endpoint's ARN under another account".to_string(),
         kept.replace(":000000000000:", ":111111111111:"),
     ));
@@ -369,6 +360,43 @@ async fn deleting_an_endpoint_the_account_does_not_hold_changes_nothing() {
             held(&sns)
         );
     }
+
+    // An `EndpointArn` of ANOTHER REGION is not an endpoint this endpoint of the service
+    // can reach at all: both the delete and the read are refused as bad input rather than
+    // served against this region's state, and the held endpoint is untouched.
+    let elsewhere = platform_endpoint_arn(
+        "eu-west-1",
+        endpoints[0].platform,
+        endpoints[0].application,
+        endpoints[0].id,
+    );
+    for operation in ["DeleteEndpoint", "GetEndpointAttributes"] {
+        let answer = sns.call(operation, &[("EndpointArn", &elsewhere)]).await;
+        assert_eq!(
+            answer.status, 400,
+            "case another region on {operation}: expected 400, got {} / {}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.code(),
+            "InvalidParameter",
+            "case another region on {operation}: expected the InvalidParameter code, got {}",
+            answer.body
+        );
+        assert_eq!(
+            answer.element("Message").as_deref(),
+            Some("Invalid parameter: EndpointArn"),
+            "case another region on {operation}: expected the member's bare refusal \
+             sentence, got {}",
+            answer.body
+        );
+    }
+    assert_eq!(
+        held(&sns),
+        vec![kept.clone()],
+        "case another region: the held endpoint must survive a refused delete, got {:?}",
+        held(&sns)
+    );
 
     // The endpoint this account does hold is still readable, so none of the deletes
     // above touched it.

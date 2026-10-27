@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDataSourceAttachment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDataSourceAttachment`'s real behaviour. Implement it here — this is
+//! Returns the current status and details of a specific data source attachment. This is
 //! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDataSourceAttachment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The attachment belongs to the application, so an application and data source pair
+//! this account holds no attachment record for is the modelled missing-resource refusal.
 //!
 //! ## Shape of an operation
 //!
@@ -91,6 +87,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    application_not_found, attachment_not_found, service_state, state_unavailable,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -163,18 +163,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDataSourceAttachment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDataSourceAttachmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDataSourceAttachment"))
+        let _ = ctx;
+        let state = service_state(&*self.engine).ok_or_else(state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The ONLY writes this report makes, and each writes only what the clock
+        // already owed a record at this instant had nobody called: an application whose
+        // provisioning has landed is active, and a pending attachment that has fallen
+        // due is reported in the status it is then in.
+        store.settle_for_attachments(now);
+
+        // The attachment belongs to the application, so an id naming none holds no
+        // attachment to report.
+        let application = store.applications.get(&input.id).ok_or_else(|| {
+            DescribeDataSourceAttachmentErrorModeled::ResourceNotFoundException(
+                application_not_found(&input.id),
+            )
+        })?;
+
+        // "Throws a ResourceNotFoundException if no attachment record exists for the
+        // specified application and data source combination."
+        let attachment = application
+            .attachment(&input.data_source_arn)
+            .ok_or_else(|| {
+                DescribeDataSourceAttachmentErrorModeled::ResourceNotFoundException(
+                    attachment_not_found(&input.id, &input.data_source_arn),
+                )
+            })?;
+
+        // Answered from the STORED record, so the call that minted the attachment and
+        // this read of it cannot report one attachment differently.
+        Ok(DescribeDataSourceAttachmentOutput {
+            attachment_id: Some(attachment.attachment_id.clone()),
+            id: Some(application.id.clone()),
+            arn: Some(application.arn.clone()),
+            data_source_arn: Some(attachment.data_source_arn.clone()),
+            status: Some(attachment.status.clone()),
+        })
     }
 }

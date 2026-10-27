@@ -167,6 +167,8 @@ mod service_specific_credential_status;
 mod service_specific_credentials;
 #[path = "all/signing_certificates.rs"]
 mod signing_certificates;
+#[path = "all/simulated_decision_attribution.rs"]
+mod simulated_decision_attribution;
 #[path = "all/simulated_principal_sources.rs"]
 mod simulated_principal_sources;
 #[path = "all/simulated_resource_policy.rs"]

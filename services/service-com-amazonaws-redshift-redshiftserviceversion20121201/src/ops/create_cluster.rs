@@ -372,6 +372,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The create holds the store's lock; the event it raises is published
+        // once that lock is released, because a publish is an in-process call
+        // into another service and must not run under it.
+        let (output, identifier) = self.create(input, ctx)?;
+
+        // The cluster now exists, which is the event this write raises: every
+        // subscription scoped to it is told, on its own topic.
+        crate::state::notifications::raise(
+            ctx,
+            &*self.engine,
+            crate::state::EVENT_ID_CLUSTER_CREATED,
+            &identifier,
+            &[(crate::state::notifications::CLUSTER_NAME, &identifier)],
+        )
+        .await;
+
+        Ok(output)
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateCluster<Eng> {
+    /// The create itself: the output it reports, and the identifier of the
+    /// cluster it created — the source the event it raises is about.
+    ///
+    /// Everything that touches the store lives here, so the lock is held for the
+    /// write ALONE and nothing is awaited while it is.
+    fn create(
+        &self,
+        input: CreateClusterInput,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+    ) -> Result<(CreateClusterOutput, String), CreateClusterError> {
         use crate::state as st;
 
         let Some(state) = st::service_state(&*self.engine) else {
@@ -735,8 +766,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             available_at: started + st::PROVISIONING_SPAN,
         });
 
-        Ok(CreateClusterOutput {
-            cluster: Some(cluster),
-        })
+        Ok((
+            CreateClusterOutput {
+                cluster: Some(cluster),
+            },
+            identifier,
+        ))
     }
 }

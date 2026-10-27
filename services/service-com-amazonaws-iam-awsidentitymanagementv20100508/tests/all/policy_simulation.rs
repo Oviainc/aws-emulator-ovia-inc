@@ -248,8 +248,8 @@ async fn the_simulation_reports_the_decision_for_every_action() {
     }
 }
 
-/// RULE: every resource the request names is decided, and the per-resource decisions
-/// are reported beside the action's own.
+/// RULE: every resource the request names is decided, and the action's own result
+/// aggregates them — the most restrictive of their decisions.
 #[tokio::test]
 async fn every_named_resource_is_decided() {
     let router = router();
@@ -281,10 +281,15 @@ async fn every_named_resource_is_decided() {
         vec![ALLOWED.to_string(), IMPLICIT_DENY.to_string()],
         "expected one decision per named resource, in request order: {body}"
     );
+    // "The top-level EvalDecision reflects the most restrictive decision across all
+    // resources" (`EvaluationResult`), so the action's own decision is the implicit deny
+    // the second resource reached, not the allow the FIRST one did. The rows that span
+    // this aggregate live in `tests/all/simulated_decision_attribution.rs`.
     assert_eq!(
         reported(&body),
-        vec![("s3:GetObject".to_string(), ALLOWED.to_string())],
-        "expected the action's own decision to be the one for the first resource: {body}"
+        vec![("s3:GetObject".to_string(), IMPLICIT_DENY.to_string())],
+        "expected the action's own decision to be the most restrictive of its \
+         resources': {body}"
     );
 }
 

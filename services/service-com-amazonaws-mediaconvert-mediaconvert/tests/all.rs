@@ -59,6 +59,8 @@ mod preset_listing;
 mod preset_settings_validation;
 #[path = "all/preset_update.rs"]
 mod preset_update;
+#[path = "all/preset_update_container_integrity.rs"]
+mod preset_update_container_integrity;
 #[path = "all/queue_capacity_validation.rs"]
 mod queue_capacity_validation;
 #[path = "all/queue_concurrency_pool.rs"]

@@ -4283,6 +4283,10 @@ pub const FIELD_TOKEN_DOMAIN: &str = "TOKEN_DOMAIN";
 /// [`FIELD_RESOURCE_ARN`].
 pub const FIELD_CHALLENGE_CONFIG: &str = "CHALLENGE_CONFIG";
 
+/// The `ParameterExceptionField` value naming a logging destination. See
+/// [`FIELD_RESOURCE_ARN`].
+pub const FIELD_LOG_DESTINATION: &str = "LOG_DESTINATION";
+
 /// The `ErrorReason` WAF carries for an ARN it will not accept, as the recorded
 /// WAF responses show it.
 ///
@@ -4341,6 +4345,68 @@ pub fn invalid_parameter_exception(
 /// [`ARN_NOT_VALID_REASON`].
 pub fn invalid_arn_exception(arn: &str) -> WAFInvalidParameterException {
     invalid_parameter_exception(FIELD_RESOURCE_ARN, arn, ARN_NOT_VALID_REASON)
+}
+
+/// The prefix a logging destination's own NAME has to carry, from the
+/// `PutLoggingConfiguration` and `LoggingConfiguration` documentation
+/// (`smithy_query(query="doc",shape="LoggingConfiguration")`): "the name that you
+/// give the destination must start with `aws-waf-logs-`".
+pub const LOG_DESTINATION_NAME_PREFIX: &str = "aws-waf-logs-";
+
+/// The NAME of the logging destination `value` addresses, or `None` when `value` is
+/// not an ARN at all.
+///
+/// Every destination kind a configuration can name — a CloudWatch Logs log group, an
+/// S3 bucket, a Firehose delivery stream — addresses the destination by its name in
+/// the LAST segment of the ARN's resource part, whether that part separates its
+/// segments with colons (`…:log-group:<name>`) or with a slash
+/// (`…:deliverystream/<name>`) or is the bare name (`arn:aws:s3:::<name>`). A
+/// log-group ARN written with the trailing `:*` that addresses every stream inside
+/// the group still resolves to the group's name: the wildcard is not a name of its
+/// own.
+pub fn log_destination_name(value: &str) -> Option<&str> {
+    // An ARN's resource part is everything after the fifth colon and may itself
+    // contain colons, so the split stops there.
+    let mut segments = value.splitn(6, ':');
+    let (
+        Some("arn"),
+        Some(partition),
+        Some(service),
+        Some(_region),
+        Some(_account),
+        Some(resource),
+    ) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    )
+    else {
+        return None;
+    };
+    if partition.is_empty() || service.is_empty() {
+        return None;
+    }
+    let addressed = resource.strip_suffix(":*").unwrap_or(resource);
+    let name = addressed.split([':', '/']).next_back()?;
+    (!name.is_empty()).then_some(name)
+}
+
+/// `true` when `value` names a logging destination WAF delivers to: an ARN whose
+/// destination NAME carries [`LOG_DESTINATION_NAME_PREFIX`].
+pub fn is_acceptable_log_destination(value: &str) -> bool {
+    log_destination_name(value).is_some_and(|name| name.starts_with(LOG_DESTINATION_NAME_PREFIX))
+}
+
+/// [`invalid_parameter_exception`] for a logging destination WAF will not deliver
+/// to: `Field` [`FIELD_LOG_DESTINATION`] (the settings the destination was declared
+/// in), `Parameter` the rejected destination as the request wrote it and `Reason`
+/// [`ARN_NOT_VALID_REASON`] — the one sentence that class carries, a destination
+/// that is no ARN and a well-formed ARN WAF cannot use as a destination alike.
+pub fn invalid_log_destination_exception(destination: &str) -> WAFInvalidParameterException {
+    invalid_parameter_exception(FIELD_LOG_DESTINATION, destination, ARN_NOT_VALID_REASON)
 }
 
 /// The `ErrorReason` WAF carries when a rule list costs more web ACL capacity
