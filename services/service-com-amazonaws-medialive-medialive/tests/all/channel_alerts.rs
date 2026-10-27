@@ -42,7 +42,10 @@ type Engine = Arc<engine::InMemoryEngine>;
 /// A created channel of `class` (absent for the service's default), answering
 /// its id.
 async fn channel(router: &MultiServiceRouter, name: &str, class: Option<&str>) -> String {
-    let mut request = json!({ "name": name });
+    let mut request = json!({
+        "name": name,
+        "encoderSettings": crate::support::channel_encoder_settings(),
+    });
     if let Some(class) = class {
         request["channelClass"] = json!(class);
     }

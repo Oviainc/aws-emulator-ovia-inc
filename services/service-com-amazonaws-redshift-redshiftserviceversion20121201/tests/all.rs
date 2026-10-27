@@ -69,6 +69,8 @@ mod reboot_cluster;
 mod redshift_idc_applications;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/reserved_node_exchange.rs"]
+mod reserved_node_exchange;
 #[path = "all/reserved_node_offerings.rs"]
 mod reserved_node_offerings;
 #[path = "all/reserved_nodes.rs"]

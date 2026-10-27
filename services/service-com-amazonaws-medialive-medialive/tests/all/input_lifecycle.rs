@@ -372,6 +372,7 @@ async fn an_input_is_attached_exactly_while_a_channel_attaches_it() {
         Some(json!({
             "name": "attaching",
             "inputAttachments": [{ "inputId": input_id, "inputAttachmentName": "primary" }],
+            "encoderSettings": crate::support::channel_encoder_settings(),
         })),
     )
     .await;

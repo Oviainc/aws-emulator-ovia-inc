@@ -340,7 +340,10 @@ async fn an_update_only_reaches_a_cluster_the_store_holds() {
         &router,
         "POST",
         "/prod/channels",
-        Some(json!({ "name": "elsewhere" })),
+        Some(json!({
+            "name": "elsewhere",
+            "encoderSettings": crate::support::channel_encoder_settings(),
+        })),
     )
     .await;
     assert_eq!(
@@ -656,6 +659,7 @@ async fn an_update_touches_only_the_cluster_it_names() {
         Some(json!({
             "name": "placed",
             "anywhereSettings": { "clusterId": id, "channelPlacementGroupId": "7000000" },
+            "encoderSettings": crate::support::channel_encoder_settings(),
         })),
     )
     .await;

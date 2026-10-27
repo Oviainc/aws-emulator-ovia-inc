@@ -430,6 +430,8 @@ mod route_server_peers;
 mod route_servers;
 #[path = "all/search_local_gateway_routes.rs"]
 mod search_local_gateway_routes;
+#[path = "all/secondary_interfaces.rs"]
+mod secondary_interfaces;
 #[path = "all/secondary_networks.rs"]
 mod secondary_networks;
 #[path = "all/secondary_subnets.rs"]

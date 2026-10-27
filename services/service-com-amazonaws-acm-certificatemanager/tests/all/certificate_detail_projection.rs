@@ -415,8 +415,9 @@ async fn every_modelled_key_algorithm_is_described_as_its_x509_descriptor() {
         );
 
         // The value the filter selects on is the stored one, in the model's spelling:
-        // asking for this algorithm by name finds exactly this certificate, and its
-        // summary reports that spelling.
+        // asking for this algorithm by name finds exactly this certificate — and the
+        // summary it is found in REPORTS the same X.509 descriptor the detail does, so
+        // one certificate never carries two key algorithms.
         let (status, listed) = call(
             &router,
             "ListCertificates",
@@ -436,8 +437,8 @@ async fn every_modelled_key_algorithm_is_described_as_its_x509_descriptor() {
             .unwrap_or_else(|| panic!("case {requested}: {arn} is missing from {listed}"));
         assert_eq!(
             summary["KeyAlgorithm"].as_str(),
-            Some(*requested),
-            "case {requested}: a summary reports the spelling the filter uses, got {summary}"
+            Some(*descriptor),
+            "case {requested}: a summary reports the descriptor the detail reports, got {summary}"
         );
     }
 

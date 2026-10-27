@@ -71,10 +71,14 @@ mod certificate_retrieval;
 mod certificate_revocation;
 #[path = "all/certificate_search.rs"]
 mod certificate_search;
+#[path = "all/certificate_state_gated_refusals.rs"]
+mod certificate_state_gated_refusals;
 #[path = "all/certificate_tag_removal.rs"]
 mod certificate_tag_removal;
 #[path = "all/certificate_validation_state_machine.rs"]
 mod certificate_validation_state_machine;
+#[path = "all/certificate_wire_representation.rs"]
+mod certificate_wire_representation;
 #[path = "all/email_validation_dispatch.rs"]
 mod email_validation_dispatch;
 #[path = "all/generic_tagging_certificate_refusal_text.rs"]

@@ -139,6 +139,17 @@ impl IssuedWebIdentityTokens {
         self.issued.retain(|_, held| held.audience != audience);
     }
 
+    /// Drop every issuance made for `subject` — the identity the issuing call recorded —
+    /// because that identity no longer exists.
+    ///
+    /// The same judgement [`Self::forget_audience`] makes, one identity rather than
+    /// everything an audience holds: an issuing service that removes a single identity (it
+    /// was deleted, or merged into another) gives up the tokens that named it, so the
+    /// redeemer stops resolving them to a role.
+    pub fn forget_subject(&mut self, subject: &str) {
+        self.issued.retain(|_, held| held.subject != subject);
+    }
+
     /// Drop what the clock has already made unredeemable.
     fn prune(&mut self, now: SystemTime) {
         self.issued.retain(|_, held| now < held.expires_at);
@@ -245,6 +256,38 @@ mod tests {
             None,
             "case its own audience: an issuance the issuer gave up must stop resolving"
         );
+    }
+
+    /// RULE: an issuance the ISSUER gives up for its SUBJECT stops resolving, and an
+    /// issuance for any other subject does not.
+    #[test]
+    fn an_issuance_whose_subject_the_issuer_gave_up_stops_resolving() {
+        let mut registry = IssuedWebIdentityTokens::default();
+        let now = SystemTime::now();
+        // (the token, the subject it was issued for)
+        let rows: Vec<(&str, &str)> = vec![
+            ("merged-away", "identity-1"),
+            ("still-there", "identity-2"),
+            ("also-merged-away", "identity-1"),
+        ];
+        for (token, subject) in &rows {
+            registry.record(
+                (*token).to_string(),
+                issuance(subject, now + Duration::from_secs(600)),
+                now,
+            );
+        }
+
+        registry.forget_subject("identity-1");
+        for (token, subject) in &rows {
+            let resolves = registry.issued(token, now).is_some();
+            let expected = *subject != "identity-1";
+            assert_eq!(
+                resolves, expected,
+                "case {token:?} issued for {subject:?}: expected resolvable == {expected}, got \
+                 {resolves}"
+            );
+        }
     }
 
     /// The write path materialises both bounds: an expired record is dropped, and the

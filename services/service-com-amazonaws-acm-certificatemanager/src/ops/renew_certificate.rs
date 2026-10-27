@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RenewCertificate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RenewCertificate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: resolves the `CertificateArn` against this service's certificate store
+//! and starts ACM's managed renewal of the record stored under it, refusing an ARN that
+//! names no ACM certificate, an ARN naming no stored certificate, a certificate ACM has
+//! not finished issuing, and a certificate ACM does not renew, each with the modelled
+//! error that reports exactly that condition.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RenewCertificate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Renews an ELIGIBLE ACM certificate" (this operation's doc), and "only exported
+//! private certificates can be renewed with the RenewCertificate command"
+//! (`CertificateDetail$RenewalEligibility` doc), so the certificates this operation
+//! applies to are the ones whose `RenewalEligibility` says so
+//! (`crate::state::Certificate::renewal_eligibility`). The renewal it starts is owed
+//! from the call, like every other transition this service owes: the record reports it
+//! as `PENDING_AUTO_RENEWAL` until it falls due, and the renewed validity window from
+//! then on.
+//!
+//! That eligibility needs a certificate that HAS been exported, which is what puts a
+//! copy of it outside ACM. No operation in this emulator records an export yet —
+//! `ExportCertificate` answers the documented "has not yet been issued" refusal because
+//! this service mints no key pair for a certificate it was asked to issue — so what a
+//! caller sees today is the refusal above, and the renewal path below is what a stored
+//! export will reach; `crate::state::Certificate::exported` is the single fact between
+//! the two, exactly as it is for `RevokeCertificate`.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +178,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RenewCertificate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RenewCertificateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RenewCertificate"))
+        let _ = ctx;
+        // Unreachable in the assembled emulator (the engine is the shared store), and
+        // this operation models no server fault, so the modelled input error is the one
+        // honest answer left.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(RenewCertificateErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some("the acm certificate store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // The member's `@pattern` already admitted only an `acm` ARN; what is left is
+        // that it names a CERTIFICATE. Classified before any lookup, exactly as on every
+        // other operation that resolves `CertificateArn`.
+        if crate::state::certificate_id_from_arn(&input.certificate_arn).is_none() {
+            return Err(RenewCertificateErrorModeled::InvalidArnException(
+                InvalidArnException {
+                    message: Some(crate::state::invalid_arn_message(&input.certificate_arn)),
+                },
+            )
+            .into());
+        }
+
+        // ONE instant answers the whole request: it materialises whatever the clock
+        // already owed and dates the renewal this call starts.
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        // Every handler materialises what the clock already owes first, so this call
+        // decides on the record a caller would see at this instant — including a renewal
+        // that has since completed, which is not one still in progress.
+        store.materialize_due(now);
+        let Some(certificate) = store.certificates.get_mut(&input.certificate_arn) else {
+            return Err(RenewCertificateErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::certificate_not_found_message(
+                        &input.certificate_arn,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "The certificate request is in process and the certificate in your account
+        // has not yet been issued" (`RequestInProgressException` doc) is the condition
+        // of a request ACM is still working on: one whose validation has not settled,
+        // and one whose renewal this operation already started and has not finished. In
+        // both the answer is to wait, not to change the request — which is what sets
+        // this refusal apart from the one below.
+        if certificate.status == crate::state::STATUS_PENDING_VALIDATION
+            || certificate.renewal_in_progress()
+        {
+            return Err(RenewCertificateErrorModeled::RequestInProgressException(
+                RequestInProgressException {
+                    message: Some(crate::state::REQUEST_IN_PROGRESS_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // "Renews an eligible ACM certificate" (this operation's doc): a certificate
+        // whose `RenewalEligibility` is not `ELIGIBLE` is one ACM does not renew at all,
+        // so the request does not satisfy this operation's constraints — which is what
+        // `ValidationException` reports ("the supplied input failed to satisfy
+        // constraints of an Amazon Web Services service"). It is decided from the very
+        // member `DescribeCertificate` reports, so a caller that read `INELIGIBLE` is
+        // never told something else here.
+        if certificate.renewal_eligibility() != crate::state::RENEWAL_ELIGIBLE {
+            return Err(RenewCertificateErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::not_renewal_eligible_message(
+                        &input.certificate_arn,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The renewal is recorded on the stored record, so every later read reports it:
+        // `PENDING_AUTO_RENEWAL` while it is owed, and the renewed validity window once
+        // the instant it falls due has passed.
+        certificate.start_renewal(now);
+
+        Ok(RenewCertificateOutput)
     }
 }

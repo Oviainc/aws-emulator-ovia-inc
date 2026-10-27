@@ -28,7 +28,11 @@ struct Row {
 /// Create a channel of `class` and start it, returning the id of a channel that
 /// is `RUNNING`.
 async fn running_channel(router: &MultiServiceRouter, case: &str, class: &str) -> String {
-    let request = json!({ "name": format!("restart-{case}"), "channelClass": class });
+    let request = json!({
+        "name": format!("restart-{case}"),
+        "channelClass": class,
+        "encoderSettings": crate::support::channel_encoder_settings(),
+    });
     let (status, created) = call(router, "POST", "/prod/channels", Some(request)).await;
     assert_eq!(status, 201, "case {case:?}: CreateChannel: got {status}: {created}");
     let id = created["channel"]["id"]
@@ -272,7 +276,10 @@ async fn restarting_pipelines_is_refused_unless_the_channel_is_running() {
             &router,
             "POST",
             "/prod/channels",
-            Some(json!({ "name": format!("restart-{case}") })),
+            Some(json!({
+                "name": format!("restart-{case}"),
+                "encoderSettings": crate::support::channel_encoder_settings(),
+            })),
         )
         .await;
         assert_eq!(status, 201, "case {case:?}: CreateChannel: got {status}: {created}");
