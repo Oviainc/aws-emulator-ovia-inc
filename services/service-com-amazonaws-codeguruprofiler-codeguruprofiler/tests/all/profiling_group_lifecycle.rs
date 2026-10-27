@@ -37,6 +37,43 @@ pub(crate) fn group_arn(name: &str) -> String {
     format!("arn:aws:codeguru-profiler:{REGION}:{ACCOUNT}:profilingGroup/{name}")
 }
 
+/// The epoch-millisecond `start` a submitted agent profile states.
+///
+/// `PostAgentProfile` parses the data it is handed and refuses a profile that does not
+/// state the start of the period it covers, so every case that submits one submits a
+/// profile that states it. The instant itself is immaterial to what these cases assert —
+/// the receipt time the store records is the clock's, and a case that needs another one
+/// places it ([`crate::profile_times::place_receipts`]). `pub(crate)` so every suite in
+/// this target builds a submittable profile the same way.
+pub(crate) const PROFILE_START_MILLIS: i64 = 1_600_000_000_000;
+
+/// A submitted profile as JSON: its `start`, and `filler` bytes of padding so a case can
+/// name the SIZE of the payload it posts.
+pub(crate) fn json_profile(start: i64, filler: usize) -> Vec<u8> {
+    format!(
+        "{{\"start\":{start},\"filler\":\"{}\"}}",
+        "x".repeat(filler)
+    )
+    .into_bytes()
+}
+
+/// The same profile in Amazon Ion's binary encoding — what `application/x-amzn-ion`
+/// carries.
+pub(crate) fn ion_profile(start: i64, filler: usize) -> Vec<u8> {
+    ion_rs::Element::from(ion_rs::Struct::from_iter([
+        (
+            ion_rs::Symbol::from("start"),
+            ion_rs::Element::from(start),
+        ),
+        (
+            ion_rs::Symbol::from("filler"),
+            ion_rs::Element::from("x".repeat(filler)),
+        ),
+    ]))
+    .encode_as(ion_rs::v1_0::Binary)
+    .expect("an encodable Ion document")
+}
+
 /// Let the aggregation every profile a group holds is owed fall due, by moving each
 /// stored receipt time back past the span the service's aggregation takes.
 ///
@@ -713,7 +750,8 @@ async fn configure_agent_answers_from_the_stored_orchestration_config_and_record
 
 /// One posted agent profile. Rows differ in payload size, byte content and media
 /// type — the two media types are the ones the model's `GetProfile$contentType` doc
-/// names: "either application/json or the default application/x-amzn-ion".
+/// names: "either application/json or the default application/x-amzn-ion". Every row is
+/// a profile a caller could submit: `PostAgentProfile` parses the data it is handed.
 struct ProfileCase {
     label: &'static str,
     content_type: &'static str,
@@ -723,9 +761,9 @@ struct ProfileCase {
 fn profile_cases() -> Vec<ProfileCase> {
     vec![
         ProfileCase {
-            label: "one byte",
+            label: "the smallest profile",
             content_type: "application/json",
-            bytes: vec![b'{'],
+            bytes: format!("{{\"start\":{PROFILE_START_MILLIS}}}").into_bytes(),
         },
         ProfileCase {
             label: "small json",
@@ -733,14 +771,14 @@ fn profile_cases() -> Vec<ProfileCase> {
             bytes: br#"{"start":1,"frames":["A","B"]}"#.to_vec(),
         },
         ProfileCase {
-            label: "ion with every byte value",
+            label: "ion, binary encoded",
             content_type: "application/x-amzn-ion",
-            bytes: (0..=255u8).collect(),
+            bytes: ion_profile(PROFILE_START_MILLIS, 255),
         },
         ProfileCase {
             label: "64 KiB of ion",
             content_type: "application/x-amzn-ion",
-            bytes: (0..65_536u32).map(|i| (i % 251) as u8).collect(),
+            bytes: ion_profile(PROFILE_START_MILLIS, 65_536),
         },
     ]
 }
@@ -833,7 +871,7 @@ async fn a_posted_agent_profile_comes_back_byte_identical() {
                     &case.name,
                     "application/json",
                     Some(&format!("ptok-{index}")),
-                    b"{\"replaced\":true}".to_vec(),
+                    b"{\"start\":1600000000001,\"replaced\":true}".to_vec(),
                 )
                 .await
                 .status,
@@ -1009,7 +1047,12 @@ async fn deleting_a_group_removes_it_and_its_profiles() {
         );
         assert_eq!(
             harness
-                .post_agent_profile(&case.name, "application/json", None, b"{\"a\":1}".to_vec())
+                .post_agent_profile(
+                    &case.name,
+                    "application/json",
+                    None,
+                    b"{\"start\":1600000000000,\"a\":1}".to_vec(),
+                )
                 .await
                 .status,
             204,
@@ -1080,7 +1123,8 @@ async fn posting_profiles_stays_inside_the_per_group_retention_bound() {
 
     // Rows: payload sizes that reach the bound by count (many tiny profiles) and by
     // total bytes (few large ones). Either way the group must stay inside BOTH caps
-    // and must still serve the profile posted last.
+    // and must still serve the profile posted last. The size is the PADDING each
+    // submitted profile carries beside the `start` it must state.
     for (label, payload_bytes, posts) in [
         ("many tiny profiles", 8usize, MAX_RETAINED_PROFILES_PER_GROUP * 3 + 1),
         (
@@ -1103,7 +1147,10 @@ async fn posting_profiles_stays_inside_the_per_group_retention_bound() {
 
         let mut last = Vec::new();
         for post in 0..posts {
-            last = vec![u8::try_from(post % 256).unwrap_or(0); payload_bytes];
+            last = json_profile(
+                PROFILE_START_MILLIS + i64::try_from(post).unwrap_or(0),
+                payload_bytes,
+            );
             assert_eq!(
                 harness
                     .post_agent_profile(
@@ -1226,7 +1273,7 @@ async fn get_profile_selects_by_the_requested_time_range() {
         tags: BTreeMap::new(),
     };
     assert_eq!(harness.create(&case, "tok-window").await.status, 201);
-    let body = b"{\"frames\":[]}".to_vec();
+    let body = b"{\"start\":1600000000000,\"frames\":[]}".to_vec();
     assert_eq!(
         harness
             .post_agent_profile(&case.name, "application/json", None, body.clone())

@@ -17,10 +17,14 @@ mod front_door_refusals;
 mod pipe_configuration_rules;
 #[path = "all/pipe_data_plane.rs"]
 mod pipe_data_plane;
+#[path = "all/pipe_fifo_delivery.rs"]
+mod pipe_fifo_delivery;
 #[path = "all/pipe_description.rs"]
 mod pipe_description;
 #[path = "all/pipe_lifecycle.rs"]
 mod pipe_lifecycle;
+#[path = "all/pipe_lifecycle_conflicts.rs"]
+mod pipe_lifecycle_conflicts;
 #[path = "all/pipe_refusal_bodies.rs"]
 mod pipe_refusal_bodies;
 #[path = "all/pipe_tagging.rs"]

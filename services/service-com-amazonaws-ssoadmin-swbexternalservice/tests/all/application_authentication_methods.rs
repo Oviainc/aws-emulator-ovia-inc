@@ -964,6 +964,11 @@ async fn a_put_resolves_the_application_at_the_instant_of_the_call() {
         .as_str()
         .unwrap_or_else(|| panic!("CreateInstance returned no InstanceArn: {created}"))
         .to_string();
+    // The create owes the new instance its activation, and a write under an instance whose
+    // creation has not finished is refused, so the STORED activation instant is moved into
+    // the past — the clock's business, not the wire's, exactly as `hold_deletion` above
+    // moves a deletion instant.
+    crate::instance_create::hold_activation(&engine, SystemTime::now() - Duration::from_secs(60));
     let fresh = create_application(&router, &new_instance_arn, "held-one").await;
     let (status, body) = get_method(&router, &fresh, IAM).await;
     assert_eq!(

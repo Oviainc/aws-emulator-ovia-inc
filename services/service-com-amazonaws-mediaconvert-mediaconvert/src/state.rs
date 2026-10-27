@@ -1647,6 +1647,42 @@ pub fn decode_cursor(token: &str) -> Option<(u128, String)> {
     Some((nanos.parse().ok()?, id.to_string()))
 }
 
+/// What this service says of a `nextToken` it did not issue, as the two refusals below
+/// both open: the phrase lives here once so the readers that word it cannot drift apart.
+const UNISSUED_NEXT_TOKEN: &str = "nextToken is not a token this service issued";
+
+/// How this service refuses a `nextToken` it did not issue.
+///
+/// Every paged reader of this service words that one refusal, so the sentence lives here
+/// beside the decoder rather than in each of them.
+pub fn unissued_next_token_message() -> String {
+    format!("{UNISSUED_NEXT_TOKEN}.")
+}
+
+/// As [`unissued_next_token_message`], naming the token refused — which the reader that
+/// issues NO token words it with, since there the problem is that a token arrived at all
+/// rather than which page it names.
+pub fn unissued_next_token_named_message(token: &str) -> String {
+    format!("{UNISSUED_NEXT_TOKEN}: {token:?}.")
+}
+
+/// The ordering key a paged reader resumes after, for the `nextToken` its request carried:
+/// `None` when it carried none, the decoded key when the token is one [`encode_cursor`]
+/// issued, and [`unissued_next_token_message`] when it is not.
+///
+/// The decode-or-refuse rule, stated once: a token this service never issued names no page
+/// to resume at, so it is a problem in the request rather than an empty page or an
+/// arbitrary one. Each paged reader maps the refusal onto its own modelled
+/// `BadRequestException`, which is the only part of it that differs between them.
+pub fn resume_from_token(next_token: Option<&str>) -> Result<Option<(u128, String)>, String> {
+    match next_token {
+        None => Ok(None),
+        Some(token) => decode_cursor(token)
+            .map(Some)
+            .ok_or_else(unissued_next_token_message),
+    }
+}
+
 /// What a paged listing needs of ONE record: the key it is ordered and resumed on, and
 /// the cursor that resumes after it.
 ///

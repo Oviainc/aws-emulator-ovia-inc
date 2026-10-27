@@ -21,7 +21,9 @@
 //! * "The request must be made from the primary Region" and "The target Region cannot be
 //!   the primary Region" are the modelled `ValidationException`;
 //! * "no other add or remove Region workflows can be in progress" is the modelled
-//!   `ConflictException`.
+//!   `ConflictException`, and so is a remove made while the INSTANCE's own creation has
+//!   not finished — `DescribeInstance`: "While the instance is in the CREATE_IN_PROGRESS
+//!   state, you can call only DescribeInstance and DeleteInstance operations".
 //!
 //! ## Shape of an operation
 //!
@@ -229,6 +231,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             not_found(crate::state::instance_not_found_message(&input.instance_arn))
         })?;
         let primary_region = instance.primary_region.clone();
+
+        // An instance whose own CREATION has not finished serves only its own describe and
+        // delete ("While the instance is in the CREATE_IN_PROGRESS state, you can call only
+        // DescribeInstance and DeleteInstance operations"), so no Region of it can be
+        // removed until that creation finishes — the conflict with the `CreateInstance`
+        // still in flight.
+        if instance.creation_in_progress() {
+            return Err(
+                RemoveRegionErrorModeled::ConflictException(ConflictException {
+                    message: Some(crate::state::instance_creation_in_progress_message(
+                        &input.instance_arn,
+                    )),
+                })
+                .into(),
+            );
+        }
 
         // "The request must be made from the primary Region."
         if called_from != primary_region {

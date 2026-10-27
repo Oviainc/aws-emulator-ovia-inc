@@ -21,14 +21,26 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The ONE renderer of an AWS constraint refusal, shared with every other service on a
+# JSON protocol: `override_refusal` delegates the wording to it.
+service-common = { path = "../common" }
 # Hashes the per-call seed the `Uuid`-shaped `runId` / `codeArtifactId` are minted from,
 # and hex-encodes both those ids and a page cursor (so a `nextToken` always satisfies
 # the modelled `^[\S]+$`). Both are already workspace dependencies.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The KMS client `UpdateAccountConfiguration` resolves the submitted
+# `encryptionConfig.kmsKeyArn` through, over the in-process callback into this same
+# emulator (no network client feature is enabled: the transport is the emulator's own).
+aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
+
+[dev-dependencies]
+# The account-configuration suite mounts the KMS service beside CodeGuru Security on one
+# engine, because `UpdateAccountConfiguration` resolves the submitted key by calling it.
+service-com-amazonaws-kms-trentservice = { workspace = true }
 
 [lints]
 workspace = true

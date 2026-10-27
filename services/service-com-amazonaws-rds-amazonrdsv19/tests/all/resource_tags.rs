@@ -234,7 +234,10 @@ const UNPOPULATED_FAMILIES: &[(&str, &str, &str)] = &[
 
 /// The three tag operations, so a refusal table asserts the SAME answer from each: they
 /// address their resource the same way, so they refuse it the same way.
-const TAG_ACTIONS: &[(&str, &[(&str, &str)])] = &[
+///
+/// `pub(crate)` so a sibling suite asserting the WORDING of that refusal drives the same
+/// three operations rather than listing them again.
+pub(crate) const TAG_ACTIONS: &[(&str, &[(&str, &str)])] = &[
     (
         "AddTagsToResource",
         &[("Tags.Tag.1.Key", "owner"), ("Tags.Tag.1.Value", "platform")],

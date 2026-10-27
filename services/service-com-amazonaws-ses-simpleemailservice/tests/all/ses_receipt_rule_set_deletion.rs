@@ -26,8 +26,8 @@ use smithy_server_runtime::MultiServiceRouter;
 use std::sync::Arc;
 
 /// A router holding only this service, beside the engine it was built over, so a
-/// suite can seed a rule set holding RULES — `CreateReceiptRule` is still a
-/// scaffold stub, so the rules of a set cannot be written over the wire yet.
+/// suite can seed a rule set holding RULES directly, keeping each case about the
+/// operation under test rather than about `CreateReceiptRule`.
 fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     (emulator_over(Arc::clone(&engine)), engine)

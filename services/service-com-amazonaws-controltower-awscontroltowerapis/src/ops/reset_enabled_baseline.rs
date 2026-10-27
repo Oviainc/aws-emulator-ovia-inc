@@ -201,7 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // state `ConflictException` reports. This operation is not `@idempotent`, so a
         // repeat is refused rather than reported as the same operation — the rule
         // `UpdateEnabledBaseline` applies too.
-        if let Some(in_flight) = store.baseline_operation_in_flight(&arn) {
+        if let Some(in_flight) = store.baseline_change_in_flight_on(&arn) {
             return Err(ResetEnabledBaselineErrorModeled::ConflictException(
                 ConflictException {
                     message: format!(

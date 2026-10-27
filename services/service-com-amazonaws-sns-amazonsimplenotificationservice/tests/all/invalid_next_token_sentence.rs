@@ -8,7 +8,8 @@
 //! it arrived in, so the listing answers `InvalidParameterException` — HTTP 400,
 //! awsQuery code `InvalidParameter`
 //! (`smithy_query(query="operation", operation="ListTopics")`, and the same error on
-//! `ListSubscriptions`, `ListSubscriptionsByTopic` and `ListSMSSandboxPhoneNumbers`) —
+//! `ListSubscriptions`, `ListSubscriptionsByTopic`, `ListSMSSandboxPhoneNumbers` and
+//! `ListOriginationNumbers`) —
 //! and the sentence is `Invalid parameter:` plus the name of that member, carrying
 //! neither the rejected value nor a reason. The mobile-push listing states the same
 //! refusal with a trailing reason clause, which is the one row whose sentence differs.
@@ -63,6 +64,11 @@ async fn a_next_token_no_listing_minted_is_refused_with_the_members_sentence() {
         ),
         (
             "ListSMSSandboxPhoneNumbers",
+            Vec::new(),
+            INVALID_NEXT_TOKEN_REFUSAL,
+        ),
+        (
+            "ListOriginationNumbers",
             Vec::new(),
             INVALID_NEXT_TOKEN_REFUSAL,
         ),

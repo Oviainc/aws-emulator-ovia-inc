@@ -19,6 +19,8 @@ mod arn_scope_refusals;
 mod arn_scope_is_relative_to_the_request;
 #[path = "all/attach_points.rs"]
 mod attach_points;
+#[path = "all/bandwidth_availability.rs"]
+mod bandwidth_availability;
 #[path = "all/billing_tier.rs"]
 mod billing_tier;
 #[path = "all/caller_created_gateways_are_attach_points.rs"]

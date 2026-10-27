@@ -33,8 +33,8 @@ use std::time::{Duration, UNIX_EPOCH};
 const SEEDED_CREATED_AT_SECS: u64 = 1_767_225_600;
 
 /// A router holding only this service, beside the engine it was built over, so a
-/// row can seed a rule set holding RULES — `CreateReceiptRule` is still a
-/// scaffold stub, so the rules of a set cannot be written over the wire yet.
+/// row can seed a rule set holding RULES directly, keeping each row about the
+/// operation under test rather than about `CreateReceiptRule`.
 fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     (emulator_over(Arc::clone(&engine)), engine)

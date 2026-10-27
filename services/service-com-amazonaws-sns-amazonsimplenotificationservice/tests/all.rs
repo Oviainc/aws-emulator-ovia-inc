@@ -53,6 +53,9 @@ mod invalid_next_token_sentence;
 #[path = "all/list_subscriptions.rs"]
 mod list_subscriptions;
 
+#[path = "all/origination_numbers_listing.rs"]
+mod origination_numbers_listing;
+
 #[path = "all/phone_number_opt_in.rs"]
 mod phone_number_opt_in;
 

@@ -35,6 +35,8 @@ mod enable_control_persistence;
 mod enable_control_validation;
 #[path = "all/enabled_baseline_drift.rs"]
 mod enabled_baseline_drift;
+#[path = "all/enabled_baseline_pending_transitions.rs"]
+mod enabled_baseline_pending_transitions;
 #[path = "all/enabled_baseline_reset.rs"]
 mod enabled_baseline_reset;
 #[path = "all/enabled_baseline_update.rs"]

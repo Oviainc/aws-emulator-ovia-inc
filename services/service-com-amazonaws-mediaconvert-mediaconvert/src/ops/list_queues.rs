@@ -178,23 +178,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A `nextToken` is decoded BEFORE the store is touched: a token this service never
         // issued is a bad request, and refusing it first keeps the handler's one write off
-        // a request that is going to fail anyway.
-        let resume_from = match input.next_token.as_deref() {
-            None => None,
-            Some(token) => {
-                let Some(cursor) = crate::state::decode_cursor(token) else {
-                    return Err(ListQueuesErrorModeled::BadRequestException(
-                        BadRequestException {
-                            message: Some(
-                                "nextToken is not a token this service issued.".to_string(),
-                            ),
-                        },
-                    )
-                    .into());
-                };
-                Some(cursor)
-            }
-        };
+        // a request that is going to fail anyway. The rule and its one refusal sentence are
+        // the state module's; only the modelled error it is answered as is this
+        // operation's.
+        let resume_from = crate::state::resume_from_token(input.next_token.as_deref()).map_err(
+            |message| {
+                ListQueuesErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(message),
+                })
+            },
+        )?;
 
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();

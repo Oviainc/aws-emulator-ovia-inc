@@ -2,8 +2,10 @@
 
 //! @op StartPipe
 //! IMPLEMENTED: moves the stored pipe's `DesiredState` to `RUNNING` and its
-//! `CurrentState` through `STARTING`. An unknown name is `NotFoundException` (404). This
-//! is the ONLY file to touch for this operation.
+//! `CurrentState` through `STARTING`, and starts the data-plane poller that a RUNNING
+//! pipe is. A start that lands while a move is already in flight is
+//! `ConflictException` (409); an unknown name is `NotFoundException` (404). This is the
+//! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -165,6 +167,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let pipe = state.pipes.get_mut(&input.name).ok_or_else(|| {
             StartPipeErrorModeled::NotFoundException(crate::state::pipe_not_found(&input.name))
         })?;
+
+        // A pipe whose last call left it mid-transition is not startable: the move in
+        // flight has to land first, so a second move is refused with the conflict error
+        // the model declares rather than interleaved with it. Of two simultaneous starts
+        // on a resting pipe the first one through this gate is therefore the only one
+        // accepted — the other arrives while the pipe is STARTING and is refused.
+        if pipe.transient_state().is_some() {
+            return Err(StartPipeErrorModeled::ConflictException(
+                crate::state::pipe_conflict(&pipe.name),
+            )
+            .into());
+        }
 
         pipe.desired_state = crate::state::requested_state::RUNNING.to_string();
         pipe.begin_transition(

@@ -25,7 +25,7 @@ use aws_smithy_types::date_time::Format;
 use ion_rs::{Element, v1_0};
 
 use crate::interval_validation::{create_group, expected_refusal};
-use crate::profile_times::place_receipts;
+use crate::profile_times::{place_profile, place_receipts};
 use crate::profiling_group_lifecycle::Harness;
 
 /// The instant every case below places its stored profile at, in epoch seconds: long
@@ -70,6 +70,18 @@ async fn group_holding(harness: &Harness, name: &str, content_type: &str, bytes:
     place_receipts(harness, name, &[RECEIPT_SECONDS]);
 }
 
+/// A group holding exactly one STORED profile whose bytes are not a profile a caller
+/// could submit, placed at [`RECEIPT_SECONDS`].
+///
+/// `PostAgentProfile` parses the data it is handed and refuses data that is not an agent
+/// profile — bytes that are no document, and a document whose root is not a struct — so
+/// the cases about what a READER does with such stored bytes place them in the store
+/// directly, through the one shared [`place_profile`].
+async fn group_storing(harness: &Harness, name: &str, content_type: &str, bytes: Vec<u8>) {
+    create_group(harness, name).await;
+    place_profile(harness, name, content_type, bytes, RECEIPT_SECONDS);
+}
+
 /// The durations the window table spans, as (the ISO 8601 text, the span it names in
 /// milliseconds).
 ///
@@ -101,7 +113,7 @@ const PERIODS: &[(&str, i64)] = &[
 #[tokio::test]
 async fn a_period_names_the_length_of_the_requested_window() {
     let harness = Harness::new();
-    let body = br#"{"callgraph":{"A":{}},"samples":1}"#.to_vec();
+    let body = br#"{"start":1600000000000,"callgraph":{"A":{}},"samples":1}"#.to_vec();
     group_holding(&harness, "period-window", JSON, body.clone()).await;
 
     for (period, millis) in PERIODS {
@@ -168,7 +180,13 @@ async fn a_period_names_the_length_of_the_requested_window() {
 #[tokio::test]
 async fn a_period_that_names_no_fixed_span_is_refused() {
     let harness = Harness::new();
-    group_holding(&harness, "period-bad", JSON, b"{}".to_vec()).await;
+    group_holding(
+        &harness,
+        "period-bad",
+        JSON,
+        b"{\"start\":1600000000000}".to_vec(),
+    )
+    .await;
 
     let rows: [(&str, &str); 8] = [
         ("a bare designator", "P"),
@@ -312,13 +330,25 @@ async fn max_depth_leaves_out_the_frames_nested_deeper_than_it() {
 
     // A frame tree written as nested LISTS is bounded the same way: the depth of a frame
     // is how many containers of the document it sits inside, whatever kind they are.
-    let listed = serde_json::json!({ "frames": [["A", ["B"]]] });
+    let listed = serde_json::json!({
+        "frames": [["A", ["B"]]],
+        "start": 1_600_000_000_000i64,
+    });
     let body = serde_json::to_vec(&listed).expect("a serializable document");
     group_holding(&harness, "depth-lists", JSON, body).await;
     let list_rows: Vec<(i64, serde_json::Value)> = vec![
-        (1, serde_json::json!({ "frames": [] })),
-        (2, serde_json::json!({ "frames": [[]] })),
-        (3, serde_json::json!({ "frames": [["A", []]] })),
+        (
+            1,
+            serde_json::json!({ "frames": [], "start": 1_600_000_000_000i64 }),
+        ),
+        (
+            2,
+            serde_json::json!({ "frames": [[]], "start": 1_600_000_000_000i64 }),
+        ),
+        (
+            3,
+            serde_json::json!({ "frames": [["A", []]], "start": 1_600_000_000_000i64 }),
+        ),
         (4, listed.clone()),
     ];
     for (max_depth, expected) in list_rows {
@@ -378,7 +408,11 @@ async fn accept_chooses_the_representation_a_profile_is_served_in() {
     // Integers only: the document is compared against the Ion reading of its own JSON
     // text, and Ion text reads a number with a fraction as a decimal where JSON's data
     // model has a float.
-    let document = serde_json::json!({ "callgraph": { "A": { "B": {} } }, "samples": 3 });
+    let document = serde_json::json!({
+        "callgraph": { "A": { "B": {} } },
+        "samples": 3,
+        "start": 1_600_000_000_000i64,
+    });
     let body = serde_json::to_vec(&document).expect("a serializable document");
     group_holding(&harness, "accept-json", JSON, body.clone()).await;
 
@@ -448,7 +482,8 @@ async fn an_ion_profile_is_served_in_either_representation() {
     let harness = Harness::new();
     let document = ion_document(
         r#"{ callgraph: { A: { B: { } } }, samples: 3, name: "demo", tag: symbolic,
-             when: 2020-09-13T12:26:40Z, payload: {{aGk=}}, ratio: 1.5 }"#,
+             when: 2020-09-13T12:26:40Z, payload: {{aGk=}}, ratio: 1.5,
+             start: 1600000000000 }"#,
     );
     let body = ion_bytes(&document);
     group_holding(&harness, "accept-ion", ION, body.clone()).await;
@@ -508,6 +543,7 @@ async fn an_ion_profile_is_served_in_either_representation() {
             "tag": "symbolic",
             "payload": "aGk=",
             "ratio": 1.5,
+            "start": 1_600_000_000_000i64,
         }),
         "case Ion served as JSON: expected the down-converted document, got {served}"
     );
@@ -523,7 +559,8 @@ async fn an_ion_profile_is_served_in_either_representation() {
     let served = ion_read(&bounded.body);
     let expected = ion_document(
         r#"{ callgraph: { A: { } }, samples: 3, name: "demo", tag: symbolic,
-             when: 2020-09-13T12:26:40Z, payload: {{aGk=}}, ratio: 1.5 }"#,
+             when: 2020-09-13T12:26:40Z, payload: {{aGk=}}, ratio: 1.5,
+             start: 1600000000000 }"#,
     );
     assert_eq!(
         served, expected,
@@ -581,7 +618,7 @@ async fn a_document_inside_the_read_bound_is_served_bounded() {
             nested_ion_containers(120),
         ),
     ] {
-        group_holding(&harness, name, content_type, bytes).await;
+        group_storing(&harness, name, content_type, bytes).await;
         let answer = harness
             .get_profile_accepting(name, "?maxDepth=2", Some(JSON))
             .await;
@@ -627,7 +664,7 @@ async fn a_document_past_the_read_bound_is_served_as_it_is_stored() {
             br#"{ callgraph: { A: { } } }"#.to_vec(),
         ),
     ] {
-        group_holding(&harness, name, content_type, bytes.clone()).await;
+        group_storing(&harness, name, content_type, bytes.clone()).await;
         for (ask, query, accept) in [
             ("a depth bound", "?maxDepth=2", None),
             ("the other representation", "", Some(JSON)),
@@ -671,7 +708,7 @@ async fn a_payload_that_is_no_document_is_served_as_it_is_stored() {
 
     for (index, (label, content_type, bytes)) in rows.into_iter().enumerate() {
         let name = format!("opaque-{index}");
-        group_holding(&harness, &name, content_type, bytes.clone()).await;
+        group_storing(&harness, &name, content_type, bytes.clone()).await;
 
         for (ask, query, accept) in [
             ("a depth bound", "?maxDepth=2", None),

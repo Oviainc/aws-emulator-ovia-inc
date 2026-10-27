@@ -879,10 +879,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     None => {
                         return Err(CreateDBClusterErrorModeled::DBClusterNotFoundFault(
                             DBClusterNotFoundFault {
-                                message: Some(format!(
-                                    "The source cluster could not be found or cannot be \
-                                     accessed: {named}"
-                                )),
+                                message: Some(
+                                    crate::state::db_cluster_cannot_be_accessed_message(named),
+                                ),
                             },
                         )
                         .into())
@@ -1087,6 +1086,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .enable_global_write_forwarding
                 .unwrap_or(false),
             cluster_create_time: crate::state::now_as_wire_timestamp(),
+            // Nothing has moved the writer of a cluster this call has just created, so the
+            // member created first is its primary; see `DbClusterRecord::writer_identifier`.
+            writer_identifier: None,
             tags,
         };
 

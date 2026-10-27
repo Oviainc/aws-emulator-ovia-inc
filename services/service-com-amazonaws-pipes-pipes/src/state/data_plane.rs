@@ -22,7 +22,15 @@
 //!   an Amazon SQS queue's `SendMessage` takes ONE payload per call, and
 //!   `PipeTargetSqsQueueParameters` carries only `MessageGroupId` and
 //!   `MessageDeduplicationId` — no batch member — so a batch of N events becomes N
-//!   messages of one event each, never one message holding an array.
+//!   messages of one event each, never one message holding an array. A parameter's value
+//!   is used as configured unless it is a JSON path into the event (`$.…`), which is
+//!   resolved against each event delivered, so the value can be the record's own.
+//!
+//! Either of those last two stages may be handed something OTHER than the event: an
+//! `InputTemplate` is what that stage receives instead, rendered per event from the
+//! values its `<$.…>` placeholders select in the event, so a target configured with one
+//! receives the payload the template spells out rather than the record envelope
+//! ([`render_template`]).
 //!
 //! A source record is deleted only once every event derived from it has been delivered,
 //! so a target the pipe could not reach leaves the record on the queue to reappear when
@@ -112,6 +120,61 @@ const STATE_MACHINE_RESOURCE: &str = "stateMachine";
 
 /// `ReceiveMessage`'s selector for every attribute: "All".
 const ALL_ATTRIBUTES: &str = "All";
+
+/// What a target parameter's value starts with when it is a JSON path INTO THE EVENT
+/// rather than a literal value: EventBridge Pipes resolves such a value against each
+/// event it delivers, so one pipe can take a per-record value from the record itself.
+///
+/// `PipeTargetParameters`' own documentation names this form — "how to use dynamic path
+/// parameters" — as part of what a pipe's target parameters are.
+const DYNAMIC_PATH_PREFIX: &str = "$.";
+
+/// The `MessageGroupId` target parameter, named as the model names it — what a
+/// resolution failure of that parameter is reported by.
+const MESSAGE_GROUP_ID: &str = "MessageGroupId";
+
+/// The `MessageDeduplicationId` target parameter, likewise.
+const MESSAGE_DEDUPLICATION_ID: &str = "MessageDeduplicationId";
+
+/// What an `InputTemplate` OPENS a placeholder with, before the JSON path of the value
+/// the placeholder stands for.
+const PLACEHOLDER_OPEN: char = '<';
+
+/// What it CLOSES one with.
+const PLACEHOLDER_CLOSE: char = '>';
+
+/// The path that selects the WHOLE event, which a template uses to pass the event on
+/// unchanged.
+const WHOLE_EVENT_PATH: &str = "$";
+
+/// The character a JSON string opens and closes with, as the text a rendering trims it
+/// from.
+const JSON_STRING_QUOTE: &str = "\"";
+
+/// That same character, for the walk that counts the quotes before a placeholder.
+const JSON_STRING_QUOTE_CHARACTER: char = '"';
+
+/// The character that escapes the next one inside a JSON string.
+const JSON_STRING_ESCAPE: char = '\\';
+
+/// The most bytes of template one render walks.
+///
+/// The model states this bound on the member itself (`InputTemplate` is
+/// `@length(max: 8192)`) and the request boundary enforces it, so this is that same
+/// bound checked where the walk RELIES on it: the template is read from stored state, and
+/// a render is refused rather than walked when the text it was handed is longer than a
+/// template may be.
+const MAX_TEMPLATE_BYTES: usize = 8192;
+
+/// The most one event's render may come to.
+///
+/// This is the EMULATOR's bound, not an AWS number: a template is bounded (8192 bytes)
+/// but it may name the same value of the event many times, so what it renders is not
+/// bounded by its own length. 256 KiB is what an Amazon SQS message carries at most
+/// ("The minimum size is 1 byte. The maximum is 262,144 bytes (256 KiB)",
+/// `SendMessage`), so a render past it is a payload no delivery could take: the render
+/// fails and the record stays on the source rather than the batch growing the heap.
+const MAX_RENDERED_PAYLOAD: usize = 256 * 1024;
 
 /// Start the in-process poller for the pipe named `pipe_name`, if one is not already
 /// running for it.
@@ -334,18 +397,37 @@ async fn move_one_batch(
         .collect();
 
     // What the TARGET stage delivers: the enrichment's answer when the pipe has one,
-    // the polled batch itself when it has none.
+    // the polled batch itself when it has none. An enrichment is handed the records
+    // rendered through ITS input template, when the pipe carries one, because that
+    // template is what it receives instead of the record.
     let events = match &run.enrichment {
         None => batch,
-        Some(enrichment) => match invoke_enrichment(callback, clients, enrichment, &batch).await {
-            Ok(events) => events,
-            Err(detail) => return Batch::Failed(detail),
-        },
+        Some(enrichment) => {
+            let handed = match transformed(run.enrichment_template.as_deref(), batch) {
+                Ok(handed) => handed,
+                Err(detail) => return Batch::Failed(detail),
+            };
+            match invoke_enrichment(callback, clients, enrichment, &handed).await {
+                Ok(events) => events,
+                Err(detail) => return Batch::Failed(detail),
+            }
+        }
     };
 
-    // One target call per event, never one call holding the array.
+    // One target call per event, never one call holding the array. What the target
+    // RECEIVES is the event rendered through the TARGET's input template, when the pipe
+    // carries one; the target parameters are read from the event itself either way.
     for event in &events {
-        if let Err(detail) = deliver_event(callback, clients, &run.target, event).await {
+        let payload = match run.target_template.as_deref() {
+            None => ::std::borrow::Cow::Borrowed(event),
+            Some(template) => match render_template(template, event) {
+                Ok(payload) => ::std::borrow::Cow::Owned(payload),
+                Err(detail) => return Batch::Failed(detail),
+            },
+        };
+        if let Err(detail) =
+            deliver_event(callback, clients, &run.target, payload.as_ref(), event).await
+        {
             return Batch::Failed(detail);
         }
     }
@@ -564,10 +646,15 @@ fn enrichment_events(returned: &[u8], arn: &str) -> Result<Vec<Value>, String> {
 }
 
 /// Deliver ONE event to the target.
+///
+/// `payload` is what the target RECEIVES — the event, or the event rendered through the
+/// target's input template — while `event` is the event itself, which the target
+/// parameters are read from.
 async fn deliver_event(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     clients: &mut Clients,
     target: &Target,
+    payload: &Value,
     event: &Value,
 ) -> Result<(), String> {
     match target {
@@ -577,15 +664,25 @@ async fn deliver_event(
             message_group_id,
             message_deduplication_id,
         } => {
+            // Each parameter is read for THIS event, so one that is a path into the event
+            // contributes the record's own value rather than one constant for every
+            // record — which is what lets a FIFO target keep a group or a deduplication
+            // token per record.
+            let group = resolved_parameter(MESSAGE_GROUP_ID, message_group_id.as_deref(), event)?;
+            let deduplication = resolved_parameter(
+                MESSAGE_DEDUPLICATION_ID,
+                message_deduplication_id.as_deref(),
+                event,
+            )?;
             let mut request = clients
                 .sqs(callback, region)
                 .send_message()
                 .queue_url(url)
-                .message_body(target_body(event));
-            if let Some(group) = message_group_id {
+                .message_body(target_body(payload));
+            if let Some(group) = group {
                 request = request.message_group_id(group);
             }
-            if let Some(deduplication) = message_deduplication_id {
+            if let Some(deduplication) = deduplication {
                 request = request.message_deduplication_id(deduplication);
             }
             request.send().await.map_err(|error| {
@@ -599,6 +696,56 @@ async fn deliver_event(
     }
 }
 
+/// The value the target parameter `member` contributes to ONE delivery, or `None` when
+/// the pipe configures none.
+///
+/// A configured value is used AS GIVEN unless it is a JSON path into the event
+/// ([`DYNAMIC_PATH_PREFIX`]), which is resolved against the event being delivered through
+/// the one bounded reference-path evaluation of this tree
+/// (`service_common::json_reference_path`): the one value it names, as the text a message
+/// member carries. A path that names no one value of the event, or names something that
+/// is not a single value, is a FAILED delivery rather than a message carrying the path
+/// itself — the record stays on the source and the pipe tries again, exactly as for a
+/// target that refused the event.
+fn resolved_parameter(
+    member: &str,
+    configured: Option<&str>,
+    event: &Value,
+) -> Result<Option<String>, String> {
+    let Some(configured) = configured else {
+        return Ok(None);
+    };
+    if !configured.starts_with(DYNAMIC_PATH_PREFIX) {
+        return Ok(Some(configured.to_string()));
+    }
+    let selected = ::service_common::json_reference_path::select(configured, event).ok_or_else(
+        || format!("the target parameter {member} {configured} names no one value of the event"),
+    )?;
+    match selected {
+        Value::String(text) => Ok(Some(text.clone())),
+        Value::Number(number) => Ok(Some(number.to_string())),
+        Value::Bool(flag) => Ok(Some(flag.to_string())),
+        other => Err(format!(
+            "the target parameter {member} {configured} names a {}, which is not a value a \
+             message carries",
+            kind_of(other)
+        )),
+    }
+}
+
+/// What KIND of value a path named, for a failure that must not copy the event into its
+/// own text.
+fn kind_of(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
 /// One event as a target message body: the text of a string event, the JSON of any
 /// other.
 fn target_body(event: &Value) -> String {
@@ -606,6 +753,198 @@ fn target_body(event: &Value) -> String {
         Value::String(text) => text.clone(),
         other => other.to_string(),
     }
+}
+
+/// Every event of `batch` rendered through `template`, or the batch itself when the
+/// stage carries no template.
+fn transformed(template: Option<&str>, batch: Vec<Value>) -> Result<Vec<Value>, String> {
+    let Some(template) = template else {
+        return Ok(batch);
+    };
+    batch
+        .iter()
+        .map(|event| render_template(template, event))
+        .collect()
+}
+
+/// One event rendered through an `InputTemplate`: what the stage the template belongs to
+/// is handed INSTEAD of the event.
+///
+/// "Valid JSON text passed to the target. In this case, nothing from the event itself is
+/// passed to the target" (`PipeTargetParameters$InputTemplate`, and the same sentence for
+/// the enrichment's) — so the template, not the record, is the payload, and the only parts
+/// of the event that reach the stage are the ones the template reads.
+///
+/// A template is text carrying placeholders — a JSON path between
+/// [`PLACEHOLDER_OPEN`] and [`PLACEHOLDER_CLOSE`] — each standing for the value that path
+/// selects in the event. A template with no placeholder is a constant, which is what a
+/// stage handed the same payload for every event is configured with.
+///
+/// The rendering is the one a template is WRITTEN for: a placeholder contributes the JSON
+/// of the value it selected, so a template that is JSON text renders to JSON (a
+/// placeholder inside a quoted string contributes the string's own text, the quotes of
+/// the template doing the quoting), and a template that is not JSON text renders to the
+/// text it spells out, each placeholder contributing its value's own text. A path that
+/// selects no one value of the event is a FAILED render — the record stays on the source
+/// — rather than a payload carrying the path itself.
+///
+/// The text is walked ONCE, left to right, and its length is bounded
+/// ([`MAX_TEMPLATE_BYTES`]), so neither the walk nor what it builds is unbounded; what
+/// the placeholders ADD is bounded by [`MAX_RENDERED_PAYLOAD`], because a template may
+/// name the same value many times. The JSON it renders to is read by `serde_json` and
+/// each path by `service_common::json_reference_path`, not by anything spelled out here.
+fn render_template(template: &str, event: &Value) -> Result<Value, String> {
+    if template.len() > MAX_TEMPLATE_BYTES {
+        return Err(format!(
+            "the input template is {} bytes, past the {MAX_TEMPLATE_BYTES} a template carries",
+            template.len()
+        ));
+    }
+    let placeholders = placeholders_of(template);
+    if placeholders.is_empty() {
+        // A constant template: the JSON it is, or the text it is.
+        return Ok(as_json_or_text(template));
+    }
+    let mut as_json = String::with_capacity(template.len());
+    let mut as_text = String::with_capacity(template.len());
+    let mut taken = 0usize;
+    for (span, path) in &placeholders {
+        let selected = selected_value(path, event)?;
+        // Inside a quoted string the template supplies the quotes, so the placeholder
+        // contributes the value's text escaped as a JSON string body; anywhere else it
+        // contributes the whole JSON of the value.
+        let text = value_text(selected);
+        let json = if inside_a_json_string(template, span.start) {
+            json_string_body(&text)
+        } else {
+            selected.to_string()
+        };
+        let before = &template[taken..span.start];
+        // Checked BEFORE either buffer grows, so what the render holds never passes the
+        // bound rather than passing it and being refused afterwards.
+        within_the_payload_bound(as_json.len() + before.len() + json.len())?;
+        within_the_payload_bound(as_text.len() + before.len() + text.len())?;
+        as_json.push_str(before);
+        as_json.push_str(&json);
+        as_text.push_str(before);
+        as_text.push_str(&text);
+        taken = span.end;
+    }
+    let rest = &template[taken..];
+    within_the_payload_bound(as_json.len().max(as_text.len()) + rest.len())?;
+    as_json.push_str(rest);
+    as_text.push_str(rest);
+    Ok(match ::serde_json::from_str::<Value>(&as_json) {
+        Ok(value) => value,
+        // Not JSON text: the template spells out text, and the text it spells out is what
+        // the stage is handed.
+        Err(_) => Value::String(as_text),
+    })
+}
+
+/// Whether a render of `bytes` is one this emulator delivers, or why it is not.
+fn within_the_payload_bound(bytes: usize) -> Result<(), String> {
+    if bytes > MAX_RENDERED_PAYLOAD {
+        return Err(format!(
+            "the input template renders more than {MAX_RENDERED_PAYLOAD} bytes for one event, \
+             which is more than a payload this emulator delivers"
+        ));
+    }
+    Ok(())
+}
+
+/// A template with no placeholder, as the payload it is: the JSON value it is the text
+/// of, or the text itself.
+fn as_json_or_text(template: &str) -> Value {
+    ::serde_json::from_str::<Value>(template).unwrap_or_else(|_| Value::String(template.to_string()))
+}
+
+/// The placeholders of `template`, in the order they appear: where each one sits and the
+/// JSON path it carries.
+///
+/// Only a `<…>` span whose content is a JSON path ([`DYNAMIC_PATH_PREFIX`], or the event
+/// itself) is a placeholder, so a template carrying `<` for any other reason is left
+/// alone — and the scan then resumes just PAST that `<`, so a stray one cannot swallow
+/// the placeholder behind it.
+fn placeholders_of(template: &str) -> Vec<(std::ops::Range<usize>, String)> {
+    let mut found: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    let mut rest = template;
+    let mut base = 0usize;
+    while let Some(open) = rest.find(PLACEHOLDER_OPEN) {
+        let after_open = open + PLACEHOLDER_OPEN.len_utf8();
+        let Some(close) = rest[after_open..].find(PLACEHOLDER_CLOSE) else {
+            break;
+        };
+        let end = after_open + close;
+        let content = rest[after_open..end].trim();
+        let consumed = if content == WHOLE_EVENT_PATH || content.starts_with(DYNAMIC_PATH_PREFIX) {
+            found.push((
+                base + open..base + end + PLACEHOLDER_CLOSE.len_utf8(),
+                content.to_string(),
+            ));
+            end + PLACEHOLDER_CLOSE.len_utf8()
+        } else {
+            // Not a placeholder: only this `<` is consumed, because the span it opened
+            // may hold the real one.
+            after_open
+        };
+        base += consumed;
+        rest = &rest[consumed..];
+    }
+    found
+}
+
+/// Whether the placeholder that starts at `upto` sits INSIDE a quoted string of the
+/// template, so the template's own quotes are what quote the value.
+///
+/// Decided by walking the text before it and counting the quotes that open and close a
+/// JSON string (a backslash escapes the next character inside one), so a placeholder with
+/// text around it inside the same string is read as quoted too.
+fn inside_a_json_string(template: &str, upto: usize) -> bool {
+    let mut quoted = false;
+    let mut escaped = false;
+    for character in template[..upto].chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            JSON_STRING_ESCAPE if quoted => escaped = true,
+            JSON_STRING_QUOTE_CHARACTER => quoted = !quoted,
+            _ => {}
+        }
+    }
+    quoted
+}
+
+/// The ONE value `path` names in `event`, or why the render fails.
+///
+/// Read through `service_common::json_reference_path`, the one bounded evaluation of a
+/// caller-supplied path in this tree, so a template cannot ask for a walk of the whole
+/// event.
+fn selected_value<'a>(path: &str, event: &'a Value) -> Result<&'a Value, String> {
+    ::service_common::json_reference_path::select(path, event)
+        .ok_or_else(|| format!("the input template's {path} names no one value of the event"))
+}
+
+/// A selected value as its own TEXT: the contents of a string, the JSON of anything else
+/// (a number, a boolean, an object or an array has no text but its JSON).
+fn value_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// `text` as the BODY of a JSON string — its JSON encoding without the surrounding
+/// quotes — so a template's own quotes quote it, whatever characters it carries.
+fn json_string_body(text: &str) -> String {
+    let encoded = Value::String(text.to_string()).to_string();
+    encoded
+        .strip_prefix(JSON_STRING_QUOTE)
+        .and_then(|rest| rest.strip_suffix(JSON_STRING_QUOTE))
+        .unwrap_or(&encoded)
+        .to_string()
 }
 
 /// An Amazon SQS-sourced pipe, as the stages above read it: what the poller moves for
@@ -623,6 +962,12 @@ struct SqsSourcedPipe {
     batching_window: Duration,
     /// The enrichment the batch is handed to, when the pipe has one.
     enrichment: Option<Enrichment>,
+    /// `EnrichmentParameters.InputTemplate`: what the ENRICHMENT is handed instead of the
+    /// record, rendered per record. Absent when the pipe configures none.
+    enrichment_template: Option<String>,
+    /// `TargetParameters.InputTemplate`: what the TARGET is handed instead of the event,
+    /// rendered per event. Absent when the pipe configures none.
+    target_template: Option<String>,
     target: Target,
 }
 
@@ -642,6 +987,9 @@ enum Target {
     Queue {
         url: String,
         region: String,
+        /// `MessageGroupId` and `MessageDeduplicationId` AS THE PIPE CONFIGURES THEM —
+        /// each a literal value or a JSON path into the event, read for every delivery by
+        /// [`resolved_parameter`] rather than fixed when the pipe is resolved.
         message_group_id: Option<String>,
         message_deduplication_id: Option<String>,
     },
@@ -650,9 +998,8 @@ enum Target {
 /// What this record asks the stages to do, or why this data plane does not serve it.
 ///
 /// A configuration it cannot serve FAITHFULLY leaves the source untouched rather than
-/// delivering something the pipe did not ask for: an input template that would reshape
-/// the payload, a filter that would drop records, or a source or target of a kind no
-/// stage here addresses.
+/// delivering something the pipe did not ask for: a filter that would drop records, or a
+/// source or target of a kind no stage here addresses.
 fn resolve_run(pipe: &PipeRecord) -> Result<SqsSourcedPipe, String> {
     let source = ::service_common::arn::parse(&pipe.source)
         .ok_or_else(|| format!("its Source {} is not a resource ARN", pipe.source))?;
@@ -690,18 +1037,6 @@ fn resolve_run(pipe: &PipeRecord) -> Result<SqsSourcedPipe, String> {
         .clamp(*BATCHING_WINDOW_RANGE.start(), *BATCHING_WINDOW_RANGE.end());
     let batching_window = Duration::from_secs(u64::try_from(window_seconds).unwrap_or_default());
 
-    if pipe
-        .enrichment_parameters
-        .as_ref()
-        .and_then(|parameters| parameters.input_template.as_deref())
-        .is_some_and(|template| !template.is_empty())
-    {
-        return Err(
-            "its EnrichmentParameters carry an InputTemplate, which this emulator does not \
-             render yet"
-                .to_string(),
-        );
-    }
     let enrichment = match pipe
         .enrichment
         .as_deref()
@@ -710,18 +1045,18 @@ fn resolve_run(pipe: &PipeRecord) -> Result<SqsSourcedPipe, String> {
         None => None,
         Some(arn) => Some(resolve_enrichment(arn)?),
     };
+    // A template is what the stage it belongs to is handed instead of the event; an empty
+    // one configures nothing.
+    let enrichment_template = pipe
+        .enrichment_parameters
+        .as_ref()
+        .and_then(|parameters| parameters.input_template.clone())
+        .filter(|template| !template.is_empty());
 
     let target_parameters = pipe.target_parameters.as_ref();
-    if target_parameters
-        .and_then(|parameters| parameters.input_template.as_deref())
-        .is_some_and(|template| !template.is_empty())
-    {
-        return Err(
-            "its TargetParameters carry an InputTemplate, which this emulator does not render \
-             yet"
-                .to_string(),
-        );
-    }
+    let target_template = target_parameters
+        .and_then(|parameters| parameters.input_template.clone())
+        .filter(|template| !template.is_empty());
     let target = resolve_target(
         &pipe.target,
         target_parameters.and_then(|parameters| parameters.sqs_queue_parameters.as_ref()),
@@ -734,6 +1069,8 @@ fn resolve_run(pipe: &PipeRecord) -> Result<SqsSourcedPipe, String> {
         batch_size,
         batching_window,
         enrichment,
+        enrichment_template,
+        target_template,
         target,
     })
 }
@@ -871,8 +1208,235 @@ impl Clients {
 
 #[cfg(test)]
 mod tests {
-    use super::{enrichment_events, target_body};
+    use super::{
+        enrichment_events, render_template, resolved_parameter, target_body,
+        MAX_TEMPLATE_BYTES, MESSAGE_GROUP_ID,
+    };
     use ::serde_json::{json, Value};
+
+    /// The record envelope the template rows below are rendered against: an Amazon SQS
+    /// record as the source stage builds one.
+    fn record() -> Value {
+        json!({
+            "messageId": "4fd2-1",
+            "body": "order-7",
+            "attributes": { "MessageGroupId": "orders", "SequenceNumber": 7 },
+            "eventSource": "aws:sqs",
+        })
+    }
+
+    /// RULE: an `InputTemplate` is what the stage it belongs to is handed INSTEAD of the
+    /// event: each `<$.…>` placeholder contributes the value that path selects in the
+    /// event, a template that renders JSON text is handed over as that JSON, and one that
+    /// does not is handed over as the text it spells out.
+    ///
+    /// The rows differ along the form of the template, which is what the rule generalises
+    /// over: one bare placeholder, a quoted one, placeholders inside a JSON object, a
+    /// template with no placeholder at all, and text around a placeholder.
+    #[test]
+    fn an_input_template_is_what_the_stage_is_handed() {
+        let event = record();
+        // (case, the template, what the stage is handed)
+        let rows: Vec<(&str, &str, Value)> = vec![
+            ("the-body-alone", "<$.body>", json!("order-7")),
+            ("the-body-quoted", "\"<$.body>\"", json!("order-7")),
+            ("the-whole-event", "<$>", record()),
+            (
+                "an-object-of-two-values",
+                r#"{"order": "<$.body>", "from": "<$.attributes.MessageGroupId>"}"#,
+                json!({"order": "order-7", "from": "orders"}),
+            ),
+            (
+                "an-unquoted-number",
+                r#"{"seq": <$.attributes.SequenceNumber>}"#,
+                json!({"seq": 7}),
+            ),
+            (
+                "a-nested-value",
+                r#"{"group": <$.attributes.MessageGroupId>}"#,
+                json!({"group": "orders"}),
+            ),
+            ("a-constant-object", r#"{"fixed": true}"#, json!({"fixed": true})),
+            ("a-constant-text", "nothing to read", json!("nothing to read")),
+            (
+                "text-around-a-placeholder",
+                "order <$.body> received",
+                json!("order order-7 received"),
+            ),
+            // Inside a JSON string with text around it: the template's own quotes quote
+            // the value, so the render is that string.
+            (
+                "a-quoted-placeholder-with-text",
+                "\"order <$.body> received\"",
+                json!("order order-7 received"),
+            ),
+            (
+                "a-quoted-placeholder-with-text-in-an-object",
+                r#"{"text": "order <$.body> from <$.attributes.MessageGroupId>"}"#,
+                json!({"text": "order order-7 from orders"}),
+            ),
+        ];
+        for (case, template, expected) in rows {
+            let rendered = render_template(template, &event)
+                .unwrap_or_else(|error| panic!("case {case:?}: {error}"));
+            assert_eq!(
+                rendered, expected,
+                "case {case:?}: expected {expected}, got {rendered}"
+            );
+        }
+    }
+
+    /// RULE: a template whose placeholder selects no one value of the event renders
+    /// nothing — the record stays on the source — rather than a payload carrying the path
+    /// itself.
+    #[test]
+    fn a_template_placeholder_that_selects_nothing_fails_the_render() {
+        let event = record();
+        // (case, the template)
+        let rows: Vec<(&str, &str)> = vec![
+            ("absent", "<$.detail>"),
+            ("absent-inside-an-object", r#"{"x": <$.attributes.Absent>}"#),
+        ];
+        for (case, template) in rows {
+            let outcome = render_template(template, &event);
+            assert!(
+                outcome.is_err(),
+                "case {case:?}: expected the render to fail, got {outcome:?}"
+            );
+        }
+    }
+
+    /// RULE: what a template renders for ONE event is bounded, however many times it
+    /// names a value of that event, and a template longer than one may carry is refused
+    /// rather than walked.
+    #[test]
+    fn a_template_that_renders_too_much_fails_the_render() {
+        // A big event, named by as many placeholders as a bounded template holds: each
+        // one is three bytes of template and a whole event of payload.
+        let event = json!({ "body": "x".repeat(8 * 1024) });
+        let template = "<$>".repeat(2 * 1024);
+        let outcome = render_template(&template, &event);
+        assert!(
+            outcome.is_err(),
+            "case amplified: expected the render to be refused, got {} byte(s)",
+            outcome.map(|value| value.to_string().len()).unwrap_or(0)
+        );
+        // And the template's own length is a bound of its own.
+        let too_long = "a".repeat(MAX_TEMPLATE_BYTES + 1);
+        let outcome = render_template(&too_long, &event);
+        assert!(
+            outcome.is_err(),
+            "case past-the-template-bound: expected the render to be refused, got {outcome:?}"
+        );
+        let at_the_bound = "a".repeat(MAX_TEMPLATE_BYTES);
+        let outcome = render_template(&at_the_bound, &event);
+        assert!(
+            outcome.is_ok(),
+            "case at-the-template-bound: expected a template of {MAX_TEMPLATE_BYTES} bytes to \
+             render, got {outcome:?}"
+        );
+    }
+
+    /// RULE: a `<…>` span that is not a JSON path is not a placeholder, so a template may
+    /// carry the characters for any other reason and is handed over as written — and a
+    /// stray `<` does not swallow the placeholder behind it.
+    #[test]
+    fn a_span_that_is_not_a_path_is_left_as_written() {
+        let event = record();
+        // (case, the template, what the stage is handed)
+        let rows: Vec<(&str, &str, Value)> = vec![
+            ("not-a-path", "a < b and c > d", json!("a < b and c > d")),
+            (
+                "a-stray-open-before-a-placeholder",
+                "a < b <$.body>",
+                json!("a < b order-7"),
+            ),
+            (
+                "a-stray-open-inside-an-object",
+                r#"{"text": "a < b <$.body>"}"#,
+                json!({"text": "a < b order-7"}),
+            ),
+            // A placeholder nothing closes is not one either: the template is text.
+            (
+                "an-unterminated-placeholder",
+                "<$.body",
+                json!("<$.body"),
+            ),
+        ];
+        for (case, template, expected) in rows {
+            let rendered = render_template(template, &event)
+                .unwrap_or_else(|error| panic!("case {case:?}: {error}"));
+            assert_eq!(
+                rendered, expected,
+                "case {case:?}: expected {expected}, got {rendered}"
+            );
+        }
+    }
+
+    /// RULE: a target parameter's value is used AS CONFIGURED unless it is a JSON path
+    /// into the event, in which case the value the path selects in the event is what the
+    /// delivery carries.
+    ///
+    /// The rows differ along the form of the configured value and the type of the node a
+    /// path selects, which is what the rule generalises over.
+    #[test]
+    fn a_target_parameter_is_the_literal_or_what_its_path_selects() {
+        let event = json!({
+            "messageId": "4fd2-1",
+            "body": "{\"n\":1}",
+            "attributes": { "MessageGroupId": "orders", "SequenceNumber": 7 },
+            "deep": { "flag": true },
+        });
+        // (case, configured value, the value one delivery carries)
+        let rows: Vec<(&str, Option<&str>, Option<&str>)> = vec![
+            ("configures-none", None, None),
+            ("a-literal", Some("orders"), Some("orders")),
+            // A literal is never read as a path, even when it looks like one in part.
+            ("a-literal-with-a-dollar", Some("group$1"), Some("group$1")),
+            ("a-path-to-a-string", Some("$.messageId"), Some("4fd2-1")),
+            (
+                "a-path-into-an-object",
+                Some("$.attributes.MessageGroupId"),
+                Some("orders"),
+            ),
+            (
+                "a-path-to-a-number",
+                Some("$.attributes.SequenceNumber"),
+                Some("7"),
+            ),
+            ("a-path-to-a-boolean", Some("$.deep.flag"), Some("true")),
+        ];
+        for (case, configured, expected) in rows {
+            let resolved = resolved_parameter(MESSAGE_GROUP_ID, configured, &event)
+                .unwrap_or_else(|error| panic!("case {case:?}: {error}"));
+            assert_eq!(
+                resolved.as_deref(),
+                expected,
+                "case {case:?}: expected {expected:?}, got {resolved:?}"
+            );
+        }
+    }
+
+    /// RULE: a path that does not select ONE value of the event is a failed delivery —
+    /// the record stays on the source — and never a message carrying the path itself.
+    #[test]
+    fn a_path_that_selects_no_one_value_fails_the_delivery() {
+        let event = json!({ "a": [1, 2], "b": { "c": "x" } });
+        // (case, the configured path)
+        let rows: Vec<(&str, &str)> = vec![
+            ("absent", "$.missing"),
+            ("several", "$.a[*]"),
+            ("an-array", "$.a"),
+            ("an-object", "$.b"),
+        ];
+        for (case, configured) in rows {
+            let outcome = resolved_parameter(MESSAGE_GROUP_ID, Some(configured), &event);
+            assert!(
+                outcome.is_err(),
+                "case {case:?}: expected the delivery to fail, got {outcome:?}"
+            );
+        }
+    }
 
     /// RULE: what an enrichment RETURNS is what the target stage delivers — the
     /// elements of a returned array (however many), the one value a returned object or
