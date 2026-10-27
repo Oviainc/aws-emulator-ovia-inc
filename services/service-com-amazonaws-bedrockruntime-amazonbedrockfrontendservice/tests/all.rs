@@ -27,6 +27,8 @@ mod bedrock_runtime_streaming;
 mod converse_prompt_cache;
 #[path = "all/converse_tool_choice.rs"]
 mod converse_tool_choice;
+#[path = "all/converse_tool_use_arguments.rs"]
+mod converse_tool_use_arguments;
 #[path = "all/guardrail_checks_conduct_categories.rs"]
 mod guardrail_checks_conduct_categories;
 #[path = "all/guardrail_checks_evaluation.rs"]
