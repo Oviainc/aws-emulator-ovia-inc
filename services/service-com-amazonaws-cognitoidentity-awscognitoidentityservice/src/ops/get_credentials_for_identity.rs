@@ -6,10 +6,15 @@
 //!
 //! ## Which role the session stands for
 //!
-//! The credentials a real identity pool vends are a session of the pool's authenticated or
-//! unauthenticated ROLE, chosen through `SetIdentityPoolRoles`, and `CustomRoleArn` picks
-//! one of the roles the pool names instead. This handler resolves that role and assumes
-//! it: the session it mints is recorded in the STS session registry in the same engine, so
+//! The credentials a real identity pool vends are a session of the ROLE the pool's own
+//! configuration resolves for the request, written through `SetIdentityPoolRoles`, and
+//! `CustomRoleArn` picks one of the roles the pool names instead. Where the pool carries a
+//! `RoleMappings` entry for the identity provider the presented login was made under, that
+//! mapping is what resolves the role — for a rules mapping, the role the first rule to
+//! match the presented token's claims names — and the pool-wide authenticated or
+//! unauthenticated role is the fallback for an exchange no mapping of the pool's resolves a
+//! role for. This handler resolves that role and assumes it: the session it mints is
+//! recorded in the STS session registry in the same engine, so
 //! `sts:GetCallerIdentity` under the vended credential answers
 //! `arn:<partition>:sts::<account>:assumed-role/<role>/CognitoIdentityCredentials`, and the
 //! assume itself is recorded in the account's management-event log as STS's own
@@ -24,7 +29,8 @@
 //! session that stands for nothing.
 //!
 //! `Logins` selects WHICH flow the exchange is: a request that presents a login is an
-//! authenticated one, and the pool's `authenticated` role is the one assumed.
+//! authenticated one, and the pool's `authenticated` role is the one assumed where no
+//! mapping of the pool's resolves a role for the login it presents.
 //!
 //! The authentication methods the trust-policy decision is made with — the
 //! `cognito-identity.amazonaws.com:amr` condition values — come from the LOGIN rather than
@@ -354,15 +360,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetCredentialsFor
 
             // Which role this vend assumes: the `CustomRoleArn` the request names, which
             // can only be honoured against the roles the pool has stored, or — for a
-            // request that names none — the pool's role for the flow the request is in.
+            // request that names none — the role the pool's own configuration resolves for
+            // this exchange. A `RoleMappings` entry for the identity provider the login was
+            // made under is what resolves it there, and the pool-wide role for the flow the
+            // request is in is the fallback when no mapping of the pool's resolves one.
             let configured = store.identity_pool_roles.get(&identity_pool_id);
             let role_arn = match &input.custom_role_arn {
                 Some(custom_role_arn) => configured
                     .filter(|configured| configured.names_role_arn(custom_role_arn))
                     .map(|_| custom_role_arn.clone()),
                 None => configured
-                    .and_then(|configured| configured.role_for(!providers.is_empty()))
-                    .map(ToString::to_string),
+                    .zip(store.identity_pools.get(&identity_pool_id))
+                    .and_then(|(configured, pool)| configured.mapped_role_arn(pool, &logins))
+                    .or_else(|| {
+                        configured
+                            .and_then(|configured| configured.role_for(!providers.is_empty()))
+                            .map(ToString::to_string)
+                    }),
             };
             let Some(role_arn) = role_arn else {
                 return Err(

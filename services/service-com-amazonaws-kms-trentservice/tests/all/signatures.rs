@@ -199,16 +199,16 @@ const SIGN_CASES: &[SignCase] = &[
 /// The `MessageType` of a message signed as given, and the one of a message that is
 /// already the hash the algorithm would have computed
 /// (`smithy_query(query="shape",shape="MessageType")`).
-const RAW: &str = "RAW";
+pub(crate) const RAW: &str = "RAW";
 /// See [`RAW`].
-const DIGEST: &str = "DIGEST";
+pub(crate) const DIGEST: &str = "DIGEST";
 
 /// The hash each `SigningAlgorithmSpec` hashes its message with:
 /// "signing algorithms that end in SHA_256 use the SHA_256 hashing algorithm", and the
 /// same sentence for SHA_384 and SHA_512
 /// (`smithy_query(query="doc",shape="SignRequest",member="MessageType")`). Written out
 /// per algorithm so the test's idea of the hash does not come from the service's.
-fn hash_of(case: &str, signing_algorithm: &str) -> &'static digest::Algorithm {
+pub(crate) fn hash_of(case: &str, signing_algorithm: &str) -> &'static digest::Algorithm {
     match signing_algorithm {
         "RSASSA_PKCS1_V1_5_SHA_256" | "RSASSA_PSS_SHA_256" | "ECDSA_SHA_256" => &digest::SHA256,
         "RSASSA_PKCS1_V1_5_SHA_384" | "RSASSA_PSS_SHA_384" | "ECDSA_SHA_384" => &digest::SHA384,
@@ -256,7 +256,7 @@ fn verification_algorithm(
 
 /// The message a row signs: `len` bytes that are neither constant nor the message of
 /// any other length, so no signature can be right by accident of its input.
-fn message_of(len: usize) -> Vec<u8> {
+pub(crate) fn message_of(len: usize) -> Vec<u8> {
     (0..len)
         .map(|index| u8::try_from((index * 31 + len) % 251).unwrap_or_default())
         .collect()
