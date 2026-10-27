@@ -246,7 +246,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let state_handle = state::require_service_state(&*self.engine)?;
         let mut store = state_handle.lock();
-        // A `Pending` endpoint reaches `Available` at an instant the clock owes it, whether
+        // A `pending` endpoint reaches `available` at an instant the clock owes it, whether
         // or not anybody called — so the moves already due are applied before this report
         // resolves the endpoint ids it was given, and two reports either side of that
         // instant differ because the CLOCK passed it and not because this call changed

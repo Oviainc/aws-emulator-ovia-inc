@@ -9,15 +9,15 @@
 //! The rule under test is that the operation REPORTS THE STORE: the set it answers with is
 //! the connections to the account's own VPC endpoint services, narrowed by the `Filters`
 //! the request names and cut into `MaxResults`-sized pages. Every table row is a distinct
-//! input along what that generalises over — which documented filter, which spelling of a
-//! state, how many values, how many filters, which Region the call is made in, which page
-//! size — so no single recorded request is the specification.
+//! input along what that generalises over — which documented filter, which state, how many
+//! values, how many filters, which Region the call is made in, which page size — so no
+//! single recorded request is the specification.
 
 use std::time::{Duration, SystemTime};
 
-use ec2::ops::types::{DnsEntry, PayerResponsibilityEntry, STATE_VALUES, Tag};
+use ec2::ops::types::{DnsEntry, PayerResponsibilityEntry, Tag};
 use ec2::state::{
-    ComAmazonawsEc2Amazonec2State as Ec2State, VPC_ENDPOINT_STATE_FILTER_VALUES,
+    ComAmazonawsEc2Amazonec2State as Ec2State, VPC_ENDPOINT_STATE_VALUES,
     VpcEndpointConnectionSpec,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
@@ -118,7 +118,7 @@ fn fixtures() -> Vec<ConnectionFixture> {
         ConnectionFixture {
             service_index: 0,
             owner: account.clone(),
-            state: "Available",
+            state: "available",
             region: REGION,
             ip_address_type: Some("ipv4"),
             network_load_balancer_arns: vec![load_balancer_arn("net", 0, 0)],
@@ -128,7 +128,7 @@ fn fixtures() -> Vec<ConnectionFixture> {
         ConnectionFixture {
             service_index: 0,
             owner: account.clone(),
-            state: "PendingAcceptance",
+            state: "pendingAcceptance",
             region: REGION,
             ip_address_type: Some("ipv6"),
             network_load_balancer_arns: vec![load_balancer_arn("net", 0, 0)],
@@ -138,7 +138,7 @@ fn fixtures() -> Vec<ConnectionFixture> {
         ConnectionFixture {
             service_index: 1,
             owner: account.clone(),
-            state: "PendingAcceptance",
+            state: "pendingAcceptance",
             region: REGION,
             ip_address_type: Some("dualstack"),
             network_load_balancer_arns: Vec::new(),
@@ -148,7 +148,7 @@ fn fixtures() -> Vec<ConnectionFixture> {
         ConnectionFixture {
             service_index: 1,
             owner: account.clone(),
-            state: "Rejected",
+            state: "rejected",
             region: "us-west-2",
             ip_address_type: Some("ipv4"),
             network_load_balancer_arns: Vec::new(),
@@ -158,7 +158,7 @@ fn fixtures() -> Vec<ConnectionFixture> {
         ConnectionFixture {
             service_index: 1,
             owner: OTHER_ACCOUNT.to_string(),
-            state: "Deleting",
+            state: "deleting",
             region: "eu-west-1",
             ip_address_type: None,
             network_load_balancer_arns: Vec::new(),
@@ -168,7 +168,7 @@ fn fixtures() -> Vec<ConnectionFixture> {
         ConnectionFixture {
             service_index: 2,
             owner: OTHER_ACCOUNT.to_string(),
-            state: "Available",
+            state: "available",
             region: REGION,
             ip_address_type: Some("ipv4"),
             network_load_balancer_arns: vec![
@@ -181,7 +181,7 @@ fn fixtures() -> Vec<ConnectionFixture> {
         ConnectionFixture {
             service_index: 2,
             owner: account.clone(),
-            state: "Failed",
+            state: "failed",
             region: REGION,
             ip_address_type: Some("ipv6"),
             network_load_balancer_arns: vec![load_balancer_arn("net", 2, 0)],
@@ -191,7 +191,7 @@ fn fixtures() -> Vec<ConnectionFixture> {
         ConnectionFixture {
             service_index: 2,
             owner: account,
-            state: "Deleted",
+            state: "deleted",
             region: REGION,
             ip_address_type: Some("ipv4"),
             network_load_balancer_arns: vec![load_balancer_arn("net", 2, 0)],
@@ -330,7 +330,7 @@ async fn every_stored_connection_is_reported_and_a_later_write_is_visible() {
     );
 
     // One connection, member by member: everything the write set round-trips through the
-    // describe, including the lists and the state's modelled spelling.
+    // describe, including the lists and the state as EC2 reports it.
     let (status, body) = describe(
         &router,
         &filters(&[("vpc-endpoint-id", &[seeded.endpoint_ids[5].as_str()])]),
@@ -342,7 +342,7 @@ async fn every_stored_connection_is_reported_and_a_later_write_is_visible() {
         ("vpcEndpointConnectionId", seeded.connection_ids[5].clone()),
         ("serviceId", seeded.service_ids[2].clone()),
         ("vpcEndpointOwner", OTHER_ACCOUNT.to_string()),
-        ("vpcEndpointState", "Available".to_string()),
+        ("vpcEndpointState", "available".to_string()),
         ("vpcEndpointRegion", REGION.to_string()),
         ("ipAddressType", "ipv4".to_string()),
         ("hostedZoneId", HOSTED_ZONE_ID.to_string()),
@@ -376,7 +376,7 @@ async fn every_stored_connection_is_reported_and_a_later_write_is_visible() {
             service_id: seeded.service_ids[0].clone(),
             vpc_endpoint_id: endpoint_id.clone(),
             vpc_endpoint_owner: OTHER_ACCOUNT.to_string(),
-            vpc_endpoint_state: "PendingAcceptance".to_string(),
+            vpc_endpoint_state: "pendingAcceptance".to_string(),
             creation_timestamp: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_100),
             vpc_endpoint_region: REGION.to_string(),
             ip_address_type: Some("ipv4".to_string()),
@@ -466,9 +466,8 @@ async fn each_documented_filter_selects_the_connections_whose_attribute_matches(
         // "the Region of the endpoint or `cross-region` to find endpoints for other
         // Regions": the endpoints outside the Region the service is hosted in.
         ("vpc-endpoint-region", vec!["cross-region".into()], vec![3, 4]),
-        // The state under the spelling the model's `State` enum publishes...
-        ("vpc-endpoint-state", vec!["Available".into()], vec![0, 5]),
-        // ...and under the spelling the filter's own doc list publishes.
+        // The state the connection reports, which is the spelling the filter's own doc list
+        // publishes.
         ("vpc-endpoint-state", vec!["available".into()], vec![0, 5]),
         (
             "vpc-endpoint-state",
@@ -589,36 +588,25 @@ async fn several_filters_are_joined_with_an_and() {
     }
 }
 
-/// Every state the `vpc-endpoint-state` filter documents selects the connection stored in
-/// the `State` enum member that names the same state — under both spellings, and for every
-/// entry of the table rather than the one the issue cited.
+/// Every state the `vpc-endpoint-state` filter documents selects the connection in that
+/// state, for every entry of the published list rather than the one the issue cited.
 #[tokio::test]
 async fn every_documented_state_selects_the_connection_in_that_state() {
     let (router, engine) = super::ec2_query::emulator();
 
-    // The modelled half of each pair must be a member of the `State` enum the connection's
-    // `VpcEndpointState` targets — `STATE_VALUES` is that enum, generated from the model.
-    for (documented, modelled) in VPC_ENDPOINT_STATE_FILTER_VALUES {
-        assert!(
-            STATE_VALUES.contains(&modelled),
-            "case {documented:?}: {modelled:?} is not a member of the model's State enum \
-             {STATE_VALUES:?}"
-        );
-    }
-
     // One connection per documented state, each to the same service.
-    let mut endpoint_ids: Vec<(&str, &str, String)> = Vec::new();
+    let mut endpoint_ids: Vec<(&str, String)> = Vec::new();
     {
         let store = engine.state::<Ec2State>();
         let mut guard = store.lock();
         let service_id = guard.next_id("vpce-svc");
-        for (documented, modelled) in VPC_ENDPOINT_STATE_FILTER_VALUES {
+        for documented in VPC_ENDPOINT_STATE_VALUES {
             let endpoint_id = guard.next_id("vpce");
             guard.insert_vpc_endpoint_connection(VpcEndpointConnectionSpec {
                 service_id: service_id.clone(),
                 vpc_endpoint_id: endpoint_id.clone(),
                 vpc_endpoint_owner: OTHER_ACCOUNT.to_string(),
-                vpc_endpoint_state: modelled.to_string(),
+                vpc_endpoint_state: documented.to_string(),
                 creation_timestamp: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_200),
                 vpc_endpoint_region: REGION.to_string(),
                 ip_address_type: Some("ipv4".to_string()),
@@ -629,21 +617,19 @@ async fn every_documented_state_selects_the_connection_in_that_state() {
                 tags: Vec::new(),
             })
             .expect("the store must have room for the seeded connection");
-            endpoint_ids.push((documented, modelled, endpoint_id));
+            endpoint_ids.push((documented, endpoint_id));
         }
     }
 
-    for (documented, modelled, endpoint_id) in &endpoint_ids {
-        for value in [documented, modelled] {
-            let case = format!("vpc-endpoint-state={value:?}");
-            let reported =
-                described_ids(&router, &case, &filters(&[("vpc-endpoint-state", &[value])])).await;
-            assert_eq!(
-                reported,
-                vec![endpoint_id.clone()],
-                "case {case:?}: expected only {endpoint_id:?}, got {reported:?}"
-            );
-        }
+    for (documented, endpoint_id) in &endpoint_ids {
+        let case = format!("vpc-endpoint-state={documented:?}");
+        let reported =
+            described_ids(&router, &case, &filters(&[("vpc-endpoint-state", &[documented])])).await;
+        assert_eq!(
+            reported,
+            vec![endpoint_id.clone()],
+            "case {case:?}: expected only {endpoint_id:?}, got {reported:?}"
+        );
     }
 }
 
@@ -818,7 +804,7 @@ async fn a_page_size_above_the_maximum_returns_at_most_one_thousand() {
                 service_id: service_id.clone(),
                 vpc_endpoint_id: endpoint_id,
                 vpc_endpoint_owner: OTHER_ACCOUNT.to_string(),
-                vpc_endpoint_state: "PendingAcceptance".to_string(),
+                vpc_endpoint_state: "pendingAcceptance".to_string(),
                 creation_timestamp: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_300),
                 vpc_endpoint_region: REGION.to_string(),
                 ip_address_type: Some("ipv4".to_string()),
@@ -877,7 +863,7 @@ fn the_connection_store_refuses_to_grow_past_its_count_ceiling() {
         service_id: service_id.clone(),
         vpc_endpoint_id: endpoint_id,
         vpc_endpoint_owner: OTHER_ACCOUNT.to_string(),
-        vpc_endpoint_state: "PendingAcceptance".to_string(),
+        vpc_endpoint_state: "pendingAcceptance".to_string(),
         creation_timestamp: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_400),
         vpc_endpoint_region: REGION.to_string(),
         ip_address_type: Some("ipv4".to_string()),
@@ -949,7 +935,7 @@ fn rewriting_one_endpoints_connection_charges_only_what_the_store_holds() {
         service_id: service_id.clone(),
         vpc_endpoint_id: endpoint_id.clone(),
         vpc_endpoint_owner: OTHER_ACCOUNT.to_string(),
-        vpc_endpoint_state: "PendingAcceptance".to_string(),
+        vpc_endpoint_state: "pendingAcceptance".to_string(),
         creation_timestamp: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_400),
         vpc_endpoint_region: REGION.to_string(),
         ip_address_type: Some("ipv4".to_string()),

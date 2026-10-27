@@ -2,7 +2,10 @@
 
 //! @op CreateDelivery
 //! Implemented: pairs one stored delivery source with one stored delivery destination,
-//! minting the delivery `DescribeDeliveries` and `GetDelivery` then report. This is the
+//! minting the delivery `DescribeDeliveries` and `GetDelivery` then report. The pair
+//! identifies the delivery, so a create naming a pair the account already holds is
+//! idempotent: it answers the stored delivery, with its existing id and configuration,
+//! rather than minting a second delivery of the pair or refusing the call. This is the
 //! ONLY file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
@@ -240,24 +243,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|destination| destination.delivery_destination_type.clone());
 
         // "Use CreateDelivery to create a delivery by pairing exactly one delivery source and
-        // one delivery destination": the PAIR is what a delivery is, so a second create of a
-        // pair the account already holds is the conflict the operation models ("This
-        // operation attempted to create a resource that already exists") rather than a second
-        // delivery of the same pair.
+        // one delivery destination": the PAIR is what identifies a delivery, so a create
+        // naming a pair the account already holds has nothing left to create. The call is
+        // idempotent — it reports the STORED delivery, with the id it was minted with and the
+        // configuration it already carries, so re-issuing the same create converges instead of
+        // failing and the pair's cardinality stays at one. A delivery's configuration is
+        // changed by `UpdateDeliveryConfiguration`, which is why this call leaves the stored
+        // record alone. `ConflictException` stays for the creates whose identity is a
+        // caller-chosen name already held by a DIFFERENT resource.
         if let Some(existing) = store.deliveries.values().find(|delivery| {
             delivery.delivery_source_name == input.delivery_source_name
                 && delivery.delivery_destination_arn == input.delivery_destination_arn
         }) {
-            return Err(CreateDeliveryErrorModeled::ConflictException(
-                ConflictException {
-                    message: Some(format!(
-                        "A delivery already exists between delivery source {} and delivery \
-                         destination {}: {}",
-                        input.delivery_source_name, input.delivery_destination_arn, existing.id
-                    )),
-                },
-            )
-            .into());
+            return Ok(CreateDeliveryOutput {
+                delivery: Some(existing.reported()),
+            });
         }
         if store.deliveries.len() >= crate::state::MAX_DELIVERIES {
             return Err(CreateDeliveryErrorModeled::ServiceQuotaExceededException(
