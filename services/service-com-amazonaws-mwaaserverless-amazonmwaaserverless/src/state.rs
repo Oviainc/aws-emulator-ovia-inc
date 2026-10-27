@@ -1046,6 +1046,89 @@ pub fn digest(fields: &[&str]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// A field sequence being built for [`digest`], in a form that DETERMINES the
+/// request it was built from: a member whose field count depends on what the
+/// request carries announces how many fields it contributes before contributing
+/// them, so the sequence can be read back as the member tree it came from.
+///
+/// This is what makes a digest usable to tell one request from another. A bare
+/// field list is ambiguous as soon as one member's field count depends on the
+/// request — an optional structure that contributes nothing when absent, or a
+/// list whose elements are appended one field each — because then a value
+/// supplied for one member lands in the position another member's value would
+/// have taken, and the two requests digest alike.
+#[derive(Debug, Default)]
+pub struct DigestFields {
+    fields: Vec<String>,
+}
+
+impl DigestFields {
+    /// An empty sequence.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// One field at a fixed position: a member every request of this kind
+    /// carries, so its position never moves.
+    pub fn field(&mut self, value: impl Into<String>) -> &mut Self {
+        self.fields.push(value.into());
+        self
+    }
+
+    /// A member whose extent depends on the request: the NUMBER of fields that
+    /// follow, then those fields. The count is what makes the member
+    /// self-delimiting, and a group nested inside a group keeps the whole
+    /// sequence so — an absent member is simply the empty group.
+    pub fn group(&mut self, build: impl FnOnce(&mut Self)) -> &mut Self {
+        let mut group = Self::new();
+        build(&mut group);
+        self.fields.push(group.fields.len().to_string());
+        self.fields.append(&mut group.fields);
+        self
+    }
+
+    /// An optional scalar: the empty group when the request supplies none, a
+    /// one-field group when it does — so a member the request omits and one it
+    /// supplies as the empty string never digest alike.
+    pub fn optional(&mut self, value: Option<&str>) -> &mut Self {
+        self.group(|group| {
+            if let Some(value) = value {
+                group.field(value);
+            }
+        })
+    }
+
+    /// A list, as one group holding one field per element, so both its length
+    /// and the order of its elements are part of the sequence.
+    pub fn list<'a>(&mut self, values: impl IntoIterator<Item = &'a str>) -> &mut Self {
+        self.group(|group| {
+            for value in values {
+                group.field(value);
+            }
+        })
+    }
+
+    /// An optional list: the empty group when the request supplies none, and the
+    /// list's own group inside a group when it does, so an absent list and an
+    /// empty one stay apart.
+    pub fn optional_list<'a, I: IntoIterator<Item = &'a str>>(
+        &mut self,
+        values: Option<I>,
+    ) -> &mut Self {
+        self.group(|group| {
+            if let Some(values) = values {
+                group.list(values);
+            }
+        })
+    }
+
+    /// The digest of the sequence built so far.
+    pub fn digest(&self) -> String {
+        let borrowed: Vec<&str> = self.fields.iter().map(String::as_str).collect();
+        digest(&borrowed)
+    }
+}
+
 /// The workflow configuration a request supplies, borrowed for digesting: the
 /// members of the configuration a version freezes ([`WorkflowSnapshot`]) that a
 /// request can express.
@@ -1067,53 +1150,72 @@ pub struct WorkflowConfigurationView<'a> {
 }
 
 impl WorkflowConfigurationView<'_> {
-    /// This configuration's digest fields, in the ONE order every workflow
-    /// digest walks them in: the role, description, trigger mode and engine
-    /// version, the definition object's three members, the code union's three
-    /// members or a placeholder when it carries none, the encryption members
-    /// when the request supplies them, the log group when it does, and the
-    /// network id lists when it does.
+    /// Append this configuration to `fields` as ONE group, walked in the ONE
+    /// order every workflow digest walks it in: the role, description, trigger
+    /// mode and engine version, the definition object, the code union, the
+    /// encryption configuration, the logging configuration and the network
+    /// configuration's two id lists.
     ///
-    /// An absent optional member digests as an empty field rather than being
-    /// skipped wherever its position is fixed, and [`digest`] length-delimits
-    /// every field, so two different configurations never share a digest. This
-    /// is the single derivation every operation that digests a workflow
-    /// configuration drives, so a member added here reaches all of them.
-    pub fn digest_fields(&self) -> Vec<String> {
-        let mut fields: Vec<String> = vec![
-            self.role_arn.to_string(),
-            self.description.unwrap_or_default().to_string(),
-            self.trigger_mode.unwrap_or_default().to_string(),
-            self.engine_version
-                .map(|version| version.to_string())
-                .unwrap_or_default(),
-            self.definition_s3_location.bucket.clone(),
-            self.definition_s3_location.object_key.clone(),
-            self.definition_s3_location
-                .version_id
-                .clone()
-                .unwrap_or_default(),
-        ];
-        match self.code {
-            Some(Code::S3Location(location)) => {
-                fields.push(location.bucket.clone());
-                fields.push(location.object_key.clone());
-                fields.push(location.version_id.clone().unwrap_or_default());
-            }
-            None => fields.push(String::new()),
-        }
-        if let Some(encryption) = self.encryption_configuration {
-            fields.push(encryption.r#type.clone());
-            fields.push(encryption.kms_key_id.clone().unwrap_or_default());
-        }
-        if let Some(logging) = self.logging_configuration {
-            fields.push(logging.log_group_name.clone());
-        }
-        if let Some(network) = self.network_configuration {
-            fields.extend(network.security_group_ids.clone().unwrap_or_default());
-            fields.extend(network.subnet_ids.clone().unwrap_or_default());
-        }
-        fields
+    /// Every member the request can omit, and every list, is a [`DigestFields`]
+    /// group that announces its own extent, so a member's fields can never be
+    /// read as another member's: two configurations that differ in any member,
+    /// in which members they supply at all, or in the size or order of a list,
+    /// never share a digest. This is the single derivation every operation that
+    /// digests a workflow configuration drives, so a member added here reaches
+    /// all of them.
+    pub fn digest_group(&self, fields: &mut DigestFields) {
+        let engine_version = self.engine_version.map(|version| version.to_string());
+        fields.group(|configuration| {
+            configuration
+                .field(self.role_arn)
+                .optional(self.description)
+                .optional(self.trigger_mode)
+                .optional(engine_version.as_deref())
+                .group(|definition| {
+                    definition
+                        .field(self.definition_s3_location.bucket.as_str())
+                        .field(self.definition_s3_location.object_key.as_str())
+                        .optional(self.definition_s3_location.version_id.as_deref());
+                })
+                .group(|code| match self.code {
+                    Some(Code::S3Location(location)) => {
+                        code.field("S3Location")
+                            .field(location.bucket.as_str())
+                            .field(location.object_key.as_str())
+                            .optional(location.version_id.as_deref());
+                    }
+                    None => {}
+                })
+                .group(|encryption| {
+                    if let Some(supplied) = self.encryption_configuration {
+                        encryption
+                            .field(supplied.r#type.as_str())
+                            .optional(supplied.kms_key_id.as_deref());
+                    }
+                })
+                .group(|logging| {
+                    if let Some(supplied) = self.logging_configuration {
+                        logging.field(supplied.log_group_name.as_str());
+                    }
+                })
+                .group(|network| {
+                    if let Some(supplied) = self.network_configuration {
+                        network
+                            .optional_list(
+                                supplied
+                                    .security_group_ids
+                                    .as_deref()
+                                    .map(|ids| ids.iter().map(String::as_str)),
+                            )
+                            .optional_list(
+                                supplied
+                                    .subnet_ids
+                                    .as_deref()
+                                    .map(|ids| ids.iter().map(String::as_str)),
+                            );
+                    }
+                });
+        });
     }
 }
 
