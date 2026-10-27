@@ -553,6 +553,30 @@ pub fn optional_free_text(value: Option<String>) -> Option<String> {
     value.filter(|value| !value.trim().is_empty())
 }
 
+/// Whether a string member the caller SENT carries no characters at all.
+///
+/// Every member in this service that names a resource — the `Name` of a queue, a preset or
+/// a job template, and the references (`Queue`, `JobTemplate`, `Role`) that point at one —
+/// targets the model's bare `__string`, which states no pattern and no length, so the
+/// boundary validator passes the zero-length value and a value made only of whitespace
+/// alike. Neither carries a resource identity: a key with no characters addresses nothing
+/// a later read can reach, and a reference with none resolves to nothing. ONE test for all
+/// of them, so no create or update path can disagree about which values are identities,
+/// answered with the bad request [`blank_member_message`] words.
+///
+/// This is the only normalisation such a member gets: a value that DOES carry characters
+/// is stored and echoed byte for byte, surrounding whitespace included, because that value
+/// is the resource's key.
+pub fn carries_no_characters(value: &str) -> bool {
+    value.trim().is_empty()
+}
+
+/// How this service words the bad request for a member that [`carries_no_characters`]: it
+/// names the member the value arrived in, exactly as the model spells it.
+pub fn blank_member_message(member: &str) -> String {
+    format!("{member} must not be empty.")
+}
+
 /// How this service words a `NotFoundException`: it names the REQUEST MEMBER that
 /// pointed at the resource, not the value the caller supplied.
 ///
