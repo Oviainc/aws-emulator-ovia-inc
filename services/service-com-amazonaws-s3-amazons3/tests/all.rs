@@ -95,6 +95,8 @@ mod listing_encoding_type;
 mod listing_optional_members;
 #[path = "all/multipart_part_upload.rs"]
 mod multipart_part_upload;
+#[path = "all/multipart_upload_abort.rs"]
+mod multipart_upload_abort;
 #[path = "all/multipart_upload_initiation.rs"]
 mod multipart_upload_initiation;
 #[path = "all/multipart_upload_listing.rs"]

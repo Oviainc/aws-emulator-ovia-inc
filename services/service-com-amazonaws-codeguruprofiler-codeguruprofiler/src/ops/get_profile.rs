@@ -126,11 +126,13 @@ use ::ion_rs::{Element, IonType, Sequence, Struct, Value as IonValue};
 /// The time window a `GetProfile` request selects over, as (start, end) bounds either
 /// of which may be open.
 ///
-/// The operation's doc fixes the rule: "Specify the time range for the requested
-/// aggregated profile using 1 or 2 of the following parameters: startTime, endTime,
-/// period. … If you specify all 3 parameters, an exception is thrown. If you specify
-/// only period, the latest aggregated profile is returned." So `period` completes
-/// whichever single bound was given, and on its own selects nothing.
+/// The rule is this service's one reading of the `startTime`/`endTime`/`period` trio
+/// ([`crate::state::requested_window`]), which the operation's own doc states: "Specify
+/// the time range for the requested aggregated profile using 1 or 2 of the following
+/// parameters: startTime, endTime, period. … If you specify all 3 parameters, an
+/// exception is thrown. If you specify only period, the latest aggregated profile is
+/// returned." So `period` completes whichever single bound was given, and on its own
+/// leaves both bounds open — which is how this operation selects the LATEST profile.
 #[allow(clippy::type_complexity)]
 fn requested_window(
     input: &GetProfileInput,
@@ -141,72 +143,24 @@ fn requested_window(
     ),
     GetProfileError,
 > {
-    // `period` here targets the free-form `Period` string, NOT the `AggregationPeriod`
-    // enum `ListProfileTimes` takes: it is the LENGTH of the requested window, stated as
-    // an ISO 8601 duration, and the one read of such a value is
-    // [`crate::state::iso8601_period`]. Only a string that names no fixed span is
-    // refused.
-    let period = match input.period.as_deref() {
-        None => None,
-        Some(period) => Some(crate::state::iso8601_period(period).ok_or_else(|| {
-            crate::scaffolded::Scaffolded::validation(crate::state::period_validation_message(
-                period,
-            ))
-        })?),
-    };
-
-    let (start, end) = match (input.start_time, input.end_time, period) {
-        (Some(_), Some(_), Some(_)) => {
-            return Err(crate::scaffolded::Scaffolded::validation(
-                "specify 1 or 2 of startTime, endTime and period, not all 3",
-            ));
-        }
-        (Some(start), None, Some(span)) => (Some(start), Some(shifted(start, nanos(span)))),
-        (None, Some(end), Some(span)) => (Some(shifted(end, -nanos(span))), Some(end)),
-        // `period` alone (and no bound at all) names no interval and selects the latest
-        // profile.
-        (start, end, _) => (start, end),
-    };
-
-    // A window that names BOTH bounds names an interval, and a pair of bounds is one only
-    // when the start is strictly before the end — the service-wide rule stated once in
-    // [`crate::state::validate_interval`]. It is checked here, ahead of the group lookup,
-    // so a request that names no interval is refused rather than answered about one, and
-    // it is checked on the COMPLETED window, so a `period` of zero length is refused as
-    // the zero-width window it names rather than served as a window at all.
-    if let (Some(start), Some(end)) = (start, end) {
-        if let Err(message) = crate::state::validate_interval(start, end) {
-            return Err(crate::scaffolded::Scaffolded::validation(message));
-        }
-    }
-    Ok((start, end))
-}
-
-/// `span` as whole nanoseconds, saturating — the sign is the caller's, which is how the
-/// same span completes a window forwards from a start and backwards from an end.
-fn nanos(span: ::std::time::Duration) -> i128 {
-    i128::try_from(span.as_nanos()).unwrap_or(i128::MAX)
-}
-
-/// `at` moved by `nanos` nanoseconds, exactly: a window length is an arbitrary ISO 8601
-/// duration, so a bound it completes keeps the sub-second part of both the instant and
-/// the span rather than rounding either to whole seconds.
-fn shifted(at: ::aws_smithy_types::DateTime, nanos: i128) -> ::aws_smithy_types::DateTime {
-    const NANOS_PER_SECOND: i128 = 1_000_000_000;
-    let total = i128::from(at.secs()) * NANOS_PER_SECOND + i128::from(at.subsec_nanos()) + nanos;
-    // `div_euclid`/`rem_euclid` floor towards the past on both sides of the epoch, so the
-    // remainder is always in `0..NANOS_PER_SECOND` and is always the in-range sub-second
-    // part of the instant.
-    let seconds = total.div_euclid(NANOS_PER_SECOND);
-    let subsec = total.rem_euclid(NANOS_PER_SECOND);
-    ::aws_smithy_types::DateTime::from_secs_and_nanos(
-        i64::try_from(seconds).unwrap_or(if seconds.is_negative() {
-            i64::MIN
-        } else {
-            i64::MAX
-        }),
-        u32::try_from(subsec).unwrap_or(0),
+    let window = crate::state::requested_window(
+        input.start_time,
+        input.end_time,
+        input.period.as_deref(),
     )
+    .map_err(crate::scaffolded::Scaffolded::validation)?;
+    Ok((window.start, window.end))
+}
+
+/// The stored profile `profile` read as a document, or `None` when its bytes are not one
+/// in the representation it was posted under (so it holds no frames this service can
+/// see).
+///
+/// `pub(crate)` because reading a stored profile as a document is not only this
+/// operation's business: `BatchGetFrameMetricData` derives a frame metric from the same
+/// documents, and both must read a profile the same way.
+pub(crate) fn profile_document(profile: &crate::state::AgentProfile) -> Option<Element> {
+    decoded(&profile.bytes, Representation::of(&profile.content_type)?)
 }
 
 /// The representations this service serves an aggregated profile in, as the model's
