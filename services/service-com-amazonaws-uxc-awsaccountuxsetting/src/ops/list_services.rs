@@ -100,10 +100,6 @@ const PAGE_TOKEN_OFFSET_DIGITS: usize = 12;
 /// caller did not size with `maxResults`.
 const SERVICE_LIST_MAX_ITEMS: usize = 500;
 
-/// The lowest and highest `maxResults` the model accepts
-/// (`smithy_query(query="shape", shape="MaxResults")`).
-const MAX_RESULTS_RANGE: std::ops::RangeInclusive<i32> = 1..=1000;
-
 /// Mint the opaque token that resumes a listing at `offset`.
 ///
 /// base64 of the plaintext above: the standard alphabet plus `=` padding is
@@ -148,19 +144,6 @@ fn pagination_token_exception(operation: &str) -> ListServicesError {
              {PAGINATION_TOKEN_EXCEPTION_DETAIL}"
         ),
         field_list: None,
-    })
-    .into()
-}
-
-/// The modelled `ValidationException` for one input member, carrying the member's
-/// path in `fieldList` the way the service's own boundary refusal does.
-fn invalid_member(path: &str, message: String) -> ListServicesError {
-    ListServicesErrorModeled::ValidationException(ValidationException {
-        message: format!("{path}: {message}"),
-        field_list: Some(vec![ValidationExceptionField {
-            path: path.to_string(),
-            message,
-        }]),
     })
     .into()
 }
@@ -239,23 +222,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Paging needs no request metadata: the resume position travels in the token.
         let _ = ctx;
 
-        // The boundary validator already refuses a `maxResults` outside the
-        // modelled range and a `nextToken` outside its length/pattern; this guard
-        // keeps the page size an invariant of the handler itself and states the
-        // refusal as the modelled `ValidationException`.
-        if let Some(max_results) = input.max_results {
-            if !MAX_RESULTS_RANGE.contains(&max_results) {
-                return Err(invalid_member(
-                    "maxResults",
-                    format!(
-                        "Member must be between {} and {}, inclusive",
-                        MAX_RESULTS_RANGE.start(),
-                        MAX_RESULTS_RANGE.end()
-                    ),
-                ));
-            }
-        }
-
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListServicesErrorModeled::InternalServerException(
                 InternalServerException {
@@ -283,6 +249,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         };
 
+        // A `maxResults` outside the modelled `@range` never reaches here: the
+        // service's front door refuses every modelled member constraint before an
+        // operation runs, so the only page size left to decide is the one for a
+        // request that named none.
         let page_size = input
             .max_results
             .map_or(SERVICE_LIST_MAX_ITEMS, |max| max as usize)

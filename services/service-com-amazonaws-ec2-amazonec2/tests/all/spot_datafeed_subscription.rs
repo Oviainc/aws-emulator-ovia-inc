@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! End-to-end cover for the account's Spot Instance data feed —
-//! `CreateSpotDatafeedSubscription` and `DescribeSpotDatafeedSubscription` — driven over the
+//! `CreateSpotDatafeedSubscription`, `DescribeSpotDatafeedSubscription` and
+//! `DeleteSpotDatafeedSubscription` — driven over the
 //! wire the service actually speaks: `ec2Query`, an
 //! `application/x-www-form-urlencoded` POST whose body carries `Action=…`, answered with XML
 //! (README.md / OPERATIONS.md "Wire protocol").
@@ -25,6 +26,11 @@
 //! 4. The ONE record the store holds is charged against the emulator's caller-supplied byte
 //!    budget when it is written and the charge is given back when it is dropped, so an
 //!    account that writes its feed over and over does not make the store drift.
+//! 5. The delete takes the account's one feed away, so the describe afterwards refuses it
+//!    the way it does for an account that never created one — and because the feed is a
+//!    singleton the caller names no resource by id, so the delete is IDEMPOTENT: an account
+//!    that holds no feed is answered the same success envelope (HTTP 200 carrying the
+//!    `<return>true</return>` flag) as one that held a feed, and never an error.
 //!
 //! So the tables below span those classes rather than one recorded request: bucket names at
 //! each published length bound and one past each, every structural naming rule the guide
@@ -117,6 +123,61 @@ async fn create(
          with body {body}"
     );
     feed(case, &body)
+}
+
+/// `DeleteSpotDatafeedSubscription` with `params`, required to succeed and to carry the
+/// ec2Query envelope's `<return>true</return>` success flag — the WHOLE body of an operation
+/// whose modelled output declares no members of its own.
+async fn delete_with(router: &MultiServiceRouter, case: &str, params: &[Param]) {
+    const ACTION: &str = "DeleteSpotDatafeedSubscription";
+    let (status, body) = call(router, ACTION, params).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from {ACTION}, got {status} with body {body}"
+    );
+    let flags = super::ec2_query::envelope_children(case, &body, ACTION, "return");
+    assert_eq!(
+        flags,
+        vec!["true".to_string()],
+        "case {case:?}: expected one <return>true</return> in the {ACTION} envelope, got \
+         {flags:?} with body {body}"
+    );
+    // The envelope's request id, which every ec2Query response carries beside the flag.
+    let ids = super::ec2_query::envelope_children(case, &body, ACTION, "requestId");
+    assert_eq!(
+        ids.len(),
+        1,
+        "case {case:?}: expected one <requestId> in the {ACTION} envelope, got {ids:?} with \
+         body {body}"
+    );
+    assert!(
+        !ids[0].is_empty(),
+        "case {case:?}: expected a non-empty <requestId>, got {:?} with body {body}",
+        ids[0]
+    );
+}
+
+/// `DeleteSpotDatafeedSubscription` with no parameters, required to succeed.
+async fn delete(router: &MultiServiceRouter, case: &str) {
+    delete_with(router, case, &[]).await;
+}
+
+/// The account has no feed to report: the describe is refused with EC2's
+/// `InvalidSpotDatafeed.NotFound` and HTTP 400.
+async fn assert_no_feed(router: &MultiServiceRouter, case: &str) {
+    let (status, body) = call(router, "DescribeSpotDatafeedSubscription", &[]).await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected HTTP 400 describing an account with no feed, got {status} \
+         with body {body}"
+    );
+    let code = error_code(&body);
+    assert_eq!(
+        code,
+        ec2::state::INVALID_SPOT_DATAFEED_NOT_FOUND,
+        "case {case:?}: expected error code {:?}, got {code:?} with body {body}",
+        ec2::state::INVALID_SPOT_DATAFEED_NOT_FOUND
+    );
 }
 
 /// `DescribeSpotDatafeedSubscription`, required to succeed; answers the feed it reported.
@@ -570,7 +631,7 @@ async fn a_dry_run_flag_set_to_false_runs_the_request() {
 /// record goes: a create charges exactly
 /// [`ec2::state::spot_datafeed_payload_bytes`] for the record it stored, a create that
 /// REPLACES the feed charges only the difference, and the removal
-/// `DeleteSpotDatafeedSubscription` will use returns the store to exactly what it held
+/// `DeleteSpotDatafeedSubscription` makes returns the store to exactly what it held
 /// before — so repeated writes cannot make the budget drift.
 ///
 /// The rows are prefixes written in sequence onto one account, differing along the length
@@ -642,4 +703,234 @@ async fn the_one_feed_is_charged_once_and_its_charge_is_given_back() {
          body {body}",
         ec2::state::INVALID_SPOT_DATAFEED_NOT_FOUND
     );
+}
+
+// ---------------------------------------------------------------------------
+// RULE 5: the delete takes the one feed away, and does so idempotently
+// ---------------------------------------------------------------------------
+
+/// The rule: `DeleteSpotDatafeedSubscription` takes the account's one data feed away, so the
+/// describe afterwards refuses the way it does for an account that never created one.
+///
+/// The rows span the feeds the delete has to be able to remove — the bucket name at each
+/// published length bound and across its character classes, and the prefix absent, empty,
+/// nested and at its published maximum encoding — each against a fresh account, so no row
+/// depends on another. Every row then deletes a SECOND time to pin the idempotence: the
+/// repeat is answered the same success, because the postcondition it asks for already holds.
+#[tokio::test]
+async fn deleting_the_feed_leaves_the_account_with_none() {
+    // (case, bucket, prefix)
+    let rows: Vec<(String, String, Option<String>)> = vec![
+        (
+            "a feed with a prefix".to_string(),
+            "spot-feed-delete".to_string(),
+            Some("logs/".to_string()),
+        ),
+        (
+            "a feed with no prefix".to_string(),
+            "spot-feed-delete".to_string(),
+            None,
+        ),
+        (
+            "a feed with an explicitly empty prefix".to_string(),
+            "spot-feed-delete".to_string(),
+            Some(String::new()),
+        ),
+        (
+            "a feed with a nested prefix".to_string(),
+            "s3.spot-feed.delete".to_string(),
+            Some("a/b/c/d/spotfeed".to_string()),
+        ),
+        (
+            "a feed in a bucket at the published minimum length".to_string(),
+            "a-c".to_string(),
+            Some("spot/".to_string()),
+        ),
+        (
+            "a feed in a bucket at the published maximum length".to_string(),
+            bucket_of_length(ec2::state::MAX_S3_BUCKET_NAME_CHARS),
+            None,
+        ),
+        (
+            "a feed with a prefix at the published maximum length".to_string(),
+            "spot-feed-delete".to_string(),
+            Some("p".repeat(ec2::state::MAX_SPOT_DATAFEED_PREFIX_BYTES)),
+        ),
+    ];
+
+    for (case, bucket, prefix) in rows {
+        let router = emulator();
+        let reported = create(&router, &case, &bucket, prefix.as_deref()).await;
+        assert_feed(&router, &case, &reported, &bucket, prefix.as_deref()).await;
+
+        delete(&router, &case).await;
+        assert_no_feed(&router, &case).await;
+
+        // The same request again: a delete names no resource, so the repeat is answered the
+        // same success and the account still holds nothing.
+        let repeated = format!("{case}, deleted again");
+        delete(&router, &repeated).await;
+        assert_no_feed(&router, &repeated).await;
+
+        // And the account can create a feed again afterwards, so the delete took the record
+        // away rather than leaving the singleton unusable.
+        let case = format!("{case}, created again after the delete");
+        let reported = create(&router, &case, &bucket, prefix.as_deref()).await;
+        assert_feed(&router, &case, &reported, &bucket, prefix.as_deref()).await;
+    }
+}
+
+/// A delete made by an account that holds NO feed is answered the same success as one that
+/// holds one: the feed is a singleton the caller names no id for, so there is no absent
+/// resource to refuse, and nothing is written either way.
+///
+/// The rows are the states the delete is made from — a fresh account, an account whose feed
+/// has just been deleted, and an account that has created and deleted one twice — so the
+/// invariant is checked from more than one history, and each state is deleted from
+/// repeatedly.
+#[tokio::test]
+async fn deleting_a_feed_the_account_does_not_have_succeeds() {
+    /// Deletes per row — enough to catch a second call answering differently from the first.
+    const DELETES: usize = 3;
+
+    // (case, how many create-and-delete lifecycles come first)
+    let rows: [(&str, usize); 3] = [
+        ("a fresh account that has never created a feed", 0),
+        ("an account whose one feed has been deleted", 1),
+        ("an account that has created and deleted a feed twice", 2),
+    ];
+
+    for (case, lifecycles) in rows {
+        let router = emulator();
+        for lifecycle in 1..=lifecycles {
+            let case = format!("{case}, lifecycle {lifecycle}");
+            create(&router, &case, "spot-feed-idempotent", Some("logs/")).await;
+            delete(&router, &case).await;
+        }
+        for attempt in 1..=DELETES {
+            let case = format!("{case}, delete {attempt}");
+            delete(&router, &case).await;
+            assert_no_feed(&router, &case).await;
+        }
+    }
+}
+
+/// A `DryRun` delete performs nothing: it is refused with `DryRunOperation` and HTTP 412, and
+/// the feed the account held is still there afterwards. `DryRun=false` is not a dry run, so
+/// it deletes.
+///
+/// The flag is read in both states — with a feed stored and with none — so its answer is
+/// pinned not to depend on whether the resource the call would remove exists, which is what
+/// makes it a question about PERMISSIONS.
+#[tokio::test]
+async fn a_dry_run_delete_performs_nothing() {
+    let router = emulator();
+    let (bucket, prefix) = ("spot-feed-dry-run-delete", Some("dry/"));
+    let stored = create(&router, "the dry run table's starting feed", bucket, prefix).await;
+
+    for attempt in 1..=2 {
+        let case = format!("a dry run delete with a feed stored, attempt {attempt}");
+        assert_dry_run_refused(&router, &case).await;
+        let reported = describe(&router, &case).await;
+        assert_eq!(
+            reported, stored,
+            "case {case:?}: a dry run delete must leave the feed {stored:?}, got {reported:?}"
+        );
+    }
+
+    // `DryRun=false` is not a dry run: this one deletes.
+    delete_with(
+        &router,
+        "a delete with DryRun=false",
+        &[param("DryRun", "false")],
+    )
+    .await;
+    assert_no_feed(&router, "a delete with DryRun=false").await;
+
+    // The same answer with nothing stored: the flag asks about permissions, not about the
+    // feed.
+    let case = "a dry run delete with no feed stored";
+    assert_dry_run_refused(&router, case).await;
+    assert_no_feed(&router, case).await;
+}
+
+/// One `DeleteSpotDatafeedSubscription` carrying `DryRun=true`, required to be refused with
+/// EC2's `DryRunOperation` and HTTP 412.
+async fn assert_dry_run_refused(router: &MultiServiceRouter, case: &str) {
+    let (status, body) = call(
+        router,
+        "DeleteSpotDatafeedSubscription",
+        &[param("DryRun", "true")],
+    )
+    .await;
+    assert_eq!(
+        status, 412,
+        "case {case:?}: expected HTTP 412 from a dry run delete, got {status} with body {body}"
+    );
+    let code = error_code(&body);
+    assert_eq!(
+        code,
+        ec2::state::DRY_RUN_OPERATION,
+        "case {case:?}: expected error code {:?}, got {code:?} with body {body}",
+        ec2::state::DRY_RUN_OPERATION
+    );
+}
+
+/// The delete gives the record's byte charge back over the WIRE, so a store driven only
+/// through the API does not drift: after each create-and-delete the store holds exactly what
+/// it held before the create, and a delete that removes nothing releases nothing.
+///
+/// The rows are feeds whose charge differs along what it is a function of — the bucket name's
+/// length and the prefix's — applied in sequence to one account.
+#[tokio::test]
+async fn the_delete_gives_the_feeds_byte_charge_back() {
+    let (router, engine) = super::ec2_query::emulator();
+    let store = engine.state::<Ec2State>();
+    // The delta is taken against what the seeded store already holds, never an absolute.
+    let before = store.lock().stored_bytes();
+
+    let long = "p".repeat(ec2::state::MAX_SPOT_DATAFEED_PREFIX_BYTES);
+    // (case, bucket, prefix)
+    let steps: Vec<(&str, &str, Option<&str>)> = vec![
+        ("a short prefix", "spot-feed-delete-bytes", Some("a/")),
+        ("no prefix", "spot-feed-delete-bytes", None),
+        (
+            "a prefix at the published maximum",
+            "spot-feed-delete-bytes",
+            Some(long.as_str()),
+        ),
+        (
+            "a longer bucket name",
+            "spot-feed-delete-bytes-with-a-much-longer-name",
+            Some("b/"),
+        ),
+    ];
+
+    for (case, bucket, prefix) in steps {
+        create(&router, case, bucket, prefix).await;
+        let charged = store.lock().stored_bytes();
+        let expected = before + ec2::state::spot_datafeed_payload_bytes(bucket, prefix);
+        assert_eq!(
+            charged, expected,
+            "case {case:?}: expected the store to hold {expected} bytes after the create, \
+             got {charged}"
+        );
+
+        delete(&router, case).await;
+        let released = store.lock().stored_bytes();
+        assert_eq!(
+            released, before,
+            "case {case:?}: expected the delete to give the charge back, leaving {before} \
+             bytes, got {released}"
+        );
+
+        // A delete with nothing stored releases nothing, so the store cannot go backwards.
+        let case = format!("{case}, deleted again");
+        delete(&router, &case).await;
+        let still = store.lock().stored_bytes();
+        assert_eq!(
+            still, before,
+            "case {case:?}: expected the store to stand at {before} bytes, got {still}"
+        );
+    }
 }
