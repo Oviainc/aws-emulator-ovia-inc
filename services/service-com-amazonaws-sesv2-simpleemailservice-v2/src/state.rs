@@ -5,9 +5,9 @@
 //! Everything the implemented operations answer with is computed from the records
 //! below: the email-identity table, the contact-list table, the configuration-set
 //! table, the suppression-list table, the multi-region-endpoint table, the
-//! outbound-message log, the per-account send counters and the account-level
-//! attributes. Nothing here is per-request scratch — the whole struct lives in the one
-//! shared engine (see [`service_state`]).
+//! dedicated-IP table, the outbound-message log, the per-account send counters and
+//! the account-level attributes. Nothing here is per-request scratch — the whole
+//! struct lives in the one shared engine (see [`service_state`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -631,6 +631,10 @@ pub struct ComAmazonawsSesv2SimpleemailserviceV2State {
     /// by [`MAX_SUPPRESSED_DESTINATIONS`], which [`Self::suppress_destination`]
     /// enforces.
     pub suppressed_destinations: BTreeMap<String, SuppressedDestinationRecord>,
+    /// The dedicated IP addresses the account holds, keyed by the address itself —
+    /// the only identity a dedicated IP has. Ordered, so `GetDedicatedIps`
+    /// enumerates and pages deterministically.
+    pub dedicated_ips: BTreeMap<String, DedicatedIpRecord>,
     /// The outbound-message log, oldest first: one entry per accepted `SendEmail`.
     pub sent_messages: Vec<SentMessage>,
     /// Per-account send counters, bumped by `SendEmail`.
@@ -2252,6 +2256,108 @@ pub fn configuration_set_name_invalid(configuration_set_name: &str) -> String {
 /// readable for a name that is itself a sentence fragment.
 pub fn configuration_set_not_found(configuration_set_name: &str) -> String {
     format!("Configuration set <{configuration_set_name}> does not exist.")
+}
+
+/// The `WarmupPercentage` a dedicated IP in a MANAGED pool reports.
+///
+/// From `DedicatedIp$WarmupPercentage`: "-1 — Appears for IP addresses in managed
+/// dedicated pools where Amazon SES automatically handles the warm-up process,
+/// making the percentage not applicable."
+pub const MANAGED_WARMUP_PERCENTAGE: i32 = -1;
+
+/// The `WarmupPercentage` of a dedicated IP whose warm-up has finished.
+///
+/// From `DedicatedIp$WarmupPercentage`: "A value of 100 means the IP address is
+/// fully warmed up and ready for use."
+pub const WARMUP_COMPLETE_PERCENTAGE: i32 = 100;
+
+/// One dedicated IP address the account holds: the pool it is in and how far its
+/// warm-up has got.
+///
+/// A dedicated IP is allocated to an account out of band — SES hands one over on a
+/// support request, or provisions it into a managed pool — so no request here mints
+/// one; the dedicated-IP operations read this table, move an address between pools
+/// and move its warm-up along.
+#[derive(Debug, Clone)]
+pub struct DedicatedIpRecord {
+    /// `DedicatedIp$Ip`: the address itself, which is also this record's key.
+    pub ip: String,
+    /// `DedicatedIp$PoolName`: the dedicated IP pool the address is associated
+    /// with, or `None` while it is in none.
+    pub pool_name: Option<String>,
+    /// `DedicatedIp$WarmupPercentage`: `0`..=[`WARMUP_COMPLETE_PERCENTAGE`] while
+    /// SES warms a standard address up, and [`MANAGED_WARMUP_PERCENTAGE`] for an
+    /// address in a managed pool, where the percentage does not apply.
+    pub warmup_percentage: i32,
+}
+
+impl DedicatedIpRecord {
+    /// A dedicated IP as the account holds it: an address, the pool it is in, and
+    /// the warm-up progress its record carries.
+    pub fn new(ip: &str, pool_name: Option<String>, warmup_percentage: i32) -> Self {
+        Self {
+            ip: ip.to_string(),
+            pool_name,
+            warmup_percentage,
+        }
+    }
+
+    /// The modelled `WarmupStatus` of this address, DERIVED from the one stored
+    /// number rather than tracked beside it, so the status and the percentage can
+    /// never disagree.
+    ///
+    /// The derivation is the one `DedicatedIp$WarmupStatus` and
+    /// `DedicatedIp$WarmupPercentage` document together: a percentage that does not
+    /// apply (the managed pools, where "Amazon SES automatically handles the
+    /// warm-up process") reports `NOT_APPLICABLE`, a fully warmed up address
+    /// ("a value of 100 means the IP address is fully warmed up and ready for use")
+    /// reports `DONE`, and anything below that is still warming up, so it reports
+    /// `IN_PROGRESS`.
+    pub fn warmup_status(&self) -> &'static str {
+        if self.warmup_percentage < 0 {
+            "NOT_APPLICABLE"
+        } else if self.warmup_percentage >= WARMUP_COMPLETE_PERCENTAGE {
+            "DONE"
+        } else {
+            "IN_PROGRESS"
+        }
+    }
+
+    /// This record as the modelled `DedicatedIp` every operation that reports a
+    /// dedicated IP answers with, so they cannot describe one address differently.
+    pub fn detail(&self) -> crate::ops::types::DedicatedIp {
+        crate::ops::types::DedicatedIp {
+            ip: self.ip.clone(),
+            warmup_status: self.warmup_status().to_string(),
+            warmup_percentage: self.warmup_percentage,
+            pool_name: self.pool_name.clone(),
+        }
+    }
+}
+
+/// Whether `ip` is the kind of value an `Ip` names: the shape is documented as "an
+/// IPv4 address", so a dotted-quad address is well formed and anything else — a
+/// host name, a truncated quad, an octet out of range, an IPv6 address — is not.
+pub fn ip_is_well_formed(ip: &str) -> bool {
+    ip.parse::<::std::net::Ipv4Addr>().is_ok()
+}
+
+/// How this service words `BadRequestException` for an `Ip` that is not an IPv4
+/// address at all, stated once for every operation that takes one.
+pub fn invalid_ip(ip: &str) -> String {
+    format!("Invalid IP address: {ip}. The value has to be an IPv4 address.")
+}
+
+/// How this service words `NotFoundException` for an address the account holds no
+/// dedicated IP for.
+///
+/// One wording for every operation that takes an `Ip`, so a client sees the same
+/// sentence whichever call first tells it the address is not one of its dedicated
+/// IPs. SES delimits the address it interpolated with angle brackets, and says
+/// which account it looked in, because an address is a dedicated IP only relative
+/// to the account that holds it.
+pub fn dedicated_ip_not_found(ip: &str) -> String {
+    format!("Could not find dedicated IP <{ip}> under this account.")
 }
 
 /// One address on a suppression list.

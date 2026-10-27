@@ -432,8 +432,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             backup_enabled_at: None,
             error_cause: None,
             tags,
-            // The source's resources as of the restore point, copied verbatim:
-            // the restored data store serves exactly what the source held then.
+            // The source's resources as of the restore point, each at the
+            // version that was current then and copied verbatim: the restored
+            // data store serves exactly what the source held at that instant.
             fhir_resources: snapshot.fhir_resources,
             fhir_resource_bytes: snapshot.fhir_resource_bytes,
         };
@@ -464,9 +465,11 @@ struct SourceSnapshot {
     profile_configuration: Option<ProfileConfiguration>,
     /// The source's tags, empty unless its backup configuration includes them.
     backed_up_tags: ::std::collections::BTreeMap<String, String>,
-    /// The source's FHIR resources as of the restore point.
+    /// The source's FHIR resources as of the restore point, each at the version
+    /// that was current at that instant.
     fhir_resources: ::std::collections::BTreeMap<(String, String), crate::state::FhirResource>,
-    /// How many bytes those resources hold together.
+    /// How many bytes those resources, and the versions they retain, hold
+    /// together.
     fhir_resource_bytes: usize,
 }
 

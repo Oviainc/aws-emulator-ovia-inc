@@ -176,9 +176,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // expression is one the service can evaluate is a property of the
         // expression, not of the rows it would be applied to, so a malformed
         // filter is refused even for an account that holds no usage records.
-        if let Some(filter) = input.filter.as_ref() {
-            check_expression(filter, 0)?;
-        }
+        // Checking DECODES the expression ([`CheckedExpression`]), so the
+        // evaluation below reads what the check settled instead of reading the
+        // request's own encoding a second time.
+        let filter = match input.filter.as_ref() {
+            None => None,
+            Some(filter) => Some(check_expression(filter, 0)?),
+        };
 
         let store = state.lock();
         let records = store.usages_for(crate::state::caller_account_id());
@@ -187,8 +191,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // token is an offset into the records and not into the filtered view.
         let mut selected: Vec<(usize, &crate::state::UsageRecord)> = Vec::new();
         for (position, record) in records.iter().enumerate().skip(offset) {
-            let keep = input
-                .filter
+            let keep = filter
                 .as_ref()
                 .is_none_or(|filter| matches_expression(record, filter));
             if keep {
@@ -258,8 +261,76 @@ fn render(record: &crate::state::UsageRecord) -> FreeTierUsage {
     }
 }
 
-/// Check that `filter` is an expression the service can evaluate, refusing it
-/// with the modelled `ValidationException` otherwise.
+/// The one root operator an `Expression` sets, carrying the operand that root
+/// holds.
+///
+/// Which roots are set and what they carry are read ONCE, so the arity check
+/// and the decode that follows it cannot disagree about either.
+#[derive(Clone, Copy)]
+enum Root<'a> {
+    /// `Or`, over the expressions it lists.
+    Or(&'a [Expression]),
+    /// `And`, over the expressions it lists.
+    And(&'a [Expression]),
+    /// `Not`, over the one expression it negates.
+    Not(&'a Expression),
+    /// `Dimensions`, over the one comparison it states.
+    Dimensions(&'a DimensionValues),
+}
+
+impl Root<'_> {
+    /// The member name the model gives this root operator.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Or(_) => ROOT_OR,
+            Self::And(_) => ROOT_AND,
+            Self::Not(_) => ROOT_NOT,
+            Self::Dimensions(_) => ROOT_DIMENSIONS,
+        }
+    }
+}
+
+/// A `filter` the service can evaluate, as [`check_expression`] decoded it:
+/// one root operator per level, each `Dimensions` comparison reduced to the
+/// single match option it compares under and the values it compares against in
+/// the form its dimension compares them in.
+///
+/// Decoding in the checking phase is what keeps ONE reading of the request:
+/// [`matches_expression`] evaluates this and never re-reads the `Expression`,
+/// so there is no second place for the arity of `MatchOptions` or the
+/// magnitude a value names to be decided differently.
+enum CheckedExpression<'a> {
+    /// `And`: every expression it lists.
+    All(Vec<CheckedExpression<'a>>),
+    /// `Or`: any expression it lists.
+    Any(Vec<CheckedExpression<'a>>),
+    /// `Not`: the negation of its expression.
+    Negated(Box<CheckedExpression<'a>>),
+    /// `Dimensions`: one dimension comparison.
+    Dimension(CheckedComparison<'a>),
+}
+
+/// One `Dimensions` comparison, decoded by [`check_dimension`].
+struct CheckedComparison<'a> {
+    /// The `Dimension` the comparison names (`Key`).
+    key: &'a str,
+    /// The single option `MatchOptions` carries.
+    option: &'a str,
+    /// What `Values` compares against.
+    wanted: CheckedValues<'a>,
+}
+
+/// The `Values` of one comparison in the form the dimension's kind compares
+/// them in (`crate::state::DimensionKind`): text as written, and a numeric
+/// dimension's values as the magnitudes they name.
+enum CheckedValues<'a> {
+    Text(&'a [String]),
+    Magnitudes(Vec<f64>),
+}
+
+/// Check that `filter` is an expression the service can evaluate, decoding it
+/// into the form [`matches_expression`] evaluates and refusing it with the
+/// modelled `ValidationException` otherwise.
 ///
 /// An `Expression` sets EXACTLY ONE root operator: "In the following Contents,
 /// you must specify exactly one of the following root operators" (the
@@ -274,63 +345,74 @@ fn render(record: &crate::state::UsageRecord) -> FreeTierUsage {
 /// Checking is separate from evaluating ([`matches_expression`]) because
 /// whether a filter is well formed depends on the filter alone: the answer must
 /// not vary with how many records the account happens to hold.
-fn check_expression(filter: &Expression, depth: usize) -> Result<(), GetFreeTierUsageError> {
+fn check_expression(
+    filter: &Expression,
+    depth: usize,
+) -> Result<CheckedExpression<'_>, GetFreeTierUsageError> {
     if depth > MAX_FILTER_DEPTH {
         return Err(validation(format!(
             "filter: the expression nests more than {MAX_FILTER_DEPTH} levels"
         )));
     }
 
-    let mut roots: Vec<&str> = Vec::new();
-    if filter.or.is_some() {
-        roots.push(ROOT_OR);
+    // The roots this expression sets, in the order the model declares the
+    // members.
+    let mut roots: Vec<Root<'_>> = Vec::new();
+    if let Some(branches) = filter.or.as_ref() {
+        roots.push(Root::Or(branches));
     }
-    if filter.and.is_some() {
-        roots.push(ROOT_AND);
+    if let Some(branches) = filter.and.as_ref() {
+        roots.push(Root::And(branches));
     }
-    if filter.not.is_some() {
-        roots.push(ROOT_NOT);
+    if let Some(inner) = filter.not.as_deref() {
+        roots.push(Root::Not(inner));
     }
-    if filter.dimensions.is_some() {
-        roots.push(ROOT_DIMENSIONS);
+    if let Some(dimensions) = filter.dimensions.as_ref() {
+        roots.push(Root::Dimensions(dimensions));
     }
 
-    if roots.len() != 1 {
+    let [root] = roots.as_slice() else {
         let set = if roots.is_empty() {
             "none".to_string()
         } else {
-            roots.join(", ")
+            roots
+                .iter()
+                .map(|root| root.name())
+                .collect::<Vec<&str>>()
+                .join(", ")
         };
         return Err(validation(format!(
             "filter: an expression must set exactly one of {}, but this one sets {set}",
             ROOT_OPERATORS.join(", ")
         )));
-    }
+    };
 
-    // `Or` and `And` carry a list of expressions each; a list that holds none
-    // states no condition, exactly as an expression with no root operator does.
-    for (name, branches) in [(ROOT_OR, filter.or.as_ref()), (ROOT_AND, filter.and.as_ref())] {
-        if let Some(branches) = branches {
-            if branches.is_empty() {
-                return Err(validation(format!(
-                    "filter.{name}: a logical operator must list at least one expression"
-                )));
-            }
-            for inner in branches {
-                check_expression(inner, depth + 1)?;
-            }
-        }
-    }
+    Ok(match *root {
+        Root::Or(branches) => CheckedExpression::Any(check_branches(ROOT_OR, branches, depth)?),
+        Root::And(branches) => CheckedExpression::All(check_branches(ROOT_AND, branches, depth)?),
+        Root::Not(inner) => CheckedExpression::Negated(Box::new(check_expression(inner, depth + 1)?)),
+        Root::Dimensions(dimensions) => CheckedExpression::Dimension(check_dimension(dimensions)?),
+    })
+}
 
-    if let Some(inner) = filter.not.as_ref() {
-        check_expression(inner, depth + 1)?;
+/// Check and decode the expressions one logical operator lists.
+///
+/// `Or` and `And` carry a list of expressions each; a list that holds none
+/// states no condition, exactly as an expression with no root operator does.
+fn check_branches<'a>(
+    name: &'static str,
+    branches: &'a [Expression],
+    depth: usize,
+) -> Result<Vec<CheckedExpression<'a>>, GetFreeTierUsageError> {
+    if branches.is_empty() {
+        return Err(validation(format!(
+            "filter.{name}: a logical operator must list at least one expression"
+        )));
     }
-
-    if let Some(dimensions) = filter.dimensions.as_ref() {
-        check_dimension(dimensions)?;
-    }
-
-    Ok(())
+    branches
+        .iter()
+        .map(|inner| check_expression(inner, depth + 1))
+        .collect()
 }
 
 /// Check one `Dimensions` comparison: the dimension it names, the values it
@@ -340,8 +422,11 @@ fn check_expression(filter: &Expression, depth: usize) -> Result<(), GetFreeTier
 /// these values in the array", `DimensionValues$MatchOptions`), it has to be one
 /// the dimension's kind can be compared by, and comparing magnitudes needs
 /// values that are magnitudes — none of which depends on a record, so all of it
-/// is settled here.
-fn check_dimension(dimensions: &DimensionValues) -> Result<(), GetFreeTierUsageError> {
+/// is settled here — and settled ONCE: what this function decodes is what
+/// [`matches_dimension`] then compares by.
+fn check_dimension(
+    dimensions: &DimensionValues,
+) -> Result<CheckedComparison<'_>, GetFreeTierUsageError> {
     let key = dimensions.key.as_str();
     if !DIMENSION_VALUES.contains(&key) {
         return Err(validation(format!(
@@ -376,7 +461,7 @@ fn check_dimension(dimensions: &DimensionValues) -> Result<(), GetFreeTierUsageE
         )));
     };
 
-    match kind {
+    let wanted = match kind {
         crate::state::DimensionKind::Text => {
             if option == MATCH_GREATER_THAN_OR_EQUAL {
                 return Err(validation(format!(
@@ -385,6 +470,7 @@ fn check_dimension(dimensions: &DimensionValues) -> Result<(), GetFreeTierUsageE
                      {key}"
                 )));
             }
+            CheckedValues::Text(dimensions.values.as_slice())
         }
         crate::state::DimensionKind::Number => {
             if option != MATCH_EQUALS && option != MATCH_GREATER_THAN_OR_EQUAL {
@@ -393,42 +479,47 @@ fn check_dimension(dimensions: &DimensionValues) -> Result<(), GetFreeTierUsageE
                      {MATCH_EQUALS} or {MATCH_GREATER_THAN_OR_EQUAL}, not with {option}"
                 )));
             }
+            let mut magnitudes = Vec::with_capacity(dimensions.values.len());
             for wanted in &dimensions.values {
-                if wanted.trim().parse::<f64>().is_err() {
+                let Ok(magnitude) = wanted.trim().parse::<f64>() else {
                     return Err(validation(format!(
                         "filter.Dimensions.Values: {wanted} is not a number, and {key} compares \
                          numbers"
                     )));
-                }
+                };
+                magnitudes.push(magnitude);
             }
+            CheckedValues::Magnitudes(magnitudes)
         }
-    }
+    };
 
-    Ok(())
+    Ok(CheckedComparison {
+        key,
+        option,
+        wanted,
+    })
 }
 
 /// Whether `record` satisfies `filter`.
 ///
-/// Evaluates an expression [`check_expression`] has already accepted, so
-/// exactly one root operator is set at every level and each is honoured as the
-/// model documents it: `And` matches all of its expressions, `Or` any of them,
-/// `Not` the negation of its expression, and `Dimensions` one dimension
+/// Evaluates the expression [`check_expression`] accepted and decoded, whose
+/// shape already says which root operator each level sets, and honours each as
+/// the model documents it: `And` matches all of its expressions, `Or` any of
+/// them, `Not` the negation of its expression, and `Dimensions` one dimension
 /// comparison. Total rather than fallible: every expression the service cannot
-/// evaluate was refused before any record was read.
-fn matches_expression(record: &crate::state::UsageRecord, filter: &Expression) -> bool {
-    if let Some(all) = filter.and.as_ref() {
-        return all.iter().all(|inner| matches_expression(record, inner));
+/// evaluate was refused before any record was read, and nothing here re-reads
+/// the request.
+fn matches_expression(record: &crate::state::UsageRecord, filter: &CheckedExpression<'_>) -> bool {
+    match filter {
+        CheckedExpression::All(branches) => branches
+            .iter()
+            .all(|inner| matches_expression(record, inner)),
+        CheckedExpression::Any(branches) => branches
+            .iter()
+            .any(|inner| matches_expression(record, inner)),
+        CheckedExpression::Negated(inner) => !matches_expression(record, inner),
+        CheckedExpression::Dimension(comparison) => matches_dimension(record, comparison),
     }
-    if let Some(any) = filter.or.as_ref() {
-        return any.iter().any(|inner| matches_expression(record, inner));
-    }
-    if let Some(inner) = filter.not.as_ref() {
-        return !matches_expression(record, inner);
-    }
-    filter
-        .dimensions
-        .as_ref()
-        .is_some_and(|dimensions| matches_dimension(record, dimensions))
 }
 
 /// Whether `record`'s value for one dimension matches the filter's values.
@@ -436,31 +527,35 @@ fn matches_expression(record: &crate::state::UsageRecord, filter: &Expression) -
 /// The record matches when its value matches AT LEAST ONE of `Values` ("the
 /// results all match at least one of the specified values",
 /// `DimensionValues$Values`) under the single match option `MatchOptions`
-/// carries. [`check_dimension`] has already refused every comparison this
-/// cannot make.
-fn matches_dimension(record: &crate::state::UsageRecord, dimensions: &DimensionValues) -> bool {
-    let [option] = dimensions.match_options.as_slice() else {
-        return false;
-    };
-    let option = option.as_str();
-
-    match record.dimension_value(dimensions.key.as_str()) {
-        None => false,
-        Some(crate::state::DimensionValue::Text(text)) => dimensions
-            .values
+/// carries — both taken from [`CheckedComparison`], which [`check_dimension`]
+/// decoded before any record was read.
+fn matches_dimension(
+    record: &crate::state::UsageRecord,
+    comparison: &CheckedComparison<'_>,
+) -> bool {
+    match (record.dimension_value(comparison.key), &comparison.wanted) {
+        // The dimension names no member of a usage record, so this record has
+        // no value to compare.
+        (None, _) => false,
+        (Some(crate::state::DimensionValue::Text(text)), CheckedValues::Text(values)) => values
             .iter()
-            .any(|wanted| matches_text(&text, wanted, option)),
-        Some(crate::state::DimensionValue::Number(number)) => {
-            dimensions.values.iter().any(|wanted| {
-                wanted.trim().parse::<f64>().is_ok_and(|wanted| {
-                    if option == MATCH_GREATER_THAN_OR_EQUAL {
-                        number >= wanted
-                    } else {
-                        (number - wanted).abs() < f64::EPSILON
-                    }
-                })
-            })
-        }
+            .any(|wanted| matches_text(&text, wanted, comparison.option)),
+        (
+            Some(crate::state::DimensionValue::Number(number)),
+            CheckedValues::Magnitudes(magnitudes),
+        ) => magnitudes.iter().any(|wanted| {
+            if comparison.option == MATCH_GREATER_THAN_OR_EQUAL {
+                number >= *wanted
+            } else {
+                (number - wanted).abs() < f64::EPSILON
+            }
+        }),
+        // Which kind of value a dimension takes is a property of its key alone
+        // (`crate::state::dimension_kind`), and the record's value and the
+        // checked values were both read from the same key, so the two are
+        // always of the same kind.
+        (Some(crate::state::DimensionValue::Text(_)), CheckedValues::Magnitudes(_))
+        | (Some(crate::state::DimensionValue::Number(_)), CheckedValues::Text(_)) => false,
     }
 }
 
