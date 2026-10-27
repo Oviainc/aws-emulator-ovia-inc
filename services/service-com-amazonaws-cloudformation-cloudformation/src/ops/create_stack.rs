@@ -28,9 +28,12 @@
 //! `DisableRollback=true` also spells) leaves the stack `CREATE_FAILED` with everything
 //! the create made, and `DELETE` takes the stack away with them.
 //!
-//! Members this handler stores but does not act on: `StackPolicyBody` (a stack policy
-//! governs which resources an update may change; `GetStackPolicy` reports it back) and
-//! `ResourceTypes` (which resource types the stack's operations may work with).
+//! Members this handler stores for a LATER call to act on: `StackPolicyBody`, the stack
+//! policy that governs which of the stack's resources an update may change (`UpdateStack`
+//! and `ExecuteChangeSet` are held to it, `GetStackPolicy` reports it back) — a create
+//! brings every resource into existence, so no action a policy governs is taken here.
+//! Stored but not acted on: `ResourceTypes` (which resource types the stack's operations
+//! may work with).
 //! `DisableValidation` turns off pre-deployment template validation, which this emulator
 //! does not perform either way. `StackPolicyURL` names a policy in Amazon S3 and is
 //! answered 501.

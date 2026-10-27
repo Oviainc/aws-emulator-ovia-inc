@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCommentsForPullRequest
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCommentsForPullRequest`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCommentsForPullRequest::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -166,6 +157,55 @@ impl From<GetCommentsForPullRequestErrorModeled> for GetCommentsForPullRequestEr
     }
 }
 
+/// A commit id named in the request, mapped onto the errors THIS operation models
+/// for it: which ids address a commit is `crate::state`'s rule
+/// ([`crate::state::checked_commit_id`]), so every operation taking one agrees
+/// about it and about the message each refusal carries.
+fn checked_commit_id(commit_id: &str) -> Result<(), GetCommentsForPullRequestError> {
+    crate::state::checked_commit_id(commit_id).map_err(|problem| {
+        let message = Some(problem.message().to_string());
+        match problem {
+            crate::state::CommitIdProblem::Missing => {
+                GetCommentsForPullRequestErrorModeled::CommitIdRequiredException(
+                    CommitIdRequiredException { message },
+                )
+            }
+            crate::state::CommitIdProblem::Invalid => {
+                GetCommentsForPullRequestErrorModeled::InvalidCommitIdException(
+                    InvalidCommitIdException { message },
+                )
+            }
+        }
+        .into()
+    })
+}
+
+/// How this operation refuses a page it cannot serve. Both codes come from this
+/// service's one pagination rule ([`crate::state::page_of_at_most`]), so every
+/// paginated listing refuses the same `maxResults` and the same `nextToken` with
+/// the same words; this only maps each outcome onto the error THIS operation
+/// models for it.
+fn page_refusal(problem: crate::state::PageProblem) -> GetCommentsForPullRequestError {
+    match problem {
+        crate::state::PageProblem::InvalidMaxResults(message) => {
+            GetCommentsForPullRequestErrorModeled::InvalidMaxResultsException(
+                InvalidMaxResultsException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+        crate::state::PageProblem::InvalidContinuationToken(message) => {
+            GetCommentsForPullRequestErrorModeled::InvalidContinuationTokenException(
+                InvalidContinuationTokenException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+    }
+}
+
 /// The `GetCommentsForPullRequest` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -202,18 +242,240 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCommentsForPullRequest` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCommentsForPullRequestErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCommentsForPullRequest"))
+        // Which ids address a pull request is `crate::state`'s rule, so every
+        // operation taking a `pullRequestId` agrees about it; this only maps each
+        // outcome onto the error THIS operation models for it.
+        let pull_request_id = crate::state::normalize_pull_request_id(&input.pull_request_id)
+            .map_err(|problem| match problem {
+                crate::state::PullRequestIdProblem::Missing => {
+                    GetCommentsForPullRequestErrorModeled::PullRequestIdRequiredException(
+                        PullRequestIdRequiredException {
+                            message: Some(
+                                crate::state::PULL_REQUEST_ID_REQUIRED_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                }
+                crate::state::PullRequestIdProblem::Invalid => {
+                    GetCommentsForPullRequestErrorModeled::InvalidPullRequestIdException(
+                        InvalidPullRequestIdException {
+                            message: Some(
+                                crate::state::INVALID_PULL_REQUEST_ID_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                }
+            })?;
+
+        // The three optional members that narrow the read to one comparison of the
+        // pull request. A blank one narrows nothing, the same as leaving it out.
+        let requested_repository = input
+            .repository_name
+            .as_deref()
+            .filter(|repository_name| !repository_name.is_empty());
+        let after_commit_id = input
+            .after_commit_id
+            .as_deref()
+            .filter(|commit_id| !commit_id.is_empty());
+        let before_commit_id = input
+            .before_commit_id
+            .as_deref()
+            .filter(|commit_id| !commit_id.is_empty());
+
+        // The members' documented conditional requirement: "afterCommitId must be
+        // specified when repositoryName is included", "beforeCommitId must be
+        // specified when repositoryName is included" and "repositoryName must be
+        // specified when beforeCommitId and afterCommitId are included" — so the
+        // three arrive together or not at all.
+        if requested_repository.is_some()
+            && (after_commit_id.is_none() || before_commit_id.is_none())
+        {
+            return Err(
+                GetCommentsForPullRequestErrorModeled::CommitIdRequiredException(
+                    CommitIdRequiredException {
+                        message: Some(crate::state::COMMIT_ID_REQUIRED_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+        if requested_repository.is_none()
+            && (after_commit_id.is_some() || before_commit_id.is_some())
+        {
+            return Err(
+                GetCommentsForPullRequestErrorModeled::RepositoryNameRequiredException(
+                    RepositoryNameRequiredException {
+                        message: Some(
+                            crate::state::REPOSITORY_NAME_REQUIRED_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        for commit_id in [before_commit_id, after_commit_id].into_iter().flatten() {
+            checked_commit_id(commit_id)?;
+        }
+
+        // `callerReactions` is the one member of a comment that depends on who is
+        // asking, so the asking identity is read the way the other readers of a
+        // stored comment read it.
+        let caller_arn = crate::state::caller_identity_arn(&*self.engine, ctx);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        // Reporting only: the comments are read exactly as the operations that post
+        // them left them, so two reads of one pull request answer the same.
+        let store = state.lock();
+        // Whether the id names a pull request AT ALL is a question about the whole
+        // store, because a pull request id is unique per account; it is answered
+        // before one repository is picked, so the two refusals below can be told
+        // apart.
+        let pull_request_exists = store.pull_request(pull_request_id).is_some();
+        // The repository whose comments this read reports: the one the request
+        // names, or — where it names none — the one holding the pull request, since
+        // a pull request's comments live on the repository that holds it.
+        let repository = match requested_repository {
+            Some(repository_name) => {
+                let repository = store.repositories.get(repository_name).ok_or_else(|| {
+                    GetCommentsForPullRequestErrorModeled::RepositoryDoesNotExistException(
+                        RepositoryDoesNotExistException {
+                            message: Some(crate::state::repository_does_not_exist_message(
+                                repository_name,
+                            )),
+                        },
+                    )
+                })?;
+                if !repository.pull_requests.contains_key(&pull_request_id) {
+                    // A pull request this repository does not hold: one that exists
+                    // elsewhere is refused as not associated with this repository,
+                    // and one no repository holds as not existing at all.
+                    return Err(if pull_request_exists {
+                        GetCommentsForPullRequestErrorModeled::RepositoryNotAssociatedWithPullRequestException(
+                            RepositoryNotAssociatedWithPullRequestException {
+                                message: Some(
+                                    crate::state::REPOSITORY_NOT_ASSOCIATED_WITH_PULL_REQUEST_MESSAGE
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into()
+                    } else {
+                        GetCommentsForPullRequestErrorModeled::PullRequestDoesNotExistException(
+                            PullRequestDoesNotExistException {
+                                message: Some(crate::state::pull_request_does_not_exist_message(
+                                    &pull_request_id.to_string(),
+                                )),
+                            },
+                        )
+                        .into()
+                    });
+                }
+                repository
+            }
+            None => store
+                .repositories
+                .values()
+                .find(|repository| repository.pull_requests.contains_key(&pull_request_id))
+                .ok_or_else(|| {
+                    GetCommentsForPullRequestErrorModeled::PullRequestDoesNotExistException(
+                        PullRequestDoesNotExistException {
+                            message: Some(crate::state::pull_request_does_not_exist_message(
+                                &pull_request_id.to_string(),
+                            )),
+                        },
+                    )
+                })?,
+        };
+
+        // A named side of the comparison has to be a commit this repository holds:
+        // an id it never had addresses no version of the pull request's files.
+        for commit_id in [before_commit_id, after_commit_id].into_iter().flatten() {
+            if !repository.commits.contains_key(commit_id) {
+                return Err(
+                    GetCommentsForPullRequestErrorModeled::CommitDoesNotExistException(
+                        CommitDoesNotExistException {
+                            message: Some(crate::state::commit_does_not_exist_message(commit_id)),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // The comment threads filed on this pull request, oldest first. A comment
+        // posted on the bare comparison of two commits carries no pull request and
+        // is not one of these, and a reply is reported inside its own thread rather
+        // than as a thread of its own. A named comparison narrows the threads to
+        // the ones filed on exactly those two commits.
+        let mut roots: Vec<&crate::state::CommentRecord> = repository
+            .comments
+            .values()
+            .filter(|comment| {
+                comment.in_reply_to.is_none()
+                    && comment.pull_request_id == Some(pull_request_id)
+                    && after_commit_id
+                        .is_none_or(|after| comment.comparison.after_commit_id == after)
+                    && before_commit_id.is_none_or(|before| {
+                        comment.comparison.before_commit_id.as_deref() == Some(before)
+                    })
+            })
+            .collect();
+        roots.sort_by_key(|comment| comment.sequence);
+        let ordered: Vec<String> = roots
+            .iter()
+            .map(|comment| comment.comment_id.clone())
+            .collect();
+
+        // A continuation token belongs to the listing it was issued for: the same
+        // pull request, read on the same repository and narrowed to the same
+        // comparison, so a token cannot carry a position from one set of threads
+        // into another. The page sizes are this operation's own published ones.
+        let scope = format!(
+            "GetCommentsForPullRequest/{pull_request_id}/{}/{}/{}",
+            repository.name,
+            before_commit_id.unwrap_or_default(),
+            after_commit_id.unwrap_or_default()
+        );
+        let (page, next_token) = crate::state::page_of_at_most(
+            &scope,
+            &ordered,
+            input.next_token.as_deref(),
+            input.max_results,
+            crate::state::COMMENTS_PAGE_MAX,
+            crate::state::COMMENTS_PAGE_DEFAULT,
+        )
+        .map_err(page_refusal)?;
+
+        // The reply edges of the whole repository, built once for the whole page;
+        // the walk is `crate::state`'s, shared with the comparison's comment read.
+        let replies = crate::state::reply_index(repository);
+        let data: Vec<CommentsForPullRequest> = page
+            .iter()
+            .filter_map(|comment_id| repository.comments.get(comment_id))
+            .map(|root| CommentsForPullRequest {
+                pull_request_id: Some(pull_request_id.to_string()),
+                repository_name: Some(repository.name.clone()),
+                before_commit_id: root.comparison.before_commit_id.clone(),
+                after_commit_id: Some(root.comparison.after_commit_id.clone()),
+                before_blob_id: root.comparison.before_blob_id.clone(),
+                after_blob_id: root.comparison.after_blob_id.clone(),
+                location: root.location.clone(),
+                comments: Some(
+                    crate::state::comment_thread(&replies, root)
+                        .into_iter()
+                        .map(|comment| comment.comment_as(&caller_arn))
+                        .collect(),
+                ),
+            })
+            .collect();
+
+        Ok(GetCommentsForPullRequestOutput {
+            comments_for_pull_request_data: Some(data),
+            next_token,
+        })
     }
 }

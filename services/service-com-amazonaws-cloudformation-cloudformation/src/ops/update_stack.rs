@@ -238,6 +238,9 @@ use crate::state::{
 struct PreviousValues {
     template_body: Option<String>,
     processed_template: crate::state::template::Processed,
+    /// The body that stage was computed over — the stored body with any `AWS::Include`
+    /// snippet already spliced in ([`StoredStack::included_template_body`]).
+    included_template_body: Option<String>,
     parameters: Vec<StoredParameter>,
     tags: Vec<StoredTag>,
     notification_arns: Vec<String>,
@@ -263,6 +266,7 @@ impl PreviousValues {
         Self {
             template_body: stack.template_body.clone(),
             processed_template: stack.processed_template.clone(),
+            included_template_body: stack.included_template_body().map(str::to_string),
             parameters: stack.parameters.clone(),
             tags: stack.tags.clone(),
             notification_arns: stack.notification_arns.clone(),
@@ -298,20 +302,17 @@ fn planned_actions(
     else {
         return Vec::new();
     };
-    let current = previous
-        .template_body
-        .as_deref()
-        .and_then(|body| previous.processed_template.body(body))
-        .and_then(crate::state::declared_template)
-        .unwrap_or_default();
-    let changes = crate::state::computed_changes(
-        Some(crate::state::StackRevision {
-            stack: crate::state::template::StackScope {
-                region: &previous.region,
-                stack_name: &previous.stack_name,
-                stack_id: &previous.stack_id,
-            },
-            template: &current,
+    // The stack's own side of the comparison, read at its PROCESSED stage by the shared
+    // reader `CreateChangeSet` plans through ([`crate::state::changes_against`]) — over the
+    // body that stage was computed over, so a stack whose template spliced in an
+    // `AWS::Include` snippet is compared with the document it really deployed.
+    let changes = crate::state::changes_against(
+        Some(crate::state::DeployedStack {
+            region: &previous.region,
+            stack_name: &previous.stack_name,
+            stack_id: &previous.stack_id,
+            body: previous.included_template_body.as_deref(),
+            processed: &previous.processed_template,
             parameters: &previous.parameters,
             deployed: &previous.deployed,
             imports: &previous.imports,
@@ -703,6 +704,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The transforms the template DECLARES are applied to the spliced document, so the
         // stage this update deploys and `GetTemplate` serves is the whole pipeline's — and
         // that expansion, like the splice, happens before the store lock below.
+        // The body that stage is computed over, which is also the body the plan below is
+        // read from: the spliced document where a transform named a snippet, else the
+        // submitted body itself.
+        let included_body = match &processing {
+            crate::state::include::Processed::Expanded(processed) => processed.clone(),
+            _ => template_body.clone(),
+        };
         let processed_template = match &processing {
             crate::state::include::Processed::Expanded(processed) => {
                 crate::state::template::process_with_parameters(processed, &parameter_values)
@@ -728,9 +736,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clone()
             .or_else(|| previous.stack_policy_body.clone());
         let denial = match (&governing_policy, &transform_failure) {
+            // Asked about the body the stage was computed OVER — the spliced document where a
+            // transform named an `AWS::Include` snippet — so the plan the policy is weighed
+            // against covers the resources that snippet contributes too.
             (Some(policy), None) => crate::state::stack_policy::denied(
                 policy,
-                &planned_actions(&previous, &template_body, &processed_template, &parameters),
+                &planned_actions(&previous, &included_body, &processed_template, &parameters),
             ),
             _ => None,
         };

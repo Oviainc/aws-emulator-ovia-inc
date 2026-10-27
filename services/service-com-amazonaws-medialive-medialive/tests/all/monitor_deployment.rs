@@ -100,7 +100,10 @@ pub(crate) async fn signal_map_discovering(
         router,
         "POST",
         "/prod/channels",
-        Some(json!({ "name": format!("{name}-entry") })),
+        Some(json!({
+            "name": format!("{name}-entry"),
+            "encoderSettings": crate::support::channel_encoder_settings(),
+        })),
     )
     .await;
     assert_eq!(

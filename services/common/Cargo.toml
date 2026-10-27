@@ -47,6 +47,11 @@ uuid = { version = "1", features = ["v4"] }
 # `iso8601_span`: the ISO 8601 duration grammar, parsed by the maintained crate rather
 # than by hand, for every service handed a span as a caller-supplied string.
 iso8601-duration = "0.2"
+# `json_reference_path`: the maintained RFC 9535 JSONPath engine, which EVALUATES the
+# reference path that module accepts — so a caller-supplied path is not interpreted here.
+# The module bounds the path's length, its segment count and its selectors before the
+# engine is handed anything, and hands it the module's own canonical rendering.
+serde_json_path = "0.7"
 
 [lints]
 workspace = true

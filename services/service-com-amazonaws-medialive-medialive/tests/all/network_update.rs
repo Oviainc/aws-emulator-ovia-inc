@@ -556,7 +556,10 @@ async fn an_update_of_a_network_no_caller_may_change_is_refused() {
         &router,
         "POST",
         "/prod/channels",
-        Some(json!({ "name": "neighbour" })),
+        Some(json!({
+            "name": "neighbour",
+            "encoderSettings": crate::support::channel_encoder_settings(),
+        })),
     )
     .await;
     assert_eq!(

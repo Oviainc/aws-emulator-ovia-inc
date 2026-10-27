@@ -161,62 +161,6 @@ fn checked_commit_id(commit_id: &str) -> Result<(), GetCommentsForComparedCommit
     })
 }
 
-/// Every comment in the repository by the comment it replies to: the reply edges of
-/// the whole store, built ONCE per request.
-///
-/// [`thread`] walks these edges per root, so without this index each step would
-/// rescan the repository's whole comment map and rendering one page would cost
-/// roots x comments.
-fn replies_by_parent(
-    repository: &crate::state::Repository,
-) -> ::std::collections::HashMap<&str, Vec<&crate::state::CommentRecord>> {
-    let mut index: ::std::collections::HashMap<&str, Vec<&crate::state::CommentRecord>> =
-        ::std::collections::HashMap::new();
-    for comment in repository.comments.values() {
-        if let Some(parent) = comment.in_reply_to.as_deref() {
-            index.entry(parent).or_default().push(comment);
-        }
-    }
-    for replies in index.values_mut() {
-        replies.sort_by_key(|comment| comment.sequence);
-    }
-    index
-}
-
-/// One comment thread: the root comment, then the comments replying to it, each
-/// level in the order it was posted. A comment and its replies are one entry of
-/// the comparison's data, which is why they are collected together.
-///
-/// Each comment is expanded AT MOST ONCE, tracked in `expanded`: the reply edges are
-/// stored data, so a record whose `in_reply_to` named itself or an ancestor would
-/// otherwise make this walk re-expand the same records for ever — growing `members`
-/// without end while the store lock is held, which is a hang of the whole service
-/// rather than of one request. Visiting each record once also bounds the thread by
-/// the repository's comment count, itself bounded by
-/// [`crate::state::MAX_COMMENTS_PER_REPOSITORY`].
-fn thread(
-    replies: &::std::collections::HashMap<&str, Vec<&crate::state::CommentRecord>>,
-    root: &crate::state::CommentRecord,
-) -> Vec<Comment> {
-    let mut members: Vec<&crate::state::CommentRecord> = vec![root];
-    let mut expanded: ::std::collections::HashSet<&str> =
-        ::std::collections::HashSet::from([root.comment_id.as_str()]);
-    let mut next = 0usize;
-    while next < members.len() {
-        let parent = members[next].comment_id.as_str();
-        next += 1;
-        for reply in replies.get(parent).into_iter().flatten() {
-            if expanded.insert(reply.comment_id.as_str()) {
-                members.push(reply);
-            }
-        }
-    }
-    members
-        .iter()
-        .map(|comment| comment.comment())
-        .collect()
-}
-
 /// The `GetCommentsForComparedCommit` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -365,8 +309,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let end = roots.len().min(start.saturating_add(page_size));
 
-        // The reply edges of the whole store, built once for the whole page.
-        let replies = replies_by_parent(repository);
+        // The reply edges of the whole repository, built once for the whole page:
+        // a reply is reported inside its root's thread, and the walk itself is
+        // `crate::state`'s, shared with the pull request's comment read.
+        let replies = crate::state::reply_index(repository);
         let data: Vec<CommentsForComparedCommit> = roots[start..end]
             .iter()
             .map(|root| CommentsForComparedCommit {
@@ -376,7 +322,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 before_blob_id: root.comparison.before_blob_id.clone(),
                 after_blob_id: root.comparison.after_blob_id.clone(),
                 location: root.location.clone(),
-                comments: Some(thread(&replies, root)),
+                comments: Some(
+                    crate::state::comment_thread(&replies, root)
+                        .into_iter()
+                        .map(crate::state::CommentRecord::comment)
+                        .collect(),
+                ),
             })
             .collect();
 

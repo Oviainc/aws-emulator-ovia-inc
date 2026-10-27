@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetReservedNodeExchangeConfigurationOptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetReservedNodeExchangeConfigurationOptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetReservedNodeExchangeConfigurationOptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the reserved-node configuration options one resource offers, under
+//! the shared `MaxRecords` window and `Marker` cursor: `ActionType` says whether
+//! the exchange is initiated from a cluster resize or a snapshot restore, and so
+//! which identifier names the resource the options are reported for — a request
+//! that does not name it is refused on the parameter combination, an identifier
+//! naming nothing this account holds is the modelled not-found fault, and a
+//! resolved resource whose node type reserved-node exchange does not cover is
+//! the modelled "isn't supported" refusal. The options themselves are the
+//! account's own reservations of that node type paired with the offerings each
+//! may be exchanged onto.
 //!
 //! ## Shape of an operation
 //!
@@ -174,20 +176,139 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetReservedNodeExchangeConfigurationOptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetReservedNodeExchangeConfigurationOptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetReservedNodeExchangeConfigurationOptions"))
+        use crate::state as st;
+
+        // "The action type of the reserved-node configuration. The action type
+        // can be an exchange initiated from either a snapshot or a resize": the
+        // action says which member names the resource whose options are
+        // reported, so a request that does not name that member says nothing to
+        // report options for and is refused on the PARAMETER COMBINATION —
+        // decided on the request alone, before the store is reached.
+        let from_cluster = input.action_type == st::EXCHANGE_ACTION_RESIZE_CLUSTER;
+        let subject_member = if from_cluster {
+            "ClusterIdentifier"
+        } else {
+            "SnapshotIdentifier"
+        };
+        let subject_named = if from_cluster {
+            input.cluster_identifier.is_some()
+        } else {
+            input.snapshot_identifier.is_some()
+        };
+        if !subject_named {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_combination(
+                format!(
+                    "You must specify the {subject_member} parameter when ActionType is {}.",
+                    input.action_type
+                ),
+            ));
+        }
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                GetReservedNodeExchangeConfigurationOptionsErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let read_at = ::std::time::Instant::now();
+
+        let mut store = state.lock();
+        // A reporting operation: the ONE write it makes is materialising the
+        // transitions the clock already owed — a cluster coming up, a snapshot
+        // completing and a reservation's payment confirmation were all due at
+        // this instant whether or not anybody called.
+        store.settle(read_at);
+
+        // EVERY identifier the request names is dereferenced, so a caller is told
+        // about a typo in either one, and each names a resource of its own kind:
+        // "The ClusterIdentifier parameter does not refer to an existing cluster"
+        // and "The snapshot identifier does not refer to an existing cluster
+        // snapshot".
+        let cluster_node_type = match input.cluster_identifier.as_deref() {
+            Some(identifier) => match store.cluster(identifier) {
+                Some(stored) => Some(stored.cluster.node_type.clone().unwrap_or_default()),
+                None => {
+                    return Err(
+                        GetReservedNodeExchangeConfigurationOptionsErrorModeled::ClusterNotFoundFault(
+                            ClusterNotFoundFault {
+                                message: Some(st::exchange_cluster_not_found_message(identifier)),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            },
+            None => None,
+        };
+        let snapshot_node_type = match input.snapshot_identifier.as_deref() {
+            Some(identifier) => match store.snapshot(identifier) {
+                Some(stored) => Some(stored.snapshot.node_type.clone().unwrap_or_default()),
+                None => {
+                    return Err(
+                        GetReservedNodeExchangeConfigurationOptionsErrorModeled::ClusterSnapshotNotFoundFault(
+                            ClusterSnapshotNotFoundFault {
+                                message: Some(st::exchange_snapshot_not_found_message(identifier)),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            },
+            None => None,
+        };
+
+        // The resource the action is initiated from is the one whose node type
+        // decides what may be exchanged; it was resolved just above, the
+        // parameter combination having already been checked.
+        let node_type = if from_cluster {
+            cluster_node_type.unwrap_or_default()
+        } else {
+            snapshot_node_type.unwrap_or_default()
+        };
+
+        // Resolving the identifier is what makes "exists but is not
+        // exchange-eligible" a different answer from "does not exist": a
+        // resource this account DOES hold, of a node type reserved-node exchange
+        // does not cover, is refused with the modelled "isn't supported" fault.
+        if !node_type.starts_with(st::EXCHANGEABLE_CLUSTER_NODE_TYPE_PREFIX) {
+            return Err(
+                GetReservedNodeExchangeConfigurationOptionsErrorModeled::UnsupportedOperationFault(
+                    UnsupportedOperationFault {
+                        message: Some(st::ONLY_DS2_EXCHANGEABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "Details for a reserved-node exchange": the account's own reservations
+        // of that node type, each paired with an offering it may be exchanged
+        // onto — the SAME candidate rule `GetReservedNodeExchangeOfferings`
+        // reports and `AcceptReservedNodeExchange` accepts. The pairs are index
+        // pairs, so the page is the only thing this request materialises.
+        let pairs = store.reserved_node_configuration_pairs(&node_type);
+
+        // The same `MaxRecords` window and opaque cursor every paginated Redshift
+        // read shares, so a marker one page hands out resumes the next.
+        let (start, end, next_marker) =
+            match st::page_bounds(input.marker.as_deref(), input.max_records, pairs.len()) {
+                Ok(page) => page,
+                Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
+            };
+        let options: Vec<ReservedNodeConfigurationOption> = pairs[start..end]
+            .iter()
+            .filter_map(|pair| store.reserved_node_configuration_option(*pair))
+            .collect();
+
+        Ok(GetReservedNodeExchangeConfigurationOptionsOutput {
+            reserved_node_configuration_option_list: Some(options),
+            marker: next_marker,
+        })
     }
 }

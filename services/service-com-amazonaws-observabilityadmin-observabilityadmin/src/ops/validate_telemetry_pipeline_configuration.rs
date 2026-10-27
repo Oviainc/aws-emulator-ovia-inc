@@ -1,15 +1,44 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ValidateTelemetryPipelineConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ValidateTelemetryPipelineConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ValidateTelemetryPipelineConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reads the request's `Configuration` as a pipeline definition and answers the
+//! defects found in it — one `ValidationError` per defect, each naming the field of the
+//! document it is about — or no `Errors` at all for a configuration this emulator would
+//! run. The call "[v]alidates a pipeline configuration without creating the pipeline",
+//! so it mints no pipeline, stores nothing and reads no stored one.
+//!
+//! ## What a defect is
+//!
+//! The document is the same YAML (or JSON, which YAML 1.2 is a superset of) definition
+//! `CreateTelemetryPipeline` stores and `TestTelemetryPipeline` runs, so it is read
+//! through that operation's bounded reader
+//! ([`crate::ops::test_telemetry_pipeline`]) rather than through a second one that
+//! could disagree with it. Four kinds of defect are reported:
+//!
+//! * the body is not a document this emulator reads — a syntax error, an alias, or
+//!   nesting past what it reads — which is the one defect reported for such a body,
+//!   since a body that was never read has no fields to report anything else against;
+//! * the document declares no pipeline, or its sections do not form ONE chain: a sink
+//!   naming a section the document does not declare, a cycle, a fan-out to two
+//!   pipelines, or a section nothing reaches;
+//! * a section does not declare exactly one source and exactly one sink — the model
+//!   documents that "[e]ach pipeline must have exactly one source" and, of the sink,
+//!   that "[e]ach pipeline must have exactly one sink" — or its `processor` sequence
+//!   names a processor, or an option, this emulator does not run, which carries its own
+//!   reason code because the document may be one the real service accepts;
+//! * a field of the document whose name names an ARN (its last name token is `arn`:
+//!   the role a source assumes, the resource a sink writes to) does not carry one,
+//!   measured against the ARN syntax this service's own model declares — the narrower
+//!   IAM role syntax for a field that names the role a plugin assumes.
+//!
+//! A defect is REPORTED, not refused: this operation's own output is where the error
+//! list lives ("[a] list of validation errors found in the pipeline configuration, if
+//! any"), so a 200 carrying no `Errors` is the only answer that says the configuration
+//! is valid. The modelled `AccessDeniedException` is deliberately unreachable here: the
+//! emulator verifies every request's signature centrally and models no IAM policy
+//! evaluation, so a 200 from this operation is not evidence that a principal is
+//! authorized.
 //!
 //! ## Shape of an operation
 //!
@@ -77,6 +106,16 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use ::std::collections::HashMap;
+use ::std::sync::LazyLock;
+
+use ::regex::Regex;
+
+use crate::ops::test_telemetry_pipeline::{
+    chain_defect, is_section, parse_configuration, processor_chain, Node, PROCESSOR_KEY, SINK_KEY,
+    SOURCE_KEY,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -149,18 +188,275 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ValidateTelemetryPipelineConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ValidateTelemetryPipelineConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ValidateTelemetryPipelineConfiguration"))
+        // `Configuration`'s presence and its required `Body` of 1..24000 characters are
+        // modelled, so the centralized request walk has already refused anything
+        // outside them. The engine is NOT reached at all: this call validates a
+        // configuration "without creating the pipeline", so it stores nothing and reads
+        // no stored pipeline, and `self.engine` stays bound for the constructor seam.
+        let _ = &self.engine;
+
+        let errors = configuration_defects(&input.configuration.body);
+
+        // Audit record for the call: who asked and how the document came out. The
+        // document itself is deliberately not in it.
+        ::tracing::info!(
+            target: "audit",
+            operation = Self::NAME,
+            outcome = if errors.is_empty() { "valid" } else { "invalid" },
+            principal = %::emulator_server::extract_akid(&ctx.parts().headers),
+            region = %crate::state::request_region(ctx.parts()),
+            findings = errors.len(),
+            "validated a telemetry pipeline configuration"
+        );
+
+        Ok(ValidateTelemetryPipelineConfigurationOutput {
+            // "A list of validation errors found in the pipeline configuration, if
+            // any", so a configuration carrying no defect answers no list at all.
+            errors: (!errors.is_empty()).then_some(errors),
+        })
     }
+}
+
+/// The member a defect is reported against when it is about the document as a whole,
+/// rather than about one field the document declares.
+const BODY_FIELD: &str = "Configuration.Body";
+
+/// `ValidationError$Reason` for a body that could not be read as a document at all:
+/// the category code this service answers for a configuration body it cannot parse.
+const REASON_PARSE_ERROR: &str = "PIPELINE_CONFIGURATION_PARSE_ERROR";
+
+/// `ValidationError$Reason` for a document that WAS parsed and declares something a
+/// pipeline definition may not — the same category, for the stage after parsing.
+const REASON_VALIDATION_ERROR: &str = "PIPELINE_CONFIGURATION_VALIDATION_ERROR";
+
+/// `ValidationError$Reason` for a field whose value does not have the form that field
+/// takes.
+const REASON_INVALID_PATTERN: &str = "INVALID_PATTERN";
+
+/// `ValidationError$Reason` for a processor, or a processor option, THIS EMULATOR does
+/// not run. It is its own code because the document may well be one the real service
+/// accepts: the defect is what the emulator cannot run, not a verdict that the
+/// configuration is invalid, and the message says which processor it is.
+const REASON_UNSUPPORTED_PROCESSOR: &str = "UNSUPPORTED_PROCESSOR";
+
+/// The ARN syntax this service's own model declares for an ARN and for the ARN of a
+/// ROLE, from `smithy_query(query="shape", shape="ResourceArn,IamRoleArn")`: the
+/// `pattern` trait on the shape every ARN member targets, and the one on the shape a
+/// role member targets. A field of a pipeline definition that names an ARN carries one
+/// of the first; one that names the ROLE a plugin assumes carries one of the second,
+/// since what it names is an IAM role.
+const ARN_PATTERN: &str = r"^arn:aws([a-z0-9\-]+)?:([a-zA-Z0-9\-]+):([a-z0-9\-]+)?:([0-9]{12})?:(.+)$";
+
+const ROLE_ARN_PATTERN: &str = r"^arn:aws[a-zA-Z-]*:iam::\d{12}:role/[\w+=,.@/-]+$";
+
+static ARN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(ARN_PATTERN).expect("the modelled ARN pattern compiles"));
+
+static ROLE_ARN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(ROLE_ARN_PATTERN).expect("the modelled role ARN pattern compiles")
+});
+
+/// Every defect in `body`, in the order the document is read in.
+fn configuration_defects(body: &str) -> Vec<ValidationError> {
+    let root = match parse_configuration(body) {
+        Ok(root) => root,
+        // A body the reader never read has no fields to report a defect against, so
+        // the syntax error is the whole answer.
+        Err(why) => return vec![defect(BODY_FIELD, REASON_PARSE_ERROR, why)],
+    };
+
+    let mut defects = Vec::new();
+    match processor_chain(&root) {
+        Ok(chain) => {
+            if let Err(why) = chain_defect(&chain) {
+                defects.push(defect(PROCESSOR_KEY, REASON_UNSUPPORTED_PROCESSOR, why));
+            }
+        }
+        Err(why) => defects.push(defect(BODY_FIELD, REASON_VALIDATION_ERROR, why)),
+    }
+    defects.extend(source_and_sink_defects(&root));
+    arn_defects(&root, "", &mut defects);
+    defects
+}
+
+/// One defect per section that does not declare exactly one source and exactly one
+/// sink.
+///
+/// A document writing its `source`/`processor`/`sink` at the top level IS one pipeline
+/// section; otherwise every mapping entry carrying one of those keys is a named
+/// section, and each of them is a pipeline in its own right.
+fn source_and_sink_defects(root: &Node) -> Vec<ValidationError> {
+    let sections: Vec<(Option<&str>, &Node)> = if is_section(root) {
+        vec![(None, root)]
+    } else {
+        root.as_mapping()
+            .unwrap_or_default()
+            .iter()
+            .filter(|(_, value)| is_section(value))
+            .map(|(name, value)| (Some(name.as_str()), value))
+            .collect()
+    };
+
+    let mut defects = Vec::new();
+    for (name, section) in sections {
+        for key in [SOURCE_KEY, SINK_KEY] {
+            let declared = section.get(key).map_or(0, plugins_named);
+            if declared == 1 {
+                continue;
+            }
+            let subject = match name {
+                None => BODY_FIELD.to_string(),
+                Some(name) => format!("{BODY_FIELD}'s pipeline section '{name}'"),
+            };
+            let message = if declared == 0 {
+                format!(
+                    "{subject} declares no {key}, and each pipeline must have exactly one {key}"
+                )
+            } else {
+                format!(
+                    "{subject} declares {declared} {key}s, and each pipeline must have exactly \
+                     one {key}"
+                )
+            };
+            defects.push(defect(key, REASON_VALIDATION_ERROR, message));
+        }
+    }
+    defects
+}
+
+/// One defect per field of the document whose NAME names an ARN and whose value is
+/// not one.
+///
+/// A pipeline definition names an ARN wherever a plugin needs an identity or a
+/// resource to reach — the role a source assumes, the resource a sink writes to — and
+/// the name of such a field ends in the token `arn`. `path` is where in the document
+/// the walk currently is, so the defect says which of them carries the value.
+///
+/// The walk recurses over a tree the reader has already bounded — a document past its
+/// node count or its nesting depth never becomes one — so the depth of this recursion
+/// is bounded by those constants rather than by the request.
+fn arn_defects(node: &Node, path: &str, defects: &mut Vec<ValidationError>) {
+    match node {
+        Node::Mapping(entries) => {
+            for (key, value) in entries {
+                let here = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                if let Some(constraint) = arn_constraint(key) {
+                    if !constraint.pattern.is_match(scalar_text(value)) {
+                        defects.push(pattern_defect(&here, value, constraint));
+                    }
+                }
+                arn_defects(value, &here, defects);
+            }
+        }
+        Node::Sequence(items) => {
+            for (index, item) in items.iter().enumerate() {
+                arn_defects(item, &format!("{path}[{index}]"), defects);
+            }
+        }
+        Node::Null | Node::Scalar { .. } => {}
+    }
+}
+
+/// The pattern the value of `key` has to match, for a field of a pipeline definition
+/// that names an ARN — a field whose last name token is `arn`. A field whose name ends
+/// in the two tokens `role`, `arn` names an IAM role, so it takes the narrower of the
+/// two patterns.
+fn arn_constraint(key: &str) -> Option<ArnConstraint> {
+    let tokens = name_tokens(key);
+    let mut tail = tokens.iter().rev();
+    if tail.next().map(String::as_str) != Some("arn") {
+        return None;
+    }
+    if tail.next().map(String::as_str) == Some("role") {
+        return Some(ArnConstraint {
+            pattern: &ROLE_ARN,
+            source: ROLE_ARN_PATTERN,
+        });
+    }
+    Some(ArnConstraint {
+        pattern: &ARN,
+        source: ARN_PATTERN,
+    })
+}
+
+/// A field name's tokens, lowercased: the words a document's key is built from,
+/// however it separates them. This format writes `sts_role_arn`, and the same document
+/// written as JSON may write `stsRoleArn`, so both read as the same field.
+fn name_tokens(key: &str) -> Vec<String> {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut token = String::new();
+    for character in key.chars() {
+        if matches!(character, '_' | '-' | '.') {
+            if !token.is_empty() {
+                tokens.push(::std::mem::take(&mut token));
+            }
+        } else if character.is_ascii_uppercase() && !token.is_empty() {
+            tokens.push(::std::mem::take(&mut token));
+            token.push(character.to_ascii_lowercase());
+        } else {
+            token.extend(character.to_lowercase());
+        }
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    tokens
+}
+
+/// One ARN constraint: the compiled pattern a value is measured against, and the
+/// pattern as the report spells it.
+struct ArnConstraint {
+    pattern: &'static Regex,
+    source: &'static str,
+}
+
+/// The text a scalar carries; anything else carries none, which no pattern matches.
+fn scalar_text(node: &Node) -> &str {
+    match node {
+        Node::Scalar { text, .. } => text.as_str(),
+        _ => "",
+    }
+}
+
+/// How many plugins a section's `source` or `sink` names: one per entry of the mapping
+/// a `source` is, and one per entry of each single-plugin mapping of the sequence a
+/// `sink` is written as. Anything else names no plugin at all.
+fn plugins_named(node: &Node) -> usize {
+    match node {
+        Node::Mapping(entries) => entries.len(),
+        Node::Sequence(items) => items.iter().map(plugins_named).sum(),
+        Node::Null | Node::Scalar { .. } => 0,
+    }
+}
+
+/// One reported defect: what is wrong, which category it falls in, and the field of
+/// the configuration it is about.
+fn defect(field: &str, reason: &str, message: String) -> ValidationError {
+    ValidationError {
+        message: Some(message.clone()),
+        reason: Some(reason.to_string()),
+        field_map: Some(HashMap::from([(field.to_string(), message)])),
+    }
+}
+
+/// The defect of a field whose value does not have the form that field takes: the
+/// value, where in the document it is and the constraint it did not satisfy, worded
+/// the way AWS words a constraint violation. A field carrying no scalar at all shows
+/// an empty value, which is what it has.
+fn pattern_defect(path: &str, value: &Node, constraint: ArnConstraint) -> ValidationError {
+    let shown = scalar_text(value);
+    let field = path.rsplit('.').next().unwrap_or_default();
+    defect(
+        field,
+        REASON_INVALID_PATTERN,
+        format!(
+            "Value '{shown}' at '{path}' failed to satisfy constraint: Member must satisfy \
+             regular expression pattern: {}",
+            constraint.source
+        ),
+    )
 }

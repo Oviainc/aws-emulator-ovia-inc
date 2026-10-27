@@ -56,7 +56,10 @@ pub(crate) async fn describe_detector(
 
 /// `DELETE /workspaces/{workspaceId}/anomalydetectors/{anomalyDetectorId}`, with
 /// `clientToken` on the query string where the model binds it.
-async fn delete_detector(
+///
+/// `pub(crate)` so the suites that drive a delete — here and in
+/// `tests/all/anomaly_detector_deletion.rs` — all send it over the SAME request path.
+pub(crate) async fn delete_detector(
     amp: &Amp,
     region: &str,
     workspace_id: &str,

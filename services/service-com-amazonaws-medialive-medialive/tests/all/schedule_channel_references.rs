@@ -62,6 +62,7 @@ async fn channel(
         "name": "referenced-channel",
         "channelClass": class,
         "inputAttachments": attachments,
+        "encoderSettings": crate::support::channel_encoder_settings(),
     });
     if let Some(encoder_settings) = encoder_settings {
         body["encoderSettings"] = encoder_settings;

@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes the application its `ApplicationArn` names from this service's
+//! state (`crate::state`), so the ARN stops resolving: the next `DescribeApplication` of
+//! it answers the modelled `ResourceNotFoundException` and `ListApplications` no longer
+//! carries it. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Everything held INSIDE the application goes with it — its access scopes, its
+//! authentication methods, its grants and its assignment and session configuration all
+//! live ON the record, and its DIRECT assignments are dropped beside it, because an
+//! assignment names the application it grants access to
+//! ([`crate::state::ComAmazonawsSsoadminSwbexternalserviceState::remove_application`], the
+//! same removal applied when an application's instance goes). The connected service
+//! resource the application federated to is not this service's to touch, so nothing
+//! outside the application is removed: its instance, its identity store and the AWS-owned
+//! application provider it ran under all stay.
+//!
+//! The removal is immediate — the model declares no in-progress status for an application
+//! and the operation returns nothing — and an `ApplicationArn` this account holds no
+//! application for is refused with the modelled `ResourceNotFoundException`, so a second
+//! delete of the same ARN is a not-found rather than a silent success. The `ClientToken`
+//! of the create that minted the record is held ON the record, so deleting it frees that
+//! token too.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +165,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteApplication"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteApplicationErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the SSO Admin state store is unavailable".to_string()),
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // A WRITE, so it first materialises what the CLOCK already owes every instance —
+        // an application whose instance the clock has already removed no longer exists —
+        // and so resolves the same application a read at this instant would resolve.
+        store.on_request(&region, ::std::time::SystemTime::now());
+
+        // Never created, already deleted, or created under an instance that has since
+        // gone — the same answer either way: there is no such application to delete. The
+        // removal is what makes the ARN stop resolving, for the describe, the enumeration
+        // and a second delete alike, so this delete is not idempotent on a missing
+        // resource.
+        if !store.remove_application(&input.application_arn) {
+            return Err(DeleteApplicationErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::application_not_found_message(
+                        &input.application_arn,
+                    )),
+                    // The model's `ResourceNotFoundExceptionReason` enum carries only KMS
+                    // key states, none of which this refusal is.
+                    reason: None,
+                },
+            )
+            .into());
+        }
+        Ok(DeleteApplicationOutput {})
     }
 }

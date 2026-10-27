@@ -49,6 +49,18 @@ pub const MAX_LOGINS_PER_POOL: usize = 2 * MAX_IDENTITIES_PER_POOL;
 /// every `ListIdentities` page carries. Refused with the modelled `LimitExceededException`.
 pub const MAX_LOGIN_PROVIDERS_PER_IDENTITY: usize = 50;
 
+/// The most logins AMAZON COGNITO links to one identity — not this emulator's own
+/// ceiling, but the service's documented limit: "The number of linked logins is limited to
+/// 20. So, the number of linked logins for the source user, SourceUserIdentifier, and the
+/// destination user, DestinationUserIdentifier, together should not be larger than 20.
+/// Otherwise, an exception will be thrown" (`MergeDeveloperIdentities`,
+/// `smithy_query(query="doc",shape="MergeDeveloperIdentities")`). A linked login is one
+/// indexed `(provider, value)` pair of the pool — a developer user identifier as much as a
+/// federated token's login — which is what [`ComAmazonawsCognitoidentityAwscognitoidentityserviceState::pool_logins_of_identity`]
+/// reports. The limit is enforced where that documentation states it: on a merge, which is
+/// the one call that adds another user's whole login set to an identity at once.
+pub const MAX_LINKED_LOGINS_PER_IDENTITY: usize = 20;
+
 /// A stored identity pool, as `CreateIdentityPool` wrote it and
 /// `DescribeIdentityPool` reports it. Every optional member is held as an `Option` so a
 /// read returns exactly what was stored, rather than inventing an empty map or list for
@@ -576,24 +588,40 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
 
     /// Every login value this pool has indexed for `provider` against `identity_id`, in
     /// a stable (sorted) order — for the pool's own `DeveloperProviderName`, the developer
-    /// user identifiers one identity is registered under. The index is a hash map, so the
-    /// order has to come from the values themselves for two successive pages of a listing
-    /// to neither overlap nor skip one.
+    /// user identifiers one identity is registered under. One provider's share of
+    /// [`Self::pool_logins_of_identity`], so the index is scanned in one place; that scan
+    /// orders the pairs, which leaves these values sorted too — and the order has to come
+    /// from the values themselves, the index being a hash map, for two successive pages of a
+    /// listing to neither overlap nor skip one.
     pub fn logins_of_identity(
         &self,
         identity_pool_id: &str,
         provider: &str,
         identity_id: &str,
     ) -> Vec<String> {
-        let mut logins: Vec<String> = self
+        self.pool_logins_of_identity(identity_pool_id, identity_id)
+            .into_iter()
+            .filter(|(login_provider, _)| login_provider == provider)
+            .map(|(_, login)| login)
+            .collect()
+    }
+
+    /// Every `(provider name, login value)` pair this pool has indexed against
+    /// `identity_id`, whatever the provider — the identity's LINKED LOGINS, the developer
+    /// user identifiers among them — in a stable (sorted) order: the index is a hash map, so
+    /// the order has to come from the pairs themselves.
+    pub fn pool_logins_of_identity(
+        &self,
+        identity_pool_id: &str,
+        identity_id: &str,
+    ) -> Vec<(String, String)> {
+        let mut logins: Vec<(String, String)> = self
             .login_index
             .iter()
-            .filter(|((pool_id, login_provider, _), linked)| {
-                pool_id == identity_pool_id
-                    && login_provider == provider
-                    && linked.as_str() == identity_id
+            .filter(|((pool_id, _, _), linked)| {
+                pool_id == identity_pool_id && linked.as_str() == identity_id
             })
-            .map(|((_, _, login), _)| login.clone())
+            .map(|((_, provider, login), _)| (provider.clone(), login.clone()))
             .collect();
         logins.sort();
         logins
@@ -633,6 +661,68 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
             provider.to_string(),
             login.to_string(),
         ))
+    }
+
+    /// Merge the identity `merged_away` of this pool INTO `survivor`, and report the access
+    /// key ids whose credentials the caller must now forget (`None` when there was no such
+    /// pair of this pool's identities to merge, so nothing was written).
+    ///
+    /// Every login `merged_away` was reached through — its developer user identifiers and
+    /// its federated logins alike — now resolves to `survivor`, which is left linked to the
+    /// union of the two provider sets and stamped with `now` as the instant it changed. The
+    /// two users are one user afterwards, so `merged_away` is no longer an identity of the
+    /// pool: what named only it goes with it, the credentials outstanding for it and the
+    /// OpenID Connect tokens issued for it, exactly as [`Self::delete_identity_pool`] gives
+    /// up what named the identities it removed.
+    ///
+    /// Both identities have to be the named pool's own, which is what the caller resolved
+    /// them through: an identity belongs to the pool that minted it and never moves, so a
+    /// pair this pool does not hold is merged nowhere and answered `None` — rather than one
+    /// pool's records being torn down while another pool's listing still names the identity.
+    pub fn merge_identity_into(
+        &mut self,
+        identity_pool_id: &str,
+        merged_away: &str,
+        survivor: &str,
+        now: SystemTime,
+    ) -> Option<Vec<String>> {
+        let both_belong_to_the_pool = [merged_away, survivor].iter().all(|identity_id| {
+            self.identities
+                .get(*identity_id)
+                .is_some_and(|identity| identity.identity_pool_id == identity_pool_id)
+        });
+        if !both_belong_to_the_pool {
+            return None;
+        }
+        for (provider, login) in self.pool_logins_of_identity(identity_pool_id, merged_away) {
+            self.link_login(identity_pool_id, &provider, &login, survivor);
+        }
+        let absorbed = self
+            .identities
+            .remove(merged_away)
+            .map(|identity| identity.logins)
+            .unwrap_or_default();
+        if let Some(identities) = self.identities_by_pool.get_mut(identity_pool_id) {
+            identities.retain(|identity_id| identity_id != merged_away);
+        }
+        if let Some(identity) = self.identities.get_mut(survivor) {
+            for provider in absorbed {
+                if !identity.logins.contains(&provider) {
+                    identity.logins.push(provider);
+                }
+            }
+            identity.logins.sort();
+            identity.last_modified_date = now;
+        }
+        self.open_id_tokens
+            .retain(|_, issued| issued.identity_id != merged_away);
+        Some(
+            self.credentials
+                .remove(merged_away)
+                .map(|issued| issued.access_key_id)
+                .into_iter()
+                .collect(),
+        )
     }
 
     /// Whether indexing `logins` for this pool would take it past
@@ -1914,5 +2004,20 @@ pub fn forget_issued_web_identities<Eng: Send + Sync + 'static>(
 ) {
     if let Some(registry) = issued_web_identity_tokens(engine) {
         registry.lock().forget_audience(identity_pool_id);
+    }
+}
+
+/// Give up every web identity token this emulator issued FOR one identity, in the registry
+/// the redeemer of one reads.
+///
+/// The same judgement [`forget_issued_web_identities`] makes, one identity rather than a
+/// whole pool: a merge leaves the identity it merged away existing no longer, so a token
+/// naming it names nobody and must stop resolving to a role.
+pub fn forget_issued_web_identities_of_identity<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    identity_id: &str,
+) {
+    if let Some(registry) = issued_web_identity_tokens(engine) {
+        registry.lock().forget_subject(identity_id);
     }
 }

@@ -34,7 +34,8 @@
 //!   router — the ambiguity existed only with both services mounted, and only the whole
 //!   router proves no THIRD mounted service claims `es` either — and pins that each answer
 //!   comes from the one model that owns the path: a success out of that model's own shapes,
-//!   or that model's own scaffold `501 NotImplemented` naming the operation it resolved.
+//!   that model's own modelled refusal, or its scaffold `501 NotImplemented` naming the
+//!   operation it resolved.
 //!   Never a router-level refusal.
 //!
 //! The dispatch rows run IN ORDER against one router over one engine, so a later row reads
@@ -284,13 +285,14 @@ fn the_es_endpoint_serves_both_api_versions() {
                 .expect("a current-thread runtime");
 
             // The rows span both API versions behind the one `es` key, and within each
-            // version both kinds of answer the owning model can give: a success out of its
-            // own shapes, and its own scaffold `501 NotImplemented` naming the operation it
-            // resolved. Each `expected_contains` fragment is something ONLY the owning
-            // model can produce — `EngineVersion` and `ClusterConfig` are the modern
-            // model's members, `ElasticsearchVersion` and `ElasticsearchClusterConfig` the
-            // legacy model's, and a 501 message names the operation, which only the model
-            // declaring it can resolve.
+            // version every kind of answer the owning model can give: a success out of its
+            // own shapes, its own modelled refusal, and its scaffold `501 NotImplemented`
+            // naming the operation it resolved. Each `expected_contains` fragment is
+            // something ONLY the owning model can produce — `EngineVersion` and
+            // `ClusterConfig` are the modern model's members, `ElasticsearchVersion` and
+            // `ElasticsearchClusterConfig` the legacy model's, a refusal message names the
+            // resource the owning model resolved the request against, and a 501 message
+            // names the operation, which only the model declaring it can resolve.
             let calls: [Call; 11] = [
                 Call {
                     case: "CreateDomain at the modern version",
@@ -407,6 +409,13 @@ fn the_es_endpoint_serves_both_api_versions() {
                     expected_absent: &[],
                 },
                 Call {
+                    // Only the modern model declares `StartMigration`, and it is
+                    // implemented, so the witness that this model served the request is
+                    // its OWN refusal rather than a scaffold's 501: the `applicationId`
+                    // below names no application of this account — the one the row above
+                    // minted carries a service-minted id — so the modern model answers
+                    // the `ResourceNotFoundException` it declares for it, which the
+                    // legacy model, declaring no such operation, could not produce.
                     case: "StartMigration reaches the modern model",
                     method: "POST",
                     path: "/2021-01-01/opensearch/app-migrations",
@@ -420,9 +429,9 @@ fn the_es_endpoint_serves_both_api_versions() {
                             "workspace": { "createWorkspace": true, "name": "router-workspace" },
                         },
                     })),
-                    expected_status: 501,
-                    expected_error: Some("NotImplemented"),
-                    expected_contains: &["StartMigration"],
+                    expected_status: 409,
+                    expected_error: Some("ResourceNotFoundException"),
+                    expected_contains: &["Application not found: abc123xyz"],
                     expected_absent: &[],
                 },
                 Call {
@@ -436,13 +445,15 @@ fn the_es_endpoint_serves_both_api_versions() {
                     expected_absent: &[],
                 },
                 Call {
+                    // As for `StartMigration` above: the implemented modern-model read
+                    // answers its own not-found refusal for an id addressing no job.
                     case: "GetMigration reaches the modern model",
                     method: "GET",
                     path: "/2021-01-01/opensearch/app-migrations/router-migration-id",
                     body: None,
-                    expected_status: 501,
-                    expected_error: Some("NotImplemented"),
-                    expected_contains: &["GetMigration"],
+                    expected_status: 409,
+                    expected_error: Some("ResourceNotFoundException"),
+                    expected_contains: &["Migration not found: router-migration-id"],
                     expected_absent: &[],
                 },
                 Call {

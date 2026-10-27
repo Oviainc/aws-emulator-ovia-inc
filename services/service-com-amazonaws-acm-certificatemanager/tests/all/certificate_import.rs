@@ -32,9 +32,11 @@ pub(crate) struct Generated {
     pub(crate) certificate: String,
     /// The PEM body handed to it as `PrivateKey`.
     pub(crate) private_key: String,
-    /// The certificate's own serial, as the detail must report it: lowercase hex of
-    /// the X.509 serial number's bytes.
+    /// The certificate's own serial, as the detail must report it: the X.509 serial
+    /// number's bytes, each as two lowercase hex digits, joined by colons.
     pub(crate) serial: String,
+    /// Those bytes themselves, so a test can check the rendering against them.
+    pub(crate) serial_bytes: Vec<u8>,
     /// The certificate's own validity window, in whole epoch seconds.
     pub(crate) not_before: f64,
     pub(crate) not_after: f64,
@@ -42,8 +44,9 @@ pub(crate) struct Generated {
 
 /// What one generated certificate is built from: the subject common name (if any),
 /// the subject organization (if any), the DNS subject alternative names, the signature
-/// algorithm its key pair uses, whether it asserts key usages, and its validity window
-/// as `(not_before, not_after)` years.
+/// algorithm its key pair uses, whether it asserts key usages, its validity window
+/// as `(not_before, not_after)` years, the X.509 serial number to give it and the
+/// extended key purposes to assert.
 pub(crate) struct Blueprint<'a> {
     pub(crate) common_name: Option<&'a str>,
     pub(crate) organization: Option<&'a str>,
@@ -51,6 +54,12 @@ pub(crate) struct Blueprint<'a> {
     pub(crate) algorithm: &'static rcgen::SignatureAlgorithm,
     pub(crate) key_usages: bool,
     pub(crate) validity: (i32, i32),
+    /// The big-endian bytes of the serial number to assign; `None` leaves the
+    /// generator's own serial.
+    pub(crate) serial: Option<&'a [u8]>,
+    /// The Extended Key Usage purposes to assert, which replace the pair
+    /// [`Blueprint::key_usages`] asserts; empty leaves that pair in force.
+    pub(crate) extended_key_usages: &'a [rcgen::ExtendedKeyUsagePurpose],
 }
 
 impl Default for Blueprint<'_> {
@@ -63,6 +72,8 @@ impl Default for Blueprint<'_> {
             algorithm: &rcgen::PKCS_ECDSA_P256_SHA256,
             key_usages: false,
             validity: (2020, 2100),
+            serial: None,
+            extended_key_usages: &[],
         }
     }
 }
@@ -102,10 +113,22 @@ fn generate_signed_by(blueprint: &Blueprint<'_>, key: &rcgen::KeyPair) -> Genera
             rcgen::ExtendedKeyUsagePurpose::ClientAuth,
         ];
     }
+    if !blueprint.extended_key_usages.is_empty() {
+        params.extended_key_usages = blueprint.extended_key_usages.to_vec();
+    }
+    if let Some(serial) = blueprint.serial {
+        params.serial_number = Some(rcgen::SerialNumber::from(serial.to_vec()));
+    }
     let certificate = params.self_signed(key).expect("a self-signed certificate").pem();
     let parsed = x509_cert::Certificate::from_pem(&certificate).expect("the certificate parses");
+    let serial_bytes = parsed.tbs_certificate.serial_number.as_bytes().to_vec();
     Generated {
-        serial: hex::encode(parsed.tbs_certificate.serial_number.as_bytes()),
+        serial: serial_bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join(":"),
+        serial_bytes,
         not_before: epoch_seconds(parsed.tbs_certificate.validity.not_before.to_system_time()),
         not_after: epoch_seconds(parsed.tbs_certificate.validity.not_after.to_system_time()),
         certificate,
@@ -756,8 +779,10 @@ async fn an_import_that_breaks_a_guideline_is_refused() {
 }
 
 /// RULE: `CertificateArn` names "an imported certificate to replace", so a reimport
-/// onto a certificate ACM was asked to issue is refused — and tags, which belong to
-/// the resource and not to the body, cannot be applied by one.
+/// onto a certificate ACM was asked to issue finds no imported certificate at that ARN
+/// — `ResourceNotFoundException`, even though every read operation resolves it — and
+/// tags, which belong to the resource and not to the body, cannot be applied by a
+/// reimport at all.
 #[tokio::test]
 async fn a_reimport_is_refused_where_it_does_not_apply() {
     let router = router();
@@ -773,7 +798,7 @@ async fn a_reimport_is_refused_where_it_does_not_apply() {
         common_name: Some("replacement.example.com"),
         ..Blueprint::default()
     });
-    let cases: &[(&str, Value)] = &[
+    let cases: &[(&str, Value, &str, String)] = &[
         (
             "a certificate ACM was asked to issue is not an imported one",
             json!({
@@ -781,6 +806,8 @@ async fn a_reimport_is_refused_where_it_does_not_apply() {
                 "PrivateKey": blob(&replacement.private_key),
                 "CertificateArn": requested,
             }),
+            "ResourceNotFoundException",
+            format!("The certificate ARN {requested} is not an imported certificate ARN."),
         ),
         (
             "a reimport may not carry tags",
@@ -790,9 +817,11 @@ async fn a_reimport_is_refused_where_it_does_not_apply() {
                 "CertificateArn": imported,
                 "Tags": [{ "Key": "owner", "Value": "platform" }],
             }),
+            "InvalidParameterException",
+            String::new(),
         ),
     ];
-    for (case, body) in cases {
+    for (case, body, expected_code, expected_message) in cases {
         let (status, response) = call(&router, "ImportCertificate", body).await;
         assert_eq!(
             status, 400,
@@ -800,9 +829,16 @@ async fn a_reimport_is_refused_where_it_does_not_apply() {
         );
         assert_eq!(
             error_code(&response),
-            "InvalidParameterException",
-            "case {case:?}: expected InvalidParameterException, got {response}"
+            *expected_code,
+            "case {case:?}: expected {expected_code}, got {response}"
         );
+        if !expected_message.is_empty() {
+            assert_eq!(
+                error_message(&response),
+                *expected_message,
+                "case {case:?}: expected message {expected_message:?}, got {response}"
+            );
+        }
     }
 
     // Neither refusal touched the certificate it named.

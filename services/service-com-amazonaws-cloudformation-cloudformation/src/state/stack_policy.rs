@@ -30,7 +30,9 @@
 //! to permit anything carries an explicit `Allow` statement for it.
 //!
 //! Nothing here reads or writes the store: the handler that is deploying computes the plan,
-//! asks this module for the verdict, and fails the update itself.
+//! asks this module for the verdict, and fails the update itself. Both of the operations that
+//! deploy an update to a LIVE stack — `UpdateStack` and `ExecuteChangeSet` — ask, each with
+//! the plan its own request would carry out, so one policy decides them alike.
 
 use ::service_common::iam_authorization::{
     resource_outcome_prepared, Decision, PreparedDocument, Request,

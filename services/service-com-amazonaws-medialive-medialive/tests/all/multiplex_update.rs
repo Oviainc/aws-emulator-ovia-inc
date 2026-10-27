@@ -324,7 +324,10 @@ async fn updating_a_multiplex_that_does_not_exist_is_refused() {
         &router,
         "POST",
         "/prod/channels",
-        Some(json!({ "name": "not-a-multiplex" })),
+        Some(json!({
+            "name": "not-a-multiplex",
+            "encoderSettings": crate::support::channel_encoder_settings(),
+        })),
     )
     .await;
     assert_eq!(

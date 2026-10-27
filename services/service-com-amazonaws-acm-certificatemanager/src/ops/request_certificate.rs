@@ -415,7 +415,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             options: input.options.clone(),
             certificate_authority_arn: input.certificate_authority_arn.clone(),
             managed_by: input.managed_by.clone(),
-            renewal_eligibility: crate::state::RENEWAL_INELIGIBLE.to_string(),
+            // No renewal has been asked for, and `RenewalSummary` "exists only when"
+            // one has (`CertificateDetail$RenewalSummary` doc).
+            renewal: None,
             // Nothing has failed: `FailureReason` "exists only when the certificate
             // status is FAILED" (`CertificateDetail$FailureReason` doc).
             failure_reason: None,

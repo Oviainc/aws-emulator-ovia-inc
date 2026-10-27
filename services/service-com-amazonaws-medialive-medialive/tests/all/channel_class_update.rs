@@ -39,6 +39,7 @@ async fn update_class(
 
 /// One created channel, answered as the create reported it.
 async fn create_channel(router: &MultiServiceRouter, body: Value) -> Value {
+    let body = crate::support::resolved_channel_body(router, body).await;
     let (status, response) = call(router, "POST", "/prod/channels", Some(body)).await;
     assert_eq!(
         status, 201,

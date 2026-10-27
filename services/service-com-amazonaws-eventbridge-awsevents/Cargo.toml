@@ -33,6 +33,8 @@ tracing = { workspace = true }
 hex = { workspace = true }
 # `arn`: the ONE parse of a caller-supplied resource ARN, shared with every other
 # service \u2014 a rule's target ARN is read through it rather than split here.
+# `json_reference_path`: the ONE bounded evaluation of a caller-supplied JSON path that
+# names a single value, which a Kinesis target's `PartitionKeyPath` is read through.
 service-common = { path = "../common" }
 # The AWS SDK for SQS, driven over the in-process callback
 # (`OperationContext::callback`): a rule delivers a matched event to its SQS queue
@@ -46,6 +48,9 @@ aws-sdk-sqs = { version = "1", default-features = false }
 aws-sdk-lambda = { version = "1", default-features = false }
 aws-sdk-sns = { version = "1", default-features = false }
 aws-sdk-sfn = { version = "1", default-features = false }
+# A Kinesis data stream target is delivered to with `PutRecord`, over the same
+# in-process callback.
+aws-sdk-kinesis = { version = "1", default-features = false }
 # `FailedInvocations`, the metric EventBridge counts an undeliverable event on,
 # is appended to the CloudWatch store in the SAME shared engine (the `AWS/Events`
 # namespace). CloudWatch refuses a `PutMetricData` into a reserved `AWS/`
@@ -73,6 +78,7 @@ service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 service-com-amazonaws-sns-amazonsimplenotificationservice = { workspace = true }
 service-com-amazonaws-sfn-awsstepfunctions = { workspace = true }
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+service-com-amazonaws-kinesis-kinesis-20131202 = { workspace = true }
 
 [lints]
 workspace = true

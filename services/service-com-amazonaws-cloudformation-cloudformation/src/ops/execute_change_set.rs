@@ -28,6 +28,13 @@
 //! operation claimed it, as in `UpdateStack`: this execution changes the stack, and a
 //! change set that has already been executed is refused on its own status anyway.
 //!
+//! An UPDATE change set's execution is held to the STACK POLICY in force, exactly as
+//! `UpdateStack` is ([`crate::state::stack_policy`]): where the policy refuses one of the
+//! actions the stored plan would take on one of the stack's resources, the plan is not
+//! carried out — the change set's configuration never reaches the stack, the protected
+//! resource reports the refusal, the update is rolled back and the change set is left in
+//! the modelled `EXECUTE_FAILED`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -283,6 +290,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // once when the change set was created — off the store lock, over the same
             // body the plan was computed from — so this call only reads it.
             let processed_template = change_set.processed_template.clone();
+            // The plan this execution would carry out, which is the one the change set
+            // computed and stored when it was created: what the STACK POLICY in force is
+            // decided against below.
+            let planned_changes = change_set.changes.clone();
             // "DO_NOTHING - if the stack creation fails, do nothing. This is equivalent to
             // specifying true for the DisableRollback parameter."
             let disable_rollback = input.disable_rollback.or_else(|| {
@@ -330,6 +341,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                     .into(),
                 );
+            }
+            // The stack policy in force governs an UPDATE change set's execution exactly
+            // as it governs `UpdateStack`: the plan the change set STORED is what this
+            // execution would do to each of the stack's resources, so an action the policy
+            // does not permit does not happen — the change set's configuration never
+            // reaches the stack, the protected resource reports the policy's verdict, and
+            // the stack rolls back (`crate::state::stack_policy`). A CREATE change set
+            // brings the stack into existence, which performs no update action on a resource
+            // a policy could protect.
+            let denial = (!creates_the_stack)
+                .then_some(stack.stack_policy_body.as_deref())
+                .flatten()
+                .and_then(|policy| {
+                    crate::state::stack_policy::denied(
+                        policy,
+                        &crate::state::stack_policy::planned_actions(&planned_changes),
+                    )
+                });
+            if let Some(denial) = denial {
+                // The same shape `UpdateStack` answers a denial with: the operation is
+                // opened so the client reads back the one it asked for, the denied
+                // resource's own events carry the verdict, and the stack rolls back to the
+                // configuration still in force — nothing having been deployed — unless this
+                // execution asked for its failed state to be kept.
+                let operation_id = crate::state::new_operation_id();
+                let client_request_token = input
+                    .client_request_token
+                    .clone()
+                    .unwrap_or_else(crate::state::new_client_request_token);
+                stack.client_request_token = Some(client_request_token.clone());
+                stack.begin_transition(
+                    now,
+                    status::UPDATE_IN_PROGRESS,
+                    status::UPDATE_COMPLETE,
+                    Some(operation_id),
+                    Some(client_request_token),
+                );
+                stack.schedule_resource_events(&denial.transitions());
+                let failed_at = ::std::time::SystemTime::now();
+                let reason = denial.reason();
+                stack.fail_transition(failed_at, status::UPDATE_FAILED, reason.clone());
+                // The flag in force on THIS execution: the request's, the change set's
+                // `OnStackFailure` where it chose one, else the stack's — the same reading
+                // the deploying path below gives that member.
+                if !disable_rollback.unwrap_or(stack.disable_rollback) {
+                    stack.begin_update_rollback(failed_at, reason);
+                }
+                // The execution was attempted and the plan was not carried out, so the
+                // change set is left in the modelled `EXECUTE_FAILED` rather than as one
+                // nothing has executed yet.
+                if let Some(change_set) =
+                    store.resolve_change_set_mut(&request_region, &change_set_id, None)
+                {
+                    change_set.execution_status = execution_status::EXECUTE_FAILED.to_string();
+                }
+                return Ok(ExecuteChangeSetOutput {});
             }
             // What the stack's resources are BEFORE this deployment: what executing the
             // change set has to keep, replace or delete in the services that own them.
