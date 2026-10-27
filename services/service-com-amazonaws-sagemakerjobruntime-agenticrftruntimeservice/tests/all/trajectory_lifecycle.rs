@@ -682,16 +682,20 @@ async fn complete_rollout_seals_the_trajectory_and_refuses_a_different_status() 
 async fn update_reward_records_scores_only_on_a_ready_trajectory() {
     // Rows differ along the length and the values of the reward list: one score,
     // several mixed-sign fractional scores, a list whose scores are all zero, and
-    // a long list. (The EMPTY list is refused, not recorded — see
-    // `an_empty_reward_list_is_refused`.)
+    // a long list. Each row captures one turn per score it submits, because the
+    // submission carries one reward value per turn — the cardinality rule is
+    // asserted on its own in `a_reward_list_carries_one_score_per_captured_turn`. The `other` list of a row is
+    // the same length with different scores, so what it conflicts with is the
+    // RECORDED reward and not its length. (The EMPTY list is refused, not
+    // recorded — see `an_empty_reward_list_is_refused`.)
     let rows: [(&str, Vec<f64>, Vec<f64>); 4] = [
         ("single reward", vec![1.0], vec![0.0]),
         (
             "mixed-sign fractional rewards",
             vec![0.5, -0.25, 3.0],
-            vec![0.5, -0.25],
+            vec![0.5, -0.25, 2.0],
         ),
-        ("all-zero rewards", vec![0.0, 0.0], vec![0.0]),
+        ("all-zero rewards", vec![0.0, 0.0], vec![1.0, 0.0]),
         (
             "long reward list",
             (0..64).map(|index| f64::from(index) / 8.0).collect(),
@@ -704,14 +708,17 @@ async fn update_reward_records_scores_only_on_a_ready_trajectory() {
         let arn = job_arn("aws", "us-west-2", "123456789012", "AgentRFT", "run-1");
         create_job(&engine, &arn);
 
-        // Not eligible before CompleteRollout.
-        assert_eq!(
-            sample(&router, &arn, "traj-1", &chat_payload("go"), false)
-                .await
-                .status,
-            200,
-            "case {case:?}: expected the first Sample to answer 200"
-        );
+        // Not eligible before CompleteRollout. One turn is captured per score the
+        // row submits.
+        for turn in 0..rewards.len() {
+            assert_eq!(
+                sample(&router, &arn, "traj-1", &chat_payload("go"), false)
+                    .await
+                    .status,
+                200,
+                "case {case:?}: expected Sample {turn} to answer 200"
+            );
+        }
         let early = update_reward(&router, &arn, "traj-1", &rewards, "tok-r").await;
         assert_eq!(
             early.status,
@@ -805,14 +812,17 @@ async fn update_reward_records_scores_only_on_a_ready_trajectory() {
             );
         }
 
-        // Sealed `failed` is terminal: it accepts no reward at all.
-        assert_eq!(
-            sample(&router, &arn, "traj-2", &chat_payload("go"), true)
-                .await
-                .status,
-            200,
-            "case {case:?}: expected the first Sample on traj-2 to answer 200"
-        );
+        // Sealed `failed` is terminal: it accepts no reward at all, not even one
+        // carrying a score per captured turn.
+        for turn in 0..rewards.len() {
+            assert_eq!(
+                sample(&router, &arn, "traj-2", &chat_payload("go"), true)
+                    .await
+                    .status,
+                200,
+                "case {case:?}: expected Sample {turn} on traj-2 to answer 200"
+            );
+        }
         assert_eq!(
             complete_rollout(&router, &arn, "traj-2", Some("failed"), "tok-c2")
                 .await
@@ -833,6 +843,194 @@ async fn update_reward_records_scores_only_on_a_ready_trajectory() {
             "ConflictException",
             "case {case:?}: expected ConflictException, got {:?}",
             on_failed.error_type
+        );
+    }
+}
+
+/// Distinct score values a reward submission is filled from, as long as the
+/// widest row below needs. The per-turn cardinality rule generalises over the
+/// LENGTH of the list, so these values only have to be distinguishable from
+/// each other.
+const SCORE_POOL: [f64; 7] = [0.0, 0.25, -0.5, 1.0, 2.5, -1.25, 3.75];
+
+/// RULE: a reward submission carries exactly one score per turn captured on the
+/// trajectory — "Provide one reward value per turn in the trajectory"
+/// (`smithy_query(query="doc",shape="UpdateRewardRequest",member="Rewards")`) —
+/// so a list of any other length is refused as invalid and records nothing,
+/// while a list of exactly that length is recorded.
+#[tokio::test]
+async fn a_reward_list_carries_one_score_per_captured_turn() {
+    // The grid spans the rule's two free dimensions: how many turns the
+    // trajectory captured, and how many scores the submission carries. Every
+    // pair is driven, so each turn count is exercised with too few scores, the
+    // matching count, and too many. (Zero scores is the EMPTY list, refused
+    // before the trajectory is even resolved — see `modelled_rejections`.)
+    let turn_counts = [1usize, 2, 3, 5];
+    let reward_counts = [1usize, 2, 3, 4, 5, 7];
+
+    for turns in turn_counts {
+        for scores in reward_counts {
+            let case = format!("{turns} captured turn(s), {scores} reward value(s)");
+            let (engine, router) = mounted_service();
+            let arn = job_arn("aws", "us-east-1", "123456789012", "AgentRFT", "run-1");
+            create_job(&engine, &arn);
+
+            // Capture the turns, alternating the sampling operation so the count
+            // is the count of turns however they were served.
+            for turn in 0..turns {
+                assert_eq!(
+                    sample(&router, &arn, "traj-1", &chat_payload("go"), turn % 2 == 1)
+                        .await
+                        .status,
+                    200,
+                    "case {case:?}: expected Sample {turn} to answer 200"
+                );
+            }
+            assert_eq!(
+                complete_rollout(&router, &arn, "traj-1", Some("ready"), "tok-c")
+                    .await
+                    .status,
+                200,
+                "case {case:?}: expected CompleteRollout to answer 200"
+            );
+
+            let rewards: Vec<f64> = SCORE_POOL[..scores].to_vec();
+            let reply = update_reward(&router, &arn, "traj-1", &rewards, "tok-r").await;
+
+            if scores == turns {
+                assert_eq!(
+                    reply.status,
+                    200,
+                    "case {case:?}: expected one score per turn to answer 200, got {} / {}",
+                    reply.status,
+                    reply.text()
+                );
+                let store = engine.state::<ServiceState>();
+                let guard = store.lock();
+                let trajectory = guard
+                    .trajectory(&arn, "traj-1")
+                    .unwrap_or_else(|| panic!("case {case:?}: expected the trajectory in state"));
+                assert_eq!(
+                    (trajectory.rewards.as_deref(), trajectory.status),
+                    (
+                        Some(rewards.as_slice()),
+                        state::TrajectoryStatus::RewardReceived
+                    ),
+                    "case {case:?}: expected the scores recorded and reward-received status, got \
+                     {:?} / {:?}",
+                    trajectory.rewards,
+                    trajectory.status
+                );
+                continue;
+            }
+
+            assert_eq!(
+                (reply.status, reply.error_code().as_str()),
+                (400, "ValidationException"),
+                "case {case:?}: expected 400 ValidationException for a mis-sized reward list, \
+                 got {} {:?} / {}",
+                reply.status,
+                reply.error_type,
+                reply.text()
+            );
+            // The `Message` member as the MODEL declares it on this service's error
+            // shapes, so a refusal the framework made before reaching this
+            // operation (which writes a lowercase `message`) cannot pass for it.
+            assert_eq!(
+                reply.json()["Message"].as_str(),
+                Some(
+                    format!(
+                        "Rewards list must contain one reward value per turn in the trajectory; \
+                         trajectory traj-1 has {turns} turn(s) but {scores} reward value(s) were \
+                         provided"
+                    )
+                    .as_str()
+                ),
+                "case {case:?}: expected the per-turn cardinality sentence, got {:?}",
+                reply.json()["Message"]
+            );
+
+            // The refused submission recorded nothing: the trajectory is still
+            // the sealed, un-rewarded one the next caller reads.
+            let store = engine.state::<ServiceState>();
+            let guard = store.lock();
+            let trajectory = guard
+                .trajectory(&arn, "traj-1")
+                .unwrap_or_else(|| panic!("case {case:?}: expected the trajectory in state"));
+            assert_eq!(
+                (
+                    trajectory.rewards.clone(),
+                    trajectory.status,
+                    trajectory.update_reward_token.clone()
+                ),
+                (None, state::TrajectoryStatus::Complete, None),
+                "case {case:?}: expected a refused UpdateReward to leave the sealed trajectory \
+                 un-rewarded, got {:?} / {:?} / {:?}",
+                trajectory.rewards,
+                trajectory.status,
+                trajectory.update_reward_token
+            );
+        }
+    }
+}
+
+/// RULE: the per-turn cardinality is checked on the trajectory the request
+/// names, so it is reached only once that trajectory is resolved and eligible: a
+/// pair the store holds nothing for is not found, and a trajectory that
+/// `CompleteRollout` has not sealed yet conflicts, whatever the submission's
+/// length.
+#[tokio::test]
+async fn an_unresolvable_or_unsealed_trajectory_is_answered_before_the_reward_count() {
+    // Rows: the submission's length against a store holding one trajectory of
+    // two captured turns, un-sealed.
+    for scores in [1usize, 2, 3] {
+        let case = format!("{scores} reward value(s)");
+        let (engine, router) = mounted_service();
+        let arn = job_arn("aws", "us-east-1", "123456789012", "AgentRFT", "run-1");
+        create_job(&engine, &arn);
+        for turn in 0..2 {
+            assert_eq!(
+                sample(&router, &arn, "traj-1", &chat_payload("go"), false)
+                    .await
+                    .status,
+                200,
+                "case {case:?}: expected Sample {turn} to answer 200"
+            );
+        }
+
+        let rewards: Vec<f64> = SCORE_POOL[..scores].to_vec();
+
+        let unknown = update_reward(&router, &arn, "no-such-trajectory", &rewards, "tok-r").await;
+        assert_eq!(
+            (unknown.status, unknown.error_code().as_str()),
+            (404, "ResourceNotFoundException"),
+            "case {case:?}: expected 404 ResourceNotFoundException for an unknown trajectory, \
+             got {} {:?} / {}",
+            unknown.status,
+            unknown.error_type,
+            unknown.text()
+        );
+
+        let unsealed = update_reward(&router, &arn, "traj-1", &rewards, "tok-r").await;
+        assert_eq!(
+            (unsealed.status, unsealed.error_code().as_str()),
+            (409, "ConflictException"),
+            "case {case:?}: expected 409 ConflictException for an un-sealed trajectory, got {} \
+             {:?} / {}",
+            unsealed.status,
+            unsealed.error_type,
+            unsealed.text()
+        );
+
+        let store = engine.state::<ServiceState>();
+        let guard = store.lock();
+        let trajectory = guard
+            .trajectory(&arn, "traj-1")
+            .unwrap_or_else(|| panic!("case {case:?}: expected the trajectory in state"));
+        assert!(
+            trajectory.rewards.is_none(),
+            "case {case:?}: expected the refused submissions to record nothing, got {:?}",
+            trajectory.rewards
         );
     }
 }

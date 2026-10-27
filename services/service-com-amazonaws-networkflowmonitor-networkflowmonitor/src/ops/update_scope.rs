@@ -225,18 +225,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // One target named in both lists says two contradictory things about it,
-        // the same contradiction `UpdateMonitor` refuses in its own four lists.
-        if let Some(both) = crate::state::overlapping_targets(&to_add, &to_delete) {
-            return Err(UpdateScopeErrorModeled::ValidationException(
-                crate::state::field_validation(
-                    "resourcesToAdd",
-                    format!(
-                        "{} is also in resourcesToDelete",
-                        crate::state::describe_target(both)
-                    ),
-                ),
-            )
-            .into());
+        // the same contradiction `UpdateMonitor` refuses in its own four lists, in
+        // the same wording.
+        if crate::state::overlapping_targets(&to_add, &to_delete).is_some() {
+            return Err(
+                UpdateScopeErrorModeled::ValidationException(crate::state::add_remove_overlap())
+                    .into(),
+            );
         }
 
         // Whatever the lists say, the scope the update leaves behind has to keep

@@ -145,23 +145,45 @@ const TOO_MANY_ENTRIES_REFUSAL: &str = "The batch request contains more entries 
 const BATCH_TOO_LONG_REFUSAL: &str =
     "The length of all the messages put together is more than the limit.";
 
-/// The sentence SNS refuses an entry `Id` that is not 1 to [`MAX_ENTRY_ID_CHARS`]
-/// alphanumerics, hyphens or underscores with: the condition, whichever half of the
-/// rule the id broke, and never the id the caller sent — "The `Id` of a batch entry in
-/// a batch request doesn't abide by the specification"
-/// (`InvalidBatchEntryIdException` doc).
+/// The sentence SNS refuses an entry `Id` that breaks neither of the two rules the
+/// member publishes and is still no identifier — the empty one — with: the modelled
+/// error's own statement, "The `Id` of a batch entry in a batch request doesn't abide
+/// by the specification" (`InvalidBatchEntryIdException` doc).
 const INVALID_ENTRY_ID_REFUSAL: &str =
     "The Id of a batch entry in a batch request doesn't abide by the specification.";
 
-/// Whether a batch entry's `Id` abides by the rule its doc states: 1 to 80
-/// characters, each an ASCII alphanumeric, a hyphen or an underscore.
-fn entry_id_is_valid(id: &str) -> bool {
-    let length = id.chars().count();
-    length > 0
-        && length <= MAX_ENTRY_ID_CHARS
-        && id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+/// Whether `c` is a character a batch entry's `Id` may carry: "alphanumeric
+/// characters, hyphens(-), and underscores (_)" (`PublishBatchRequestEntry$Id` doc).
+fn is_entry_id_character(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '-' || c == '_'
+}
+
+/// Why this batch entry's `Id` is not one SNS accepts, or `None` when it is.
+///
+/// The member publishes TWO rules — "This identifier can have up to 80 characters" and
+/// "The following characters are accepted: alphanumeric characters, hyphens(-), and
+/// underscores (_)" — and the refusal says WHICH of them the request broke and names
+/// the id that broke it, so a batch publisher can find the entry to repair. The length
+/// is judged first: an id past the bound is reported as the long id it is, whatever
+/// else it carries.
+fn entry_id_refusal(id: &str) -> Option<String> {
+    if id.chars().count() > MAX_ENTRY_ID_CHARS {
+        return Some(format!(
+            "The Id of a batch entry in the batch request is too long: {id}"
+        ));
+    }
+    if !id.chars().all(is_entry_id_character) {
+        return Some(format!(
+            "The Id of a batch entry in the batch request contains an impermissible \
+             character: {id}"
+        ));
+    }
+    if id.is_empty() {
+        // No characters is no identifier either, and neither published rule speaks of
+        // it, so the error's own statement stands.
+        return Some(INVALID_ENTRY_ID_REFUSAL.to_string());
+    }
+    None
 }
 
 /// The bytes one entry contributes to the batch's combined size: "The combined size of
@@ -306,10 +328,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every entry is identified before any of them is published: the id is how the
         // response reports an entry's own result, so a batch SNS could not report on
         // fails as a whole rather than entry by entry.
-        if entries.iter().any(|entry| !entry_id_is_valid(&entry.id)) {
+        if let Some(message) = entries
+            .iter()
+            .find_map(|entry| entry_id_refusal(&entry.id))
+        {
             return Err(PublishBatchErrorModeled::InvalidBatchEntryIdException(
                 InvalidBatchEntryIdException {
-                    message: Some(INVALID_ENTRY_ID_REFUSAL.to_string()),
+                    message: Some(message),
                 },
             )
             .into());

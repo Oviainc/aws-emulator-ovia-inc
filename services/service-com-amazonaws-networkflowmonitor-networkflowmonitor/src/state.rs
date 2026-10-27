@@ -535,29 +535,20 @@ impl Query {
         }
     }
 
-    /// What `StopQuery*` does to this query: cancel it, or say why it cannot be
-    /// canceled.
+    /// What `StopQuery*` does to this query: cancel it while it is still moving,
+    /// and nothing at all once it has reached a terminal status.
     ///
-    /// A query that has not finished becomes `CANCELED`. A query already `CANCELED`
-    /// is left as it is and the call succeeds — `StopQueryMonitorTopContributors` is
-    /// `@idempotent`, so the retry of a stop that already landed must not be refused.
-    /// A query that FINISHED is refused with the modelled `ValidationException`: there
-    /// is nothing left to stop, and answering success would tell the caller it
-    /// canceled a query whose results are sitting in the store.
-    pub fn stop(&mut self) -> Result<(), ValidationException> {
-        match self.status {
-            QueryStatus::Queued | QueryStatus::Running => {
-                self.status = QueryStatus::Canceled;
-                Ok(())
-            }
-            QueryStatus::Canceled => Ok(()),
-            QueryStatus::Succeeded => Err(ValidationException {
-                message: Some(format!(
-                    "query {} has already finished with status {} and cannot be stopped",
-                    self.query_id,
-                    self.status.as_wire()
-                )),
-            }),
+    /// The stop is modelled as an idempotent fire-and-forget — `@idempotent`, an
+    /// EMPTY output shape, and no status of its own to report — so it asks only
+    /// that the query not go on running, which is already true of a query that
+    /// finished or was already canceled. Such a query KEEPS the outcome it
+    /// reached, so a later `GetQueryStatus*` still reports it, and the call
+    /// succeeds: refusing the retry of a stop that already landed, or the
+    /// defensive stop a cleanup path makes, would fail a request the service has
+    /// nothing left to do for.
+    pub fn stop(&mut self) {
+        if !self.status.is_terminal() {
+            self.status = QueryStatus::Canceled;
         }
     }
 }
@@ -933,16 +924,6 @@ pub fn merged_targets(
     merged
 }
 
-/// How a target names itself in a refusal, so a caller can tell WHICH entry of a
-/// list was refused: the account it names, and the Region it names it in.
-pub fn describe_target(target: &TargetResource) -> String {
-    format!(
-        "the target for account {} in {}",
-        target_account_id(&target.target_identifier.target_id),
-        target.region
-    )
-}
-
 /// Per-service state for com-amazonaws-networkflowmonitor-networkflowmonitor. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsNetworkflowmonitorNetworkflowmonitorState {
@@ -1185,11 +1166,10 @@ pub fn state_unavailable() -> InternalServerException {
 /// resource this service mints an ARN for.
 ///
 /// The ARN-qualified forms below are for the resources this service DOES mint an
-/// ARN for — a monitor ([`monitor_not_found`]) and a scope ([`scope_not_found`]).
-/// This generic form is what is left: a `queryId`, which is an identifier inside a
-/// monitor's or a scope's own lifecycle and has no ARN of its own, and the tagging
-/// operations' `resourceArn`, which the caller already addressed BY its ARN, so the
-/// id this message carries is that ARN.
+/// ARN for — a monitor ([`monitor_not_found`]) and a scope ([`scope_not_found`]) —
+/// and a `queryId` has its own renderer ([`query_not_found`]). This generic form is
+/// what is left: the tagging operations' `resourceArn`, which the caller already
+/// addressed BY its ARN, so the id this message carries is that ARN.
 pub fn not_found(resource_type: &str, id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(format!("{} [{id}] doesn't exist", capitalized(resource_type))),
@@ -1236,6 +1216,53 @@ pub fn scope_not_found(region: &str, scope_id: &str) -> ResourceNotFoundExceptio
             "There's no scope with ARN: [{}]",
             resource_arn(region, SCOPE_RESOURCE, scope_id)
         )),
+    }
+}
+
+/// How this service names a `queryId` that names no query it holds: a fixed prefix
+/// and the request's own id in braces.
+///
+/// A query carries no ARN of its own — it is an identifier inside a monitor's or a
+/// scope's own lifecycle — so the refusal identifies it by the id the REQUEST
+/// carried, the way the renderers above identify a monitor or a scope by the ARN
+/// built from the request. One sentence serves every operation that can be handed
+/// an id naming no query, whichever error class that operation models for it.
+fn no_such_query(query_id: &str) -> String {
+    format!("There's no query with id {{{query_id}}}")
+}
+
+/// The modelled 404 for a `queryId` the store holds no query under, on the
+/// `GetQueryResults*` readers — the operations whose model declares
+/// `ResourceNotFoundException`.
+pub fn query_not_found(query_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(no_such_query(query_id)),
+    }
+}
+
+/// The same condition on an operation whose model declares NO
+/// `ResourceNotFoundException` (`GetQueryStatus*`): the class is that operation's
+/// modelled 400, and the message is the one sentence this service words a missing
+/// query with.
+pub fn unknown_query(query_id: &str) -> ValidationException {
+    ValidationException {
+        message: Some(no_such_query(query_id)),
+    }
+}
+
+/// The modelled 400 for an update that names one item BOTH in an add list and in
+/// the matching remove list.
+///
+/// The text is a constant for the condition, echoing nothing of the request: the
+/// request carried no bad value — every entry of it is admissible on its own — it
+/// said two contradictory things about one item, which is the whole of what the
+/// caller has to be told. Every update of this service refuses the contradiction
+/// with it, so the pair of lists it was found in does not change the wording.
+pub fn add_remove_overlap() -> ValidationException {
+    ValidationException {
+        message: Some(
+            "invalid input -> (detected overlap between add/remove resources)".to_string(),
+        ),
     }
 }
 

@@ -21,6 +21,8 @@ mod harness;
 mod monitor_update;
 #[path = "all/query_lifecycle.rs"]
 mod query_lifecycle;
+#[path = "all/query_terminal_and_result_reporting.rs"]
+mod query_terminal_and_result_reporting;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/scope_listing.rs"]

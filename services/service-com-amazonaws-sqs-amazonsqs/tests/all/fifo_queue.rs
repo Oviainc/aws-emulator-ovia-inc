@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::support::{as_map, call, create_ok, emulator, error_code, messages, ok};
+use super::support::{as_map, call, create_ok, emulator, error_code, fifo_attributes, messages, ok};
 
 /// One row of the deduplication table: the case, the attributes the queue is created
 /// with, the sends as `(group, body, token)` and how many copies the queue keeps.
@@ -39,16 +39,6 @@ type DeduplicationRow<'a> = (
 /// One row of the attribute-selection table: the case, the names the request selects
 /// (nothing at all when `None`) and the FIFO attributes that must come back.
 type SelectionRow<'a> = (&'a str, Option<Vec<&'a str>>, &'a [&'a str]);
-
-/// The attributes a FIFO queue is created with here; `name` always carries the `.fifo`
-/// suffix a FIFO queue name must end with.
-fn fifo_attributes(extra: &[(&str, &str)]) -> Value {
-    let mut attributes = json!({ "FifoQueue": "true" });
-    for (name, value) in extra {
-        attributes[*name] = json!(value);
-    }
-    attributes
-}
 
 /// Send one message and return the HTTP status and the answer.
 async fn send(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {

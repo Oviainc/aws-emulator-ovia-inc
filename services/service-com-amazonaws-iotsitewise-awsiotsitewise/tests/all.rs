@@ -12,6 +12,14 @@
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
 //
+// `query_results` is declared HERE, between that note and the first suite below,
+// rather than in the sorted list or at the END of the file: those are the two
+// stretches every concurrent iotsitewise change puts a declaration of its own in,
+// and each attempt to land this one in either collided with a branch that had just
+// inserted beside it. Fold it into the list once the churn settles.
+#[path = "all/query_results.rs"]
+mod query_results;
+
 // `actions` is declared HERE, at the head of the file, rather than in the sorted
 // list or appended after it: both of those are where every concurrent
 // iotsitewise change puts a declaration of its own, and each of three attempts
@@ -504,4 +512,10 @@ mod describe_project_reads;
 // of its own. Fold it into the sorted list once the churn settles.
 #[path = "all/list_project_assets_paging.rs"]
 mod list_project_assets_paging;
+
+// Declared last, for the same reason the suites above it are: both stretches
+// higher up are where every concurrent iotsitewise change inserts a declaration
+// of its own. Fold it into the sorted list once the churn settles.
+#[path = "all/update_gateway.rs"]
+mod update_gateway;
 

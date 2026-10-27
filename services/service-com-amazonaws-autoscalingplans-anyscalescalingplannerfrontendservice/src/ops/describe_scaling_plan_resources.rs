@@ -4,6 +4,11 @@
 //! Derives one `ScalingPlanResource` per stored `ScalingInstruction` of the named
 //! plan, read back from [`crate::state`] and paged by `MaxResults`/`NextToken`.
 //!
+//! Each reported resource carries the target tracking scaling policies its own
+//! instruction calls for — "AWS Auto Scaling creates target tracking scaling policies
+//! based on the scaling instructions" — together with the narrative of its scaling
+//! status, both derived from the plan record.
+//!
 //! Both input members are required and together name ONE plan, but this operation binds
 //! no not-found error at all, so a `ScalingPlanName` naming no stored plan is not a client
 //! error: it reports the empty set of scalable resources, HTTP 200 with an empty
@@ -194,23 +199,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => (0usize, Vec::new()),
                 Some(plan) => {
                     let scaling_status_code = plan.scaling_status_code();
+                    let scaling_status_message = plan.scaling_status_message();
                     let page: Vec<ScalingPlanResource> = plan
                         .scaling_instructions
                         .iter()
+                        .enumerate()
                         .skip(start)
                         .take(page_size)
-                        .map(|instruction| ScalingPlanResource {
-                            scaling_plan_name: plan.name.clone(),
-                            scaling_plan_version: plan.version,
-                            service_namespace: instruction.service_namespace.clone(),
-                            resource_id: instruction.resource_id.clone(),
-                            scalable_dimension: instruction.scalable_dimension.clone(),
-                            // No scaling policies are materialised by this emulator:
-                            // nothing creates a target-tracking policy here, so reporting
-                            // one would be reporting work that never ran.
-                            scaling_policies: None,
-                            scaling_status_code: scaling_status_code.to_string(),
-                            scaling_status_message: None,
+                        .map(|(resource, instruction)| {
+                            // "AWS Auto Scaling creates target tracking scaling policies
+                            // based on the scaling instructions" — so the policies on a
+                            // resource are those its own instruction calls for, reported
+                            // once the plan's configuration has reached it.
+                            let policies = plan.applied_policies(resource, instruction);
+                            ScalingPlanResource {
+                                scaling_plan_name: plan.name.clone(),
+                                scaling_plan_version: plan.version,
+                                service_namespace: instruction.service_namespace.clone(),
+                                resource_id: instruction.resource_id.clone(),
+                                scalable_dimension: instruction.scalable_dimension.clone(),
+                                scaling_policies: (!policies.is_empty()).then_some(policies),
+                                scaling_status_code: scaling_status_code.to_string(),
+                                scaling_status_message: Some(scaling_status_message.to_string()),
+                            }
                         })
                         .collect();
                     (plan.scaling_instructions.len(), page)
