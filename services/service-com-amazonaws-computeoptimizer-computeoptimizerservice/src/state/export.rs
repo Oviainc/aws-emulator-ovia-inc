@@ -279,7 +279,8 @@ pub struct ExportRequest<'a, F: ExportFilter> {
     pub resource_type: &'a str,
     /// The request's `accountIds` and whether it asked for the organization's member accounts
     /// — "The parameters are mutually exclusive." They select WHOSE recommendations go into
-    /// the file, not where it is written.
+    /// the file, not where it is written, so an id naming an account this service cannot
+    /// answer about ([`super::is_foreign_account`]) is refused rather than exported under.
     pub account_ids: Option<Vec<String>>,
     /// See [`ExportRequest::account_ids`].
     pub include_member_accounts: bool,
@@ -352,6 +353,9 @@ pub struct CreatedExport {
 ///
 /// A malformed request is refused BEFORE the store is read, so an invalid parameter takes
 /// precedence over the enrollment gate, as it does in every other operation of this service.
+/// An `accountIds` naming another account is such a request: it asks for an export of an
+/// account this service answers nothing about, and is refused with the crate's one
+/// cross-account refusal ([`super::CROSS_ACCOUNT_MESSAGE`]) exactly as a reader refuses it.
 /// Creating a job is a write, so this is also where the jobs the seven-day reporting window
 /// has dropped are let go of — a reader never writes. The export job belongs to the Region
 /// whose endpoint created it, and so does the one-job-in-progress limit each export operation
@@ -386,6 +390,21 @@ pub fn create_export_job<Eng: Send + Sync + 'static, F: ExportFilter>(
             "The value supplied for parameter accountIds is not valid: {value} is not a \
              12-digit Amazon Web Services account ID."
         )));
+    }
+    // `accountIds` is the MANAGEMENT-account mechanism for naming a member account of an
+    // organization, and this emulator presents exactly one standalone account
+    // ([`super::is_foreign_account`]) and records no organization. So an id naming any OTHER
+    // account asks for an export of an account whose analysis this service does not hold, and
+    // is refused with the refusal the whole crate shares ([`super::CROSS_ACCOUNT_MESSAGE`]) —
+    // the same answer a `Get*Recommendations` reader gives the same id, rather than writing
+    // THIS account's rows into a file whose metadata names that other account.
+    if account_ids
+        .iter()
+        .any(|value| super::is_foreign_account(value))
+    {
+        return Err(ExportRefusal::InvalidParameter(
+            super::CROSS_ACCOUNT_MESSAGE.to_string(),
+        ));
     }
 
     // The filters are the ones the surface's recommendation reader selects with, so a name or
@@ -784,9 +803,10 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     ///
     /// The rows are the ONE account this emulator presents
     /// ([`engine::emulator_account_id`]): `accountIds` and `includeMemberAccounts` select
-    /// whose recommendations go into the file, and this emulator records no organization and
-    /// holds no other account's analysis, so neither of them selects any row away or adds one
-    /// — they are stated in the metadata file as what the export was asked for.
+    /// whose recommendations go into the file, an admitted request can name no account but
+    /// this one ([`create_export_job`]), and this emulator records no organization and holds
+    /// no other account's analysis, so neither of them selects any row away or adds one —
+    /// they are stated in the metadata file as what the export was asked for.
     ///
     /// Compute Optimizer reports recommendations for an ENROLLED account only, and only once
     /// the analysis its enrollment starts is due, so an export created before then holds the
