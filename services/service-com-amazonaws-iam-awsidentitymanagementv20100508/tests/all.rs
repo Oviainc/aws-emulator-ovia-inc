@@ -91,6 +91,8 @@ mod policy_listing;
 mod policy_refusal_wording;
 #[path = "all/policy_simulation.rs"]
 mod policy_simulation;
+#[path = "all/policy_tag_authorization.rs"]
+mod policy_tag_authorization;
 #[path = "all/policy_tag_listing.rs"]
 mod policy_tag_listing;
 #[path = "all/policy_tag_removal.rs"]
