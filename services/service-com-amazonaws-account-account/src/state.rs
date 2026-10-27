@@ -41,6 +41,12 @@
 //! and what it reports before any opt call, and [`region_opt_target`] is the one
 //! place that reads it to answer whether a Region can be the TARGET of an opt
 //! call — the question `EnableRegion` and `DisableRegion` both decide by.
+//!
+//! The primary contact structure carries rules of the same kind, which the model
+//! states in prose rather than in constraints: which two-letter strings are
+//! country codes, and in which countries an address must carry a state or
+//! region. [`validated_contact_information`] is the one place that decides both,
+//! the question `PutContactInformation` admits a structure by.
 
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
@@ -224,6 +230,102 @@ pub fn initial_contact_information(account_id: &str) -> ContactInformation {
         phone_number: INITIAL_PHONE_NUMBER.to_string(),
         company_name: None,
         website_url: None,
+    }
+}
+
+/// The country codes a primary contact address must carry a `StateOrRegion`
+/// for, from that member's OWN documentation: "This field is required in the
+/// following countries: US, CA, GB, DE, JP, IN, and BR"
+/// (`smithy_query(query="doc", shape="ContactInformation",
+/// member="StateOrRegion")`).
+///
+/// The model leaves `StateOrRegion` optional, because whether it is required
+/// depends on another member of the same structure — so the cross-member rule is
+/// this service's own, exactly as WHICH strings name a Region is
+/// ([`REGION_CATALOG`]).
+pub const COUNTRIES_REQUIRING_STATE_OR_REGION: &[&str] =
+    &["US", "CA", "GB", "DE", "JP", "IN", "BR"];
+
+/// The `ContactInformation` member a refusal about the country of the address
+/// names in its `fieldList`.
+const COUNTRY_CODE_MEMBER: &str = "CountryCode";
+
+/// The `ContactInformation` member a refusal about the state of the address
+/// names in its `fieldList`.
+const STATE_OR_REGION_MEMBER: &str = "StateOrRegion";
+
+/// Whether `country_code` is an ISO 3166-1 alpha-2 country code, which is what
+/// `CountryCode` is documented to hold ("The ISO-3166 two-letter country code
+/// for the primary contact address").
+///
+/// The model constrains the member only `@length(min: 2, max: 2)`, so WHICH
+/// two-letter strings are country codes is data this service decides by — the
+/// `rust_iso3166` crate's published table, rather than a list restated here.
+/// The codes are published as two UPPERCASE letters, so the lookup is
+/// case-sensitive: a lower-case or digit-bearing pair is not one of them.
+pub fn is_country_code(country_code: &str) -> bool {
+    country_code.chars().all(|letter| letter.is_ascii_uppercase())
+        && ::rust_iso3166::from_alpha2(country_code).is_some()
+}
+
+/// Whether `contact` is a primary contact structure this service accepts, and
+/// the refusal it earns when it is not: the country must be an assigned
+/// ISO 3166-1 alpha-2 code ([`is_country_code`]) and, in the countries that
+/// documentation names, the address must carry a state or region
+/// ([`COUNTRIES_REQUIRING_STATE_OR_REGION`]).
+///
+/// The ONE statement of the rules the model cannot express about a
+/// `ContactInformation` — the counterpart of [`region_opt_target`] — so
+/// `PutContactInformation` decides through it before it resolves an account or
+/// touches the store, and a refused put writes nothing.
+pub fn validated_contact_information(
+    contact: &ContactInformation,
+) -> Result<(), ValidationException> {
+    if !is_country_code(&contact.country_code) {
+        return Err(unknown_country_code(&contact.country_code));
+    }
+    if contact.state_or_region.is_none()
+        && COUNTRIES_REQUIRING_STATE_OR_REGION.contains(&contact.country_code.as_str())
+    {
+        return Err(state_or_region_required(&contact.country_code));
+    }
+    Ok(())
+}
+
+/// The `ValidationException` payload for a `CountryCode` that is not an
+/// ISO 3166-1 alpha-2 country code.
+///
+/// `reason` is `fieldValidationFailed` and `fieldList` names the member, so the
+/// caller can see which input was rejected — the same shape as
+/// [`unknown_region`], the other member of this service whose admitted values
+/// are data rather than a modelled constraint.
+pub fn unknown_country_code(country_code: &str) -> ValidationException {
+    ValidationException {
+        message: format!(
+            "{COUNTRY_CODE_MEMBER} {country_code:?} is not an ISO-3166 two-letter country code"
+        ),
+        reason: Some(FIELD_VALIDATION_FAILED.to_string()),
+        field_list: Some(vec![ValidationExceptionField {
+            name: COUNTRY_CODE_MEMBER.to_string(),
+            message: format!("{country_code:?} is not an ISO-3166 two-letter country code"),
+        }]),
+    }
+}
+
+/// The `ValidationException` payload for a primary contact address in a country
+/// that requires a state or region and carries none.
+///
+/// The message names the country the request submitted, which is what tells the
+/// caller why the member it left out was required.
+pub fn state_or_region_required(country_code: &str) -> ValidationException {
+    let rule = format!("{STATE_OR_REGION_MEMBER} is required in {country_code}");
+    ValidationException {
+        message: rule.clone(),
+        reason: Some(FIELD_VALIDATION_FAILED.to_string()),
+        field_list: Some(vec![ValidationExceptionField {
+            name: STATE_OR_REGION_MEMBER.to_string(),
+            message: rule,
+        }]),
     }
 }
 

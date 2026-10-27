@@ -4132,6 +4132,10 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         || resource_type == KMS_KEY
         || resource_type == AOSS_COLLECTION
         || resource_type == ACM_ACME_ENDPOINT
+        // An ACM certificate is the same case: `RequestCertificate` takes no identifier
+        // and answers the `CertificateArn` ACM minted, and that type's `Ref` returns that
+        // ARN — a template declares the domain the certificate covers, never its id.
+        || resource_type == ACM_CERTIFICATE
         || resource_type == MSK_CLUSTER
         || resource_type == MSK_SERVERLESS_CLUSTER
         || resource_type == ROUTE53RESOLVER_ENDPOINT
@@ -4521,6 +4525,14 @@ const HOSTED_ZONE_ID_SALT: &str = "route53-hosted-zone";
 /// rule could compute — so the identifier a stack reports for the resource is the value
 /// `acm DescribeAcmeEndpoint` resolves.
 pub const ACM_ACME_ENDPOINT: &str = "AWS::CertificateManager::AcmeEndpoint";
+
+/// An AWS Certificate Manager certificate's resource type (the same model's
+/// `cloudFormationName: CertificateManager`). This is a type `super::provisioning` creates
+/// in ACM itself, and the identifier the provider reports for it is the `CertificateArn`
+/// ACM minted — an ARN `RequestCertificate` ASSIGNS, which no naming rule could compute —
+/// so the identifier a stack reports for the resource is the value `acm DescribeCertificate`
+/// resolves ("Ref returns the certificate ARN").
+pub const ACM_CERTIFICATE: &str = "AWS::CertificateManager::Certificate";
 
 /// An Amazon EventBridge rule's resource type (the EventBridge model:
 /// `cloudFormationName: Events`). This is a type `super::provisioning` creates in
