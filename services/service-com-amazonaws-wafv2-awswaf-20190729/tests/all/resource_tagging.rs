@@ -34,30 +34,30 @@ use crate::web_acl_lifecycle::{create_ip_set, create_web_acl, rule, sqli_stateme
 /// `WAFTagOperationException`'s sentence for a key under the reserved prefix, as
 /// recorded from WAF. Spelled out here independently of the service's own constant,
 /// so this suite pins the text and not merely its reuse.
-const RESERVED_TAG_KEY: &str = "You tried to tag your resources with system tag \
+pub(crate) const RESERVED_TAG_KEY: &str = "You tried to tag your resources with system tag \
      keys. These tags have an aws: prefix and are reserved by AWS. Change your tag \
      keys, and try again.";
 
 /// `WAFNonexistentItemException`'s sentence, as recorded from WAF.
-const NONEXISTENT_ITEM: &str =
+pub(crate) const NONEXISTENT_ITEM: &str =
     "AWS WAF couldn’t perform the operation because your resource doesn’t exist.";
 
 /// Keys AWS keeps for itself: every one of them begins with the `aws:` prefix the
 /// tagging documentation reserves ("These tags have an aws: prefix and are reserved
 /// by AWS"), in the forms AWS's own system tags take — a plain reserved key, a
 /// namespaced one, and the bare prefix itself.
-const RESERVED_KEYS: &[&str] = &["aws:Reserved", "aws:cloudformation:stack-name", "aws:"];
+pub(crate) const RESERVED_KEYS: &[&str] = &["aws:Reserved", "aws:cloudformation:stack-name", "aws:"];
 
 /// Keys that are a caller's own, including every way `aws` can appear in a key
 /// WITHOUT it being a system tag key. Each satisfies `TagKey`'s own `@pattern`
 /// (`^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$`, from
 /// `smithy_query(query="shape",shape="TagKey")`).
-const ACCEPTED_KEYS: &[&str] = &["Team", "aws", "awsome", "team:aws:owner", "Cost.Center/1"];
+pub(crate) const ACCEPTED_KEYS: &[&str] = &["Team", "aws", "awsome", "team:aws:owner", "Cost.Center/1"];
 
 /// The four resource kinds WAF tags — "web ACLs, rule groups, IP sets, and regex
 /// pattern sets" (`TagResource`'s own doc) — as the case name and the ARN of one
 /// freshly created in `scope`.
-async fn taggable_resources(waf: &Waf, scope: &str) -> Vec<(String, String)> {
+pub(crate) async fn taggable_resources(waf: &Waf, scope: &str) -> Vec<(String, String)> {
     let (_id, ip_set_arn, _lock) = create_ip_set(waf, scope, "tagged-ips").await;
     let (_id, web_acl_arn, _lock) = create_web_acl(waf, scope, "tagged-acl", json!([])).await;
     let (_id, rule_group_arn, _lock) = create_rule_group(
@@ -79,13 +79,13 @@ async fn taggable_resources(waf: &Waf, scope: &str) -> Vec<(String, String)> {
 }
 
 /// A `TagList` of one pair.
-fn tags(key: &str, value: &str) -> Value {
+pub(crate) fn tags(key: &str, value: &str) -> Value {
     json!([{ "Key": key, "Value": value }])
 }
 
 /// The tags `ListTagsForResource` reports for `arn`, as `(key, value)` pairs in the
 /// order the listing answers them.
-async fn listed_tags(waf: &Waf, arn: &str) -> Vec<(String, String)> {
+pub(crate) async fn listed_tags(waf: &Waf, arn: &str) -> Vec<(String, String)> {
     let listed = waf
         .ok("ListTagsForResource", json!({ "ResourceARN": arn }))
         .await;
