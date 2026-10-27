@@ -39,6 +39,8 @@ mod default_cluster_parameters;
 mod error_envelope;
 #[path = "all/event_categories.rs"]
 mod event_categories;
+#[path = "all/event_notifications.rs"]
+mod event_notifications;
 #[path = "all/event_subscriptions.rs"]
 mod event_subscriptions;
 #[path = "all/existence_preconditions.rs"]

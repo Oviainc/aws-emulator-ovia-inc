@@ -309,7 +309,7 @@ use super::template::{
     ROUTE53RESOLVER_RULE_ASSOCIATION,
     S3VECTORS_BUCKET_SEGMENT, S3VECTORS_INDEX,
     S3VECTORS_VECTOR_BUCKET, SAGEMAKER_MODEL_PACKAGE_GROUP, SCHEDULER_SCHEDULE,
-    SCHEDULER_SCHEDULE_GROUP, SES_CONFIGURATION_SET,
+    SCHEDULER_SCHEDULE_GROUP, SES_CONFIGURATION_SET, SNS_SUBSCRIPTION,
     SNS_TOPIC, SQS_QUEUE, SQS_QUEUE_INLINE_POLICY, SQS_QUEUE_POLICY,
     SSM_PARAMETER, STEP_FUNCTIONS_ACTIVITY,
     TRANSFER_SERVER, WAFV2_IP_SET, WAFV2_REGEX_PATTERN_SET, WAFV2_RULE_GROUP, WAFV2_WEB_ACL,
@@ -382,6 +382,10 @@ pub(super) enum Provisioner {
     SqsQueuePolicy,
     SageMakerModelPackageGroup,
     SnsTopic,
+    /// `AWS::SNS::Subscription`: a subscriber of a topic, which is a resource of Amazon
+    /// SNS's own — `Subscribe` creates it and `Unsubscribe` deletes it — beside the inline
+    /// `Subscription` list an `AWS::SNS::Topic` may declare.
+    SnsSubscription,
     FisExperimentTemplate,
     WafRegionalIpSet,
     Wafv2WebAcl,
@@ -446,6 +450,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         SQS_QUEUE_POLICY | SQS_QUEUE_INLINE_POLICY => Some(Provisioner::SqsQueuePolicy),
         SAGEMAKER_MODEL_PACKAGE_GROUP => Some(Provisioner::SageMakerModelPackageGroup),
         SNS_TOPIC => Some(Provisioner::SnsTopic),
+        SNS_SUBSCRIPTION => Some(Provisioner::SnsSubscription),
         FIS_EXPERIMENT_TEMPLATE => Some(Provisioner::FisExperimentTemplate),
         WAF_REGIONAL_IP_SET => Some(Provisioner::WafRegionalIpSet),
         WAFV2_WEB_ACL => Some(Provisioner::Wafv2WebAcl),
@@ -550,6 +555,9 @@ impl Provisioner {
                 create_model_package_group(ctx, region, resource, propagated).await
             }
             Self::SnsTopic => create_topic(ctx, region, resource, propagated).await,
+            // A subscription publishes no `Tags` property — SNS holds tags on topics alone —
+            // so no tags are propagated to one.
+            Self::SnsSubscription => subscribe(ctx, region, resource).await,
             Self::FisExperimentTemplate => {
                 create_experiment_template(ctx, region, resource, propagated).await
             }
@@ -858,6 +866,10 @@ impl Provisioner {
             // — so a changed declaration is applied to the key the stack created rather
             // than replacing it ([`update_kms_key`]).
             Self::KmsKey => update_kms_key(ctx, region, resource, declared).await.map(Some),
+            // Every attribute of a live subscription has one SNS call that writes it, so a
+            // changed declaration of one is applied to the subscription the stack created
+            // rather than dropped ([`update_subscription`]).
+            Self::SnsSubscription => update_subscription(ctx, region, resource, declared).await,
             // Every other type's in-place update is its own entry here, exactly as its
             // create and delete are: until one is written, nothing is asked of the owning
             // service and the deployment says so.
@@ -967,6 +979,7 @@ impl Provisioner {
                 delete_model_package_group(ctx, region, physical_resource_id).await
             }
             Self::SnsTopic => delete_topic(ctx, region, physical_resource_id).await,
+            Self::SnsSubscription => unsubscribe(ctx, region, resource).await,
             Self::FisExperimentTemplate => {
                 delete_experiment_template(ctx, region, physical_resource_id).await
             }
@@ -1167,6 +1180,7 @@ impl Provisioner {
                 describe_model_package_group(ctx, region, physical_resource_id).await
             }
             Self::SnsTopic => describe_topic(ctx, region, physical_resource_id).await,
+            Self::SnsSubscription => describe_subscription(ctx, region, resource).await,
             Self::FisExperimentTemplate => {
                 describe_experiment_template(ctx, region, physical_resource_id).await
             }
@@ -5123,9 +5137,281 @@ fn declared_subscriptions(properties: &Value) -> Vec<Vec<(String, String)>> {
 }
 
 // ---------------------------------------------------------------------------
-// Amazon SageMaker: AWS::SageMaker::ModelPackageGroup
+// Amazon SNS: AWS::SNS::Subscription
 // ---------------------------------------------------------------------------
 
+/// The properties of an `AWS::SNS::Subscription` that are `Subscribe` ATTRIBUTES, named
+/// identically on both sides: each is one entry of the `Attributes` map `Subscribe` and
+/// `SetSubscriptionAttributes` take ("DeliveryPolicy", "FilterPolicy", "FilterPolicyScope",
+/// "RawMessageDelivery", "RedrivePolicy", "ReplayPolicy", "SubscriptionRoleArn" are the
+/// names both the resource type's properties and that map use).
+///
+/// Every other property of the type is a member of the `Subscribe` call itself
+/// ([`SUBSCRIPTION_IDENTITY_PROPERTIES`]), so nothing is dropped.
+const SUBSCRIPTION_ATTRIBUTE_PROPERTIES: &[&str] = &[
+    "DeliveryPolicy",
+    "FilterPolicy",
+    "FilterPolicyScope",
+    "RawMessageDelivery",
+    "RedrivePolicy",
+    "ReplayPolicy",
+    "SubscriptionRoleArn",
+];
+
+/// The properties that make a subscription what it IS — the topic it extends, the protocol
+/// it is delivered over, the endpoint it reaches and the Region its topic lives in. Amazon
+/// SNS has no call that moves an existing subscription to another of them, so a declaration
+/// that changes one describes a different subscription.
+const SUBSCRIPTION_IDENTITY_PROPERTIES: &[&str] =
+    &["TopicArn", "Protocol", "Endpoint", "Region"];
+
+/// What a subscription attribute goes back to when the declaration stops carrying it: the
+/// value Amazon SNS documents as that attribute's absent state.
+///
+/// A policy-valued attribute is REMOVED by an empty value ("you can remove a filter policy
+/// by setting the FilterPolicy attribute to an empty value"), raw delivery goes back to the
+/// envelope SNS wraps a notification in by default, and the filter scope back to the
+/// message attributes ("MessageAttributes (default)"). `SubscriptionRoleArn` carries no
+/// documented absent value, so a declaration that drops it leaves the role as it is rather
+/// than writing a value SNS does not define.
+const SUBSCRIPTION_ATTRIBUTE_CLEARED: &[(&str, &str)] = &[
+    ("DeliveryPolicy", ""),
+    ("FilterPolicy", ""),
+    ("RedrivePolicy", ""),
+    ("ReplayPolicy", ""),
+    ("RawMessageDelivery", "false"),
+    ("FilterPolicyScope", "MessageAttributes"),
+];
+
+/// The Amazon SNS call that writes one attribute of a subscription that already exists.
+const SNS_SET_SUBSCRIPTION_ATTRIBUTES: &str = "SetSubscriptionAttributes";
+
+/// The Region the topic a subscription extends lives in: the `Region` property — "for
+/// cross-region subscriptions, the region in which the topic resides" — or the stack's own
+/// Region when the declaration names none.
+fn subscription_region<'a>(properties: &'a Value, region: &'a str) -> &'a str {
+    properties
+        .get("Region")
+        .and_then(Value::as_str)
+        .filter(|named| !named.is_empty())
+        .unwrap_or(region)
+}
+
+/// The `Attributes` map an `AWS::SNS::Subscription`'s declared properties are, as
+/// `Subscribe` takes them.
+///
+/// An attribute value is a STRING on the wire, so a boolean or a policy document the
+/// template wrote as such is rendered as the text it is ([`attribute_text`]), exactly as a
+/// topic's attributes are. A property SNS does not know is not filtered out: the owning
+/// service's own validation is what judges an attribute, and its refusal leaves the stack
+/// `CREATE_FAILED` rather than a subscription configured differently from the template.
+fn subscription_attributes(properties: &Value) -> BTreeMap<String, String> {
+    let mut attributes = BTreeMap::new();
+    for property in SUBSCRIPTION_ATTRIBUTE_PROPERTIES {
+        if let Some(value) = properties.get(*property) {
+            attributes.insert((*property).to_string(), attribute_text(value));
+        }
+    }
+    attributes
+}
+
+/// Subscribe the endpoint an `AWS::SNS::Subscription` declares to the topic it names.
+///
+/// A subscription is a resource of Amazon SNS's own, created by the one call a client makes
+/// — `Subscribe`, with the protocol and endpoint the declaration names and the attribute map
+/// [`subscription_attributes`] reads off its remaining properties — so the subscriber the
+/// stack declares really is a subscriber of that topic: a later `Publish` delivers to it and
+/// `ListSubscriptionsByTopic` reports it, like any subscription a client made itself.
+///
+/// The ARN the call answers with is this resource's physical id ("Ref returns the
+/// subscription ARN"), which is what `Unsubscribe` takes when the stack is deleted. It is
+/// asked for unconditionally (`ReturnSubscriptionArn`), because a subscription whose
+/// subscriber has still to confirm answers with the `pending confirmation` sentinel in its
+/// place, and a stack cannot address a resource by a sentinel.
+async fn subscribe(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    let properties = &resource.properties;
+    let mut parameters = Vec::new();
+    for member in ["TopicArn", "Protocol", "Endpoint"] {
+        if let Some(value) = properties.get(member) {
+            parameters.push((member.to_string(), attribute_text(value)));
+        }
+    }
+    parameters.push(("ReturnSubscriptionArn".to_string(), "true".to_string()));
+    for (index, (name, value)) in subscription_attributes(properties).iter().enumerate() {
+        let entry = index + 1;
+        parameters.push((format!("Attributes.entry.{entry}.key"), name.clone()));
+        parameters.push((format!("Attributes.entry.{entry}.value"), value.clone()));
+    }
+    let answered = call_query(
+        ctx,
+        SNS_SIGNING_NAME,
+        subscription_region(properties, region),
+        SNS_API_VERSION,
+        "Subscribe",
+        &parameters,
+    )
+    .await?;
+    let arn = xml_element(&answered, "SubscriptionArn")
+        .filter(|arn| !arn.is_empty())
+        .ok_or_else(|| Refusal {
+            code: "InternalFailure".to_string(),
+            message: "Amazon SNS answered Subscribe without a SubscriptionArn".to_string(),
+        })?;
+    Ok(Created {
+        physical_resource_id: Some(arn),
+        attributes: BTreeMap::new(),
+    })
+}
+
+/// Apply a CHANGED `AWS::SNS::Subscription` declaration to the subscription that already
+/// exists: every attribute whose declared value moved is written through the one call that
+/// changes an attribute of a live subscription, and one the declaration stopped carrying
+/// goes back to its documented absent value ([`SUBSCRIPTION_ATTRIBUTE_CLEARED`]).
+///
+/// `Ok(None)` for a change to what the subscription IS
+/// ([`SUBSCRIPTION_IDENTITY_PROPERTIES`]): SNS has no call that moves a subscription to
+/// another topic, protocol or endpoint, so nothing is asked of it and the deployment reports
+/// the change as not applied rather than as a success that dropped it.
+async fn update_subscription(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+) -> Result<Option<Created>, Refusal> {
+    for property in SUBSCRIPTION_IDENTITY_PROPERTIES {
+        if declared.get(*property) != resource.properties.get(*property) {
+            return Ok(None);
+        }
+    }
+    let region = subscription_region(&resource.properties, region);
+    let held = subscription_attributes(&resource.properties);
+    let wanted = subscription_attributes(declared);
+    for (name, value) in &wanted {
+        if held.get(name) != Some(value) {
+            set_subscription_attribute(
+                ctx,
+                region,
+                &resource.physical_resource_id,
+                name,
+                value,
+            )
+            .await?;
+        }
+    }
+    for name in held.keys() {
+        if wanted.contains_key(name) {
+            continue;
+        }
+        let Some((_, absent)) = SUBSCRIPTION_ATTRIBUTE_CLEARED
+            .iter()
+            .find(|(attribute, _)| attribute == name)
+        else {
+            continue;
+        };
+        set_subscription_attribute(ctx, region, &resource.physical_resource_id, name, absent)
+            .await?;
+    }
+    Ok(Some(Created {
+        physical_resource_id: None,
+        attributes: BTreeMap::new(),
+    }))
+}
+
+/// One `SetSubscriptionAttributes` writing `name` on the subscription `subscription_arn`
+/// names.
+async fn set_subscription_attribute(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    subscription_arn: &str,
+    name: &str,
+    value: &str,
+) -> Result<(), Refusal> {
+    let parameters = vec![
+        ("SubscriptionArn".to_string(), subscription_arn.to_string()),
+        ("AttributeName".to_string(), name.to_string()),
+        ("AttributeValue".to_string(), value.to_string()),
+    ];
+    call_query(
+        ctx,
+        SNS_SIGNING_NAME,
+        region,
+        SNS_API_VERSION,
+        SNS_SET_SUBSCRIPTION_ATTRIBUTES,
+        &parameters,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Delete the subscription a stack created, by the ARN the create reported.
+///
+/// A subscription SNS no longer holds is already in the state the delete asks for — its
+/// topic may have been deleted with it, which takes its subscriptions along — so SNS's own
+/// not-found code is a success here, exactly as it is for the topic.
+async fn unsubscribe(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<(), Refusal> {
+    let parameters = vec![(
+        "SubscriptionArn".to_string(),
+        resource.physical_resource_id.clone(),
+    )];
+    match call_query(
+        ctx,
+        SNS_SIGNING_NAME,
+        subscription_region(&resource.properties, region),
+        SNS_API_VERSION,
+        "Unsubscribe",
+        &parameters,
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The subscription's configuration as Amazon SNS reports it, for drift detection.
+///
+/// A subscription SNS no longer has (`NotFound`) was deleted. Its configuration IS its
+/// attribute map, which carries both the members that make it what it is (`TopicArn`,
+/// `Protocol`, `Endpoint`) and the attributes a declaration may set — named identically to
+/// this type's properties — so a subscription whose filter policy was changed outside the
+/// stack is MODIFIED.
+async fn describe_subscription(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Option<Value>, Refusal> {
+    let parameters = vec![(
+        "SubscriptionArn".to_string(),
+        resource.physical_resource_id.clone(),
+    )];
+    match call_query(
+        ctx,
+        SNS_SIGNING_NAME,
+        subscription_region(&resource.properties, region),
+        SNS_API_VERSION,
+        "GetSubscriptionAttributes",
+        &parameters,
+    )
+    .await
+    {
+        Ok(answered) => Ok(Some(Value::Object(xml_entry_map(&answered, "Attributes")))),
+        Err(refusal) if refusal.code == NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Amazon SageMaker: AWS::SageMaker::ModelPackageGroup
+// ---------------------------------------------------------------------------
 /// SageMaker's signing name and `X-Amz-Target` prefix, from its model (`sigv4Name:
 /// sagemaker`, service shape `SageMaker`), which speaks `awsJson1_1`.
 const SAGEMAKER_SIGNING_NAME: &str = "sagemaker";

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AttachDataSource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AttachDataSource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Attaches a data source to an OpenSearch application. This is the ONLY file to touch
+//! for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AttachDataSource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pending attachment completes on the clock rather than on a call: the record
+//! carries the status move it is owed, and whichever later read materialises it.
 //!
 //! ## Shape of an operation
 //!
@@ -108,6 +104,13 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    application_not_found, attachment_client_token_taken, attachment_outcome,
+    attachment_quota_exceeded, data_source_not_found, internal_failure, is_arn, malformed_arn,
+    service_state, state_unavailable, workspace_selection_conflict, DataSourceAttachment,
+    ATTACHMENT_QUOTA, ATTACHMENT_STATUS_FAILED,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -181,18 +184,150 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AttachDataSource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AttachDataSourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AttachDataSource"))
+        let _ = ctx;
+        let state = service_state(&*self.engine).ok_or_else(state_unavailable)?;
+
+        // `workspaceId` is "mutually exclusive with workspaceConfiguration" and
+        // `workspaceConfiguration` "mutually exclusive with workspaceId": a request
+        // carrying both names two different workspaces for one attachment, which is a
+        // malformed request rather than a choice this service makes for the caller.
+        if input.workspace_id.is_some() && input.workspace_configuration.is_some() {
+            return Err(
+                AttachDataSourceErrorModeled::ValidationException(workspace_selection_conflict())
+                    .into(),
+            );
+        }
+
+        // `ARN` is `@length(20..2048)` with pattern `.*`, so the request boundary
+        // enforces only the length: a value no ARN parser would accept names no data
+        // source, and is refused as the malformed input it is rather than looked up.
+        if !is_arn(&input.data_source_arn) {
+            return Err(AttachDataSourceErrorModeled::ValidationException(malformed_arn(
+                "dataSourceArn",
+                &input.data_source_arn,
+            ))
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // Whatever the clock already owed the records this call reads is materialised
+        // first, so the decisions below are made on the state at `now`: a domain whose
+        // provisioning has landed is up — which this call reads to decide whether the
+        // attachment can complete — an application that has finished provisioning is
+        // active, and a pending attachment that has fallen due has landed.
+        store.settle_all(now);
+        store.settle_for_attachments(now);
+
+        // The attachment belongs to the application, so an id naming none has nothing
+        // to attach a data source to.
+        let application = store.applications.get(&input.id).ok_or_else(|| {
+            AttachDataSourceErrorModeled::ResourceNotFoundException(application_not_found(
+                &input.id,
+            ))
+        })?;
+
+        // "A unique, case-sensitive identifier to ensure idempotency of the request. If
+        // you retry a request with the same client token and the SAME PARAMETERS, the
+        // retry succeeds without performing any further actions": what the token
+        // identifies is the attach of one data source, so a token this application
+        // already holds an attachment under for a DIFFERENT data source is one token for
+        // two attaches, which cannot both be the one it identifies — the modelled
+        // conflict rather than the other data source's attachment reported back.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(served) = application.attachment_of_client_token(token) {
+                if served.data_source_arn != input.data_source_arn {
+                    return Err(AttachDataSourceErrorModeled::ConflictException(
+                        attachment_client_token_taken(token, &served.data_source_arn),
+                    )
+                    .into());
+                }
+            }
+        }
+
+        // "This operation is idempotent: if the data source is already attached or
+        // pending, the operation returns the existing attachment." An attachment that
+        // FAILED is neither attached nor pending, so a later attach of that data source
+        // is a fresh attempt rather than a repeat of the one that failed.
+        let held = application.attachment(&input.data_source_arn);
+        if let Some(attachment) = held.filter(|held| held.status != ATTACHMENT_STATUS_FAILED) {
+            return Ok(attached(&input.id, &application.arn, attachment));
+        }
+
+        let application_active_at = application.active_at();
+        let attachments_held = application.attachments.len();
+        let replaces_failed = held.is_some();
+
+        // "The data source must be an Amazon OpenSearch Service domain": an ARN naming
+        // no domain of this account names nothing that can be attached, and the state
+        // of the domain it does name is what decides whether the attachment completes
+        // now or is owed to the clock.
+        let data_source_up_at = store
+            .domain_of_arn(&input.data_source_arn)
+            .ok_or_else(|| {
+                AttachDataSourceErrorModeled::ResourceNotFoundException(data_source_not_found(
+                    &input.data_source_arn,
+                ))
+            })?
+            .cluster_up_at();
+
+        // The set is bounded: past its quota an attach is refused rather than adding
+        // another record, so a caller looping with fresh data sources cannot grow one
+        // application's state without end. Replacing the record of a data source whose
+        // attachment FAILED adds none.
+        if attachments_held >= ATTACHMENT_QUOTA && !replaces_failed {
+            return Err(AttachDataSourceErrorModeled::ValidationException(
+                attachment_quota_exceeded(&input.id),
+            )
+            .into());
+        }
+
+        // Both the application and the data source must be active for the attachment to
+        // complete, so what a pending one waits for is whichever of the two becomes
+        // active LAST.
+        let active_at = [application_active_at, data_source_up_at]
+            .into_iter()
+            .flatten()
+            .max();
+        let (status, owed) = attachment_outcome(active_at);
+        let attachment = DataSourceAttachment {
+            attachment_id: store.mint_attachment_id(),
+            data_source_arn: input.data_source_arn.clone(),
+            status,
+            owed,
+            created_at: now,
+            client_token: input.client_token,
+        };
+
+        // Stored on the application the data source is attached to, and answered with
+        // the record that was stored, so this call's answer and a later read of the same
+        // attachment report one attachment.
+        let application = store.applications.get_mut(&input.id).ok_or_else(|| {
+            AttachDataSourceErrorModeled::InternalException(internal_failure("the application"))
+        })?;
+        let answer = attached(&input.id, &application.arn, &attachment);
+        application
+            .attachments
+            .insert(input.data_source_arn, attachment);
+        Ok(answer)
+    }
+}
+
+/// The stored attachment as this operation answers with it.
+///
+/// Both the call that mints an attachment and a repeat of it answer through here, so a
+/// retry cannot report the attachment differently from the call that made it.
+fn attached(
+    id: &str,
+    application_arn: &str,
+    attachment: &DataSourceAttachment,
+) -> AttachDataSourceOutput {
+    AttachDataSourceOutput {
+        attachment_id: Some(attachment.attachment_id.clone()),
+        id: Some(id.to_string()),
+        arn: Some(application_arn.to_string()),
+        data_source_arn: Some(attachment.data_source_arn.clone()),
+        status: Some(attachment.status.clone()),
     }
 }

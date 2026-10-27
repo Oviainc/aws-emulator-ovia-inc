@@ -21,6 +21,8 @@ mod collection_element_refusals;
 mod compatible_versions;
 #[path = "all/cross_cluster_connections.rs"]
 mod cross_cluster_connections;
+#[path = "all/data_source_attachments.rs"]
+mod data_source_attachments;
 #[path = "all/data_source_create_rules.rs"]
 mod data_source_create_rules;
 #[path = "all/data_source_registry.rs"]

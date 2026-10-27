@@ -163,12 +163,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // Argument validation, BEFORE the store is consulted: a `ResourceArn` that is
-        // not a topic ARN at all is bad input, not a topic that does not exist.
+        // not a topic ARN of this endpoint's own region is bad input, not a topic that
+        // does not exist.
+        let region = state::request_region(ctx.parts());
         if let Some(message) =
-            state::tagged_topic_arn_refusal(RESOURCE_ARN_MEMBER, &input.resource_arn)
+            state::tagged_topic_arn_refusal(RESOURCE_ARN_MEMBER, &input.resource_arn, &region)
         {
             return Err(TagResourceErrorModeled::InvalidParameterException(
                 InvalidParameterException {

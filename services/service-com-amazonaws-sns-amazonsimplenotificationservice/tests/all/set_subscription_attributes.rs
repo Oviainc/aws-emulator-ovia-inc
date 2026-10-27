@@ -730,12 +730,6 @@ async fn setting_an_attribute_of_a_subscription_that_is_not_there_is_refused() {
              11111111-1111-4111-8111-111111111111"
                 .to_string(),
         ),
-        (
-            "another region and account",
-            "arn:aws:sns:eu-west-1:123456789012:other-topic:\
-             22222222-2222-4222-8222-222222222222"
-                .to_string(),
-        ),
     ];
     for (case, arn) in &absent {
         let answer = set(&sns, arn, "RawMessageDelivery", Some("true")).await;
@@ -759,6 +753,9 @@ async fn setting_an_attribute_of_a_subscription_that_is_not_there_is_refused() {
         "arn:aws:sns:us-east-1:000000000000:a-topic:",
         "arn:aws:sqs:us-east-1:000000000000:q:11111111",
         "arn:aws:sns:us-east-1:000000000000:two words:11111111",
+        // A subscription of another region: this endpoint does not reach it, so the write
+        // is refused rather than reported as a subscription that does not exist.
+        "arn:aws:sns:eu-west-1:123456789012:other-topic:22222222-2222-4222-8222-222222222222",
         "pending confirmation",
         "PendingConfirmation",
     ];
