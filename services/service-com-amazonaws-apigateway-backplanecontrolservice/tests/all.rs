@@ -232,3 +232,5 @@ mod gateway_response_parameter_mappings;
 mod documentation_part_import_atomicity;
 #[path = "all/delete_model.rs"]
 mod delete_model;
+#[path = "all/update_base_path_mapping.rs"]
+mod update_base_path_mapping;
