@@ -362,61 +362,16 @@ fn validate_algorithms(
     Ok(())
 }
 
-/// The revocation rules the `RevocationConfiguration` member documents: "A configuration
-/// disabling CRLs or OCSP must contain only the Enabled=False parameter, and will fail if
-/// other parameters such as CustomCname or ExpirationInDays are included." An enabled CRL
-/// configuration conversely needs the bucket it is written to and the period it expires
-/// after.
+/// The revocation rules the `RevocationConfiguration` member documents, held in
+/// [`crate::state::invalid_revocation_configuration_reason`] because
+/// `UpdateCertificateAuthority` carries the same member under the same rules.
 fn validate_revocation_configuration(
     revocation: Option<&RevocationConfiguration>,
 ) -> Result<(), CreateCertificateAuthorityError> {
-    let Some(revocation) = revocation else {
-        return Ok(());
-    };
-    if let Some(crl) = revocation.crl_configuration.as_ref() {
-        if crl.enabled {
-            if crl.s3_bucket_name.is_none() {
-                return Err(invalid_args(
-                    "RevocationConfiguration.CrlConfiguration.S3BucketName is required when \
-                     CRLs are enabled",
-                ));
-            }
-            if crl.expiration_in_days.is_none() {
-                return Err(invalid_args(
-                    "RevocationConfiguration.CrlConfiguration.ExpirationInDays is required when \
-                     CRLs are enabled",
-                ));
-            }
-        } else if let Some((member, _)) = [
-            ("ExpirationInDays", crl.expiration_in_days.is_some()),
-            ("CustomCname", crl.custom_cname.is_some()),
-            ("S3BucketName", crl.s3_bucket_name.is_some()),
-            ("S3ObjectAcl", crl.s3_object_acl.is_some()),
-            (
-                "CrlDistributionPointExtensionConfiguration",
-                crl.crl_distribution_point_extension_configuration.is_some(),
-            ),
-            ("CrlType", crl.crl_type.is_some()),
-            ("CustomPath", crl.custom_path.is_some()),
-        ]
-        .iter()
-        .find(|(_, present)| *present)
-        {
-            return Err(invalid_args(format!(
-                "RevocationConfiguration.CrlConfiguration must contain only Enabled=false when \
-                 CRLs are disabled, but {member} was included"
-            )));
-        }
+    match crate::state::invalid_revocation_configuration_reason(revocation) {
+        Some(reason) => Err(invalid_args(reason)),
+        None => Ok(()),
     }
-    if let Some(ocsp) = revocation.ocsp_configuration.as_ref() {
-        if !ocsp.enabled && ocsp.ocsp_custom_cname.is_some() {
-            return Err(invalid_args(
-                "RevocationConfiguration.OcspConfiguration must contain only Enabled=false when \
-                 OCSP is disabled, but OcspCustomCname was included",
-            ));
-        }
-    }
-    Ok(())
 }
 
 /// Tag keys are unique within a resource, and the `aws:` prefix is reserved for the tags

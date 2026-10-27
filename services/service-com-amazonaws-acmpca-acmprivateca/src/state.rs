@@ -74,6 +74,14 @@ pub const DELETABLE_STATUSES: &[&str] = &[
 /// (`DeleteCertificateAuthority` docs).
 pub const UNRESTORABLE_DELETION_STATUSES: &[&str] = &[STATUS_CREATING, STATUS_FAILED];
 
+/// The `CertificateAuthorityStatus` members a CA can be UPDATED in: "Your private CA must
+/// be in the ACTIVE or DISABLED state before you can update it. You can disable a private
+/// CA that is in the ACTIVE state or make a CA that is in the DISABLED state active
+/// again." (`UpdateCertificateAuthority` docs) — the same two members are therefore the
+/// only statuses that call can put a CA INTO, since those two transitions are all it
+/// performs.
+pub const UPDATABLE_STATUSES: &[&str] = &[STATUS_ACTIVE, STATUS_DISABLED];
+
 /// What Amazon Web Services Private CA answers when a CA is asked to be deleted in a
 /// status that does not allow deletion: one sentence about the statuses deletion is
 /// allowed from, naming no request of its own. The statuses are the ones
@@ -93,6 +101,17 @@ pub const DELETE_INVALID_STATE_MESSAGE: &str =
 pub const DELETED_INVALID_STATE_MESSAGE: &str =
     "The certificate authority is in the DELETED state and must be restored to complete \
      this action.";
+
+/// What Amazon Web Services Private CA answers when a CA's status or configuration is
+/// asked to change from a status that does not allow the change: one sentence naming the
+/// two statuses an update is allowed from ([`UPDATABLE_STATUSES`]), carrying no ARN,
+/// status name, timestamp or other value out of the request or the store, so it is the
+/// same sentence whichever CA and whichever requested change was refused.
+///
+/// Distinct from [`DELETED_INVALID_STATE_MESSAGE`] on purpose: both are
+/// `InvalidStateException`, and a caller tells the two refusals apart by the text.
+pub const UPDATE_INVALID_STATE_MESSAGE: &str =
+    "The certificate authority must be in the ACTIVE or DISABLED state to be updated";
 
 /// The restoration window a deletion opens when the request names none: "By default, if
 /// you do not set the PermanentDeletionTimeInDays parameter, the CA remains restorable
@@ -853,6 +872,12 @@ impl CertificateAuthorityRecord {
         self.status == STATUS_DELETED
     }
 
+    /// Whether this CA's status allows `UpdateCertificateAuthority`
+    /// ([`UPDATABLE_STATUSES`]).
+    pub fn is_updatable(&self) -> bool {
+        UPDATABLE_STATUSES.contains(&self.status.as_str())
+    }
+
     /// The restoration window a deletion of this CA opens when the request asked for
     /// `requested_days`: that many days, 30 when the request named none, and none at all
     /// from a status a deletion assigns no restoration period to
@@ -996,6 +1021,69 @@ pub fn reported_revocation_configuration(
                 .unwrap_or_default(),
         ),
     }
+}
+
+/// Why `revocation` is not a revocation configuration this service will store, or `None`
+/// when it is.
+///
+/// The rules the `RevocationConfiguration` member documents, identically on
+/// `CreateCertificateAuthority` and `UpdateCertificateAuthority`: "A configuration
+/// disabling CRLs or OCSP must contain only the `Enabled=False` parameter, and will fail
+/// if other parameters such as `CustomCname` or `ExpirationInDays` are included." An
+/// enabled CRL configuration conversely needs the bucket it is written to and the period
+/// it expires after. Each caller lifts the reason into its own modelled
+/// `InvalidArgsException`.
+pub fn invalid_revocation_configuration_reason(
+    revocation: Option<&RevocationConfiguration>,
+) -> Option<String> {
+    let revocation = revocation?;
+    if let Some(crl) = revocation.crl_configuration.as_ref() {
+        if crl.enabled {
+            if crl.s3_bucket_name.is_none() {
+                return Some(
+                    "RevocationConfiguration.CrlConfiguration.S3BucketName is required when \
+                     CRLs are enabled"
+                        .to_string(),
+                );
+            }
+            if crl.expiration_in_days.is_none() {
+                return Some(
+                    "RevocationConfiguration.CrlConfiguration.ExpirationInDays is required \
+                     when CRLs are enabled"
+                        .to_string(),
+                );
+            }
+        } else if let Some((member, _)) = [
+            ("ExpirationInDays", crl.expiration_in_days.is_some()),
+            ("CustomCname", crl.custom_cname.is_some()),
+            ("S3BucketName", crl.s3_bucket_name.is_some()),
+            ("S3ObjectAcl", crl.s3_object_acl.is_some()),
+            (
+                "CrlDistributionPointExtensionConfiguration",
+                crl.crl_distribution_point_extension_configuration.is_some(),
+            ),
+            ("CrlType", crl.crl_type.is_some()),
+            ("CustomPath", crl.custom_path.is_some()),
+        ]
+        .iter()
+        .find(|(_, present)| *present)
+        {
+            return Some(format!(
+                "RevocationConfiguration.CrlConfiguration must contain only Enabled=false when \
+                 CRLs are disabled, but {member} was included"
+            ));
+        }
+    }
+    if let Some(ocsp) = revocation.ocsp_configuration.as_ref() {
+        if !ocsp.enabled && ocsp.ocsp_custom_cname.is_some() {
+            return Some(
+                "RevocationConfiguration.OcspConfiguration must contain only Enabled=false \
+                 when OCSP is disabled, but OcspCustomCname was included"
+                    .to_string(),
+            );
+        }
+    }
+    None
 }
 
 /// Whether `document` is a resource-based policy this service will attach to a private CA.
