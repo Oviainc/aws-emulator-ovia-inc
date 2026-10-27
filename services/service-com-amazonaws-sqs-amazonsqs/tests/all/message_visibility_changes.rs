@@ -8,14 +8,14 @@
 //! and is counted from the instant of the call — "the 10 seconds begin to count from the
 //! time that you make the ChangeMessageVisibility call" — so the message is handed to
 //! nobody else until that long has passed, whatever the queue's own `VisibilityTimeout`
-//! says, and a timeout of zero hands it back at once. The change is about a message IN
-//! FLIGHT: a handle the queue holds no message under is `ReceiptHandleIsInvalid`, a message
-//! whose timeout has already lapsed (or that was never received) is `MessageNotInflight`,
-//! and a value outside the member's documented range is refused before anything is changed.
+//! says, and a timeout of zero hands it back at once. The change is about the message a
+//! receipt handle NAMES: a handle the queue holds no message under is
+//! `ReceiptHandleIsInvalid`, and a value outside the member's documented range is refused
+//! before anything is changed; a handle whose visibility window has lapsed still names its
+//! message, so the change is applied (see [`super::receipt_handle_lifetime`]).
 //! The batch applies that same change once per entry and reports each entry under its own
 //! outcome, while the whole batch is refused on the id and size rules every batch operation
-//! of this service shares. Every entry of ONE batch is judged against the message states
-//! the REQUEST arrived to, so an entry's own change cannot decide another entry's outcome:
+//! of this service shares. An entry's own change cannot decide another entry's outcome:
 //! several entries naming one message are all applied, and the LAST of them is the one
 //! whose span the message keeps.
 //!
@@ -198,7 +198,7 @@ async fn a_changed_visibility_timeout_decides_when_the_message_comes_back() {
 /// that condition, and changes nothing.
 #[tokio::test]
 async fn a_visibility_change_is_refused_for_what_it_cannot_act_on() {
-    let (router, engine) = emulator_over_engine();
+    let (router, _engine) = emulator_over_engine();
     let url = create_ok(
         &router,
         "visibility-refusals",
@@ -257,22 +257,6 @@ async fn a_visibility_change_is_refused_for_what_it_cannot_act_on() {
         held, 0,
         "case 'the refusals': a refused change must leave the message in flight, got {held} \
          available"
-    );
-
-    // A message whose visibility timeout has LAPSED is not in flight, so it has no timeout
-    // to change — which is the one refusal that is about the message rather than the call.
-    age_visibility(&engine, &url, Duration::from_secs(QUEUE_TIMEOUT.parse().unwrap_or(600)));
-    let (status, body) = call(
-        &router,
-        "ChangeMessageVisibility",
-        &json!({"QueueUrl": url, "ReceiptHandle": handle, "VisibilityTimeout": 30}),
-    )
-    .await;
-    assert_eq!(
-        (status, error_code(&body).as_str()),
-        (400, "MessageNotInflight"),
-        "case 'a message whose timeout has lapsed': expected 400 MessageNotInflight, got \
-         {status} with {body}"
     );
 }
 
@@ -401,9 +385,10 @@ async fn a_batch_reports_each_entry_under_its_own_outcome() {
         "case 'the batch': every message comes back once its timeout has passed"
     );
 
-    // A message that is not in flight has no timeout to change, which an entry reports the
-    // same way the single-message call does. The deadline is moved into the past without
-    // receiving again, so the handle is still the one that message is held under.
+    // A handle whose visibility window has lapsed still names its message, so an entry
+    // carrying one is applied the same way the single-message call is. The deadline is
+    // moved into the past without receiving again, so the handle is still the one that
+    // message is held under.
     let (lapsed_router, lapsed_engine) = emulator_over_engine();
     let lapsed_url = create_ok(
         &lapsed_router,
@@ -427,9 +412,15 @@ async fn a_batch_reports_each_entry_under_its_own_outcome() {
     )
     .await;
     assert_eq!(
-        lapsed["Failed"][0]["Code"],
-        json!("MessageNotInflight"),
-        "case 'a lapsed entry': expected the entry to report MessageNotInflight, got {lapsed}"
+        (lapsed["Successful"][0]["Id"].clone(), lapsed["Failed"].clone()),
+        (json!("lapsed"), json!([])),
+        "case 'a lapsed entry': expected the entry to be applied, got {lapsed}"
+    );
+    let rehidden = available_now(&lapsed_router, &lapsed_url).await;
+    assert_eq!(
+        rehidden, 0,
+        "case 'a lapsed entry': the applied entry hides the message again, got {rehidden} \
+         available"
     );
 }
 
@@ -659,11 +650,11 @@ async fn every_entry_of_one_batch_is_judged_against_the_state_the_request_arrive
     }
 }
 
-/// The same judgment the other way round: a message that was NOT in flight when the request
-/// arrived has no timeout for any entry to change, so every entry naming it is refused —
-/// including one asking for zero — and the message is left where it was.
+/// The same judgment for a handle whose visibility window has lapsed: the handle still
+/// names its message, so every entry naming it is applied — and the LAST entry's span is
+/// the one the message keeps, exactly as it is for a message still hidden.
 #[tokio::test]
-async fn no_entry_can_change_a_message_that_was_not_in_flight_when_the_request_arrived() {
+async fn every_entry_naming_a_lapsed_handle_is_applied_and_the_last_one_wins() {
     let (router, engine) = emulator_over_engine();
     let url = create_ok(
         &router,
@@ -691,25 +682,22 @@ async fn no_entry_can_change_a_message_that_was_not_in_flight_when_the_request_a
     )
     .await;
 
-    let expected = vec![
-        ("extend".to_string(), "MessageNotInflight".to_string()),
-        ("release".to_string(), "MessageNotInflight".to_string()),
-    ];
     assert_eq!(
         reported_failures(&answered),
-        expected,
-        "case 'a lapsed handle named twice': expected {expected:?}, got {answered}"
+        Vec::new(),
+        "case 'a lapsed handle named twice': a lapsed handle still names its message, so no \
+         entry can be refused, got {answered}"
     );
     assert_eq!(
         reported_ids(&answered, "Successful"),
-        Vec::<String>::new(),
-        "case 'a lapsed handle named twice': no entry can be applied, got {answered}"
+        vec!["extend".to_string(), "release".to_string()],
+        "case 'a lapsed handle named twice': every entry must be applied, got {answered}"
     );
     let available = available_now(&router, &url).await;
     assert_eq!(
         available, 1,
-        "case 'a lapsed handle named twice': a refused entry changes nothing, so the message \
-         is still the visible one it was, got {available} available"
+        "case 'a lapsed handle named twice': the last entry released the message, so it is \
+         available again, got {available} available"
     );
 }
 

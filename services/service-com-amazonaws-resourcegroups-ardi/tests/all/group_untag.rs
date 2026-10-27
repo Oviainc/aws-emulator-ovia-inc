@@ -38,7 +38,10 @@ use super::resource_group_lifecycle::{error_code, Emulator, ACCOUNT};
 
 /// `PATCH /resources/{Arn}/tags` with `keys` as the request's `Keys` list, signed
 /// (in scope only) for `region`.
-async fn untag(emulator: &Emulator, region: &str, arn: &str, keys: &[String]) -> (u16, Value) {
+///
+/// Shared with the sibling suite that reads a group's tags back through every
+/// identity form, which drives removals through this same path.
+pub(crate) async fn untag(emulator: &Emulator, region: &str, arn: &str, keys: &[String]) -> (u16, Value) {
     emulator
         .request_in(
             region,

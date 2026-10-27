@@ -84,8 +84,9 @@ async fn write_batch(emulator: &Emulator, case: &str, name: &str, payloads: &[&s
             &json!({ "StreamName": name, "Records": entries }),
         )
         .await;
-    assert!(
-        answer["FailedRecordCount"].is_null(),
+    assert_eq!(
+        answer["FailedRecordCount"].as_i64(),
+        Some(0),
         "case {case}: expected every entry of the batch to be stored, got {answer}"
     );
     reported_type(case, "PutRecords", &answer)

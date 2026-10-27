@@ -164,18 +164,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // The window a listing searches runs forwards: a request whose `endTime` precedes
-        // its `startTime` describes no interval at all, so it is refused rather than
-        // answered with the empty page the window test would produce.
-        if input.end_time.as_secs_f64() < input.start_time.as_secs_f64() {
-            return Err(ListEphemeridesErrorModeled::InvalidParameterException(
-                InvalidParameterException {
-                    message: Some("endTime must not precede startTime".to_string()),
-                    parameter_name: Some("endTime".to_string()),
-                },
-            )
-            .into());
-        }
+        // The window a listing searches runs forwards, by this service's one reading of
+        // that rule (`crate::state::validate_search_window`), shared with every other
+        // window-filtered listing.
+        crate::state::validate_search_window(input.start_time, input.end_time)
+            .map_err(ListEphemeridesErrorModeled::InvalidParameterException)?;
 
         // An offset counts within the FILTERED sequence, so the filters are part of the
         // scope its token is issued under: resuming with a different window, satellite,

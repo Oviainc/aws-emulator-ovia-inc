@@ -16,6 +16,10 @@
 //! * a session is started only for a triple the AppConfig control plane actually
 //!   holds; an unresolvable level is `ResourceNotFoundException` (404) naming the
 //!   modelled `ResourceType` and the request member that named it;
+//! * a session is over a DEPLOYED configuration, so every session started here is
+//!   started over a triple a deployment has already put a configuration into (the
+//!   refusal owed to a triple with no deployment is asserted in
+//!   `session_requires_a_deployment`);
 //! * each identifier is "the ID or the name" of its level, so a session resolves
 //!   either spelling;
 //! * a poll returns the content of the configuration version the environment's
@@ -208,6 +212,28 @@ impl Emulator {
         }
     }
 
+    /// One more environment under an existing application, answered by its id.
+    pub(crate) async fn create_environment(
+        &self,
+        application_id: &str,
+        environment: &str,
+    ) -> String {
+        let created = self
+            .post_json(
+                &format!("/applications/{application_id}/environments"),
+                &format!(r#"{{"Name":"{environment}"}}"#),
+            )
+            .await;
+        assert_eq!(
+            created.status,
+            201,
+            "CreateEnvironment({environment}): expected 201, got {} body {}",
+            created.status,
+            created.text()
+        );
+        created.string("Id")
+    }
+
     /// One more hosted configuration profile under an existing application.
     pub(crate) async fn create_profile(&self, application_id: &str, profile: &str) -> String {
         self.create_typed_profile(application_id, profile, None)
@@ -253,6 +279,20 @@ impl Emulator {
         content_type: &str,
         version_label: Option<&str>,
     ) {
+        self.deploy_numbered(hierarchy, profile_id, content, content_type, version_label)
+            .await;
+    }
+
+    /// [`Self::deploy`], answering the deployment number — for a test that has to name
+    /// the deployment afterwards.
+    pub(crate) async fn deploy_numbered(
+        &self,
+        hierarchy: &Hierarchy,
+        profile_id: &str,
+        content: &[u8],
+        content_type: &str,
+        version_label: Option<&str>,
+    ) -> i64 {
         let application_id = &hierarchy.application_id;
         let mut headers: Vec<(&str, &str)> = Vec::new();
         if let Some(label) = version_label {
@@ -310,6 +350,37 @@ impl Emulator {
             started.status,
             started.text()
         );
+        started.json()["DeploymentNumber"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("no DeploymentNumber in {}", started.text()))
+    }
+
+    /// Stop a deployment as a caller undoes one, with `AllowRevert` so a deployment that
+    /// has already completed is reverted rather than refused: afterwards the
+    /// configuration it deployed is no longer the one in force for its profile, while the
+    /// deployment itself is still a deployment the environment holds.
+    pub(crate) async fn stop_deployment(&self, hierarchy: &Hierarchy, number: i64) {
+        let application_id = &hierarchy.application_id;
+        let environment_id = &hierarchy.environment_id;
+        let stopped = self
+            .send(
+                "DELETE",
+                &format!(
+                    "/applications/{application_id}/environments/{environment_id}\
+                     /deployments/{number}"
+                ),
+                "application/json",
+                &[("Allow-Revert", "true")],
+                Bytes::new(),
+            )
+            .await;
+        assert_eq!(
+            stopped.status,
+            202,
+            "StopDeployment({number}): expected 202, got {} body {}",
+            stopped.status,
+            stopped.text()
+        );
     }
 
     /// Move every deployment in the hierarchy's environment far enough into the past
@@ -319,7 +390,7 @@ impl Emulator {
     /// strategy's durations have passed, whether or not anybody reads it — so a test
     /// that needs a finished deployment moves the start instant rather than sleeping
     /// for the strategy's bake time.
-    fn settle_deployments(&self, hierarchy: &Hierarchy) {
+    pub(crate) fn settle_deployments(&self, hierarchy: &Hierarchy) {
         let state = self.control_plane();
         let mut store = state.lock();
         let Some(environment) = store
@@ -427,7 +498,7 @@ impl Reply {
     }
 
     /// The error code a restJson1 error response carries.
-    fn error_code(&self) -> String {
+    pub(crate) fn error_code(&self) -> String {
         self.string("__type")
     }
 
@@ -444,7 +515,7 @@ impl Reply {
 }
 
 /// The token pattern the model declares for `Token`: `^\S{1,8192}$`.
-fn is_modelled_token(token: &str) -> bool {
+pub(crate) fn is_modelled_token(token: &str) -> bool {
     !token.is_empty()
         && token.len() <= 8192
         && !token.chars().any(char::is_whitespace)
@@ -509,6 +580,17 @@ async fn a_poll_returns_content_only_when_the_deployed_version_changed() {
         let hierarchy = emulator
             .create_hierarchy("MyApp", "Prod", "MyProfile")
             .await;
+        // A session is over a deployed configuration, so the version is deployed before
+        // the session that polls it is started.
+        emulator
+            .deploy(
+                &hierarchy,
+                &hierarchy.profile_id,
+                case.first,
+                case.content_type,
+                case.first_label,
+            )
+            .await;
         let token = emulator
             .session_token(
                 &hierarchy.application_name,
@@ -520,16 +602,6 @@ async fn a_poll_returns_content_only_when_the_deployed_version_changed() {
             is_modelled_token(&token),
             "case {name}: the initial token must satisfy the modelled token pattern, got {token:?}"
         );
-
-        emulator
-            .deploy(
-                &hierarchy,
-                &hierarchy.profile_id,
-                case.first,
-                case.content_type,
-                case.first_label,
-            )
-            .await;
 
         // FIRST POLL — the session has been served nothing yet, so the deployed
         // content comes back with its content type and version label.
@@ -841,11 +913,17 @@ async fn a_session_for_a_resource_the_control_plane_lacks_is_not_found() {
     }
 }
 
-/// A poll serves its OWN configuration profile's deployment: a deployment of another
-/// profile in the same environment is not what this session polls, so there is nothing
-/// to serve and the refusal is the modelled `ResourceNotFoundException`.
+/// A poll serves the configuration ITS OWN profile has in force: once the deployment a
+/// session was started over has been undone, that profile has nothing in force in the
+/// environment — a deployment of another profile there is not what this session polls —
+/// so there is nothing to serve and the refusal is the modelled
+/// `ResourceNotFoundException` naming the `Configuration`.
+///
+/// Having BEEN deployed (which is what lets the session be started at all) and having a
+/// configuration in force (which is what a poll serves) are two different questions, and
+/// this is the case that separates them.
 #[tokio::test]
-async fn a_poll_with_nothing_deployed_for_its_profile_is_not_found() {
+async fn a_poll_with_nothing_in_force_for_its_profile_is_not_found() {
     let emulator = Emulator::new();
     let hierarchy = emulator
         .create_hierarchy("MyApp", "Prod", "MyProfile")
@@ -862,9 +940,22 @@ async fn a_poll_with_nothing_deployed_for_its_profile_is_not_found() {
             None,
         )
         .await;
+    // OtherProfile is deployed and then that deployment is undone, so the profile has a
+    // deployment but no configuration in force, while MyProfile's deployment — another
+    // profile's, in the same environment — stays in force throughout.
+    let undone = emulator
+        .deploy_numbered(
+            &hierarchy,
+            &other_profile,
+            b"withdrawn from OtherProfile",
+            "text/plain",
+            None,
+        )
+        .await;
+    emulator.stop_deployment(&hierarchy, undone).await;
 
     let cases: &[(&str, &str)] = &[
-        ("a profile nothing was deployed for", "OtherProfile"),
+        ("a profile with nothing in force, named by name", "OtherProfile"),
         ("the same profile named by id", &other_profile),
     ];
     for (name, profile) in cases {
@@ -1049,7 +1140,18 @@ async fn the_requested_minimum_poll_interval_is_held_to_its_modelled_range() {
 
     for (name, requested, expected_status) in cases {
         let emulator = Emulator::new();
-        emulator.create_hierarchy("MyApp", "Prod", "MyProfile").await;
+        let hierarchy = emulator.create_hierarchy("MyApp", "Prod", "MyProfile").await;
+        // The interval is what is under test, so the triple a session is started over
+        // carries a deployed configuration: a session is over a deployed one.
+        emulator
+            .deploy(
+                &hierarchy,
+                &hierarchy.profile_id,
+                b"{}",
+                "application/json",
+                None,
+            )
+            .await;
         let interval = requested
             .map(|seconds| format!(r#","RequiredMinimumPollIntervalInSeconds":{seconds}"#))
             .unwrap_or_default();

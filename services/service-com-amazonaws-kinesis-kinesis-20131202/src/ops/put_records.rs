@@ -442,9 +442,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(PutRecordsOutput {
             records,
-            // `FailedRecordCount` is modelled `range 1..`, so a batch nothing failed in
-            // reports no count at all rather than a zero the member cannot carry.
-            failed_record_count: (failed > 0).then_some(failed),
+            // "The number of unsuccessfully processed records in a PutRecords request"
+            // (`PutRecordsOutput$FailedRecordCount`): the count a batch write reports is
+            // how many of ITS entries failed, so every accepted batch carries it — zero
+            // when the whole batch was stored. The member's modelled range bounds what a
+            // count may be, not whether this answer states one, and the documented retry
+            // idiom reads the count on every response to decide whether any entry needs
+            // writing again.
+            failed_record_count: Some(failed),
             encryption_type: Some(encryption_type),
         })
     }

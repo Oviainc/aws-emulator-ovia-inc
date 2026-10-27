@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end cover for `CreatePlacementGroup` and `DescribePlacementGroups`, driven over
+//! End-to-end cover for `CreatePlacementGroup`, `DescribePlacementGroups` and
+//! `DeletePlacementGroup`, driven over
 //! the wire the service actually speaks: `ec2Query` — an
 //! `application/x-www-form-urlencoded` POST whose body carries
 //! `Action=CreatePlacementGroup`, answered with XML (README.md / OPERATIONS.md "Wire
@@ -14,7 +15,11 @@
 //! and an ARN naming the signed Region and the group's name, is `available`, and reads back
 //! unchanged through `DescribePlacementGroups` by id, by name and through every filter that
 //! operation documents. A name the account already holds is refused, and a member that
-//! belongs to another strategy is refused rather than stored.
+//! belongs to another strategy is refused rather than stored. `DeletePlacementGroup` then
+//! TAKES THE GROUP IT NAMES OUT OF THE ACCOUNT: neither its name nor its id resolves for
+//! any later caller, the name is free for a new group, and a name the account holds no
+//! group under is refused with `InvalidPlacementGroup.Unknown` rather than reported as a
+//! deletion that happened.
 //!
 //! Every table row is a distinct input along what that generalises over — the strategy (one
 //! row per member of the model's own `PlacementStrategy` catalog), the name's value, length
@@ -30,7 +35,7 @@ use ec2::state::{
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::ec2_query::error_code;
+use super::ec2_query::{error_code, error_message, member};
 use super::wire::{child, child_text, document, is_long_id, param, Param};
 
 /// The Region most calls here are signed for.
@@ -1189,5 +1194,420 @@ async fn a_create_past_the_store_ceiling_is_refused() {
         stored, None,
         "case {case:?}: a refused create must store nothing, got {stored:?}"
     );
+}
+
+/// One `DeletePlacementGroup` call carrying `params`, signed for [`REGION`].
+async fn delete(router: &MultiServiceRouter, params: &[Param]) -> (u16, String) {
+    super::ec2_query::call(router, REGION, "DeletePlacementGroup", params).await
+}
+
+/// `DeletePlacementGroup` for `group_name`, requiring success.
+async fn delete_ok(case: &str, router: &MultiServiceRouter, group_name: &str) -> String {
+    let (status, body) = delete(router, &[param("GroupName", group_name)]).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from DeletePlacementGroup, got {status} \
+         with body {body}"
+    );
+    body
+}
+
+/// The refusal a request naming no stored placement group must get, asserted for the case
+/// and the group the request named: HTTP 400 `InvalidPlacementGroup.Unknown`, whose message
+/// names that group.
+fn assert_unknown_group(case: &str, named: &str, status: u16, body: &str) {
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected HTTP 400 for the group {named:?}, got {status} \
+         with body {body}"
+    );
+    let code = error_code(body);
+    assert_eq!(
+        code, "InvalidPlacementGroup.Unknown",
+        "case {case:?}: expected InvalidPlacementGroup.Unknown for {named:?}, got {code:?} \
+         with body {body}"
+    );
+    let message = error_message(body);
+    let expected = format!("The Placement Group '{named}' is unknown.");
+    assert_eq!(
+        message, expected,
+        "case {case:?}: expected the message {expected:?}, got {message:?} with body {body}"
+    );
+}
+
+/// One row of the delete table: the case, the name of the group to create and delete, and
+/// the extra form fields its create carries.
+type DeleteCase = (&'static str, String, Vec<Param>);
+
+/// The delete table: one row per `PlacementStrategy` member, plus rows varying the tag
+/// count and the name's length and character set — what the rule "a deleted placement group
+/// is no longer a group of the account" generalises over, so the one name a recording
+/// happens to carry is one row among many.
+fn delete_cases() -> Vec<DeleteCase> {
+    let mut cases: Vec<DeleteCase> = Vec::new();
+    for strategy in STRATEGIES {
+        let mut extra = vec![param("Strategy", strategy)];
+        if strategy == "partition" {
+            extra.push(param("PartitionCount", "3"));
+        }
+        if strategy == "spread" {
+            extra.push(param("SpreadLevel", SPREAD_LEVELS[1]));
+        }
+        cases.push((strategy, format!("doomed-{strategy}"), extra));
+    }
+    cases.push((
+        "a group carrying tags",
+        "doomed-tagged".to_string(),
+        {
+            let mut fields = vec![param("Strategy", "cluster")];
+            fields.extend(tag_fields(&[("Owner", "TeamA"), ("Phase", "probe")]));
+            fields
+        },
+    ));
+    // "Up to 255 ASCII characters" (`CreatePlacementGroupRequest$GroupName`): the published
+    // bound, and the shortest name there is, are both deletable names.
+    cases.push((
+        "a name of one character",
+        "d".to_string(),
+        vec![param("Strategy", "cluster")],
+    ));
+    cases.push((
+        "a name of the published maximum length",
+        name_of_length("doomed-long", 255),
+        vec![param("Strategy", "cluster")],
+    ));
+    cases.push((
+        "a name of punctuation and digits",
+        "doomed.0-9_x".to_string(),
+        vec![param("Strategy", "cluster")],
+    ));
+    // A name is an opaque identifier: the delete resolves it the way the create stored it
+    // and the describe selects on it, so surrounding whitespace is part of the name rather
+    // than something to strip.
+    cases.push((
+        "a name with surrounding whitespace",
+        " doomed-padded ".to_string(),
+        vec![param("Strategy", "cluster")],
+    ));
+    cases
+}
+
+#[tokio::test]
+async fn a_deleted_group_is_no_longer_a_group_of_the_account() {
+    let router = emulator();
+    // A group created beside each row and never deleted: every probe below must leave it
+    // exactly where it is, so a delete is shown to take ONE group out of the store.
+    let bystander = "kept-cluster";
+    let bystander_body = create_ok(
+        "the bystander",
+        &router,
+        &[param("GroupName", bystander), param("Strategy", "cluster")],
+    )
+    .await;
+    let bystander_id = one_group("the bystander", &bystander_body)
+        .required("the bystander", "groupId")
+        .to_string();
+
+    for (case, group_name, extra) in delete_cases() {
+        let mut params = vec![param("GroupName", &group_name)];
+        params.extend(extra.clone());
+        let created = create_ok(case, &router, &params).await;
+        let group_id = one_group(case, &created).required(case, "groupId").to_string();
+        assert!(
+            is_long_id("pg", &group_id),
+            "case {case:?}: expected a service-minted pg- id, got {group_id:?}"
+        );
+
+        // The group is there before the delete, by both of the names a caller can select it
+        // by, so what the probes after the delete report is the delete's own doing.
+        let listed = describe_ok(case, &router, &[param("GroupName.1", &group_name)]).await;
+        assert_eq!(
+            reported_ids(case, &listed),
+            vec![group_id.clone()],
+            "case {case:?}: the created group must be describable by name, got {listed}"
+        );
+
+        let deleted = delete_ok(case, &router, &group_name).await;
+        assert_eq!(
+            error_code(&deleted),
+            "",
+            "case {case:?}: a successful delete answers no error envelope, got {deleted}"
+        );
+        // The modelled output declares no members, so the body is the envelope's success
+        // flag: the operation's whole report of what it did.
+        assert_eq!(
+            member(&deleted, "return").as_deref(),
+            Some("true"),
+            "case {case:?}: the delete must report the envelope's success flag, got {deleted}"
+        );
+
+        // The name no longer resolves…
+        let (status, body) = describe(&router, &[param("GroupName.1", &group_name)]).await;
+        assert_unknown_group(case, &group_name, status, &body);
+        // …nor does the id the group was minted with…
+        let (status, body) = describe(&router, &[param("GroupId.1", &group_id)]).await;
+        assert_unknown_group(case, &group_id, status, &body);
+        // …and a second delete of the same name is refused rather than reported as a
+        // deletion that happened.
+        let (status, body) = delete(&router, &[param("GroupName", &group_name)]).await;
+        assert_unknown_group(case, &group_name, status, &body);
+
+        // The unnarrowed describe reports every group the account still holds: the
+        // bystander, and not the deleted group.
+        let listed = describe_ok(case, &router, &[]).await;
+        let reported = reported_ids(case, &listed);
+        assert_eq!(
+            reported,
+            vec![bystander_id.clone()],
+            "case {case:?}: only the bystander may remain, got {reported:?} from {listed}"
+        );
+
+        // The name is free again, and the group created under it is a NEW group: a deleted
+        // group's id is not handed back.
+        let recreated = create_ok(case, &router, &params).await;
+        let new_id = one_group(case, &recreated)
+            .required(case, "groupId")
+            .to_string();
+        assert_ne!(
+            new_id, group_id,
+            "case {case:?}: a group created after the delete must be a new group, \
+             got {new_id:?} again"
+        );
+        delete_ok(case, &router, &group_name).await;
+    }
+
+    // And the bystander survived every row.
+    let listed = describe_ok("the bystander", &router, &[param("GroupName.1", bystander)]).await;
+    assert_eq!(
+        reported_ids("the bystander", &listed),
+        vec![bystander_id],
+        "a delete must take only the group it names, got {listed}"
+    );
+}
+
+#[tokio::test]
+async fn delete_refuses_a_name_the_account_holds_no_group_under() {
+    let router = emulator();
+    let seeds = seeded(&router).await;
+    let (stored_name, stored_id) = seeds[0].clone();
+
+    // Each row is a name that resolves to no stored group, along what "names no group"
+    // generalises over: never created, a name of different case, a name the store holds an
+    // ID (not a name) equal to, and a name whose group was deleted a call ago.
+    let deleted_name = "seed-spread";
+    delete_ok("a deleted name", &router, deleted_name).await;
+    let cases: Vec<(&str, String)> = vec![
+        ("a name nothing was created under", "nothing-here".to_string()),
+        (
+            "a stored name in another case",
+            stored_name.to_ascii_uppercase(),
+        ),
+        ("a stored group's id used as a name", stored_id.clone()),
+        (
+            "a stored name with whitespace around it",
+            format!(" {stored_name} "),
+        ),
+        ("a well-formed id nothing holds", "pg-0000000000000dead".to_string()),
+        ("the name of a group deleted a call ago", deleted_name.to_string()),
+    ];
+    for (case, named) in cases {
+        let (status, body) = delete(&router, &[param("GroupName", &named)]).await;
+        assert_unknown_group(case, &named, status, &body);
+    }
+
+    // A request that carries the member empty names no group at all, which is the missing
+    // parameter it is rather than an unknown group.
+    let case = "an empty GroupName";
+    let (status, body) = delete(&router, &[param("GroupName", "")]).await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected HTTP 400, got {status} with body {body}"
+    );
+    let code = error_code(&body);
+    assert_eq!(
+        code, "MissingParameter",
+        "case {case:?}: expected MissingParameter, got {code:?} with body {body}"
+    );
+
+    // Every refused delete left the store alone: the groups that were not deleted above are
+    // still all there.
+    let listed = describe_ok("after the refusals", &router, &[]).await;
+    let mut expected: Vec<String> = seeds
+        .iter()
+        .filter(|(name, _)| name != deleted_name)
+        .map(|(_, group_id)| group_id.clone())
+        .collect();
+    expected.sort();
+    let reported = reported_ids("after the refusals", &listed);
+    assert_eq!(
+        reported, expected,
+        "a refused delete must remove nothing, got {reported:?} from {listed}"
+    );
+}
+
+#[tokio::test]
+async fn delete_refuses_a_group_another_group_names_as_its_parent() {
+    // "You cannot delete a placement group that is a parent of a cluster placement group.
+    // Delete the cluster placement groups first" (`DeletePlacementGroup`).
+    let router = emulator();
+    let case = "a parent of a cluster group";
+    let parent_body = create_ok(
+        case,
+        &router,
+        &[param("GroupName", "parent"), param("Strategy", "cluster")],
+    )
+    .await;
+    let parent_id = one_group(case, &parent_body)
+        .required(case, "groupId")
+        .to_string();
+    create_ok(
+        case,
+        &router,
+        &[
+            param("GroupName", "child"),
+            param("Strategy", "cluster"),
+            param("ParentGroupId", &parent_id),
+        ],
+    )
+    .await;
+
+    let (status, body) = delete(&router, &[param("GroupName", "parent")]).await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected HTTP 400, got {status} with body {body}"
+    );
+    let code = error_code(&body);
+    assert_eq!(
+        code, "InvalidPlacementGroup.InUse",
+        "case {case:?}: expected InvalidPlacementGroup.InUse, got {code:?} with body {body}"
+    );
+    // The refusal names the group the request named, so the caller is told which group
+    // blocked the delete.
+    let message = error_message(&body);
+    let expected = "The placement group 'parent' is in use.";
+    assert_eq!(
+        message, expected,
+        "case {case:?}: expected the message {expected:?}, got {message:?} with body {body}"
+    );
+    // The refused delete removed nothing: the parent is still describable by name.
+    let listed = describe_ok(case, &router, &[param("GroupName.1", "parent")]).await;
+    assert_eq!(
+        reported_ids(case, &listed),
+        vec![parent_id],
+        "case {case:?}: a refused delete must remove nothing, got {listed}"
+    );
+
+    // The child first, then the parent: with nothing naming it as a parent any more, the
+    // parent deletes.
+    delete_ok(case, &router, "child").await;
+    delete_ok(case, &router, "parent").await;
+    let listed = describe_ok(case, &router, &[]).await;
+    assert!(
+        groups(case, &listed).is_empty(),
+        "case {case:?}: both groups must be gone, got {listed}"
+    );
+}
+
+#[tokio::test]
+async fn a_dry_run_delete_removes_nothing() {
+    let router = emulator();
+    let case = "dry run delete";
+    let created = create_ok(
+        case,
+        &router,
+        &[param("GroupName", "dry-delete"), param("Strategy", "cluster")],
+    )
+    .await;
+    let group_id = one_group(case, &created).required(case, "groupId").to_string();
+
+    let (status, body) = delete(
+        &router,
+        &[param("GroupName", "dry-delete"), param("DryRun", "true")],
+    )
+    .await;
+    assert_eq!(
+        status, 412,
+        "case {case:?}: expected HTTP 412 from a dry run, got {status} with body {body}"
+    );
+    let code = error_code(&body);
+    assert_eq!(
+        code, "DryRunOperation",
+        "case {case:?}: expected DryRunOperation, got {code:?} with body {body}"
+    );
+
+    // Still there, and the real delete then takes it.
+    let listed = describe_ok(case, &router, &[param("GroupName.1", "dry-delete")]).await;
+    assert_eq!(
+        reported_ids(case, &listed),
+        vec![group_id],
+        "case {case:?}: a dry run must remove nothing, got {listed}"
+    );
+    delete_ok(case, &router, "dry-delete").await;
+    let (status, body) = describe(&router, &[param("GroupName.1", "dry-delete")]).await;
+    assert_unknown_group(case, "dry-delete", status, &body);
+}
+
+#[tokio::test]
+async fn a_delete_gives_the_group_s_stored_bytes_back() {
+    // The byte budget a create charges is what a delete releases, whatever the record holds
+    // — so a create/delete cycle cannot leak budget however many tags the group carried.
+    let (router, engine) = super::ec2_query::emulator();
+    let held = || engine.state::<Ec2State>().lock().stored_bytes();
+    let before = held();
+    let cases: Vec<(&str, Vec<Param>)> = vec![
+        ("no tags", Vec::new()),
+        ("one tag", tag_fields(&[("Owner", "TeamA")])),
+        (
+            "three tags, one of them long",
+            tag_fields(&[
+                ("Owner", "TeamA"),
+                ("Phase", "probe"),
+                ("Notes", &name_of_length("note", 200)),
+            ]),
+        ),
+    ];
+    for (case, tags) in cases {
+        let mut params = vec![
+            param("GroupName", "recycled"),
+            param("Strategy", "cluster"),
+        ];
+        params.extend(tags);
+        let (status, body) = super::ec2_query::call(
+            &router,
+            REGION,
+            "CreatePlacementGroup",
+            &params,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from CreatePlacementGroup, got {status} \
+             with body {body}"
+        );
+        let charged = held();
+        assert!(
+            charged > before,
+            "case {case:?}: a stored group must charge the budget, got {charged} \
+             against {before}"
+        );
+        let (status, body) = super::ec2_query::call(
+            &router,
+            REGION,
+            "DeletePlacementGroup",
+            &[param("GroupName", "recycled")],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from DeletePlacementGroup, got {status} \
+             with body {body}"
+        );
+        let after = held();
+        assert_eq!(
+            after, before,
+            "case {case:?}: a delete must give back exactly what the create charged, \
+             got {after} against {before}"
+        );
+    }
 }
 

@@ -13,9 +13,10 @@
 //! router: the endpoint host does not matter, the modelled path space does.
 //!
 //! The data plane serves a session only over an (application, environment,
-//! configuration profile) triple the control plane holds, so the suite creates that
-//! hierarchy first — through the control plane in this same router, which is itself part
-//! of what is being checked.
+//! configuration profile) triple the control plane holds, and only once a configuration
+//! has been deployed into that environment, so the suite creates that hierarchy and
+//! deploys a configuration into it first — through the control plane in this same
+//! router, which is itself part of what is being checked.
 //!
 //! Assembling the router costs stack, so it runs on an explicitly sized thread for
 //! the same reason `boot_serve.rs` does.
@@ -130,6 +131,10 @@ const CASES: &[Case] = &[
 /// The AppConfig control-plane endpoint host, used for the setup calls below.
 const CONTROL_PLANE_HOST: &str = "appconfig.us-east-1.amazonaws.com";
 
+/// The predefined deployment strategy that reaches every target at once, which is what
+/// the setup deploys the configuration through.
+const ALL_AT_ONCE: &str = "AppConfig.AllAtOnce";
+
 /// Send one request through the assembled router and answer its status and body.
 async fn send(
     router: &MultiServiceRouter,
@@ -153,12 +158,15 @@ async fn send(
 }
 
 /// Create the application, environment and configuration profile `SESSION_BODY` names,
-/// through the AppConfig control plane in this same router.
+/// and deploy a configuration into that environment, through the AppConfig control plane
+/// in this same router.
 ///
 /// AppConfigData is AppConfig's DATA plane: a session is started only over a triple the
-/// control plane actually holds, so the hierarchy has to exist before the data plane can
-/// serve one. Driving the setup through the same router is also part of what this suite
-/// checks — both services answer their own paths in one assembled emulator.
+/// control plane actually holds, and only over a configuration profile that has been
+/// deployed into the environment, so the hierarchy has to exist AND carry a deployment
+/// before the data plane can serve one. Driving the setup through the same router is also
+/// part of what this suite checks — both services answer their own paths in one assembled
+/// emulator.
 async fn create_hierarchy(router: &MultiServiceRouter) {
     let (status, body) = send(
         router,
@@ -172,28 +180,76 @@ async fn create_hierarchy(router: &MultiServiceRouter) {
         status, 201,
         "setup CreateApplication: expected 201, got {status} {body}"
     );
-    let application_id = serde_json::from_str::<serde_json::Value>(&body)
+    let application_id = minted_id(&body, "setup CreateApplication");
+
+    let (status, body) = send(
+        router,
+        CONTROL_PLANE_HOST,
+        "POST",
+        &format!("/applications/{application_id}/environments"),
+        r#"{"Name":"Prod"}"#,
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "setup CreateEnvironment: expected 201, got {status} {body}"
+    );
+    let environment_id = minted_id(&body, "setup CreateEnvironment");
+
+    let (status, body) = send(
+        router,
+        CONTROL_PLANE_HOST,
+        "POST",
+        &format!("/applications/{application_id}/configurationprofiles"),
+        r#"{"Name":"MyProfile","LocationUri":"hosted"}"#,
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "setup CreateConfigurationProfile: expected 201, got {status} {body}"
+    );
+    let profile_id = minted_id(&body, "setup CreateConfigurationProfile");
+
+    let (status, body) = send(
+        router,
+        CONTROL_PLANE_HOST,
+        "POST",
+        &format!(
+            "/applications/{application_id}/configurationprofiles/{profile_id}\
+             /hostedconfigurationversions"
+        ),
+        r#"{"feature":"on"}"#,
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "setup CreateHostedConfigurationVersion: expected 201, got {status} {body}"
+    );
+
+    let (status, body) = send(
+        router,
+        CONTROL_PLANE_HOST,
+        "POST",
+        &format!("/applications/{application_id}/environments/{environment_id}/deployments"),
+        &format!(
+            r#"{{"DeploymentStrategyId":"{ALL_AT_ONCE}",
+                  "ConfigurationProfileId":"{profile_id}",
+                  "ConfigurationVersion":"1"}}"#
+        ),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "setup StartDeployment: expected 201, got {status} {body}"
+    );
+}
+
+/// The `Id` a control-plane create answered with.
+fn minted_id(body: &str, what: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
         .ok()
         .and_then(|document| document["Id"].as_str().map(str::to_string))
-        .unwrap_or_else(|| panic!("setup CreateApplication: no Id in {body}"));
-
-    for (path, request_body) in [
-        (
-            format!("/applications/{application_id}/environments"),
-            r#"{"Name":"Prod"}"#,
-        ),
-        (
-            format!("/applications/{application_id}/configurationprofiles"),
-            r#"{"Name":"MyProfile","LocationUri":"hosted"}"#,
-        ),
-    ] {
-        let (status, body) =
-            send(router, CONTROL_PLANE_HOST, "POST", &path, request_body).await;
-        assert_eq!(
-            status, 201,
-            "setup POST {path}: expected 201, got {status} {body}"
-        );
-    }
+        .unwrap_or_else(|| panic!("{what}: no Id in {body}"))
 }
 
 #[test]

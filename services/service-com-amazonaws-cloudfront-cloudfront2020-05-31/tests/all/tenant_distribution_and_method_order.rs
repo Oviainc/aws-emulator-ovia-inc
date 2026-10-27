@@ -501,9 +501,10 @@ impl TenancyCase {
 /// targets the `Method` enum, so a value outside it is refused before any reordering —
 /// which is why the reordering can treat the set as a permutation of what was submitted.
 ///
-/// The code is the one the operation MODELS for an argument it cannot take
-/// (`InvalidArgument`, 400): a value outside an enum's value set is such an argument, and
-/// the refusal names the member and the value set it broke.
+/// The code is the one this service answers a request whose published schema it cannot read
+/// (`MalformedXML`, 400): the value set an enum declares is part of that schema, so a value
+/// outside it is no value of the member at all, and the refusal names the member and the
+/// value set it broke.
 #[tokio::test]
 async fn a_method_outside_the_modelled_set_is_refused() {
     let router = emulator();
@@ -526,8 +527,8 @@ async fn a_method_outside_the_modelled_set_is_refused() {
         );
         assert_eq!(
             answer.error_code(),
-            "InvalidArgument",
-            "case method={value:?}: expected InvalidArgument, got {:?}",
+            "MalformedXML",
+            "case method={value:?}: expected MalformedXML, got {:?}",
             answer.error_code()
         );
     }
