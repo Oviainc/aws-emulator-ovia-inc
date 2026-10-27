@@ -77,6 +77,8 @@ mod regex_pattern_set_listing;
 mod regex_pattern_set_updates;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
+#[path = "all/resource_untagging.rs"]
+mod resource_untagging;
 #[path = "all/response_members.rs"]
 mod response_members;
 #[path = "all/rule_evaluation_order.rs"]
