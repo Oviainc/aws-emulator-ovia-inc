@@ -219,12 +219,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // state and `ReputationMetricsEnabled` is the set's stored
             // publishing state, which
             // `UpdateConfigurationSetReputationMetricsEnabled` is what writes.
-            // `LastFreshStart` is "null" for a set whose sending "has never been
-            // disabled and later re-enabled".
+            // `LastFreshStart` is the instant the set's reputation metrics were
+            // last reset — "null" for a set whose sending "has never been
+            // disabled and later re-enabled", which is exactly what the stored
+            // record holds.
             reputation_options: asked_for("reputationOptions").then_some(ReputationOptions {
                 sending_enabled: configuration_set.sending_enabled,
                 reputation_metrics_enabled: configuration_set.reputation_metrics_enabled,
-                last_fresh_start: None,
+                last_fresh_start: configuration_set
+                    .last_fresh_start
+                    .map(::aws_smithy_types::DateTime::from),
             }),
         })
     }
