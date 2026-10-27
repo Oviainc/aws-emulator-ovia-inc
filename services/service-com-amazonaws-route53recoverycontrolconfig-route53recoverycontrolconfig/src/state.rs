@@ -15,12 +15,20 @@
 //! * `ControlPanel$RoutingControlCount` — counted from [`routing_controls`] on every
 //!   projection ([`Store::routing_control_count`]).
 //!
+//! The refusals every handler shares are worded here as well, so two operations cannot
+//! say the same thing differently: the sentences a lookup, a reference and a dependent
+//! refusal state, and [`authorize_resource_arn`], the one check that decides \u2014 from the
+//! request alone, before any ARN is resolved \u2014 whether the caller may act on the resource
+//! an ARN names.
+//!
 //! [`routing_controls`]: Store::routing_controls
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::ops::types::{Cluster, ClusterEndpoint, ControlPanel, RoutingControl};
+use crate::ops::types::{
+    AccessDeniedException, Cluster, ClusterEndpoint, ControlPanel, RoutingControl,
+};
 
 /// The ARN service segment Route 53 Application Recovery Controller's recovery-control
 /// resources carry: AWS documents them as
@@ -561,6 +569,45 @@ pub const CONTROL_PANEL_RESOURCE: &str = "Control Panel";
 
 /// The name a routing control is named by in those same refusals.
 pub const ROUTING_CONTROL_RESOURCE: &str = "Routing Control";
+
+/// The namespace this service's IAM actions are published under: the model's
+/// `arnNamespace`, which is also its endpoint prefix
+/// (`smithy_query(query="service_info")`) and so is NOT [`ARN_SERVICE`], the namespace its
+/// RESOURCE ARNs carry.
+pub const IAM_ACTION_NAMESPACE: &str = "route53-recovery-control-config";
+
+/// Refuse a request that names `arn` when that ARN belongs to another account.
+///
+/// Whether the caller may act on a resource is decided from the REQUEST alone — the
+/// principal that signed it, the action it asked for and the ARN it named — so it is
+/// decided before the ARN is resolved: a caller who may not act on another account's
+/// resource never learns from the answer whether one is stored under it. Every operation
+/// that takes a caller-supplied ARN of this service's resources asks here first, with its
+/// own modelled name as `action`, and lifts the payload into its own
+/// `AccessDeniedException` (403).
+///
+/// `Ok` means only that the ARN names no OTHER account: an ARN of the caller's own
+/// account, and a value no account can be read out of at all (one that is not a
+/// well-formed ARN, or whose account field is empty), are both left to the lookup the
+/// handler goes on to do, which is what refuses them.
+pub fn authorize_resource_arn(action: &str, arn: &str) -> Result<(), AccessDeniedException> {
+    // The tree's one ARN parse, so this service cannot disagree with another about which
+    // account an ARN names.
+    let account = ::service_common::arn::parse(arn).map(|parsed| parsed.account);
+    let Some(account) = account.filter(|account| !account.is_empty()) else {
+        return Ok(());
+    };
+    if account == ::engine::emulator_account_id() {
+        return Ok(());
+    }
+    Err(AccessDeniedException {
+        message: ::service_common::iam_authorization::not_authorized_by_resource_policy(
+            &::service_common::caller_principal::ambient_user_arn(),
+            &format!("{IAM_ACTION_NAMESPACE}:{action}"),
+            arn,
+        ),
+    })
+}
 
 /// The `ValidationException$Message` for a create request that names a resource it would
 /// attach to and that this service does not hold.
