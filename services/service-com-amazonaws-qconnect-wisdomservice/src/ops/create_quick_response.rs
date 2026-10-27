@@ -231,27 +231,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let knowledge_base_id = knowledge_base.knowledge_base_id.clone();
         let knowledge_base_arn = knowledge_base.knowledge_base_arn.clone();
 
-        // A replayed `@idempotencyToken` answers with the quick response it already
-        // created under THIS knowledge base rather than creating a second one. The token
-        // is scoped to this operation and this parent, so the same token on another
-        // create is another resource.
-        let replay_key = input.client_token.as_deref().map(|token| {
-            crate::state::idempotency_key(
-                &format!("CreateQuickResponse/{knowledge_base_id}"),
-                token,
-            )
-        });
-        if let Some(created) = replay_key
-            .as_ref()
-            .and_then(|key| store.idempotency.get(key).cloned())
-        {
-            if let Some(quick_response) = store.quick_response(&knowledge_base_id, &created) {
-                return Ok(CreateQuickResponseOutput {
-                    quick_response: Some(quick_response.to_quick_response_data()),
-                });
-            }
-        }
-
         // The model puts no bound on the `tags` map, so the store does: AWS's tagging
         // restrictions allow at most 50 tags on a resource, and a request past that is
         // outside what the service accepts. The count is taken from what the caller sent,
@@ -259,6 +238,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let tags = input.tags.clone().unwrap_or_default();
         if tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
             return Err(validation(crate::state::message_too_many_tags()));
+        }
+
+        // What this create's `@idempotencyToken` identifies: every member the record below
+        // is built from, with the tag map fingerprinted in key order
+        // (`crate::state::tags_fingerprint`). The members that carry no map are
+        // fingerprinted through their `Debug` rendering, which is stable for one request.
+        let fingerprint = crate::state::request_fingerprint(&[
+            input.name.clone(),
+            format!("{:?}", input.content),
+            input.content_type.clone().unwrap_or_default(),
+            format!("{:?}", input.grouping_configuration),
+            input.description.clone().unwrap_or_default(),
+            input.shortcut_key.clone().unwrap_or_default(),
+            format!("{:?}", input.is_active),
+            format!("{:?}", input.channels),
+            input.language.clone().unwrap_or_default(),
+            crate::state::tags_fingerprint(&tags),
+        ]);
+
+        // A replayed `@idempotencyToken` answers with the quick response it already
+        // created under THIS knowledge base rather than creating a second one, while the
+        // same token carrying a DIFFERENT request is the modelled idempotency conflict
+        // rather than a record the caller did not ask for. The token is scoped to this
+        // operation and this parent, so the same token on another create is another
+        // resource.
+        let token_scope = format!("{}/{knowledge_base_id}", Self::NAME);
+        match store.replayed_create(&token_scope, input.client_token.as_deref(), &fingerprint) {
+            crate::state::Replay::Conflict => {
+                return Err(conflict(crate::state::MESSAGE_IDEMPOTENCY_CONFLICT))
+            }
+            crate::state::Replay::Retry(created) => {
+                if let Some(quick_response) = store.quick_response(&knowledge_base_id, &created) {
+                    return Ok(CreateQuickResponseOutput {
+                        quick_response: Some(quick_response.to_quick_response_data()),
+                    });
+                }
+            }
+            crate::state::Replay::Fresh => {}
         }
 
         // A quick response's name identifies it inside its knowledge base, so a create
@@ -345,9 +362,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // created.
             last_modified_at: now,
         });
-        if let Some(key) = replay_key {
-            store.idempotency.insert(key, quick_response_id.clone());
-        }
+        store.remember_create(
+            &token_scope,
+            input.client_token.as_deref(),
+            &fingerprint,
+            &quick_response_id,
+        );
 
         // Render out of the INSERTED record rather than out of the request: what this
         // call answers is what a later `GetQuickResponse` answers.
