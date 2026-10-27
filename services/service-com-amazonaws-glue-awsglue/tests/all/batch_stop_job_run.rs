@@ -26,6 +26,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_glue_awsglue::state::messages::JOB_NOT_FOUND;
 use service_com_amazonaws_glue_awsglue::state::{
     JOB_RUN_ID_PREFIX, JOB_RUN_NOT_EXECUTED_MESSAGE, JOB_RUN_STATE_FAILED, JOB_RUN_STATE_STARTING,
     JOB_RUN_STATE_STOPPED, JOB_RUN_STATE_STOPPING, TERMINAL_JOB_RUN_STATES,
@@ -484,9 +485,12 @@ async fn a_run_the_stop_cannot_reach_is_reported_per_run() {
                 code, ENTITY_NOT_FOUND_CODE,
                 "case {unknown_job:?}: expected {ENTITY_NOT_FOUND_CODE}, got {answer}"
             );
-            assert!(
-                message.contains(unknown_job),
-                "case {unknown_job:?}: the message must name the job, got {message:?}"
+            // The job-definition miss is a fixed sentence that discloses no name: the
+            // entry AROUND the detail is what names the job and the run.
+            // `job_not_found_message.rs` pins that wording.
+            assert_eq!(
+                message, JOB_NOT_FOUND,
+                "case {unknown_job:?}: expected the job-miss sentence, got {message:?}"
             );
         }
     }

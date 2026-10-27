@@ -2747,10 +2747,28 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
             .filter(|record| record.instance_arn == instance_arn)
             .map(|record| record.application_arn.clone())
             .collect();
-        self.applications
-            .retain(|_, record| record.instance_arn != instance_arn);
+        for application_arn in &orphaned_applications {
+            self.remove_application(application_arn);
+        }
+    }
+
+    /// Drop the application `application_arn` names and everything held INSIDE it,
+    /// reporting whether such an application was stored at all.
+    ///
+    /// Its access scopes, its authentication methods and its grants live ON the record
+    /// (see [`ApplicationRecord`]), so they go with it. Its DIRECT assignments are stored
+    /// beside it and are dropped here, because an assignment names the application it
+    /// grants access to: leaving the rows behind would keep a grant of an application no
+    /// reader can see, and would let a later application minted under the same ARN
+    /// inherit an access nobody granted on it.
+    ///
+    /// Shared by `DeleteApplication` and by the instance removal above, so an application
+    /// a caller deletes and one the clock removes with its instance leave the same store.
+    pub fn remove_application(&mut self, application_arn: &str) -> bool {
+        let removed = self.applications.remove(application_arn).is_some();
         self.application_assignments
-            .retain(|record| !orphaned_applications.contains(&record.application_arn));
+            .retain(|record| record.application_arn != application_arn);
+        removed
     }
 
     /// Whether the permission-set / account-assignment surface is WITHDRAWN on the

@@ -55,11 +55,12 @@ pub const RELATIVE_FILE_VERSION_AFTER: &str = "AFTER";
 /// are limited to 10,240 characters."
 pub const MAX_COMMENT_CHARACTERS: usize = 10_240;
 
-/// How many comment threads one `GetCommentsForComparedCommit` page carries when
-/// the caller names no `maxResults`, and the largest value that member accepts.
-/// Documented on it: "A non-zero, non-negative integer used to limit the number of
-/// returned results. The default is 100 comments, but you can configure up to
-/// 500."
+/// How many comment threads one page of a comment read carries when the caller
+/// names no `maxResults`, and the largest value that member accepts.
+/// Documented on `GetCommentsForComparedCommit`: "A non-zero, non-negative integer
+/// used to limit the number of returned results. The default is 100 comments, but
+/// you can configure up to 500.", and on `GetCommentsForPullRequest`: "The default
+/// is 100 comments. You can return up to 500 comments with a single request."
 pub const COMMENTS_PAGE_DEFAULT: i32 = 100;
 pub const COMMENTS_PAGE_MAX: i32 = 500;
 
@@ -540,6 +541,13 @@ pub const INVALID_PULL_REQUEST_STATUS_UPDATE_MESSAGE: &str =
 /// once for every operation that requires a `pullRequestStatus`.
 pub const PULL_REQUEST_STATUS_REQUIRED_MESSAGE: &str =
     "A pull request status is required, but none was provided.";
+
+/// `RepositoryNameRequiredException`'s message: the sentence the model documents
+/// for the shape, naming nothing from the request. Worded here once for the
+/// request boundary (`crate::service`) and for the handlers that require a
+/// `repositoryName` the model leaves optional.
+pub const REPOSITORY_NAME_REQUIRED_MESSAGE: &str =
+    "A repository name is required, but was not specified.";
 
 /// The message AWS returns with `RepositoryDoesNotExistException`: the requested
 /// repository name, then `" for "`, then the account the lookup ran in.
@@ -1421,6 +1429,57 @@ impl CommentRecord {
             reaction_counts: (!reaction_counts.is_empty()).then_some(reaction_counts),
         }
     }
+}
+
+/// Every comment of one repository by the comment it replies to: the reply edges
+/// of that repository's whole comment map, built ONCE per request.
+///
+/// [`comment_thread`] walks these edges per root, so without this index each step
+/// would rescan the whole map and rendering one page would cost roots x comments.
+/// The edges live here rather than in one reader because a reply is reported
+/// inside its root's thread by every read of a comment thread — the comparison's
+/// and the pull request's alike — so both walk the same stored edges.
+pub fn reply_index(repository: &Repository) -> HashMap<&str, Vec<&CommentRecord>> {
+    let mut index: HashMap<&str, Vec<&CommentRecord>> = HashMap::new();
+    for comment in repository.comments.values() {
+        if let Some(parent) = comment.in_reply_to.as_deref() {
+            index.entry(parent).or_default().push(comment);
+        }
+    }
+    for replies in index.values_mut() {
+        replies.sort_by_key(|comment| comment.sequence);
+    }
+    index
+}
+
+/// One comment thread: the root comment, then the comments replying to it, each
+/// level in the order it was posted. A comment and its replies are one entry of a
+/// comment read, which is why they are collected together.
+///
+/// Each comment is expanded AT MOST ONCE, tracked in `expanded`: the reply edges
+/// are stored data, so a record whose `in_reply_to` named itself or an ancestor
+/// would otherwise make this walk re-expand the same records for ever — growing
+/// `members` without end while the store lock is held, which is a hang of the whole
+/// service rather than of one request. Visiting each record once also bounds the
+/// thread by the repository's comment count, itself bounded by
+/// [`MAX_COMMENTS_PER_REPOSITORY`].
+pub fn comment_thread<'a>(
+    replies: &HashMap<&'a str, Vec<&'a CommentRecord>>,
+    root: &'a CommentRecord,
+) -> Vec<&'a CommentRecord> {
+    let mut members: Vec<&CommentRecord> = vec![root];
+    let mut expanded: BTreeSet<&str> = BTreeSet::from([root.comment_id.as_str()]);
+    let mut next = 0usize;
+    while next < members.len() {
+        let parent = members[next].comment_id.as_str();
+        next += 1;
+        for reply in replies.get(parent).into_iter().flatten() {
+            if expanded.insert(reply.comment_id.as_str()) {
+                members.push(reply);
+            }
+        }
+    }
+    members
 }
 
 /// A location's members as a comparable key: two comments sit in the same place in

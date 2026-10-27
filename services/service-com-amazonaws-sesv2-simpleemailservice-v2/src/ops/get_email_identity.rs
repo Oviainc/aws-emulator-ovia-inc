@@ -2,8 +2,9 @@
 
 //! @op GetEmailIdentity
 //! Reports the persisted email identity: its type, verification and feedback
-//! status, DKIM attributes, tags, configuration set and policies, exactly as they
-//! were created. This is the ONLY file to touch for this operation.
+//! status, DKIM attributes, custom MAIL FROM configuration, tags, configuration
+//! set and policies, exactly as they were created. This is the ONLY file to touch
+//! for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -196,9 +197,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             feedback_forwarding_status: record.feedback_forwarding,
             verified_for_sending_status: record.verified_for_sending,
             dkim_attributes: Some(record.dkim_attributes()),
-            // A custom MAIL FROM domain is configured by
-            // `PutEmailIdentityMailFromAttributes`; nothing has set one here.
-            mail_from_attributes: None,
+            // The custom MAIL FROM configuration
+            // `PutEmailIdentityMailFromAttributes` persisted, when one is enabled
+            // for this identity.
+            mail_from_attributes: record.mail_from.as_ref().map(crate::state::MailFromState::view),
             policies: Some(record.policies.clone().into_iter().collect()),
             tags: Some(record.tag_list()),
             configuration_set_name: record.configuration_set_name.clone(),

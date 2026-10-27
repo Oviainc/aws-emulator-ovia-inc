@@ -39,6 +39,8 @@ mod connection_function_list;
 mod connection_function_publish;
 #[path = "all/connection_group_by_routing_endpoint.rs"]
 mod connection_group_by_routing_endpoint;
+#[path = "all/connection_group_delete.rs"]
+mod connection_group_delete;
 #[path = "all/connection_group_tags.rs"]
 mod connection_group_tags;
 #[path = "all/connection_group_update.rs"]

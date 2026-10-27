@@ -49,7 +49,10 @@ use crate::distribution_lifecycle::{
 ///
 /// `IfMatch` is a required member, so every call states one: what the rows differ along is
 /// the value, not whether the header is there.
-async fn update_connection_group(
+///
+/// `pub(crate)` so the sibling delete suite disables a group over this one wire path rather
+/// than growing a copy of it.
+pub(crate) async fn update_connection_group(
     router: &MultiServiceRouter,
     id: &str,
     if_match: &str,

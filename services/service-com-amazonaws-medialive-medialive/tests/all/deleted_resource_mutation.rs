@@ -154,7 +154,11 @@ async fn a_mutation_on_a_resource_whose_delete_was_accepted_is_not_found() {
             case: "channel",
             create: (
                 "/prod/channels",
-                || json!({ "name": "doomed-channel", "tags": { "team": "video" } }),
+                || json!({
+                    "name": "doomed-channel",
+                    "tags": { "team": "video" },
+                    "encoderSettings": crate::support::channel_encoder_settings(),
+                }),
                 Some("channel"),
             ),
             read: (|id| format!("/prod/channels/{id}"), None),
@@ -351,7 +355,10 @@ async fn a_refused_schedule_mutation_leaves_the_schedule_it_named_alone() {
         &router,
         "POST",
         "/prod/channels",
-        Some(json!({ "name": "scheduled-then-deleted" })),
+        Some(json!({
+            "name": "scheduled-then-deleted",
+            "encoderSettings": crate::support::channel_encoder_settings(),
+        })),
     )
     .await;
     assert_eq!(status, 201, "CreateChannel: got {status}: {created}");

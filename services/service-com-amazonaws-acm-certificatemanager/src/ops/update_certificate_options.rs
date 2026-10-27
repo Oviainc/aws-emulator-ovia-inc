@@ -229,6 +229,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // `CertificateOptions` configures ACM's own issuance of the certificate — the
+        // transparency logging of a public certificate it issues, the export it allows,
+        // the method it validates the names by. A certificate whose material came from
+        // outside ACM has no such issuance to configure: nothing this call could change
+        // would ever take effect, so the request is refused rather than accepted and
+        // dropped. It is the certificate's own state that rules the change out, which is
+        // what `InvalidStateException` reports.
+        if certificate.is_imported() {
+            return Err(UpdateCertificateOptionsErrorModeled::InvalidStateException(
+                InvalidStateException {
+                    message: Some(
+                        crate::state::IMPORTED_CERTIFICATE_OPTIONS_MESSAGE.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
         // The options this operation updates are those of an ISSUED certificate: a
         // request ACM is still validating has not produced one yet, a request that
         // failed or timed out never will, and a revoked or expired one no longer has a

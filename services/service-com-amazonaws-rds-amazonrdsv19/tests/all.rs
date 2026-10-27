@@ -49,6 +49,8 @@ mod db_parameter_group_deletion;
 mod db_parameter_group_provisioning;
 #[path = "all/db_parameter_groups.rs"]
 mod db_parameter_groups;
+#[path = "all/db_parameter_metadata.rs"]
+mod db_parameter_metadata;
 #[path = "all/db_parameters.rs"]
 mod db_parameters;
 #[path = "all/db_security_group_ingress.rs"]

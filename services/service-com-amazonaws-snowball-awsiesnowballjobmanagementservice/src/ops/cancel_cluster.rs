@@ -138,7 +138,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // The cancellation holds the store's lock; the notifications the job states it
+        // moved owe are published once that lock is released, because a publish is an
+        // in-process call into Amazon SNS and must not run under it.
+        let notifications = self.cancel(&input)?;
+
+        // Each node job that moved has entered a state its own notification settings may
+        // select, and a subscriber of the topic they name is told about it.
+        crate::state::job_notifications::publish(ctx, &notifications).await;
+
+        Ok(CancelClusterOutput {})
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CancelCluster<Eng> {
+    /// The cancellation itself: the job-state notifications it owes.
+    ///
+    /// Everything that touches the store lives here, so the lock is held for the write
+    /// ALONE and nothing is awaited while it is.
+    fn cancel(
+        &self,
+        input: &CancelClusterInput,
+    ) -> Result<Vec<crate::state::job_notifications::JobStateNotification>, CancelClusterError> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::validation(
                 crate::state::STATE_UNAVAILABLE,
@@ -185,14 +206,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // created"), so cancelling the cluster is what stops every device it ordered — each
         // node that is itself still within its own cancellation window.
         let node_job_ids = cluster.node_job_ids.clone();
+        // The node jobs this call actually moved, which are the ones that have entered
+        // `Cancelled` and so the ones whose notification settings have something to report.
+        let mut cancelled: Vec<String> = Vec::new();
         for job_id in node_job_ids {
             if let Some(job) = store.jobs.get_mut(&job_id) {
                 if job.job_state.is_cancellable() {
                     job.job_state = crate::state::JobState::Cancelled;
+                    cancelled.push(job_id);
                 }
             }
         }
 
-        Ok(CancelClusterOutput {})
+        // Each node that moved has entered a state its own notification settings may select,
+        // so what each owes is decided here, under the lock, and published below once the
+        // guard is dropped (`crate::state::job_notifications`).
+        Ok(crate::state::job_notifications::owed_for_jobs(
+            &store,
+            &cancelled,
+            ::std::time::SystemTime::now(),
+        ))
     }
 }

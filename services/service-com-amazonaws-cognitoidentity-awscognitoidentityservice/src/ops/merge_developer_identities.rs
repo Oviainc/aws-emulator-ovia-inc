@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op MergeDeveloperIdentities
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `MergeDeveloperIdentities`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`MergeDeveloperIdentities::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Two developer-authenticated users of one identity pool become ONE user: every login the
+//! destination user was reached through resolves to the `IdentityId` of the SOURCE user
+//! afterwards — the id this call answers, as its recorded response does — and the
+//! destination user's own identity exists no longer.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +166,267 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `MergeDeveloperIdentities` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(MergeDeveloperIdentitiesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // The call AWS audits is this one, whatever it answers: the record is written from
+        // the outcome, so a refused call is recorded with the error code its caller was
+        // answered with.
+        let request_parameters = ::service_common::management_events::recorded_members([
+            (
+                "identityPoolId",
+                ::serde_json::json!(input.identity_pool_id),
+            ),
+            (
+                "developerProviderName",
+                ::serde_json::json!(input.developer_provider_name),
+            ),
+            (
+                "sourceUserIdentifier",
+                ::serde_json::json!(input.source_user_identifier),
+            ),
+            (
+                "destinationUserIdentifier",
+                ::serde_json::json!(input.destination_user_identifier),
+            ),
+        ]);
+        let region = crate::state::request_region(ctx.parts());
+        let identity_pool_id = Some(input.identity_pool_id.clone());
+        let outcome = self.merge(input, ctx).await;
+        crate::state::record_served_call(
+            &*self.engine,
+            ctx.parts(),
+            &crate::state::ServedCall {
+                operation: Self::NAME,
+                region: &region,
+                read_only: false,
+                identity_pool_id,
+                request_parameters,
+                response_elements: outcome.as_ref().ok().map(|output| {
+                    ::service_common::management_events::recorded_members([(
+                        "identityId",
+                        ::serde_json::json!(output.identity_id),
+                    )])
+                }),
+            },
+            &outcome,
+        );
+        outcome
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> MergeDeveloperIdentities<Eng> {
+    /// The merge itself: authorize, resolve both developer users of the pool, then leave the
+    /// source user's identity the one identity every login of the two resolves to.
+    async fn merge(
+        &self,
+        input: MergeDeveloperIdentitiesInput,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+    ) -> Result<MergeDeveloperIdentitiesOutput, MergeDeveloperIdentitiesError> {
+        // Authorization comes first, before anything is read or written: this is a
+        // developer-credentials operation ("You must use Amazon Web Services developer
+        // credentials to call this operation"), so it is served only to a caller whose
+        // identity-based IAM policies allow its own action on the pool the request names.
+        if let Some(denied) = crate::state::authorization::denied(
+            &*self.engine,
+            ctx,
+            <Self as smithy_server_runtime::Operation>::NAME,
+            Some(&crate::state::identity_pool_arn(&input.identity_pool_id)),
+        ) {
+            return Err(denied);
+        }
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                MergeDeveloperIdentitiesErrorModeled::InternalErrorException(
+                    InternalErrorException {
+                        message: Some("the identity-pool store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The two users merged are users "existing in the same identity pool", so the pool
+        // has to be one this service holds.
+        let Some(pool) = store.identity_pools.get(&input.identity_pool_id) else {
+            return Err(
+                MergeDeveloperIdentitiesErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "IdentityPool '{}' not found.",
+                            input.identity_pool_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A developer identity is a login of the pool keyed by the pool's own
+        // `DeveloperProviderName` — "the 'domain' by which Cognito will refer to your
+        // users" — whose value is the developer user identifier. A request naming any other
+        // provider therefore names mappings this pool cannot hold, exactly as one naming
+        // identifiers that were never registered does.
+        let developer_provider = pool
+            .developer_provider_name
+            .clone()
+            .filter(|provider| *provider == input.developer_provider_name);
+        let (source, destination) = match &developer_provider {
+            Some(provider) => (
+                store
+                    .linked_identity(
+                        &input.identity_pool_id,
+                        provider,
+                        &input.source_user_identifier,
+                    )
+                    .cloned(),
+                store
+                    .linked_identity(
+                        &input.identity_pool_id,
+                        provider,
+                        &input.destination_user_identifier,
+                    )
+                    .cloned(),
+            ),
+            None => (None, None),
+        };
+
+        // "Only developer-authenticated users can be merged": each side of the merge is a
+        // developer user identifier this pool has registered, and one it has not registered
+        // names no user the caller may be told about — resolving a developer user identifier
+        // is an authorization question, so nothing is disclosed about what the pool holds
+        // for one, exactly as the lookup and the unlink of one answer.
+        let (Some(developer_provider), Some(source), Some(destination)) =
+            (developer_provider, source, destination)
+        else {
+            return Err(
+                MergeDeveloperIdentitiesErrorModeled::NotAuthorizedException(
+                    NotAuthorizedException {
+                        message: Some(
+                            crate::state::DEVELOPER_IDENTIFIER_FORBIDDEN_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "Merges two users having different IdentityIds": two identifiers that already
+        // resolve to ONE identity are one user, so the merge the request asks for has
+        // already happened and the identity it asks for is reported. That is what makes
+        // this operation idempotent — the call that merged them answers the same id again.
+        if source == destination {
+            return Ok(MergeDeveloperIdentitiesOutput {
+                identity_id: Some(source),
+            });
+        }
+
+        let source_logins = store.pool_logins_of_identity(&input.identity_pool_id, &source);
+        let destination_logins =
+            store.pool_logins_of_identity(&input.identity_pool_id, &destination);
+
+        // "If the users to be merged are associated with the same public provider, but as
+        // two different users, an exception will be thrown." A login of one provider resolves
+        // to one identity, so two users both reached through one provider are necessarily
+        // two different users of it — and the pool's own developer provider is excluded,
+        // being the provider whose two users this call exists to combine.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("MergeDeveloperIdentities"))
+        // This refusal and the one below it carry wording taken from the sentences of this
+        // operation's own documentation that state the rule, with the provider, the count and
+        // the limit filled in from the request and the store: no recording of either refusal
+        // is available to read AWS's own fixed text off.
+        let shared_public_provider = source_logins
+            .iter()
+            .map(|(provider, _)| provider)
+            .find(|provider| {
+                **provider != developer_provider
+                    && destination_logins
+                        .iter()
+                        .any(|(linked, _)| linked == *provider)
+            });
+        if let Some(provider) = shared_public_provider {
+            return Err(
+                MergeDeveloperIdentitiesErrorModeled::ResourceConflictException(
+                    ResourceConflictException {
+                        message: Some(format!(
+                            "The users to be merged are associated with the provider \
+                             '{provider}' as two different users."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "The number of linked logins is limited to 20. So, the number of linked logins
+        // for the source user [...] and the destination user [...] together should not be
+        // larger than 20. Otherwise, an exception will be thrown." The two sets are
+        // disjoint — one indexed login resolves to one identity — so the merged user would
+        // carry exactly their sum, and a sum past the limit is a pair of users this service
+        // cannot merge rather than a single login held by another account.
+        let linked_after = source_logins.len() + destination_logins.len();
+        if linked_after > crate::state::MAX_LINKED_LOGINS_PER_IDENTITY {
+            return Err(
+                MergeDeveloperIdentitiesErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "Invalid value for parameters SourceUserIdentifier and \
+                             DestinationUserIdentifier: merging them would link {linked_after} \
+                             logins to one identity, more than the {} allowed.",
+                            crate::state::MAX_LINKED_LOGINS_PER_IDENTITY
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The two users are one user from here on, and the identity it keeps is the one the
+        // SOURCE user identifier resolves to: that is the `IdentityId` the recorded response
+        // of this operation answers, and the identity the recording still resolves both
+        // identifiers to afterwards — which is what this service follows, rather than the
+        // other way round that one sentence of the operation's documentation reads as
+        // ("Cognito associates the given source user (SourceUserIdentifier) with the
+        // IdentityId of the DestinationUserIdentifier"). Every login of the destination
+        // user — its other developer user identifiers and its federated logins alike —
+        // resolves to that identity, and the destination identity is one no more.
+        let revoked =
+            store.merge_identity_into(&input.identity_pool_id, &destination, &source, now);
+        // Both identities were resolved through THIS pool's own login index, which names no
+        // other pool's identities, so the merge has no pair to decline here: the arm is the
+        // invariant written down rather than an input any request reaches. A pair it does
+        // decline is one this pool does not hold, which is the same refusal an identifier it
+        // has not registered gets.
+        let Some(revoked) = revoked else {
+            return Err(
+                MergeDeveloperIdentitiesErrorModeled::NotAuthorizedException(
+                    NotAuthorizedException {
+                        message: Some(
+                            crate::state::DEVELOPER_IDENTIFIER_FORBIDDEN_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        // The stores the merged-away identity was known in OUTSIDE this service's own are
+        // written with this lock released, so two of them are never held at once.
+        drop(store);
+
+        // The identity the merge gave up exists no longer, so the session issued to it is no
+        // longer a credential this emulator accepts, and the tokens issued for it name
+        // nobody the redeemer of one can resolve.
+        for access_key_id in revoked {
+            crate::state::discard_vended_role_session(
+                &*self.engine,
+                ctx.credential_store(),
+                &access_key_id,
+            );
+        }
+        crate::state::forget_issued_web_identities_of_identity(&*self.engine, &destination);
+
+        Ok(MergeDeveloperIdentitiesOutput {
+            identity_id: Some(source),
+        })
     }
 }

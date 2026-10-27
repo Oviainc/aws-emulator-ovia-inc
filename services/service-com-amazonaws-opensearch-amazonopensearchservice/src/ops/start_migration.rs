@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartMigration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartMigration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartMigration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts the ONE saved-object migration job the call asks for, as a
+//! [`crate::state::Migration`] held beside the applications it migrates into, and
+//! answers with the stored record — so the start's answer and a later `GetMigration`
+//! cannot disagree.
+//!
+//! The job is started in a transient status: it is `PENDING` the instant the call
+//! returns, and the clock owes it the statuses running it leaves it in — the export
+//! that moves it to `IN_PROGRESS` and the import that completes it
+//! ([`crate::state::Migration::settle`]), which whichever later call reads the record
+//! materialises.
+//!
+//! A `clientToken` a start was already served under answers with THAT job rather than
+//! starting another, and an `applicationId` naming no application of this account names
+//! nothing to migrate into ([`crate::state::application_not_found`]).
 //!
 //! ## Shape of an operation
 //!
@@ -90,6 +96,13 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    application_not_found, is_arn, malformed_arn, migration_client_token_taken,
+    migration_quota_exceeded, migration_workspace_refusal, service_state, state_unavailable,
+    unsupported_conflict_resolution, Migration, CONFLICT_RESOLUTION_VALUES, MIGRATION_QUOTA,
+    MIGRATION_STATUS_PENDING,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -163,18 +176,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartMigration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartMigrationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartMigration"))
+        let _ = ctx;
+        let state = service_state(&*self.engine).ok_or_else(state_unavailable)?;
+
+        let options = input.migration_options;
+
+        // What the import writes into has to be ONE workspace: a request naming two, or
+        // none, or a new one with no name describes no target, which is malformed input
+        // rather than a target this service picks for the caller.
+        if let Some(refusal) = migration_workspace_refusal(&options.workspace) {
+            return Err(StartMigrationErrorModeled::ValidationException(refusal).into());
+        }
+
+        // `conflictResolution` is typed as a plain string, so the values its
+        // documentation publishes are the ones this service honours: a strategy outside
+        // that set names behaviour the import has no rule for.
+        if let Some(resolution) = options.conflict_resolution.as_deref() {
+            if !CONFLICT_RESOLUTION_VALUES.contains(&resolution) {
+                return Err(StartMigrationErrorModeled::ValidationException(
+                    unsupported_conflict_resolution(resolution),
+                )
+                .into());
+            }
+        }
+
+        // `ARN` is `@length(20..2048)` with pattern `.*`, so the request boundary
+        // enforces only the length: a value no ARN parser would accept names no data
+        // source, and is refused as the malformed input it is.
+        if !is_arn(&options.source.datasource_arn) {
+            return Err(StartMigrationErrorModeled::ValidationException(malformed_arn(
+                "migrationOptions.source.datasourceArn",
+                &options.source.datasource_arn,
+            ))
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // Whatever the clock already owed the records this call reads is materialised
+        // first, so the decisions below are made on the state at `now`: an application
+        // that has finished provisioning is active, and a job whose export or import has
+        // fallen due has moved on.
+        store.settle_applications(now);
+        store.settle_migrations(now);
+
+        // "A unique, case-sensitive identifier to ensure that the operation completes no
+        // more than one time. If this token matches a previous request, Amazon OpenSearch
+        // Service ignores the request but does not return an error": a repeat is answered
+        // with the job the first call started. What the token identifies is the start of
+        // ONE job, so a token already identifying a job of a DIFFERENT application is one
+        // token for two starts, which cannot both be the one it identifies.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(served) = store.migration_of_client_token(token) {
+                if served.application_id != input.application_id {
+                    return Err(StartMigrationErrorModeled::ConflictException(
+                        migration_client_token_taken(token, &served.application_id),
+                    )
+                    .into());
+                }
+                return Ok(started(served));
+            }
+        }
+
+        // The job migrates saved objects INTO an application's workspace, so an id
+        // naming no application of this account names nothing to migrate into.
+        if !store.applications.contains_key(&input.application_id) {
+            return Err(StartMigrationErrorModeled::ResourceNotFoundException(
+                application_not_found(&input.application_id),
+            )
+            .into());
+        }
+
+        // The store is bounded: past its quota a start is refused rather than adding
+        // another record, so a caller looping cannot grow the state without end.
+        if store.migrations_of_application(&input.application_id) >= MIGRATION_QUOTA {
+            return Err(StartMigrationErrorModeled::ValidationException(
+                migration_quota_exceeded(&input.application_id),
+            )
+            .into());
+        }
+
+        let mut migration = Migration {
+            migration_id: store.mint_migration_id(),
+            application_id: input.application_id,
+            source: options.source,
+            workspace: options.workspace,
+            export_options: options.export_options,
+            conflict_resolution: options.conflict_resolution,
+            // "The status is PENDING when a migration is first created": the export has
+            // not run the instant the call returns, and the clock owes the job the
+            // statuses running it leaves it in.
+            status: MIGRATION_STATUS_PENDING.to_string(),
+            owed: None,
+            exported_count: 0,
+            imported_count: 0,
+            created_at: now,
+            // Nothing has changed the job since the call that started it, so the instant
+            // it last changed IS the instant it was created.
+            updated_at: now,
+            client_token: input.client_token,
+        };
+        migration.owed = migration.next_step(now);
+
+        // Answered from the STORED record, so this call's answer and a later read of the
+        // same job report one migration.
+        Ok(started(store.insert_migration(migration)))
+    }
+}
+
+/// The stored job as this operation answers with it.
+///
+/// Both the start that mints a job and a repeat of it under the same `clientToken`
+/// answer through here, so a retry cannot report the job differently from the call that
+/// started it.
+fn started(migration: &Migration) -> StartMigrationOutput {
+    StartMigrationOutput {
+        migration_id: Some(migration.migration_id.clone()),
+        status: Some(migration.status.clone()),
     }
 }

@@ -173,80 +173,103 @@ pub fn is_terminal_job_status(status: &str) -> bool {
     status == STATUS_COMPLETED || status == STATUS_FAILED
 }
 
-/// The two lifecycle facts every job family's record holds: the status it is in, and
-/// the clock-owed transitions that status still has to catch up with.
+/// The one lifecycle fact every stored record of this service holds whose status the
+/// CLOCK moves on its own: the transitions that status still has to catch up with.
 ///
-/// One trait rather than four copies of [`jobs_in_flight`], which is what every
-/// family's concurrency quota is measured against: the four job records differ in
-/// what a job IS, not in how its status moves.
-pub trait JobLifecycle {
-    /// Materialise every status transition the clock already owes this job — the
+/// One trait rather than one spelling per family, so the rule "materialise what the
+/// clock already owed, then report" is written once ([`record_mut`],
+/// [`materialised_newest_first`], [`jobs_in_flight`]) over any family's store: the
+/// records differ in what a resource IS, not in how a due transition is caught up
+/// with. A family added later reaches those helpers only by implementing this, so it
+/// cannot be served by a lookup or a listing that forgot the clock step.
+pub trait ClockedRecord {
+    /// Materialise every status transition the clock already owes this record — the
     /// record's own `advance_clock`.
     fn materialise_due_transitions(&mut self, now: SystemTime);
-
-    /// The job's current status, one of the four values its family's `*JobStatus`
-    /// enum models.
-    fn job_status(&self) -> &str;
-
-    /// The job's creation sequence number, so "the oldest record" is a total order
-    /// even for two jobs started in the same clock tick.
-    fn sequence(&self) -> u64;
 }
 
-impl JobLifecycle for TranscriptionJobRecord {
-    fn materialise_due_transitions(&mut self, now: SystemTime) {
-        self.advance_clock(now);
-    }
-
-    fn job_status(&self) -> &str {
-        &self.status
-    }
-
-    fn sequence(&self) -> u64 {
-        self.sequence
-    }
+/// Give each family's record the [`ClockedRecord`] view of its own `advance_clock`.
+macro_rules! clocked_records {
+    ($($record:ident;)+) => {
+        $(
+            impl ClockedRecord for $record {
+                fn materialise_due_transitions(&mut self, now: SystemTime) {
+                    self.advance_clock(now);
+                }
+            }
+        )+
+    };
 }
 
-impl JobLifecycle for MedicalTranscriptionJobRecord {
-    fn materialise_due_transitions(&mut self, now: SystemTime) {
-        self.advance_clock(now);
-    }
-
-    fn job_status(&self) -> &str {
-        &self.status
-    }
-
-    fn sequence(&self) -> u64 {
-        self.sequence
-    }
+// Every family whose records the model gives a status or state the clock moves. A
+// custom vocabulary FILTER has no `VocabularyState` in the model and a Call Analytics
+// category no status at all, so neither family has a transition to materialise and
+// neither appears here.
+clocked_records! {
+    TranscriptionJobRecord;
+    MedicalTranscriptionJobRecord;
+    MedicalScribeJobRecord;
+    CallAnalyticsJobRecord;
+    LanguageModelRecord;
+    VocabularyRecord;
+    MedicalVocabularyRecord;
 }
 
-impl JobLifecycle for CallAnalyticsJobRecord {
-    fn materialise_due_transitions(&mut self, now: SystemTime) {
-        self.advance_clock(now);
-    }
-
-    fn job_status(&self) -> &str {
-        &self.status
-    }
-
-    fn sequence(&self) -> u64 {
-        self.sequence
-    }
+/// The record `region` holds under `name`, with every transition the clock already
+/// owed it materialised, or `None` when that Region holds none — whatever any other
+/// Region holds under the same name.
+///
+/// THE SINGLE-RECORD LOOKUP of this service, written once over [`ClockedRecord`]
+/// rather than once per family, so every operation that reads, updates or deletes a
+/// resource of any family sees the same status: the one the clock already owed it.
+/// The transitions are materialised FIRST, before the caller decides anything from
+/// that status, so a resource whose transition was already due is reported — and
+/// refused, or deleted — in the state it has reached rather than the one it had left.
+pub fn record_mut<'store, R: ClockedRecord>(
+    store: &'store mut RegionalStore<R>,
+    region: &str,
+    name: &str,
+    now: SystemTime,
+) -> Option<&'store mut R> {
+    let record = store.get_mut(region, name)?;
+    record.materialise_due_transitions(now);
+    Some(record)
 }
 
-impl JobLifecycle for MedicalScribeJobRecord {
-    fn materialise_due_transitions(&mut self, now: SystemTime) {
-        self.advance_clock(now);
-    }
+/// `region`'s records, newest first.
+///
+/// THE ORDERING of every sequence-paged listing this service serves ("ordered by
+/// creation date, with the newest ... first", as each of their docs words it), written
+/// once over the creation sequence [`ListedRecord`] gives every family's records: a
+/// listing that put the oldest first would page a caller through history before
+/// reaching what it just created. Only `region`'s records, because a listing is served
+/// by one Region's endpoint and reports what that Region holds.
+pub fn newest_first<'store, R: ListedRecord>(
+    store: &'store RegionalStore<R>,
+    region: &str,
+) -> Vec<&'store R> {
+    let mut records: Vec<&R> = store.values_in(region).collect();
+    records.sort_by_key(|record| std::cmp::Reverse(record.sequence()));
+    records
+}
 
-    fn job_status(&self) -> &str {
-        &self.status
+/// Materialise every clock-owed transition of the records `region` holds, then those
+/// records [`newest_first`] — what a listing of a family whose records have a
+/// transition at all answers with.
+///
+/// The two rules composed in one place for every such family: the status a listing
+/// reports is the one the clock already owed each record, and the order is that
+/// family's creation order reversed. A family whose records carry no transition
+/// (a custom vocabulary filter) orders itself with [`newest_first`] alone.
+pub fn materialised_newest_first<'store, R: ClockedRecord + ListedRecord>(
+    store: &'store mut RegionalStore<R>,
+    region: &str,
+    now: SystemTime,
+) -> Vec<&'store R> {
+    for record in store.values_in_mut(region) {
+        record.materialise_due_transitions(now);
     }
-
-    fn sequence(&self) -> u64 {
-        self.sequence
-    }
+    newest_first(store, region)
 }
 
 /// How many of `region`'s `jobs` the service is still working on at `now`: the records
@@ -258,7 +281,13 @@ impl JobLifecycle for MedicalScribeJobRecord {
 /// bounds (see [`MAX_CONCURRENT_TRANSCRIPTION_JOBS`]), so a finished job releases its
 /// slot while staying listable. The ceiling is published per account per REGION, so
 /// only the jobs of the Region the start was signed for are counted.
-pub fn jobs_in_flight<R: JobLifecycle>(
+///
+/// One spelling for every job family, bounded by the two traits that already state
+/// what it needs of a record — the clock-owed transitions ([`ClockedRecord`]) and the
+/// status ([`ListedRecord`]) — rather than by a third trait of its own: the four job
+/// records differ in what a job IS, not in how its status moves. A family whose model
+/// gives its records no status at all is in flight for nothing.
+pub fn jobs_in_flight<R: ClockedRecord + ListedRecord>(
     jobs: &mut RegionalStore<R>,
     region: &str,
     now: SystemTime,
@@ -266,7 +295,10 @@ pub fn jobs_in_flight<R: JobLifecycle>(
     let mut in_flight = 0;
     for record in jobs.values_in_mut(region) {
         record.materialise_due_transitions(now);
-        if !is_terminal_job_status(record.job_status()) {
+        if record
+            .status()
+            .is_some_and(|status| !is_terminal_job_status(status))
+        {
             in_flight += 1;
         }
     }
@@ -283,7 +315,7 @@ pub fn jobs_in_flight<R: JobLifecycle>(
 /// is this count, not that ceiling, that caps how many records one caller can hold
 /// unfinished at once (see [`MAX_QUEUED_TRANSCRIPTION_JOBS`] and
 /// [`MAX_QUEUED_CALL_ANALYTICS_JOBS`]).
-pub fn jobs_waiting_in_queue<R: JobLifecycle>(
+pub fn jobs_waiting_in_queue<R: ClockedRecord + ListedRecord>(
     jobs: &mut RegionalStore<R>,
     region: &str,
     now: SystemTime,
@@ -291,7 +323,7 @@ pub fn jobs_waiting_in_queue<R: JobLifecycle>(
     let mut waiting = 0;
     for record in jobs.values_in_mut(region) {
         record.materialise_due_transitions(now);
-        if record.job_status() == STATUS_QUEUED {
+        if record.status() == Some(STATUS_QUEUED) {
             waiting += 1;
         }
     }
@@ -330,7 +362,7 @@ pub enum StartAdmission {
 /// waiting job holds no running slot, so the ceiling cannot cap how many of them one
 /// caller accumulates: `depth` does, and a start that would make the queue deeper is
 /// refused in the ceiling's own words (see [`MAX_QUEUED_TRANSCRIPTION_JOBS`]).
-pub fn admit_start<R: JobLifecycle>(
+pub fn admit_start<R: ClockedRecord + ListedRecord>(
     jobs: &mut RegionalStore<R>,
     region: &str,
     now: SystemTime,
@@ -412,7 +444,10 @@ pub const MAX_RETAINED_JOB_RECORDS: usize = 500;
 /// delete of that job would drop it. With the concurrency quota capping how many jobs
 /// can be in flight at once, the two together bound a family's store for one Region at
 /// [`MAX_RETAINED_JOB_RECORDS`] plus that quota.
-pub fn evict_oldest_finished_jobs<R: JobLifecycle>(jobs: &mut RegionalStore<R>, region: &str) {
+pub fn evict_oldest_finished_jobs<R: ClockedRecord + ListedRecord>(
+    jobs: &mut RegionalStore<R>,
+    region: &str,
+) {
     let held = jobs.len_in(region);
     if held <= MAX_RETAINED_JOB_RECORDS {
         return;
@@ -420,7 +455,7 @@ pub fn evict_oldest_finished_jobs<R: JobLifecycle>(jobs: &mut RegionalStore<R>, 
     let excess = held - MAX_RETAINED_JOB_RECORDS;
     let mut finished: Vec<(u64, String)> = jobs
         .iter_in(region)
-        .filter(|(_, record)| is_terminal_job_status(record.job_status()))
+        .filter(|(_, record)| record.status().is_some_and(is_terminal_job_status))
         .map(|(name, record)| (record.sequence(), name.to_string()))
         .collect();
     finished.sort_unstable();
@@ -1505,246 +1540,163 @@ impl ComAmazonawsTranscribeTranscribeState {
         self.next_sequence
     }
 
-    /// The transcription job named `name`, with every clock-owed transition of it
-    /// already materialised, or `None` when that Region has started no such job.
-    ///
-    /// The single lookup for this family, so every operation that reads or deletes a
-    /// transcription job sees the same status: the one the clock already owed it. The
-    /// transitions are materialised FIRST, before the caller decides anything from the
-    /// status, so a job whose completion was already due is reported — and deleted —
-    /// as completed rather than as the status it had left.
+    /// The transcription job named `name`, through the shared lookup ([`record_mut`]),
+    /// so every operation that reads or deletes a transcription job sees the status the
+    /// clock already owed it.
     pub fn transcription_job_mut(
         &mut self,
         region: &str,
         name: &str,
         now: SystemTime,
     ) -> Option<&mut TranscriptionJobRecord> {
-        let record = self.transcription_jobs.get_mut(region, name)?;
-        record.advance_clock(now);
-        Some(record)
+        record_mut(&mut self.transcription_jobs, region, name, now)
     }
 
-    /// Materialise every clock-owed status transition of the jobs `region` holds, then
-    /// those jobs newest first — the order `ListTranscriptionJobs` documents ("Jobs are
-    /// ordered by creation date, with the newest job first").
-    ///
-    /// Only `region`'s jobs: a listing is served by one Region's endpoint and reports
-    /// what that Region holds.
+    /// This family's share of `region`, through the shared listing projection
+    /// ([`materialised_newest_first`]) — the order `ListTranscriptionJobs` documents
+    /// ("Jobs are ordered by creation date, with the newest job first").
     pub fn jobs_newest_first(
         &mut self,
         region: &str,
         now: SystemTime,
     ) -> Vec<&TranscriptionJobRecord> {
-        for record in self.transcription_jobs.values_in_mut(region) {
-            record.advance_clock(now);
-        }
-        let mut records: Vec<&TranscriptionJobRecord> =
-            self.transcription_jobs.values_in(region).collect();
-        records.sort_by_key(|record| std::cmp::Reverse(record.sequence));
-        records
+        materialised_newest_first(&mut self.transcription_jobs, region, now)
     }
 
-    /// The MEDICAL transcription job named `name`, with every clock-owed transition of
-    /// it already materialised, or `None` when that Region has started no such job.
-    ///
-    /// The single lookup for this family, so every operation that reads or deletes a
-    /// medical transcription job sees the same status: the one the clock already owed
-    /// it.
+    /// The MEDICAL transcription job named `name`, through the shared lookup
+    /// ([`record_mut`]).
     pub fn medical_transcription_job_mut(
         &mut self,
         region: &str,
         name: &str,
         now: SystemTime,
     ) -> Option<&mut MedicalTranscriptionJobRecord> {
-        let record = self.medical_transcription_jobs.get_mut(region, name)?;
-        record.advance_clock(now);
-        Some(record)
+        record_mut(&mut self.medical_transcription_jobs, region, name, now)
     }
 
-    /// Materialise every clock-owed MEDICAL transcription job transition, then the
-    /// stored jobs newest first — the order `ListMedicalTranscriptionJobs` documents
-    /// ("Jobs are ordered by creation date, with the newest job first").
+    /// This family's share of `region`, through the shared listing projection
+    /// ([`materialised_newest_first`]) — the order `ListMedicalTranscriptionJobs`
+    /// documents ("Jobs are ordered by creation date, with the newest job first").
     pub fn medical_transcription_jobs_newest_first(
         &mut self,
         region: &str,
         now: SystemTime,
     ) -> Vec<&MedicalTranscriptionJobRecord> {
-        for record in self.medical_transcription_jobs.values_in_mut(region) {
-            record.advance_clock(now);
-        }
-        let mut records: Vec<&MedicalTranscriptionJobRecord> =
-            self.medical_transcription_jobs.values_in(region).collect();
-        records.sort_by_key(|record| std::cmp::Reverse(record.sequence));
-        records
+        materialised_newest_first(&mut self.medical_transcription_jobs, region, now)
     }
 
-    /// The Medical Scribe job named `name`, with every clock-owed transition of it
-    /// already materialised, or `None` when that Region has started no such job.
-    ///
-    /// The single lookup for this family, so every operation that reads or deletes a
-    /// Medical Scribe job sees the same status: the one the clock already owed it.
+    /// The Medical Scribe job named `name`, through the shared lookup ([`record_mut`]).
     pub fn medical_scribe_job_mut(
         &mut self,
         region: &str,
         name: &str,
         now: SystemTime,
     ) -> Option<&mut MedicalScribeJobRecord> {
-        let record = self.medical_scribe_jobs.get_mut(region, name)?;
-        record.advance_clock(now);
-        Some(record)
+        record_mut(&mut self.medical_scribe_jobs, region, name, now)
     }
 
-    /// Materialise every clock-owed Medical Scribe job transition, then the stored
-    /// jobs newest first — the order `ListMedicalScribeJobs` documents ("Jobs are
-    /// ordered by creation date, with the newest job first").
+    /// This family's share of `region`, through the shared listing projection
+    /// ([`materialised_newest_first`]) — the order `ListMedicalScribeJobs` documents
+    /// ("Jobs are ordered by creation date, with the newest job first").
     pub fn medical_scribe_jobs_newest_first(
         &mut self,
         region: &str,
         now: SystemTime,
     ) -> Vec<&MedicalScribeJobRecord> {
-        for record in self.medical_scribe_jobs.values_in_mut(region) {
-            record.advance_clock(now);
-        }
-        let mut records: Vec<&MedicalScribeJobRecord> =
-            self.medical_scribe_jobs.values_in(region).collect();
-        records.sort_by_key(|record| std::cmp::Reverse(record.sequence));
-        records
+        materialised_newest_first(&mut self.medical_scribe_jobs, region, now)
     }
 
-    /// The Call Analytics job named `name`, with every clock-owed transition of it
-    /// already materialised, or `None` when that Region has started no such job.
-    ///
-    /// The single lookup for this family, so every operation that reads a Call
-    /// Analytics job sees the same status: the one the clock already owed it.
+    /// The Call Analytics job named `name`, through the shared lookup ([`record_mut`]).
     pub fn call_analytics_job_mut(
         &mut self,
         region: &str,
         name: &str,
         now: SystemTime,
     ) -> Option<&mut CallAnalyticsJobRecord> {
-        let record = self.call_analytics_jobs.get_mut(region, name)?;
-        record.advance_clock(now);
-        Some(record)
+        record_mut(&mut self.call_analytics_jobs, region, name, now)
     }
 
-    /// Materialise every clock-owed Call Analytics job transition, then the stored
-    /// jobs newest first — the order `ListCallAnalyticsJobs` documents ("Jobs are
-    /// ordered by creation date, with the newest job first").
+    /// This family's share of `region`, through the shared listing projection
+    /// ([`materialised_newest_first`]) — the order `ListCallAnalyticsJobs` documents
+    /// ("Jobs are ordered by creation date, with the newest job first").
     pub fn call_analytics_jobs_newest_first(
         &mut self,
         region: &str,
         now: SystemTime,
     ) -> Vec<&CallAnalyticsJobRecord> {
-        for record in self.call_analytics_jobs.values_in_mut(region) {
-            record.advance_clock(now);
-        }
-        let mut records: Vec<&CallAnalyticsJobRecord> =
-            self.call_analytics_jobs.values_in(region).collect();
-        records.sort_by_key(|record| std::cmp::Reverse(record.sequence));
-        records
+        materialised_newest_first(&mut self.call_analytics_jobs, region, now)
     }
 
-    /// The custom vocabulary named `name`, with every clock-owed transition of it
-    /// already materialised, or `None` when that Region holds no such vocabulary.
+    /// The custom vocabulary named `name`, through the shared lookup ([`record_mut`]).
     pub fn vocabulary_mut(
         &mut self,
         region: &str,
         name: &str,
         now: SystemTime,
     ) -> Option<&mut VocabularyRecord> {
-        let record = self.vocabularies.get_mut(region, name)?;
-        record.advance_clock(now);
-        Some(record)
+        record_mut(&mut self.vocabularies, region, name, now)
     }
 
-    /// Materialise every clock-owed vocabulary transition, then the stored
-    /// vocabularies newest first.
-    ///
-    /// Newest first for the same reason the job listing is: a listing that put the
-    /// oldest first would page a caller through history before reaching what it just
-    /// created.
+    /// This family's share of `region`, through the shared listing projection
+    /// ([`materialised_newest_first`]).
     pub fn vocabularies_newest_first(
         &mut self,
         region: &str,
         now: SystemTime,
     ) -> Vec<&VocabularyRecord> {
-        for record in self.vocabularies.values_in_mut(region) {
-            record.advance_clock(now);
-        }
-        let mut records: Vec<&VocabularyRecord> = self.vocabularies.values_in(region).collect();
-        records.sort_by_key(|record| std::cmp::Reverse(record.sequence));
-        records
+        materialised_newest_first(&mut self.vocabularies, region, now)
     }
 
-    /// The custom MEDICAL vocabulary named `name`, with every clock-owed transition
-    /// of it already materialised, or `None` when that Region holds no such medical
-    /// vocabulary.
+    /// The custom MEDICAL vocabulary named `name`, through the shared lookup
+    /// ([`record_mut`]).
     pub fn medical_vocabulary_mut(
         &mut self,
         region: &str,
         name: &str,
         now: SystemTime,
     ) -> Option<&mut MedicalVocabularyRecord> {
-        let record = self.medical_vocabularies.get_mut(region, name)?;
-        record.advance_clock(now);
-        Some(record)
+        record_mut(&mut self.medical_vocabularies, region, name, now)
     }
 
-    /// Materialise every clock-owed medical-vocabulary transition, then the stored
-    /// medical vocabularies newest first — the order `ListMedicalVocabularies`
-    /// documents ("Custom vocabularies are ordered by creation date, with the newest
-    /// vocabulary first").
+    /// This family's share of `region`, through the shared listing projection
+    /// ([`materialised_newest_first`]) — the order `ListMedicalVocabularies` documents
+    /// ("Custom vocabularies are ordered by creation date, with the newest vocabulary
+    /// first").
     pub fn medical_vocabularies_newest_first(
         &mut self,
         region: &str,
         now: SystemTime,
     ) -> Vec<&MedicalVocabularyRecord> {
-        for record in self.medical_vocabularies.values_in_mut(region) {
-            record.advance_clock(now);
-        }
-        let mut records: Vec<&MedicalVocabularyRecord> =
-            self.medical_vocabularies.values_in(region).collect();
-        records.sort_by_key(|record| std::cmp::Reverse(record.sequence));
-        records
+        materialised_newest_first(&mut self.medical_vocabularies, region, now)
     }
 
-    /// The stored custom vocabulary filters, newest first. A filter has no
-    /// `VocabularyState` in the model, so none of them has a clock-owed transition.
+    /// This family's share of `region`, through the shared ordering alone
+    /// ([`newest_first`]): a filter has no `VocabularyState` in the model, so none of
+    /// them has a clock-owed transition to materialise first.
     pub fn vocabulary_filters_newest_first(&self, region: &str) -> Vec<&VocabularyFilterRecord> {
-        let mut records: Vec<&VocabularyFilterRecord> =
-            self.vocabulary_filters.values_in(region).collect();
-        records.sort_by_key(|record| std::cmp::Reverse(record.sequence));
-        records
+        newest_first(&self.vocabulary_filters, region)
     }
 
-    /// The custom language model named `name`, with every clock-owed transition of it
-    /// already materialised, or `None` when that Region holds no such model.
+    /// The custom language model named `name`, through the shared lookup
+    /// ([`record_mut`]).
     pub fn language_model_mut(
         &mut self,
         region: &str,
         name: &str,
         now: SystemTime,
     ) -> Option<&mut LanguageModelRecord> {
-        let record = self.language_models.get_mut(region, name)?;
-        record.advance_clock(now);
-        Some(record)
+        record_mut(&mut self.language_models, region, name, now)
     }
 
-    /// Materialise every clock-owed language-model transition, then the stored custom
-    /// language models newest first — the order `ListLanguageModels` documents
+    /// This family's share of `region`, through the shared listing projection
+    /// ([`materialised_newest_first`]) — the order `ListLanguageModels` documents
     /// ("Language models are ordered by creation date, with the newest model first").
     pub fn language_models_newest_first(
         &mut self,
         region: &str,
         now: SystemTime,
     ) -> Vec<&LanguageModelRecord> {
-        for record in self.language_models.values_in_mut(region) {
-            record.advance_clock(now);
-        }
-        let mut records: Vec<&LanguageModelRecord> =
-            self.language_models.values_in(region).collect();
-        records.sort_by_key(|record| std::cmp::Reverse(record.sequence));
-        records
+        materialised_newest_first(&mut self.language_models, region, now)
     }
 
     /// Whether `region` holds a resource of `family` named `name`.

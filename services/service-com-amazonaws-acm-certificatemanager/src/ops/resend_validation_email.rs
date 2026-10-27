@@ -252,12 +252,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // There is validation mail to resend only while ACM is still waiting for proof
+        // of domain control. That is a fact of the CERTIFICATE, so it is decided before
+        // the domain the request named is resolved: a certificate past that state holds
+        // no validation for any name, and answering "no such domain" for it would tell
+        // a caller its ARN or its name was wrong when neither is.
+        if certificate.status != crate::state::STATUS_PENDING_VALIDATION {
+            return Err(invalid_state(crate::state::not_pending_validation_message(
+                &input.certificate_arn,
+            )));
+        }
+
         // `Domain` is "the fully qualified domain name (FQDN) of the certificate that
         // needs to be validated" (`ResendValidationEmailRequest$Domain` doc), so it
         // names one of the certificate's own domain validations. A name this
         // certificate does not cover has no validation record to resend for, and a
         // resource the account does not hold is what `ResourceNotFoundException`
-        // reports, whatever the certificate's status.
+        // reports.
         let Some(index) = certificate
             .domain_validations
             .iter()
@@ -277,15 +288,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Beyond here the request is well formed and the only question is whether this
-        // certificate still has validation mail to send.
-        if certificate.status != crate::state::STATUS_PENDING_VALIDATION {
-            let status = certificate.status.clone();
-            return Err(invalid_state(format!(
-                "The certificate {} has status {status}, so it is no longer awaiting domain validation.",
-                input.certificate_arn
-            )));
-        }
-
+        // certificate still has validation mail to send for that domain.
         let validation = &certificate.domain_validations[index];
         if validation.validation_method != crate::state::VALIDATION_METHOD_EMAIL {
             let method = validation.validation_method.clone();

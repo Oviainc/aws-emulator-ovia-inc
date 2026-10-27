@@ -258,13 +258,13 @@ pub const MAX_COMPILED_PATTERNS: usize = 25;
 const MESSAGE_FIELD: &str = "message";
 
 /// The document key holding a section's processor sequence.
-const PROCESSOR_KEY: &str = "processor";
+pub(crate) const PROCESSOR_KEY: &str = "processor";
 
 /// The document key holding a section's source.
-const SOURCE_KEY: &str = "source";
+pub(crate) const SOURCE_KEY: &str = "source";
 
 /// The document key holding a section's sink sequence.
-const SINK_KEY: &str = "sink";
+pub(crate) const SINK_KEY: &str = "sink";
 
 /// The source and sink plugin that chains one pipeline section into another, and the
 /// key naming the section it chains to.
@@ -326,8 +326,11 @@ const PROCESSORS: &[(&str, &[&str])] = &[
 /// constants instead of by what the document asks for. The sibling API Gateway crate
 /// reads an API definition the same way, for the same reasons
 /// (`services/service-com-amazonaws-apigateway-backplanecontrolservice/src/ops/put_rest_api.rs`).
+/// `pub(crate)` because `ValidateTelemetryPipelineConfiguration` reports defects in the
+/// SAME document this reads, so it reads it through the same bounded reader rather
+/// than through a second one that could disagree with this one.
 #[derive(Debug, Clone, Default, PartialEq)]
-enum Node {
+pub(crate) enum Node {
     /// An empty value, `~` or `null` written plain.
     #[default]
     Null,
@@ -354,7 +357,7 @@ impl Node {
         }
     }
 
-    fn as_mapping(&self) -> Option<&[(String, Node)]> {
+    pub(crate) fn as_mapping(&self) -> Option<&[(String, Node)]> {
         match self {
             Self::Mapping(entries) => Some(entries.as_slice()),
             _ => None,
@@ -362,7 +365,7 @@ impl Node {
     }
 
     /// The value of `key`, for a mapping that carries one.
-    fn get(&self, key: &str) -> Option<&Node> {
+    pub(crate) fn get(&self, key: &str) -> Option<&Node> {
         self.as_mapping()?
             .iter()
             .find(|(name, _)| name == key)
@@ -596,7 +599,7 @@ fn guard_configuration_nesting(body: &str) -> Result<(), String> {
 }
 
 /// The configuration document as a node tree.
-fn parse_configuration(body: &str) -> Result<Node, String> {
+pub(crate) fn parse_configuration(body: &str) -> Result<Node, String> {
     guard_configuration_nesting(body)?;
     let mut builder = ConfigurationBuilder::default();
     ::yaml_rust2::parser::Parser::new_from_str(body)
@@ -623,7 +626,7 @@ fn parse_configuration(body: &str) -> Result<Node, String> {
 /// named section, and the chain is the entry section's processors followed by those of
 /// each section a `pipeline` sink hands its records on to — which is what the format's
 /// `pipeline` source and sink mean.
-fn processor_chain(root: &Node) -> Result<Vec<(&str, &Node)>, String> {
+pub(crate) fn processor_chain(root: &Node) -> Result<Vec<(&str, &Node)>, String> {
     if matches!(root, Node::Null) {
         return Err("Configuration.Body declares no pipeline".to_string());
     }
@@ -707,7 +710,7 @@ fn chain_of_sections(entries: &[(String, Node)]) -> Result<Vec<(&str, &Node)>, S
 
 /// Whether a node is a pipeline section: a mapping carrying a source, a processor
 /// sequence or a sink.
-fn is_section(node: &Node) -> bool {
+pub(crate) fn is_section(node: &Node) -> bool {
     node.as_mapping().is_some_and(|entries| {
         entries
             .iter()
@@ -895,6 +898,14 @@ fn compile_chain(chain: &[(&str, &Node)]) -> Result<Vec<Step>, String> {
         .iter()
         .map(|&(name, options)| compile_step(name, options, &mut patterns))
         .collect()
+}
+
+/// Whether every processor of `chain` is one this emulator runs, with options it
+/// takes: the compiled chain itself is this operation's business, so a caller that
+/// only wants the DEFECT — `ValidateTelemetryPipelineConfiguration`, which reports it
+/// instead of refusing the request — gets the refusal text and nothing else.
+pub(crate) fn chain_defect(chain: &[(&str, &Node)]) -> Result<(), String> {
+    compile_chain(chain).map(|_| ())
 }
 
 fn compile_step(name: &str, options: &Node, patterns: &mut usize) -> Result<Step, String> {

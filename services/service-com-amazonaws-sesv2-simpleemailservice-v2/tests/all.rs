@@ -49,6 +49,8 @@ mod email_identity_dkim_attributes;
 mod email_identity_feedback_attributes;
 #[path = "all/email_identity_lifecycle.rs"]
 mod email_identity_lifecycle;
+#[path = "all/email_identity_mail_from_attributes.rs"]
+mod email_identity_mail_from_attributes;
 #[path = "all/email_identity_policies.rs"]
 mod email_identity_policies;
 #[path = "all/email_templates.rs"]

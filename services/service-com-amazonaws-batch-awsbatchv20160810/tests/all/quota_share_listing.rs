@@ -30,7 +30,10 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_batch_awsbatchv20160810::state;
 
-use crate::job_lifecycle::{arn, compute_environment, error_code, error_message, job_queue, Batch};
+use crate::job_lifecycle::{
+    arn, assert_clock_owed_status, bracketed, compute_environment, error_code, error_message,
+    job_queue, Batch,
+};
 
 /// `ListQuotaShares`' route (`smithy_query(query="operation",
 /// operation="ListQuotaShares")`: POST /v1/listquotashares).
@@ -513,21 +516,27 @@ async fn a_listing_reports_the_status_the_clock_owes_and_follows_the_writes() {
 
     for share in shares().into_iter().filter(|row| row.queue == QUEUE) {
         let case = share.label.clone();
-        batch
-            .ok(CREATE, create_body(&share.name, share.queue, &share.extra))
+        // Both calls are bracketed: the move out of the transient status falls due one span
+        // after the CREATE, so the create's bracket and the listing's together decide what
+        // this listing must report for this share.
+        let created = bracketed(batch.ok(CREATE, create_body(&share.name, share.queue, &share.extra)))
             .await;
-        let fresh = listed(&batch, &case, json!({"jobQueue": QUEUE})).await;
-        let listed_share = details(&fresh)
+        let fresh = bracketed(listed(&batch, &case, json!({"jobQueue": QUEUE}))).await;
+        let listed_share = details(&fresh.value)
             .into_iter()
-            .find(|detail| {
-                detail["quotaShareName"].as_str() == Some(share.name.as_str())
-            })
-            .unwrap_or_else(|| panic!("case {case}: the created share is listed, got {fresh}"));
-        // The span is never zero, so the transient status is observable.
-        assert_eq!(
-            listed_share["status"].as_str(),
-            Some(state::STATUS_CREATING),
-            "case {case}: a fresh share is listed in the non-terminal status, got {listed_share}"
+            .find(|detail| detail["quotaShareName"].as_str() == Some(share.name.as_str()))
+            .unwrap_or_else(|| {
+                panic!("case {case}: the created share is listed, got {}", fresh.value)
+            });
+        // A listing is a read: it reports the share where the share's OWN span puts it —
+        // the non-terminal status while the listing is certainly before the move fell due,
+        // `VALID` once it is certainly after it.
+        assert_clock_owed_status(
+            &case,
+            &fresh.with_value(listed_share.clone()),
+            created.due_window(),
+            state::STATUS_CREATING,
+            Some(state::STATUS_VALID),
         );
         // The state the create asked for (or the documented default) is reported as stored.
         let requested_state = share.extra["state"]

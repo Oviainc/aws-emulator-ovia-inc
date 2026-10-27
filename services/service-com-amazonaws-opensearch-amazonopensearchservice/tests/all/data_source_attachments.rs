@@ -90,7 +90,7 @@ async fn list_attachments(emulator: &Emulator, id: &str, body: Value) -> Answer 
 }
 
 /// An application of this account, answering with the id it was minted under.
-async fn application(emulator: &Emulator, name: &str) -> String {
+pub(crate) async fn application(emulator: &Emulator, name: &str) -> String {
     let answer = emulator
         .call(
             "POST",

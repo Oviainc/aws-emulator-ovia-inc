@@ -254,6 +254,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
+        // The whole channel configuration is validated BEFORE anything is
+        // stored, so a request that does not describe a channel this service
+        // could run creates nothing: one `ValidationErrors` entry per problem,
+        // each naming the element it was found at, in the operation's modelled
+        // 422. The same rule `UpdateChannel` validates a rewritten
+        // configuration against, so the two cannot disagree about what a
+        // channel configuration is.
+        let problems = state.channel_configuration_problems(&crate::state::ChannelConfiguration {
+            encoder_settings: input.encoder_settings.as_ref(),
+            input_attachments: input.input_attachments.as_deref().unwrap_or_default(),
+        });
+        if !problems.is_empty() {
+            return Err(unprocessable(problems));
+        }
+
         // The store is bounded, so a create loop cannot grow the emulator's heap
         // without limit: once it is full the operation's own modelled throttle is
         // the answer, not another channel.
@@ -320,6 +335,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             channel: Some(channel),
         })
     }
+}
+
+/// The refusal a channel configuration this service could not run earns: the
+/// operation's modelled `UnprocessableEntityException` (422), carrying one
+/// `ValidationErrors` entry per problem — "A collection of validation error
+/// responses", each naming the element path the problem was found at — beside
+/// the message that says what the refusal is about. Nothing is stored for it,
+/// so no channel is created.
+fn unprocessable(problems: Vec<ValidationError>) -> CreateChannelError {
+    CreateChannelErrorModeled::UnprocessableEntityException(UnprocessableEntityException {
+        message: Some(crate::state::CHANNEL_CONTAINS_ERRORS_MESSAGE.to_string()),
+        validation_errors: Some(problems),
+    })
+    .into()
 }
 
 /// The engine this operation was built from is not the shared in-memory engine,

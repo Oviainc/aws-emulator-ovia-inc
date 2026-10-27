@@ -96,7 +96,13 @@ async fn channel(
     settings: Option<Value>,
     running: bool,
 ) -> String {
-    let mut request = json!({ "name": format!("thumbnails-{case}"), "channelClass": class });
+    let mut request = json!({
+        "name": format!("thumbnails-{case}"),
+        "channelClass": class,
+        // A channel configuration declares the encoder settings it encodes
+        // through; a row that is about those settings replaces them below.
+        "encoderSettings": crate::support::channel_encoder_settings(),
+    });
     if let Some(settings) = settings {
         request["encoderSettings"] = settings;
     }

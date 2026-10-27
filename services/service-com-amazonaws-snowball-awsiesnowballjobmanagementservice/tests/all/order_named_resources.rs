@@ -41,7 +41,7 @@ use super::job_lifecycle::{
 
 /// The Region every request in this suite is signed for, Snowball's and the owning
 /// services' alike: a resource is resolved where the order that names it is placed.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The account every resource this emulator holds belongs to.
 fn account() -> &'static str {
@@ -78,7 +78,7 @@ fn router_with_owning_services() -> MultiServiceRouter {
 /// One request to a service other than Snowball, signed for that service's own endpoint in
 /// [`REGION`]: the router picks a service by the SigV4 credential scope's service field.
 /// Nothing is verified — the harness turns request authentication off.
-async fn owning_service(
+pub(crate) async fn owning_service(
     router: &MultiServiceRouter,
     service: &str,
     method: &str,
@@ -116,7 +116,7 @@ async fn owning_service(
 /// The text of the first `<tag>` element of an XML body, which is how the query-protocol
 /// services here report a minted ARN or id. A scan rather than a document model, as this
 /// crate's sibling suites do: every tag read here is a leaf whose content is text.
-fn element(body: &str, tag: &str, case: &str) -> String {
+pub(crate) fn element(body: &str, tag: &str, case: &str) -> String {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let start = body
@@ -131,7 +131,7 @@ fn element(body: &str, tag: &str, case: &str) -> String {
 
 /// Percent-encode one `application/x-www-form-urlencoded` component, leaving only RFC 3986's
 /// unreserved characters literal.
-fn form_encode(value: &str) -> String {
+pub(crate) fn form_encode(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
         match byte {
@@ -233,7 +233,7 @@ async fn create_kms_key(router: &MultiServiceRouter) -> String {
 }
 
 /// `CreateTopic` on the mounted Amazon SNS service, answering the topic ARN SNS minted.
-async fn create_topic(router: &MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn create_topic(router: &MultiServiceRouter, name: &str) -> String {
     let case = format!("create the topic {name}");
     let body = format!(
         "Action=CreateTopic&Version=2010-03-31&Name={}",

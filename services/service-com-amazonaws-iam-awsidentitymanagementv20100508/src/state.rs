@@ -3313,9 +3313,19 @@ impl AwsManagedPolicy {
 /// the account-wide and job-function ones a client is most likely to read, and the
 /// service-linked-role policies that are published but NOT attachable
 /// ([`AwsManagedPolicy::is_attachable`]), so both kinds of entry a client can meet
-/// are discoverable here. An `arn:aws:iam::aws:policy/` ARN this catalog does not
-/// carry is therefore NOT refused as absent: see `crate::ops::get_policy`, which
-/// answers 501 for it rather than claiming AWS holds no such policy.
+/// are discoverable here.
+///
+/// It also carries every AWS-managed policy ARN another service of this emulator
+/// hands a caller as a recommendation: a control plane that names a policy ARN in a
+/// response must be able to describe that ARN, so an identifier this emulator
+/// publishes is never one its own API reports as missing. The EKS add-on catalog's
+/// `podIdentityConfiguration[].recommendedManagedPolicies` is the one place that
+/// does so today, and the five policies it names are entries here.
+///
+/// An `arn:aws:iam::aws:policy/` ARN this catalog does not carry resolves to no
+/// policy, and a read addressed by such an ARN is refused as the missing entity
+/// `NoSuchEntityException` names — the operations' modelled refusal — rather than
+/// with a code none of them declares.
 pub const AWS_MANAGED_POLICIES: &[AwsManagedPolicy] = &[
     AwsManagedPolicy {
         path: "/",
@@ -3329,6 +3339,15 @@ pub const AWS_MANAGED_POLICIES: &[AwsManagedPolicy] = &[
         policy_id: "ANPA_AWSLAMBDAEXECUTE",
         document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["logs:*"],"Resource":"arn:aws:logs:*:*:*"},{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject"],"Resource":"arn:aws:s3:::*"}]}"#,
     },
+    // Recommended by the EKS add-on catalog for the `amazon-cloudwatch-observability`
+    // add-on's `cloudwatch-agent` service account, beside
+    // `CloudWatchAgentServerPolicy`.
+    AwsManagedPolicy {
+        path: "/",
+        policy_name: "AWSXrayWriteOnlyAccess",
+        policy_id: "ANPA_AWSXRAYWRITEONLYACCESS",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["xray:PutTraceSegments","xray:PutTelemetryRecords","xray:GetSamplingRules","xray:GetSamplingTargets","xray:GetSamplingStatisticSummaries"],"Resource":["*"]}]}"#,
+    },
     AwsManagedPolicy {
         path: "/",
         policy_name: "AdministratorAccess",
@@ -3340,6 +3359,14 @@ pub const AWS_MANAGED_POLICIES: &[AwsManagedPolicy] = &[
         policy_name: "AmazonEC2ReadOnlyAccess",
         policy_id: "ANPA_AMAZONEC2READONLYACCESS",
         document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"ec2:Describe*","Resource":"*"},{"Effect":"Allow","Action":"elasticloadbalancing:Describe*","Resource":"*"},{"Effect":"Allow","Action":["cloudwatch:ListMetrics","cloudwatch:GetMetricStatistics","cloudwatch:Describe*"],"Resource":"*"},{"Effect":"Allow","Action":"autoscaling:Describe*","Resource":"*"}]}"#,
+    },
+    // Recommended by the EKS add-on catalog for the `vpc-cni` add-on's `aws-node`
+    // service account.
+    AwsManagedPolicy {
+        path: "/",
+        policy_name: "AmazonEKS_CNI_Policy",
+        policy_id: "ANPA_AMAZONEKS_CNI_POLICY",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ec2:AssignPrivateIpAddresses","ec2:AttachNetworkInterface","ec2:CreateNetworkInterface","ec2:DeleteNetworkInterface","ec2:DescribeInstances","ec2:DescribeTags","ec2:DescribeNetworkInterfaces","ec2:DescribeInstanceTypes","ec2:DescribeSubnets","ec2:DetachNetworkInterface","ec2:ModifyNetworkInterfaceAttribute","ec2:UnassignPrivateIpAddresses"],"Resource":"*"},{"Effect":"Allow","Action":["ec2:CreateTags"],"Resource":["arn:aws:ec2:*:*:network-interface/*"]}]}"#,
     },
     AwsManagedPolicy {
         path: "/",
@@ -3364,6 +3391,14 @@ pub const AWS_MANAGED_POLICIES: &[AwsManagedPolicy] = &[
         policy_name: "AmazonSQSFullAccess",
         policy_id: "ANPA_AMAZONSQSFULLACCESS",
         document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["sqs:*"],"Resource":"*"}]}"#,
+    },
+    // Recommended by the EKS add-on catalog for the
+    // `amazon-cloudwatch-observability` add-on's `cloudwatch-agent` service account.
+    AwsManagedPolicy {
+        path: "/",
+        policy_name: "CloudWatchAgentServerPolicy",
+        policy_id: "ANPA_CLOUDWATCHAGENTSERVERPOLICY",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["cloudwatch:PutMetricData","ec2:DescribeVolumes","ec2:DescribeTags","logs:PutLogEvents","logs:PutRetentionPolicy","logs:DescribeLogStreams","logs:DescribeLogGroups","logs:CreateLogStream","logs:CreateLogGroup","xray:PutTraceSegments","xray:PutTelemetryRecords","xray:GetSamplingRules","xray:GetSamplingTargets","xray:GetSamplingStatisticSummaries"],"Resource":"*"},{"Effect":"Allow","Action":["ssm:GetParameter"],"Resource":"arn:aws:ssm:*:*:parameter/AmazonCloudWatch-*"}]}"#,
     },
     AwsManagedPolicy {
         path: "/",
@@ -3437,11 +3472,31 @@ pub const AWS_MANAGED_POLICIES: &[AwsManagedPolicy] = &[
         policy_id: "ANPA_SERVICEROLE_AWSLAMBDABASICEXECUTIONROLE",
         document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],"Resource":"*"}]}"#,
     },
+    // Recommended by the EKS add-on catalog for the `aws-ebs-csi-driver` add-on's
+    // `ebs-csi-controller-sa` service account. The conditions are the published
+    // policy's: the driver may create and delete only the volumes and snapshots it
+    // tagged for itself.
+    AwsManagedPolicy {
+        path: "/service-role/",
+        policy_name: "AmazonEBSCSIDriverPolicy",
+        policy_id: "ANPA_SERVICEROLE_AMAZONEBSCSIDRIVERPOLICY",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ec2:CreateSnapshot","ec2:AttachVolume","ec2:DetachVolume","ec2:ModifyVolume","ec2:DescribeAvailabilityZones","ec2:DescribeInstances","ec2:DescribeSnapshots","ec2:DescribeTags","ec2:DescribeVolumes","ec2:DescribeVolumesModifications"],"Resource":"*"},{"Effect":"Allow","Action":["ec2:CreateTags"],"Resource":["arn:aws:ec2:*:*:volume/*","arn:aws:ec2:*:*:snapshot/*"],"Condition":{"StringEquals":{"ec2:CreateAction":["CreateVolume","CreateSnapshot"]}}},{"Effect":"Allow","Action":["ec2:DeleteTags"],"Resource":["arn:aws:ec2:*:*:volume/*","arn:aws:ec2:*:*:snapshot/*"]},{"Effect":"Allow","Action":["ec2:CreateVolume"],"Resource":"*","Condition":{"StringLike":{"aws:RequestTag/ebs.csi.aws.com/cluster":"true"}}},{"Effect":"Allow","Action":["ec2:CreateVolume"],"Resource":"*","Condition":{"StringLike":{"aws:RequestTag/CSIVolumeName":"*"}}},{"Effect":"Allow","Action":["ec2:DeleteVolume"],"Resource":"*","Condition":{"StringLike":{"ec2:ResourceTag/ebs.csi.aws.com/cluster":"true"}}},{"Effect":"Allow","Action":["ec2:DeleteVolume"],"Resource":"*","Condition":{"StringLike":{"ec2:ResourceTag/CSIVolumeName":"*"}}},{"Effect":"Allow","Action":["ec2:DeleteSnapshot"],"Resource":"*","Condition":{"StringLike":{"ec2:ResourceTag/CSIVolumeSnapshotName":"*"}}},{"Effect":"Allow","Action":["ec2:DeleteSnapshot"],"Resource":"*","Condition":{"StringLike":{"ec2:ResourceTag/ebs.csi.aws.com/cluster":"true"}}}]}"#,
+    },
     AwsManagedPolicy {
         path: "/service-role/",
         policy_name: "AmazonECSTaskExecutionRolePolicy",
         policy_id: "ANPA_SERVICEROLE_AMAZONECSTASKEXECUTIONROLEPOLICY",
         document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ecr:GetAuthorizationToken","ecr:BatchCheckLayerAvailability","ecr:GetDownloadUrlForLayer","ecr:BatchGetImage","logs:CreateLogStream","logs:PutLogEvents"],"Resource":"*"}]}"#,
+    },
+    // Recommended by the EKS add-on catalog for the `aws-efs-csi-driver` add-on's
+    // `efs-csi-controller-sa` service account. The conditions are the published
+    // policy's: the driver may create an access point only while tagging it for its
+    // cluster, and may tag or delete only an access point already carrying that tag.
+    AwsManagedPolicy {
+        path: "/service-role/",
+        policy_name: "AmazonEFSCSIDriverPolicy",
+        policy_id: "ANPA_SERVICEROLE_AMAZONEFSCSIDRIVERPOLICY",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["elasticfilesystem:DescribeAccessPoints","elasticfilesystem:DescribeFileSystems","elasticfilesystem:DescribeMountTargets","ec2:DescribeAvailabilityZones"],"Resource":"*"},{"Effect":"Allow","Action":["elasticfilesystem:CreateAccessPoint"],"Resource":"*","Condition":{"StringLike":{"aws:RequestTag/efs.csi.aws.com/cluster":"true"}}},{"Effect":"Allow","Action":"elasticfilesystem:TagResource","Resource":"*","Condition":{"StringLike":{"aws:ResourceTag/efs.csi.aws.com/cluster":"true"}}},{"Effect":"Allow","Action":"elasticfilesystem:DeleteAccessPoint","Resource":"*","Condition":{"StringEquals":{"aws:ResourceTag/efs.csi.aws.com/cluster":"true"}}}]}"#,
     },
 ];
 
@@ -3470,20 +3525,28 @@ pub fn aws_managed_policy(arn: &str) -> Option<&'static AwsManagedPolicy> {
 /// carrying [`AWS_MANAGED_POLICY_ACCOUNT`] as its account — whether or not
 /// [`AWS_MANAGED_POLICIES`] carries that policy.
 ///
-/// This is what separates "AWS owns this policy" from "the account was asked about
-/// a policy it does not hold": the first is never reported as a missing entity.
+/// This is what separates "AWS owns this policy" from "this account owns it": the
+/// write operations refuse an AWS-owned ARN as an out-of-range value for their
+/// parameter rather than as a missing entity, because no account can create, change
+/// or delete a policy AWS owns.
 pub fn is_aws_managed_policy_arn(arn: &str) -> bool {
     parse_policy_arn(arn).is_some_and(|parsed| parsed.account == AWS_MANAGED_POLICY_ACCOUNT)
 }
 
-/// The scaffold's 501 payload for an ARN in AWS's own managed-policy namespace
-/// that [`AWS_MANAGED_POLICIES`] does not carry — `what` naming the part of the
-/// policy the caller asked about ("metadata", "document").
+/// The scaffold's 501 payload for a policy ATTACHED to an identity whose ARN is in
+/// AWS's own managed-policy namespace and which [`AWS_MANAGED_POLICIES`] does not
+/// carry — `what` naming the part of the policy the caller needed ("document").
 ///
-/// ONE wording, shared by every read addressed by `PolicyArn`, so no reader can
-/// answer "AWS serves no such policy" where another answers "the catalog is short
-/// of it": the emulator carries a SUBSET of AWS's catalog, and the only honest
-/// answer for an entry it does not carry is that nobody has written it down yet.
+/// NOT for an operation addressed by a `PolicyArn`: a read of the policy resource
+/// itself resolves the ARN and refuses a miss with the `NoSuchEntityException` its
+/// model declares ([`policy_not_found`]), because an operation may answer only the
+/// errors it models. This payload is for the operations whose subject is an IDENTITY
+/// that exists and whose attached grant the emulator holds no document for: nothing
+/// they model says "a document this request needed is not available", so the honest
+/// answer is that nobody has written that catalog entry down yet.
+///
+/// ONE wording, shared by those operations, so they cannot describe the same
+/// unreadable grant three different ways.
 pub fn uncarried_aws_managed_policy(arn: &str, what: &str) -> crate::scaffolded::NotImplemented {
     crate::scaffolded::NotImplemented {
         message: format!(

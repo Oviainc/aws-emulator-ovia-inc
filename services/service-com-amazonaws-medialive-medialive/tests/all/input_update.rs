@@ -453,6 +453,7 @@ async fn an_input_attached_to_a_channel_that_has_not_stopped_cannot_be_updated()
         Some(json!({
             "name": "attaching",
             "inputAttachments": [{ "inputId": input_id, "inputAttachmentName": "primary" }],
+            "encoderSettings": crate::support::channel_encoder_settings(),
         })),
     )
     .await;

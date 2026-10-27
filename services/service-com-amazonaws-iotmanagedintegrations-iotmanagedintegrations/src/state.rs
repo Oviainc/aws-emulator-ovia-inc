@@ -892,6 +892,66 @@ pub fn credential_locker_not_found(identifier: &str) -> ResourceNotFoundExceptio
     }
 }
 
+/// The `ResourceType` this service reports the custom endpoint under — the Smithy resource
+/// name, as [`CREDENTIAL_LOCKER_RESOURCE_TYPE`] is for a credential locker.
+pub const CUSTOM_ENDPOINT_RESOURCE_TYPE: &str = "CustomEndpoint";
+
+/// The custom-endpoint resource as a READ's reason names it: the resource's name in words,
+/// the way [`MANAGED_THING_RESOURCE_NAME`] is for a managed thing.
+pub const CUSTOM_ENDPOINT_RESOURCE_NAME: &str = "Custom Endpoint";
+
+/// This service's own regional DNS name, from the model's endpoint prefix
+/// (`smithy_query(query="service_info")` -> `"endpointPrefix": "api.iotmanagedintegrations"`).
+/// A registered custom endpoint's address is one account's dedicated label in front of it,
+/// so the address a region reports is built from what the model publishes rather than
+/// written down whole.
+pub const SERVICE_ENDPOINT_PREFIX: &str = "api.iotmanagedintegrations";
+
+/// The DNS suffix the regional endpoints of the `aws` partition carry, which the emulator's
+/// ARNs name as their partition too ([`engine::emulator_arn`] -> `arn:aws:…`).
+pub const AWS_DNS_SUFFIX: &str = "amazonaws.com";
+
+/// How many characters the dedicated label of a registered custom endpoint carries.
+///
+/// The label is what makes one account's endpoint ITS endpoint, so it is minted rather than
+/// derived from anything a caller sends. Its LENGTH is CHOSEN for the emulator — neither the
+/// model nor the AWS documentation publishes one — and chosen so the whole address stays
+/// well inside the modelled `EndpointAddress` maximum of 256 characters.
+pub const CUSTOM_ENDPOINT_LABEL_LENGTH: usize = 14;
+
+/// The dedicated label of one custom endpoint: the low [`CUSTOM_ENDPOINT_LABEL_LENGTH`]
+/// characters of a fresh opaque identifier ([`opaque_id`]), whose per-store counter occupies
+/// the end — so two registrations in one run never mint the same label. Lowercase hex, which
+/// the modelled `EndpointAddress` pattern (`^[A-Za-z0-9._@-]+$`) admits.
+pub fn custom_endpoint_label(counter: u64) -> String {
+    let id = opaque_id(counter);
+    let from = id.len().saturating_sub(CUSTOM_ENDPOINT_LABEL_LENGTH);
+    id.split_at(from).1.to_string()
+}
+
+/// The `EndpointAddress` of the custom endpoint `label` names in `region`: the dedicated
+/// label in front of this service's own regional DNS name
+/// ([`SERVICE_ENDPOINT_PREFIX`]`.{region}.`[`AWS_DNS_SUFFIX`]), as the modelled
+/// `EndpointAddress` (len 1..256, pattern `^[A-Za-z0-9._@-]+$`) requires.
+pub fn custom_endpoint_address(label: &str, region: &str) -> String {
+    format!("{label}.{SERVICE_ENDPOINT_PREFIX}.{region}.{AWS_DNS_SUFFIX}")
+}
+
+/// The modelled `ResourceNotFoundException` `GetCustomEndpoint` answers for a region where
+/// no `RegisterCustomEndpoint` has minted an endpoint yet: the read path's reason
+/// ([`resource_not_found_message`]) with this resource's name in words, plus the
+/// `ResourceType` member every 404 of this service reports.
+///
+/// The request carries NO identifier — the custom endpoint is a singleton — so there is
+/// nothing for the `ResourceId` member to report, and it stays absent.
+pub fn custom_endpoint_not_found_on_read() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(resource_not_found_message(CUSTOM_ENDPOINT_RESOURCE_NAME)),
+        resource_id: None,
+        resource_type: Some(CUSTOM_ENDPOINT_RESOURCE_TYPE.to_string()),
+    }
+}
+
 /// Per-service state for com-amazonaws-iotmanagedintegrations-iotmanagedintegrations. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
@@ -988,6 +1048,13 @@ pub struct ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
     /// none installed, which is what its read reports as the modelled 404 and what
     /// `ResetRuntimeLogConfiguration` returns it to.
     pub runtime_log_configurations: HashMap<RegionalName, RuntimeLogConfigurations>,
+    /// The dedicated custom endpoint a `RegisterCustomEndpoint` has minted in each region:
+    /// the region -> the `EndpointAddress` that call answered. The custom endpoint is a
+    /// per-account, per-region SINGLETON — neither its register nor its read carries an
+    /// identifier — so one address per region is the whole store, and a region with no
+    /// entry has had none registered. Keyed by a region the request carries, so it is
+    /// bounded by [`MAX_CONFIGURED_REGIONS`] like this service's other per-region stores.
+    pub custom_endpoints: HashMap<String, String>,
 }
 
 /// One region's hub configuration: the hub token timer expiry an account set there, and
@@ -1148,6 +1215,40 @@ impl ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
         self.hub_configurations
             .insert(region.to_string(), record.clone());
         Some(record)
+    }
+
+    /// The custom endpoint address `region`'s endpoint reports, or `None` when no
+    /// `RegisterCustomEndpoint` has minted one there.
+    pub fn custom_endpoint_in(&self, region: &str) -> Option<&str> {
+        self.custom_endpoints.get(region).map(String::as_str)
+    }
+
+    /// The custom endpoint of `region`, MINTING it on the first call: the address the
+    /// region already holds, else a freshly minted one, which is stored and answered — or
+    /// `None` when this store cannot take on another region.
+    ///
+    /// `RegisterCustomEndpoint` is a get-or-create: it carries no identifier and answers
+    /// the account's dedicated endpoint for the region it was signed for, so repeating it
+    /// hands back the address the first call minted instead of minting a second one. The
+    /// label is minted ONCE ([`custom_endpoint_label`]) and the address kept, which is what
+    /// makes every later register and every read report that same value.
+    ///
+    /// Taking on a region the store does not already hold is refused once it holds
+    /// [`MAX_CONFIGURED_REGIONS`] of them — the same rule, and the same bound, as
+    /// [`Self::put_hub_configuration`] — so a caller that varies its signing region cannot
+    /// make this store grow without end.
+    pub fn register_custom_endpoint(&mut self, region: &str) -> Option<String> {
+        if let Some(address) = self.custom_endpoints.get(region) {
+            return Some(address.clone());
+        }
+        if self.custom_endpoints.len() >= MAX_CONFIGURED_REGIONS {
+            return None;
+        }
+        let label = custom_endpoint_label(self.take_sequence());
+        let address = custom_endpoint_address(&label, region);
+        self.custom_endpoints
+            .insert(region.to_string(), address.clone());
+        Some(address)
     }
 
     /// The default encryption configuration `region`'s endpoint reports: the one a put

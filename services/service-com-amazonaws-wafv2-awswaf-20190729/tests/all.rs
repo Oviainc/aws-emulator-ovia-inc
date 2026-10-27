@@ -101,6 +101,8 @@ mod state_roundtrip;
 mod tag_value_round_trip;
 #[path = "all/top_path_statistics.rs"]
 mod top_path_statistics;
+#[path = "all/web_acl_association_fanout.rs"]
+mod web_acl_association_fanout;
 #[path = "all/web_acl_associations.rs"]
 mod web_acl_associations;
 #[path = "all/web_acl_lifecycle.rs"]

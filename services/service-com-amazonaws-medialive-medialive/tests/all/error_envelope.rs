@@ -185,7 +185,10 @@ async fn every_failure_carries_the_response_envelope() {
         "fixture channel",
         "POST",
         "/prod/channels",
-        Some(json!({ "name": "envelope-channel" })),
+        Some(json!({
+            "name": "envelope-channel",
+            "encoderSettings": crate::support::channel_encoder_settings(),
+        })),
     )
     .await;
     assert_eq!(
@@ -340,7 +343,10 @@ async fn a_success_reports_a_request_id_and_no_envelope_members() {
         "create a channel",
         "POST",
         "/prod/channels",
-        Some(json!({ "name": "success-channel" })),
+        Some(json!({
+            "name": "success-channel",
+            "encoderSettings": crate::support::channel_encoder_settings(),
+        })),
     )
     .await;
     let rows = vec![

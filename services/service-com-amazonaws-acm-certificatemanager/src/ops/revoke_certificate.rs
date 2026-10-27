@@ -200,6 +200,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // "Revokes a PUBLIC ACM certificate" (`RevokeCertificate` doc): the
+        // certificates this operation revokes are the ones ACM itself issued. A
+        // certificate whose material came from outside ACM is not one of them — ACM
+        // never signed it and operates no revocation list it appears on — so the call
+        // does not apply to it at all, before any question of export arises.
+        if certificate.is_imported() {
+            return Err(RevokeCertificateErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::not_a_public_certificate_message(
+                        &input.certificate_arn,
+                    )),
+                },
+            )
+            .into());
+        }
+
         // "You can only revoke certificates that have been previously exported" and
         // "revoking a certificate is permanent" (`RevokeCertificate` doc). A
         // certificate outside that state is a request this operation does not apply

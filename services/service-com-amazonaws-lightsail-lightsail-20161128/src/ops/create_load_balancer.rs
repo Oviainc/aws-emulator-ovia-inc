@@ -259,18 +259,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .unwrap_or_default();
         // `LoadBalancer$healthCheckPath` is a `NonEmptyString` (pattern `\S`),
-        // so a blank path is not one this load balancer could ever report; an
-        // ABSENT one gets the documented root path instead.
+        // so a blank path is not one this load balancer could ever report (the
+        // shared rule, [`crate::state::health_check_path_value`]); an ABSENT one
+        // gets the documented root path instead.
         let health_check_path = match input.health_check_path.as_deref() {
             None => crate::state::DEFAULT_HEALTH_CHECK_PATH.to_string(),
-            Some(path) if path.trim().is_empty() => {
-                return Err(invalid(
-                    "healthCheckPath must carry a non-whitespace path, or be omitted to use \
-                     the root path of the website"
-                        .to_string(),
-                ))
-            }
-            Some(path) => path.to_string(),
+            Some(path) => match crate::state::health_check_path_value(path) {
+                Some(value) => value,
+                None => {
+                    return Err(invalid(
+                        "healthCheckPath must carry a non-whitespace path, or be omitted to \
+                         use the root path of the website"
+                            .to_string(),
+                    ))
+                }
+            },
         };
         let tags = input.tags.clone().unwrap_or_default();
         if tags.len() > crate::state::MAX_TAGS {
@@ -287,6 +290,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ip_address_type
             .clone()
             .unwrap_or_else(|| crate::state::DEFAULT_IP_ADDRESS_TYPE.to_string());
+
+        // "Use the GetLoadBalancerTlsPolicies action to get a list of TLS policy
+        // names that you can specify": a name that catalog does not report names
+        // no policy this load balancer could be given.
+        if let Some(policy) = input.tls_policy_name.as_deref() {
+            if !crate::state::publishes_load_balancer_tls_policy(policy) {
+                return Err(invalid(crate::state::unpublished_tls_policy_message(
+                    "tlsPolicyName",
+                    policy,
+                )));
+            }
+        }
 
         let name = input.load_balancer_name;
         let location = crate::state::StoredLocation::regional(&region);

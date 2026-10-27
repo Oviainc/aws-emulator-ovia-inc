@@ -18,7 +18,11 @@
 //! A group belongs to the Region its ARN names, and an account holds at most
 //! [`MAX_INVESTIGATION_GROUPS_PER_REGION`] of them there — so the store is keyed by
 //! id and read per region through
-//! [`ComAmazonawsAiopsAiopsState::groups_in_region`].
+//! [`ComAmazonawsAiopsAiopsState::groups_in_region`] (or, for a page that resumes at
+//! an id, [`ComAmazonawsAiopsAiopsState::groups_in_region_from`]).
+//!
+//! What an id looks like is likewise decided once, in [`is_group_id`], from the one
+//! modelled pattern segment that states it.
 //!
 //! This service is REGIONAL — its endpoints are `aiops.<region>.<dns-suffix>`
 //! (`smithy_query(query="service_info")`) — so every regional endpoint serves only the
@@ -28,6 +32,7 @@
 //! it belongs to another one.
 
 use std::collections::{BTreeMap, HashMap};
+use std::ops::Bound;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_smithy_schema::{Schema, ShapeType, TraitMap};
@@ -259,8 +264,27 @@ impl ComAmazonawsAiopsAiopsState {
         &'a self,
         region: &'a str,
     ) -> impl Iterator<Item = &'a InvestigationGroup> + 'a {
+        self.groups_in_region_from(region, None)
+    }
+
+    /// The same per-region read as [`Self::groups_in_region`], resumed at `start_id`:
+    /// the groups of `region` whose id is not before it, still in the store's stable
+    /// id order.
+    ///
+    /// This is the reader a PAGINATED regional reader needs — the store is keyed by
+    /// id, so a page token naming an id is where the next page starts — and it is the
+    /// one place "which groups belong to this Region" is decided, for the quota and
+    /// for a listing alike. `start_id` need not be a stored id: the walk simply
+    /// begins at the first id that is not before it.
+    pub fn groups_in_region_from<'a>(
+        &'a self,
+        region: &'a str,
+        start_id: Option<&'a str>,
+    ) -> impl Iterator<Item = &'a InvestigationGroup> + 'a {
+        let from = start_id.map_or(Bound::Unbounded, Bound::Included);
         self.investigation_groups
-            .values()
+            .range::<str, _>((from, Bound::Unbounded))
+            .map(|(_, group)| group)
             .filter(move |group| group.region == region)
     }
 
@@ -1003,6 +1027,18 @@ pub fn store_capacity_exceeded() -> ServiceQuotaExceededException {
     ))
 }
 
+/// Whether `text` has the shape of an investigation-group id.
+///
+/// One modelled pattern segment decides it: the last segment of
+/// `InvestigationGroupArn` is `[A-Za-z0-9]{16}`
+/// (`smithy_query(query="shape",shape="InvestigationGroupArn")`). Everything that has
+/// to judge whether some text could name a stored group — the ARN resolver below and
+/// the opaque page token a regional reader hands back — judges it here, so the rule is
+/// read off that pattern in exactly one place.
+pub fn is_group_id(text: &str) -> bool {
+    text.len() == GROUP_ID_LEN && text.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
 /// The id segment of an investigation-group ARN, or `None` when `identifier` is not
 /// an ARN of this service's investigation-group resource.
 pub fn group_id_from_arn(identifier: &str) -> Option<&str> {
@@ -1022,7 +1058,7 @@ pub fn group_id_from_arn(identifier: &str) -> Option<&str> {
         return None;
     }
     let id = resource.strip_prefix(GROUP_ARN_RESOURCE_PREFIX)?;
-    (id.len() == GROUP_ID_LEN && id.bytes().all(|b| b.is_ascii_alphanumeric())).then_some(id)
+    is_group_id(id).then_some(id)
 }
 
 /// The ARN of the investigation group `id` in `region`.

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/asset_types.rs"]
 mod asset_types;
+#[path = "all/assets.rs"]
+mod assets;
 #[path = "all/batch_delete_connection.rs"]
 mod batch_delete_connection;
 #[path = "all/batch_get_jobs.rs"]
@@ -109,6 +111,8 @@ mod integration_table_properties;
 mod job_deletion;
 #[path = "all/job_listing.rs"]
 mod job_listing;
+#[path = "all/job_not_found_message.rs"]
+mod job_not_found_message;
 #[path = "all/job_regions.rs"]
 mod job_regions;
 #[path = "all/job_run_listing.rs"]

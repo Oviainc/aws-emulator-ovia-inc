@@ -53,6 +53,8 @@ mod application_authentication_methods_list;
 mod application_create;
 #[path = "all/application_create_providers.rs"]
 mod application_create_providers;
+#[path = "all/application_delete.rs"]
+mod application_delete;
 #[path = "all/application_describe.rs"]
 mod application_describe;
 #[path = "all/application_grant_independence.rs"]

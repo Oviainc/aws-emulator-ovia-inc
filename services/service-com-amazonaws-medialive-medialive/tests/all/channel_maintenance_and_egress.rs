@@ -35,6 +35,7 @@ const MAINTENANCE_DAYS: [&str; 7] = [
 ];
 
 async fn create(router: &MultiServiceRouter, body: Value) -> Value {
+    let body = crate::support::resolved_channel_body(router, body).await;
     let (status, response) = call(router, "POST", "/prod/channels", Some(body)).await;
     assert_eq!(
         status, 201,

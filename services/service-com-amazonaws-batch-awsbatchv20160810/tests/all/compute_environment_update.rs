@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_batch_awsbatchv20160810::state;
 
-use crate::job_lifecycle::Batch;
+use crate::job_lifecycle::{assert_clock_owed_status, assert_reads_agree, bracketed, Batch};
 
 /// Every `CRType` the model declares, with whether it runs on Fargate. The names are the
 /// crate's own `C_R_TYPE_VALUES` (the model's `com.amazonaws.batch#CRType` enum), and the
@@ -554,31 +554,36 @@ async fn the_move_out_of_updating_is_owed_by_the_clock_and_never_by_a_read() {
         state::STATUS_VALID
     );
 
-    batch
-        .ok(
-            "/v1/updatecomputeenvironment",
-            json!({"computeEnvironment": "ce-status", "state": "DISABLED"}),
-        )
-        .await;
+    let accepted = bracketed(batch.ok(
+        "/v1/updatecomputeenvironment",
+        json!({"computeEnvironment": "ce-status", "state": "DISABLED"}),
+    ))
+    .await;
 
-    // The span is never zero, so the caller observes the transient status...
-    let updating = describe(&batch, "ce-status").await;
-    assert_eq!(
-        updating["status"].as_str(),
-        Some(state::STATUS_UPDATING),
-        "case straight after the update: expected {}, got {updating}",
-        state::STATUS_UPDATING
+    // The span is never zero, so the caller observes the transient status — which of the
+    // two this read must report is decided by the bracket of the update that started it...
+    let updating = bracketed(describe(&batch, "ce-status")).await;
+    assert_clock_owed_status(
+        "the accepted update",
+        &updating,
+        accepted.due_window(),
+        state::STATUS_UPDATING,
+        Some(state::STATUS_VALID),
     );
     assert_eq!(
-        updating["state"].as_str(),
+        updating.value["state"].as_str(),
         Some("DISABLED"),
-        "case straight after the update: the update is already persisted, got {updating}"
+        "case straight after the update: the update is already persisted, got {}",
+        updating.value
     );
-    // ...and reading it again does not move it on: two reads at one instant agree.
-    let read_again = describe(&batch, "ce-status").await;
-    assert_eq!(
-        read_again, updating,
-        "case a second read at the same instant: a read must not change what a later caller sees, got {read_again}"
+    // ...and reading it again does not move it on: two reads before the clock owes
+    // anything agree.
+    let read_again = bracketed(describe(&batch, "ce-status")).await;
+    assert_reads_agree(
+        "the accepted update",
+        &updating,
+        &read_again,
+        accepted.due_window(),
     );
 
     // The clock does move it on, back to VALID, with the update still in place.

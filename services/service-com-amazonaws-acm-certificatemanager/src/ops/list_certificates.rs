@@ -346,9 +346,11 @@ fn matches_filters(cert: &crate::state::Certificate, input: &ListCertificatesInp
     let excluded_by_usage = includes.key_usage.as_ref().is_some_and(|wanted| {
         !wanted.iter().any(|name| cert.key_usages.contains(name))
     }) || includes.extended_key_usage.as_ref().is_some_and(|wanted| {
-        !wanted
-            .iter()
-            .any(|name| cert.extended_key_usages.contains(name))
+        !wanted.iter().any(|name| {
+            cert.extended_key_usages
+                .iter()
+                .any(|usage| usage.name == *name)
+        })
     });
 
     !(excluded_by_export || excluded_by_manager || excluded_by_usage)
