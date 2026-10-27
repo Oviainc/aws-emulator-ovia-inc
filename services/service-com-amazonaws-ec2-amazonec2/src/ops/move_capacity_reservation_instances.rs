@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op MoveCapacityReservationInstances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `MoveCapacityReservationInstances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`MoveCapacityReservationInstances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: moves available capacity from one stored Capacity Reservation into another,
+//! so each side's total and available counts change together and the capacity the two hold
+//! between them is conserved. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +144,326 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `MoveCapacityReservationInstances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(MoveCapacityReservationInstancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("MoveCapacityReservationInstances"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state;
+
+        let source_id = input.source_capacity_reservation_id.clone();
+        let destination_id = input.destination_capacity_reservation_id.clone();
+
+        // The SHAPE of both ids, before either is looked up: a value that is not a Capacity
+        // Reservation id at all names no reservation in ANY account, so it is refused as
+        // malformed rather than reported not found — the ONE reading of that form this
+        // crate has ([`crate::state::capacity_reservation_id_is_well_formed`]). Both ids
+        // are asked HERE so the SOURCE's shape is refused first, the order the request
+        // names the two in; the lookups further down ask the same question again through
+        // [`crate::state::require_known_capacity_reservation`], where it is a no-op for an
+        // id that got past this point.
+        state::require_well_formed_capacity_reservation_id(&source_id)?;
+        state::require_well_formed_capacity_reservation_id(&destination_id)?;
+
+        // "Move available capacity FROM a source Capacity Reservation TO a destination
+        // Capacity Reservation": one reservation is not two, and moving capacity from a
+        // reservation into itself would change nothing while reporting that it had.
+        if source_id == destination_id {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{destination_id}' for destinationCapacityReservationId: \
+                 it is the same Capacity Reservation as sourceCapacityReservationId"
+            )));
+        }
+
+        // "The number of instances that you want to move from the source Capacity
+        // Reservation" (`InstanceCount`): a move moves instances, so there has to be at
+        // least one of them. The model puts no `@range` on the member, so the handler is
+        // the only place this floor can be kept; how many the source HAS to give is a fact
+        // of that reservation and is checked below, once it has been resolved.
+        if input.instance_count < 1 {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{}' for instanceCount: a move moves at least 1 instance",
+                input.instance_count
+            )));
+        }
+
+        // The token map keeps the token for the process's lifetime, so its length is
+        // bounded the way every other idempotent request of this crate bounds its own.
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > state::MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "clientToken accepts at most {} characters",
+                state::MAX_CLIENT_TOKEN_CHARS
+            )));
+        }
+
+        let region = state::request_region(ctx.parts());
+        // ONE reading of the wall clock for this call, so the state both reservations are
+        // judged in and the state the answer reports cannot differ.
+        let now = ::std::time::SystemTime::now();
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // Every move the clock already owed is materialised before anything is read, so
+        // this call decides against the state a caller would have been shown anyway.
+        store.materialize_due_transitions();
+
+        // Idempotency: "Unique, case-sensitive identifier that you provide to ensure the
+        // idempotency of the request" (`ClientToken`) — one token names the ONE move it
+        // made, so a replay reports that move and moves nothing more. A repeat that carries
+        // the same token but asks for something ELSE is not a replay: the two reservations
+        // and the count the first request moved are compared against this one, and a
+        // difference is answered with `IdempotentParameterMismatch`. A token whose move
+        // named a reservation the store no longer holds is a MISS, not a mismatch: there is
+        // nothing left to report, so the request is served as a fresh move.
+        let replayed = input
+            .client_token
+            .as_deref()
+            .and_then(|token| {
+                store
+                    .capacity_reservation_move_client_tokens
+                    .get(&(region.clone(), token.to_string()))
+                    .cloned()
+            })
+            .filter(|first| {
+                store
+                    .capacity_reservations
+                    .contains_key(&first.source_capacity_reservation_id)
+                    && store
+                        .capacity_reservations
+                        .contains_key(&first.destination_capacity_reservation_id)
+            });
+        if let Some(first) = replayed {
+            if first
+                != (state::CapacityReservationInstanceMove {
+                    source_capacity_reservation_id: source_id.clone(),
+                    destination_capacity_reservation_id: destination_id.clone(),
+                    instance_count: input.instance_count,
+                })
+            {
+                // EC2's own wording for the code, from the one place this crate words it.
+                return Err(state::idempotent_parameter_mismatch());
+            }
+            // A replay writes nothing, so DryRun is the only thing left that can change
+            // the answer.
+            if input.dry_run == Some(true) {
+                return Err(Scaffolded::dry_run_operation());
+            }
+            return move_response(&store, &first, now);
+        }
+
+        // Both reservations have to exist for capacity to move between them. Each view is
+        // taken as of `now`, so an expiry the clock already owed is seen here rather than
+        // after the write.
+        let source =
+            state::require_known_capacity_reservation(&store, &source_id)?.view_at(now);
+        let destination =
+            state::require_known_capacity_reservation(&store, &destination_id)?.view_at(now);
+
+        // "The source Capacity Reservation and the destination Capacity Reservation must be
+        // `active`": capacity that is not available for use cannot be moved, and capacity
+        // cannot be added to a reservation that is not holding any.
+        for (id, view) in [(&source_id, &source), (&destination_id, &destination)] {
+            let current = view.state.as_deref().unwrap_or_default();
+            if current != state::CAPACITY_RESERVATION_STATE_ACTIVE {
+                return Err(state::incorrect_state_of(
+                    "Capacity Reservation",
+                    id,
+                    current,
+                ));
+            }
+        }
+
+        // "… and share the following: Instance type, Platform, Availability Zone, Tenancy,
+        // Placement group, Capacity Reservation end time - At specific time or Manually."
+        // The capacity being moved is capacity OF a configuration, so the destination has
+        // to reserve the same one: each member of that list is compared, and the first one
+        // that differs is named with both values, which is what the caller has to change.
+        // The end time appears as its TYPE — `limited` ("At specific time") or `unlimited`
+        // ("Manually"), the two members of the modelled `EndDateType` — rather than as the
+        // instant itself, which the list's own wording is about.
+        let shared: [(&str, Option<&str>, Option<&str>); 6] = [
+            (
+                "instanceType",
+                source.instance_type.as_deref(),
+                destination.instance_type.as_deref(),
+            ),
+            (
+                "instancePlatform",
+                source.instance_platform.as_deref(),
+                destination.instance_platform.as_deref(),
+            ),
+            (
+                "availabilityZone",
+                source.availability_zone.as_deref(),
+                destination.availability_zone.as_deref(),
+            ),
+            (
+                "tenancy",
+                source.tenancy.as_deref(),
+                destination.tenancy.as_deref(),
+            ),
+            (
+                "placementGroupArn",
+                source.placement_group_arn.as_deref(),
+                destination.placement_group_arn.as_deref(),
+            ),
+            (
+                "endDateType",
+                source.end_date_type.as_deref(),
+                destination.end_date_type.as_deref(),
+            ),
+        ];
+        if let Some((member, source_value, destination_value)) = shared
+            .into_iter()
+            .find(|(_, source_value, destination_value)| source_value != destination_value)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{destination_id}' for destinationCapacityReservationId: \
+                 its {member} is '{destination}' where Capacity Reservation \
+                 '{source_id}' has '{source}'",
+                destination = destination_value.unwrap_or_default(),
+                source = source_value.unwrap_or_default(),
+            )));
+        }
+
+        // "MOVE AVAILABLE capacity from a source Capacity Reservation": the instances a
+        // move takes are the source's unused ones — "the number of instances that can be
+        // launched in the Capacity Reservation"
+        // (`CapacityReservation$AvailableInstanceCount`) — so a move of more than the
+        // source has available is refused rather than taking capacity an instance is
+        // already using.
+        let source_available = source.available_instance_count.unwrap_or_default();
+        if input.instance_count > source_available {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{}' for instanceCount: Capacity Reservation \
+                 '{source_id}' has {source_available} instances available to move",
+                input.instance_count
+            )));
+        }
+
+        // The token map keeps one entry per move for the process's lifetime, so the bytes
+        // it would retain are charged against the store's budget BEFORE the write, the way
+        // every other caller-supplied string here is: the token's length is bounded above,
+        // but the number of moves a caller can make is not.
+        let payload_bytes = input.client_token.as_deref().map_or(0, str::len);
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(Scaffolded::tag_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied \
+                 data, so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // DryRun sits AFTER every parameter has been validated and both reservations
+        // resolved, and BEFORE the first write: "If you have the required permissions, the
+        // error response is DryRunOperation" (`DryRun`), so a request that would have been
+        // refused is refused with that reason instead, and one that would have succeeded
+        // leaves the store untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        let moved = state::CapacityReservationInstanceMove {
+            source_capacity_reservation_id: source_id.clone(),
+            destination_capacity_reservation_id: destination_id.clone(),
+            instance_count: input.instance_count,
+        };
+
+        // The capacity LEAVES the source and ARRIVES at the destination: both counts move
+        // on each side — the total the reservation reserves and the part of it nothing has
+        // launched into — so the capacity the two hold between them is conserved and
+        // neither side's available count can exceed its total. Saturating arithmetic: the
+        // counts are bounded by the checks above, and a count the type could not hold is
+        // pinned at its limit rather than wrapping into a negative reservation.
+        let Some(source_record) = store.capacity_reservations.get_mut(&source_id) else {
+            return Err(Scaffolded::internal_error(format!(
+                "the Capacity Reservation '{source_id}' could not be read back to move \
+                 its capacity"
+            )));
+        };
+        source_record.view.total_instance_count = Some(
+            source_record
+                .view
+                .total_instance_count
+                .unwrap_or_default()
+                .saturating_sub(input.instance_count),
+        );
+        source_record.view.available_instance_count = Some(
+            source_record
+                .view
+                .available_instance_count
+                .unwrap_or_default()
+                .saturating_sub(input.instance_count),
+        );
+
+        let Some(destination_record) = store.capacity_reservations.get_mut(&destination_id)
+        else {
+            return Err(Scaffolded::internal_error(format!(
+                "the Capacity Reservation '{destination_id}' could not be read back to \
+                 take the capacity moved into it"
+            )));
+        };
+        destination_record.view.total_instance_count = Some(
+            destination_record
+                .view
+                .total_instance_count
+                .unwrap_or_default()
+                .saturating_add(input.instance_count),
+        );
+        destination_record.view.available_instance_count = Some(
+            destination_record
+                .view
+                .available_instance_count
+                .unwrap_or_default()
+                .saturating_add(input.instance_count),
+        );
+
+        // The token is recorded only once the move has been made, so a request refused
+        // above leaves nothing behind to replay. Its own bytes are charged against the
+        // store's budget, the way every other caller-supplied string here is.
+        if let Some(token) = input.client_token.clone() {
+            store.add_stored_bytes(payload_bytes);
+            store
+                .capacity_reservation_move_client_tokens
+                .insert((region, token), moved.clone());
+        }
+
+        // The answer is read back OUT of the store, so this call and every later reader of
+        // either reservation cannot report the move differently.
+        move_response(&store, &moved, now)
     }
+}
+
+/// The two Capacity Reservations `moved` names, as this operation answers them: the source
+/// it took capacity out of, the destination it put it into, and "the number of instances
+/// that were moved from the source Capacity Reservation to the destination Capacity
+/// Reservation" (`MoveCapacityReservationInstancesResult$InstanceCount`).
+///
+/// Read out of the store rather than built from the request, so the call that made a move
+/// and a replay of it answer the same thing, and both report each reservation in the state
+/// the clock has actually reached (`now`).
+fn move_response(
+    store: &crate::state::ComAmazonawsEc2Amazonec2State,
+    moved: &crate::state::CapacityReservationInstanceMove,
+    now: ::std::time::SystemTime,
+) -> Result<MoveCapacityReservationInstancesOutput, MoveCapacityReservationInstancesError> {
+    let reservation = |capacity_reservation_id: &str| {
+        store
+            .capacity_reservations
+            .get(capacity_reservation_id)
+            .map(|record| record.view_at(now))
+            .ok_or_else(|| {
+                crate::scaffolded::Scaffolded::internal_error(format!(
+                    "the Capacity Reservation '{capacity_reservation_id}' could not be \
+                     read back to report the capacity moved"
+                ))
+            })
+    };
+    Ok(MoveCapacityReservationInstancesOutput {
+        source_capacity_reservation: Some(reservation(&moved.source_capacity_reservation_id)?),
+        destination_capacity_reservation: Some(reservation(
+            &moved.destination_capacity_reservation_id,
+        )?),
+        instance_count: Some(moved.instance_count),
+    })
 }
