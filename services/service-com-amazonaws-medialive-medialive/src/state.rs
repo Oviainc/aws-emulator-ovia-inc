@@ -271,10 +271,11 @@ pub(crate) use channel_placement_groups::channel_placement_group_output;
 pub mod alarm_templates;
 
 pub use alarm_templates::{
-    alarm_template_summary, template_scope, AlarmTemplateRefusal, AlarmTemplateUpdateRefusal,
-    CloudWatchAlarmTemplateChanges, CloudWatchAlarmTemplateRecord, NewCloudWatchAlarmTemplate,
-    MAX_ALARM_PERIOD_SECONDS, MAX_ALARM_TEMPLATES, MAX_ALARM_TEMPLATE_TOKENS, MAX_METRIC_NAME_LEN,
-    MIN_ALARM_DATAPOINTS, MIN_ALARM_PERIOD_SECONDS,
+    alarm_template_summary, check_alarm_template_settings, template_scope, AlarmTemplateRefusal,
+    AlarmTemplateSettings, AlarmTemplateUpdateRefusal, CloudWatchAlarmTemplateChanges,
+    CloudWatchAlarmTemplateRecord, NewCloudWatchAlarmTemplate, MAX_ALARM_PERIOD_SECONDS,
+    MAX_ALARM_TEMPLATES, MAX_ALARM_TEMPLATE_TOKENS, MAX_METRIC_NAME_LEN, MIN_ALARM_DATAPOINTS,
+    MIN_ALARM_PERIOD_SECONDS,
 };
 
 pub(crate) use alarm_templates::alarm_template_output;
@@ -976,6 +977,67 @@ pub fn bounded_length(
     Err(format!(
         "{member} must be between {min} and {max} characters long, but was {len}"
     ))
+}
+
+/// Check a numeric member against the range its target shape names, answering
+/// the message that refusal carries: the member, the bound and the value that
+/// broke it.
+///
+/// The counterpart of [`bounded_length`] for the integer members, and ONE copy
+/// of that range rule and of its wording for the same reason: a create and the
+/// update beside it check the same member of the same resource against the same
+/// range, so neither can drift into its own reading of it.
+///
+/// A member the request did not carry is `None` and asks for no change, so it
+/// breaks no bound.
+pub fn bounded_integer(member: &str, value: Option<i32>, min: i32, max: i32) -> Result<(), String> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if value >= min && value <= max {
+        return Ok(());
+    }
+    Err(format!(
+        "{member} must be between {min} and {max}, but was {value}"
+    ))
+}
+
+/// Check a member against the closed set of values the model declares for it,
+/// answering the message that refusal carries: the member, the catalog and the
+/// value that is not in it.
+///
+/// ONE copy of that closed-set rule and of its wording, for the reason
+/// [`bounded_length`] states: an enum member names a set the service can act on,
+/// and every operation that writes that member is held to the same set.
+///
+/// A member the request did not carry is `None` and asks for no change, so it
+/// names no value outside the set.
+pub fn one_of(member: &str, values: &[&str], value: Option<&str>) -> Result<(), String> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if values.contains(&value) {
+        return Ok(());
+    }
+    Err(format!(
+        "{member} must be one of {}, but was {value}",
+        values.join(", ")
+    ))
+}
+
+/// Check a count against the floor the model's `__integerMin1` sets for it,
+/// answering the message that refusal carries: the member and the count that
+/// broke it.
+///
+/// ONE copy of that floor and of its wording, for the reason [`bounded_length`]
+/// states: a purchase and the update beside it hold the same counts to the same
+/// minimum. A member the request did not carry is not a count at all, so it is
+/// not refused.
+pub fn at_least_one(member: &str, value: Option<i32>) -> Result<(), String> {
+    match value {
+        Some(count) if count < 1 => Err(format!("{member} must be at least 1, got {count}")),
+        _ => Ok(()),
+    }
 }
 
 /// The most tags one resource carries.
