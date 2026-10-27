@@ -160,13 +160,16 @@ fn judge_against_store(
     input: &AcceptConnectionProposalInput,
     region: &str,
 ) -> Result<StoreVerdict, AcceptConnectionProposalError> {
-    // The `activationKey` is the proposal's only handle, and it is the same handle
-    // `DescribeConnectionProposal` reads the proposal's parameters through: the
-    // store's `activationKey` -> connection-id index resolves it, and the connection
-    // it names is then resolved in the Region the request was signed for, so a key
-    // minted through another Region's endpoint resolves to nothing here. A key that
-    // resolves to no proposal is the modelled 404, worded without the key itself,
-    // which `ActivationKey` marks `@sensitive`.
+    // The `activationKey` is the proposal's only handle. The store's
+    // `activationKey` -> connection-id index resolves it, and the connection it names
+    // is then resolved in the Region the request was signed for, so a key minted
+    // through another Region's endpoint resolves to nothing here. A key that resolves
+    // to no proposal is the modelled 404, worded without the key itself, which
+    // `ActivationKey` marks `@sensitive`. Unlike the proposal READ
+    // (`crate::state::proposal_in`), which serves nothing once a `DeleteConnection`
+    // has been made on the connection, the record is resolved here whatever state it
+    // is in: the state is what refuses the acceptance below, and the refusal reports
+    // it.
     let stored = store
         .activation_keys
         .get(&input.activation_key)

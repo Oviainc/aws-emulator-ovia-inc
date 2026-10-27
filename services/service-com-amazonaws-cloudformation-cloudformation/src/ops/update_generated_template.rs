@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateGeneratedTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateGeneratedTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateGeneratedTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Changes the generated template the request addresses and starts a NEW generation over it:
+//! the name it is addressable by, the resources it covers (added, removed, or refreshed
+//! against the live state of the account) and the `TemplateConfiguration` assigned to them.
+//! The id it answers is the record's OWN id, which the update does not change, and the
+//! generation it starts is asynchronous exactly as the first one was — so
+//! `DescribeGeneratedTemplate` reports `UPDATE_IN_PROGRESS` until
+//! [`crate::state::generated_template::GENERATION_DELAY`] has passed and `COMPLETE` after it,
+//! and `GetGeneratedTemplate` goes on answering the template of the last COMPLETE generation
+//! until this one concludes ([`crate::state::generated_template`] holds that clock).
+//!
+//! A member the request leaves out changes nothing: the record keeps the name, the resources
+//! and the policies it already carried.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +167,169 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateGeneratedTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateGeneratedTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateGeneratedTemplate"))
+        use crate::state::generated_template as generated;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no generated template to update, and
+            // nothing was written.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateGeneratedTemplate",
+            ));
+        };
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+
+        let mut store = state.lock();
+        // Settled FIRST, so this update is computed over the record as the clock already
+        // leaves it rather than over a generation it has concluded since.
+        store.settle(now);
+
+        // The refusal for an address no record of this Region holds, which is also what a
+        // record that stopped resolving between the checks below and the write would be
+        // answered: "the generated template was not found".
+        let not_found = || -> Self::Error {
+            UpdateGeneratedTemplateErrorModeled::GeneratedTemplateNotFoundException(
+                GeneratedTemplateNotFoundException {
+                    message: Some(generated::does_not_exist(&input.generated_template_name)),
+                },
+            )
+            .into()
+        };
+
+        // "The name or Amazon Resource Name (ARN) of a generated template": either address
+        // resolves the record, and only within the Region the request is signed for.
+        let Some(current) = store
+            .resolve_generated_template(&region, &input.generated_template_name)
+        else {
+            return Err(not_found());
+        };
+        // The record's own id, which is what this operation answers: "the Amazon Resource
+        // Name (ARN) of the generated template" is minted with the record and an update
+        // changes the record, not its identity.
+        let generated_template_id = current.generated_template_id.clone();
+        let stack_id = current.stack_id.clone();
+        let mut resources = current.resources.clone();
+
+        // "An optional new name to assign to the generated template": a name addresses one
+        // generated template of the request's Region, so a rename onto a name another record
+        // already answers for is refused — "the resource with the name requested already
+        // exists" — while renaming a record to the name it already has changes nothing.
+        if let Some(new_name) = input.new_generated_template_name.as_deref() {
+            let taken = store
+                .resolve_generated_template(&region, new_name)
+                .is_some_and(|other| other.generated_template_id != generated_template_id);
+            if taken {
+                return Err(UpdateGeneratedTemplateErrorModeled::AlreadyExistsException(
+                    AlreadyExistsException {
+                        message: Some(generated::already_exists(new_name)),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // "A list of logical ids for resources to remove from the generated template", then
+        // "an optional list of resources to be added": the removal is applied first, so a
+        // request that names one logical id in both ends up covering the resource as the
+        // request defined it rather than as the record had it.
+        if let Some(remove) = input.remove_resources.as_deref() {
+            resources = generated::without_logical_ids(&resources, remove);
+        }
+        for definition in input.add_resources.iter().flatten() {
+            generated::fold(
+                &mut resources,
+                generated::GeneratedResource {
+                    resource_type: definition.resource_type.clone(),
+                    logical_resource_id: definition.logical_resource_id.clone(),
+                    resource_identifier: definition
+                        .resource_identifier
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect(),
+                },
+            );
+        }
+
+        // "If true, update the resource properties in the generated template with their
+        // current live state": the live state is read from the resources this account holds
+        // in the request's Region right now, so a refresh reports what they carry at this
+        // call rather than what they carried when the template was generated.
+        if input.refresh_all_resources == Some(true) {
+            let live = store.scannable_resources(&region);
+            for resource in &mut resources {
+                if let Some(found) = live_state(resource, stack_id.as_deref(), &live) {
+                    resource.resource_identifier = found.resource_identifier.clone();
+                }
+            }
+        }
+
+        // Both modelled resource lists of this feature are `@length(max: 500)`, so an update
+        // cannot leave a generated template holding — or reporting — more resources than
+        // that. Refused BEFORE anything is written, so the record is left as it was.
+        if resources.len() > generated::MAX_GENERATED_TEMPLATE_RESOURCES {
+            return Err(UpdateGeneratedTemplateErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(generated::resource_limit_exceeded()),
+                },
+            )
+            .into());
+        }
+
+        let Some(template) =
+            store.resolve_generated_template_mut(&region, &input.generated_template_name)
+        else {
+            return Err(not_found());
+        };
+        template.resources = resources;
+        if let Some(new_name) = input.new_generated_template_name.clone() {
+            template.generated_template_name = new_name;
+        }
+        // "Change the DeletionPolicy and UpdateReplacePolicy settings": each setting the
+        // request supplies is assigned, and one it does not mention keeps the value the
+        // record already carried — an update changes what it names.
+        if let Some(configuration) = input.template_configuration.as_ref() {
+            if configuration.deletion_policy.is_some() {
+                template.deletion_policy = configuration.deletion_policy.clone();
+            }
+            if configuration.update_replace_policy.is_some() {
+                template.update_replace_policy = configuration.update_replace_policy.clone();
+            }
+        }
+        // "You can check the status of the update to the generated template using the
+        // DescribeGeneratedTemplate API action": the update is answered with its generation
+        // still in flight and concludes on the clock.
+        template.begin_update(now);
+
+        Ok(UpdateGeneratedTemplateOutput {
+            generated_template_id: Some(generated_template_id),
+        })
     }
+}
+
+/// The live resource one row of a generated template stands for, when this account still
+/// holds it.
+///
+/// What a resource of this account looks like right now is the set a resource scan of the
+/// Region finds ([`crate::state::ComAmazonawsCloudformationCloudformationState::scannable_resources`]),
+/// so a row is matched against that set by what identifies it: the primary-identifier value
+/// the record already holds for it, or — for a row the base stack contributed, which carries
+/// no identifier of its own — the logical id that stack declares it under. A row nothing live
+/// answers for keeps the properties the record had, since there is no live state to report
+/// for it.
+fn live_state<'a>(
+    resource: &crate::state::generated_template::GeneratedResource,
+    stack_id: Option<&str>,
+    live: &'a [crate::state::resource_scans::FoundResource],
+) -> Option<&'a crate::state::resource_scans::FoundResource> {
+    live.iter().find(|found| {
+        found.resource_type == resource.resource_type
+            && (resource
+                .resource_identifier
+                .values()
+                .any(|value| value == &found.physical_resource_id)
+                || (resource.resource_identifier.is_empty()
+                    && stack_id == Some(found.stack_id.as_str())
+                    && resource.logical_resource_id.as_deref()
+                        == Some(found.logical_resource_id.as_str())))
+    })
 }

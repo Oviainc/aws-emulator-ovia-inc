@@ -59,7 +59,7 @@ const THREE_RESOURCE_STACK: &str = r#"{"Resources":{
 
 /// `GetGeneratedTemplate` for one address, in one language (or in none, so the service's
 /// own default answers).
-async fn get_generated_template(
+pub(crate) async fn get_generated_template(
     router: &MultiServiceRouter,
     name_or_id: &str,
     format: Option<&str>,
@@ -424,7 +424,7 @@ fn declared_resources(parsed: &template::Template) -> Vec<(String, String)> {
 }
 
 /// The resources one rendered template body declares, in the same order.
-fn declared(case: &str, body: &str) -> Vec<(String, String)> {
+pub(crate) fn declared(case: &str, body: &str) -> Vec<(String, String)> {
     declared_resources(&parsed_template(case, body))
 }
 

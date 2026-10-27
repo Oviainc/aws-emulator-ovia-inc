@@ -3432,60 +3432,103 @@ fn next_time_of_day_occurrence(
     SystemTime::UNIX_EPOCH + Duration::from_secs(start)
 }
 
-/// The maximum bitrate, in BITS PER SECOND, a router input of `tier` may carry, or `None`
-/// for a tier this function does not know.
+/// The Mbps steps a router tier may name, in the order the documentation publishes them.
 ///
-/// "The tier sets the maximum bitrate, in Mbps, for the router input. Valid values include
-/// the following: INPUT_20 – 20 Mbps, INPUT_50 – 50 Mbps, INPUT_100 – 100 Mbps, INPUT_250
-/// – 250 Mbps, INPUT_500 – 500 Mbps"
-/// (`smithy_query(query="doc",shape="CreateRouterInputRequest",member="Tier")`), so the
-/// tier a create names bounds the `MaximumBitrate` it may ask for. The published numbers
-/// are in Mbps and MediaConnect states a bitrate in bits per second, so each is converted
-/// through [`BITS_PER_MEGABIT`] — the router output side of the same rule is
-/// [`router_output_tier_bitrate_ceiling`].
-pub fn router_input_tier_bitrate_ceiling(tier: &str) -> Option<i64> {
-    let megabits_per_second = match tier {
-        "INPUT_20" => 20,
-        "INPUT_50" => 50,
-        "INPUT_100" => 100,
-        "INPUT_250" => 250,
-        "INPUT_500" => 500,
-        _ => return None,
-    };
-    Some(megabits_per_second * BITS_PER_MEGABIT)
+/// Both tier enums declare the SAME ladder, each name prefixed by the side of the router it
+/// configures: `RouterInputTier` (`smithy_query(query="shape",shape="RouterInputTier")`:
+/// INPUT_20 | INPUT_50 | INPUT_100 | INPUT_250 | INPUT_500) and `RouterOutputTier`
+/// (`smithy_query(query="shape",shape="RouterOutputTier")`: OUTPUT_20 | OUTPUT_50 |
+/// OUTPUT_100 | OUTPUT_250 | OUTPUT_500), with the Mbps of each spelled out by the tier's
+/// own documentation ("INPUT_20 – 20 Mbps, INPUT_50 – 50 Mbps, INPUT_100 – 100 Mbps,
+/// INPUT_250 – 250 Mbps, INPUT_500 – 500 Mbps",
+/// `smithy_query(query="doc",shape="CreateRouterInputRequest",member="Tier")`, and the same
+/// numbers under `smithy_query(query="doc",shape="CreateRouterOutputRequest",member="Tier")`).
+/// So the ladder is written ONCE and read through [`RouterTierLadder`].
+const ROUTER_TIER_MEGABITS_PER_SECOND: [i64; 5] = [20, 50, 100, 250, 500];
+
+/// One side of the router's tier catalog: the tier names it declares and what a refusal
+/// calls the resource those tiers configure.
+///
+/// The tier "sets the maximum bitrate, in Mbps" for the resource
+/// (`smithy_query(query="doc",shape="CreateRouterInputRequest",member="Tier")` and
+/// `smithy_query(query="doc",shape="CreateRouterOutputRequest",member="Tier")`, which
+/// `UpdateRouterInput$Tier` and `UpdateRouterOutput$Tier` repeat), and that is ONE rule:
+/// the tier a resource ends up with resolves to a ceiling on [`ROUTER_TIER_MEGABITS_PER_SECOND`],
+/// and the bitrate it is asked for must be positive and at most that ceiling. The two sides
+/// differ only in the prefix their tier names carry and in the noun a refusal names, so both
+/// are this one type: [`ROUTER_INPUT_TIERS`] and [`ROUTER_OUTPUT_TIERS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RouterTierLadder {
+    /// The prefix every tier name of this side carries, before the `_` and the Mbps step.
+    prefix: &'static str,
+    /// What this side's resource is called in the sentence a refusal carries.
+    noun: &'static str,
 }
 
-/// Why a router input of tier `tier` may not carry a `MaximumBitrate` of
-/// `maximum_bitrate`, or `None` when that pair is acceptable.
-///
-/// "The tier sets the maximum bitrate, in Mbps, for the router input"
-/// (`smithy_query(query="doc",shape="CreateRouterInputRequest",member="Tier")`, which
-/// `UpdateRouterInput$Tier` repeats), so the tier an input ENDS UP with bounds the bitrate
-/// it may be asked for, through the one catalog [`router_input_tier_bitrate_ceiling`]; and a
-/// bitrate is a count of bits per second, so it is positive. Every operation that sets
-/// either member (CreateRouterInput, UpdateRouterInput) judges the pair HERE, so the bound
-/// cannot drift between them — the input-side counterpart of
-/// [`router_output_bitrate_rejection`]. The detail is the sentence the refusal's envelope
-/// carries ([`validation_failed_message`]).
-pub fn router_input_bitrate_rejection(tier: &str, maximum_bitrate: i64) -> Option<String> {
-    let Some(ceiling) = router_input_tier_bitrate_ceiling(tier) else {
-        return Some(format!(
-            "Tier {tier:?} is not a router input tier this service offers."
-        ));
-    };
-    if maximum_bitrate <= 0 {
-        return Some(format!(
-            "MaximumBitrate is a number of bits per second and must be positive; this \
-             request asks for {maximum_bitrate}."
-        ));
+/// The router INPUT side of [`RouterTierLadder`] — the catalog `CreateRouterInput$Tier` and
+/// `UpdateRouterInput$Tier` name a tier from.
+pub const ROUTER_INPUT_TIERS: RouterTierLadder = RouterTierLadder {
+    prefix: "INPUT",
+    noun: "router input",
+};
+
+/// The router OUTPUT side of [`RouterTierLadder`] — the catalog `CreateRouterOutput$Tier`
+/// and `UpdateRouterOutput$Tier` name a tier from.
+pub const ROUTER_OUTPUT_TIERS: RouterTierLadder = RouterTierLadder {
+    prefix: "OUTPUT",
+    noun: "router output",
+};
+
+impl RouterTierLadder {
+    /// The maximum bitrate, in BITS PER SECOND, that `tier` allows a resource of this side,
+    /// or `None` when `tier` is not one this side declares.
+    ///
+    /// The published numbers are in Mbps and MediaConnect states a bitrate in bits per
+    /// second, so each step is converted through [`BITS_PER_MEGABIT`].
+    pub fn bitrate_ceiling(&self, tier: &str) -> Option<i64> {
+        let step = tier.strip_prefix(self.prefix)?.strip_prefix('_')?;
+        ROUTER_TIER_MEGABITS_PER_SECOND
+            .into_iter()
+            .find(|megabits_per_second| megabits_per_second.to_string() == step)
+            .map(|megabits_per_second| megabits_per_second * BITS_PER_MEGABIT)
     }
-    if maximum_bitrate > ceiling {
-        return Some(format!(
-            "MaximumBitrate {maximum_bitrate} bps exceeds the {ceiling} bps the {tier} tier \
-             allows."
-        ));
+
+    /// Why a resource of this side at tier `tier` may not carry a `MaximumBitrate` of
+    /// `maximum_bitrate`, or `None` when that pair is acceptable.
+    ///
+    /// The tier a resource ENDS UP with bounds the bitrate it may be asked for, through the
+    /// one catalog [`Self::bitrate_ceiling`]; and a bitrate is a count of bits per second, so
+    /// it is positive. Every operation that sets either member (CreateRouterInput,
+    /// UpdateRouterInput, CreateRouterOutput, UpdateRouterOutput) judges the pair HERE, so
+    /// the bound cannot drift between them or between the two sides. The detail is the
+    /// sentence the refusal's envelope carries ([`validation_failed_message`]).
+    pub fn bitrate_rejection(&self, tier: &str, maximum_bitrate: i64) -> Option<String> {
+        let Some(ceiling) = self.bitrate_ceiling(tier) else {
+            let noun = self.noun;
+            return Some(format!(
+                "Tier {tier:?} is not a {noun} tier this service offers."
+            ));
+        };
+        if maximum_bitrate <= 0 {
+            return Some(format!(
+                "MaximumBitrate is a number of bits per second and must be positive; this \
+                 request asks for {maximum_bitrate}."
+            ));
+        }
+        if maximum_bitrate > ceiling {
+            return Some(format!(
+                "MaximumBitrate {maximum_bitrate} bps exceeds the {ceiling} bps the {tier} tier \
+                 allows."
+            ));
+        }
+        None
     }
-    None
+}
+
+/// The maximum bitrate, in BITS PER SECOND, a router input of `tier` may carry, or `None`
+/// for a tier this service does not offer — [`ROUTER_INPUT_TIERS`]' own ceiling.
+pub fn router_input_tier_bitrate_ceiling(tier: &str) -> Option<i64> {
+    ROUTER_INPUT_TIERS.bitrate_ceiling(tier)
 }
 
 /// The `RouterInputTransitEncryption` an input reports when the create named none.
@@ -4008,55 +4051,10 @@ pub const FABRIC_LATENCY_MODE_BALANCED: &str = "BALANCED";
 pub const BITS_PER_MEGABIT: i64 = 1_000_000;
 
 /// The maximum bitrate, in BITS PER SECOND, that the tier `tier` allows a router output,
-/// or `None` when `tier` is not one the model declares.
-///
-/// The catalog is `CreateRouterOutput$Tier`'s own documentation
-/// (`smithy_query(query="doc",shape="CreateRouterOutputRequest",member="Tier")`: "The tier
-/// sets the maximum bitrate, in Mbps, for the router output. … `OUTPUT_20` – 20 Mbps,
-/// `OUTPUT_50` – 50 Mbps, `OUTPUT_100` – 100 Mbps, `OUTPUT_250` – 250 Mbps, `OUTPUT_500` –
-/// 500 Mbps"), converted to bits per second through [`BITS_PER_MEGABIT`].
+/// or `None` when `tier` is not one the model declares — [`ROUTER_OUTPUT_TIERS`]' own
+/// ceiling.
 pub fn router_output_tier_bitrate_ceiling(tier: &str) -> Option<i64> {
-    let megabits_per_second = match tier {
-        "OUTPUT_20" => 20,
-        "OUTPUT_50" => 50,
-        "OUTPUT_100" => 100,
-        "OUTPUT_250" => 250,
-        "OUTPUT_500" => 500,
-        _ => return None,
-    };
-    Some(megabits_per_second * BITS_PER_MEGABIT)
-}
-
-/// Why a router output of tier `tier` may not carry a `MaximumBitrate` of
-/// `maximum_bitrate`, or `None` when that pair is acceptable.
-///
-/// "The tier sets the maximum bitrate, in Mbps, for the router output"
-/// (`smithy_query(query="doc",shape="CreateRouterOutputRequest",member="Tier")`), so the
-/// tier an output ENDS UP with bounds the bitrate it may be asked for, through the one
-/// catalog [`router_output_tier_bitrate_ceiling`]; and a bitrate is a count of bits per
-/// second, so it is positive. Every operation that sets either member
-/// (CreateRouterOutput, UpdateRouterOutput) judges the pair HERE, so the bound cannot
-/// drift between them. The detail is the sentence the refusal's envelope carries
-/// ([`validation_failed_message`]).
-pub fn router_output_bitrate_rejection(tier: &str, maximum_bitrate: i64) -> Option<String> {
-    let Some(ceiling) = router_output_tier_bitrate_ceiling(tier) else {
-        return Some(format!(
-            "Tier {tier:?} is not a router output tier this service offers."
-        ));
-    };
-    if maximum_bitrate <= 0 {
-        return Some(format!(
-            "MaximumBitrate is a number of bits per second and must be positive; this \
-             request asks for {maximum_bitrate}."
-        ));
-    }
-    if maximum_bitrate > ceiling {
-        return Some(format!(
-            "MaximumBitrate {maximum_bitrate} bps exceeds the {ceiling} bps the {tier} tier \
-             allows."
-        ));
-    }
-    None
+    ROUTER_OUTPUT_TIERS.bitrate_ceiling(tier)
 }
 
 /// The ceiling on how many router outputs this store holds.

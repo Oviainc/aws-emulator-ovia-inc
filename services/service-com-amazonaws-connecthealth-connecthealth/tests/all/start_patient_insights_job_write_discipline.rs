@@ -34,7 +34,7 @@ use std::time::SystemTime;
 use serde_json::{json, Value};
 
 use service_com_amazonaws_connecthealth_connecthealth::state::{
-    self, PATIENT_INSIGHTS_INFERENCE_UNAVAILABLE, PATIENT_INSIGHTS_JOB_STEP_SPAN,
+    self, PATIENT_INSIGHTS_JOB_STEP_SPAN,
 };
 
 use crate::arn_resolution_during_domain_deletion::web_app_setup;
@@ -247,11 +247,11 @@ async fn an_idempotent_retry_answers_the_stored_job_and_resets_nothing() {
 
     // The rows differ along HOW FAR the clock has moved the job when the retry arrives:
     // none of its spans elapsed, one, or both — the whole modelled lifecycle this
-    // emulator's own jobs walk (`JobStatus`: SUBMITTED -> IN_PROGRESS -> FAILED).
+    // emulator's own jobs walk (`JobStatus`: SUBMITTED -> IN_PROGRESS -> SUCCEEDED).
     let rows: [(&str, u32, &str); 3] = [
         ("no span elapsed", 0, "SUBMITTED"),
         ("one span elapsed", 1, "IN_PROGRESS"),
-        ("both spans elapsed", 2, "FAILED"),
+        ("both spans elapsed", 2, "SUCCEEDED"),
     ];
 
     for (index, (case, spans, expected_status)) in rows.into_iter().enumerate() {
@@ -277,11 +277,10 @@ async fn an_idempotent_retry_answers_the_stored_job_and_resets_nothing() {
             expected_status,
             "case {case:?}: the clock must have moved the job to {expected_status}, got {before}"
         );
-        if expected_status == "FAILED" {
-            assert_eq!(
-                string_at(&before, "statusDetails"),
-                PATIENT_INSIGHTS_INFERENCE_UNAVAILABLE,
-                "case {case:?}: a failed job must report why, got {before}"
+        if expected_status == "SUCCEEDED" {
+            assert!(
+                before.get("insightsOutput").is_some(),
+                "case {case:?}: a completed job must report where its output went, got {before}"
             );
         }
 
@@ -305,7 +304,7 @@ async fn an_idempotent_retry_answers_the_stored_job_and_resets_nothing() {
         // between, so what must not change is what the START owns — the identifiers, the
         // creation instant and the parameters.
         let after = get_job(&emulator, case, &domain_id, &job_id).await;
-        if expected_status == "FAILED" {
+        if expected_status == "SUCCEEDED" {
             assert_eq!(
                 after, before,
                 "case {case:?}: a retry must leave a terminal record untouched ({before}), \

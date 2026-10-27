@@ -184,9 +184,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(CreateGeneratedTemplateErrorModeled::AlreadyExistsException(
                 AlreadyExistsException {
-                    message: Some(format!(
-                        "Generated template [{}] already exists",
-                        input.generated_template_name
+                    message: Some(generated::already_exists(
+                        &input.generated_template_name,
                     )),
                 },
             )
@@ -270,11 +269,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if resources.len() > generated::MAX_GENERATED_TEMPLATE_RESOURCES {
             return Err(CreateGeneratedTemplateErrorModeled::LimitExceededException(
                 LimitExceededException {
-                    message: Some(format!(
-                        "Limit for resources in a generated template exceeded: no more than \
-                         {} resources can be included",
-                        generated::MAX_GENERATED_TEMPLATE_RESOURCES
-                    )),
+                    message: Some(generated::resource_limit_exceeded()),
                 },
             )
             .into());
@@ -313,7 +308,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// A listed resource that names a logical id the base stack already contributed is the SAME
 /// resource of the generated template, not a second one, so it is folded onto the stack's
 /// row (the request's own `ResourceIdentifier` is what identifies it) rather than appended
-/// beside it.
+/// beside it — the rule [`crate::state::generated_template::fold`] holds for every resource
+/// a request contributes to a generated template.
 fn generated_resources(
     stack_resources: &[crate::state::StoredResource],
     listed: Option<&[ResourceDefinition]>,
@@ -329,25 +325,18 @@ fn generated_resources(
         })
         .collect();
     for definition in listed.unwrap_or_default() {
-        let identifier: ::std::collections::BTreeMap<String, String> = definition
-            .resource_identifier
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect();
-        let already = definition.logical_resource_id.as_ref().and_then(|logical| {
-            resources.iter_mut().find(|resource| {
-                resource.logical_resource_id.as_ref() == Some(logical)
-                    && resource.resource_type == definition.resource_type
-            })
-        });
-        match already {
-            Some(resource) => resource.resource_identifier = identifier,
-            None => resources.push(GeneratedResource {
+        crate::state::generated_template::fold(
+            &mut resources,
+            GeneratedResource {
                 resource_type: definition.resource_type.clone(),
                 logical_resource_id: definition.logical_resource_id.clone(),
-                resource_identifier: identifier,
-            }),
-        }
+                resource_identifier: definition
+                    .resource_identifier
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            },
+        );
     }
     resources
 }
