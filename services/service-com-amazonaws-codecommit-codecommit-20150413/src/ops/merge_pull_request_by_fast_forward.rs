@@ -1,15 +1,41 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op MergePullRequestByFastForward
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `MergePullRequestByFastForward`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`MergePullRequestByFastForward::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: merges the pull request's source reference into its destination
+//! reference with the FAST-FORWARD strategy — the one merge that writes no commit.
+//! A fast-forward is nothing but an advance of the destination reference, so the
+//! only question it asks is how the two tips are related by ancestry
+//! ([`crate::state::merge::fast_forward`], the one reading of that relation this
+//! crate has, shared with `MergeBranchesByFastForward` and `GetMergeOptions`): where
+//! the destination tip is the merge base, the destination branch is left at the
+//! SOURCE tip and that tip is the merge; where the source tip is already part of the
+//! destination's history there is nothing to advance, so the destination tip stands
+//! as the merge and no reference moves. Nothing about which paths either side
+//! changed enters into it, which is why this operation models no conflict members.
+//!
+//! Two tips neither of which is the other's ancestor cannot be joined by moving a
+//! reference, so the merge is refused with the modelled
+//! `ManualMergeRequiredException` and nothing is written; so are a pull request that
+//! is no longer open, one whose approval rules still state conditions its approvals
+//! do not meet ([`crate::state::PullRequestRecord::approval_rules_satisfied`]), and
+//! one whose source or destination reference the repository no longer holds — the
+//! modelled `ReferenceDoesNotExistException`, which is the error the model gives
+//! THIS merge and not its squash and three-way siblings, because a fast-forward has
+//! nothing but those references to work with.
+//!
+//! The merge is between the tips the two references hold NOW rather than the tips
+//! the pull request was opened at — `sourceCommitId` is the value to pass "if you
+//! want an exception thrown if the current commit ID of the tip of the source branch
+//! does not match this commit ID", so the current tip is what is merged — and the
+//! stored target then records what was merged, who merged it, the commit the merge
+//! left on the destination branch and the strategy, with the pull request CLOSED:
+//! "If the merge is successful, it closes the pull request." A later
+//! `GetPullRequest` therefore reports the merge rather than a prediction of it.
+//!
+//! The ancestry walk runs under one per-request budget and off the async worker,
+//! exactly as every other merge question in this crate does, because it holds the
+//! store guard for its whole span.
 //!
 //! ## Shape of an operation
 //!
@@ -203,18 +229,348 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `MergePullRequestByFastForward` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(MergePullRequestByFastForwardErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Which ids address a pull request is `crate::state`'s rule, so every
+        // operation taking a `pullRequestId` agrees about it; this only maps each
+        // outcome onto the error THIS operation models for it.
+        let pull_request_id = crate::state::normalize_pull_request_id(&input.pull_request_id)
+            .map_err(|problem| match problem {
+                crate::state::PullRequestIdProblem::Missing => {
+                    MergePullRequestByFastForwardErrorModeled::PullRequestIdRequiredException(
+                        PullRequestIdRequiredException {
+                            message: Some(
+                                crate::state::PULL_REQUEST_ID_REQUIRED_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                }
+                crate::state::PullRequestIdProblem::Invalid => {
+                    MergePullRequestByFastForwardErrorModeled::InvalidPullRequestIdException(
+                        InvalidPullRequestIdException {
+                            message: Some(
+                                crate::state::INVALID_PULL_REQUEST_ID_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                }
+            })?;
+
+        // `sourceCommitId` is "the full commit ID of the original or updated commit
+        // in the pull request source branch", so a value that is not a commit id at
+        // all addresses no commit — and the only commit-id failure this operation
+        // models is the invalid one.
+        let requested_source_tip = input.source_commit_id.as_deref();
+        if requested_source_tip
+            .is_some_and(|commit_id| crate::state::checked_commit_id(commit_id).is_err())
+        {
+            return Err(
+                MergePullRequestByFastForwardErrorModeled::InvalidCommitIdException(
+                    InvalidCommitIdException {
+                        message: Some(crate::state::INVALID_COMMIT_ID_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let now = std::time::SystemTime::now();
+        // "The Amazon Resource Name (ARN) of the user who merged the branches": the
+        // caller this request was signed by, read the one way this crate reads a
+        // caller's identity.
+        let merged_by = crate::state::caller_identity_arn(&*self.engine, ctx);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let mut store = state.lock();
+        // Whether the id names a pull request AT ALL is a question about the whole
+        // store, because a pull request id is unique per account; it is answered
+        // before one repository is borrowed to write, so the two refusals below can
+        // be told apart.
+        let pull_request_exists = store.pull_request(pull_request_id).is_some();
+        let repository = store
+            .repositories
+            .get_mut(&input.repository_name)
+            .ok_or_else(|| {
+                MergePullRequestByFastForwardErrorModeled::RepositoryDoesNotExistException(
+                    RepositoryDoesNotExistException {
+                        message: Some(crate::state::repository_does_not_exist_message(
+                            &input.repository_name,
+                        )),
+                    },
+                )
+            })?;
+
+        // Everything the merge reads out of the stored pull request, resolved
+        // before anything is written: the two branches its target names and the
+        // tips they hold NOW.
+        let (source_tip, destination_branch, destination_tip) = {
+            let Some(pull_request) = repository.pull_requests.get(&pull_request_id) else {
+                // A pull request this repository does not hold: one that exists
+                // elsewhere is refused as not associated with this repository, and
+                // one no repository holds as not existing at all.
+                return Err(if pull_request_exists {
+                    MergePullRequestByFastForwardErrorModeled::RepositoryNotAssociatedWithPullRequestException(
+                        RepositoryNotAssociatedWithPullRequestException {
+                            message: Some(
+                                crate::state::REPOSITORY_NOT_ASSOCIATED_WITH_PULL_REQUEST_MESSAGE
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into()
+                } else {
+                    MergePullRequestByFastForwardErrorModeled::PullRequestDoesNotExistException(
+                        PullRequestDoesNotExistException {
+                            message: Some(crate::state::pull_request_does_not_exist_message(
+                                &pull_request_id.to_string(),
+                            )),
+                        },
+                    )
+                    .into()
+                });
+            };
+            // A merge closes the pull request, and "pull request status can only
+            // change from OPEN to CLOSED": one that is already closed cannot be
+            // merged again, and nothing is written for it.
+            if pull_request.status != crate::state::PULL_REQUEST_STATUS_OPEN {
+                return Err(
+                    MergePullRequestByFastForwardErrorModeled::PullRequestAlreadyClosedException(
+                        PullRequestAlreadyClosedException {
+                            message: Some(
+                                crate::state::PULL_REQUEST_ALREADY_CLOSED_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // "The pull request cannot be merged because one or more approval
+            // rules applied to the pull request have conditions that have not been
+            // met": the conditions are counted against the approvals the STORED
+            // pull request holds, the one reading of an approval rule this crate
+            // has, and an override of its rules is what sets them aside.
+            if !pull_request.approval_rules_satisfied() {
+                return Err(
+                    MergePullRequestByFastForwardErrorModeled::PullRequestApprovalRulesNotSatisfiedException(
+                        PullRequestApprovalRulesNotSatisfiedException {
+                            message: Some(
+                                crate::state::PULL_REQUEST_APPROVAL_RULES_NOT_SATISFIED_MESSAGE
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            let Some(target) = pull_request.targets.first() else {
+                // Every stored pull request carries its target, so this is an
+                // internal inconsistency rather than a modelled CodeCommit failure.
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "the pull request holds no target to merge",
+                ));
+            };
+            let source_reference = target.source_reference.clone();
+            let destination_reference = target.destination_reference.clone();
+
+            // A reference the repository no longer holds as a branch holds no tip:
+            // there is nothing to merge from, and nothing to advance to. This
+            // operation is the one pull request merge the model gives
+            // `ReferenceDoesNotExistException`, whose sentence says exactly that,
+            // so it is what answers a reference that is gone — on either side.
+            let reference_does_not_exist = || {
+                MergePullRequestByFastForwardErrorModeled::ReferenceDoesNotExistException(
+                    ReferenceDoesNotExistException {
+                        message: Some(crate::state::REFERENCE_DOES_NOT_EXIST_MESSAGE.to_string()),
+                    },
+                )
+            };
+            // The source side: "the full commit ID of the tip of the source branch
+            // used to create the pull request. If the pull request branch is
+            // updated by a push while the pull request is open, the commit ID
+            // changes to reflect the new tip of the branch" — so what is merged is
+            // the tip the reference holds now.
+            let source_tip = repository
+                .resolve_branch(&source_reference)
+                .and_then(|branch| repository.branches.get(branch))
+                .map(|branch| branch.commit_id.clone())
+                .ok_or_else(reference_does_not_exist)?;
+            // "Pass this value if you want an exception thrown if the current
+            // commit ID of the tip of the source branch does not match this commit
+            // ID."
+            if requested_source_tip.is_some_and(|requested| requested != source_tip) {
+                return Err(
+                    MergePullRequestByFastForwardErrorModeled::TipOfSourceReferenceIsDifferentException(
+                        TipOfSourceReferenceIsDifferentException {
+                            message: Some(
+                                crate::state::TIP_OF_SOURCE_REFERENCE_IS_DIFFERENT_MESSAGE
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            // The destination side: the branch the merge advances. A fast-forward
+            // is nothing but that advance, so a reference the repository no longer
+            // holds leaves it nothing to do.
+            let destination_branch = repository
+                .resolve_branch(&destination_reference)
+                .map(str::to_string)
+                .ok_or_else(reference_does_not_exist)?;
+            let destination_tip = repository
+                .branches
+                .get(&destination_branch)
+                .map(|branch| branch.commit_id.clone())
+                .ok_or_else(reference_does_not_exist)?;
+            (source_tip, destination_branch, destination_tip)
+        };
+
+        // How the two tips are related by ancestry — the ONE question a
+        // fast-forward asks, and the same reading of it `GetMergeOptions` and
+        // `MergeBranchesByFastForward` answer with, so one pair of commits is
+        // judged the same way whether the merge is reported or written.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("MergePullRequestByFastForward"))
+        // This is caller-driven CPU work (two history walks) and it runs under this
+        // service's store lock, so it is held to one per-request budget and moved
+        // off the async worker, exactly as this crate's other merge work is.
+        let relation = crate::service::off_the_async_worker(|| {
+            let mut budget = crate::state::merge::MergeBudget::for_one_request();
+            crate::state::merge::fast_forward(
+                repository,
+                &source_tip,
+                &destination_tip,
+                &mut budget,
+            )
+        });
+        // The modelled refusal for two tips a reference move cannot join, in the
+        // words the model states for the shape.
+        let manual_merge_required = || -> MergePullRequestByFastForwardError {
+            MergePullRequestByFastForwardErrorModeled::ManualMergeRequiredException(
+                ManualMergeRequiredException {
+                    message: Some(
+                        "The pull request cannot be merged automatically into the destination \
+                         branch. You must manually merge the branches and resolve any conflicts."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into()
+        };
+        let relation = relation.map_err(|problem| match problem {
+            // The two tips share no commit at all, so neither history contains the
+            // other and no reference move can join them: the merge has to be made
+            // by hand, which is what the modelled refusal says.
+            crate::state::merge::MergeProblem::NoMergeBase => manual_merge_required(),
+            // The allowance this emulator spends on one merge question, which is
+            // its own bound rather than a modelled CodeCommit failure.
+            crate::state::merge::MergeProblem::ItemsToCompare
+            | crate::state::merge::MergeProblem::ContentToLoad => {
+                crate::scaffolded::Scaffolded::validation(format!(
+                    "the histories of {source_tip} and {destination_tip} exceed the {} commits \
+                     this emulator walks at once",
+                    crate::state::merge::MAX_COMMITS_WALKED_PER_REQUEST
+                ))
+            }
+            crate::state::merge::MergeProblem::Deadline => {
+                crate::scaffolded::Scaffolded::validation(format!(
+                    "walking the histories of {source_tip} and {destination_tip} took longer than \
+                     the {} seconds this emulator spends comparing two commits",
+                    crate::state::merge::MAX_MERGE_SECONDS
+                ))
+            }
+        })?;
+        // Which commit the destination branch holds once the merge is made, and the
+        // merge base it was made against — for a fast-forward the base IS one of
+        // the two tips, which is what makes the merge a reference move.
+        let (merge_commit_id, base_commit_id) = match relation {
+            // The destination's history is a prefix of the source's: the reference
+            // advances, and the source tip is the merge.
+            crate::state::merge::FastForward::Advances => {
+                (source_tip.clone(), destination_tip.clone())
+            }
+            // The source is already part of the destination's history, so there is
+            // nothing to advance and the destination tip stands as the merge.
+            crate::state::merge::FastForward::AlreadyMerged => {
+                (destination_tip.clone(), source_tip.clone())
+            }
+            // Each history holds commits the other does not, so honouring both
+            // sides needs a merge commit, which no reference move can make.
+            crate::state::merge::FastForward::Diverged => return Err(manual_merge_required()),
+        };
+
+        // A fast-forward writes no commit and no object: the merge IS one of the
+        // two tips, so all there is to write is the reference. A destination
+        // already at that commit has nothing left to do, so the store is left
+        // untouched rather than restamped.
+        if destination_tip != merge_commit_id {
+            // The reference moves through the one place a branch tip moves, so
+            // every OPEN pull request reading from it follows the new tip.
+            repository.set_branch_tip(&destination_branch, &merge_commit_id, now, Some(&merged_by));
+            // Moving a reference modifies the repository, so `lastModifiedDate`
+            // moves with it, exactly as it does for a merge that writes a commit.
+            repository.last_modified_date = now;
+        }
+
+        // "If the merge is successful, it closes the pull request": the stored
+        // pull request records the merge — what was merged, who merged it, the
+        // commit the destination branch now holds and the strategy — and is
+        // CLOSED, so every later read of it reports the merge rather than a
+        // prediction of one.
+        let pull_request = repository
+            .pull_requests
+            .get_mut(&pull_request_id)
+            .ok_or_else(|| {
+                // Read above under this same guard, so it is still there;
+                // answering rather than panicking keeps the handler total.
+                MergePullRequestByFastForwardErrorModeled::PullRequestDoesNotExistException(
+                    PullRequestDoesNotExistException {
+                        message: Some(crate::state::pull_request_does_not_exist_message(
+                            &pull_request_id.to_string(),
+                        )),
+                    },
+                )
+            })?;
+        pull_request.status = crate::state::PULL_REQUEST_STATUS_CLOSED.to_string();
+        let actor = merged_by.clone();
+        if let Some(target) = pull_request.targets.first_mut() {
+            target.source_commit = source_tip;
+            target.destination_commit = destination_tip;
+            target.merge_base = Some(base_commit_id);
+            target.merged = true;
+            target.merged_by = Some(merged_by);
+            target.merge_commit_id = Some(merge_commit_id);
+            target.merge_option = Some(crate::state::merge::MERGE_OPTION_FAST_FORWARD.to_string());
+        }
+        // The merge changed two things about the pull request, so its event log
+        // records both, in the order they happened: the merge state of the
+        // target, then the close that merge caused. Recording them also moves
+        // "the day and time of the last user or system activity on the pull
+        // request" onto this call.
+        let merged_state = pull_request.targets.first().map(|target| {
+            crate::state::PullRequestEventDetail::MergeStateChanged {
+                repository_name: target.repository_name.clone(),
+                destination_reference: target.destination_reference.clone(),
+                merged: target.merged,
+                merged_by: target.merged_by.clone(),
+                merge_commit_id: target.merge_commit_id.clone(),
+                merge_option: target.merge_option.clone(),
+            }
+        });
+        if let Some(merged_state) = merged_state {
+            pull_request.record_event(now, Some(actor.clone()), merged_state);
+        }
+        let status = pull_request.status.clone();
+        pull_request.record_event(
+            now,
+            Some(actor),
+            crate::state::PullRequestEventDetail::StatusChanged { status },
+        );
+
+        Ok(MergePullRequestByFastForwardOutput {
+            pull_request: Some(pull_request.to_modeled()),
+        })
     }
 }

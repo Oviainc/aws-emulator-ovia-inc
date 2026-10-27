@@ -101,6 +101,8 @@ mod merge_branches_three_way;
 mod merge_conflicts;
 #[path = "all/merge_options.rs"]
 mod merge_options;
+#[path = "all/merge_pull_request_fast_forward.rs"]
+mod merge_pull_request_fast_forward;
 #[path = "all/merge_pull_request_squash.rs"]
 mod merge_pull_request_squash;
 #[path = "all/merge_pull_request_three_way.rs"]
