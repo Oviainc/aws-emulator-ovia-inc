@@ -431,11 +431,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-            // An operation still in flight on this stack, or a stack a `CREATE` change set
-            // created that nothing has executed yet (it has no template and no resources to
-            // update — the change set is what brings it into existence): neither can take an
-            // update.
-            if previous.pending.is_some() || previous.status == status::REVIEW_IN_PROGRESS {
+            // An operation still in flight on this stack, or a stack whose status says it
+            // holds no configuration an update could change
+            // ([`crate::state::status_takes_an_update`]): a deletion or a rollback that
+            // failed and has to be resolved on its own terms, a create that was rolled back,
+            // and a stack a `CREATE` change set created that nothing has executed yet (it
+            // has no template and no resources to update — the change set is what brings it
+            // into existence). None of them can take an update.
+            if previous.pending.is_some()
+                || !crate::state::status_takes_an_update(&previous.status)
+            {
                 return Err(crate::scaffolded::Scaffolded::validation_error(
                     crate::state::stack_cannot_be_updated(&previous.stack_id, &previous.status),
                 ));
@@ -614,7 +619,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-            if stack.pending.is_some() || stack.status == status::REVIEW_IN_PROGRESS {
+            if stack.pending.is_some() || !crate::state::status_takes_an_update(&stack.status) {
                 return Err(crate::scaffolded::Scaffolded::validation_error(
                     crate::state::stack_cannot_be_updated(&stack.stack_id, &stack.status),
                 ));
