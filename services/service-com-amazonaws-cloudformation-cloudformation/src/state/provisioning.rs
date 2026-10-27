@@ -661,7 +661,7 @@ pub async fn reconcile(
     let mut outcome = Materialised::default();
     // The identifiers the owning services MINTED in this walk, each against the stand-in
     // the naming rules had computed for that resource ([`repoint_references`]).
-    let mut minted: Vec<(String, String)> = Vec::new();
+    let mut minted: Vec<Minted> = Vec::new();
     let mut declared = declared.into_iter();
     // Every `{{resolve:...}}` DYNAMIC REFERENCE the declarations carry is resolved by
     // CLOUDFORMATION ITSELF, here, before anything is asked of any owning service: a
@@ -892,8 +892,20 @@ pub async fn reconcile(
                 let computed = resource.physical_resource_id.clone();
                 let computed_attributes = resource.attributes.clone();
                 adopt_minted_identity(&mut resource, created.physical_resource_id);
-                if resource.physical_resource_id != computed {
-                    minted.push((computed, resource.physical_resource_id.clone()));
+                // An EMPTY stand-in is no identifier a reference could have resolved to,
+                // and matching one would rewrite every empty value — and every empty
+                // segment of a longer one — so there is nothing to re-point for it, exactly
+                // as for an attribute the naming rules left empty below.
+                if !computed.is_empty() && resource.physical_resource_id != computed {
+                    minted.push(Minted {
+                        // The stand-in is an identifier CloudFormation COMPUTED whenever it
+                        // is not the name the declaration itself asked for, so a longer
+                        // value carrying it carries it because a reference to this resource
+                        // put it there — see [`Minted::composed`].
+                        composed: super::declared_name(&resource).as_deref() != Some(&*computed),
+                        stand_in: computed,
+                        assigned: resource.physical_resource_id.clone(),
+                    });
                 }
                 resource.attributes.extend(created.attributes);
                 // An ATTRIBUTE the owning service reports differently from the value the
@@ -907,7 +919,13 @@ pub async fn reconcile(
                         continue;
                     };
                     if !stand_in.is_empty() && assigned != stand_in {
-                        minted.push((stand_in.clone(), assigned.clone()));
+                        minted.push(Minted {
+                            stand_in: stand_in.clone(),
+                            assigned: assigned.clone(),
+                            // An attribute is an ARN, an endpoint or a url — a value a
+                            // property carries WHOLE.
+                            composed: false,
+                        });
                     }
                 }
                 resource.materialised = true;
@@ -1082,32 +1100,76 @@ const MAX_REPOINTED_NESTING: usize = 64;
 /// [`reconcile`] pairs those too, so a property reaches its own service as the value the
 /// resource it names really publishes.
 ///
-/// Matched WHOLE value, never as a substring: a reference resolved to the stand-in is the
-/// entire scalar, while a stand-in is often the NAME the declaration asked for — so a
-/// longer value that merely contains one (an association named `<rule name>-assoc`) is a
-/// value of its own and is left exactly as written.
+/// Matched WHOLE value — or, where the stand-in is an identifier CloudFormation computed
+/// rather than a name the declaration asked for ([`Minted::composed`]), as one whole
+/// slash-separated SEGMENT of a longer value, which is the one form a template composes an
+/// identifier into (`integrations/<IntegrationId>`). Never as any shorter run of
+/// characters: a stand-in is often the NAME the declaration asked for, so a longer value
+/// that merely contains one (an association named `<rule name>-assoc`) is a value of its
+/// own and is left exactly as written.
 ///
 /// Called by [`reconcile`] for the identifiers minted in the walk it is driving. A resource
 /// is never re-pointed with its OWN pair — it cannot reference itself, and for a type whose
 /// stand-in is the name it declares that pair would rewrite that very property. The
 /// identifiers a stack ALREADY has are not substituted at all:
 /// [`super::StoredStack::deploy_template`] resolves the declarations against them instead.
-fn repoint_references(properties: &mut Value, minted: &[(String, String)]) {
+fn repoint_references(properties: &mut Value, minted: &[Minted]) {
     repoint(properties, minted, 0);
 }
 
+/// One identifier an owning service MINTED in a deployment walk, against the stand-in the
+/// naming rules had computed for the same resource ([`repoint_references`]).
+#[derive(Debug, Clone)]
+struct Minted {
+    /// What a reference to the resource was resolved to before its create.
+    stand_in: String,
+    /// What that reference has to carry now.
+    assigned: String,
+    /// Whether the stand-in may also be matched INSIDE a longer value, as one whole
+    /// slash-separated segment of it.
+    ///
+    /// True only where the stand-in is an identifier CloudFormation COMPUTED rather than
+    /// the name the declaration asked for: such a value is not one a template composed out
+    /// of its own strings, so a longer value carrying it carries it because a reference to
+    /// this resource put it there. That is how an API Gateway v2 route names the
+    /// integration it is wired to — `Target: !Join ['/', ['integrations', !Ref
+    /// Integration]]`, which is the `integrations/<IntegrationId>` form that service
+    /// accepts — so without this such a route would be created pointing at an integration
+    /// id nothing minted.
+    composed: bool,
+}
+
 /// [`repoint_references`] over one value, `depth` levels into the document.
-fn repoint(properties: &mut Value, minted: &[(String, String)], depth: usize) {
+fn repoint(properties: &mut Value, minted: &[Minted], depth: usize) {
     if minted.is_empty() || depth >= MAX_REPOINTED_NESTING {
         return;
     }
     match properties {
         Value::String(text) => {
-            if let Some((_, assigned)) = minted
+            if let Some(minted) = minted
                 .iter()
-                .find(|(computed, _)| computed.as_str() == text.as_str())
+                .find(|minted| minted.stand_in.as_str() == text.as_str())
             {
-                *text = assigned.clone();
+                *text = minted.assigned.clone();
+                return;
+            }
+            for minted in minted
+                .iter()
+                .filter(|minted| minted.composed && !minted.stand_in.contains('/'))
+            {
+                if text.split('/').any(|segment| segment == minted.stand_in) {
+                    *text = text
+                        .split('/')
+                        .map(|segment| {
+                            if segment == minted.stand_in {
+                                minted.assigned.as_str()
+                            } else {
+                                segment
+                            }
+                        })
+                        .collect::<Vec<&str>>()
+                        .join("/");
+                }
             }
         }
         Value::Array(items) => {

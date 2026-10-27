@@ -36,7 +36,7 @@ use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::sta
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::common::{call, error_code, router, router_with_engine};
+use super::common::{call, error_code, router, router_with_engine, Harness};
 
 /// The region every case signs for. Nothing in an instance's communication-limits
 /// config is region-dependent, so the cases that do not vary it use this one.
@@ -80,7 +80,7 @@ fn stored_entries(
 /// Start `instance`'s onboarding job and wait out the span the clock owes it, so the
 /// instance has a config to configure by the time this returns. Nothing in the
 /// emulator sleeps for that span — only a caller that wants the settled state does.
-async fn onboard(router: &MultiServiceRouter, region: &str, instance: &str) {
+async fn onboard(router: &Harness, region: &str, instance: &str) {
     let (status, body) = start_onboarding(router, region, instance).await;
     assert_eq!(
         status, 200,
@@ -89,12 +89,15 @@ async fn onboard(router: &MultiServiceRouter, region: &str, instance: &str) {
     tokio::time::sleep(ONBOARDING_JOB_DURATION + std::time::Duration::from_millis(150)).await;
 }
 
-/// `StartInstanceOnboardingJob` for `instance`, without waiting for the job.
+/// `StartInstanceOnboardingJob` for `instance`, without waiting for the job — on an
+/// instance registered in the account's Connect registry first, since onboarding
+/// resolves the `connectInstanceId` against it.
 async fn start_onboarding(
-    router: &MultiServiceRouter,
+    router: &Harness,
     region: &str,
     instance: &str,
 ) -> (u16, Value) {
+    router.register_connect_instance(region, instance);
     call(
         router,
         region,

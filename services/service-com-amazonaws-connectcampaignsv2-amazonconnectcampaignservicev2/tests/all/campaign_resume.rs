@@ -18,16 +18,15 @@ use serde_json::Value;
 use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::state::{
     CampaignAction, CampaignState,
 };
-use smithy_server_runtime::MultiServiceRouter;
-
 // The campaign fixture (onboard, create, read the state, drive the lifecycle) is the
 // shared one every lifecycle suite in this crate sets its cases up with.
 use super::common::{
     call, campaign_state as state, create_campaign, drive_lifecycle as drive, error_code, router,
+    Harness,
 };
 
 /// A campaign on an onboarded instance, returning its minted id.
-async fn campaign(router: &MultiServiceRouter, region: &str, instance: &str) -> String {
+async fn campaign(router: &Harness, region: &str, instance: &str) -> String {
     create_campaign(router, region, instance, &format!("resume-{instance}"), None).await
 }
 

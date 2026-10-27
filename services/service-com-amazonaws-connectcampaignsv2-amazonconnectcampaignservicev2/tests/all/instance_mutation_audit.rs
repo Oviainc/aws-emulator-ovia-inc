@@ -20,11 +20,10 @@
 //!   integration config — only wire metadata and the instance id the request named.
 
 use serde_json::{json, Value};
-use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::state::ONBOARDING_JOB_DURATION;
 
-use super::common::{call, error_code, router};
+use super::common::{call, error_code, router, Harness};
 
 /// The region every case here signs for; nothing in an audit record is
 /// region-dependent, so one is enough.
@@ -37,8 +36,12 @@ const CALLER_AKID: &str = "AKIDEXAMPLE";
 /// How the instance under a row has to be set up before the row's request runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Setup {
-    /// Nothing at all: the service holds no record of the instance.
+    /// Nothing at all: the service holds no record of the instance, and neither does
+    /// the account's Connect instance registry.
     Fresh,
+    /// The account's Connect registry holds the instance, so there is an instance to
+    /// onboard, and this service holds nothing for it yet.
+    Registered,
     /// `StartInstanceOnboardingJob` has been called and the clock has NOT yet
     /// finished the job, so the instance is at the transient status.
     Onboarding,
@@ -100,13 +103,24 @@ fn rows() -> Vec<Row> {
         Row {
             case: "onboarding accepted",
             instance: "audit-onboard-ok",
-            setup: Setup::Fresh,
+            setup: Setup::Registered,
             method: "PUT",
             path: "/onboarding",
             body: json!({"encryptionConfig": {"enabled": false}}),
             status: 200,
             error: None,
             record: Some(("StartInstanceOnboardingJob", "accepted")),
+        },
+        Row {
+            case: "onboarding refused: the account holds no such Connect instance",
+            instance: "audit-onboard-unknown",
+            setup: Setup::Fresh,
+            method: "PUT",
+            path: "/onboarding",
+            body: json!({"encryptionConfig": {"enabled": false}}),
+            status: 404,
+            error: Some("ResourceNotFoundException"),
+            record: Some(("StartInstanceOnboardingJob", "ResourceNotFoundException")),
         },
         Row {
             case: "onboarding refused: encryption enabled with no key",
@@ -320,8 +334,11 @@ fn rows() -> Vec<Row> {
     ]
 }
 
-/// `StartInstanceOnboardingJob` for `instance`, asserted to have started.
-async fn start_onboarding(router: &MultiServiceRouter, instance: &str, case: &str) {
+/// `StartInstanceOnboardingJob` for `instance`, asserted to have started — on an
+/// instance registered in the account's Connect registry first, since onboarding
+/// resolves the `connectInstanceId` against it.
+async fn start_onboarding(router: &Harness, instance: &str, case: &str) {
+    router.register_connect_instance(REGION, instance);
     let (status, body) = call(
         router,
         REGION,
@@ -353,6 +370,11 @@ async fn every_instance_mutation_records_how_it_ended() {
     tokio::time::sleep(ONBOARDING_JOB_DURATION + std::time::Duration::from_millis(150)).await;
 
     for row in &rows {
+        if row.setup == Setup::Registered {
+            // The instance exists in the account's Connect registry and nowhere else:
+            // this row's own request is what gives it an onboarding record.
+            router.register_connect_instance(REGION, row.instance);
+        }
         if row.setup == Setup::Onboarding {
             // Started and NOT waited out: the job is still at the transient status
             // when this row's request runs.

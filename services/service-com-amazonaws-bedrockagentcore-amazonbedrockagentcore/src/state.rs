@@ -7,6 +7,11 @@
 //! were created. Every one of `CreateEvent` / `ListSessions` / `ListEvents` /
 //! `GetEvent` / `DeleteEvent` computes its answer from these maps; nothing is canned.
 //!
+//! The AgentCore *tools* data plane keeps its own map: a code interpreter holds the
+//! sessions `StartCodeInterpreterSession` started on it, and
+//! `GetCodeInterpreterSession` reports one of them back — its status read off the
+//! clock against the time-to-live the request asked for.
+//!
 //! # The store has an explicit ceiling
 //!
 //! `CreateEvent` is the only growth site, and a caller chooses every key it inserts
@@ -23,10 +28,20 @@
 //! `MAX_MEMORIES * MAX_ACTORS_PER_MEMORY * MAX_SESSIONS_PER_ACTOR` session records,
 //! whatever a caller sends. AWS publishes no retention for any of this, so these are
 //! the EMULATOR's own bounds, set far above any test or client working set.
+//!
+//! `StartCodeInterpreterSession` is the tools plane's only growth site, and a caller
+//! chooses its `codeInterpreterIdentifier` and `clientToken`, so it is bounded the
+//! same way: [`MAX_CODE_INTERPRETERS`], [`MAX_CODE_INTERPRETER_SESSIONS`] and
+//! [`MAX_IDEMPOTENCY_RECORDS_PER_CODE_INTERPRETER`], each evicting its least recently
+//! written record.
 
 use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, SystemTime};
 
-use crate::ops::types::{Branch, Event, MetadataValue, PayloadType, SessionSummary};
+use crate::ops::types::{
+    Branch, Certificate, Event, MetadataValue, PayloadType, SessionSummary,
+    ToolsFileSystemConfiguration,
+};
 
 /// The most memory containers this emulator retains; the least recently written one
 /// is evicted once the store passes it.
@@ -50,6 +65,25 @@ pub const MAX_STORED_EVENTS: usize = 10_000;
 /// The most `clientToken` records this emulator retains for one memory container.
 pub const MAX_IDEMPOTENCY_RECORDS_PER_MEMORY: usize = 1_000;
 
+/// The most code interpreters this emulator retains sessions for; the least recently
+/// used one is evicted once the store passes it.
+pub const MAX_CODE_INTERPRETERS: usize = 32;
+
+/// The most sessions this emulator retains for one code interpreter.
+pub const MAX_CODE_INTERPRETER_SESSIONS: usize = 256;
+
+/// The most `clientToken` records this emulator retains for one code interpreter.
+pub const MAX_IDEMPOTENCY_RECORDS_PER_CODE_INTERPRETER: usize = 1_000;
+
+/// `CodeInterpreterSessionStatus` for a session that is still inside its
+/// time-to-live, so it can run code (source: smithy_query
+/// query="shape" shape="CodeInterpreterSessionStatus", values READY | TERMINATED).
+pub const CODE_INTERPRETER_SESSION_READY: &str = "READY";
+
+/// `CodeInterpreterSessionStatus` for a session whose time-to-live has run out, from
+/// the same enum.
+pub const CODE_INTERPRETER_SESSION_TERMINATED: &str = "TERMINATED";
+
 /// Per-service state for com-amazonaws-bedrockagentcore-amazonbedrockagentcore. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {
@@ -60,10 +94,19 @@ pub struct ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {
     /// [`MAX_STORED_EVENTS`]. An entry whose event is already gone (deleted, or
     /// evicted by a per-level bound) is simply skipped when it reaches the front.
     pub order: VecDeque<EventKey>,
-    /// Monotonic counter feeding the hex suffix of every generated `eventId`, so two
-    /// events minted inside the same millisecond still get distinct ids, and ordering
-    /// the records each bound evicts by.
+    /// Monotonic counter feeding the hex suffix of every generated `eventId` and
+    /// `sessionId`, so two records minted inside the same millisecond still get
+    /// distinct ids, and ordering the records each bound evicts by.
     pub event_seq: u64,
+    /// Code interpreters this data plane has started a session on, keyed by the
+    /// `codeInterpreterIdentifier` the caller named. Bounded by
+    /// [`MAX_CODE_INTERPRETERS`].
+    ///
+    /// A code interpreter is registered here by the first `StartCodeInterpreterSession`
+    /// that names it, for the same reason a memory container is registered by its first
+    /// event: the interpreter itself is created through the CONTROL plane, a different
+    /// service.
+    pub code_interpreters: HashMap<String, CodeInterpreterStore>,
 }
 
 impl ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {
@@ -218,6 +261,81 @@ impl ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {
             self.memories.remove(&key.memory_id);
         }
     }
+
+    /// The stored code interpreter session addressed by (code interpreter, session),
+    /// or `None` when this emulator holds no such session.
+    pub fn code_interpreter_session(
+        &self,
+        code_interpreter_identifier: &str,
+        session_id: &str,
+    ) -> Option<&CodeInterpreterSessionRecord> {
+        self.code_interpreters
+            .get(code_interpreter_identifier)?
+            .sessions
+            .get(session_id)
+    }
+
+    /// The session a `clientToken` already started on this code interpreter, or `None`
+    /// when that token started none (or the session it started is no longer held).
+    pub fn code_interpreter_session_for_token(
+        &self,
+        code_interpreter_identifier: &str,
+        client_token: &str,
+    ) -> Option<&CodeInterpreterSessionRecord> {
+        let interpreter = self.code_interpreters.get(code_interpreter_identifier)?;
+        let session_id = &interpreter.idempotency.get(client_token)?.session_id;
+        interpreter.sessions.get(session_id)
+    }
+
+    /// Persist one code interpreter session — registering its code interpreter on the
+    /// way — and hold every bound in
+    /// [the module's ceiling](self#the-store-has-an-explicit-ceiling).
+    pub fn insert_code_interpreter_session(
+        &mut self,
+        session: CodeInterpreterSessionRecord,
+        client_token: Option<String>,
+    ) {
+        let seq = session.seq;
+        let session_id = session.session_id.clone();
+        let interpreter = self
+            .code_interpreters
+            .entry(session.code_interpreter_identifier.clone())
+            .or_default();
+        interpreter.last_seq = seq;
+        interpreter.sessions.insert(session_id.clone(), session);
+        if let Some(token) = client_token {
+            interpreter
+                .idempotency
+                .insert(token, SessionLocator { session_id, seq });
+            while interpreter.idempotency.len() > MAX_IDEMPOTENCY_RECORDS_PER_CODE_INTERPRETER {
+                let Some(oldest) =
+                    least_recently_written(&interpreter.idempotency, |locator| locator.seq)
+                else {
+                    break;
+                };
+                interpreter.idempotency.remove(&oldest);
+            }
+        }
+
+        while interpreter.sessions.len() > MAX_CODE_INTERPRETER_SESSIONS {
+            let Some(oldest) = least_recently_written(&interpreter.sessions, |session| session.seq)
+            else {
+                break;
+            };
+            interpreter.sessions.remove(&oldest);
+            interpreter
+                .idempotency
+                .retain(|_, locator| locator.session_id != oldest);
+        }
+        while self.code_interpreters.len() > MAX_CODE_INTERPRETERS {
+            let Some(oldest) =
+                least_recently_written(&self.code_interpreters, |interpreter| interpreter.last_seq)
+            else {
+                break;
+            };
+            self.code_interpreters.remove(&oldest);
+        }
+    }
 }
 
 /// The least recently written entry of `map`, by the sequence `seq_of` reads off a
@@ -364,6 +482,78 @@ impl StoredEvent {
     }
 }
 
+/// One code interpreter's sessions, as `StartCodeInterpreterSession` wrote them.
+#[derive(Debug, Default)]
+pub struct CodeInterpreterStore {
+    /// Sessions keyed by their minted `sessionId`. Bounded by
+    /// [`MAX_CODE_INTERPRETER_SESSIONS`].
+    pub sessions: HashMap<String, CodeInterpreterSessionRecord>,
+    /// `clientToken` -> the session that token already started.
+    /// `StartCodeInterpreterSession` is `@idempotent` and its `clientToken` is an
+    /// `@idempotencyToken`, so a replayed token answers with the first session rather
+    /// than starting a second one. Bounded by
+    /// [`MAX_IDEMPOTENCY_RECORDS_PER_CODE_INTERPRETER`], and a record is dropped with
+    /// the session it points at.
+    pub idempotency: HashMap<String, SessionLocator>,
+    /// The sequence of the last session started on this code interpreter, which is
+    /// what its eviction order is read from.
+    pub last_seq: u64,
+}
+
+/// Where an already-started session lives, so a replayed `clientToken` can find it.
+#[derive(Debug, Clone)]
+pub struct SessionLocator {
+    pub session_id: String,
+    /// The sequence of the session this record points at: its eviction order.
+    pub seq: u64,
+}
+
+/// One code interpreter session: exactly what `StartCodeInterpreterSession`
+/// persisted, which is what `GetCodeInterpreterSession` reports.
+#[derive(Debug, Clone)]
+pub struct CodeInterpreterSessionRecord {
+    /// Minted by [`mint_code_interpreter_session_id`]; never client-supplied.
+    pub session_id: String,
+    pub code_interpreter_identifier: String,
+    pub name: Option<String>,
+    pub created_at: SystemTime,
+    /// The session's time-to-live in seconds, as the request asked for it (the model
+    /// defaults it to 900 when a request omits it).
+    pub session_timeout_seconds: i32,
+    pub certificates: Option<Vec<Certificate>>,
+    pub filesystem_configurations: Option<Vec<ToolsFileSystemConfiguration>>,
+    /// The value [`ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState::next_seq`]
+    /// handed this session: its eviction order, and what keeps two sessions started in
+    /// the same millisecond apart.
+    pub seq: u64,
+}
+
+impl CodeInterpreterSessionRecord {
+    /// The instant this session's time-to-live runs out, or `None` when that instant
+    /// is not representable (so nothing can be past it).
+    ///
+    /// `sessionTimeoutSeconds` is modelled as "the duration in seconds
+    /// (time-to-live) after which the session automatically terminates, regardless of
+    /// ongoing activity", so the session's own requested value is the span — nothing
+    /// chosen here. The model's range makes it positive; a value that is not is read as
+    /// no time at all rather than as a time in the past.
+    pub fn expires_at(&self) -> Option<SystemTime> {
+        let ttl = Duration::from_secs(u64::try_from(self.session_timeout_seconds).unwrap_or(0));
+        self.created_at.checked_add(ttl)
+    }
+
+    /// This session's `CodeInterpreterSessionStatus` at `now`: `READY` until its
+    /// time-to-live has run out, `TERMINATED` from then on. The clock alone decides,
+    /// so a read reports the termination that was already due without writing
+    /// anything.
+    pub fn status_as_of(&self, now: SystemTime) -> &'static str {
+        match self.expires_at() {
+            Some(expiry) if now >= expiry => CODE_INTERPRETER_SESSION_TERMINATED,
+            _ => CODE_INTERPRETER_SESSION_READY,
+        }
+    }
+}
+
 /// The key a `memoryId` is stored under.
 ///
 /// `MemoryId`'s pattern admits either the bare id or the
@@ -393,6 +583,19 @@ pub fn mint_event_id(seq: u64) -> String {
 /// `SessionId`'s pattern is `^[a-zA-Z0-9][a-zA-Z0-9-_]*$` with length 1..100.
 pub fn mint_session_id(seq: u64) -> String {
     format!("session-{seq:016x}")
+}
+
+/// Mint a `CodeInterpreterSessionId`.
+///
+/// That shape's pattern is `^[0-9a-zA-Z]{1,40}$` — alphanumerics only, so the id is
+/// the creation instant in epoch milliseconds followed by the engine-wide sequence,
+/// both in lowercase hex (26 characters), which keeps two sessions started in one
+/// millisecond apart.
+pub fn mint_code_interpreter_session_id(seq: u64) -> String {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis());
+    format!("{millis:010x}{seq:016x}")
 }
 
 /// Encode an opaque `nextToken` for `kind` resuming at `offset`.

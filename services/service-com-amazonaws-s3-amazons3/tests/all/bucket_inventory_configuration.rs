@@ -64,7 +64,7 @@ const KMS_KEY_ARN: &str = "arn:aws:kms:us-east-1:123456789012:key/inventory-key"
 /// `smithy_query(query="shape",shape="InventoryEncryption")` declares it: either of the two
 /// members, each with its own `xmlName`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Encryption {
+pub(crate) enum Encryption {
     /// `InventoryEncryption$SSES3` — "Specifies the use of SSE-S3 to encrypt delivered
     /// inventory reports", a container with no members at all.
     Sses3,
@@ -88,7 +88,7 @@ impl Encryption {
 /// name, file format, bucket owner (optional), and prefix (optional) where inventory results
 /// are published" — flattened to the members a request names and a report brings back.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct Destination {
+pub(crate) struct Destination {
     bucket: String,
     format: String,
     account_id: Option<String>,
@@ -99,7 +99,7 @@ struct Destination {
 impl Destination {
     /// A destination publishing in `format` to [`DESTINATION_ARN`], with none of the
     /// optional members.
-    fn new(format: &str) -> Self {
+    pub(crate) fn new(format: &str) -> Self {
         Self {
             bucket: DESTINATION_ARN.to_string(),
             format: format.to_string(),
@@ -110,20 +110,20 @@ impl Destination {
     }
 
     /// The same destination, owned by `account_id` — "the destination bucket account ID".
-    fn owned_by(mut self, account_id: &str) -> Self {
+    pub(crate) fn owned_by(mut self, account_id: &str) -> Self {
         self.account_id = Some(account_id.to_string());
         self
     }
 
     /// The same destination, publishing under `prefix` — "the prefix that is prepended to
     /// all inventory results".
-    fn under(mut self, prefix: &str) -> Self {
+    pub(crate) fn under(mut self, prefix: &str) -> Self {
         self.prefix = Some(prefix.to_string());
         self
     }
 
     /// The same destination, with the reports encrypted the named way.
-    fn encrypted(mut self, encryption: Encryption) -> Self {
+    pub(crate) fn encrypted(mut self, encryption: Encryption) -> Self {
         self.encryption = Some(encryption);
         self
     }
@@ -149,8 +149,8 @@ impl Destination {
 
 /// One whole `InventoryConfiguration`, as a put carries it and as a read reports it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct Configuration {
-    id: String,
+pub(crate) struct Configuration {
+    pub(crate) id: String,
     is_enabled: bool,
     included_object_versions: String,
     frequency: String,
@@ -165,7 +165,7 @@ struct Configuration {
 impl Configuration {
     /// An enabled configuration of `id`, inventorying the named object versions on the named
     /// schedule into `destination`, with no filter and no optional fields.
-    fn new(
+    pub(crate) fn new(
         id: &str,
         included_object_versions: &str,
         frequency: &str,
@@ -184,19 +184,19 @@ impl Configuration {
 
     /// The same configuration, not in force — `InventoryConfiguration$IsEnabled` "set to
     /// False, no inventory list is generated".
-    fn disabled(mut self) -> Self {
+    pub(crate) fn disabled(mut self) -> Self {
         self.is_enabled = false;
         self
     }
 
     /// The same configuration, inventorying only the objects under `prefix`.
-    fn filtered(mut self, prefix: &str) -> Self {
+    pub(crate) fn filtered(mut self, prefix: &str) -> Self {
         self.filter_prefix = Some(prefix.to_string());
         self
     }
 
     /// The same configuration, asking for exactly `fields` in the report.
-    fn with_fields(mut self, fields: &[&str]) -> Self {
+    pub(crate) fn with_fields(mut self, fields: &[&str]) -> Self {
         self.optional_fields = Some(fields.iter().map(|field| (*field).to_string()).collect());
         self
     }
@@ -232,7 +232,7 @@ impl Configuration {
 }
 
 /// `PUT /<bucket>?inventory&id=<id>` — `PutBucketInventoryConfiguration`.
-async fn put_inventory(
+pub(crate) async fn put_inventory(
     router: &MultiServiceRouter,
     bucket: &str,
     wanted: &Configuration,
@@ -260,7 +260,7 @@ async fn put_inventory_payload(
 }
 
 /// `GET /<bucket>?inventory&id=<id>` — `GetBucketInventoryConfiguration`.
-async fn get_inventory(router: &MultiServiceRouter, bucket: &str, id: &str) -> Answer {
+pub(crate) async fn get_inventory(router: &MultiServiceRouter, bucket: &str, id: &str) -> Answer {
     get_inventory_with_headers(router, bucket, id, &[]).await
 }
 
@@ -282,16 +282,31 @@ async fn get_inventory_with_headers(
 }
 
 /// The one configuration a `GetBucketInventoryConfiguration` body reports.
+fn reported_configuration(answer: &Answer) -> Configuration {
+    reported_configurations(answer)
+        .into_iter()
+        .next()
+        .unwrap_or_default()
+}
+
+/// EVERY `InventoryConfiguration` a body reports, in document order: one for a
+/// `GetBucketInventoryConfiguration` body, as many as the page carries for a
+/// `ListBucketInventoryConfigurations` body (which the listing suite beside this one reads
+/// through this same parser rather than a second one).
 ///
 /// Parsed with `quick-xml` (already a dependency of this workspace), the way the analytics
 /// suite beside this one reads a container, rather than by slicing the body. The member a
 /// value belongs to is its PATH, not its tag: `Prefix` sits on the filter and on the
 /// destination alike, and `Bucket` names the destination bucket.
-fn reported_configuration(answer: &Answer) -> Configuration {
+pub(crate) fn reported_configurations(answer: &Answer) -> Vec<Configuration> {
     let body = String::from_utf8_lossy(&answer.body).into_owned();
     let mut reader = Reader::from_str(&body);
 
+    let mut all: Vec<Configuration> = Vec::new();
+    // The configuration being read: an `InventoryConfiguration` opening starts a new one, so
+    // the previous one is complete and is pushed then.
     let mut reported = Configuration::default();
+    let mut reading = false;
     let mut path: Vec<String> = Vec::new();
     // An element OPENING is what declares which member is present, so a member whose value
     // is the empty string (`<Prefix></Prefix>`, which carries no text event at all) and a
@@ -335,6 +350,12 @@ fn reported_configuration(answer: &Answer) -> Configuration {
             }
             Event::Start(start) => {
                 let name = String::from_utf8_lossy(start.name().as_ref()).into_owned();
+                if name == "InventoryConfiguration" {
+                    if reading {
+                        all.push(std::mem::take(&mut reported));
+                    }
+                    reading = true;
+                }
                 begin(&name, &path, &mut reported);
                 path.push(name);
             }
@@ -379,11 +400,14 @@ fn reported_configuration(answer: &Answer) -> Configuration {
             _ => {}
         }
     }
-    reported
+    if reading {
+        all.push(reported);
+    }
+    all
 }
 
 /// Stand up a bucket named `name`, which is what an inventory configuration is put on.
-async fn bucket(router: &MultiServiceRouter, name: &str) {
+pub(crate) async fn bucket(router: &MultiServiceRouter, name: &str) {
     let created = create_bucket(router, name, None, None).await;
     assert_eq!(
         created.status, 200,

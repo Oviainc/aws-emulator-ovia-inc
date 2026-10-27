@@ -2,8 +2,10 @@
 
 //! @op DescribeWorkerConfiguration
 //! Reports one stored worker configuration, found by its `workerConfigurationArn`, with
-//! its latest revision's stored `propertiesFileContent`. An ARN this service never
-//! minted, or one whose configuration has been dropped, is a `NotFoundException`.
+//! its latest revision's stored `propertiesFileContent`. A `workerConfigurationArn` that
+//! is not a well-formed ARN of this service is a `BadRequestException`; a well-formed one
+//! this service never minted, or one whose configuration has been dropped, is a
+//! `NotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -170,6 +172,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let mut state = store.lock();
         state.settle_due();
+
+        // A value that is not a kafkaconnect ARN at all names no configuration,
+        // so it is incorrect input rather than a resource that is absent: the
+        // modelled 400, blaming the member that carried it.
+        if let Some(message) = crate::state::arn_syntax_refusal(
+            "workerConfigurationArn",
+            &input.worker_configuration_arn,
+            crate::state::ARN_SERVICE,
+        ) {
+            return Err(DescribeWorkerConfigurationErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
 
         // A regional endpoint resolves only its own region's configurations, so
         // a workerConfigurationArn minted in another region is as absent here

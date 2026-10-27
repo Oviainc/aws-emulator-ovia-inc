@@ -325,6 +325,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
+
+        // "To make a StartCallAnalyticsJob request, you must first upload your media
+        // file into an Amazon S3 bucket": every location this start names for its input
+        // audio is resolved against this emulator's own Amazon S3 before anything is
+        // stored, so a start pointed at an object that store says is not there is
+        // refused and no job record exists for a media file nobody uploaded (see
+        // [`crate::state::resolve_media_objects`], which also states why an answer that
+        // is not S3 reporting an absent object refuses nothing). BOTH media members
+        // are input audio for this family: "you can redact the audio contained in your
+        // media file by including RedactedMediaFileUri, instead of MediaFileUri, to
+        // specify the location of your input audio".
+        let media_uris: Vec<&str> = [
+            input.media.media_file_uri.as_deref(),
+            input.media.redacted_media_file_uri.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if crate::state::resolve_media_objects(ctx, &region, &media_uris).await
+            == crate::state::MediaVerdict::NoSuchObject
+        {
+            return Err(bad_request(crate::state::MEDIA_URI_NAMES_NO_OBJECT));
+        }
+
         let mut store = state.lock();
 
         // A Call Analytics job may only apply a custom vocabulary, custom vocabulary

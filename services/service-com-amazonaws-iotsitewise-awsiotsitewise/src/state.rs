@@ -5758,6 +5758,134 @@ pub fn check_property_shape(
 /// [`check_property_shape`].
 pub const DATA_TYPE_STRUCT: &str = "STRUCT";
 
+/// `id`, unless it is absent or empty.
+pub fn non_empty_id(id: Option<&str>) -> Option<String> {
+    id.filter(|id| !id.is_empty()).map(ToString::to_string)
+}
+
+/// Whether a request's `(id, externalId)` pair names the stored member whose own
+/// pair is `(held_id, held_external_id)`.
+///
+/// A member of an asset model's definition — a property, a hierarchy, a composite
+/// model — is addressed by its `id`, or by its `externalId` when the request
+/// carries no id for it; a request that carries neither describes a NEW member,
+/// which is why a pair of absent ids never matches anything.
+pub fn same_definition_member(
+    held_id: Option<&str>,
+    held_external_id: Option<&str>,
+    id: Option<&str>,
+    external_id: Option<&str>,
+) -> bool {
+    match (non_empty_id(id), non_empty_id(external_id)) {
+        (Some(id), _) => held_id == Some(id.as_str()),
+        (None, Some(external_id)) => held_external_id == Some(external_id.as_str()),
+        (None, None) => false,
+    }
+}
+
+/// The property list a request's `AssetModelProperty`s become, resolved against
+/// the `stored` properties they replace.
+///
+/// Each requested property is checked by the same rule every arriving model
+/// property is ([`check_property_shape`]). A property the holder already carries
+/// keeps its stored id — so its asset-level data and its alias survive — and may
+/// change its name, unit and the inside of its type, but not its TYPE or its DATA
+/// TYPE: "You can’t change the type or data type of an existing property". A
+/// property the request carries no stored id for is new and gets one minted,
+/// unless the request supplied one. A property the request does not name at all is
+/// gone, which is how a caller removes one.
+///
+/// Shared by every operation that rewrites a stored property list from a full
+/// `AssetModelProperty` list, so the properties of a model and the properties of
+/// one of its composite models follow one rule. The `Err` carries the refusal
+/// message, which the calling operation lifts into its own modelled
+/// `InvalidRequestException`.
+pub fn resolve_updated_properties(
+    stored: &[AssetModelProperty],
+    requested: &[AssetModelProperty],
+) -> Result<Vec<AssetModelProperty>, String> {
+    let mut resolved: Vec<AssetModelProperty> = Vec::with_capacity(requested.len());
+    for property in requested {
+        check_property_shape(
+            &property.name,
+            &property.data_type,
+            property.data_type_spec.as_deref(),
+            &property.r#type,
+        )?;
+        let held = stored.iter().find(|held| {
+            same_definition_member(
+                held.id.as_deref(),
+                held.external_id.as_deref(),
+                property.id.as_deref(),
+                property.external_id.as_deref(),
+            )
+        });
+        let id = match held {
+            Some(held) => {
+                // `dataTypeSpec` is part of a STRUCT property's data type ("the data
+                // type of the structure for this property"), so it cannot move either.
+                if held.data_type != property.data_type
+                    || held.data_type_spec != property.data_type_spec
+                {
+                    return Err(format!(
+                        "The existing property {} cannot change its data type from {} to {}.",
+                        property.name,
+                        describe_data_type(&held.data_type, held.data_type_spec.as_deref()),
+                        describe_data_type(&property.data_type, property.data_type_spec.as_deref()),
+                    ));
+                }
+                let held_kind = property_type_kind(&held.r#type);
+                let kind = property_type_kind(&property.r#type);
+                if held_kind != kind {
+                    return Err(format!(
+                        "The existing property {} cannot change its property type from {} to {}.",
+                        property.name,
+                        held_kind.unwrap_or("none"),
+                        kind.unwrap_or("none"),
+                    ));
+                }
+                held.id.clone().unwrap_or_else(new_id)
+            }
+            None => non_empty_id(property.id.as_deref()).unwrap_or_else(new_id),
+        };
+        resolved.push(AssetModelProperty {
+            id: Some(id),
+            external_id: property.external_id.clone(),
+            name: property.name.clone(),
+            data_type: property.data_type.clone(),
+            data_type_spec: property.data_type_spec.clone(),
+            unit: property.unit.clone(),
+            r#type: property.r#type.clone(),
+            // `path` is server-computed, never caller-supplied; the reads derive
+            // what they report.
+            path: None,
+        });
+    }
+    // One request cannot describe the same stored property twice: both entries
+    // would be that one property, so the later one would silently win.
+    for (at, property) in resolved.iter().enumerate() {
+        if resolved[..at]
+            .iter()
+            .any(|earlier| earlier.id == property.id)
+        {
+            return Err(format!(
+                "The request names the property {} more than once.",
+                property.id.as_deref().unwrap_or_default()
+            ));
+        }
+    }
+    Ok(resolved)
+}
+
+/// A property's data type as a refusal names it: the `PropertyDataType`, plus the
+/// `dataTypeSpec` a STRUCT carries.
+fn describe_data_type(data_type: &str, data_type_spec: Option<&str>) -> String {
+    match data_type_spec {
+        Some(spec) => format!("{data_type} ({spec})"),
+        None => data_type.to_string(),
+    }
+}
+
 /// The `ETag` the `If-Match` / `If-None-Match` preconditions of an asset-model
 /// write are evaluated against, as of `now`, or `None` when the version
 /// `version_type` names does not exist.

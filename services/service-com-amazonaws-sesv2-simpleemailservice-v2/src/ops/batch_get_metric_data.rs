@@ -1,15 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetMetricData
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetMetricData`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Answers each query in the batch from the records this service keeps: the account's
+//! VDM attributes, the email-identity, configuration-set and tenant tables, and the
+//! outbound-message log the send operations write. A query names a metric, a window
+//! and the dimensions to filter by, and its result is the time series those records
+//! yield for it — never a figure nothing recorded. This is the ONLY file to touch for
+//! this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetMetricData::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The rules this handler implements:
+//!
+//! * The `VDM` namespace is the account's Virtual Deliverability Manager data, so it
+//!   is served only while the account's VDM configuration is enabled
+//!   (`VdmAttributes$VdmEnabled`, which `PutAccountVdmAttributes` writes and
+//!   `GetAccount` reports). While it is off there is no such data to read and a query
+//!   against the namespace is refused as invalid input.
+//! * A dimension states which of the recorded activity the metric is wanted for, so
+//!   it filters the records rather than looking the resource it names up: a query
+//!   whose dimension names a configuration set, an identity, a tenant or a provider
+//!   the records do not carry keeps no message, and so reports no data for the
+//!   window rather than being refused.
+//! * `SEND` counts, per `Metric`'s own documentation, the messages the account sent
+//!   "eligible for tracking in the VDM dashboard", which "excludes emails sent to the
+//!   mailbox simulator and emails addressed to more than one recipient": one data
+//!   point per message in the log that was addressed to a single non-simulator
+//!   recipient and matches every dimension.
+//! * Every other metric counts a delivery, engagement or feedback event — a bounce, a
+//!   complaint, an open, a click, a delivery — and nothing in this emulator observes
+//!   one, so such a query has no data points rather than a count nothing recorded.
 //!
 //! ## Shape of an operation
 //!
@@ -73,6 +91,9 @@
 //! * `TooManyRequestsException` (HTTP 429) — Too many requests have been made to the
 //!   operation.
 
+use std::collections::BTreeMap;
+use std::time::SystemTime;
+
 #[allow(unused_imports)]
 use super::types::*;
 
@@ -111,6 +132,33 @@ impl From<BatchGetMetricDataErrorModeled> for BatchGetMetricDataError {
     }
 }
 
+/// `Metric`'s value for messages the account sent, the one metric the records here
+/// can count: "SEND - Emails sent eligible for tracking in the VDM dashboard".
+const SEND: &str = "SEND";
+
+/// `MetricDimensionName`'s value for "the email identity used when sending messages".
+const EMAIL_IDENTITY: &str = "EMAIL_IDENTITY";
+
+/// `MetricDimensionName`'s value for "the configuration set used when sending
+/// messages (if one was used)".
+const CONFIGURATION_SET: &str = "CONFIGURATION_SET";
+
+/// `MetricDimensionName`'s value for "the name of the tenant used when sending
+/// messages (if one was used)".
+const TENANT_NAME: &str = "TENANT_NAME";
+
+/// The domain of the SES mailbox simulator, whose addresses (`success@`, `bounce@`,
+/// `complaint@`, `ooto@`, `suppressionlist@`) SES answers itself without delivering
+/// anything. `Metric` documents every metric as excluding mail sent to it, so a
+/// message addressed there is not counted.
+const MAILBOX_SIMULATOR_DOMAIN: &str = "simulator.amazonses.com";
+
+/// The span one data point covers: the VDM dashboard reports sending activity by
+/// day, so a data point is one UTC day and its timestamp is the instant that day
+/// starts. Seconds since the epoch divide into UTC days exactly — the epoch is
+/// itself a UTC midnight — so the bucket is a division.
+const DATA_POINT_SPAN_SECONDS: i64 = 24 * 60 * 60;
+
 /// The `BatchGetMetricData` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -147,18 +195,307 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetMetricData` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetMetricDataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetMetricData"))
+        // The metrics belong to the account the request was signed for, and the
+        // emulator serves one, so nothing in `ctx` selects the records to read.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The engine is not the shared in-memory engine, so this service has no
+            // store to read. That is not a modelled SES state: answer the scaffold's
+            // 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "BatchGetMetricData without the shared emulator state",
+            ));
+        };
+
+        // Every query's own members are checked before anything is resolved against
+        // the account's records: a value outside a modelled set, or a window that
+        // runs backwards, is the caller's mistake whatever the account holds.
+        let queries = input
+            .queries
+            .into_iter()
+            .map(MetricQuery::checked)
+            .collect::<Result<Vec<MetricQuery>, BatchGetMetricDataError>>()?;
+
+        // Reporting only: no metric falls due with the clock, so this read leaves the
+        // store exactly as a later caller finds it.
+        let store = state.lock();
+
+        // The namespace every query names is the account's VDM data, which exists
+        // only while the account's VDM configuration is enabled.
+        if store.account.vdm_enabled != crate::state::FEATURE_ENABLED {
+            return Err(bad_request(
+                "VDM is not enabled for your account.".to_string(),
+            ));
+        }
+
+        let mut results = Vec::with_capacity(queries.len());
+        for query in queries {
+            let filters = query.filters();
+            let data_points = query.data_points(&store, &filters);
+            results.push(MetricDataResult {
+                id: Some(query.id),
+                timestamps: Some(
+                    data_points
+                        .iter()
+                        .map(|(at, _)| ::aws_smithy_types::DateTime::from_secs(*at))
+                        .collect(),
+                ),
+                values: Some(data_points.iter().map(|(_, count)| *count).collect()),
+            });
+        }
+
+        // `Errors` carries the queries this service failed to process at all
+        // (`INTERNAL_FAILURE`) or is not allowed to answer (`ACCESS_DENIED`); every
+        // query reaching here was answered from the records, so the list is empty.
+        Ok(BatchGetMetricDataOutput {
+            results: Some(results),
+            errors: Some(Vec::new()),
+        })
     }
+}
+
+/// One query of the batch, with every member checked against the model's own value
+/// sets and its window read as a pair of instants.
+struct MetricQuery {
+    /// `BatchGetMetricDataQuery$Id`, which correlates the result with the query.
+    id: String,
+    /// `BatchGetMetricDataQuery$Metric`, one of `METRIC_VALUES`.
+    metric: String,
+    /// The dimensions to filter by, by name, in a fixed order so a refusal names the
+    /// same dimension however the request's map happened to be ordered.
+    dimensions: BTreeMap<String, String>,
+    /// The start of the query window, in seconds since the epoch.
+    start: f64,
+    /// The end of the query window, in the same units.
+    end: f64,
+}
+
+impl MetricQuery {
+    /// `query` with each member checked, or this operation's input error.
+    fn checked(query: BatchGetMetricDataQuery) -> Result<Self, BatchGetMetricDataError> {
+        // `Namespace` and `Metric` are modelled enums the generated input holds as
+        // plain strings, so their value sets are this handler's to enforce, with the
+        // `BadRequestException` the model binds for "the input you provided is
+        // invalid". The namespace is the only one SES publishes, and it selects the
+        // data the rest of this handler reads, so a value outside the set names no
+        // metric data at all.
+        enum_value("Namespace", query.namespace, METRIC_NAMESPACE_VALUES)?;
+        let metric = enum_value("Metric", query.metric, METRIC_VALUES)?;
+
+        let mut dimensions = BTreeMap::new();
+        for (name, value) in query.dimensions.unwrap_or_default() {
+            let name = enum_value("Dimensions", name, METRIC_DIMENSION_NAME_VALUES)?;
+            dimensions.insert(name, value);
+        }
+
+        // The two bounds describe ONE window, so a query whose end precedes its start
+        // describes no window at all: invalid input, refused the way every window in
+        // this service is, rather than answered with the empty series the comparison
+        // would otherwise produce.
+        let start = query.start_date.as_secs_f64();
+        let end = query.end_date.as_secs_f64();
+        if end < start {
+            return Err(bad_request(format!(
+                "Start date {} must be before end date {}",
+                window_bound(&query.start_date),
+                window_bound(&query.end_date)
+            )));
+        }
+
+        Ok(Self {
+            id: query.id,
+            metric,
+            dimensions,
+            start,
+            end,
+        })
+    }
+
+    /// This query's dimensions as the filters they are.
+    ///
+    /// A dimension states which of the recorded activity a metric is wanted for, so
+    /// it is a filter over the records and not a lookup of the resource it names: a
+    /// value nothing in the records carries — a configuration set or an identity the
+    /// account does not hold, a provider it never sent to — keeps no message, which
+    /// is what makes such a query report no data rather than be refused.
+    fn filters(&self) -> Vec<Dimension> {
+        self.dimensions
+            .iter()
+            .map(|(name, value)| match name.as_str() {
+                // An identity is compared through the key the identity table is
+                // keyed by, so the domain part of a value matches the way DNS
+                // compares it.
+                EMAIL_IDENTITY => Dimension::EmailIdentity(crate::state::identity_key(value)),
+                CONFIGURATION_SET => Dimension::ConfigurationSet(value.clone()),
+                TENANT_NAME => Dimension::Tenant,
+                // The one remaining name is `ISP`, "the recipient ISP (e.g. Gmail,
+                // Yahoo, etc.)" — the keys were checked against the model's value
+                // set above.
+                _ => Dimension::Isp(value.clone()),
+            })
+            .collect()
+    }
+
+    /// The time series this query's metric yields from the records, as
+    /// (seconds since the epoch, count) pairs in ascending order of instant.
+    ///
+    /// A span the records hold nothing for is not a data point: the account collected
+    /// no metric for it, which is what an absent point says.
+    fn data_points(
+        &self,
+        store: &crate::state::ComAmazonawsSesv2SimpleemailserviceV2State,
+        filters: &[Dimension],
+    ) -> Vec<(i64, i64)> {
+        // Every metric other than `SEND` counts an event in the message's life after
+        // SES accepted it — a delivery, a bounce, a complaint, an open, a click.
+        // Nothing here delivers a message or observes a recipient reading one, so
+        // there is no such event to count and the series is empty.
+        if self.metric != SEND {
+            return Vec::new();
+        }
+
+        let mut counts: BTreeMap<i64, i64> = BTreeMap::new();
+        for message in &store.sent_messages {
+            let Ok(since_epoch) = message.sent_at.duration_since(SystemTime::UNIX_EPOCH) else {
+                continue;
+            };
+            let at = since_epoch.as_secs_f64();
+            if at < self.start || at > self.end {
+                continue;
+            }
+            // "This excludes … emails addressed to more than one recipient", so only
+            // a message with exactly one recipient is eligible, and that recipient is
+            // the one the recipient-side dimensions are read against.
+            let Some(recipient) = sole_recipient(message) else {
+                continue;
+            };
+            // "This excludes emails sent to the mailbox simulator".
+            if recipient_domain(recipient) == MAILBOX_SIMULATOR_DOMAIN {
+                continue;
+            }
+            if !filters
+                .iter()
+                .all(|filter| filter.keeps(store, message, recipient))
+            {
+                continue;
+            }
+            let seconds = since_epoch.as_secs() as i64;
+            *counts
+                .entry(seconds - seconds.rem_euclid(DATA_POINT_SPAN_SECONDS))
+                .or_default() += 1;
+        }
+        counts.into_iter().collect()
+    }
+}
+
+/// One dimension of a query, as the filter over the records it is.
+enum Dimension {
+    /// `EMAIL_IDENTITY`: the identity key (see `crate::state::identity_key`) of the
+    /// identity the value names.
+    EmailIdentity(String),
+    /// `CONFIGURATION_SET`: the name of a configuration set.
+    ConfigurationSet(String),
+    /// `ISP`: the recipient's mailbox provider.
+    Isp(String),
+    /// `TENANT_NAME`: a tenant of the account.
+    Tenant,
+}
+
+impl Dimension {
+    /// Whether this dimension keeps `message`, whose single recipient is `recipient`.
+    fn keeps(
+        &self,
+        store: &crate::state::ComAmazonawsSesv2SimpleemailserviceV2State,
+        message: &crate::state::SentMessage,
+        recipient: &str,
+    ) -> bool {
+        match self {
+            // "The email identity used when sending messages": the identity a message
+            // was sent under is the one that authorised its `From` address — the
+            // address identity itself, or the domain identity that covers it — so a
+            // value naming no identity the account holds keeps no message.
+            Self::EmailIdentity(key) => message
+                .from
+                .as_deref()
+                .and_then(|from| store.sending_identity(from))
+                .is_some_and(|used| &crate::state::identity_key(&used.name) == key),
+            // "The configuration set used when sending messages (if one was used)".
+            Self::ConfigurationSet(name) => {
+                message.configuration_set_name.as_deref() == Some(name.as_str())
+            }
+            Self::Isp(isp) => serves_recipient(isp, recipient),
+            // "The name of the tenant used when sending messages (if one was used)":
+            // no message in the log was sent through a tenant, because the send
+            // operations answer a request carrying a `TenantName` as unwritten, so no
+            // tenant accounts for any message.
+            Self::Tenant => false,
+        }
+    }
+}
+
+/// The only recipient of `message`, or `None` when it was addressed to none or to
+/// more than one.
+fn sole_recipient(message: &crate::state::SentMessage) -> Option<&String> {
+    let mut recipients = message.recipients();
+    let only = recipients.next()?;
+    recipients.next().is_none().then_some(only)
+}
+
+/// The mail domain of `address`, lower-cased, or `""` when the value carries none.
+///
+/// The value is an address as the send request gave it, so it may be a display-name
+/// form (`Name <user@example.com>`); the mailbox is what names the provider. DNS
+/// compares domain labels without regard to case.
+fn recipient_domain(address: &str) -> String {
+    crate::state::addr_spec(address)
+        .rsplit_once('@')
+        .map(|(_, domain)| domain.to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+/// Whether the ISP named by an `ISP` dimension is the one that hosts `recipient`.
+///
+/// The provider that hosts a mailbox is the one its mail domain belongs to, and the
+/// documented examples of the dimension name a provider without its public suffix
+/// (`Gmail` for `gmail.com`), so either form of the name identifies it. Both sides
+/// compare without regard to case.
+fn serves_recipient(isp: &str, recipient: &str) -> bool {
+    let domain = recipient_domain(recipient);
+    let isp = isp.trim().to_ascii_lowercase();
+    if isp.is_empty() {
+        return false;
+    }
+    domain == isp || domain.split_once('.').is_some_and(|(label, _)| label == isp)
+}
+
+/// One bound of the query window, as the refusal of an inverted window prints it:
+/// the instant to the minute, with no seconds and no zone suffix — the rendering the
+/// other windowed operations of this service refuse with.
+///
+/// The value is the request's own bound; only its rendering is fixed here.
+fn window_bound(at: &::aws_smithy_types::DateTime) -> String {
+    const TO_THE_MINUTE: usize = "YYYY-MM-DDThh:mm".len();
+    at.fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .map(|rendered| rendered.chars().take(TO_THE_MINUTE).collect())
+        .unwrap_or_default()
+}
+
+/// `value` when it is one of `allowed`, and this operation's input error otherwise.
+///
+/// The wording is the service's shared one, lifted into this operation's error
+/// channel, so every member refuses an unmodelled value the same way.
+fn enum_value(
+    member: &str,
+    value: String,
+    allowed: &[&str],
+) -> Result<String, BatchGetMetricDataError> {
+    crate::state::modelled_enum_value(member, value, allowed).map_err(bad_request)
+}
+
+/// Refuse the request with the error the model binds for invalid input.
+fn bad_request(message: String) -> BatchGetMetricDataError {
+    BatchGetMetricDataErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
 }

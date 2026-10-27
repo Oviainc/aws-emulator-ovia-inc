@@ -192,10 +192,10 @@ async fn every_refused_request_carries_its_documented_error_message() {
                 code: "NotImplemented",
                 message: "",
             },
-            // `?inventory` with no `id` is `ListBucketInventoryConfigurations`, still a
-            // scaffold; `?object-lock` and `?logging` are implemented now, so this row names
-            // an operation that is genuinely unwritten.
-            send(&router, "GET", "/message-bucket?inventory", &[], "").await,
+            // `?metadataTable` is `GetBucketMetadataTableConfiguration`, still a scaffold;
+            // `?inventory`, `?object-lock` and `?logging` are implemented now, so this row
+            // names an operation that is genuinely unwritten.
+            send(&router, "GET", "/message-bucket?metadataTable", &[], "").await,
         ),
     ];
 

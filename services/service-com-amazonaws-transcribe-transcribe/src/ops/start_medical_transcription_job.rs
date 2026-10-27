@@ -5,7 +5,9 @@
 //! record it just stored, which `GetMedicalTranscriptionJob` reads back. A job is
 //! `IN_PROGRESS` from the moment it is started — the operation models no deferred
 //! execution — and the clock owes it `COMPLETED` a
-//! [`crate::state::JOB_TRANSITION_DELAY`] later.
+//! [`crate::state::JOB_TRANSITION_DELAY`] later, or `FAILED` with the modelled
+//! `FailureReason` when the media it was pointed at contradicts the `MediaFormat` the
+//! request declared (see [`crate::state::media_failure_reason`]).
 //!
 //! NOTHING IS TRANSCRIBED: no audio is transcribed and no personal health information
 //! is identified, so the `MedicalTranscript.TranscriptFileUri` a completed job reports
@@ -13,11 +15,13 @@
 //! [`crate::state::MedicalTranscriptionJobRecord`]). The job RECORD is what this
 //! emulates.
 //!
-//! The rules the model's own constraint traits cannot express — `Media.MediaFileUri`,
-//! a `LanguageCode` that must be `en-US` because the member targets the service-wide
-//! language enum, the co-dependencies `MedicalTranscriptionSetting` documents between
-//! a toggle and the value that qualifies it, and a `Settings.VocabularyName` that must
-//! name a custom medical vocabulary this account holds — are refused with the modelled
+//! The rules the model's own constraint traits cannot express — a `Media.MediaFileUri`
+//! that must name an object this emulator's own Amazon S3 holds (see
+//! [`crate::state::resolve_media_objects`]), a `LanguageCode` that must be `en-US`
+//! because the member targets the service-wide language enum, the co-dependencies
+//! `MedicalTranscriptionSetting` documents between a toggle and the value that
+//! qualifies it, and a `Settings.VocabularyName` that must name a custom medical
+//! vocabulary this account holds — are refused with the modelled
 //! `BadRequestException`.
 //!
 //! ## Shape of an operation
@@ -334,6 +338,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The Region this request is served in: the job is started in — and only in —
         // the Region the caller signed for.
         let region = crate::state::request_region(ctx.parts());
+
+        // "To make a StartMedicalTranscriptionJob request, you must first upload your
+        // media file into an Amazon S3 bucket; you can then specify the Amazon S3
+        // location of the file using the Media parameter": the location is resolved
+        // against this emulator's own Amazon S3 before anything is stored, so a start
+        // pointed at an object that store says is not there is refused and no job
+        // record exists for a media file nobody uploaded (see
+        // [`crate::state::resolve_media_objects`], which also states why an answer
+        // that is not S3 reporting an absent object refuses nothing).
+        let media_verdict = crate::state::resolve_media_objects(
+            ctx,
+            &region,
+            &[input.media.media_file_uri.as_deref().unwrap_or_default()],
+        )
+        .await;
+        if media_verdict == crate::state::MediaVerdict::NoSuchObject {
+            return Err(bad_request(crate::state::MEDIA_URI_NAMES_NO_OBJECT));
+        }
+        // What the clock owes this job instead of a transcript, judged once here from
+        // the media the request pointed at: a job the service found nothing wrong with
+        // completes (see
+        // [`crate::state::MedicalTranscriptionJobRecord::advance_clock`]).
+        let failure_due = crate::state::media_failure_reason(
+            media_verdict,
+            input.media_format.as_deref(),
+            &input.media,
+        );
+
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
@@ -445,6 +477,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Filled in when the job completes and the transcript location exists.
             transcript: None,
             failure_reason: None,
+            failure_due,
             creation_time: now,
             start_time: Some(now),
             completion_time: None,

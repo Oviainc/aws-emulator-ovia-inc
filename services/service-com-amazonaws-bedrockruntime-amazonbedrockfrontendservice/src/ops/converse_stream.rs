@@ -20,7 +20,11 @@
 //! A turn a mandatory `toolConfig.toolChoice` obliged to request a tool carries
 //! no text: its block opens with a `contentBlockStart` naming the minted
 //! `toolUseId` and the tool, its input arrives in that block's
-//! `contentBlockDelta`, and `messageStop` reports `tool_use`.
+//! `contentBlockDelta`, and `messageStop` reports `tool_use`. That input is the
+//! argument object the requested tool's own `inputSchema` describes
+//! ([`crate::state::tool_input_arguments`]), serialized once, so the fragments a
+//! streaming client reassembles and the document `Converse` answers with for the
+//! same request are one value.
 //!
 //! This operation is hand-authored rather than generated: its output is a
 //! `@streaming` union, which the op-stub generator declines

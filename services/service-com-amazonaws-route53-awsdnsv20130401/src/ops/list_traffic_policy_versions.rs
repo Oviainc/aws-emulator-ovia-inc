@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTrafficPolicyVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTrafficPolicyVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTrafficPolicyVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports every version the traffic policy the request names holds, as one
+//! page of a listing ordered the way the versions are numbered ("Traffic policy
+//! versions are listed in numerical order by VersionNumber"), which is the
+//! order the versions are keyed by on the policy. A page stops after `MaxItems`
+//! versions, with `TrafficPolicyVersionMarker` carrying the version number the
+//! next page starts at. A pure read — nothing here writes to the store.
 //!
 //! ## Shape of an operation
 //!
@@ -96,6 +94,17 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{FIRST_TRAFFIC_POLICY_VERSION, MAX_TRAFFIC_POLICY_VERSION};
+
+/// The most traffic policy versions one response carries.
+///
+/// `ListTrafficPolicyVersionsRequest$MaxItems` publishes no ceiling of its own,
+/// and one policy's versions are numbered within `TrafficPolicyVersion`
+/// (`range 1..1000`, which is [`MAX_TRAFFIC_POLICY_VERSION`]) — the policy
+/// cannot hold more versions than that — so no page can be larger than it,
+/// whatever `maxitems` asks for.
+const MAX_PAGE_SIZE: i32 = MAX_TRAFFIC_POLICY_VERSION;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -163,20 +172,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTrafficPolicyVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTrafficPolicyVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTrafficPolicyVersions"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable under the router, which always mounts this service on
+            // the shared `InMemoryEngine`.
+            ListTrafficPolicyVersionsErrorModeled::InvalidInput(InvalidInput {
+                message: Some("the Route 53 emulator's state store is unavailable".to_string()),
+            })
+        })?;
+
+        let page_size = input
+            .max_items
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+        // Route 53 echoes "the value that you specified for the maxitems
+        // parameter"; the clamped `page_size` above only bounds the work and the
+        // response size.
+        let reported_max_items = input.max_items.unwrap_or(MAX_PAGE_SIZE);
+        let marker = input
+            .traffic_policy_version_marker
+            .as_deref()
+            .filter(|marker| !marker.is_empty());
+
+        // A pure read: nothing below writes to the store.
+        let store = state.lock();
+
+        // The request addresses ONE policy and lists the versions OF it, so an
+        // `Id` the account holds no policy under has no versions to list —
+        // refused through the ONE place this service words a traffic policy it
+        // does not hold.
+        let policy = store.traffic_policies.get(&input.id).ok_or_else(|| {
+            ListTrafficPolicyVersionsErrorModeled::NoSuchTrafficPolicy(
+                crate::state::no_such_traffic_policy(),
+            )
+        })?;
+
+        // The marker is a VERSION NUMBER (`TrafficPolicyVersionMarker`), and the
+        // listing runs in numerical order by it, so the marker positions the
+        // page at the first version at or past the number it carries. Anything
+        // that is not a version number positions nothing: the caller is told so
+        // rather than handed a page starting somewhere else.
+        let start_version = match marker {
+            None => FIRST_TRAFFIC_POLICY_VERSION,
+            Some(marker) => marker
+                .parse::<i32>()
+                .ok()
+                .filter(|version| {
+                    (FIRST_TRAFFIC_POLICY_VERSION..=MAX_TRAFFIC_POLICY_VERSION).contains(version)
+                })
+                .ok_or_else(|| {
+                    ListTrafficPolicyVersionsErrorModeled::InvalidInput(InvalidInput {
+                        message: Some(format!(
+                            "trafficpolicyversion {marker:?} is not a traffic policy version \
+                             number between {FIRST_TRAFFIC_POLICY_VERSION} and \
+                             {MAX_TRAFFIC_POLICY_VERSION}; the marker positions the listing at a \
+                             version, so it has to be the TrafficPolicyVersionMarker a previous \
+                             ListTrafficPolicyVersions response returned"
+                        )),
+                    })
+                })?,
+        };
+
+        let mut traffic_policies = Vec::new();
+        let mut next_marker = None;
+        // The versions are keyed by number on the policy, so walking the range
+        // from the marker upwards IS the documented numerical order, and no
+        // version can be reported twice or skipped.
+        for (&version, _) in policy.versions.range(start_version..) {
+            if traffic_policies.len() >= page_size as usize {
+                next_marker = Some(version);
+                break;
+            }
+            traffic_policies.push(
+                policy
+                    .to_traffic_policy(version)
+                    .expect("a version the policy is keyed by must project"),
+            );
+        }
+
+        Ok(ListTrafficPolicyVersionsOutput {
+            traffic_policies,
+            is_truncated: next_marker.is_some(),
+            // "This element is present only if IsTruncated is true" — so a
+            // listing that ends here names no version to resume at.
+            traffic_policy_version_marker: next_marker
+                .map(|version| version.to_string())
+                .unwrap_or_default(),
+            // The echoed `maxitems`, so a request outside the page bound reads
+            // its own value back while the page itself stays clamped.
+            max_items: reported_max_items,
+        })
     }
 }

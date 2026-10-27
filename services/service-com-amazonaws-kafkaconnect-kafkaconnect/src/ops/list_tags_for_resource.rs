@@ -2,8 +2,9 @@
 
 //! @op ListTagsForResource
 //! Reports the tags stored on the resource the `resourceArn` names — a custom plugin, a
-//! connector or a worker configuration — as they were last written. An ARN this emulator
-//! holds no resource for is a `NotFoundException`.
+//! connector or a worker configuration — as they were last written. A `resourceArn` that
+//! is not a well-formed ARN of this service is a `BadRequestException`; a well-formed one
+//! this emulator holds no resource for is a `NotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -160,6 +161,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let mut state = store.lock();
         state.settle_due();
+
+        // A value that is not a kafkaconnect ARN at all names none of this
+        // service's taggable resources, so it is incorrect input rather than a
+        // resource that is absent: the modelled 400, blaming the member that
+        // carried it.
+        if let Some(message) = crate::state::arn_syntax_refusal(
+            "resourceArn",
+            &input.resource_arn,
+            crate::state::ARN_SERVICE,
+        ) {
+            return Err(ListTagsForResourceErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
 
         // A tag set is reported for whichever resource the ARN names: every taggable
         // resource this emulator holds is keyed by its own ARN, so the lookup is the ARN

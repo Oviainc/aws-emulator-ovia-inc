@@ -25,7 +25,7 @@ use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::ops
 use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::state::ONBOARDING_JOB_DURATION;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::common::{call, router};
+use super::common::{call, router, Harness};
 
 /// One `CommunicationLimit` entry.
 fn limit(max_count_per_recipient: i64, frequency: i64, unit: &str) -> Value {
@@ -55,7 +55,10 @@ fn telephony_config() -> Value {
 /// Onboard `instance` and wait out the span the clock owes its onboarding job, so the
 /// instance is configurable and a campaign target by the time this returns. Nothing in
 /// the emulator sleeps for that span — only a caller that wants the settled state does.
-async fn onboard(router: &MultiServiceRouter, region: &str, instance: &str) {
+async fn onboard(router: &Harness, region: &str, instance: &str) {
+    // Onboarding resolves the `connectInstanceId` against the account's Connect
+    // instance registry, so the instance is registered there first.
+    router.register_connect_instance(region, instance);
     let (status, body) = call(
         router,
         region,

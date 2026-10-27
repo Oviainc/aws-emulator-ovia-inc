@@ -377,7 +377,7 @@ pub mod input_devices;
 
 pub use input_devices::{
     configurable_settings_error, input_device_transfer_type, input_device_type_for_id,
-    is_account_id, not_a_device_id_message, not_an_account_id_message,
+    is_account_id, not_a_device_id_message, not_an_account_id_message, reboot_input_device_force,
     settings_member_mismatch_message, InputDeviceConfiguration, InputDeviceRecord,
     InputDeviceThumbnailRecord, InputDeviceTransferRecord, TransferAcceptance, TransferCancellation,
     TransferRejection,

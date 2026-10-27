@@ -684,8 +684,10 @@ async fn a_tag_key_or_value_at_a_modelled_bound_round_trips_and_is_removed_by_it
 #[tokio::test]
 async fn tagging_an_arn_the_service_never_minted_is_a_not_found() {
     let emulator = emulator();
-    // Every row is an ARN this store does not hold: one of each resource kind
-    // the service tags, and a string that is no ARN at all.
+    // Every row is a WELL-FORMED kafkaconnect ARN this store does not hold: one
+    // of each resource kind the service tags, and one of a resource kind it
+    // mints none of. A value that is not an ARN at all is incorrect input
+    // instead, which `arn_label_refusals` pins.
     let unknown: Vec<(&str, String)> = vec![
         (
             "a worker configuration that was never created",
@@ -705,7 +707,7 @@ async fn tagging_an_arn_the_service_never_minted_is_a_not_found() {
                 "arn:aws:kafkaconnect:{REGION}:{ACCOUNT}:connector/ghost/00000000-0000-4000-8000-000000000000"
             ),
         ),
-        ("not an ARN at all", "worker-configuration".to_string()),
+        ("not a resource kind this service mints", format!("arn:aws:kafkaconnect:{REGION}:{ACCOUNT}:worker-configuration")),
     ];
 
     for (case, arn) in unknown {

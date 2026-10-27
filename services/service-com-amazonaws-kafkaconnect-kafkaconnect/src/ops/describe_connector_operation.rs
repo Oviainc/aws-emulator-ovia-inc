@@ -3,8 +3,9 @@
 //! @op DescribeConnectorOperation
 //! Reports the stored connector operation the request names: the connector it ran
 //! against, its type, the state the clock has walked it to and, once it has reached its
-//! terminal state, when it ended. An ARN this emulator holds no operation of is a
-//! `NotFoundException`.
+//! terminal state, when it ended. A `connectorOperationArn` that is not a well-formed ARN
+//! of this service is a `BadRequestException`; a well-formed one this emulator holds no
+//! operation of is a `NotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -179,6 +180,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let mut state = store.lock();
         state.settle_due();
+
+        // A value that is not a kafkaconnect ARN at all names no operation, so
+        // it is incorrect input rather than a resource that is absent: the
+        // modelled 400, blaming the member that carried it.
+        if let Some(message) = crate::state::arn_syntax_refusal(
+            "connectorOperationArn",
+            &input.connector_operation_arn,
+            crate::state::ARN_SERVICE,
+        ) {
+            return Err(DescribeConnectorOperationErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
 
         // An operation belongs to the connector it ran against and so lives in
         // that connector's region: a regional endpoint reports only the

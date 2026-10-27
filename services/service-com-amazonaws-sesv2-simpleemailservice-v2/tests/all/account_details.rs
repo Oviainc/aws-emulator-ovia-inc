@@ -652,7 +652,9 @@ async fn a_value_outside_a_members_modelled_set_is_refused_and_nothing_is_stored
     // One row per enum-valued member, each with a value its model does not declare:
     // the lower-case spelling of a declared value, a value of the sibling member's
     // catalog, and a value no catalog in the service carries. The member the
-    // refusal has to name is the one the request's own JSON names.
+    // refusal has to name is the one the request's own JSON names; the value that
+    // violated the set is WITHHELD from the sentence, which is how this service
+    // states a value outside a modelled value set.
     let rows: &[(&str, &str, &str, Value)] = &[
         (
             "mail-type-lower-case",
@@ -717,9 +719,9 @@ async fn a_value_outside_a_members_modelled_set_is_refused_and_nothing_is_stored
         );
         let message = refused.message();
         assert!(
-            message.contains(member) && message.contains(value),
-            "case {case:?}: expected the refusal to name the member {member:?} and the value \
-             {value:?}, got {message:?}"
+            message.contains(member) && !message.contains(value),
+            "case {case:?}: expected the refusal to name the member {member:?} and to withhold \
+             the value {value:?}, got {message:?}"
         );
         assert_eq!(
             ses.stored_details(),
