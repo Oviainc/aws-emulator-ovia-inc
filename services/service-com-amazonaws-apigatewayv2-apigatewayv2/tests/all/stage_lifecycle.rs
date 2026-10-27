@@ -182,8 +182,12 @@ fn rows() -> Vec<Row> {
             request: json!({
                 "stageName": "sockets",
                 "clientCertificateId": "abcd1234ef",
+                // Every facility member of the block is named here, so this row asserts
+                // the ECHO: a member a request leaves unset is resolved by the service,
+                // which `server_applied_defaults` is the table for.
                 "defaultRouteSettings": {
                     "dataTraceEnabled": true,
+                    "detailedMetricsEnabled": true,
                     "loggingLevel": "INFO",
                     "throttlingRateLimit": 7.5
                 }

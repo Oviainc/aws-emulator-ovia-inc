@@ -490,6 +490,39 @@ impl StoredStackSet {
         ids
     }
 
+    /// This stack set's DEPLOYMENT TARGETS, which `ListStackSetAutoDeploymentTargets`
+    /// reports as `StackSetAutoDeploymentTargetSummary`: each
+    /// `OrganizationalUnitId` — "the organization root ID or organizational unit (OU) IDs
+    /// where the StackSet is targeted" — once in first-seen order, paired with `Regions`,
+    /// "the list of Regions targeted for this organization or OU", likewise each once in
+    /// first-seen order.
+    ///
+    /// Read off the instances the stack set holds, the way [`Self::organizational_unit_ids`]
+    /// and [`Self::deployed_regions`] are, so a target is reported exactly while the stack
+    /// set has a deployment under it and the Regions reported for it are the Regions it is
+    /// deployed to there. A self-managed stack set's instances carry no OU, so it has no
+    /// targets.
+    pub fn deployment_targets(&self) -> Vec<(String, Vec<String>)> {
+        let mut targets: Vec<(String, Vec<String>)> = Vec::new();
+        for instance in &self.instances {
+            let Some(id) = instance.organizational_unit_id.as_ref() else {
+                continue;
+            };
+            let index = match targets.iter().position(|(held, _)| held == id) {
+                Some(index) => index,
+                None => {
+                    targets.push((id.clone(), Vec::new()));
+                    targets.len() - 1
+                }
+            };
+            let regions = &mut targets[index].1;
+            if !regions.iter().any(|held| held == &instance.region) {
+                regions.push(instance.region.clone());
+            }
+        }
+        targets
+    }
+
     /// Put `instance` in this stack set, replacing the one for the same account and Region
     /// if it already holds one — an account and Region pair carries at most ONE instance of
     /// a stack set, which is why `DescribeStackInstance` addresses one by that pair alone.
