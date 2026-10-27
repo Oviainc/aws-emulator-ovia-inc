@@ -77,6 +77,8 @@ mod service_dependency_metrics;
 mod service_groups;
 #[path = "all/service_operation_metric_references.rs"]
 mod service_operation_metric_references;
+#[path = "all/service_state_latest_change.rs"]
+mod service_state_latest_change;
 #[path = "all/sli_metric_query.rs"]
 mod sli_metric_query;
 #[path = "all/sli_metric_type.rs"]

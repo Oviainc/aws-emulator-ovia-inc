@@ -25,8 +25,12 @@ mod artifact_document_plane;
 mod change_sets;
 #[path = "all/cloudformation_templates.rs"]
 mod cloudformation_templates;
+#[path = "all/empty_response_framing.rs"]
+mod empty_response_framing;
 #[path = "all/error_bodies.rs"]
 mod error_bodies;
+#[path = "all/presigned_locators.rs"]
+mod presigned_locators;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/version_templates.rs"]

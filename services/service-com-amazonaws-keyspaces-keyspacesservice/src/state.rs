@@ -2526,6 +2526,17 @@ pub fn is_aws_region(candidate: &str) -> bool {
 /// list being required at all, so both are checked here. A `SINGLE_REGION`
 /// keyspace is replicated in the region it was created in.
 ///
+/// The list names "the Amazon Web Services Regions where the keyspace is replicated in"
+/// (`ReplicationSpecification$regionList`), so it denotes a SET: `RegionList` carries no
+/// `uniqueItems` (smithy_query shape="RegionList"), and a Region a request names twice is
+/// still one Region the keyspace is replicated in. So the list is collapsed to the Regions
+/// it denotes, in the order the request first named each, and the "at least one additional
+/// Amazon Web Services Region" half of the sentence holds of that set — the modelled
+/// minimum length of 2 is on the list, not on the set, so a list that only repeats one
+/// Region satisfies the model and still names no additional Region. What this returns is
+/// therefore what a keyspace is replicated in, with every Region in it once, whichever
+/// operation resolved it.
+///
 /// `regionList` holds "the Amazon Web Services Regions where the keyspace is replicated
 /// in" (`ReplicationSpecification$regionList`), and a keyspace can only be replicated in
 /// a Region that exists — a value naming none is the "invalid or malformed request" the
@@ -2588,7 +2599,26 @@ pub fn resolve_replication(
             "replicationSpecification.regionList must contain the current Region '{region}'"
         ));
     }
-    Ok((specification.replication_strategy.clone(), regions))
+    // The Regions the list denotes: a repeated entry is kept once, in the order the
+    // request first named it — the set beside the list is what keeps that one pass linear,
+    // as this crate's other duplicate-name checks do ([`resolve_replica_specifications`]).
+    // The count is already capped above.
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut denoted: Vec<String> = Vec::with_capacity(regions.len());
+    for listed in &regions {
+        if seen.insert(listed.as_str()) {
+            denoted.push(listed.clone());
+        }
+    }
+    if denoted.len() < 2 {
+        return Err(format!(
+            "replicationSpecification.regionList names only Region '{}': a \
+             {MULTI_REGION_STRATEGY} keyspace requires the current Region and at least one \
+             additional Amazon Web Services Region",
+            denoted.join(", ")
+        ));
+    }
+    Ok((specification.replication_strategy.clone(), denoted))
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

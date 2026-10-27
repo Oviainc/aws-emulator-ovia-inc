@@ -165,30 +165,38 @@ const STATEMENT: &str = "{\"Effect\":\"Allow\",\"Action\":[\"bedrock:ApplyGuardr
 /// Documents the IAM resource-policy grammar admits, each written in a DIFFERENT form —
 /// the forms `service_common::iam_policy` states (one statement as an object or in a
 /// list, several statements, both effects, the `Not…` complements, an omitted `Version`)
-/// plus whitespace and key order a caller chooses, which a verbatim store must keep.
-fn admitted_documents() -> Vec<(&'static str, String)> {
+/// plus whitespace and key order a caller chooses — as `(case, submitted, reported)`.
+///
+/// `reported` is what a read hands back: the document's CANONICAL form, which is the
+/// submitted document with the whitespace between its JSON tokens dropped and nothing else
+/// about it changed. Amazon Bedrock holds a resource policy parsed and serializes it again
+/// on read, so the key order the caller chose, its string literals and its number
+/// spellings survive while its layout does not. Each row's reported text is written out
+/// here rather than computed, so a row pins the bytes a client reads.
+fn admitted_documents() -> Vec<(&'static str, String, String)> {
+    let already_canonical = |case: &'static str, document: String| (case, document.clone(), document);
     vec![
-        (
+        already_canonical(
             "one statement in a list",
             format!("{{\"Version\":\"2012-10-17\",\"Statement\":[{STATEMENT}]}}"),
         ),
-        (
+        already_canonical(
             "one statement written as the object itself",
             format!("{{\"Version\":\"2012-10-17\",\"Statement\":{STATEMENT}}}"),
         ),
-        (
+        already_canonical(
             "two statements",
             format!("{{\"Version\":\"2012-10-17\",\"Statement\":[{STATEMENT},{STATEMENT}]}}"),
         ),
-        (
+        already_canonical(
             "no Version, which a policy may omit",
             format!("{{\"Statement\":[{STATEMENT}]}}"),
         ),
-        (
+        already_canonical(
             "the legacy policy version",
             format!("{{\"Version\":\"2008-10-17\",\"Statement\":[{STATEMENT}]}}"),
         ),
-        (
+        already_canonical(
             "a Deny over the Not… complements",
             "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Deny\",\
              \"NotAction\":\"bedrock:DeleteGuardrail\",\
@@ -201,8 +209,29 @@ fn admitted_documents() -> Vec<(&'static str, String)> {
                 "{{\n  \"Statement\": [\n    {STATEMENT}\n  ],\n  \
                  \"Version\": \"2012-10-17\"\n}}"
             ),
+            // The layout is gone; the caller's own element order is not.
+            format!("{{\"Statement\":[{STATEMENT}],\"Version\":\"2012-10-17\"}}"),
         ),
         (
+            "a space after every colon and comma, as a default JSON dump writes it",
+            format!(
+                "{{\"Version\": \"2012-10-17\", \"Statement\": [{STATEMENT}]}}"
+            ),
+            format!("{{\"Version\":\"2012-10-17\",\"Statement\":[{STATEMENT}]}}"),
+        ),
+        (
+            "whitespace around the whole document and inside a Sid",
+            " \t\n{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"two  words\",\
+             \"Effect\":\"Allow\",\"Action\":\"bedrock:GetGuardrail\",\
+             \"Principal\":\"*\",\"Resource\":\"*\"}]}\n "
+                .to_string(),
+            // The whitespace INSIDE the `Sid` string is part of its value, so it stays.
+            "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"two  words\",\
+             \"Effect\":\"Allow\",\"Action\":\"bedrock:GetGuardrail\",\
+             \"Principal\":\"*\",\"Resource\":\"*\"}]}"
+                .to_string(),
+        ),
+        already_canonical(
             "a Sid carrying a non-ASCII character the member's pattern admits",
             "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"caf\u{e9}\",\
              \"Effect\":\"Allow\",\"Action\":\"bedrock:GetGuardrail\",\
@@ -242,12 +271,12 @@ fn refused_documents() -> Vec<(&'static str, String)> {
 }
 
 // ---------------------------------------------------------------------------------------
-// 1 + 2. A policy attaches to the resource its ARN names, reads back verbatim, and is
-// replaced by a further put.
+// 1 + 2. A policy attaches to the resource its ARN names, reads back in its canonical
+// form, and is replaced by a further put.
 // ---------------------------------------------------------------------------------------
 
 #[tokio::test]
-async fn every_resource_type_round_trips_every_policy_form_verbatim() {
+async fn every_resource_type_round_trips_every_policy_form_canonically() {
     let emu = emulator();
     // One resource of each type this service mints an ARN for and holds a record of, so
     // the rule is exercised across the resource dimension it generalises over rather than
@@ -265,7 +294,7 @@ async fn every_resource_type_round_trips_every_policy_form_verbatim() {
     ];
 
     for (resource, arn) in &resources {
-        for (form, document) in admitted_documents() {
+        for (form, document, reported) in admitted_documents() {
             let case = format!("{resource} / {form}");
             let put = put_policy(&emu, arn, &document).await;
             assert_eq!(
@@ -286,11 +315,11 @@ async fn every_resource_type_round_trips_every_policy_form_verbatim() {
                 "case {case:?}: GetResourcePolicy must answer 200, got {} {:?}",
                 read.status, read.body
             );
-            let reported = read.text("resourcePolicy");
+            let answered = read.text("resourcePolicy");
             assert_eq!(
-                reported, document,
-                "case {case:?}: the stored document must come back byte for byte, got \
-                 {reported:?}"
+                answered, reported,
+                "case {case:?}: the read must report the canonical form of the stored \
+                 document, got {answered:?}"
             );
         }
     }
@@ -300,7 +329,7 @@ async fn every_resource_type_round_trips_every_policy_form_verbatim() {
     let last = admitted_documents()
         .last()
         .expect("the document table has rows")
-        .1
+        .2
         .clone();
     for (resource, arn) in &resources {
         let read = get_policy(&emu, arn).await;
@@ -325,7 +354,7 @@ async fn a_further_put_replaces_the_policy_the_resource_holds() {
 
     // Every row is put in turn over the SAME resource: the read after each one reports
     // that row and nothing of the row before it.
-    for (form, document) in &documents {
+    for (form, document, reported) in &documents {
         let put = put_policy(&emu, &arn, document).await;
         assert_eq!(
             put.status, 201,
@@ -335,7 +364,7 @@ async fn a_further_put_replaces_the_policy_the_resource_holds() {
         let read = get_policy(&emu, &arn).await;
         assert_eq!(
             read.text("resourcePolicy"),
-            *document,
+            *reported,
             "case {form:?}: the last put decides the policy in force, got {:?}",
             read.body
         );
@@ -368,7 +397,7 @@ async fn both_arn_spellings_of_one_resource_address_the_same_policy() {
         ("put under the ARN, read under the alias", &router, &other_spelling),
         ("put under the alias, read under the ARN", &other_spelling, &router),
     ] {
-        for (form, document) in &documents {
+        for (form, document, reported) in &documents {
             let put = put_policy(&emu, written, document).await;
             assert_eq!(
                 put.status, 201,
@@ -378,7 +407,7 @@ async fn both_arn_spellings_of_one_resource_address_the_same_policy() {
             let read = get_policy(&emu, read_through).await;
             assert_eq!(
                 read.text("resourcePolicy"),
-                *document,
+                *reported,
                 "case {case:?} / {form:?}: both spellings address one policy, got {:?}",
                 read.body
             );
@@ -732,7 +761,7 @@ async fn every_resource_type_and_policy_form_is_taken_away_by_the_delete() {
     ];
 
     for (resource, arn) in &resources {
-        for (form, document) in admitted_documents() {
+        for (form, document, reported) in admitted_documents() {
             let case = format!("{resource} / {form}");
             let put = put_policy(&emu, arn, &document).await;
             assert_eq!(
@@ -765,7 +794,7 @@ async fn every_resource_type_and_policy_form_is_taken_away_by_the_delete() {
             let reattached = get_policy(&emu, arn).await;
             assert_eq!(
                 reattached.text("resourcePolicy"),
-                document,
+                reported,
                 "case {case:?}: a put after the delete attaches again, got {:?}",
                 reattached.body
             );

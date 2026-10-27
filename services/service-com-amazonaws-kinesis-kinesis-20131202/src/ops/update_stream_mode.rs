@@ -221,6 +221,11 @@ fn update_stream_mode(
         )));
     }
 
+    // How many streams of the on-demand capacity mode this region already holds, read
+    // BEFORE the stored stream is borrowed to be written: the quota the change below is
+    // counted against.
+    let on_demand_in_region = store.on_demand_streams_held_in(now, region);
+
     // `StreamARN` is the only identifier this operation takes (`@required`), and `StreamId`
     // is documented "Not Implemented. Reserved for future use".
     let identifier = input.stream_arn.clone();
@@ -238,6 +243,25 @@ fn update_stream_mode(
         return Err(UpdateStreamModeErrorModeled::ResourceInUseException(
             ResourceInUseException {
                 message: Some(crate::state::stream_not_active_message(&identifier, status)),
+            },
+        )
+        .into());
+    }
+
+    // A stream of the on-demand capacity mode is counted against the on-demand stream quota
+    // of this account and region, which is the quota `DescribeLimits` reports as
+    // `OnDemandStreamCountLimit`: a change that would take the region past it is refused,
+    // while a stream that already carries that mode is counted already and so takes it past
+    // nothing.
+    if stream_mode == crate::state::STREAM_MODE_ON_DEMAND
+        && stream.stream_mode != crate::state::STREAM_MODE_ON_DEMAND
+        && on_demand_in_region >= crate::state::MAX_ON_DEMAND_STREAMS_PER_REGION
+    {
+        return Err(UpdateStreamModeErrorModeled::LimitExceededException(
+            LimitExceededException {
+                message: Some(crate::state::on_demand_stream_ceiling_exceeded_message(
+                    on_demand_in_region,
+                )),
             },
         )
         .into());

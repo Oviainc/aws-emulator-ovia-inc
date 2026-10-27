@@ -1421,8 +1421,8 @@ fn filter_policy_parse_refusal(value: &str, error: &serde_json::Error) -> String
 
     let diagnosis = match fault::unrecognized_token(value, error) {
         Some((word, line, column)) => format!(
-            "Unrecognized token '{word}': was expecting (JSON String, Number, Array, \
-             Object or token 'null', 'true' or 'false'){}",
+            "Unrecognized token '{word}': was expecting ({}){}",
+            fault::VALUE_CLASSES,
             fault::source_location(line, column)
         ),
         None => format!(

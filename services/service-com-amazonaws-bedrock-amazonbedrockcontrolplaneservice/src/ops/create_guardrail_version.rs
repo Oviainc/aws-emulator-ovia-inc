@@ -161,10 +161,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(guardrail) = store.guardrail_mut(&input.guardrail_identifier) else {
             return Err(CreateGuardrailVersionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "no guardrail {} exists in this account",
-                        input.guardrail_identifier
-                    )),
+                    message: Some(crate::state::GUARDRAIL_NOT_FOUND.to_string()),
                 },
             )
             .into());

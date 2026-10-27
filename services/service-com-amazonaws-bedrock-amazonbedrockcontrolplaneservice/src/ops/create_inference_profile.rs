@@ -180,11 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if tag_count > crate::state::MAX_TAGS_PER_RESOURCE {
             return Err(CreateInferenceProfileErrorModeled::TooManyTagsException(
                 TooManyTagsException {
-                    message: Some(format!(
-                        "a resource may carry at most {} tags, and this request carries \
-                         {tag_count}",
-                        crate::state::MAX_TAGS_PER_RESOURCE
-                    )),
+                    message: Some(crate::state::too_many_tags_message()),
                     resource_name: None,
                 },
             )

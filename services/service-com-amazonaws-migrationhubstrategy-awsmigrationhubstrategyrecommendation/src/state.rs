@@ -2026,6 +2026,11 @@ impl RegionState {
     ///
     /// The groups are collected into a set first, so the count costs one pass over the
     /// inventory and one over the filter rather than the product of the two.
+    ///
+    /// The inventory is the one the portfolio holds when the report starts, so call
+    /// [`Self::settle_all`] first: a server an import whose completion is already due
+    /// brought in is part of that inventory, so the count does not depend on whether an
+    /// unrelated read materialised the completion first.
     pub fn servers_in_groups(&self, groups: &[Group]) -> i32 {
         if groups.is_empty() {
             return count_of(self.servers.len());

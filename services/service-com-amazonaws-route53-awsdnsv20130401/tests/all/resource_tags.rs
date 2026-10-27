@@ -29,7 +29,10 @@ use crate::hosted_zone_records::{
 
 /// A `ChangeTagsForResource` body. An empty list is OMITTED rather than sent as
 /// an empty element, because `TagList`/`TagKeyList` are `len 1..10`.
-fn change_tags_body(add: &[(&str, &str)], remove: &[&str]) -> String {
+///
+/// `pub(crate)` so a sibling suite in this test target tags a resource through
+/// the SAME request rather than growing a second copy of it.
+pub(crate) fn change_tags_body(add: &[(&str, &str)], remove: &[&str]) -> String {
     let add_block = if add.is_empty() {
         String::new()
     } else {
@@ -61,7 +64,9 @@ fn change_tags_body(add: &[(&str, &str)], remove: &[&str]) -> String {
 }
 
 /// Apply one tag batch to a resource.
-async fn change_tags(
+///
+/// `pub(crate)` for the same reason [`change_tags_body`] is.
+pub(crate) async fn change_tags(
     router: &MultiServiceRouter,
     resource_type: &str,
     resource_id: &str,
@@ -78,7 +83,14 @@ async fn change_tags(
 }
 
 /// Read a resource's tags back.
-async fn list_tags(router: &MultiServiceRouter, resource_type: &str, resource_id: &str) -> Reply {
+///
+/// `pub(crate)` so a sibling suite reads one resource's tags through the SAME
+/// single-resource operation it compares a batch read against.
+pub(crate) async fn list_tags(
+    router: &MultiServiceRouter,
+    resource_type: &str,
+    resource_id: &str,
+) -> Reply {
     call(
         router,
         "GET",
@@ -117,19 +129,28 @@ fn carries_tags_container(reply: &Reply) -> bool {
 
 /// The `(Key, Value)` pairs of every `<Tag>` in a reply, in document order.
 fn tag_pairs(reply: &Reply) -> Vec<(String, String)> {
+    tag_pairs_in(&reply.body)
+}
+
+/// The `(Key, Value)` pairs of every `<Tag>` inside one stretch of XML, in
+/// document order.
+///
+/// Takes the stretch rather than the whole reply so a suite reading a reply that
+/// carries SEVERAL tag sets can read each set's tags through this ONE reader.
+pub(crate) fn tag_pairs_in(xml: &str) -> Vec<(String, String)> {
     let mut pairs = Vec::new();
-    let mut rest = reply.body.as_str();
+    let mut rest = xml;
     while let Some(start) = rest.find("<Tag>") {
         let block_start = start + "<Tag>".len();
         let end = rest[block_start..]
             .find("</Tag>")
             .map(|offset| block_start + offset)
-            .unwrap_or_else(|| panic!("unterminated <Tag> element in {}", reply.body));
+            .unwrap_or_else(|| panic!("unterminated <Tag> element in {xml}"));
         let block = &rest[block_start..end];
         let key = element_text(block, "Key")
-            .unwrap_or_else(|| panic!("a <Tag> must carry a <Key>; body {}", reply.body));
+            .unwrap_or_else(|| panic!("a <Tag> must carry a <Key>; body {xml}"));
         let value = element_text(block, "Value")
-            .unwrap_or_else(|| panic!("a <Tag> must carry a <Value>; body {}", reply.body));
+            .unwrap_or_else(|| panic!("a <Tag> must carry a <Value>; body {xml}"));
         pairs.push((key, value));
         rest = &rest[end + "</Tag>".len()..];
     }

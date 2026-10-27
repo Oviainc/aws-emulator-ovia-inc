@@ -97,7 +97,10 @@ async fn listed_domain_ids(emulator: &Emulator) -> Vec<String> {
 }
 
 /// The detail text of a refusal, in the member this service reports it in.
-fn detail(case: &str, body: &Value) -> String {
+///
+/// `pub(crate)` so a sibling suite reads a refusal's text the same way rather than growing
+/// a second copy of the reader.
+pub(crate) fn detail(case: &str, body: &Value) -> String {
     body.get("Message")
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("case {case:?}: a refusal must carry a Message, got {body}"))

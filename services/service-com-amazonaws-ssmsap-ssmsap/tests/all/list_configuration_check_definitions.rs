@@ -32,7 +32,7 @@ use service_com_amazonaws_ssmsap_ssmsap::ops::types::{
 use service_com_amazonaws_ssmsap_ssmsap::state::MAX_PAGE_SIZE;
 
 use crate::application_lifecycle::{valid_registration, Emulator, Reply};
-use crate::configuration_checks::{field, started, string_field};
+use crate::configuration_checks::{field, settle, started, string_field};
 use crate::validation_message_rendering::{message, VALIDATION_EXCEPTION};
 
 /// The regional endpoints the catalogue is read at. The catalogue is the service's own,
@@ -325,6 +325,10 @@ async fn a_definition_names_the_application_types_its_check_can_be_started_again
                 registration.status, 200,
                 "case {case:?}: expected 200 from RegisterApplication, got {registration:?}"
             );
+            // A check is started against an application that owes the clock nothing, so
+            // the registration is waited out first
+            // (`tests/all/configuration_checks_in_flight.rs` pins that refusal).
+            settle().await;
 
             let reply = emulator
                 .start_checks(json!({

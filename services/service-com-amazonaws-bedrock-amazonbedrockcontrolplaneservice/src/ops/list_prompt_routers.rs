@@ -2,15 +2,16 @@
 
 //! @op ListPromptRouters
 //!
-//! Lists the prompt routers of the region the request addresses, out of what
-//! `ops/create_prompt_router.rs` persisted in [`crate::state`]: one `PromptRouterSummary`
-//! per stored router whose `PromptRouterType` is the one the request asked for, in ARN
-//! order, paginated. A read, and only a read.
+//! Lists the prompt routers of the region the request addresses: one
+//! `PromptRouterSummary` per router whose `PromptRouterType` is the one the request asked
+//! for, in ARN order, paginated. A read, and only a read.
 //!
 //! `type` is modelled with `@default("default")`, so a request that names none asks for
-//! the routers Amazon Bedrock itself publishes — this emulator publishes none, and a
-//! router a caller created is `custom`, so the default listing is empty until Amazon's own
-//! catalog is modelled.
+//! the routers Amazon Bedrock itself publishes: those come out of the published catalog
+//! [`crate::state::default_prompt_routers`] (the same rows `ops/get_prompt_router.rs`
+//! resolves one of), and a router a caller created is `custom`, so it comes out of what
+//! `ops/create_prompt_router.rs` persisted in [`crate::state`]. The two sets never
+//! overlap, because the type a router reports decides which listing reports it.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
@@ -116,21 +117,9 @@ impl<Eng> ListPromptRouters<Eng> {
 /// span it admits.
 const MAX_PAGE_SIZE: usize = 1000;
 
-/// One listed router as the `PromptRouterSummary` the response carries.
-fn summary(router: &crate::state::PromptRouter) -> PromptRouterSummary {
-    PromptRouterSummary {
-        prompt_router_name: router.name.clone(),
-        routing_criteria: router.routing_criteria.clone(),
-        description: router.description.clone(),
-        created_at: Some(crate::state::date_time(router.created_at)),
-        updated_at: Some(crate::state::date_time(router.updated_at)),
-        prompt_router_arn: router.arn.clone(),
-        models: router.models.clone(),
-        fallback_model: router.fallback_model.clone(),
-        status: router.status.to_string(),
-        r#type: router.router_type.to_string(),
-    }
-}
+// A listed router is reported through the ONE mapping in
+// `crate::state::prompt_router_summary`, which `GetPromptRouter` reports a router through
+// too, so a listing and a read never disagree about a member.
 
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListPromptRouters<Eng>
@@ -163,17 +152,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
 
         // The routers of THIS region, of the type the request asked for, in ARN order —
-        // which is the cursor order too. A router's ARN carries the region the create
-        // addressed, so the ARN prefix of this region is what scopes the listing.
+        // which is the cursor order too. A stored router's ARN carries the region the
+        // create addressed, and a published router carries the region it is offered in, so
+        // the ARN prefix of this region is what scopes the listing either way.
         let region_prefix = crate::state::prompt_router_arn(&region, "");
-        let mut rows: Vec<&crate::state::PromptRouter> = store
+        let mut rows: Vec<PromptRouterSummary> = store
             .prompt_routers
             .values()
             .filter(|router| {
                 router.arn.starts_with(&region_prefix) && router.router_type == input.r#type
             })
+            .map(crate::state::prompt_router_summary)
             .collect();
-        rows.sort_unstable_by(|left, right| left.arn.cmp(&right.arn));
+        if input.r#type == crate::state::PROMPT_ROUTER_TYPE_DEFAULT {
+            rows.extend(crate::state::default_prompt_routers(&region));
+        }
+        rows.sort_unstable_by(|left, right| {
+            left.prompt_router_arn.cmp(&right.prompt_router_arn)
+        });
 
         // The cursor IS the ARN the next page starts on, so the pages partition the
         // listing with neither a gap nor a repeat even when a router has been deleted
@@ -189,7 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-            rows.retain(|router| router.arn.as_str() >= token);
+            rows.retain(|router| router.prompt_router_arn.as_str() >= token);
         }
 
         let page_size = input
@@ -197,13 +193,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|max| usize::try_from(max).ok())
             .unwrap_or(MAX_PAGE_SIZE)
             .clamp(1, MAX_PAGE_SIZE);
-        let next_token = rows.get(page_size).map(|router| router.arn.clone());
+        let next_token = rows
+            .get(page_size)
+            .map(|router| router.prompt_router_arn.clone());
         rows.truncate(page_size);
 
         Ok(ListPromptRoutersOutput {
             // `PromptRouterSummaries` admits zero entries, so an account with no router
             // of this type reports the empty list rather than omitting the member.
-            prompt_router_summaries: Some(rows.into_iter().map(summary).collect()),
+            prompt_router_summaries: Some(rows),
             next_token,
         })
     }

@@ -346,7 +346,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 InvalidExecutionInput {
                     message: Some(crate::state::resource_error_message(
                         crate::state::INVALID_STATE_MACHINE_EXECUTION_INPUT,
-                        &error.to_string(),
+                        &crate::state::json_parse_diagnostic(&state_input, &error),
                     )),
                 },
             )
@@ -369,7 +369,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Err(error) => {
                     return Err(refuse(format!(
                         "variables must be a JSON object literal whose keys are the variable \
-                         names: {error}"
+                         names: {}",
+                        crate::state::json_parse_diagnostic(text, &error)
                     )))
                 }
             },
@@ -396,8 +397,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 Err(error) => {
                     return Err(refuse(format!(
-                        "context must be a JSON string representing a valid Context object: \
-                         {error}"
+                        "context must be a JSON string representing a valid Context object: {}",
+                        crate::state::json_parse_diagnostic(text, &error)
                     )))
                 }
             },

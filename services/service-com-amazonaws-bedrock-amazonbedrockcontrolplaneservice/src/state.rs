@@ -48,6 +48,13 @@
 //! copy of it: the model a job produced is the model `ops/get_custom_model.rs` and
 //! `ops/list_custom_models.rs` report.
 //!
+//! And it holds the model copy jobs `ops/create_model_copy_job.rs` submits and
+//! `ops/get_model_copy_job.rs` reads back, together with the instant each job's
+//! non-terminal `status` is owed its move to `Completed`. A job that completes is what
+//! brings the COPIED model into being, so the completion registers that model in the
+//! custom models below rather than holding a second copy of it: the model a copy produced
+//! is the model `ops/get_custom_model.rs` and `ops/list_custom_models.rs` report.
+//!
 //! And it holds the Bedrock Marketplace model endpoints
 //! `ops/create_marketplace_model_endpoint.rs` mints,
 //! `ops/update_marketplace_model_endpoint.rs` reconfigures,
@@ -173,8 +180,8 @@ use crate::ops::types::{
     GuardrailTopicsTierConfig, GuardrailWord, GuardrailWordConfig, GuardrailWordPolicy,
     GuardrailWordPolicyConfig, InferenceProfileModel, InferenceProfileSummary, LoggingConfig,
     MarketplaceModelEndpoint,
-    ModelConfiguration, ModelDataSource, ModelEnforcement, OutputDataConfig,
-    PromptRouterTargetModel,
+    ModelConfiguration, ModelCopyJobSummary, ModelDataSource, ModelEnforcement, OutputDataConfig,
+    PromptRouterSummary, PromptRouterTargetModel,
     ProvisionedModelSummary, RoutingCriteria, SelectiveContentGuarding, Tag, TrainingDataConfig,
     ValidationDataConfig, VpcConfig,
 };
@@ -218,6 +225,17 @@ pub const TIER_CLASSIC: &str = "CLASSIC";
 /// put installs is the ACCOUNT-level one, so this is the owner every stored configuration
 /// reports.
 pub const CONFIGURATION_OWNER_ACCOUNT: &str = "ACCOUNT";
+
+/// What this service answers as its `ResourceNotFoundException` message for a
+/// `guardrailIdentifier` that resolves to no guardrail of this account — a guardrail that
+/// was never created, one that has been deleted, or a version the guardrail does not
+/// carry.
+///
+/// RECORDED behaviour: Amazon Bedrock reports that the guardrail is not there and nothing
+/// about the request — a FIXED sentence, carrying no identifier, no version and no account
+/// reference — so every operation that resolves a guardrail identifier answers with this
+/// one value rather than wording the miss itself.
+pub const GUARDRAIL_NOT_FOUND: &str = "This guardrail does not exist.";
 
 /// The most guardrails this account may hold at once, past which a create is
 /// refused with `ServiceQuotaExceededException`.
@@ -274,12 +292,42 @@ pub const RESPONSE_QUALITY_DIFFERENCE_STEP: f64 = 5.0;
 /// server-side bound no matter how many creates a caller issues.
 pub const MAX_PROMPT_ROUTERS_PER_ACCOUNT: usize = 500;
 
+/// What this service answers as its `ValidationException` message for a
+/// `CreatePromptRouter` whose `promptRouterName` another router of this account and region
+/// already holds.
+///
+/// RECORDED behaviour, and a message BUILT FROM THE REQUEST: Amazon Bedrock reports that
+/// the resource was not created and names the name the request asked for, so the rule is
+/// "name the name the request carried" rather than one recorded router name. The name
+/// "must be unique within your Amazon Web Services account in the current region"
+/// (`smithy_query(query="doc",shape="CreatePromptRouterRequest",member="promptRouterName")`),
+/// which is the rule this refusal reports.
+#[must_use]
+pub fn duplicate_prompt_router_message(prompt_router_name: &str) -> String {
+    format!(
+        "Failed to create the resource because the prompt router with name \
+         {prompt_router_name} already exists."
+    )
+}
+
 /// The most tags one resource of this service may carry.
 ///
 /// `TooManyTagsException` documents the bound itself — "The request contains more tags
 /// than can be associated with a resource (50 tags per resource)" — so a create carrying
 /// more is refused with that error rather than stored.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// What this service answers as its `TooManyTagsException` message for a request carrying
+/// more tags than one resource may hold.
+///
+/// RECORDED behaviour: Amazon Bedrock states the BOUND and nothing about the request — no
+/// member path, no submitted tag count and no resource — so the one variable part is the
+/// bound itself, read off [`MAX_TAGS_PER_RESOURCE`] rather than spelled into the sentence,
+/// and every operation that refuses a request for its tag count answers alike.
+#[must_use]
+pub fn too_many_tags_message() -> String {
+    format!("You can assign a maximum of {MAX_TAGS_PER_RESOURCE} tags to a resource")
+}
 
 /// `MarketplaceModelEndpoint$status` — an endpoint Amazon Bedrock Marketplace knows.
 ///
@@ -362,6 +410,39 @@ pub const IMPORT_JOB_COMPLETE_AFTER: Duration = Duration::from_millis(500);
 /// server-side cap a caller could grow this part of the store with nothing but fresh job
 /// names.
 pub const MAX_MODEL_IMPORT_JOBS_PER_ACCOUNT: usize = 100;
+
+/// `ModelCopyJobStatus` — the copy Amazon Bedrock accepted is running.
+///
+/// The enum is `[InProgress, Completed, Failed]`
+/// (`smithy_query(query="shape",shape="ModelCopyJobStatus")`). A copy runs after the call
+/// that submits it returns, so this is the status every accepted job carries first.
+pub const MODEL_COPY_JOB_STATUS_IN_PROGRESS: &str = "InProgress";
+
+/// `ModelCopyJobStatus` — the copy finished, which is what brings the copied custom model
+/// into being; the terminal status the non-terminal one above is owed its move to.
+///
+/// `Failed` names a copy that did not finish; nothing in this emulator makes an accepted
+/// copy fail, so no call here mints it.
+pub const MODEL_COPY_JOB_STATUS_COMPLETED: &str = "Completed";
+
+/// How long after `CreateModelCopyJob` a job's non-terminal `status` is owed its move to
+/// [`MODEL_COPY_JOB_STATUS_COMPLETED`].
+///
+/// CHOSEN, not documented: AWS publishes no duration for copying a custom model into
+/// another region. It is non-zero, so a caller that reads the job straight after creating
+/// it still observes the `InProgress` status the real service reports; and it is
+/// materialised from the stored due instant on the next read rather than waited on, so no
+/// handler sleeps.
+pub const MODEL_COPY_JOB_COMPLETE_AFTER: Duration = Duration::from_secs(3);
+
+/// The most model copy jobs this account may hold at once, past which a create is refused
+/// with 400 `ValidationException` — the refusal channel this operation's own errors do not
+/// carry a quota error on.
+///
+/// The emulator's own bound rather than a published quota, for the reason
+/// [`MAX_MODEL_IMPORT_JOBS_PER_ACCOUNT`] is one: without a server-side cap a caller could
+/// grow this part of the store with nothing but fresh target model names.
+pub const MAX_MODEL_COPY_JOBS_PER_ACCOUNT: usize = 100;
 
 /// `EvaluationJobStatus` — the job Amazon Bedrock accepted is running.
 ///
@@ -1633,6 +1714,51 @@ impl CustomModelRecord {
             self.active_due_at = None;
         }
     }
+}
+
+/// One stored model copy job: the identity `CreateModelCopyJob` minted, the source model
+/// the request named, the copied model the job produces, and the job's own lifecycle
+/// status.
+///
+/// `status` is `&'static str` for the same reason [`CustomModelRecord::status`] is: the
+/// statuses are the ones this emulator's lifecycle passes through rather than anything a
+/// request chooses.
+#[derive(Debug, Clone)]
+pub struct ModelCopyJobRecord {
+    /// The `ModelCopyJobArn` this job is addressed by, minted by [`model_copy_job_arn`].
+    pub arn: String,
+    /// The region the create addressed — the region the copy is made INTO, which
+    /// [`Self::arn`] also carries.
+    pub region: String,
+    /// `sourceModelArn`, as the create request spelled it. The model being copied lives in
+    /// the region its own ARN names, which is how this operation copies across regions.
+    pub source_model_arn: String,
+    /// `sourceModelName` — the name of the custom model being copied, as that model
+    /// carries it.
+    pub source_model_name: Option<String>,
+    /// `sourceAccountId` — the account the model being copied originated from, read off the
+    /// source ARN.
+    pub source_account_id: String,
+    /// `targetModelArn` — the `CustomModelArn` the copied model is minted under, decided
+    /// when the job is accepted so the job reports the model it will produce from the
+    /// start.
+    pub target_model_arn: String,
+    /// `targetModelName`, as the create request spelled it.
+    pub target_model_name: String,
+    /// `targetModelKmsKeyArn` — the key the copy is encrypted with (absent when the create
+    /// named none).
+    pub target_model_kms_key_arn: Option<String>,
+    /// `targetModelTags` — the tags the create attached to the copied model.
+    pub target_model_tags: Vec<Tag>,
+    /// `ModelCopyJobStatus`.
+    pub status: &'static str,
+    /// When [`Self::status`] is owed its move to [`MODEL_COPY_JOB_STATUS_COMPLETED`], or
+    /// `None` once it is terminal.
+    ///
+    /// The due INSTANT, not a timer, for the same reason
+    /// [`CustomModelRecord::active_due_at`] is one.
+    pub completed_due_at: Option<SystemTime>,
+    pub created_at: SystemTime,
 }
 
 /// One stored model customization job: the identity `CreateModelCustomizationJob` minted,
@@ -3056,6 +3182,16 @@ pub struct ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// How many model customization job ids this store has minted; the uniqueness half of
     /// a minted id.
     pub minted_model_customization_jobs: u64,
+    /// Every submitted model copy job, keyed by its `ModelCopyJobArn` — the one identifier
+    /// `GetModelCopyJob` addresses a job by.
+    pub model_copy_jobs: HashMap<String, ModelCopyJobRecord>,
+    /// `CreateModelCopyJob` idempotency: `(region, clientRequestToken)` -> the `jobArn`
+    /// that token minted. Scoped to that one operation, and to the region the request
+    /// addressed, the way the model customization job index is.
+    pub model_copy_job_create_tokens: HashMap<(String, String), String>,
+    /// How many model copy job ids this store has minted; the uniqueness half of a minted
+    /// id.
+    pub minted_model_copy_jobs: u64,
     /// Every submitted batch inference job, keyed by its `ModelInvocationJobArn` — one of
     /// the two spellings a `ModelInvocationJobIdentifier` carries, the other being the
     /// minted job id, which that ARN itself carries.
@@ -3872,10 +4008,12 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
         now: SystemTime,
     ) -> Option<&mut CustomModelRecord> {
         // A customization job the clock has already completed is what brings its output
-        // model into being, so those completions are materialised before a model is looked
+        // model into being, and so is a copy job the clock has already completed, so those
+        // completions are materialised before a model is looked
         // up: such a model was owed at its job's due instant even if nobody had read the
         // job.
         self.settle_model_customization_jobs(now);
+        self.settle_model_copy_jobs(now);
         let arn = self.custom_model_arn_of(identifier, region)?;
         let record = self.custom_models.get_mut(&arn)?;
         record.settle(now);
@@ -3886,9 +4024,10 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// so a LISTING reports — and filters on — the status each record holds at `now`
     /// exactly as a read of that one model would.
     pub fn settle_custom_models(&mut self, now: SystemTime) {
-        // Including the models whose customization job the clock has completed, for the
-        // reason [`Self::custom_model`] materialises those first.
+        // Including the models whose customization or copy job the clock has completed,
+        // for the reason [`Self::custom_model`] materialises those first.
         self.settle_model_customization_jobs(now);
+        self.settle_model_copy_jobs(now);
         for record in self.custom_models.values_mut() {
             record.settle(now);
         }
@@ -4009,6 +4148,95 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
         let arns: Vec<String> = self.model_customization_jobs.keys().cloned().collect();
         for arn in arns {
             self.settle_model_customization_job(&arn, now);
+        }
+    }
+
+    /// Mint a fresh model copy job id: the resource half of a `model-copy-job/<id>` ARN,
+    /// unique within this store.
+    ///
+    /// Built like a model customization job id, and for the same two reasons;
+    /// `ModelCopyJobArn` admits exactly `[a-z0-9]{12}` there.
+    pub fn mint_model_copy_job_id(&mut self, now: SystemTime) -> String {
+        self.minted_model_copy_jobs += 1;
+        minted_id(self.minted_model_copy_jobs, now)
+    }
+
+    /// The model copy job a `ModelCopyJobArn` names, with any status transition the clock
+    /// has made due at `now` materialised first — so every caller reads the status the job
+    /// holds at `now`, whichever operation asked.
+    pub fn model_copy_job(
+        &mut self,
+        arn: &str,
+        now: SystemTime,
+    ) -> Option<&ModelCopyJobRecord> {
+        self.settle_model_copy_job(arn, now);
+        self.model_copy_jobs.get(arn)
+    }
+
+    /// Materialise the completion the clock has already made due at `now` for the job
+    /// `arn` names: the copy finishing is what brings the copied custom model into being,
+    /// so the completion registers that model beside the account's other custom models
+    /// rather than holding a second copy of it.
+    ///
+    /// The only write a reporting operation on this resource makes, and it was owed at the
+    /// due instant even if nobody had called — which is why that instant, not `now`, is the
+    /// one the model the copy produced reports as its creation.
+    fn settle_model_copy_job(&mut self, arn: &str, now: SystemTime) {
+        let copied = {
+            let Some(job) = self.model_copy_jobs.get_mut(arn) else {
+                return;
+            };
+            let Some(due) = job.completed_due_at.filter(|due| now >= *due) else {
+                return;
+            };
+            job.status = MODEL_COPY_JOB_STATUS_COMPLETED;
+            job.completed_due_at = None;
+            CustomModelRecord {
+                arn: job.target_model_arn.clone(),
+                name: job.target_model_name.clone(),
+                region: job.region.clone(),
+                // The copy is of the SOURCE model, so the copied model descends from
+                // whatever that model descended from: its base is the source model's own
+                // base, which is the segment both ARNs carry.
+                base_model_arn: job.source_model_arn.clone(),
+                base_model_name: custom_model_base_segment(&job.source_model_arn)
+                    .unwrap_or(CUSTOM_MODEL_IMPORTED_BASE)
+                    .to_string(),
+                foundation_model_arn: None,
+                job_arn: Some(job.arn.clone()),
+                customization_type: CUSTOMIZATION_TYPE_IMPORTED,
+                // The artifacts were copied from another model rather than named by a
+                // request, so the copied model carries neither source.
+                model_source_config: None,
+                custom_model_data_source: None,
+                model_kms_key_arn: job.target_model_kms_key_arn.clone(),
+                role_arn: None,
+                tags: job.target_model_tags.clone(),
+                // The copy has finished, so the model it produced is ready and the clock
+                // owes it no further transition.
+                status: CUSTOM_MODEL_STATUS_ACTIVE,
+                active_due_at: None,
+                created_at: due,
+            }
+        };
+        self.custom_model_names.insert(
+            (copied.region.clone(), copied.name.clone()),
+            copied.arn.clone(),
+        );
+        self.custom_models.insert(copied.arn.clone(), copied);
+    }
+
+    /// Materialise every model copy job completion the clock has made due at `now`, so a
+    /// reader of the custom models those copies PRODUCE sees the same jobs a read of each
+    /// one would.
+    ///
+    /// Lives beside the per-job materialisation for the reason
+    /// [`Self::settle_model_customization_jobs`] does: a completion brings a custom model
+    /// into being, and a caller that reads only the model never touches the job.
+    pub fn settle_model_copy_jobs(&mut self, now: SystemTime) {
+        let arns: Vec<String> = self.model_copy_jobs.keys().cloned().collect();
+        for arn in arns {
+            self.settle_model_copy_job(&arn, now);
         }
     }
 
@@ -4662,6 +4890,29 @@ pub fn prompt_router_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn("bedrock", region, &format!("default-prompt-router/{id}"))
 }
 
+/// One stored prompt router as the `PromptRouterSummary` a listing carries.
+///
+/// Lives here rather than in `ops/list_prompt_routers.rs` because every member it carries
+/// is also a member `GetPromptRouter` reports, and the two must agree about them: a listed
+/// summary is the same router the read of that one router finds. It is also the shape the
+/// published routers are built in ([`default_prompt_routers`]), so a caller-created router
+/// and a published one are reported through ONE mapping.
+#[must_use]
+pub fn prompt_router_summary(router: &PromptRouter) -> PromptRouterSummary {
+    PromptRouterSummary {
+        prompt_router_name: router.name.clone(),
+        routing_criteria: router.routing_criteria.clone(),
+        description: router.description.clone(),
+        created_at: Some(date_time(router.created_at)),
+        updated_at: Some(date_time(router.updated_at)),
+        prompt_router_arn: router.arn.clone(),
+        models: router.models.clone(),
+        fallback_model: router.fallback_model.clone(),
+        status: router.status.to_string(),
+        r#type: router.router_type.to_string(),
+    }
+}
+
 /// The ARN of an application inference profile in `region`:
 /// `arn:aws:bedrock:<region>:<account>:application-inference-profile/<id>`.
 ///
@@ -5028,6 +5279,83 @@ pub fn custom_model_arn(region: &str, base: &str, id: &str) -> String {
     ::engine::emulator_arn("bedrock", region, &format!("custom-model/{base}/{id}"))
 }
 
+/// The base-model segment a `CustomModelArn` embeds: the text between that ARN's
+/// `custom-model/` resource type and the custom model's own id, which is either
+/// [`CUSTOM_MODEL_IMPORTED_BASE`] or the id of the foundation model the custom model was
+/// customized from, with the version qualifiers AWS appends to it.
+///
+/// `None` for a value that is not a `custom-model` ARN of this service's namespace at all;
+/// such a value is refused by the member's own modelled constraints before any handler
+/// sees it.
+///
+/// A TOTAL read of the value: the shared six-field ARN parse
+/// (`service_common::arn::parse_of`, which answers `None` for anything that is not an ARN
+/// of this service's namespace), then `strip_prefix` and `rsplit_once`, each answering
+/// `None` rather than panicking. Nothing is indexed, sliced or unwrapped, so no value a
+/// caller can send reaches a panic here.
+///
+/// Lives here because every operation that takes a custom model's ARN as a MODEL SOURCE
+/// reads the same segment out of it and refuses the same way
+/// ([`invalid_base_model_message`]): `ops/create_custom_model_deployment.rs` and
+/// `ops/create_model_copy_job.rs` today.
+#[must_use]
+pub fn custom_model_base_segment(model_arn: &str) -> Option<&str> {
+    let arn = ::service_common::arn::parse_of(model_arn, ARN_NAMESPACE)?;
+    let rest = arn.resource.strip_prefix("custom-model/")?;
+    let (segment, id) = rest.rsplit_once('/')?;
+    (!segment.is_empty() && !id.is_empty()).then_some(segment)
+}
+
+/// What this service answers as its `ValidationException` message for a `CustomModelArn`
+/// whose base-model segment names no foundation model the published catalog carries.
+///
+/// RECORDED behaviour, and a message BUILT FROM THE REQUEST rather than a constant: the
+/// corpus records Amazon Bedrock naming the base model the submitted ARN embedded
+/// ([`custom_model_base_segment`]), quoted, in exactly this sentence. So the rule is "name
+/// the base model the ARN embeds", not one recorded model id.
+#[must_use]
+pub fn invalid_base_model_message(base_model_segment: &str) -> String {
+    format!(
+        "The foundation model '{base_model_segment}' for custom model is not a valid \
+         foundation model"
+    )
+}
+
+/// The ARN of a model copy job in `region`:
+/// `arn:aws:bedrock:<region>:<account>:model-copy-job/<id>`, as `ModelCopyJobArn`
+/// (`^arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:model-copy-job/[a-z0-9]{12}$`)
+/// spells it.
+#[must_use]
+pub fn model_copy_job_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn("bedrock", region, &format!("model-copy-job/{id}"))
+}
+
+/// One stored model copy job as the `ModelCopyJobSummary` a listing carries.
+///
+/// Lives here rather than in `ops/list_model_copy_jobs.rs` because every member it carries
+/// is also a member `GetModelCopyJob` reports, and the two must agree about them: a listed
+/// summary is the same job the read of that one job finds.
+///
+/// `failureMessage` is reported for a copy that FAILED; nothing here makes an accepted copy
+/// fail, so there is none to report. `targetModelTags` admits zero entries, so a copy
+/// carrying no tags reports the empty list rather than omitting the member.
+#[must_use]
+pub fn model_copy_job_summary(job: &ModelCopyJobRecord) -> ModelCopyJobSummary {
+    ModelCopyJobSummary {
+        job_arn: job.arn.clone(),
+        status: job.status.to_string(),
+        creation_time: date_time(job.created_at),
+        target_model_arn: job.target_model_arn.clone(),
+        target_model_name: Some(job.target_model_name.clone()),
+        source_account_id: job.source_account_id.clone(),
+        source_model_arn: job.source_model_arn.clone(),
+        target_model_kms_key_arn: job.target_model_kms_key_arn.clone(),
+        target_model_tags: Some(job.target_model_tags.clone()),
+        failure_message: None,
+        source_model_name: job.source_model_name.clone(),
+    }
+}
+
 /// The ARN of a model customization job in `region`:
 /// `arn:aws:bedrock:<region>:<account>:model-customization-job/<base model>/<id>`, as
 /// `ModelCustomizationJobArn`
@@ -5252,6 +5580,15 @@ pub const ARN_NAMESPACE: &str = "bedrock";
 pub const ARN_INVALID_FOR_SERVICE_REGION: &str =
     "The provided ARN is invalid for the service region";
 
+/// What this service answers for a value submitted to a member whose modelled form admits
+/// NOTHING BUT an ARN, when that value is not a well-formed ARN at all.
+///
+/// RECORDED behaviour: Amazon Bedrock reads such a member as an ARN itself, ahead of the
+/// `@pattern` the model declares for it, and reports that the ARN cannot be read. A
+/// CONSTANT, interpolating no part of the request: it carries neither the rejected value,
+/// nor the member that carried it, nor the expression that member declares.
+pub const ARN_INVALID: &str = "Provided ARN is invalid.";
+
 /// The ARN resource types this service validates ITSELF — the ones the two sentences
 /// above cover.
 ///
@@ -5283,6 +5620,26 @@ pub const SELF_VALIDATED_RESOURCE_TYPES: &[&str] = &[
     "model-invocation-job",
     "provisioned-model",
 ];
+
+/// Whether a declared `@pattern` spells the ARN of a resource this service validates
+/// itself ([`SELF_VALIDATED_RESOURCE_TYPES`]).
+///
+/// Read off the expression rather than off a value, because it answers a question about
+/// the MEMBER: which resource the member is declared to carry an ARN of. That is what
+/// decides whether a value submitted to it is read as an ARN at all — an
+/// `evaluation-job` identifier is spelled as an ARN too, and the corpus records the
+/// framework's constraint envelope for a value outside its form, which is why this is the
+/// same catalog and not "every ARN-valued member".
+///
+/// Matched on `:<type>/` — the resource field as every ARN pattern of this service spells
+/// it, behind the account field's colon — so one resource type is never read as the prefix
+/// of another (`:custom-model/` is not `:custom-model-deployment/`).
+#[must_use]
+pub fn pattern_names_self_validated_resource(pattern: &str) -> bool {
+    SELF_VALIDATED_RESOURCE_TYPES
+        .iter()
+        .any(|resource_type| pattern.contains(&format!(":{resource_type}/")))
+}
 
 /// A caller-supplied ARN this service validates itself: one of its own namespace naming a
 /// resource type in [`SELF_VALIDATED_RESOURCE_TYPES`], as the parsed ARN and the type it
@@ -6137,6 +6494,122 @@ pub fn foundation_model_details(model: &FoundationModel, region: &str) -> Founda
 }
 
 // =============================================================================
+// The published default prompt router catalog
+// =============================================================================
+//
+// Amazon Bedrock publishes the `default` prompt routers itself — `PromptRouterType` is
+// `[custom, default]` and `ListPromptRouters$type` DEFAULTS to `default`
+// (`smithy_query(query="operation",operation="ListPromptRouters")`) — and there is no
+// operation that creates one, so these rows are published data the same way
+// [`FOUNDATION_MODELS`] is: the same for every account, written by no handler. A caller
+// discovers the routable model sets from them before building a router of its own.
+
+/// `PromptRouterType` — the type of a router Amazon Bedrock itself publishes.
+///
+/// The other of the two values the enum carries, beside [`PROMPT_ROUTER_TYPE_CUSTOM`].
+pub const PROMPT_ROUTER_TYPE_DEFAULT: &str = "default";
+
+/// The `responseQualityDifference` a published router reports.
+///
+/// `RoutingCriteria$responseQualityDifference` is modelled `@range(min: 0, max: 100)` and
+/// is `@required`, so a published router reports one; AWS publishes no tolerance for its
+/// own routers, so this is the minimum that range admits — the strictest criteria, under
+/// which a prompt is routed to the smaller model only when its answer is no worse.
+pub const PUBLISHED_ROUTING_QUALITY_DIFFERENCE: f64 = 0.0;
+
+/// One prompt router Amazon Bedrock publishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DefaultPromptRouter {
+    /// The resource half of the router's `PromptRouterArn`, whose pattern admits
+    /// `[a-zA-Z0-9-:.]+` there ([`prompt_router_arn`]).
+    pub id: &'static str,
+    /// `promptRouterName` — inside `PromptRouterName`'s `^([0-9a-zA-Z][ _-]?)+$`.
+    pub name: &'static str,
+    /// The `modelId`s the router routes between, in the order the summary reports them.
+    /// Every id is a row of [`FOUNDATION_MODELS`], so a router never offers a model this
+    /// control plane does not serve.
+    pub models: &'static [&'static str],
+    /// The `modelId` of the model the router falls back to when the criteria are not met;
+    /// one of [`DefaultPromptRouter::models`].
+    pub fallback_model: &'static str,
+}
+
+/// The prompt routers this emulator's Amazon Bedrock publishes, in `id` order — the order
+/// their ARNs sort in, which is the order a listing pages through.
+///
+/// The ids, names and model sets are the ones AWS publishes in "Intelligent prompt
+/// routing": one router per model family, routing between two models of that family and
+/// falling back to the larger one. The model ids are the rows [`FOUNDATION_MODELS`]
+/// carries for those families, so the two catalogs agree about which models exist.
+///
+/// Offered in every region this emulator serves: AWS publishes these routers in the
+/// regions where intelligent prompt routing is available, and nothing in the model marks a
+/// region as one of them, so a region is not treated as having none.
+pub const DEFAULT_PROMPT_ROUTERS: &[DefaultPromptRouter] = &[
+    DefaultPromptRouter {
+        id: "anthropic.claude:1",
+        name: "Anthropic Prompt Router",
+        models: &[
+            "anthropic.claude-3-haiku-20240307-v1:0",
+            "anthropic.claude-3-5-sonnet-20241022-v2:0",
+        ],
+        fallback_model: "anthropic.claude-3-5-sonnet-20241022-v2:0",
+    },
+    DefaultPromptRouter {
+        id: "meta.llama:1",
+        name: "Meta Prompt Router",
+        models: &[
+            "meta.llama3-1-8b-instruct-v1:0",
+            "meta.llama3-70b-instruct-v1:0",
+        ],
+        fallback_model: "meta.llama3-70b-instruct-v1:0",
+    },
+];
+
+/// Every prompt router Amazon Bedrock publishes in `region`, as the `PromptRouterSummary`
+/// a listing carries, in `promptRouterArn` order.
+///
+/// Each one reports the foundation models it routes between as `PromptRouterTargetModel`s
+/// carrying the `FoundationModelArn` of this region ([`foundation_model_arn`]) — the form
+/// `PromptRouterTargetModelArn` admits — and no `createdAt` or `updatedAt`: those two
+/// members are optional, and nothing publishes an instant for a router no caller created.
+#[must_use]
+pub fn default_prompt_routers(region: &str) -> Vec<PromptRouterSummary> {
+    let target = |model_id: &str| PromptRouterTargetModel {
+        model_arn: foundation_model_arn(region, model_id),
+    };
+    DEFAULT_PROMPT_ROUTERS
+        .iter()
+        .map(|router| PromptRouterSummary {
+            prompt_router_name: router.name.to_string(),
+            routing_criteria: RoutingCriteria {
+                response_quality_difference: PUBLISHED_ROUTING_QUALITY_DIFFERENCE,
+            },
+            description: None,
+            created_at: None,
+            updated_at: None,
+            prompt_router_arn: prompt_router_arn(region, router.id),
+            models: router.models.iter().map(|model| target(model)).collect(),
+            fallback_model: target(router.fallback_model),
+            status: PROMPT_ROUTER_AVAILABLE.to_string(),
+            r#type: PROMPT_ROUTER_TYPE_DEFAULT.to_string(),
+        })
+        .collect()
+}
+
+/// The prompt router Amazon Bedrock publishes in `region` under `arn`, if it publishes one.
+///
+/// `GetPromptRouter` addresses a router by its `PromptRouterArn` alone, and a published
+/// router carries the ARN of the region it is offered in, so one of another region names
+/// another account-region's router.
+#[must_use]
+pub fn default_prompt_router(arn: &str, region: &str) -> Option<PromptRouterSummary> {
+    default_prompt_routers(region)
+        .into_iter()
+        .find(|published| published.prompt_router_arn == arn)
+}
+
+// =============================================================================
 // The published cross-region inference profile catalog
 // =============================================================================
 //
@@ -6298,6 +6771,53 @@ pub fn system_defined_inference_profiles(region: &str) -> Vec<InferenceProfileSu
             }
         })
         .collect()
+}
+
+/// One stored application inference profile as the `InferenceProfileSummary` a listing
+/// carries.
+///
+/// Lives here rather than in `ops/list_inference_profiles.rs` because every member it
+/// carries is also a member `GetInferenceProfile` reports, and the two must agree about
+/// them: a listed summary is the same profile the read of that one profile finds. It is
+/// also the shape the published profiles are built in
+/// ([`system_defined_inference_profiles`]), so a caller-created profile and a published one
+/// are reported through ONE mapping.
+#[must_use]
+pub fn inference_profile_summary(profile: &InferenceProfileRecord) -> InferenceProfileSummary {
+    InferenceProfileSummary {
+        inference_profile_name: profile.name.clone(),
+        description: profile.description.clone(),
+        created_at: Some(date_time(profile.created_at)),
+        updated_at: Some(date_time(profile.updated_at)),
+        inference_profile_arn: profile.arn.clone(),
+        models: profile.models.clone(),
+        inference_profile_id: profile.id.clone(),
+        status: profile.status.to_string(),
+        r#type: profile.profile_type.to_string(),
+    }
+}
+
+/// The system-defined inference profile Amazon Bedrock publishes in `region` under
+/// `identifier`, if it publishes one.
+///
+/// `InferenceProfileIdentifier` admits the profile's own ARN or its bare
+/// `inferenceProfileId` (`smithy_query(query="operation",operation="GetInferenceProfile")`),
+/// so both spellings address the same published profile \u2014 resolved here the way
+/// [`ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::inference_profile_arn_of`]
+/// resolves the two spellings of a profile a caller created. A published profile carries
+/// the ARN of the region it is offered in, so one of another region names a profile of
+/// another account-region.
+#[must_use]
+pub fn published_inference_profile(
+    identifier: &str,
+    region: &str,
+) -> Option<InferenceProfileSummary> {
+    system_defined_inference_profiles(region)
+        .into_iter()
+        .find(|published| {
+            published.inference_profile_arn == identifier
+                || published.inference_profile_id == identifier
+        })
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

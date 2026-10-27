@@ -37,6 +37,8 @@ mod acme_endpoint_update;
 mod acme_external_account_binding_credentials;
 #[path = "all/acme_external_account_binding_lifecycle.rs"]
 mod acme_external_account_binding_lifecycle;
+#[path = "all/acme_external_account_binding_listing.rs"]
+mod acme_external_account_binding_listing;
 #[path = "all/acme_external_account_binding_revocation.rs"]
 mod acme_external_account_binding_revocation;
 #[path = "all/acme_surface_wire_values.rs"]

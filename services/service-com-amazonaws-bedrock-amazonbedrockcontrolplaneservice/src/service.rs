@@ -46,23 +46,29 @@
 //!
 //! # This service's own ARN check
 //!
-//! For the resources in [`crate::state::SELF_VALIDATED_RESOURCE_TYPES`], Amazon Bedrock
-//! reads an ARN a caller submits ITSELF, ahead of the constraints the model declares for
-//! the member carrying it, and answers one of its OWN two short sentences for an ARN it
-//! will not accept — never the `N validation error(s) detected: Value '…' at '…' failed
-//! to satisfy constraint: Member must satisfy regular expression pattern: …` envelope the
-//! framework words a constraint violation in. An ARN of any OTHER resource — and any
-//! other refusal — keeps the framework's wording, which is what the corpus records for
-//! them. Both sentences and the catalog live in [`crate::state`]; this file is where the
-//! two layers that produce them sit:
+//! Amazon Bedrock reads an ARN a caller submits ITSELF, ahead of the constraints the model
+//! declares for the member carrying it, and answers one of its OWN short sentences for an
+//! ARN it will not accept — never the `N validation error(s) detected: Value '…' at '…'
+//! failed to satisfy constraint: Member must satisfy regular expression pattern: …`
+//! envelope the framework words a constraint violation in. Every sentence and the catalog
+//! of resources two of them cover ([`crate::state::SELF_VALIDATED_RESOURCE_TYPES`]) live
+//! in [`crate::state`]; this file is where the two layers that produce them sit:
 //!
 //! * [`ArnChecked`], the wrapper every modelled operation is served behind
 //!   (`override_operation`), refuses an ARN of this service's own namespace that names
 //!   ANOTHER region before the modelled walk runs. It is the layer that can: the walk's
 //!   refusal reaches `override_refusal` with the violations ALONE — no request — so the
 //!   region the request addresses is not knowable there.
-//! * `override_refusal` words what is left: an ARN of this service's namespace that is
-//!   in-region but is not a well-formed ARN of the resource type it names.
+//! * `override_refusal` words what is left, from the violation's own member expression and
+//!   value ([`refused_arn`]): an ARN of this service's namespace that is in-region but is
+//!   not a well-formed ARN of the resource type it names, and a value that is no ARN at
+//!   all submitted to a member whose modelled form admits nothing but the ARN of one of
+//!   those resources ([`pattern_requires_an_arn`]).
+//!
+//! A value submitted to a member the model lets carry a bare NAME beside an ARN keeps the
+//! framework's wording: such a caller named a resource rather than spelling an ARN, so
+//! there is no ARN for this service to read. So does an ARN of a resource type this
+//! service does not validate itself, which is what the corpus records for them.
 
 pub mod validation;
 
@@ -94,15 +100,21 @@ const VALIDATION_EXCEPTION: &str = "ValidationException";
 /// [`ArnChecked`]'s region check does not apply to them, keyed by the operation that
 /// declares the member and the member's own path.
 ///
-/// One member today. `CreateModelCopyJob` "Copies a model to another region so that it
-/// can be used there" (`smithy_query(query="doc",shape="CreateModelCopyJob")`) and its
-/// input declares no target-region member
+/// Both members today carry the SOURCE model of a copy. `CreateModelCopyJob` "Copies a
+/// model to another region so that it can be used there"
+/// (`smithy_query(query="doc",shape="CreateModelCopyJob")`) and its input declares no
+/// target-region member
 /// (`smithy_query(query="operation",operation="CreateModelCopyJob")`: `sourceModelArn`,
 /// `targetModelName`, `modelKmsKeyId`, `targetModelTags`, `clientRequestToken`), so the
 /// region the request addresses IS the target and the source model it names lives in
 /// another one. Refusing that ARN for naming another region would refuse the whole
-/// operation.
-const CROSS_REGION_ARN_INPUTS: &[(&str, &str)] = &[("CreateModelCopyJob", "sourceModelArn")];
+/// operation — and `ListModelCopyJobs$sourceModelArnEquals` "Filters for model copy jobs
+/// in which the Amazon Resource Name (ARN) of the source model is equal to the value that
+/// you specify", so it carries that same ARN and would make the filter unusable.
+const CROSS_REGION_ARN_INPUTS: &[(&str, &str)] = &[
+    ("CreateModelCopyJob", "sourceModelArn"),
+    ("ListModelCopyJobs", "sourceModelArnEquals"),
+];
 
 /// The `com-amazonaws-bedrock-amazonbedrockcontrolplaneservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -212,7 +224,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
                 code: VALIDATION_EXCEPTION.to_string(),
                 message: violations
                     .iter()
-                    .find_map(refused_arn_format)
+                    .find_map(refused_arn)
                     .or_else(|| validation::envelope(violations))?,
             }),
             // `Refusal` is `#[non_exhaustive]`: a refusal this service has no wording of
@@ -251,26 +263,48 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 }
 
-/// This service's own format sentence for `violation`, when the value it refused is an
-/// ARN of a resource this service validates itself
-/// ([`crate::state::SELF_VALIDATED_RESOURCE_TYPES`]) submitted to a member the MODEL
-/// declares an ARN-admitting `@pattern` for.
+/// This service's own sentence for `violation`, when the value it refused is one this
+/// service reads as an ARN itself.
+///
+/// Two sentences, both decided from the violation ALONE — the member's declared expression
+/// and the value that broke it, which is all this seam is handed:
+///
+/// * a well-formed ARN of a resource this service validates itself
+///   ([`crate::state::SELF_VALIDATED_RESOURCE_TYPES`]) whose resource is not a well-formed
+///   one of the type the ARN itself names reports that form
+///   ([`crate::state::invalid_arn_format_message`]);
+/// * a value that is no ARN at all, submitted to a member whose modelled form admits
+///   nothing but an ARN ([`pattern_requires_an_arn`]) of a resource this service validates
+///   itself ([`crate::state::pattern_names_self_validated_resource`]), reports that the ARN
+///   cannot be read ([`crate::state::ARN_INVALID`]). The MEMBER decides this, not the
+///   value: a member that also admits a bare name carries no ARN to read when a name
+///   arrives, a member declared as the ARN of a resource outside that catalog keeps the
+///   refusal the model's own constraints word — which is what the corpus records for an
+///   `evaluation-job` identifier — and a value that IS an ARN but of a resource type
+///   outside it keeps that refusal too.
 ///
 /// Only a `@pattern` violation: a value outside a LENGTH bound is refused for its size
-/// rather than for its ARN form, and an absent member carries no value to read an ARN
-/// off at all. The declared expression comes with the violation, which is how this seam
-/// — handed the violations alone — applies the same "the member admits an ARN" test
+/// rather than for its ARN form, and an absent member carries no value to read an ARN off
+/// at all. The declared expression comes with the violation, which is how this seam —
+/// handed the violations alone — applies the same "the member admits an ARN" test
 /// [`admits_an_arn`] makes against the input schema: a caller who puts an ARN into a
 /// member that is not one (a name, a description, a tag value) breaks that member's own
 /// rule, not an ARN rule, and the corpus records the constraint envelope for it.
-fn refused_arn_format(violation: &Violation) -> Option<String> {
+fn refused_arn(violation: &Violation) -> Option<String> {
     let ViolationKind::Pattern(declared) = &violation.kind else {
         return None;
     };
     if !pattern_admits_an_arn(declared) {
         return None;
     }
-    crate::state::invalid_arn_format_message(violation.value.as_deref()?)
+    let value = violation.value.as_deref()?;
+    if let Some(message) = crate::state::invalid_arn_format_message(value) {
+        return Some(message);
+    }
+    let unreadable = pattern_requires_an_arn(declared)
+        && crate::state::pattern_names_self_validated_resource(declared)
+        && ::service_common::arn::parse(value).is_none();
+    unreadable.then(|| crate::state::ARN_INVALID.to_string())
 }
 
 /// One modelled operation, served behind this service's own ARN check.
@@ -396,6 +430,111 @@ fn admits_an_arn(input_schema: &Schema, member_path: &str) -> bool {
 /// whatever a caller puts in it.
 fn pattern_admits_an_arn(pattern: &str) -> bool {
     pattern.contains("arn:")
+}
+
+/// Whether a declared `@pattern` admits NOTHING BUT an ARN — the test for a member this
+/// service reads as an ARN itself, whatever arrived in it.
+///
+/// Decided over the expression's TOP-LEVEL alternatives ([`alternatives`]): the member
+/// requires an ARN when every one of them does, and an alternative requires one when it
+/// begins with the literal `arn:` or is a single group whose own alternatives all require
+/// one ([`sole_group`], which refuses a group a quantifier makes optional or repeatable).
+/// `ModelArn` and `CustomModelArn` are such members; `ProvisionedModelId`
+/// (`^((([0-9a-zA-Z][_-]?)+)|(arn:…))$`) and `ModelInvocationJobIdentifier`
+/// (`^((arn:…)?[a-z0-9]{12})$`) are not, because each also admits a bare name.
+///
+/// A member that spells its ARN alternatives in a form this test cannot read reports
+/// NOTHING BUT an ARN and is read as admitting other values, which keeps the framework's
+/// constraint envelope for it: the miss is fail-safe in that one direction, so no value is
+/// refused for an ARN it does not carry.
+fn pattern_requires_an_arn(pattern: &str) -> bool {
+    let body = pattern.trim_start_matches('^').trim_end_matches('$');
+    !body.is_empty() && alternatives(body).into_iter().all(alternative_requires_an_arn)
+}
+
+/// Whether ONE alternative of an expression admits nothing but an ARN.
+fn alternative_requires_an_arn(alternative: &str) -> bool {
+    let alternative = alternative.trim_start_matches('^');
+    alternative.starts_with("arn:")
+        || sole_group(alternative).is_some_and(pattern_requires_an_arn)
+}
+
+/// The top-level alternatives of a regular expression: the spans `|` separates OUTSIDE
+/// every group and character class, with a backslash escaping the character after it.
+///
+/// One span \u2014 the expression itself \u2014 when it carries no such `|`.
+fn alternatives(expression: &str) -> Vec<&str> {
+    let mut spans = Vec::new();
+    let mut start = 0;
+    let mut depth = 0usize;
+    let mut in_class = false;
+    let mut escaped = false;
+    for (index, character) in expression.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            '[' if !in_class => in_class = true,
+            ']' if in_class => in_class = false,
+            '(' if !in_class => depth += 1,
+            ')' if !in_class => depth = depth.saturating_sub(1),
+            '|' if !in_class && depth == 0 => {
+                spans.push(&expression[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    spans.push(&expression[start..]);
+    spans
+}
+
+/// What a regular expression that is ONE group contains, with the group's own `(` and `)`
+/// and any `?:` that opens a non-capturing one removed.
+///
+/// `None` when the expression does not begin a group, when that group closes before the
+/// end of the expression, or when a quantifier follows it: a group spelled `(…)?` or `(…)*`
+/// admits the EMPTY match beside what it carries, so what it carries does not decide what
+/// the expression admits.
+fn sole_group(expression: &str) -> Option<&str> {
+    if !expression.starts_with('(') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut in_class = false;
+    let mut escaped = false;
+    for (index, character) in expression.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            '[' if !in_class => in_class = true,
+            ']' if in_class => in_class = false,
+            '(' if !in_class => depth += 1,
+            ')' if !in_class => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    // The group has to span the whole expression: anything after it \u2014 a
+                    // quantifier or another term \u2014 means the group alone does not decide
+                    // what the expression admits.
+                    if index + 1 != expression.len() {
+                        return None;
+                    }
+                    let inner = &expression[1..index];
+                    return Some(inner.strip_prefix("?:").unwrap_or(inner));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The `@pattern` expression `input_schema` declares for its top-level member

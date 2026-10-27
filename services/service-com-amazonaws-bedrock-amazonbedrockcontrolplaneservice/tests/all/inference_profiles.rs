@@ -654,8 +654,10 @@ async fn an_identifier_naming_no_profile_is_refused_by_the_read_and_the_delete()
 
     // The rows differ along what the rule generalises over: the spelling of the
     // identifier (bare id, this region's ARN, another region's ARN) and the resource type
-    // the ARN names (the system-defined `inference-profile` type, which no operation of
-    // this service mints).
+    // the ARN names (the system-defined `inference-profile` type, for a model Amazon
+    // Bedrock publishes no cross-region profile of — `cohere.embed-english-v3` is a row of
+    // the foundation-model catalog and not one of the cross-region profile catalog, so no
+    // profile of this region answers to it).
     let rows: Vec<(&str, String)> = vec![
         ("a bare id nothing minted", "zzzzzzzzzzzz".to_string()),
         (
@@ -663,8 +665,8 @@ async fn an_identifier_naming_no_profile_is_refused_by_the_read_and_the_delete()
             format!("{}zzzzzzzzzzzz", arn_prefix(REGION)),
         ),
         (
-            "a system-defined profile ARN",
-            system_profile_source(REGION, &format!("us.{CATALOG_MODEL}")),
+            "a system-defined profile ARN of no published profile",
+            system_profile_source(REGION, "us.cohere.embed-english-v3"),
         ),
         ("a live profile of another region", elsewhere_arn.clone()),
     ];

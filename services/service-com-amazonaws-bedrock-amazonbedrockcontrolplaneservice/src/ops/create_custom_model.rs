@@ -273,11 +273,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
             return Err(CreateCustomModelErrorModeled::TooManyTagsException(
                 TooManyTagsException {
-                    message: Some(format!(
-                        "a resource may carry at most {} tags, and this request carries {}",
-                        crate::state::MAX_TAGS_PER_RESOURCE,
-                        tags.len()
-                    )),
+                    message: Some(crate::state::too_many_tags_message()),
                     resource_name: None,
                 },
             )

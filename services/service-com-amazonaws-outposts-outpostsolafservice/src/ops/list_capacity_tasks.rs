@@ -163,7 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `OutpostIdentifier`, so it accepts the bare id or the full Outpost ARN; an
         // ARN carries a partition, a Region and an account of its own, and one that is
         // not this endpoint's names no Outpost of this inventory — so nothing can
-        // match it ([`matches_filters`]).
+        // match it ([`crate::state::identifier_filter_accepts`]).
         let outpost_filter = match input
             .outpost_identifier_filter
             .as_deref()
@@ -233,9 +233,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// values, the results include items that match any of the values that you specify
 /// for the filter": several filters together narrow rather than widen, an absent (or
 /// empty) filter narrows nothing, and a filter that is a LIST of values accepts a
-/// task whose value is any one of them — which for the list filter is
-/// [`crate::state::filter_accepts`], the rule every list of this service selects
-/// with.
+/// task whose value is any one of them. Each of the two kinds of filter this
+/// operation takes selects by the shared rule its own kind selects by —
+/// [`crate::state::identifier_filter_accepts`] for the one modelled as an identifier
+/// and [`crate::state::filter_accepts`] for the one modelled as a list of values — so
+/// this list can never disagree with another list of this service about either.
 ///
 /// A filter is a filter and not an identifier the request is addressed to: it
 /// narrows the list the caller is reported, so one naming an Outpost that holds no
@@ -246,14 +248,8 @@ fn matches_filters(
     outpost_filter: Option<&crate::state::ResolvedIdentifier>,
     status_filter: Option<&[String]>,
 ) -> bool {
-    let outpost_matches = match outpost_filter {
-        None => true,
-        Some(filter) => filter
-            .here()
-            .is_some_and(|outpost_id| task.outpost_id == outpost_id),
-    };
-    // The status filter is a list of accepted values, so it selects by the rule every
-    // list of this service selects its own list filters by.
+    let outpost_matches =
+        crate::state::identifier_filter_accepts(outpost_filter, Some(task.outpost_id.as_str()));
     let status_matches = crate::state::filter_accepts(status_filter, Some(task.status.as_str()));
     outpost_matches && status_matches
 }

@@ -74,7 +74,10 @@ fn query_value(value: &str) -> String {
 
 /// The `DELETE /tags/{resourceArn}?tagKeys=…` URI: `tagKeys` is an `@httpQuery` list, so
 /// each key travels as its own repeated `tagKeys=` parameter.
-fn untag_path(arn: &str, keys: &[String]) -> String {
+///
+/// `pub(crate)` so a sibling suite addresses this operation the same way rather than
+/// growing a second copy of the URI builder.
+pub(crate) fn untag_path(arn: &str, keys: &[String]) -> String {
     let query: Vec<String> = keys
         .iter()
         .map(|key| format!("tagKeys={}", query_value(key)))

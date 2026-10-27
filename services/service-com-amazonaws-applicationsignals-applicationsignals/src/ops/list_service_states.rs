@@ -156,7 +156,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// Report the state of each service this emulator observed over the requested period, a
     /// page at a time: the most recent change recorded for it inside that period.
     ///
-    /// A read: it projects what the store holds and persists nothing. The range is refused
+    /// A read: it projects what the store holds and records nothing of its own, beyond
+    /// materialising the configuration lapses the clock already owes. The range is refused
     /// when it does not run forwards — a rule about the PAIR of members, so it is enforced
     /// here rather than by a per-member constraint — and the reported range is the requested
     /// one, as `ListServices` reports it. The page bound is refused the same way when it is
@@ -172,7 +173,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ///
     /// Nothing in the reported event comes off this REQUEST: the change it reports is a write
     /// the store already holds the record of, so its Region and its name are that record's
-    /// own and this read reports one recorded change exactly as `ListEntityEvents` does.
+    /// own and this read reports one recorded change exactly as `ListEntityEvents` does. The
+    /// change is picked from every dated record the store holds against the service, the same
+    /// set that read reports, so the two cannot disagree about an entity's most recent change.
     async fn handle(
         &self,
         input: Self::Input,
@@ -220,7 +223,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let observed = if other_account {
             Vec::new()
         } else {
-            state.lock().observed_service_states(
+            // The change records this read reports one of include the instrumentation
+            // configurations applied to a service, and a configuration whose expiry has
+            // fallen due is gone whether or not anybody called, so the lapses the clock
+            // already owes are materialised first — exactly as the read that reports the
+            // same records as a history does
+            // ([`crate::state::ComAmazonawsApplicationsignalsApplicationsignalsState::expire_instrumentation_configurations`]).
+            let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+            let mut store = state.lock();
+            store.expire_instrumentation_configurations(&now);
+            store.observed_service_states(
                 &input.start_time,
                 &input.end_time,
                 input.attribute_filters.as_deref().unwrap_or_default(),

@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBackupPlan
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateBackupPlan`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateBackupPlan::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Inserts a backup plan into [`crate::state`] and answers from it: the plan ID,
+//! ARN and version ID this service mints, and the creation instant it records.
+//! Every later read of the plan reports the body stored here.
+//!
+//! A plan is identified by the ID this service mints, so the body is stored
+//! verbatim with a `RuleId` minted for each rule. A create that repeats a
+//! `CreatorRequestId` already recorded answers with the plan that token made
+//! (the model documents that the matching plan "is returned"); any OTHER create
+//! naming a plan this account already holds is refused with
+//! `AlreadyExistsException`.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +169,202 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateBackupPlan` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateBackupPlanErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateBackupPlan"))
+        // `BackupPlan` is `@required`, as are each rule's `RuleName` and
+        // `TargetBackupVaultName`, and both of those target patterned shapes:
+        // an absent or malformed one is refused before this handler runs, and
+        // `crate::service` words that refusal as this service's own
+        // `MissingParameterValueException` / `InvalidParameterValueException`.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateBackupPlanErrorModeled::ServiceUnavailableException(ServiceUnavailableException {
+                message: Some("the backup vault store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+        let plan = input.backup_plan;
+
+        // A plan "includes a BackupPlanName and one or more sets of Rules"
+        // (model doc for the member), so a rule list the model admits as
+        // present but empty schedules nothing and is refused.
+        if plan.rules.is_empty() {
+            return Err(invalid_parameter(
+                "Rules must contain at least one backup rule",
+            ));
+        }
+
+        // The rule list is sized by the request, so it is capped BEFORE the
+        // per-rule checks below walk it and before any of it is stored.
+        if plan.rules.len() > crate::state::MAX_RULES_PER_PLAN {
+            return Err(CreateBackupPlanErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "a backup plan may hold at most {} rules",
+                        crate::state::MAX_RULES_PER_PLAN
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        for (index, rule) in plan.rules.iter().enumerate() {
+            // A rule is identified within its plan by its name, so two rules of
+            // one plan cannot share one.
+            if plan.rules[..index]
+                .iter()
+                .any(|earlier| earlier.rule_name == rule.rule_name)
+            {
+                return Err(invalid_parameter(&format!(
+                    "RuleName {} is used by more than one rule; rule names must be \
+                     unique within a backup plan",
+                    rule.rule_name
+                )));
+            }
+
+            // Both backup windows carry a documented range — `StartWindowMinutes`
+            // "must be at least 60 minutes to avoid errors" and "has a maximum
+            // value of 100 years (52,560,000 minutes)" — and a value outside it
+            // is one AWS refuses. The check is `crate::state`'s, shared with the
+            // windows of a single `StartBackupJob`, so the two cannot drift.
+            for (member, minutes, minimum) in [
+                (
+                    "StartWindowMinutes",
+                    rule.start_window_minutes,
+                    crate::state::MIN_START_WINDOW_MINUTES,
+                ),
+                ("CompletionWindowMinutes", rule.completion_window_minutes, 0),
+            ] {
+                if let Some(refusal) =
+                    crate::state::rejected_window_minutes(member, minutes, minimum)
+                {
+                    return Err(
+                        CreateBackupPlanErrorModeled::InvalidParameterValueException(refusal)
+                            .into(),
+                    );
+                }
+            }
+
+            // The model types both members below as `ARN` with no pattern, so
+            // the framework cannot refuse a malformed one; AWS does, rather than
+            // storing a rule whose destination no ARN resolves to.
+            let arns = rule
+                .target_logically_air_gapped_backup_vault_arn
+                .as_deref()
+                .map(|arn| ("TargetLogicallyAirGappedBackupVaultArn", arn))
+                .into_iter()
+                .chain(rule.copy_actions.iter().flatten().map(|copy| {
+                    (
+                        "DestinationBackupVaultArn",
+                        copy.destination_backup_vault_arn.as_str(),
+                    )
+                }));
+            for (member, arn) in arns {
+                if let Some(refusal) = crate::state::rejected_arn(member, arn) {
+                    return Err(
+                        CreateBackupPlanErrorModeled::InvalidParameterValueException(refusal)
+                            .into(),
+                    );
+                }
+            }
+        }
+
+        let mut store = state.lock();
+
+        // A repeated `CreatorRequestId` replays the plan that token created: no
+        // second plan, and the same identifiers the first call answered with.
+        // Resolved BEFORE the name check, since a replay necessarily repeats the
+        // name of the plan it created.
+        if let Some(existing) = input
+            .creator_request_id
+            .as_deref()
+            .and_then(|token| store.backup_plan_by_creator_request_id(token))
+        {
+            return Ok(plan_created(existing));
+        }
+
+        // "If you call CreateBackupPlan with a plan that already exists, you
+        // receive an AlreadyExistsException exception": a create that is not the
+        // replay above and names a plan this account already holds is refused,
+        // and the refusal discloses nothing about the stored plan.
+        if store.holds_backup_plan_named(&plan.backup_plan_name) {
+            return Err(CreateBackupPlanErrorModeled::AlreadyExistsException(
+                crate::state::plan_already_exists(),
+            )
+            .into());
+        }
+
+        // The store is in memory and every request can add to it, so the number
+        // of plans it keeps is bounded. AWS answers the same modelled error once
+        // an account reaches its own backup-plan quota.
+        if store.backup_plans.len() >= crate::state::MAX_BACKUP_PLANS {
+            return Err(CreateBackupPlanErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "this emulator keeps at most {} backup plans",
+                        crate::state::MAX_BACKUP_PLANS
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        let plan_id = store.next_id(now);
+        let version_id = store.next_id(now);
+        let rules = plan
+            .rules
+            .into_iter()
+            .map(|rule| {
+                let rule_id = store.next_id(now);
+                crate::state::stored_backup_rule(rule, rule_id)
+            })
+            .collect();
+        let record = crate::state::BackupPlanRecord {
+            arn: crate::state::backup_plan_arn(&region, &plan_id),
+            plan_id: plan_id.clone(),
+            version_id,
+            name: plan.backup_plan_name,
+            rules,
+            advanced_backup_settings: plan.advanced_backup_settings.unwrap_or_default(),
+            scan_settings: plan.scan_settings.unwrap_or_default(),
+            creator_request_id: input.creator_request_id,
+            creation_date: now,
+            // A plan is live from the moment it is created, and nothing has run
+            // one of its rules yet.
+            deletion_date: None,
+            last_execution_date: None,
+            tags: input
+                .backup_plan_tags
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+        };
+        let output = plan_created(&record);
+        store.backup_plans.insert(plan_id, record);
+        Ok(output)
     }
+}
+
+/// What this operation answers for the plan it stored — the same answer a
+/// replayed `CreatorRequestId` gets, so a retry cannot report identifiers that
+/// differ from the ones the first call reported.
+fn plan_created(record: &crate::state::BackupPlanRecord) -> CreateBackupPlanOutput {
+    CreateBackupPlanOutput {
+        backup_plan_id: Some(record.plan_id.clone()),
+        backup_plan_arn: Some(record.arn.clone()),
+        creation_date: Some(::aws_smithy_types::DateTime::from(record.creation_date)),
+        version_id: Some(record.version_id.clone()),
+        advanced_backup_settings: record.advanced_backup_settings_view(),
+    }
+}
+
+/// This operation's refusal for a `BackupPlan` member carrying a value AWS does
+/// not accept.
+fn invalid_parameter(message: &str) -> CreateBackupPlanError {
+    CreateBackupPlanErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
+        message: Some(message.to_string()),
+        ..Default::default()
+    })
+    .into()
 }

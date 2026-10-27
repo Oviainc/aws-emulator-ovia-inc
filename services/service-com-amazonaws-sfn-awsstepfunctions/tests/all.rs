@@ -51,6 +51,8 @@ mod execution_history_outcomes;
 mod execution_interpreter;
 #[path = "all/execution_redrive.rs"]
 mod execution_redrive;
+#[path = "all/json_parse_diagnostics.rs"]
+mod json_parse_diagnostics;
 #[path = "all/list_state_machine_aliases_pages.rs"]
 mod list_state_machine_aliases_pages;
 #[path = "all/map_run_failure_budget.rs"]

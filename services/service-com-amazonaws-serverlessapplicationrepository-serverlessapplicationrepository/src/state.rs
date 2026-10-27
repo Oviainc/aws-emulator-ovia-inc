@@ -383,18 +383,36 @@ impl Artifact {
 /// which is what routes a fetch of it to [`crate::service`]'s document seam.
 pub const ARTIFACT_PATH_PREFIX: &str = "/serverlessrepo-artifacts";
 
-/// The link reported for content the caller supplied INLINE: an address on the emulator's
-/// own endpoint that [`ComAmazonawsServerlessapplicationrepositoryServerlessapplicationrepositoryState::artifact_body`]
+/// The link reported for content the caller supplied INLINE: a PRESIGNED address on the
+/// emulator's own endpoint that
+/// [`ComAmazonawsServerlessapplicationrepositoryServerlessapplicationrepositoryState::artifact_body`]
 /// serves the retained bytes at.
 ///
-/// The real service copies an inline body into an S3 object it owns and reports that
-/// object's URL. This emulator holds the body in its own state and serves it itself, so
-/// the locator carries the same four facts an S3 key would — the region and the account
-/// that published it, the application, and the version for an artefact a version
-/// published — under `host`, the endpoint the publishing request arrived on. A literal
-/// AWS hostname would send the next client out of the emulator entirely, so it is never
-/// announced here.
+/// The real service copies an inline body into an S3 object it owns and reports a
+/// presigned download URL for that object — a link whose query string carries the
+/// signature, so whoever holds the link can fetch the document with no credential of their
+/// own, until it expires. This emulator holds the body in its own state and serves it
+/// itself, so the locator carries the same four facts an S3 key would — the region and the
+/// account that published it, the application, and the version for an artefact a version
+/// published — under `host`, the endpoint the publishing request arrived on, and the same
+/// query-string signature, minted over that address by [`presigned_artifact_url`] and
+/// honoured by the document plane in `crate::service`. A literal AWS hostname would send
+/// the next client out of the emulator entirely, so it is never announced here.
 pub fn minted_artifact_url(
+    host: &str,
+    region: &str,
+    application_name: &str,
+    semantic_version: Option<&str>,
+    artifact: Artifact,
+) -> String {
+    let address = artifact_address(host, region, application_name, semantic_version, artifact);
+    presigned_artifact_url(&address, region, SystemTime::now(), ARTIFACT_URL_LIFETIME)
+}
+
+/// The bare address of one stored artefact, without the signature
+/// [`minted_artifact_url`] announces it with: the path
+/// [`parse_artifact_path`] reads back.
+fn artifact_address(
     host: &str,
     region: &str,
     application_name: &str,
@@ -430,9 +448,9 @@ pub struct ArtifactTarget {
 /// one [`minted_artifact_url`] announces.
 ///
 /// Every segment is read back out of the announced locator, so a fetch resolves by what
-/// the URL NAMES rather than by string equality with a stored field: a client that was
-/// handed the URL through one endpoint host reaches the same artefact through any other
-/// endpoint this emulator answers on.
+/// the URL NAMES rather than by string equality with a stored field: the record is found by
+/// the region, account, application and version the address carries, whatever endpoint of
+/// this emulator the locator was announced on.
 pub fn parse_artifact_path(path: &str) -> Option<ArtifactTarget> {
     let rest = path.strip_prefix(ARTIFACT_PATH_PREFIX)?.strip_prefix('/')?;
     let segments: Vec<&str> = rest.split('/').collect();
@@ -460,6 +478,29 @@ pub fn parse_artifact_path(path: &str) -> Option<ArtifactTarget> {
     })
 }
 
+/// Whether `path` addresses the document plane: [`ARTIFACT_PATH_PREFIX`] followed by a
+/// path separator, or by nothing at all.
+///
+/// The separator is required so that a sibling path space whose name merely STARTS with the
+/// prefix is not claimed by this service.
+pub fn addresses_artifact_plane(path: &str) -> bool {
+    match path.strip_prefix(ARTIFACT_PATH_PREFIX) {
+        Some(rest) => rest.is_empty() || rest.starts_with('/'),
+        None => false,
+    }
+}
+
+/// The region a document-plane path is addressed in: the first segment under
+/// [`ARTIFACT_PATH_PREFIX`], which every locator carries and whose scope the locator's
+/// signature was minted under. `None` for a path that carries no segment at all.
+pub fn artifact_path_region(path: &str) -> Option<&str> {
+    path.strip_prefix(ARTIFACT_PATH_PREFIX)?
+        .strip_prefix('/')?
+        .split('/')
+        .next()
+        .filter(|segment| !segment.is_empty())
+}
+
 /// The link stored for a `*Body`/`*Url` pair: the caller's URL, or a minted locator
 /// for a body they supplied inline, or `None` when they supplied neither.
 pub fn resolve_artifact_url(
@@ -482,6 +523,353 @@ pub fn resolve_artifact_url(
         )),
         (None, None) => None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// The signature a published locator carries.
+//
+// Every `*Url` this service announces for a body it STORES is a presigned download
+// address: AWS reports a presigned S3 URL for one, whose query string carries the
+// signature that makes the document fetchable with no credential of the holder's own,
+// until it expires. The signature here is computed by the maintained `aws-sigv4` crate
+// over the very address being announced, and `crate::service`'s document plane verifies
+// it before serving a byte — so the link this service hands out is a link that is
+// honoured because it was signed, and a tampered or expired one is refused.
+//
+// The framework's own request verifier is deliberately NOT the verifier here: it checks a
+// CALLER's SigV4 against the credentials the emulator minted and holds in its credential
+// store, while a locator below is signed with this document plane's own ephemeral key,
+// which that store neither holds nor should. What the two share is the computation, and
+// that is the `aws-sigv4` crate both use rather than a signing routine written here.
+//
+// A locator is honoured as it was ANNOUNCED, field for field: a client that re-encodes the
+// query it was handed presents a different canonical request, which is a different
+// signature, exactly as it would be to the object store this plane stands in for.
+// ---------------------------------------------------------------------------
+
+/// How long a locator this service announces stays followable.
+///
+/// One week, the longest lifetime SigV4 query-string signing allows ("the maximum
+/// expiration for a presigned URL is one week from the time of creation"), so a locator a
+/// publish announced outlives every read of the record that carries it rather than
+/// expiring under a client that was handed it.
+pub const ARTIFACT_URL_LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// `address` with the query-string signature that makes it a download link anyone holding
+/// it can follow: `X-Amz-Algorithm`, `X-Amz-Credential`, `X-Amz-Date`, `X-Amz-Expires`,
+/// `X-Amz-SignedHeaders` and `X-Amz-Signature`, as `aws-sigv4` computes them for a `GET`
+/// of that address over the host it names.
+///
+/// `signed_at` and `lifetime` are parameters rather than read from the clock so that the
+/// instant a locator was signed at is the caller's: [`minted_artifact_url`] signs at the
+/// publishing instant, and [`artifact_signature`] re-signs at the instant the presented
+/// locator states, which is what lets one computation both mint and verify.
+///
+/// An address that is not an absolute URL cannot be signed; it is announced unsigned, and
+/// the document plane then refuses it rather than serving a document from a link whose
+/// signature nothing computed.
+pub fn presigned_artifact_url(
+    address: &str,
+    region: &str,
+    signed_at: SystemTime,
+    lifetime: Duration,
+) -> String {
+    presign(address, region, signed_at, lifetime).unwrap_or_else(|| {
+        ::tracing::warn!(%address, "a published artifact address could not be signed");
+        address.to_string()
+    })
+}
+
+/// What a document-plane request's own locator is: the verdict `crate::service` serves or
+/// refuses on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactSignature {
+    /// Signed by this service, over this address, and not expired yet.
+    Honoured,
+    /// No query-string signature at all.
+    Absent,
+    /// Signed by this service, but the expiry the locator states has passed.
+    Expired,
+    /// A signature that does not verify over the address it was presented on: a field was
+    /// rewritten, the address was, or it was signed by something else.
+    Invalid,
+}
+
+/// Whether the locator a document-plane request presents is one this service signed and
+/// still honours.
+///
+/// `target` is the request target as it arrived (path and query), `host` the endpoint it
+/// arrived on and `region` the one the addressed application is catalogued in — the facts
+/// the signature covers. The locator is honoured when it is FIELD FOR FIELD the one this
+/// service would mint over that address, at the instant and for the lifetime the locator
+/// itself states: the signing fields are stripped, the rest of the query travels into the
+/// address being re-signed, and what comes back is compared with what was presented. So a
+/// rewritten scope, algorithm, signed-header list, timestamp, lifetime or signature, a
+/// field of the client's own, another endpoint host and another document's address are each
+/// a locator this service did not mint. A lifetime longer than [`ARTIFACT_URL_LIFETIME`] is
+/// not one it ever mints, and neither is a target carrying more than
+/// [`MAX_LOCATOR_FIELDS`] query fields — the count is capped before any per-field work, so
+/// what this check costs does not depend on how many fields a caller sends.
+///
+/// The locator is signed for the download of a document, so a `HEAD` of it — which reports
+/// what a `GET` of the same address would answer ABOUT that document — is checked against
+/// the same signature.
+pub fn artifact_signature(
+    host: &str,
+    target: &str,
+    region: &str,
+    now: SystemTime,
+) -> ArtifactSignature {
+    let Some((path, query)) = target.split_once('?') else {
+        return ArtifactSignature::Absent;
+    };
+    // The field count is the one part of this check a CALLER chooses, so it is capped
+    // before the fields are even collected: past the cap the target is one this service
+    // never announced, whatever the fields say.
+    if query.split('&').count() > MAX_LOCATOR_FIELDS {
+        return ArtifactSignature::Invalid;
+    }
+    let presented = query_fields(query);
+    if !presented
+        .iter()
+        .any(|(name, _value)| *name == "X-Amz-Signature")
+    {
+        return ArtifactSignature::Absent;
+    }
+    let stated = |name: &str| {
+        presented
+            .iter()
+            .find_map(|(field, value)| (*field == name).then_some(*value))
+    };
+    let (Some(signed_at), Some(expires)) = (stated("X-Amz-Date"), stated("X-Amz-Expires")) else {
+        return ArtifactSignature::Invalid;
+    };
+    let (Some(signed_at), Ok(lifetime)) = (signing_instant(signed_at), expires.parse::<u64>())
+    else {
+        return ArtifactSignature::Invalid;
+    };
+    let lifetime = Duration::from_secs(lifetime);
+    if lifetime > ARTIFACT_URL_LIFETIME {
+        return ArtifactSignature::Invalid;
+    }
+    let Some(expires_at) = signed_at.checked_add(lifetime) else {
+        return ArtifactSignature::Invalid;
+    };
+    // Every field the signing adds back is dropped; everything else is part of the address
+    // the signature covers, so a field a client appended of its own travels into it.
+    let carried: Vec<String> = presented
+        .iter()
+        .filter(|(name, _value)| !name.starts_with("X-Amz-"))
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect();
+    let address = if carried.is_empty() {
+        format!("https://{host}{path}")
+    } else {
+        format!("https://{host}{path}?{}", carried.join("&"))
+    };
+    let Some(minted) = presign(&address, region, signed_at, lifetime) else {
+        return ArtifactSignature::Invalid;
+    };
+    let Some((_address, minted_query)) = minted.split_once('?') else {
+        return ArtifactSignature::Invalid;
+    };
+    if !same_locator(&query_fields(minted_query), &presented) {
+        return ArtifactSignature::Invalid;
+    }
+    // Expiry is answered only for a locator that IS this service's: one it never minted is
+    // not expired, it is invalid.
+    if now >= expires_at {
+        ArtifactSignature::Expired
+    } else {
+        ArtifactSignature::Honoured
+    }
+}
+
+/// The most query fields a document-plane request target may carry.
+///
+/// A locator this service mints carries exactly the signing fields and none of a client's
+/// own, so this is those plus a little room: a target carrying more is one this service did
+/// not announce, and refusing it on the count alone is what keeps the verification's work
+/// independent of how many fields a caller sends.
+const MAX_LOCATOR_FIELDS: usize = 8;
+
+/// The query fields of `query`, in the order they arrived, as (name, value) pairs.
+fn query_fields(query: &str) -> Vec<(&str, &str)> {
+    query
+        .split('&')
+        .filter(|field| !field.is_empty())
+        .map(|field| field.split_once('=').unwrap_or((field, "")))
+        .collect()
+}
+
+/// Whether `presented` is the locator `minted` field for field: the same fields, each with
+/// the same value, in any order.
+///
+/// The presented fields are indexed once and each minted field is looked up in that index,
+/// so the comparison costs one pass over each side rather than one pass per field.
+fn same_locator(minted: &[(&str, &str)], presented: &[(&str, &str)]) -> bool {
+    if minted.len() != presented.len() {
+        return false;
+    }
+    let presented: BTreeMap<&str, &str> = presented.iter().copied().collect();
+    minted.iter().all(|(name, value)| {
+        presented.get(name).is_some_and(|presented| {
+            // The signature is the field derived from this service's own key, so how long
+            // its comparison takes must not depend on how much of a presented one was
+            // right.
+            if *name == "X-Amz-Signature" {
+                same_signature(value, presented)
+            } else {
+                presented == value
+            }
+        })
+    })
+}
+
+/// The signing of one download address, shared by the mint and the verification so there
+/// is one computation and no second copy of what a locator's signature covers.
+///
+/// `None` when the address is not an absolute URL, or when the parameters the crate needs
+/// cannot be built from it.
+fn presign(
+    address: &str,
+    region: &str,
+    signed_at: SystemTime,
+    lifetime: Duration,
+) -> Option<String> {
+    use ::aws_sigv4::http_request::{
+        sign, PayloadChecksumKind, SignableBody, SignableRequest, SignatureLocation,
+        SigningSettings,
+    };
+
+    let authority = url_authority(address)?;
+    let identity: ::aws_smithy_runtime_api::client::identity::Identity =
+        ::aws_credential_types::Credentials::builder()
+            .provider_name(ARN_NAMESPACE)
+            .access_key_id(document_plane_key_id())
+            .secret_access_key(document_plane_key())
+            .build()
+            .into();
+    let mut settings = SigningSettings::default();
+    // The signature travels in the query string, which is what makes the locator
+    // followable by a client that sends no `Authorization` header at all.
+    settings.signature_location = SignatureLocation::QueryParams;
+    settings.expires_in = Some(lifetime);
+    settings.payload_checksum_kind = PayloadChecksumKind::NoHeader;
+    let params = ::aws_sigv4::sign::v4::SigningParams::builder()
+        .identity(&identity)
+        .region(region)
+        .name(ARN_NAMESPACE)
+        .settings(settings)
+        .time(signed_at)
+        .build()
+        .ok()?;
+    let signable = SignableRequest::new(
+        "GET",
+        address,
+        ::std::iter::once(("host", authority)),
+        SignableBody::UnsignedPayload,
+    )
+    .ok()?;
+    let (instructions, _signature) = sign(signable, &params.into()).ok()?.into_parts();
+    let mut request = ::http::Request::builder()
+        .method("GET")
+        .uri(address)
+        .body(())
+        .ok()?;
+    instructions.apply_to_request_http1x(&mut request);
+    Some(request.uri().to_string())
+}
+
+/// The key this service's document plane signs a published locator with.
+///
+/// Drawn once per process from [`process_seed`] and digested with `sha2`: it is the
+/// plane's own signing key, not a credential of any account and not the emulator's own —
+/// nothing returns it, nothing else accepts it, and it is gone when the process is, so a
+/// locator one run announced is not followable against another.
+fn document_plane_key() -> &'static str {
+    static KEY: OnceLock<String> = OnceLock::new();
+    KEY.get_or_init(|| digest_of("artifact-download-signing-key"))
+        .as_str()
+}
+
+/// The id of that key, as the locator's `X-Amz-Credential` names the signer: 20 uppercase
+/// characters, the shape of an access key id, derived from the process seed under its own
+/// domain so it identifies the signing key without revealing it.
+fn document_plane_key_id() -> &'static str {
+    static KEY_ID: OnceLock<String> = OnceLock::new();
+    KEY_ID
+        .get_or_init(|| digest_of("artifact-download-key-id")[..20].to_ascii_uppercase())
+        .as_str()
+}
+
+/// This process's seed digested under `domain`, hex-rendered: one derivation, so two
+/// values of this module are never the same bytes under two names.
+fn digest_of(domain: &str) -> String {
+    use ::sha2::Digest as _;
+
+    let mut digest = ::sha2::Sha256::new();
+    digest.update(process_seed().to_be_bytes());
+    digest.update(domain.as_bytes());
+    ::hex::encode(digest.finalize())
+}
+
+/// The instant a locator's `X-Amz-Date` names: `YYYYMMDDTHHMMSSZ`, the basic form SigV4
+/// states it in.
+///
+/// The fixed-width fields are re-rendered as the extended form and read by
+/// `aws_smithy_types`' own date-time parser (the one [`iso8601`] renders with), so the
+/// calendar arithmetic is the maintained crate's rather than this module's.
+fn signing_instant(stamp: &str) -> Option<SystemTime> {
+    let bytes = stamp.as_bytes();
+    if bytes.len() != 16 || bytes[8] != b'T' || bytes[15] != b'Z' {
+        return None;
+    }
+    if !bytes[..8]
+        .iter()
+        .chain(&bytes[9..15])
+        .all(u8::is_ascii_digit)
+    {
+        return None;
+    }
+    let extended = format!(
+        "{}-{}-{}T{}:{}:{}Z",
+        &stamp[0..4],
+        &stamp[4..6],
+        &stamp[6..8],
+        &stamp[9..11],
+        &stamp[11..13],
+        &stamp[13..15]
+    );
+    let at = ::aws_smithy_types::DateTime::from_str(
+        &extended,
+        ::aws_smithy_types::date_time::Format::DateTime,
+    )
+    .ok()?;
+    SystemTime::try_from(at).ok()
+}
+
+/// The authority of an absolute URL: the host, with its port when it names one.
+fn url_authority(url: &str) -> Option<&str> {
+    let after_scheme = url.split_once("://")?.1;
+    Some(match after_scheme.find(['/', '?', '#']) {
+        Some(end) => &after_scheme[..end],
+        None => after_scheme,
+    })
+}
+
+/// `expected == presented`, without stopping at the first byte that differs.
+///
+/// A signature is derived from a key this service holds, so how long the comparison takes
+/// must not depend on how much of a presented one was right.
+fn same_signature(expected: &str, presented: &str) -> bool {
+    let (expected, presented) = (expected.as_bytes(), presented.as_bytes());
+    expected.len() == presented.len()
+        && expected
+            .iter()
+            .zip(presented)
+            .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+            == 0
 }
 
 /// The application ARN minted for `name`:

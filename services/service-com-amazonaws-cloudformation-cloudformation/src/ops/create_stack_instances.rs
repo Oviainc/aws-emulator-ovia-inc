@@ -118,51 +118,9 @@
 use super::types::*;
 use crate::state::stack_sets::{
     detailed_status, instance_status, new_instance_stack_name, operation_action,
-    operation_status, StoredStackInstance,
+    operation_status, target_accounts, StoredStackInstance,
 };
 use crate::state::{status, StoredStack};
-
-/// The target accounts a request names, by the member that names them.
-///
-/// "[Self-managed permissions] The account IDs of one or more Amazon Web Services accounts
-/// that you want to create stack instances in" / "[Service-managed permissions] The
-/// Organizations accounts in which to create stack instances": "You can specify Accounts
-/// or DeploymentTargets, but not both", and "you must specify at least one value for
-/// either".
-fn target_accounts(input: &CreateStackInstancesInput) -> Result<Vec<String>, String> {
-    let accounts = input.accounts.clone().unwrap_or_default();
-    let targets = input
-        .deployment_targets
-        .as_ref()
-        .map(|targets| targets.accounts.clone().unwrap_or_default())
-        .unwrap_or_default();
-    if !accounts.is_empty() && input.deployment_targets.is_some() {
-        return Err("You cannot specify both Accounts and DeploymentTargets".to_string());
-    }
-    // "The location of the accounts" an `AccountsUrl` names is an Amazon S3 object, which
-    // would have to be fetched over the network — this emulator makes no outbound
-    // connections, so a request naming one is refused rather than served with the accounts
-    // nobody read.
-    if input
-        .deployment_targets
-        .as_ref()
-        .is_some_and(|targets| targets.accounts_url.is_some())
-    {
-        return Err(
-            "DeploymentTargets.AccountsUrl names an Amazon S3 object this emulator does not \
-             read"
-                .to_string(),
-        );
-    }
-    let selected = if accounts.is_empty() { targets } else { accounts };
-    if selected.is_empty() {
-        return Err(
-            "You must specify at least one value for either Accounts or DeploymentTargets"
-                .to_string(),
-        );
-    }
-    Ok(selected)
-}
 
 /// One instance's stack, as the write block hands it to the provisioning walk that creates
 /// its resources in the services that own them.
@@ -262,8 +220,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "CreateStackInstances",
             ));
         };
-        let accounts =
-            target_accounts(&input).map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        let accounts = target_accounts(input.accounts.as_deref(), input.deployment_targets.as_ref())
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         // "You must specify at least one value for Regions."
         if input.regions.is_empty() {
             return Err(crate::scaffolded::Scaffolded::validation_error(

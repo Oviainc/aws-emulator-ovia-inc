@@ -241,22 +241,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The model types these members as `ARN` with no pattern, so the
         // framework cannot refuse a malformed one; AWS does. Refusing here keeps
-        // a value the service could never have resolved out of stored state.
+        // a value the service could never have resolved out of stored state. The
+        // check and its sentence are `crate::state`'s, shared with every other
+        // member this service types as an ARN.
         for (member, value) in [
             ("ResourceArn", input.resource_arn.as_str()),
             ("IamRoleArn", input.iam_role_arn.as_str()),
         ] {
-            if !crate::state::is_arn(value) {
-                return Err(StartBackupJobErrorModeled::InvalidParameterValueException(
-                    InvalidParameterValueException {
-                        message: Some(format!(
-                            "{member} must be an ARN of the form \
-                             arn:<partition>:<service>:<region>:<account>:<resource>"
-                        )),
-                        ..Default::default()
-                    },
-                )
-                .into());
+            if let Some(refusal) = crate::state::rejected_arn(member, value) {
+                return Err(
+                    StartBackupJobErrorModeled::InvalidParameterValueException(refusal).into(),
+                );
             }
         }
 
@@ -272,18 +267,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
             ("CompleteWindowMinutes", input.complete_window_minutes, 0),
         ] {
-            let range = minimum..=crate::state::MAX_WINDOW_MINUTES;
-            if minutes.is_some_and(|minutes| !range.contains(&minutes)) {
-                return Err(StartBackupJobErrorModeled::InvalidParameterValueException(
-                    InvalidParameterValueException {
-                        message: Some(format!(
-                            "{member} must be between {minimum} and {} minutes",
-                            crate::state::MAX_WINDOW_MINUTES
-                        )),
-                        ..Default::default()
-                    },
-                )
-                .into());
+            if let Some(refusal) = crate::state::rejected_window_minutes(member, minutes, minimum) {
+                return Err(
+                    StartBackupJobErrorModeled::InvalidParameterValueException(refusal).into(),
+                );
             }
         }
 

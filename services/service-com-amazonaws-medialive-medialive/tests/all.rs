@@ -104,6 +104,9 @@ mod cluster_description;
 #[path = "all/cluster_listing.rs"]
 mod cluster_listing;
 
+#[path = "all/cluster_network_resolution.rs"]
+mod cluster_network_resolution;
+
 #[path = "all/cluster_update.rs"]
 mod cluster_update;
 

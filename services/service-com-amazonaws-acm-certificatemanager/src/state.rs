@@ -41,8 +41,9 @@
 //! bindings are a contiguous range
 //! ([`ComAmazonawsAcmCertificatemanagerState::acme_external_account_bindings_of`]) and
 //! deleting the endpoint drops them with it. `DescribeAcmeExternalAccountBinding`
-//! projects that record through [`acme_external_account_binding_detail`], and the
-//! credentials it carries — the key id an ACME client presents and the MAC key it signs
+//! projects that record through [`acme_external_account_binding_detail`] and
+//! `ListAcmeExternalAccountBindings` through
+//! [`acme_external_account_binding_summary`], and the credentials it carries — the key id an ACME client presents and the MAC key it signs
 //! with ([`mint_acme_external_account_binding_mac_key`]) — are minted when the binding is
 //! created and never rewritten, so every later read reports the same pair.
 //! `GetAcmeExternalAccountBindingCredentials` is the operation that reports that pair —
@@ -81,6 +82,7 @@ use crate::ops::types::{
     AcmeEndpoint,
     AcmeEndpointSummary,
     AcmeExternalAccountBinding,
+    AcmeExternalAccountBindingSummary,
     CertificateAuthority,
     CertificateDetail, CertificateMetadata, CertificateOptions, CertificateSearchResult,
     CertificateSummary, DistinguishedName, DnsPrevalidationDetails, DomainScope, DomainValidation,
@@ -3060,6 +3062,31 @@ pub fn acme_external_account_binding_detail(
         last_used_at: binding.last_used_at.map(to_date_time),
         created_at: Some(to_date_time(binding.created_at)),
         updated_at: Some(to_date_time(binding.updated_at)),
+    }
+}
+
+/// A stored ACME external account binding as `ListAcmeExternalAccountBindings`'
+/// `AcmeExternalAccountBindingSummary`.
+///
+/// `AcmeExternalAccountBindingSummary` declares exactly the members
+/// `AcmeExternalAccountBinding` does, so one binding is reported identically whether it
+/// is read one at a time or listed: the summary is projected from the same record, member
+/// for member, through [`acme_external_account_binding_detail`] — including the three
+/// instant members that exist only for a binding that has reached them. The credentials
+/// are no members of this shape either, so listing reports no secret.
+pub fn acme_external_account_binding_summary(
+    binding: &AcmeExternalAccountBindingRecord,
+) -> AcmeExternalAccountBindingSummary {
+    let detail = acme_external_account_binding_detail(binding);
+    AcmeExternalAccountBindingSummary {
+        acme_external_account_binding_arn: detail.acme_external_account_binding_arn,
+        acme_endpoint_arn: detail.acme_endpoint_arn,
+        role_arn: detail.role_arn,
+        expires_at: detail.expires_at,
+        revoked_at: detail.revoked_at,
+        last_used_at: detail.last_used_at,
+        created_at: detail.created_at,
+        updated_at: detail.updated_at,
     }
 }
 

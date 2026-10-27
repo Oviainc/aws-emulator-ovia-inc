@@ -260,16 +260,20 @@ async fn a_deleted_network_moves_through_deleting_to_the_terminal_deleted() {
 }
 
 /// One row of the association table: the clusters created against the row's two
-/// networks, each as the interfaces it maps. `Some(index)` names the row's
-/// network at that index and `None` names the id nothing minted; a repeated index
-/// is a second interface of the same cluster mapped onto one network.
+/// networks, each as the interfaces it maps. Each entry names the row's network
+/// at that index; a repeated index is a second interface of the same cluster
+/// mapped onto one network.
+///
+/// Every entry names a network the row CREATED, because a mapping may only name
+/// a network this account holds (`cluster_network_resolution` has the table for
+/// the refusal of one that does not).
 ///
 /// The bodies themselves are built by the create suite's own
 /// [`crate::networks::cluster_body`], so the two suites cannot disagree about how
 /// a cluster is mapped onto a network.
 struct Association {
     case: &'static str,
-    clusters: &'static [&'static [Option<usize>]],
+    clusters: &'static [&'static [usize]],
 }
 
 /// Rule: a network is deleted only once nothing is associated with it — "Delete a
@@ -282,8 +286,8 @@ struct Association {
 /// The rows differ along the COUNT of clusters attached to the network under test
 /// and the FORM of the mapping that attaches them (none at all, one cluster, two
 /// clusters, two interfaces of one cluster, a cluster on the other network only,
-/// a cluster with no mapping, a cluster naming an id nothing minted, a cluster
-/// across both networks), because that is what the rule generalises over. Which
+/// a cluster with no mapping, a cluster across both networks), because that is
+/// what the rule generalises over. Which
 /// outcome each row expects is read off the REQUESTS, not off the emulator.
 #[tokio::test]
 async fn a_network_an_associated_resource_still_uses_is_not_deleted() {
@@ -294,31 +298,27 @@ async fn a_network_an_associated_resource_still_uses_is_not_deleted() {
         },
         Association {
             case: "one cluster on the network",
-            clusters: &[&[Some(0)]],
+            clusters: &[&[0]],
         },
         Association {
             case: "two clusters on the network",
-            clusters: &[&[Some(0)], &[Some(0)]],
+            clusters: &[&[0], &[0]],
         },
         Association {
             case: "two interfaces of one cluster on the network",
-            clusters: &[&[Some(0), Some(0)]],
+            clusters: &[&[0, 0]],
         },
         Association {
             case: "one cluster on the other network only",
-            clusters: &[&[Some(1)]],
+            clusters: &[&[1]],
         },
         Association {
             case: "a cluster with no mapping at all",
             clusters: &[&[]],
         },
         Association {
-            case: "a cluster mapped onto an id nothing minted",
-            clusters: &[&[None]],
-        },
-        Association {
             case: "a cluster across both networks",
-            clusters: &[&[Some(0), Some(1)]],
+            clusters: &[&[0, 1]],
         },
     ];
 
@@ -349,7 +349,7 @@ async fn a_network_an_associated_resource_still_uses_is_not_deleted() {
             };
             let body = cluster_body(format!("cluster-{index}"), &spec, &network_ids);
             let cluster_id = created_cluster(&router, case, body).await;
-            if mappings.contains(&Some(0)) {
+            if mappings.contains(&0) {
                 attached.push(cluster_id);
             }
         }

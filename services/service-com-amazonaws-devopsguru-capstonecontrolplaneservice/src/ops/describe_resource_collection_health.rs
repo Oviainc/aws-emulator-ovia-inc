@@ -210,16 +210,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let collection_type = input.resource_collection_type.clone();
         let scope = format!("DescribeResourceCollectionHealth/{collection_type}");
         let invalid_next_token = || -> DescribeResourceCollectionHealthError {
-            DescribeResourceCollectionHealthErrorModeled::ValidationException(ValidationException {
-                message: "NextToken does not name a page of this resource collection's health"
-                    .to_string(),
-                reason: Some("FIELD_VALIDATION_FAILED".to_string()),
-                fields: Some(vec![ValidationExceptionField {
-                    name: "NextToken".to_string(),
-                    message: "must be a token returned by an earlier DescribeResourceCollectionHealth for the same ResourceCollectionType"
-                        .to_string(),
-                }]),
-            })
+            DescribeResourceCollectionHealthErrorModeled::ValidationException(
+                crate::state::FilterRejection::stale_cursor(
+                    "DescribeResourceCollectionHealth",
+                    "this resource collection's health",
+                    "ResourceCollectionType",
+                )
+                .validation_exception(),
+            )
             .into()
         };
         let token = input.next_token.as_deref();

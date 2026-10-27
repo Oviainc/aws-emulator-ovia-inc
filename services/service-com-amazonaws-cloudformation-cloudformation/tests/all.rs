@@ -37,6 +37,8 @@ mod content_delivery_stack_outputs;
 mod cross_stack_imports;
 #[path = "all/delete_canceled_export_in_use.rs"]
 mod delete_canceled_export_in_use;
+#[path = "all/delete_stack_instances.rs"]
+mod delete_stack_instances;
 #[path = "all/detect_resource_drift.rs"]
 mod detect_resource_drift;
 #[path = "all/drift_and_resource_reads.rs"]

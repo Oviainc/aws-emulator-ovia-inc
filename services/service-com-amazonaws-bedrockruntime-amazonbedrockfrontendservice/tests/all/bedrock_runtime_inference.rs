@@ -373,7 +373,9 @@ async fn count_invoke_body_tokens(
 }
 
 /// The tokens a set of prompt pieces is, by the emulator's one tokenizer.
-fn tokens_of(pieces: &[&str]) -> i64 {
+///
+/// `pub(crate)` so the other suites of this target count with the SAME helper.
+pub(crate) fn tokens_of(pieces: &[&str]) -> i64 {
     pieces
         .iter()
         .map(|piece| i64::from(state::count_text_tokens(piece)))
@@ -671,11 +673,20 @@ async fn an_inference_call_counts_every_piece_of_prompt_text_the_request_carries
             call.status,
             String::from_utf8_lossy(&call.body)
         );
-        let reported = call.json()["usage"]["inputTokens"].as_i64();
+        // The prompt tokens a turn reports are its `inputTokens` plus whatever a
+        // cache checkpoint moved into the cache counters, so the comparison
+        // holds for a request that marks a cacheable prefix too.
+        let usage = &call.json()["usage"];
+        let reported = usage["inputTokens"].as_i64().map(|input| {
+            input
+                + usage["cacheReadInputTokens"].as_i64().unwrap_or_default()
+                + usage["cacheWriteInputTokens"].as_i64().unwrap_or_default()
+        });
         assert_eq!(
             reported,
             Some(expected),
-            "case {case:?}: expected Converse usage.inputTokens {expected}, got {reported:?}"
+            "case {case:?}: expected Converse to account for {expected} prompt tokens, \
+             got {usage}"
         );
         if row.pieces.is_empty() {
             assert_eq!(

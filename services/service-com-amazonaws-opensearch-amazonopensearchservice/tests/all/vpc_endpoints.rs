@@ -30,6 +30,13 @@
 //!   same id names no endpoint;
 //! * `ClientToken` makes a create idempotent: the same token twice answers with the
 //!   one endpoint the first call minted;
+//! * the number of endpoints a create may add is bounded by the set the ACCOUNT already
+//!   holds at the instant of the call: one create at the bound is served, every create
+//!   past it is refused with the modelled `LimitExceededException` and mints nothing —
+//!   whichever domain it names and whether or not it carries a token — a retry of a
+//!   create already served is still answered from the record it made, and releasing an
+//!   endpoint frees exactly one slot, so the bound counts what is STORED and not how
+//!   many creates were ever made;
 //! * paging walks the whole set exactly once in the order the listing reports it, with
 //!   every page but the last full.
 
@@ -785,55 +792,22 @@ async fn paging_walks_the_whole_set_exactly_once() {
         ));
     }
 
+    // The walk itself is the shared one every paged read of this listing goes through,
+    // so what this test adds to it is the page-fullness rule and the order.
+    let pages = walked_pages(&emulator, "ListVpcEndpoints").await;
     let mut walked: Vec<String> = Vec::new();
-    let mut token: Option<String> = None;
-    for page in 0..=total {
-        assert!(
-            page < total,
-            "case ListVpcEndpoints: the listing handed out more pages than there are endpoints"
-        );
-        let answer = list_endpoints(&emulator, token.as_deref()).await;
-        assert_eq!(
-            answer.status, 200,
-            "case ListVpcEndpoints(page {page}): expected 200, got {} with {:?}",
-            answer.status, answer.body
-        );
-        let summaries = answer.body["VpcEndpointSummaryList"]
-            .as_array()
-            .unwrap_or_else(|| {
-                panic!(
-                    "case ListVpcEndpoints(page {page}): expected a summary list, got {:?}",
-                    answer.body
-                )
-            })
-            .clone();
-        let next = answer.body["NextToken"].as_str().unwrap_or_else(|| {
-            panic!(
-                "case ListVpcEndpoints(page {page}): the model declares NextToken required, got \
-                 {:?}",
-                answer.body
-            )
-        });
-        if !next.is_empty() {
+    for (page, summaries) in pages.iter().enumerate() {
+        if page + 1 < pages.len() {
             assert_eq!(
                 summaries.len(),
                 VPC_ENDPOINT_PAGE,
-                "case ListVpcEndpoints(page {page}): every page but the last is full, got {:?}",
-                answer.body
+                "case ListVpcEndpoints(page {page}): every page but the last is full, got \
+                 {summaries:?}"
             );
         }
-        for summary in &summaries {
-            walked.push(
-                summary["VpcEndpointId"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned(),
-            );
+        for summary in summaries {
+            walked.push(member(summary, "VpcEndpointId", "ListVpcEndpoints"));
         }
-        if next.is_empty() {
-            break;
-        }
-        token = Some(next.to_owned());
     }
 
     let mut expected = minted_ids.clone();
@@ -854,5 +828,261 @@ async fn paging_walks_the_whole_set_exactly_once() {
          {} with {:?}",
         refused.status,
         refused.body
+    );
+}
+
+/// `ListVpcEndpoints` walked to its end, one entry per page in the order the listing
+/// handed the pages out: the ONE walk of the account's whole set this suite has, resumed
+/// through the token each page carries and bounded by the pages the account's own bound
+/// can fill. Each page is asserted to be served and to carry the `NextToken` the model
+/// declares required; what a page HOLDS is for the caller to assert.
+async fn walked_pages(emulator: &Emulator, case: &str) -> Vec<Vec<Value>> {
+    let mut pages: Vec<Vec<Value>> = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        assert!(
+            pages.len() <= VPC_ENDPOINT_QUOTA / VPC_ENDPOINT_PAGE,
+            "case {case}: the listing handed out more pages than the bounded set can fill, got \
+             {pages:?}"
+        );
+        let page = pages.len();
+        let answer = list_endpoints(emulator, token.as_deref()).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case}(page {page}): expected 200 from ListVpcEndpoints, got {} with {:?}",
+            answer.status, answer.body
+        );
+        pages.push(
+            answer.body["VpcEndpointSummaryList"]
+                .as_array()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "case {case}(page {page}): expected a VpcEndpointSummaryList, got {:?}",
+                        answer.body
+                    )
+                })
+                .clone(),
+        );
+        let next = answer.body["NextToken"].as_str().unwrap_or_else(|| {
+            panic!(
+                "case {case}(page {page}): the model declares NextToken required, got {:?}",
+                answer.body
+            )
+        });
+        if next.is_empty() {
+            return pages;
+        }
+        token = Some(next.to_owned());
+    }
+}
+
+/// Every endpoint id this account holds, in the order the listing reports them: the
+/// STORED set a create is counted against, read through [`walked_pages`] because at the
+/// bound the set spans more pages than one listing answers with.
+async fn held_ids(emulator: &Emulator, case: &str) -> Vec<String> {
+    walked_pages(emulator, case)
+        .await
+        .iter()
+        .flatten()
+        .map(|summary| member(summary, "VpcEndpointId", case))
+        .collect()
+}
+
+/// One create to make once the account is at its bound: which domain it names and what
+/// else it carries.
+struct PastBound {
+    case: &'static str,
+    body: Value,
+}
+
+/// The subnet the create filling position `index` of the account's bound names, so the
+/// retry of one of those creates asks for exactly what it asked for.
+fn filling_subnet(index: usize) -> String {
+    format!("subnet-0b0b00000000{index:05}")
+}
+
+#[tokio::test]
+async fn a_create_past_the_account_s_bound_is_refused_and_mints_nothing() {
+    let emulator = Emulator::new();
+
+    // The bound is on the ACCOUNT's set, so it is filled across two domains: neither of
+    // them alone holds the maximum, and the refusals below are the account's set rather
+    // than any one domain's.
+    let first = vpc_domain(&emulator, "endpoint-bound-one").await;
+    let second = vpc_domain(&emulator, "endpoint-bound-two").await;
+    // A token the first create is served under, so the retry below is a repeat of a
+    // request the account already holds an endpoint for.
+    let served_token = "bound-retry";
+
+    for index in 0..VPC_ENDPOINT_QUOTA {
+        let case = format!("the create filling position {index} of the bound");
+        let arn = if index % 2 == 0 { &first } else { &second };
+        let mut body = json!({
+            "DomainArn": arn,
+            "VpcOptions": { "SubnetIds": [filling_subnet(index)] },
+        });
+        if index == 0 {
+            body["ClientToken"] = json!(served_token);
+        }
+        let answer = create_endpoint(&emulator, body).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case}: a create below the bound is served, got {} with {:?}",
+            answer.status, answer.body
+        );
+    }
+
+    // The create that brought the account TO the bound was served, so what is refused
+    // below is only the one past it.
+    let at_bound = held_ids(&emulator, "the account at its bound").await;
+    assert_eq!(
+        at_bound.len(),
+        VPC_ENDPOINT_QUOTA,
+        "case the account at its bound: expected the creates at and below the bound to all be \
+         held, got {at_bound:?}"
+    );
+
+    // A third domain holding no endpoint at all, so one row below asks for the create on
+    // a domain that has used none of the account's set.
+    let third = vpc_domain(&emulator, "endpoint-bound-three").await;
+    let rows = vec![
+        PastBound {
+            case: "a domain that already holds endpoints",
+            body: json!({
+                "DomainArn": first,
+                "VpcOptions": { "SubnetIds": ["subnet-0c0c00000000000a1"] },
+            }),
+        },
+        PastBound {
+            case: "a domain that holds none",
+            body: json!({
+                "DomainArn": third,
+                "VpcOptions": { "SubnetIds": ["subnet-0c0c00000000000a2"] },
+            }),
+        },
+        PastBound {
+            case: "a create carrying a token nothing was served under",
+            body: json!({
+                "DomainArn": second,
+                "VpcOptions": {
+                    "SubnetIds": ["subnet-0c0c00000000000a3", "subnet-0c0c00000000000a4"],
+                    "SecurityGroupIds": ["sg-0c0c00000000000a1"],
+                    "EgressEnabled": true,
+                },
+                "ClientToken": "past-the-bound",
+            }),
+        },
+    ];
+
+    for row in rows {
+        let case = row.case;
+        let answer = create_endpoint(&emulator, row.body).await;
+        assert_eq!(
+            answer.status, 409,
+            "case {case}: expected 409 past the bound, got {} with {:?}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            error_code(&answer),
+            "LimitExceededException",
+            "case {case}: expected LimitExceededException, got {:?}",
+            answer.body
+        );
+        let message = answer.body["message"].as_str().unwrap_or_default().to_owned();
+        assert!(
+            message.contains(&VPC_ENDPOINT_QUOTA.to_string()),
+            "case {case}: expected the refusal to state the maximum of {VPC_ENDPOINT_QUOTA}, got \
+             {message:?}"
+        );
+        assert_eq!(
+            held_ids(&emulator, case).await,
+            at_bound,
+            "case {case}: a refused create mints nothing, so the account holds the same set"
+        );
+    }
+
+    // A repeat of a create the account WAS served is still answered from the record that
+    // create made: it adds nothing to the set, so the bound has nothing to refuse.
+    let retried = create_endpoint(
+        &emulator,
+        json!({
+            "DomainArn": first,
+            "VpcOptions": { "SubnetIds": [filling_subnet(0)] },
+            "ClientToken": served_token,
+        }),
+    )
+    .await;
+    let endpoint = minted(&retried, "a create already served, retried at the bound");
+    assert!(
+        at_bound.contains(&member(
+            &endpoint,
+            "VpcEndpointId",
+            "a create already served, retried at the bound"
+        )),
+        "case a create already served, retried at the bound: expected the endpoint the first \
+         call minted, got {endpoint:?}"
+    );
+    assert_eq!(
+        held_ids(&emulator, "a create already served, retried at the bound").await,
+        at_bound,
+        "case a create already served, retried at the bound: the retry mints nothing"
+    );
+
+    // Releasing an endpoint frees exactly one slot: the bound counts the set the store
+    // HOLDS at the instant of the call, not how many creates it ever served.
+    let released = at_bound
+        .last()
+        .expect("the account holds endpoints at its bound")
+        .clone();
+    let gone = delete_endpoint(&emulator, &released).await;
+    assert_eq!(
+        gone.status, 200,
+        "case releasing one endpoint at the bound: expected 200, got {} with {:?}",
+        gone.status, gone.body
+    );
+    assert_eq!(
+        held_ids(&emulator, "one slot freed").await.len(),
+        VPC_ENDPOINT_QUOTA - 1,
+        "case one slot freed: expected the released endpoint to be out of the set"
+    );
+
+    let refilled = create_endpoint(
+        &emulator,
+        json!({
+            "DomainArn": third,
+            "VpcOptions": { "SubnetIds": ["subnet-0d0d00000000000a1"] },
+        }),
+    )
+    .await;
+    let took_the_slot = minted(&refilled, "the create taking the freed slot");
+    assert_eq!(
+        took_the_slot["DomainArn"],
+        json!(third),
+        "case the create taking the freed slot: expected it minted for the domain it named, got \
+         {took_the_slot:?}"
+    );
+    assert_eq!(
+        held_ids(&emulator, "the slot taken again").await.len(),
+        VPC_ENDPOINT_QUOTA,
+        "case the slot taken again: expected the account back at its bound"
+    );
+
+    // And the account is at its bound again, so the next create past it is refused as
+    // before.
+    let refused_again = create_endpoint(
+        &emulator,
+        json!({
+            "DomainArn": third,
+            "VpcOptions": { "SubnetIds": ["subnet-0d0d00000000000a2"] },
+        }),
+    )
+    .await;
+    assert_eq!(
+        (refused_again.status, error_code(&refused_again).as_str()),
+        (409, "LimitExceededException"),
+        "case a create past the bound once the slot was taken again: expected the same refusal, \
+         got {} with {:?}",
+        refused_again.status,
+        refused_again.body
     );
 }

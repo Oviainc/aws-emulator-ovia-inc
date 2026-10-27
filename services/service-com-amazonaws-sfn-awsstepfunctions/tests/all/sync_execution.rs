@@ -37,7 +37,11 @@ use crate::state_machine_lifecycle::{
 };
 
 /// Create an EXPRESS state machine that must succeed, and return its ARN.
-async fn create_express(emulator: &Emulator, name: &str, definition: &str) -> String {
+///
+/// `pub(crate)`, not private: `tests/all.rs` is this binary's crate root, so the
+/// suite that drives `StartSyncExecution` for ANOTHER rule — the diagnostic a
+/// refusal quotes — reads this helper rather than carrying a second copy of it.
+pub(crate) async fn create_express(emulator: &Emulator, name: &str, definition: &str) -> String {
     let created = emulator
         .ok(
             "CreateStateMachine",

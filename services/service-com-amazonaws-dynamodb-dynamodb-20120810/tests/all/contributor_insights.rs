@@ -31,7 +31,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::emulator::{call, emulator, error_code, message, ok};
+use crate::emulator::{call, emulator, error_code, message, ok, ok_in, REGION};
 
 /// Wait out one transient span, so whatever the clock owes a resource is due.
 pub(crate) async fn settle() {
@@ -42,8 +42,20 @@ pub(crate) async fn settle() {
     .await;
 }
 
-/// Create one on-demand table carrying `indexes` global secondary indexes.
+/// Create one on-demand table carrying `indexes` global secondary indexes, in
+/// [`REGION`].
 pub(crate) async fn create_table(router: &MultiServiceRouter, name: &str, indexes: &[&str]) -> Value {
+    create_table_in(router, REGION, name, indexes).await
+}
+
+/// The same, in `region`: a table name is unique within ONE region, which is the scope
+/// the store keys by, so a suite about that scope needs the region on the call.
+pub(crate) async fn create_table_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    name: &str,
+    indexes: &[&str],
+) -> Value {
     let mut request = json!({
         "TableName": name,
         "KeySchema": [{"AttributeName": "Part", "KeyType": "HASH"}],
@@ -70,7 +82,7 @@ pub(crate) async fn create_table(router: &MultiServiceRouter, name: &str, indexe
                 .collect(),
         );
     }
-    ok(router, "CreateTable", request).await
+    ok_in(router, region, "CreateTable", request).await
 }
 
 /// One request body for each operation, addressing `table` (and `index` where the
@@ -88,9 +100,21 @@ fn request_for(operation: &str, table: &str, index: Option<&str>) -> Value {
     request
 }
 
-/// Send one `UpdateContributorInsights` and return the parsed response.
+/// Send one `UpdateContributorInsights` in [`REGION`] and return the parsed response.
 pub(crate) async fn set_insights(
     router: &MultiServiceRouter,
+    table: &str,
+    index: Option<&str>,
+    action: &str,
+    mode: Option<&str>,
+) -> Value {
+    set_insights_in(router, REGION, table, index, action, mode).await
+}
+
+/// The same, signed for `region`.
+pub(crate) async fn set_insights_in(
+    router: &MultiServiceRouter,
+    region: &str,
     table: &str,
     index: Option<&str>,
     action: &str,
@@ -103,16 +127,26 @@ pub(crate) async fn set_insights(
     if let Some(mode) = mode {
         request["ContributorInsightsMode"] = json!(mode);
     }
-    ok(router, "UpdateContributorInsights", request).await
+    ok_in(router, region, "UpdateContributorInsights", request).await
 }
 
-/// Read one resource's setting back.
+/// Read one resource's setting back, in [`REGION`].
 pub(crate) async fn describe_insights(router: &MultiServiceRouter, table: &str, index: Option<&str>) -> Value {
+    describe_insights_in(router, REGION, table, index).await
+}
+
+/// The same, signed for `region`.
+pub(crate) async fn describe_insights_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    table: &str,
+    index: Option<&str>,
+) -> Value {
     let mut request = json!({"TableName": table});
     if let Some(index) = index {
         request["IndexName"] = json!(index);
     }
-    ok(router, "DescribeContributorInsights", request).await
+    ok_in(router, region, "DescribeContributorInsights", request).await
 }
 
 /// The three operations of this surface, each of which resolves a `TableName`.

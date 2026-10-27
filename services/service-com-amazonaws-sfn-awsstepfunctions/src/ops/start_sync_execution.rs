@@ -262,7 +262,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 InvalidExecutionInput {
                     message: Some(crate::state::resource_error_message(
                         crate::state::INVALID_STATE_MACHINE_EXECUTION_INPUT,
-                        &error.to_string(),
+                        &crate::state::json_parse_diagnostic(&execution_input, &error),
                     )),
                 },
             )

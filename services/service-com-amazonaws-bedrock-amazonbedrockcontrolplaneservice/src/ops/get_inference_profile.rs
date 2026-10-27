@@ -2,11 +2,15 @@
 
 //! @op GetInferenceProfile
 //!
-//! Reports the application inference profile an `inferenceProfileIdentifier` names,
-//! entirely out of the record `ops/create_inference_profile.rs` stored in
-//! [`crate::state`]: the ARN and id it was minted with, its name, description, tracked
-//! models, status, type and the two instants. Both spellings the identifier admits — the
-//! profile ARN and the bare `inferenceProfileId` — resolve to that one record
+//! Reports the inference profile an `inferenceProfileIdentifier` names: an APPLICATION
+//! profile out of the record `ops/create_inference_profile.rs` stored in [`crate::state`]
+//! \u2014 the ARN and id it was minted with, its name, description, tracked models, status,
+//! type and the two instants \u2014 or one of the SYSTEM_DEFINED cross-region profiles Amazon
+//! Bedrock itself publishes in this region
+//! ([`crate::state::published_inference_profile`], the same rows
+//! `ops/list_inference_profiles.rs` reports), which no call creates and every account can
+//! read. Both spellings the identifier admits \u2014 the profile ARN and the bare
+//! `inferenceProfileId` \u2014 resolve to one profile either way
 //! ([`crate::state::ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::inference_profile`]),
 //! and an identifier naming no profile of this account and region is 404
 //! `ResourceNotFoundException`.
@@ -163,7 +167,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
 
-        let Some(profile) = store.inference_profile(&input.inference_profile_identifier, &region)
+        let Some(profile) = store
+            .inference_profile(&input.inference_profile_identifier, &region)
+            .map(crate::state::inference_profile_summary)
+            .or_else(|| {
+                crate::state::published_inference_profile(
+                    &input.inference_profile_identifier,
+                    &region,
+                )
+            })
         else {
             return Err(GetInferenceProfileErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
@@ -174,15 +186,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(GetInferenceProfileOutput {
-            inference_profile_name: profile.name.clone(),
-            description: profile.description.clone(),
-            created_at: Some(crate::state::date_time(profile.created_at)),
-            updated_at: Some(crate::state::date_time(profile.updated_at)),
-            inference_profile_arn: profile.arn.clone(),
-            models: profile.models.clone(),
-            inference_profile_id: profile.id.clone(),
-            status: profile.status.to_string(),
-            r#type: profile.profile_type.to_string(),
+            inference_profile_name: profile.inference_profile_name,
+            description: profile.description,
+            created_at: profile.created_at,
+            updated_at: profile.updated_at,
+            inference_profile_arn: profile.inference_profile_arn,
+            models: profile.models,
+            inference_profile_id: profile.inference_profile_id,
+            status: profile.status,
+            r#type: profile.r#type,
         })
     }
 }

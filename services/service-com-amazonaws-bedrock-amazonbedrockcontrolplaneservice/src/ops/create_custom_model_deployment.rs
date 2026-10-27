@@ -11,11 +11,13 @@
 //! rather than out of one request:
 //!
 //! * `modelArn` names the custom model to deploy, and a `CustomModelArn` EMBEDS the base
-//!   model the custom model was customized from ([`base_model_segment`]). A segment that
+//!   model the custom model was customized from
+//!   ([`crate::state::custom_model_base_segment`]). A segment that
 //!   names no model the account's published catalog carries
 //!   ([`crate::state::FoundationModelCatalog::qualified_model`]) is no foundation model to
 //!   serve inference with, so the create is refused synchronously with 400
-//!   `ValidationException` naming that base model ([`invalid_base_model_message`]). The
+//!   `ValidationException` naming that base model
+//!   ([`crate::state::invalid_base_model_message`]). The
 //!   [`crate::state::CUSTOM_MODEL_IMPORTED_BASE`] segment names a custom model whose
 //!   artifacts were brought in, which has no base model in the catalog, so it carries no
 //!   such requirement.
@@ -166,41 +168,11 @@ impl<Eng> CreateCustomModelDeployment<Eng> {
     }
 }
 
-/// The base-model segment a `CustomModelArn` embeds: what sits between the
-/// `custom-model/` resource type and the custom model's own id, which is either
-/// [`crate::state::CUSTOM_MODEL_IMPORTED_BASE`] or the id of the foundation model the
-/// custom model was customized from, with the version qualifiers AWS appends to it.
-///
-/// `None` for a value that is not a `custom-model` ARN of this service's namespace at all;
-/// such a value is refused by the member's own modelled constraints before this handler
-/// sees it. Read here rather than in `crate::state` because this is the only operation
-/// that decides anything from the segment.
-///
-/// A TOTAL read of the value: the shared six-field ARN parse
-/// (`service_common::arn::parse_of`, which answers `None` for anything that is not an ARN
-/// of this service's namespace), then `strip_prefix` and `rsplit_once`, each answering
-/// `None` rather than panicking. Nothing is indexed, sliced or unwrapped, so no value a
-/// caller can send reaches a panic here.
-fn base_model_segment(model_arn: &str) -> Option<&str> {
-    let arn = ::service_common::arn::parse_of(model_arn, ::service_common::bedrock::ARN_NAMESPACE)?;
-    let rest = arn.resource.strip_prefix("custom-model/")?;
-    let (segment, id) = rest.rsplit_once('/')?;
-    (!segment.is_empty() && !id.is_empty()).then_some(segment)
-}
-
-/// What this operation answers as its `ValidationException` message for a `CustomModelArn`
-/// whose base-model segment names no foundation model the published catalog carries.
-///
-/// RECORDED behaviour, and a message BUILT FROM THE REQUEST rather than a constant: the
-/// corpus records Amazon Bedrock naming the base model the submitted ARN embedded
-/// ([`base_model_segment`]), quoted, in exactly this sentence. So the rule is "name the
-/// base model the ARN embeds", not one recorded model id.
-fn invalid_base_model_message(base_model_segment: &str) -> String {
-    format!(
-        "The foundation model '{base_model_segment}' for custom model is not a valid \
-         foundation model"
-    )
-}
+// The base-model segment a `CustomModelArn` embeds, and the refusal for one that names no
+// published foundation model, both live in `crate::state`: every operation that takes a
+// custom model's ARN as a model source reads that segment and refuses alike, so the read
+// (`custom_model_base_segment`) and the sentence (`invalid_base_model_message`) are stated
+// once.
 
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for CreateCustomModelDeployment<Eng>
@@ -259,11 +231,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateCustomModelDeploymentErrorModeled::TooManyTagsException(
                     TooManyTagsException {
-                        message: Some(format!(
-                            "a resource may carry at most {} tags, and this request carries {}",
-                            crate::state::MAX_TAGS_PER_RESOURCE,
-                            tags.len()
-                        )),
+                        message: Some(crate::state::too_many_tags_message()),
                         resource_name: None,
                     },
                 )
@@ -274,14 +242,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The base model a `CustomModelArn` embeds has to be one the account's published
         // catalog carries: nothing else can serve on-demand inference. An imported custom
         // model is customized from no base model, so it is exempt.
-        if let Some(segment) = base_model_segment(&input.model_arn) {
+        if let Some(segment) = crate::state::custom_model_base_segment(&input.model_arn) {
             if segment != crate::state::CUSTOM_MODEL_IMPORTED_BASE
                 && store.foundation_models.qualified_model(segment).is_none()
             {
                 return Err(
                     CreateCustomModelDeploymentErrorModeled::ValidationException(
                         ValidationException {
-                            message: Some(invalid_base_model_message(segment)),
+                            message: Some(crate::state::invalid_base_model_message(segment)),
                         },
                     )
                     .into(),

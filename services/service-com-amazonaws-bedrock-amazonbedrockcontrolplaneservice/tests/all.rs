@@ -49,6 +49,8 @@ mod evaluation_jobs;
 mod foundation_models;
 #[path = "all/get_foundation_model.rs"]
 mod get_foundation_model;
+#[path = "all/guardrail_not_found_message.rs"]
+mod guardrail_not_found_message;
 #[path = "all/guardrail_timestamp_wire_form.rs"]
 mod guardrail_timestamp_wire_form;
 #[path = "all/guardrail_wire_shape.rs"]
@@ -65,6 +67,8 @@ mod inference_profiles;
 mod marketplace_endpoint_deregistration;
 #[path = "all/marketplace_model_endpoints.rs"]
 mod marketplace_model_endpoints;
+#[path = "all/model_copy_jobs.rs"]
+mod model_copy_jobs;
 #[path = "all/model_customization_jobs.rs"]
 mod model_customization_jobs;
 #[path = "all/model_customization_pass_role.rs"]
@@ -77,6 +81,8 @@ mod model_invocation_jobs;
 mod model_invocation_logging;
 #[path = "all/prompt_routers.rs"]
 mod prompt_routers;
+#[path = "all/published_catalogues.rs"]
+mod published_catalogues;
 #[path = "all/range_refusal_wording.rs"]
 mod range_refusal_wording;
 #[path = "all/provisioned_model_throughputs.rs"]

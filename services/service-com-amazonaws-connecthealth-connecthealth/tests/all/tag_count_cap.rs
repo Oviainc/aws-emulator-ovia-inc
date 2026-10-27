@@ -64,8 +64,9 @@ fn tags_value(tags: &BTreeMap<String, String>) -> Value {
 /// How many domains this emulator currently holds, so a refused `CreateDomain` can be
 /// shown to have minted none.
 ///
-/// `pub(crate)` so a sibling suite counts the account's domains the same way rather than
-/// growing a second copy of the count.
+/// `pub(crate)` so a sibling suite — including the one that pins which refusal a map
+/// earns when it breaks two rules at once (`tests/all/tag_bound_precedence.rs`) — counts
+/// the account's domains the same way rather than growing a second copy of the count.
 pub(crate) async fn held_domains(emulator: &Emulator) -> usize {
     let (status, listed) = emulator.send("GET", "/domain", None).await;
     assert_eq!(status, 200, "ListDomains got {status} {listed}");

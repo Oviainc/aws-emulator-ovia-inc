@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the tag keys the request names from the persisted record of the resource its
+//! `Resource` ARN names — a [`crate::state::MicrovmImage`], the one resource type this
+//! service mints and therefore the only one its tagging operations can address. Every
+//! key the request does NOT name keeps its stored value, and a named key the resource
+//! does not carry is simply not there to remove, so the operation is `@idempotent`:
+//! removing the same keys again leaves the same tag set and answers the same 204.
+//!
+//! A resource whose asynchronous deletion is still in flight (`DELETING`) is a record
+//! this account still holds and still reads back, so its tags are removed like any
+//! other's; once the clock-owed removal has taken the record, the ARN names nothing
+//! this account holds and the call is the missing-resource condition. The modelled
+//! `ResourceConflictException` is therefore unused here, as it is on `TagResource`:
+//! there is no window in which this operation has to refuse a resource it can read.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +174,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagResourceErrorModeled::ServiceException(ServiceException {
+                r#type: None,
+                message: Some("the MicroVM image store is unavailable".to_string()),
+            })
+            .into());
+        };
+        let _ = ctx;
+
+        let mut store = state.lock();
+        // A resource whose asynchronous deletion the clock has already made due is gone
+        // before this call is served, so the tag removal lands on the same records every
+        // other operation sees at this instant.
+        store.materialize_due(::std::time::Instant::now());
+
+        // `Resource` is "The ARN of the resource to remove tags from", so the lookup is
+        // by the ARN this service minted for the resource — resolved through the same
+        // index every other operation resolves an identifier through, so an ARN of
+        // another partition, region or account resolves to nothing rather than to a
+        // local resource of the same name. `Resource`'s own pattern has already refused
+        // anything that is not a well-formed taggable ARN before this handler runs.
+        let Some(image) = store.image_mut(&input.resource) else {
+            // A well-formed taggable ARN naming nothing this account holds is the
+            // missing-resource condition, not a bad request: `message` is the only
+            // required member of `ResourceNotFoundException`, and this service leaves
+            // `resourceType` and `resourceId` unset.
+            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::image_not_found_message(&input.resource),
+                    resource_type: None,
+                    resource_id: None,
+                },
+            )
+            .into());
+        };
+
+        // Removing tags takes out exactly the keys the request names and leaves every
+        // other key the record carries where it is. A named key the resource does not
+        // carry removes nothing, which is what makes the operation `@idempotent`.
+        for key in &input.tag_keys {
+            image.tags.remove(key);
+        }
+
+        // The operation models no output members; the remaining tags are observed by
+        // reading the resource back (`ListTags`, or `GetMicrovmImage`'s `tags`).
+        Ok(UntagResourceOutput)
     }
 }

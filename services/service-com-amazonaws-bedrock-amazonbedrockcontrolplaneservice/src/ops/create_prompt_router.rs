@@ -19,7 +19,9 @@
 //!
 //! A replay of the same `clientRequestToken` answers with the router that token already
 //! minted (`@idempotencyToken`), and a name another router already holds in the same
-//! region is refused with `ConflictException`.
+//! region is refused with 400 `ValidationException` naming that name
+//! ([`crate::state::duplicate_prompt_router_message`]) — the resource is not created
+//! because the name is taken, which is what Amazon Bedrock reports for it.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
@@ -197,11 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if tag_count > crate::state::MAX_TAGS_PER_RESOURCE {
             return Err(CreatePromptRouterErrorModeled::TooManyTagsException(
                 TooManyTagsException {
-                    message: Some(format!(
-                        "a resource may carry at most {} tags, and this request carries \
-                         {tag_count}",
-                        crate::state::MAX_TAGS_PER_RESOURCE
-                    )),
+                    message: Some(crate::state::too_many_tags_message()),
                     resource_name: None,
                 },
             )
@@ -230,15 +228,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let name_key = (region.clone(), input.prompt_router_name.clone());
         if store.prompt_router_names.contains_key(&name_key) {
-            return Err(CreatePromptRouterErrorModeled::ConflictException(
-                ConflictException {
-                    message: Some(format!(
-                        "a prompt router named {} already exists in this account in {region}",
-                        input.prompt_router_name
-                    )),
-                },
-            )
-            .into());
+            return Err(validation(crate::state::duplicate_prompt_router_message(
+                &input.prompt_router_name,
+            )));
         }
 
         // The account's prompt router quota. Enforcing it here is also what bounds this

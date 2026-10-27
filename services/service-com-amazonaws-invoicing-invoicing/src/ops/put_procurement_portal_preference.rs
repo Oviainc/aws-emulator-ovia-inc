@@ -226,24 +226,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                 })?;
 
-            // `MarketplacePunchOutEnabled` "defaults to false if not provided", so an
-            // omitted member takes that default here rather than the stored value.
-            let marketplace_punch_out_enabled = input.marketplace_punch_out_enabled.unwrap_or(false);
-            // The same Marketplace PunchOut rule the create applies, read against the
+            // The same Marketplace PunchOut rule the create applies — the member's
+            // default and the combination it refuses, both held by
+            // `crate::state::resolve_marketplace_punch_out_enabled` — read against the
             // portal the STORED preference routes to: this operation's input does not
             // carry `ProcurementPortalName`, because a preference's portal is not
             // something an update can change.
-            if marketplace_punch_out_enabled
-                && stored.preference.procurement_portal_name == crate::state::PORTAL_COUPA
-                && input.marketplace_punch_out_preference.is_none()
-            {
-                return Err(PutProcurementPortalPreferenceErrorModeled::ValidationException(
-                    crate::state::marketplace_punch_out_preference_required(
-                        &stored.preference.procurement_portal_name,
-                    ),
+            let marketplace_punch_out_enabled =
+                crate::state::resolve_marketplace_punch_out_enabled(
+                    &stored.preference.procurement_portal_name,
+                    input.marketplace_punch_out_enabled,
+                    input.marketplace_punch_out_preference.as_ref(),
                 )
-                .into());
-            }
+                .map_err(PutProcurementPortalPreferenceErrorModeled::ValidationException)?;
 
             let preference = &mut stored.preference;
 

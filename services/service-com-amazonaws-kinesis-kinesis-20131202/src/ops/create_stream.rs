@@ -415,6 +415,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::MAX_SHARDS_PER_REGION
             )));
         }
+        // A stream of the on-demand capacity mode is counted against the on-demand stream
+        // quota of this account and region, which is the quota `DescribeLimits` reports as
+        // `OnDemandStreamCountLimit`, so a create past it is refused rather than served.
+        if on_demand {
+            let on_demand_in_region = store.on_demand_streams_held_in(created_at, &region);
+            if on_demand_in_region >= crate::state::MAX_ON_DEMAND_STREAMS_PER_REGION {
+                drop(store);
+                audit(&akid, &region, "refused");
+                return Err(limit_exceeded(
+                    crate::state::on_demand_stream_ceiling_exceeded_message(on_demand_in_region),
+                ));
+            }
+        }
         if store.streams_held(created_at) >= crate::state::MAX_STREAMS_TOTAL
             || store
                 .shards_held(created_at)

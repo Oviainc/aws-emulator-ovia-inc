@@ -446,9 +446,22 @@ async fn a_name_is_unique_per_region() {
         );
         assert_eq!(
             again.error.as_deref(),
-            Some("ConflictException"),
-            "case {name:?}: expected ConflictException, got {:?}",
+            Some("ValidationException"),
+            "case {name:?}: expected ValidationException, got {:?}",
             again.error
+        );
+        // The refusal names the name the request asked for, and nothing else about the
+        // request: Amazon Bedrock reports that the resource was not created because that
+        // name is taken.
+        let expected = format!(
+            "Failed to create the resource because the prompt router with name {name} \
+             already exists."
+        );
+        assert_eq!(
+            again.body.get("message").and_then(Value::as_str),
+            Some(expected.as_str()),
+            "case {name:?}: expected the message {expected:?}, got {:?}",
+            again.body
         );
 
         let elsewhere = create_in_region(&emu, other_region, create_body(name, 5.0)).await;
@@ -618,9 +631,10 @@ async fn a_router_carrying_more_tags_than_a_resource_admits_is_refused() {
 async fn the_listing_reports_the_routers_of_the_region_and_type_asked_for() {
     // `type` is modelled `@default("default")`
     // (`smithy_query(query="operation",operation="ListPromptRouters")`), and a router a
-    // caller created is `custom`, so the rows span: the type the created routers carry,
-    // the type the request defaults to, that same default named explicitly, and the
-    // listing of another region.
+    // caller created is `custom` while the routers Amazon Bedrock publishes are `default`,
+    // so the rows span: the type the created routers carry, the type the request defaults
+    // to, that same default named explicitly, and the listing of another region under both
+    // types.
     let emu = emulator();
     let other_region = "eu-central-1";
 
@@ -635,16 +649,38 @@ async fn the_listing_reports_the_routers_of_the_region_and_type_asked_for() {
         .text("promptRouterArn");
     here.sort();
 
+    // The routers Amazon Bedrock publishes itself in this region, which the `default`
+    // listing reports: the ids come from the published catalog ("Intelligent prompt
+    // routing"), spelled as the `PromptRouterArn` of the region the request addresses.
+    let published: Vec<String> = ["anthropic.claude:1", "meta.llama:1"]
+        .iter()
+        .map(|id| format!("{}{id}", arn_prefix(REGION)))
+        .collect();
+
     // (case, region, query, the ARNs the listing must report)
     let rows: Vec<(&str, &str, &str, Vec<String>)> = vec![
         ("type=custom", REGION, "type=custom", here.clone()),
-        ("no type, so the default", REGION, "", Vec::new()),
-        ("type=default", REGION, "type=default", Vec::new()),
+        (
+            "no type, so the default",
+            REGION,
+            "",
+            published.clone(),
+        ),
+        ("type=default", REGION, "type=default", published.clone()),
         (
             "another region, type=custom",
             other_region,
             "type=custom",
             vec![elsewhere.clone()],
+        ),
+        (
+            "another region, type=default",
+            other_region,
+            "type=default",
+            ["anthropic.claude:1", "meta.llama:1"]
+                .iter()
+                .map(|id| format!("{}{id}", arn_prefix(other_region)))
+                .collect(),
         ),
     ];
 

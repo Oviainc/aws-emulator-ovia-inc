@@ -225,9 +225,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the STORE (is a task still owed its terminal status?), never from what this
         // request carries, so two calls of any parameters inside one task's span get the
         // same id back.
-        let running = store
-            .region_mut(&region)
-            .and_then(|portfolio| portfolio.in_progress_report_id(now));
+        // Both of the things this call reads out of the portfolio — the task already
+        // running and the inventory the new task's scope is counted from — are read with
+        // every completion the clock already owed this portfolio materialised first
+        // (`RegionState::settle_all`): owed at this same instant even if nobody had
+        // called, so what the call answers and stores does not depend on whether some
+        // unrelated read happened to materialise them first. A Region nothing was
+        // imported in holds nothing to settle and gets no partition minted for it.
+        let running = store.region_mut(&region).and_then(|portfolio| {
+            portfolio.settle_all(now);
+            portfolio.in_progress_report_id(now)
+        });
         if let Some(running) = running {
             return Ok(StartRecommendationReportGenerationOutput { id: Some(running) });
         }
@@ -269,8 +277,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The report covers the servers the filter names, counted from this Region's
-        // inventory as it stands now. The count is what the task keeps; the filter itself
-        // is not stored.
+        // inventory as it stands now — the inventory every completion the clock already
+        // owed has been materialised over above, so a server an import whose completion
+        // was already due brought in is counted. The count is what the task keeps; the
+        // filter itself is not stored.
         let servers_covered = store.region(&region).servers_in_groups(&group_id_filter);
 
         let id = store.mint_recommendation_report_id(&region);
