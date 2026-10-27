@@ -57,8 +57,8 @@ fn remove_directory(h: &fixture::Harness, directory_id: &str) {
 const UNAUTHORIZED_MESSAGE: &str =
     "Unauthorized. Please check the request and access policy and try again.";
 
-/// One EC2 instance of the account's seeded fleet (`state::seed_account_instances`), so a
-/// request can be AUTHORIZED; every other instance id below is deliberately not in it.
+/// One EC2 instance of this service's own fleet seam (`state::seed_account_instances`), so a
+/// request can be AUTHORIZED; no instance of the account has any other id used below.
 const AUTHORIZED_INSTANCE: &str = "i-0f1e2d3c4b5a69788";
 
 /// The status this service reports a refusal it answers with a non-modelled code with
