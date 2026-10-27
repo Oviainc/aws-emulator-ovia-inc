@@ -228,12 +228,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // documents no meaning for) gets `DEFAULT_PAGE_SIZE` plus a `nextToken` to walk the
         // rest, rather than the whole store serialised into one response.
         // `tests/all/enrollment_and_preferences.rs` pins both.
-        let page_size = input
-            .max_results
-            .and_then(|requested| usize::try_from(requested).ok())
-            .filter(|requested| *requested > 0)
-            .unwrap_or(crate::state::DEFAULT_PAGE_SIZE)
-            .min(crate::state::MAX_PAGE_SIZE);
+        let page_size = crate::state::page_size(
+            input.max_results,
+            crate::state::DEFAULT_PAGE_SIZE,
+            crate::state::MAX_PAGE_SIZE,
+        );
         // A scope, when supplied, selects exactly the record written at that scope.
         let only_scope = input
             .scope
