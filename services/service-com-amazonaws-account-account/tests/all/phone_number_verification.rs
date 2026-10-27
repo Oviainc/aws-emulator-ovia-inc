@@ -164,11 +164,15 @@ impl Answer {
 
 /// A `ContactInformation` carrying the modelled required members, with
 /// `PhoneNumber` set to `phone_number`.
+///
+/// `StateOrRegion` is present because that member's own documentation requires
+/// it in the United States, the country these rows name.
 fn contact_with(phone_number: &str) -> Value {
     json!({
         "FullName": "Ada Lovelace",
         "AddressLine1": "410 Terry Ave N",
         "City": "Seattle",
+        "StateOrRegion": "WA",
         "PostalCode": "98109",
         "CountryCode": "US",
         "PhoneNumber": phone_number,

@@ -167,6 +167,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::not_implemented("ListStacks"));
         };
 
+        // A resource of a stack of this Region whose owning service had not reported it
+        // ready when the create answered holds that stack's operation open, so the summary
+        // status it reports is still `*_IN_PROGRESS`: those services are asked, before the
+        // store is locked, what they report now
+        // ([`crate::state::provisioning::advance_stabilisations`]).
+        crate::state::provisioning::advance_stabilisations(ctx, &state).await;
         // The summary status a stack rolling back reports is the one that rollback reaches:
         // a rollback the failure of an update already made due is carried out here, before
         // the summaries are read, since it was owed at the instant that update failed

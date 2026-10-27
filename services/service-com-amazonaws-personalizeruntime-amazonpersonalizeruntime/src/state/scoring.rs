@@ -138,13 +138,20 @@ pub fn normalize_by<T>(candidates: &mut [T], score: impl Fn(&mut T) -> &mut f64)
     }
 }
 
-/// Order two scored entries the way every one of these operations reports them:
-/// by score descending, then by id ascending so that equal scores still produce ONE
-/// stable order for an idempotent call.
-pub fn by_score_desc(left: (&str, f64), right: (&str, f64)) -> std::cmp::Ordering {
+/// Order two scored entries the way every one of these operations reports them: by
+/// score descending, with a pair whose scores do not compare (a non-numeric score)
+/// treated as equal.
+///
+/// Each entry is `(tie-break key, score)`. The score half is the rule all three
+/// operations share and lives only here; the key is the caller's, because a tied pair
+/// still has to produce ONE stable order for an idempotent call and each operation
+/// states which key settles it — the entry's own id where the operation chooses the
+/// list, the caller's list position where it re-ranks a list the caller sent. The key
+/// is compared ascending.
+pub fn by_score_desc<Key: Ord>(left: (Key, f64), right: (Key, f64)) -> std::cmp::Ordering {
     right
         .1
         .partial_cmp(&left.1)
         .unwrap_or(std::cmp::Ordering::Equal)
-        .then_with(|| left.0.cmp(right.0))
+        .then_with(|| left.0.cmp(&right.0))
 }

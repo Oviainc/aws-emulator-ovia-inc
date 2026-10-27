@@ -331,6 +331,22 @@ pub const MAX_CLIENT_TOKENS: usize = MAX_DATASTORES;
 /// lives.
 pub const MAX_FHIR_RESOURCES_PER_DATASTORE: usize = 500;
 
+/// The most versions of ONE FHIR resource the data plane retains at once,
+/// counting the version a read answers.
+///
+/// The update interaction supersedes the version a read answers, and the
+/// superseded version is RETAINED beside it, so a point-in-time restore can
+/// still reproduce the resource as it stood before that write. A ceiling, not a
+/// claim about any AWS quota: it exists so a loop of updates against one logical
+/// id cannot grow the emulator's heap without bound, and the retained bytes are
+/// charged against the same budgets a create is charged against
+/// ([`MAX_FHIR_RESOURCE_BYTES_PER_DATASTORE`] and
+/// [`MAX_FHIR_RESOURCE_BYTES_TOTAL`]). Past it the OLDEST retained version is
+/// dropped, so a restore point older than every version a data store still
+/// holds for a resource reproduces none of them — the same answer as a restore
+/// point before that resource was created.
+pub const MAX_FHIR_RESOURCE_VERSIONS: usize = 10;
+
 /// The largest single FHIR resource the data plane stores.
 ///
 /// A count ceiling alone does not bound the retained HEAP: the bytes held would
@@ -570,13 +586,15 @@ pub struct Datastore {
     /// Bounded by [`MAX_FHIR_RESOURCES_PER_DATASTORE`].
     pub fhir_resources: BTreeMap<(String, String), FhirResource>,
     /// How many BYTES the resources above hold together — the sum of their own
-    /// [`FhirResource::bytes`], maintained as they are stored so the data plane
-    /// can refuse past [`MAX_FHIR_RESOURCE_BYTES_PER_DATASTORE`] without
-    /// re-measuring every stored resource.
+    /// [`FhirResource::retained_bytes`], so every version a resource retains is
+    /// counted, maintained as they are stored so the data plane can refuse past
+    /// [`MAX_FHIR_RESOURCE_BYTES_PER_DATASTORE`] without re-measuring every
+    /// stored resource.
     pub fhir_resource_bytes: usize,
 }
 
-/// One FHIR resource a data store holds, as the FHIR REST data plane stored it.
+/// One FHIR resource a data store holds, as the FHIR REST data plane stored it:
+/// the version a read answers, plus the versions earlier writes left behind.
 ///
 /// The resource is kept as the JSON a read answers VERBATIM, so two reads of one
 /// resource cannot differ and no read re-derives a server-owned value.
@@ -599,6 +617,141 @@ pub struct FhirResource {
     /// store, so a later delete can give the budget back exactly what the
     /// create took.
     pub bytes: usize,
+    /// The versions a later write SUPERSEDED, oldest first, each exactly as it
+    /// was stored — never the version above, which is the one a read answers.
+    ///
+    /// Retained rather than discarded because a write only ends the span a
+    /// version was current for: a reader asking what this resource was at an
+    /// earlier instant (the point-in-time restore
+    /// [`Datastore::fhir_resources_as_of`] performs) is answered from here.
+    /// Bounded by [`MAX_FHIR_RESOURCE_VERSIONS`], and by the retention budgets
+    /// the bytes held here are charged against, both of which drop the OLDEST
+    /// versions first.
+    pub superseded: Vec<FhirResourceVersion>,
+}
+
+/// One version of a FHIR resource a later write superseded: everything that
+/// version of the resource was, kept so an earlier instant can be answered for.
+///
+/// Carries no `resourceType` or logical id of its own: those identify the
+/// RESOURCE, which is [`FhirResource`], and every version of it shares them.
+#[derive(Debug, Clone)]
+pub struct FhirResourceVersion {
+    /// `meta.versionId` of this version.
+    pub version: u64,
+    /// `meta.lastUpdated`: the instant this version was written, so it is the
+    /// version a read as of any instant from here until the next write answers.
+    pub last_updated: ::aws_smithy_types::DateTime,
+    /// The stored resource JSON of this version, verbatim.
+    pub content: ::serde_json::Value,
+    /// How many bytes that JSON serializes to, so retaining it is charged — and
+    /// dropping it refunded — exactly what it costs.
+    pub bytes: usize,
+}
+
+impl FhirResource {
+    /// The bytes this resource costs its data store: the version a read answers
+    /// plus every superseded version retained beside it.
+    pub fn retained_bytes(&self) -> usize {
+        self.superseded
+            .iter()
+            .fold(self.bytes, |total, version| {
+                total.saturating_add(version.bytes)
+            })
+    }
+
+    /// How many of the versions this resource would retain after a further
+    /// write must be DROPPED to keep [`MAX_FHIR_RESOURCE_VERSIONS`], counted
+    /// from the oldest.
+    ///
+    /// The floor on what a write drops; the data plane drops more when its
+    /// retention budgets cannot hold what is left.
+    pub fn forced_drops_on_supersede(&self) -> usize {
+        // One more version is about to be held: the current one moves into the
+        // history and the new one takes its place, so the history would hold
+        // `len() + 1` beside it.
+        self.superseded
+            .len()
+            .saturating_add(2)
+            .saturating_sub(MAX_FHIR_RESOURCE_VERSIONS)
+    }
+
+    /// The most versions a further write can drop: every version it would
+    /// retain, which leaves the new version standing alone.
+    pub fn max_drops_on_supersede(&self) -> usize {
+        self.superseded.len().saturating_add(1)
+    }
+
+    /// How many bytes a further write RELEASES when it drops the `drop` oldest
+    /// of the versions it would otherwise retain.
+    ///
+    /// Stated separately from [`Self::supersede_dropping`] so the data plane can
+    /// charge its retention budgets BEFORE it writes, the way it already does
+    /// for the bytes a write adds.
+    pub fn release_dropping(&self, drop: usize) -> usize {
+        // The versions this resource would retain, oldest first: its history,
+        // and then the version this write supersedes.
+        self.superseded
+            .iter()
+            .map(|version| version.bytes)
+            .chain(::std::iter::once(self.bytes))
+            .take(drop)
+            .fold(0usize, usize::saturating_add)
+    }
+
+    /// Supersede the version a read answers with `next`, keeping the version it
+    /// replaces in this resource's history and dropping the `drop` oldest
+    /// versions retained there, and report the bytes those dropped versions
+    /// released.
+    pub fn supersede_dropping(&mut self, next: FhirResourceVersion, drop: usize) -> usize {
+        self.superseded.push(FhirResourceVersion {
+            version: self.version,
+            last_updated: self.last_updated,
+            content: ::std::mem::replace(&mut self.content, next.content),
+            bytes: self.bytes,
+        });
+        self.version = next.version;
+        self.last_updated = next.last_updated;
+        self.bytes = next.bytes;
+        self.superseded
+            .drain(..drop.min(self.superseded.len()))
+            .fold(0usize, |total, version| {
+                total.saturating_add(version.bytes)
+            })
+    }
+
+    /// This resource as it stood at `at`: the newest version written at or
+    /// before that instant, carrying the versions written before it, or `None`
+    /// when this data store holds no version of it from then.
+    ///
+    /// A version is current from the instant it was written until the next write
+    /// supersedes it, so the newest version at or before `at` IS what a read at
+    /// `at` would have answered. Nothing is reconstructed: a version is copied
+    /// exactly as it was stored, or the resource is left out.
+    pub fn as_of(&self, at: &::aws_smithy_types::DateTime) -> Option<Self> {
+        let cutoff = epoch_nanos(at);
+        // The version a read answers now is the newest of all, so when it is
+        // itself at or before the cutoff every retained version is too.
+        if epoch_nanos(&self.last_updated) <= cutoff {
+            return Some(self.clone());
+        }
+        // Otherwise the newest RETAINED version at or before the cutoff, found
+        // from the newest end because the history runs oldest first.
+        let index = self
+            .superseded
+            .iter()
+            .rposition(|version| epoch_nanos(&version.last_updated) <= cutoff)?;
+        let held = &self.superseded[index];
+        Some(Self {
+            resource_type: self.resource_type.clone(),
+            id: self.id.clone(),
+            version: held.version,
+            last_updated: held.last_updated,
+            content: held.content.clone(),
+            bytes: held.bytes,
+            superseded: self.superseded[..index].to_vec(),
+        })
+    }
 }
 
 impl Datastore {
@@ -720,37 +873,28 @@ impl Datastore {
     /// This data store's FHIR resources as they stood at `at`, with the bytes
     /// they hold together.
     ///
-    /// A point-in-time restore reproduces the data store as of one instant, so a
-    /// resource whose last write came AFTER that instant was not in the data
-    /// store in that form then and is not in the restored one. Nothing is
-    /// reconstructed: a resource is copied exactly as this service holds it, or
-    /// not at all.
-    ///
-    /// KNOWN LIMITATION, and the reason this is a `<=` filter rather than a
-    /// version walk: [`FhirResource`] holds ONE version — the FHIR update
-    /// interaction rewrites it in place and keeps no history — so a resource
-    /// created before `at` and updated after it has no version this service can
-    /// answer for `at`. It is left out rather than copied at the version it
-    /// reached later, because that content did not exist at `at` and a restore
-    /// must not invent it. Whoever gives [`FhirResource`] a version history
-    /// (charging the retained bytes the way the create and update paths already
-    /// charge [`MAX_FHIR_RESOURCE_BYTES_PER_DATASTORE`]) should make this pick
-    /// the newest version at or before `at` instead, which is exactly what the
-    /// real point-in-time restore does.
+    /// A point-in-time restore reproduces the data store as of one instant, so
+    /// each resource is taken at the newest version written at or before that
+    /// instant — the version a read at that instant would have answered, which
+    /// for a resource written once is that one version and for an updated one is
+    /// the version the update superseded — and a resource this data store holds
+    /// no version of from then (it was created later, or every version it still
+    /// retains postdates the instant) is left out. Nothing is reconstructed: a
+    /// version is copied exactly as it was stored, or not at all.
     pub fn fhir_resources_as_of(
         &self,
         at: &::aws_smithy_types::DateTime,
     ) -> (BTreeMap<(String, String), FhirResource>, usize) {
-        let cutoff = epoch_nanos(at);
         let resources: BTreeMap<(String, String), FhirResource> = self
             .fhir_resources
             .iter()
-            .filter(|(_, resource)| epoch_nanos(&resource.last_updated) <= cutoff)
-            .map(|(key, resource)| (key.clone(), resource.clone()))
+            .filter_map(|(key, resource)| {
+                resource.as_of(at).map(|held| (key.clone(), held))
+            })
             .collect();
-        let bytes = resources
-            .values()
-            .fold(0usize, |total, resource| total.saturating_add(resource.bytes));
+        let bytes = resources.values().fold(0usize, |total, resource| {
+            total.saturating_add(resource.retained_bytes())
+        });
         (resources, bytes)
     }
 

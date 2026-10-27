@@ -17,6 +17,8 @@ mod account_plan_window;
 mod activity_language_code;
 #[path = "all/date_time_wire_form.rs"]
 mod date_time_wire_form;
+#[path = "all/dimension_decode.rs"]
+mod dimension_decode;
 #[path = "all/free_tier.rs"]
 mod free_tier;
 #[path = "all/refused_request_media_type.rs"]

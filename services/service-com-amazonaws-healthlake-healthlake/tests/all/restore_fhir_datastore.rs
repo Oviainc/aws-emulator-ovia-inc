@@ -5,10 +5,10 @@
 //! The rules under test, each over a SET of inputs rather than one case:
 //!
 //! 1. a restore mints a NEW data store holding the source data store's FHIR
-//!    resources AS OF the requested restore point — every resource written at or
-//!    before it, none written after it — and leaves the source untouched (a
-//!    resource this service holds no version of as of that instant, because the
-//!    update interaction keeps no history, is left out rather than invented);
+//!    resources AS OF the requested restore point — each resource at the newest
+//!    version written at or before it, and no resource this data store holds no
+//!    version of from then (one created later, or one whose every retained
+//!    version postdates it) — and leaves the source untouched;
 //! 2. every input member that names a property of the restored data store
 //!    replaces that property, and one the request omits is inherited from the
 //!    data store being restored;
@@ -989,8 +989,432 @@ async fn a_restored_datastore_serves_its_own_fhir_endpoint() {
     );
 }
 
+/// Write `resource` to `path` as a FHIR `update` (`PUT [base]/{type}/{id}`) and
+/// return the version it stored, after asserting the status and the version the
+/// write must land on.
+///
+/// `expected_status` is 201 for the write that creates the resource at that id
+/// (FHIR's `update-as-create`) and 200 for one that supersedes a version held
+/// there.
+async fn put_version(
+    service: &HealthLake,
+    path: &str,
+    resource_type: &str,
+    id: &str,
+    resource: &Value,
+    expected_status: u16,
+    expected_version: u64,
+) -> Value {
+    let (status, body, _headers) = service
+        .fhir("PUT", &format!("{path}{resource_type}/{id}"), resource)
+        .await;
+    assert_eq!(
+        status, expected_status,
+        "the update of {resource_type}/{id} must answer {expected_status}, got {status}: {body}"
+    );
+    assert_eq!(
+        body["meta"]["versionId"],
+        json!(expected_version.to_string()),
+        "the update must land on version {expected_version}, got {body}"
+    );
+    body
+}
+
+/// One FHIR resource this suite wrote more than once: how to address it, and the
+/// body each of its versions was stored as, oldest first (index 0 is
+/// `meta.versionId` 1).
+struct Versioned {
+    resource_type: &'static str,
+    id: String,
+    versions: Vec<Value>,
+}
+
+/// One row of the restore-point table: where the restore point falls, and the
+/// index of the version each written resource must be restored at — `None` for
+/// a resource the restored data store must hold no version of.
+struct RestorePointCase {
+    case: &'static str,
+    point: Option<f64>,
+    expected: [Option<usize>; 3],
+}
+
+/// Read `resource` back from the data store serving `path` and assert it is the
+/// version `expected` names — the index of a version in [`Versioned::versions`],
+/// or `None` for a resource that data store must hold no version of.
+async fn assert_restored_version(
+    case: &str,
+    service: &HealthLake,
+    path: &str,
+    resource: &Versioned,
+    expected: Option<usize>,
+) {
+    let (status, body) = read_resource(service, path, resource.resource_type, &resource.id).await;
+    match expected {
+        Some(index) => {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: the restored data store must hold {}/{} at version {}, got \
+                 {status}: {body}",
+                resource.resource_type,
+                resource.id,
+                index + 1
+            );
+            assert_eq!(
+                body, resource.versions[index],
+                "case {case:?}: {}/{} must be restored at the version that was current then \
+                 (version {}), got {body}",
+                resource.resource_type,
+                resource.id,
+                index + 1
+            );
+            assert_eq!(
+                body["meta"]["versionId"],
+                json!((index + 1).to_string()),
+                "case {case:?}: the restored {} must report the version that was current then, \
+                 got {body}",
+                resource.resource_type
+            );
+        }
+        None => {
+            assert_eq!(
+                status, 404,
+                "case {case:?}: the restored data store must hold NO version of {}/{}, got \
+                 {status}: {body}",
+                resource.resource_type, resource.id
+            );
+            assert_eq!(
+                outcome_code(&body),
+                "not-found",
+                "case {case:?}: a resource the restore point reaches no version of reads as \
+                 not-found, got {body}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
-async fn a_resource_whose_only_version_postdates_the_restore_point_is_not_restored() {
+async fn a_restore_reproduces_each_resource_at_the_version_current_at_the_restore_point() {
+    let service = HealthLake::new();
+    let source =
+        active_datastore(&service, &backup_enabled_create("pitr.history", 7, false)).await;
+
+    // Three resources that differ along what the rule generalises over: how many
+    // versions they have (three, one, two), which interaction wrote the first
+    // one (a server-assigned id from a POST, a caller-chosen id from a PUT), the
+    // resource TYPE, and the form of each version's content. An instant is
+    // captured between every pair of writes, so a restore point can fall in each
+    // gap.
+    let before_any_write = epoch_secs();
+    tokio::time::sleep(WRITE_GAP).await;
+
+    let patient = write_resource(
+        &service,
+        &source.path,
+        "Patient",
+        &json!({
+            "resourceType": "Patient",
+            "active": true,
+            "name": [{ "family": "Lovelace", "given": ["Ada"] }],
+        }),
+    )
+    .await;
+    let mut patient_versions = vec![patient.stored.clone()];
+    tokio::time::sleep(WRITE_GAP).await;
+    let after_patient_v1 = epoch_secs();
+    tokio::time::sleep(WRITE_GAP).await;
+
+    let observation = write_resource(
+        &service,
+        &source.path,
+        "Observation",
+        &json!({
+            "resourceType": "Observation",
+            "status": "final",
+            "valueQuantity": { "value": 36.6, "unit": "C" },
+        }),
+    )
+    .await;
+    tokio::time::sleep(WRITE_GAP).await;
+    let after_observation = epoch_secs();
+    tokio::time::sleep(WRITE_GAP).await;
+
+    patient_versions.push(
+        put_version(
+            &service,
+            &source.path,
+            "Patient",
+            &patient.id,
+            &json!({ "resourceType": "Patient", "id": patient.id, "active": false }),
+            200,
+            2,
+        )
+        .await,
+    );
+    tokio::time::sleep(WRITE_GAP).await;
+    let after_patient_v2 = epoch_secs();
+    tokio::time::sleep(WRITE_GAP).await;
+
+    // A caller-chosen id, written first by the update interaction itself.
+    let practitioner_id = "pitr.history-practitioner".to_string();
+    let mut practitioner_versions = vec![
+        put_version(
+            &service,
+            &source.path,
+            "Practitioner",
+            &practitioner_id,
+            &json!({
+                "resourceType": "Practitioner",
+                "id": practitioner_id,
+                "active": true,
+            }),
+            201,
+            1,
+        )
+        .await,
+    ];
+    tokio::time::sleep(WRITE_GAP).await;
+    let after_practitioner_v1 = epoch_secs();
+    tokio::time::sleep(WRITE_GAP).await;
+
+    patient_versions.push(
+        put_version(
+            &service,
+            &source.path,
+            "Patient",
+            &patient.id,
+            &json!({
+                "resourceType": "Patient",
+                "id": patient.id,
+                "active": true,
+                "telecom": [{ "system": "email", "value": "ada@example.test" }],
+            }),
+            200,
+            3,
+        )
+        .await,
+    );
+    tokio::time::sleep(WRITE_GAP).await;
+    let after_patient_v3 = epoch_secs();
+    tokio::time::sleep(WRITE_GAP).await;
+
+    practitioner_versions.push(
+        put_version(
+            &service,
+            &source.path,
+            "Practitioner",
+            &practitioner_id,
+            &json!({
+                "resourceType": "Practitioner",
+                "id": practitioner_id,
+                "active": false,
+                "qualification": [{ "code": { "text": "MD" } }],
+            }),
+            200,
+            2,
+        )
+        .await,
+    );
+    tokio::time::sleep(WRITE_GAP).await;
+    let after_every_write = epoch_secs();
+
+    let written = [
+        Versioned {
+            resource_type: "Patient",
+            id: patient.id.clone(),
+            versions: patient_versions,
+        },
+        Versioned {
+            resource_type: "Observation",
+            id: observation.id.clone(),
+            versions: vec![observation.stored.clone()],
+        },
+        Versioned {
+            resource_type: "Practitioner",
+            id: practitioner_id.clone(),
+            versions: practitioner_versions,
+        },
+    ];
+
+    // The rule generalises over WHERE the restore point falls among the writes,
+    // so the rows walk it across every gap — and over a request naming no point
+    // at all, which restores to the latest instant the backup covers. Each row
+    // names, per resource, the index of the version that was current then.
+    let cases = vec![
+        RestorePointCase {
+            case: "before any resource was written",
+            point: Some(before_any_write),
+            expected: [None, None, None],
+        },
+        RestorePointCase {
+            case: "after the Patient's first version only",
+            point: Some(after_patient_v1),
+            expected: [Some(0), None, None],
+        },
+        RestorePointCase {
+            case: "after the Observation, which is never updated",
+            point: Some(after_observation),
+            expected: [Some(0), Some(0), None],
+        },
+        RestorePointCase {
+            case: "after the Patient's second version",
+            point: Some(after_patient_v2),
+            expected: [Some(1), Some(0), None],
+        },
+        RestorePointCase {
+            case: "after the Practitioner was created at a caller-chosen id",
+            point: Some(after_practitioner_v1),
+            expected: [Some(1), Some(0), Some(0)],
+        },
+        RestorePointCase {
+            case: "after the Patient's third version",
+            point: Some(after_patient_v3),
+            expected: [Some(2), Some(0), Some(0)],
+        },
+        RestorePointCase {
+            case: "after every write",
+            point: Some(after_every_write),
+            expected: [Some(2), Some(0), Some(1)],
+        },
+        RestorePointCase {
+            case: "no restore point, i.e. the latest the backup covers",
+            point: None,
+            expected: [Some(2), Some(0), Some(1)],
+        },
+    ];
+
+    for RestorePointCase {
+        case,
+        point,
+        expected,
+    } in cases
+    {
+        let restored = ok(
+            &service,
+            "RestoreFHIRDatastore",
+            &restore_request(&source.id, point),
+        )
+        .await;
+        assert_restored_identifiers(case, &restored, &source);
+        let restored_path = endpoint_path(&string_at(&restored, "DatastoreEndpoint"));
+        tokio::time::sleep(PAST_TRANSITION).await;
+
+        for (resource, expected) in written.iter().zip(expected) {
+            assert_restored_version(case, &service, &restored_path, resource, expected).await;
+        }
+
+        // The source is REPORTED from, never written to: every resource it holds
+        // is still readable there at its newest version after the restore.
+        for resource in &written {
+            let newest = Some(resource.versions.len() - 1);
+            assert_restored_version(case, &service, &source.path, resource, newest).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_restore_reaches_the_versions_the_data_plane_still_retains() {
+    // The retained-version ceiling is this emulator's own
+    // (`crate::state::MAX_FHIR_RESOURCE_VERSIONS`): a resource keeps that many
+    // versions, and a write past it drops the OLDEST. So a restore point reaches
+    // every version still retained, and a resource whose version from that
+    // instant has been dropped is not restored — the same answer as a restore
+    // point before it existed.
+    let retained = service_com_amazonaws_healthlake_healthlake::state::MAX_FHIR_RESOURCE_VERSIONS;
+    let service = HealthLake::new();
+    let source =
+        active_datastore(&service, &backup_enabled_create("pitr.ceiling", 7, false)).await;
+
+    let patient = write_resource(
+        &service,
+        &source.path,
+        "Patient",
+        &json!({ "resourceType": "Patient", "active": true }),
+    )
+    .await;
+    let mut versions = vec![patient.stored.clone()];
+    // An instant after each version was written, so a restore point can name the
+    // span every single version was current for.
+    tokio::time::sleep(WRITE_GAP).await;
+    let mut after_version = vec![epoch_secs()];
+
+    // One write past the ceiling, so exactly the oldest version is dropped.
+    for write in 2..=(retained + 1) {
+        tokio::time::sleep(WRITE_GAP).await;
+        versions.push(
+            put_version(
+                &service,
+                &source.path,
+                "Patient",
+                &patient.id,
+                &json!({
+                    "resourceType": "Patient",
+                    "id": patient.id,
+                    "active": write % 2 == 0,
+                    "multipleBirthInteger": write,
+                }),
+                200,
+                write as u64,
+            )
+            .await,
+        );
+        tokio::time::sleep(WRITE_GAP).await;
+        after_version.push(epoch_secs());
+    }
+
+    let resource = Versioned {
+        resource_type: "Patient",
+        id: patient.id.clone(),
+        versions,
+    };
+
+    // The rows walk the ceiling: the version just past it (dropped), the oldest
+    // version still retained, one in the middle, and the newest — reached both
+    // by naming its instant and by naming no restore point at all.
+    let cases: Vec<(&str, Option<f64>, Option<usize>)> = vec![
+        (
+            "the span of the one version the ceiling dropped",
+            Some(after_version[0]),
+            None,
+        ),
+        (
+            "the span of the oldest version still retained",
+            Some(after_version[1]),
+            Some(1),
+        ),
+        (
+            "the span of a version in the middle of what is retained",
+            Some(after_version[retained / 2]),
+            Some(retained / 2),
+        ),
+        (
+            "the span of the newest version",
+            Some(after_version[retained]),
+            Some(retained),
+        ),
+        (
+            "no restore point, i.e. the latest the backup covers",
+            None,
+            Some(retained),
+        ),
+    ];
+
+    for (case, point, expected) in cases {
+        let restored = ok(
+            &service,
+            "RestoreFHIRDatastore",
+            &restore_request(&source.id, point),
+        )
+        .await;
+        let restored_path = endpoint_path(&string_at(&restored, "DatastoreEndpoint"));
+        tokio::time::sleep(PAST_TRANSITION).await;
+        assert_restored_version(case, &service, &restored_path, &resource, expected).await;
+    }
+}
+
+#[tokio::test]
+async fn a_restore_before_an_update_carries_the_version_that_update_superseded() {
+    // The reported case: a resource CREATED before the restore point and UPDATED
+    // after it is restored at the version it had at that instant, not dropped.
     let service = HealthLake::new();
     let source =
         active_datastore(&service, &backup_enabled_create("updated.source", 7, false)).await;
@@ -1006,26 +1430,21 @@ async fn a_resource_whose_only_version_postdates_the_restore_point_is_not_restor
     let between = epoch_secs();
     tokio::time::sleep(WRITE_GAP).await;
 
-    // The FHIR update interaction rewrites the resource in place, so after it
-    // the service holds NO version of this resource as of `between`.
-    let (status, updated, _headers) = service
-        .fhir(
-            "PUT",
-            &format!("{}Patient/{}", source.path, patient.id),
-            &json!({ "resourceType": "Patient", "id": patient.id, "active": false }),
-        )
-        .await;
-    assert_eq!(
-        status, 200,
-        "the update of a stored resource answers 200, got {status}: {updated}"
-    );
-    assert_eq!(
-        updated["meta"]["versionId"], "2",
-        "the update lands on the second version, got {updated}"
-    );
+    // The FHIR update interaction supersedes the version a read answers, and the
+    // superseded version stays retained for an earlier instant to be read at.
+    let updated = put_version(
+        &service,
+        &source.path,
+        "Patient",
+        &patient.id,
+        &json!({ "resourceType": "Patient", "id": patient.id, "active": false }),
+        200,
+        2,
+    )
+    .await;
 
-    // Restoring to an instant the service holds no version for leaves the
-    // resource out rather than copying content that did not exist then.
+    // Restoring to an instant between the two writes carries the version that
+    // was current then — version 1, verbatim, not the content the update wrote.
     let before = ok(
         &service,
         "RestoreFHIRDatastore",
@@ -1036,18 +1455,16 @@ async fn a_resource_whose_only_version_postdates_the_restore_point_is_not_restor
     tokio::time::sleep(PAST_TRANSITION).await;
     let (status, body) = read_resource(&service, &before_path, "Patient", &patient.id).await;
     assert_eq!(
-        status, 404,
-        "a resource this service holds no version of as of the restore point is not restored \
-         (it keeps no version history), got {status}: {body}"
+        status, 200,
+        "a resource the source held at the restore point is restored, got {status}: {body}"
     );
     assert_eq!(
-        outcome_code(&body),
-        "not-found",
-        "the restored data store answers for it with the FHIR not-found code, got {body}"
+        body, patient.stored,
+        "the restored resource is the version that was current at the restore point, verbatim, \
+         got {body}"
     );
 
-    // Restoring to an instant AFTER the update carries exactly the version the
-    // service does hold — verbatim, not re-derived.
+    // Restoring to an instant AFTER the update carries the version it wrote.
     let after = ok(
         &service,
         "RestoreFHIRDatastore",
