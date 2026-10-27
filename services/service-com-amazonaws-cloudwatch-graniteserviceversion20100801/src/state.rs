@@ -135,6 +135,31 @@ impl StoredDatum {
             None
         }
     }
+
+    /// The instant this datapoint is AGGREGATED at: the start of the one-minute bucket its own
+    /// time stamp falls in for a datapoint published at REGULAR resolution, and its own time
+    /// stamp for a high-resolution one.
+    ///
+    /// "Setting this to 1 specifies this metric as a high-resolution metric, so that CloudWatch
+    /// stores the metric with sub-minute resolution down to one second. Setting this to 60
+    /// specifies this metric as regular resolution, which CloudWatch stores at 1-minute
+    /// resolution."
+    /// (`smithy_query(query="doc",shape="MetricDatum",member="StorageResolution")`) — a
+    /// regular-resolution datapoint HAS no sub-minute detail stored, so a read that asks for a
+    /// sub-minute period cannot see one: the datapoint is aggregated in the minute it was
+    /// published in, which is why such a read answers with whole-minute instants however short
+    /// its period is. Only a high-resolution datapoint is aggregated at a finer granularity.
+    ///
+    /// The granularity is the datapoint's own declared `StorageResolution`, so one definition
+    /// serves every reader that lays period windows over a series and the alarm evaluation that
+    /// grades them.
+    pub fn aggregated_instant(&self) -> f64 {
+        let resolution = f64::from(self.storage_resolution);
+        if resolution <= 1.0 {
+            return self.timestamp_secs;
+        }
+        (self.timestamp_secs / resolution).floor() * resolution
+    }
 }
 
 /// The basic statistics of a span of ONE series' datapoints.
@@ -362,7 +387,8 @@ pub fn retained_at_period(timestamp_secs: f64, period: i32, now: f64) -> bool {
 /// holding no datapoint is never inserted, so what this allocates is bounded by the
 /// datapoints the series holds in the range rather than by the range the request spans.
 /// A datapoint the retention tier of `period` no longer holds is not in any window
-/// ([`retained_at_period`]).
+/// ([`retained_at_period`]), and which window a datapoint falls in is decided by the instant
+/// its own `StorageResolution` stores it at ([`StoredDatum::aggregated_instant`]).
 ///
 /// The unit is part of the key because it is part of a datapoint's identity: "If you omit
 /// Unit, all data that was collected with any unit is returned, along with the corresponding
@@ -385,17 +411,21 @@ pub fn windows_by_unit<'a>(
     let span = f64::from(period);
     let mut windows: BTreeMap<(i64, Option<&str>), Vec<&StoredDatum>> = BTreeMap::new();
     for datum in data {
-        if datum.timestamp_secs < start || datum.timestamp_secs >= end {
+        // The instant the datapoint is AGGREGATED at, which is the start of its own minute for
+        // one published at regular resolution ([`StoredDatum::aggregated_instant`]): a read sees
+        // a datapoint at the granularity it is stored at, not at a finer one it asks for.
+        let instant = datum.aggregated_instant();
+        if instant < start || instant >= end {
             continue;
         }
         if unit.is_some_and(|unit| datum.unit.as_deref() != Some(unit)) {
             continue;
         }
-        if !retained_at_period(datum.timestamp_secs, period, now) {
+        if !retained_at_period(instant, period, now) {
             continue;
         }
         #[allow(clippy::cast_possible_truncation)]
-        let index = ((datum.timestamp_secs - start) / span).floor() as i64;
+        let index = ((instant - start) / span).floor() as i64;
         windows
             .entry((index, datum.unit.as_deref()))
             .or_default()
@@ -1679,6 +1709,43 @@ pub fn rfc3339(secs: f64) -> Option<String> {
     to_timestamp(secs)
         .fmt(::aws_smithy_types::date_time::Format::DateTime)
         .ok()
+}
+
+/// `secs` as the instant one of this service's JSON DOCUMENTS writes it, or `None` for an
+/// instant the timestamp type cannot render.
+///
+/// Every instant CloudWatch stamps INSIDE one of the JSON documents it reports — an alarm's
+/// `StateReasonData` and the `HistoryData` that records it, and the notification document an
+/// action carries — is written with a three-digit millisecond field and a NUMERIC UTC offset
+/// (`2026-09-22T23:06:00.000+0000`), which is what lets a consumer parse it with one
+/// `yyyy-MM-dd'T'HH:mm:ss.SSSZ` pattern. The fixed parts of the form are the `-`/`T`/`:`
+/// separators, the `.` before the milliseconds and the trailing offset; the variable part is
+/// the instant itself. An instant written with a `Z` suffix, or with no fractional field, is
+/// NOT that form: a client parsing a document with that pattern fails on it instead of
+/// recovering the moment the document is about.
+///
+/// The calendar fields come from the modelled timestamp type's own rendering ([`rfc3339`]) and
+/// are only re-shaped here, so no second date implementation lives in this crate and an instant
+/// a document names is the instant the modelled member beside it reports.
+pub fn document_instant(secs: f64) -> Option<String> {
+    /// How many fractional digits the form carries: milliseconds, written whether or not the
+    /// instant has a fraction.
+    const FRACTION_DIGITS: usize = 3;
+    /// The numeric offset the form ends with — every instant this service reports is UTC.
+    const UTC_OFFSET: &str = "+0000";
+
+    let rendered = rfc3339(secs)?;
+    // The modelled rendering writes the zone as `Z` and carries only as many fractional digits
+    // as the instant needs, so the zone is replaced and the fraction padded (or cut) to the
+    // fixed width of this form.
+    let instant = rendered.strip_suffix('Z').unwrap_or(rendered.as_str());
+    let (whole, fraction) = instant.split_once('.').unwrap_or((instant, ""));
+    let millis: String = fraction
+        .chars()
+        .chain(::std::iter::repeat_n('0', FRACTION_DIGITS))
+        .take(FRACTION_DIGITS)
+        .collect();
+    Some(format!("{whole}.{millis}{UTC_OFFSET}"))
 }
 
 /// Normalise a request's dimension list into the key form: later entries for one name win,
@@ -3375,7 +3442,10 @@ fn composite_state_reason_data(children: &[ChildAlarmState]) -> String {
             insert_member(
                 &mut state,
                 "timestamp",
-                child.transitioned_secs.and_then(rfc3339).map(Value::from),
+                child
+                    .transitioned_secs
+                    .and_then(document_instant)
+                    .map(Value::from),
             );
             let mut entry = Map::new();
             entry.insert("arn".to_string(), Value::from(child.identity()));

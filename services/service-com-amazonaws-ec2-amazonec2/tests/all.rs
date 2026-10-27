@@ -678,3 +678,8 @@ mod transit_gateway_metering_policies;
 // between two Capacity Reservations, what it conserves, and what it refuses.
 #[path = "all/move_capacity_reservation_instances.rs"]
 mod move_capacity_reservation_instances;
+// Appended at the END of this file, for the reason the header gives. The security group VPC
+// association slice: what `AssociateSecurityGroupVpc` writes and refuses, and what
+// `DescribeSecurityGroupVpcAssociations` reports out of that store.
+#[path = "all/security_group_vpc_associations.rs"]
+mod security_group_vpc_associations;

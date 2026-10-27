@@ -33,6 +33,8 @@ mod procurement_portal_preference_reads;
 mod procurement_portal_preference_status;
 #[path = "all/procurement_portal_preferences.rs"]
 mod procurement_portal_preferences;
+#[path = "all/procurement_portal_supplier_page_tokens.rs"]
+mod procurement_portal_supplier_page_tokens;
 #[path = "all/procurement_portal_suppliers.rs"]
 mod procurement_portal_suppliers;
 #[path = "all/procurement_portals.rs"]
