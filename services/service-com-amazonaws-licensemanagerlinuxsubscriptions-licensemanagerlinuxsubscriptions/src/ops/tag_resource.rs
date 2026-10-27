@@ -167,25 +167,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .resource_tags_mut(&input.resource_arn)
             .ok_or_else(TagResourceError::not_found)?;
 
-        // The resultant set is what the resource would carry, so it is the set the tag
-        // bound applies to: count the keys the write would ADD to what is stored.
-        let resultant = tags.len()
-            + input
-                .tags
-                .keys()
-                .filter(|key| !tags.contains_key(*key))
-                .count();
-        if resultant > crate::state::MAX_TAGS_PER_RESOURCE {
-            return Err(TagResourceError::tag_limit_exceeded());
-        }
-
-        // Add or overwrite exactly the keys the request names: a key it does not name
-        // keeps the value it had, which is what makes two writes of different keys
-        // converge on the union of both, and what makes a repeat of the same write (the
-        // operation is `@idempotent`) leave the same set behind.
-        for (key, value) in input.tags {
-            tags.insert(key, value);
-        }
+        // Add or overwrite exactly the keys the request names, under the resultant-set
+        // bound: a key the request does not name keeps the value it had, which is what
+        // makes two writes of different keys converge on the union of both and a repeat
+        // of the same write (the operation is `@idempotent`) leave the same set behind.
+        // The merge and the bound live in `crate::state::merge_tags`, which every tag
+        // write of this service goes through, so a write made here and the one a repeated
+        // registration makes cannot disagree. A refusal stores nothing.
+        crate::state::merge_tags(tags, input.tags)
+            .map_err(|_| TagResourceError::tag_limit_exceeded())?;
 
         Ok(TagResourceOutput::default())
     }
