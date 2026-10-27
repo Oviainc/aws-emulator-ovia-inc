@@ -28,9 +28,10 @@
 //!    `ValidationException`: a `credentialType` other than the one supported type, and a
 //!    `durationInSeconds` outside 1..=12 hours.
 //! 5. `clientToken` is `@idempotencyToken`: the same request replayed answers with the
-//!    SAME session rather than minting a second credential, the same token carrying a
-//!    different request is refused, and a request naming no token mints its own session
-//!    every time.
+//!    SAME session rather than minting a second credential — whichever of the accepted
+//!    identifier forms of rule 2 each call names the pair by, since both forms name one
+//!    stored record — the same token carrying a different request is refused, and a request
+//!    naming no token mints its own session every time.
 //! 6. A session's expiry is owed to the clock: once it has passed, the same token mints a
 //!    fresh session instead of handing back an expired one.
 //! 7. Issuing a session is not a write to the endpoint: however many are issued, every
@@ -610,6 +611,135 @@ async fn a_replayed_client_token_names_the_session_the_first_call_issued() {
             "case {case:?}: a request carrying no clientToken must mint its own session"
         );
     }
+}
+
+/// RULE 5, over the FORM each identifier takes: a replay is decided by the resources the
+/// request names, not by the spelling it names them with. Each identifier is accepted as
+/// the resource's own id or as its full ARN (RULE 2), both naming one stored record, so a
+/// call that replays a spent `clientToken` through the OTHER accepted form is the same
+/// request and answers the same session.
+#[tokio::test]
+async fn a_replay_naming_the_same_pair_the_other_accepted_way_is_still_a_replay() {
+    let emr = Emr::new();
+    let (cluster, endpoint) = active_endpoint(&emr, "idemform").await;
+    let cluster_arn = state::virtual_cluster_arn(REGION, &cluster);
+    let endpoint_arn = state::managed_endpoint_arn(REGION, &cluster, &endpoint);
+
+    // Every way this one pair can be spelled: each identifier as the resource's
+    // `ResourceIdString` id or as its own ARN.
+    let spellings: Vec<(&str, String, String)> = vec![
+        ("both as ids", cluster.clone(), endpoint.clone()),
+        (
+            "the endpoint as its ARN",
+            cluster.clone(),
+            path_segment(&endpoint_arn),
+        ),
+        (
+            "the cluster as its ARN",
+            path_segment(&cluster_arn),
+            endpoint.clone(),
+        ),
+        (
+            "both as ARNs",
+            path_segment(&cluster_arn),
+            path_segment(&endpoint_arn),
+        ),
+    ];
+    // The rows differ along the request the token stands for as well, so the comparison is
+    // exercised for more than one shape of request.
+    let bodies: Vec<(&str, Value)> = vec![
+        ("the smallest acceptable request", json!({})),
+        (
+            "a request that sizes its session",
+            json!({"durationInSeconds": 1_800}),
+        ),
+        (
+            "a request carrying a log context",
+            json!({"logContext": "idemform-logs"}),
+        ),
+    ];
+
+    for (body_index, (body_case, extra)) in bodies.iter().enumerate() {
+        for (issued_index, (issued_case, issued_cluster, issued_endpoint)) in
+            spellings.iter().enumerate()
+        {
+            for (replay_index, (replay_case, replay_cluster, replay_endpoint)) in
+                spellings.iter().enumerate()
+            {
+                let token = format!("idemform-{body_index}-{issued_index}-{replay_index}");
+                let mut extra = extra.clone();
+                if let Some(members) = extra.as_object_mut() {
+                    members.insert("clientToken".to_string(), json!(token));
+                }
+                let body = request_body(extra);
+                let case = format!(
+                    "{body_case}, issued naming {issued_case} and replayed naming {replay_case}"
+                );
+
+                let first = issue_session(&emr, issued_cluster, issued_endpoint, body.clone()).await;
+                let session = first.ok(&case).clone();
+                let again = issue_session(&emr, replay_cluster, replay_endpoint, body.clone()).await;
+                assert_eq!(
+                    again.ok(&case),
+                    &session,
+                    "case {case:?}: a clientToken replayed on the same pair must answer the session the first call issued, got {:?}",
+                    again.ok(&case)
+                );
+
+                // The other spelling is not a blanket pass: the SAME token naming the pair
+                // that other way while asking for something DIFFERENT is still refused,
+                // and the first session is left replayable.
+                let mut changed = body.clone();
+                if let Some(members) = changed.as_object_mut() {
+                    members.insert("durationInSeconds".to_string(), json!(42));
+                    members.insert(
+                        "executionRoleArn".to_string(),
+                        json!("arn:aws:iam::000000000000:role/OtherStudioRole"),
+                    );
+                }
+                issue_session(&emr, replay_cluster, replay_endpoint, changed)
+                    .await
+                    .refused(&case, 400, "ValidationException");
+                let after_refusal =
+                    issue_session(&emr, replay_cluster, replay_endpoint, body).await;
+                assert_eq!(
+                    after_refusal.ok(&case),
+                    &session,
+                    "case {case:?}: the refused call must have left the first session replayable"
+                );
+            }
+        }
+    }
+
+    // The token is still scoped to the endpoint it was spent on, whichever form named it:
+    // the same token on ANOTHER endpoint mints that endpoint's own session.
+    let (other_cluster, other_endpoint) = active_endpoint(&emr, "idemformtwo").await;
+    let case = "a spent token offered on another endpoint";
+    let body = request_body(json!({"clientToken": "idemform-0-0-0"}));
+    let other = issue_session(
+        &emr,
+        &path_segment(&state::virtual_cluster_arn(REGION, &other_cluster)),
+        &path_segment(&state::managed_endpoint_arn(
+            REGION,
+            &other_cluster,
+            &other_endpoint,
+        )),
+        body,
+    )
+    .await;
+    let other = other.ok(case).clone();
+    let first = issue_session(
+        &emr,
+        &cluster,
+        &endpoint,
+        request_body(json!({"clientToken": "idemform-0-0-0"})),
+    )
+    .await;
+    assert_ne!(
+        text(&other, "/id", case),
+        text(first.ok(case), "/id", case),
+        "case {case:?}: a token spent on one endpoint must not name another endpoint's session: {other}"
+    );
 }
 
 /// RULE 6: a session's expiry is owed to the clock. Once `expiresAt` has passed the record

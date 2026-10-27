@@ -47,6 +47,8 @@ mod custom_line_item_and_create_name_refusals;
 mod custom_line_item_associations_accumulate;
 #[path = "all/custom_line_item_billing_group_scope.rs"]
 mod custom_line_item_billing_group_scope;
+#[path = "all/custom_line_item_creation_billing_period.rs"]
+mod custom_line_item_creation_billing_period;
 #[path = "all/custom_line_item_tag_lifecycle.rs"]
 mod custom_line_item_tag_lifecycle;
 #[path = "all/custom_line_item_versions_by_billing_period.rs"]

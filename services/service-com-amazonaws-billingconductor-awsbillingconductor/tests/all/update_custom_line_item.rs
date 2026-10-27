@@ -221,6 +221,36 @@ async fn fixture(name: &str, create: Value) -> (Emulator, String, String) {
     (emulator, group, item)
 }
 
+/// The `BillingPeriod` `months` after the CURRENT billing period (negative for earlier),
+/// in the zero-padded spelling the modelled `BillingPeriod` pattern
+/// `^\d{4}-(0?[1-9]|1[012])$` allows.
+///
+/// Which period is the current one the wall clock decides, and an item created with no
+/// range applies from the period its create was made in on — so no row here names a fixed
+/// month.
+fn period(months: i64) -> String {
+    let current =
+        service_com_amazonaws_billingconductor_awsbillingconductor::state::current_billing_period();
+    let (year, month) = current
+        .split_once('-')
+        .expect("the current billing period is spelled YYYY-MM");
+    let total = year.parse::<i64>().expect("a four-digit year") * 12
+        + month.parse::<i64>().expect("a month")
+        - 1
+        + months;
+    format!("{:04}-{:02}", total.div_euclid(12), total.rem_euclid(12) + 1)
+}
+
+/// The same billing period with its month spelled without a leading zero — the other
+/// spelling the modelled `BillingPeriod` pattern allows. A month from October on has only
+/// the one spelling, so for those this is the value it was given.
+fn one_digit_month(billing_period: &str) -> String {
+    let (year, month) = billing_period
+        .split_once('-')
+        .expect("a billing period is spelled YYYY-MM");
+    format!("{year}-{}", month.trim_start_matches('0'))
+}
+
 /// One `LineItemFilter`, as the model shapes it
 /// (`smithy_query(query="shape",shape="LineItemFilter")`: `@required Attribute`,
 /// `@required MatchOption`, and the value lists).
@@ -347,7 +377,7 @@ async fn every_member_the_request_carries_replaces_the_stored_one_and_the_rest_i
                     "Flat": { "ChargeValue": 1234.5 },
                     "LineItemFilters": [filter.clone()],
                 },
-                "BillingPeriodRange": { "InclusiveStartBillingPeriod": "2026-1" },
+                "BillingPeriodRange": { "InclusiveStartBillingPeriod": one_digit_month(&period(0)) },
             }),
             "everything",
             "every member at once",
@@ -427,9 +457,11 @@ async fn every_member_the_request_carries_replaces_the_stored_one_and_the_rest_i
         );
 
         // The ROUND TRIP: the same values are what a later read reports, and the
-        // creation time is not rewritten by an update.
+        // creation time is not rewritten by an update. The read names no billing period,
+        // so it asks about the current one — the period the item was created in, and the
+        // one every update above applies in.
         let read = emulator
-            .read_back(case, &item, Some("2026-1"))
+            .read_back(case, &item, None)
             .await
             .unwrap_or_else(|| panic!("case {case:?}: expected {item} to be readable"));
         for member in [
@@ -610,49 +642,55 @@ async fn charge_details_naming_both_kinds_or_the_wrong_one_are_refused_and_chang
 type RangeRow = (
     &'static str,
     Value,
-    Vec<&'static str>,
-    Vec<&'static str>,
-    Vec<&'static str>,
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
 );
 
 /// The billing-period range the request names is the range the NEW version of the item
 /// applies in: a read of a period inside it reports the item with its new values, a read
 /// of a period BEFORE the one the update is applied from still reports the version the
-/// item had there, and a read of a period the update's own range ends before reports no
-/// item at all. A range that covers no billing period at all is refused and changes
-/// nothing.
+/// item had there, and a read of a period the update's own range ends before — or of one
+/// that closed before the item was created at all — reports no item at all. A range that
+/// covers no billing period at all is refused and changes nothing.
 #[tokio::test]
 async fn the_billing_period_range_decides_which_periods_report_the_updated_item() {
     // (case, the range, the periods that must report the updated version, the periods
     // that must still report the version the item had, the periods that must report no
-    // item at all)
+    // item at all). The fixture's item names no range, so it applies from the CURRENT
+    // billing period on and every period here is counted from that one.
     let rows: Vec<RangeRow> = vec![
         (
             "a half-open range of three months",
             json!({
-                "InclusiveStartBillingPeriod": "2026-05",
-                "ExclusiveEndBillingPeriod": "2026-08",
+                "InclusiveStartBillingPeriod": period(1),
+                "ExclusiveEndBillingPeriod": period(4),
             }),
-            vec!["2026-05", "2026-5", "2026-06", "2026-07"],
-            vec!["2026-04", "2025-12", "2019-01"],
-            vec!["2026-08", "2027-01"],
+            vec![
+                period(1),
+                one_digit_month(&period(1)),
+                period(2),
+                period(3),
+            ],
+            vec![period(0)],
+            vec![period(-1), period(4), period(16)],
         ),
         (
             "an open-ended range",
-            json!({ "InclusiveStartBillingPeriod": "2026-10" }),
-            vec!["2026-10", "2026-11", "2030-12"],
-            vec!["2026-09", "2025-10"],
-            vec![],
+            json!({ "InclusiveStartBillingPeriod": period(3) }),
+            vec![period(3), period(4), period(52)],
+            vec![period(0), period(1), period(2)],
+            vec![period(-1), period(-13)],
         ),
         (
             "a one-month range",
             json!({
-                "InclusiveStartBillingPeriod": "2026-1",
-                "ExclusiveEndBillingPeriod": "2026-2",
+                "InclusiveStartBillingPeriod": one_digit_month(&period(1)),
+                "ExclusiveEndBillingPeriod": period(2),
             }),
-            vec!["2026-1", "2026-01"],
-            vec!["2025-12", "2019-07"],
-            vec!["2026-02"],
+            vec![period(1), one_digit_month(&period(1))],
+            vec![period(0)],
+            vec![period(-1), period(2)],
         ),
     ];
 
@@ -668,7 +706,7 @@ async fn the_billing_period_range_decides_which_periods_report_the_updated_item(
 
         for period in updated {
             let read = emulator
-                .read_back(case, &item, Some(period))
+                .read_back(case, &item, Some(&period))
                 .await
                 .unwrap_or_else(|| {
                     panic!("case {case:?}: expected the item to be reported for {period}")
@@ -681,7 +719,7 @@ async fn the_billing_period_range_decides_which_periods_report_the_updated_item(
         }
         for period in kept {
             let read = emulator
-                .read_back(case, &item, Some(period))
+                .read_back(case, &item, Some(&period))
                 .await
                 .unwrap_or_else(|| {
                     panic!(
@@ -696,7 +734,7 @@ async fn the_billing_period_range_decides_which_periods_report_the_updated_item(
             );
         }
         for period in absent {
-            let read = emulator.read_back(case, &item, Some(period)).await;
+            let read = emulator.read_back(case, &item, Some(&period)).await;
             assert!(
                 read.is_none(),
                 "case {case:?}: expected no item for {period}, got {read:?}"
