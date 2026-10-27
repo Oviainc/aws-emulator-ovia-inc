@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemoveAttachmentRoutingPolicyLabel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RemoveAttachmentRoutingPolicyLabel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RemoveAttachmentRoutingPolicyLabel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Takes the routing policy label OFF one attachment of one core network: the attachment
+//! holds no label afterwards, so `ListAttachmentRoutingPolicyAssociations` no longer
+//! reports a routing policy association for it, and the payload answers the label that was
+//! removed beside the two ids it was removed from. A mutating operation addressing two
+//! resources that must already be stored, so it mints nothing. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -157,17 +155,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RemoveAttachmentRoutingPolicyLabel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RemoveAttachmentRoutingPolicyLabelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // request metadata.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RemoveAttachmentRoutingPolicyLabelErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the networkmanager store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+        })?;
+        let mut store = state.lock();
+
+        // Both path ids ADDRESS resources that have to be stored already — this call
+        // unlabels an attachment that exists rather than minting one — so an id naming
+        // nothing stored is the service's not-found refusal, naming whichever of the two the
+        // store does not hold; the core network the request reaches the attachment through
+        // is resolved first (`State::attachment_of_core_network_mut`, shared with the
+        // operation that applies a label, which addresses the same pair of resources).
+        let record = store
+            .attachment_of_core_network_mut(&input.core_network_id, &input.attachment_id)
+            .map_err(RemoveAttachmentRoutingPolicyLabelErrorModeled::ResourceNotFoundException)?;
+
+        // An attachment carries at most ONE routing policy label, so the whole effect of
+        // this call is that the attachment holds none afterwards — whatever lifecycle state
+        // it is in, since a label is carried from the create onwards, including while the
+        // attachment still waits for the acceptance its core network policy asked for.
+        // Nothing else about the attachment changes: the modelled `Attachment` carries no
+        // label member, so a read of the attachment itself answers precisely what it
+        // answered before.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RemoveAttachmentRoutingPolicyLabel"))
+        // The label taken off is what the payload reports, so it is read out of the record
+        // as it is cleared. An attachment that carried NO label has nothing to take off and
+        // the operation models no error for that: its modelled not-found is about the two
+        // resources the path addresses, both of which are stored in that case, and the
+        // output's `RoutingPolicyLabel` is optional — which is how a call that removed no
+        // label reports what it removed. The removal is therefore idempotent: repeating it
+        // answers the same success with that member absent, and the attachment is left
+        // label-free either way.
+        let removed = record.routing_policy_label.take();
+
+        // Answered from the stored record, so the payload cannot report a core network or an
+        // attachment the store does not hold.
+        Ok(RemoveAttachmentRoutingPolicyLabelOutput {
+            core_network_id: Some(record.core_network_id.clone()),
+            attachment_id: Some(record.id.clone()),
+            routing_policy_label: removed,
+        })
     }
 }

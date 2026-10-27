@@ -39,26 +39,26 @@ const PUT_URI: &str = "/routing-policy-label";
 /// The `ListAttachmentRoutingPolicyAssociations` route prefix
 /// (`GET /routing-policy-label/core-network/{CoreNetworkId}`), which is how a stored label
 /// is read back.
-const LIST_PREFIX: &str = "/routing-policy-label/core-network";
+pub(crate) const LIST_PREFIX: &str = "/routing-policy-label/core-network";
 
 /// The upper bound the model puts on a routing policy label: `ConstrainedString`, which
 /// `PutAttachmentRoutingPolicyLabelRequest$RoutingPolicyLabel` targets, is `length 0..256`
 /// (`smithy_query shape=ConstrainedString`).
-const MAX_LABEL_CHARS: usize = 256;
+pub(crate) const MAX_LABEL_CHARS: usize = 256;
 
 /// The ARN resource types a not-found refusal of this call reports, which are this
 /// service's own ARN resource types for the two resources the request addresses.
-const CORE_NETWORK: &str = "core-network";
+pub(crate) const CORE_NETWORK: &str = "core-network";
 /// See [`CORE_NETWORK`].
-const ATTACHMENT: &str = "attachment";
+pub(crate) const ATTACHMENT: &str = "attachment";
 
 /// The state an attachment claimed by a rule asking for acceptance waits in
 /// (`smithy_query shape=AttachmentState`).
-const PENDING_ACCEPTANCE: &str = "PENDING_ATTACHMENT_ACCEPTANCE";
+pub(crate) const PENDING_ACCEPTANCE: &str = "PENDING_ATTACHMENT_ACCEPTANCE";
 
 /// The edge locations the core network of the table configures, so every row sits at one
 /// of them.
-const REGIONS: [&str; 3] = ["us-west-2", "eu-central-1", "ap-southeast-4"];
+pub(crate) const REGIONS: [&str; 3] = ["us-west-2", "eu-central-1", "ap-southeast-4"];
 
 /// A `PutAttachmentRoutingPolicyLabel` request body, carrying `ClientToken` when `token`
 /// names one.
@@ -81,7 +81,7 @@ async fn put(emulator: &Emulator, body: Value) -> (u16, Value) {
 
 /// `PutAttachmentRoutingPolicyLabel`, asserting the call succeeded and that its payload
 /// reports the two ids it addressed and the label it applied.
-async fn put_ok(
+pub(crate) async fn put_ok(
     emulator: &Emulator,
     case: &str,
     core_network: &str,
@@ -118,7 +118,7 @@ async fn put_ok(
 
 /// The label `ListAttachmentRoutingPolicyAssociations` reports for `attachment`, or `None`
 /// when that attachment has no routing policy association at all.
-async fn stored_label(
+pub(crate) async fn stored_label(
     emulator: &Emulator,
     case: &str,
     core_network: &str,
@@ -160,7 +160,7 @@ async fn stored_label(
 /// query="operation"
 /// operation="CreateVpcAttachment,CreateConnectAttachment,CreateSiteToSiteVpnAttachment"`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
+pub(crate) enum Kind {
     Vpc,
     Connect,
     Vpn,
@@ -264,18 +264,18 @@ fn label_cases() -> Vec<LabelCase> {
 
 /// What one attachment to create looks like: how it is named in an assertion, its kind,
 /// the edge location it sits at, and the label its own create carries.
-struct AttachmentSpec<'a> {
-    name: &'a str,
-    kind: Kind,
-    region: &'a str,
-    label: Option<&'a str>,
+pub(crate) struct AttachmentSpec<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) kind: Kind,
+    pub(crate) region: &'a str,
+    pub(crate) label: Option<&'a str>,
 }
 
 /// Create the attachment `spec` describes on `core_network`, answering its minted id.
 ///
 /// `index` keeps each row's VPC / subnet / VPN ARNs distinct, and `transport` is the VPC
 /// attachment a Connect attachment is carried over.
-async fn create_case(
+pub(crate) async fn create_case(
     emulator: &Emulator,
     core_network: &str,
     index: usize,
@@ -335,7 +335,7 @@ async fn create_case(
 /// `base` offsets the ARNs this subject's attachments attach, so two subjects of one
 /// emulator attach different VPCs and VPN connections: a resource is attached by at most
 /// one attachment across every core network.
-async fn seeded(emulator: &Emulator, name: &str, base: usize) -> (String, String) {
+pub(crate) async fn seeded(emulator: &Emulator, name: &str, base: usize) -> (String, String) {
     let (_, core_network) = core_network_at(emulator, name, &REGIONS).await;
     let transport = create_case(
         emulator,
