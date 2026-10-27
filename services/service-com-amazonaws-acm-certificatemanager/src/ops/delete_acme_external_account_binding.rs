@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAcmeExternalAccountBinding
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAcmeExternalAccountBinding`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAcmeExternalAccountBinding::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +154,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAcmeExternalAccountBinding` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAcmeExternalAccountBindingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // No request metadata is needed: the `AcmeExternalAccountBindingArn` the request
+        // names carries the Region, the account and the endpoint the binding was created
+        // under, so the record is found by ARN alone — as in
+        // `DescribeAcmeExternalAccountBinding`.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator (the engine IS the shared store);
+            // this operation models a server fault, so that is the honest answer.
+            return Err(
+                DeleteAcmeExternalAccountBindingErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the acm acme external account binding store is unavailable".into(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The account segment of the ARN is INPUT this operation validates: a caller
+        // addresses only their own account's resources, so an ARN carrying another
+        // account's id names nothing they could delete. Decided before the store is
+        // consulted at all, and reported for the resource type the member's own
+        // `@pattern` fixes.
+        if !crate::state::arn_is_in_caller_account(&input.acme_external_account_binding_arn) {
+            return Err(
+                DeleteAcmeExternalAccountBindingErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::service::cross_account_arn_refusal(
+                            crate::state::ACME_EXTERNAL_ACCOUNT_BINDING_SEGMENT,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // ONE instant answers the whole request: it materialises the transitions the clock
+        // already owes, so the deletion acts on the binding as it stands now.
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.materialize_due(now);
+        // The record goes, and with it the idempotency tokens that resolved to it
+        // ([`crate::state::ComAmazonawsAcmCertificatemanagerState::remove_acme_external_account_binding`]),
+        // so a replayed create mints a fresh binding rather than naming a deleted one.
+        // "A deleted binding cannot be recovered" (`DeleteAcmeExternalAccountBinding`
+        // doc): nothing is kept behind, so the credentials the binding carried are gone
+        // with it and "previously fetched credentials for this binding will no longer be
+        // usable for account registration" — `GetAcmeExternalAccountBindingCredentials`
+        // has no record left to report them from.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAcmeExternalAccountBinding"))
+        // Whether the binding stood revoked does not gate the delete: a revocation
+        // withdrew the authority to register with it, and this call asks for the record
+        // itself to stop existing, so refusing a revoked one would leave a record no call
+        // could remove.
+        //
+        // The ACME accounts already registered through the binding are deliberately left
+        // alone, exactly as a revocation leaves them: each is a resource of its endpoint
+        // that records which binding admitted it, and deleting the binding withdraws only
+        // what further registrations it could still admit.
+        //
+        // An ARN no record answers to leaves the store untouched and is a success: the
+        // binding is already gone, which is the state this `@idempotent` call asks for —
+        // and this operation models no not-found error to report it with.
+        store.remove_acme_external_account_binding(&input.acme_external_account_binding_arn);
+
+        Ok(DeleteAcmeExternalAccountBindingOutput)
     }
 }
