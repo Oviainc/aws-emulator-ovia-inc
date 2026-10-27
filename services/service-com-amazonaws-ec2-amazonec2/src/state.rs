@@ -729,7 +729,8 @@
 //! account does not hold is refused with [`invalid_network_insights_path_id_not_found`]
 //! rather than analyzed. [`ComAmazonawsEc2Amazonec2State::insert_network_insights_path`] is
 //! its one writer, so every member a path reports is derived there rather than by each
-//! caller.
+//! caller, and [`ComAmazonawsEc2Amazonec2State::remove_network_insights_path`] is its one
+//! remover, so the bytes a deleted path held go back to the store's budget with it.
 //!
 //! [`ComAmazonawsEc2Amazonec2State::network_insights_analyses`] holds the analyses started
 //! on those paths, keyed by `NetworkInsightsAnalysisId`, as
@@ -34407,6 +34408,28 @@ pub fn network_insights_path_payload_bytes(spec: &NetworkInsightsPathSpec) -> us
         .saturating_add(STORED_RECORD_OVERHEAD_BYTES)
 }
 
+/// The bytes one STORED path holds, as [`network_insights_path_payload_bytes`] charged them
+/// when it was written: the record's own members read back into the spec they came from, so
+/// a remove gives back exactly what the insert took and the charge lives in ONE formula
+/// rather than two that could drift (the split
+/// [`network_interface_payload_bytes`]/[`network_interface_spec_bytes`] records).
+pub fn network_insights_path_record_bytes(path: &NetworkInsightsPath) -> usize {
+    network_insights_path_payload_bytes(&NetworkInsightsPathSpec {
+        source: path.source.clone(),
+        destination: path.destination.clone(),
+        source_ip: path.source_ip.clone(),
+        destination_ip: path.destination_ip.clone(),
+        protocol: path.protocol.clone(),
+        destination_port: path.destination_port,
+        filter_at_source: path.filter_at_source.clone(),
+        filter_at_destination: path.filter_at_destination.clone(),
+        // The Region a path's ARN names is charged by neither side: the formula counts the
+        // caller-chosen members the record retains, and the record keeps no Region member.
+        region: String::new(),
+        tags: path.tags.clone().unwrap_or_default(),
+    })
+}
+
 /// The caller-chosen bytes one stored path analysis holds: its tags, the client token that
 /// names it and the accounts and ARNs scoping it, on top of the record's own fixed overhead
 /// ([`STORED_RECORD_OVERHEAD_BYTES`]), so an analysis carrying none of them is not free
@@ -34433,6 +34456,22 @@ pub fn invalid_network_insights_path_id_not_found<E>(path_id: &str) -> Scaffolde
         400,
         format!("The network insights path ID '{path_id}' does not exist"),
     )
+}
+
+/// Refuse a path id the operation ACTING on the one path it names cannot resolve: HTTP 400
+/// `InvalidParameterValue`, naming the member that carried it and the value.
+///
+/// Which of the two refusals EC2 answers for an id it cannot resolve is a fact of the
+/// OPERATION rather than of the id — the split
+/// [`invalid_network_insights_access_scope_id_value`] records for the Network Access Scope
+/// surface: the describes and the start answer this resource's own
+/// [`INVALID_NETWORK_INSIGHTS_PATH_ID_NOT_FOUND`], while the operation that acts on the one
+/// path it is given states that the `NetworkInsightsPathId` it was given is not a valid one
+/// — one answer for every id it cannot resolve, whatever its form. This is the ONE place
+/// that second wording lives, so the operation and the suite that asserts it cannot drift
+/// apart.
+pub fn invalid_network_insights_path_id_value<E>(path_id: &str) -> Scaffolded<E> {
+    invalid_parameter_value(format!("NetworkInsightsPathId ({path_id}) is not valid"))
 }
 
 /// Refuse an analysis id a request named that the account holds no analysis under: HTTP 400
@@ -34508,6 +34547,19 @@ impl ComAmazonawsEc2Amazonec2State {
         };
         self.network_insights_paths.insert(path_id.clone(), path);
         Some(path_id)
+    }
+
+    /// Remove the Reachability Analyzer path `path_id` and answer it as it was last
+    /// reported, or `None` when the store holds no path under that id.
+    ///
+    /// The exact reverse of [`Self::insert_network_insights_path`]: the bytes the record held
+    /// go back to the store's budget ([`network_insights_path_record_bytes`]), so a create
+    /// followed by a delete leaves the store exactly where it started. The one way a path
+    /// leaves the store, so no caller can drop the record and keep its charge.
+    pub fn remove_network_insights_path(&mut self, path_id: &str) -> Option<NetworkInsightsPath> {
+        let path = self.network_insights_paths.remove(path_id)?;
+        self.release_stored_bytes(network_insights_path_record_bytes(&path));
+        Some(path)
     }
 
     /// Start one path analysis and answer it as it was stored — or `None` when the store is

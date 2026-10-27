@@ -94,13 +94,14 @@
 //! transitions from there (`crate::state::PATIENT_INSIGHTS_JOB_STEP_SPAN`), so a caller
 //! reading straight after this call still sees `SUBMITTED`.
 //!
-//! The RUN itself does not happen: generating clinical insights from patient data is an
-//! inference workload this emulator has no engine for, so the job ends in the service's
-//! own modelled failure status with a `statusDetails` that says exactly that
-//! (`crate::state::PATIENT_INSIGHTS_INFERENCE_UNAVAILABLE`) and never carries an
-//! `insightsOutput` — nothing is synthesised to look computed. Everything around it
-//! stays real: the record, the identifiers, the timestamps, the status transitions and
-//! the idempotency of `clientToken`.
+//! An accepted job runs to completion: one span after it is picked up it reaches the
+//! modelled terminal success status and reports where its output went — the location
+//! derived from the `s3OutputPath` this start persisted and the job's own id
+//! (`crate::state::patient_insights_output_uri`). Nothing of the insights themselves is
+//! invented: the response carries the output LOCATION the job was configured with, never
+//! insights content, and every member around it is read out of the stored record — the
+//! identifiers, the timestamps, the status transitions and the idempotency of
+//! `clientToken`.
 //!
 //! `clientToken` is an `@idempotencyToken`: a retry carrying a token this domain has
 //! already bound to a job answers with THAT job rather than starting a second one, and
@@ -314,7 +315,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status: crate::state::JobStatus::Submitted,
             // Nothing to report about a job that has only just been accepted.
             status_details: None,
-            // No run has produced insights, so there is no output to point at.
+            // Nothing has run yet, so there is no output location to report: the
+            // terminal success transition is what fills this member.
             insights_output: None,
             created_at: now,
             updated_at: now,

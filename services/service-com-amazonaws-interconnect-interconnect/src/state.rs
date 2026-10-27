@@ -272,8 +272,8 @@ pub struct ComAmazonawsInterconnectInterconnectState {
     /// `DescribeConnectionProposal` / `AcceptConnectionProposal` resolve a
     /// partner-portal key through. One entry per stored connection, dropped with it,
     /// so it is bounded by [`MAX_STORED_RECORDS`] too. The connection the entry names
-    /// is still resolved through [`Self::connection_in`], so a key minted in one
-    /// Region resolves to nothing in another.
+    /// is resolved through [`Self::proposal_in`], so a key whose connection belongs to
+    /// another Region, or has had a `DeleteConnection` made on it, resolves to nothing.
     pub activation_keys: BTreeMap<String, String>,
 }
 
@@ -382,6 +382,25 @@ impl ComAmazonawsInterconnectInterconnectState {
         self.connections
             .get(identifier)
             .filter(|stored| visible_in(stored, region))
+    }
+
+    /// The proposal the partner-portal `activation_key` names in `region` — the only
+    /// connection a request whose sole handle is that key can reach.
+    ///
+    /// Two scopes, both the ones every other resolution here applies. The connection
+    /// the `activationKey` -> connection-id index names is resolved through
+    /// [`Self::connection_in`], so a key minted through another Region's endpoint
+    /// resolves to nothing. And a connection a `DeleteConnection` has been made on
+    /// resolves to nothing either: the record stays readable BY ITS IDENTIFIER so a
+    /// caller polling the delete sees the teardown and then the terminal state, but
+    /// the connectivity the proposal offered is going or gone, so the key names
+    /// nothing left to describe or confirm — the same answer a key that was never
+    /// issued gets.
+    pub fn proposal_in(&self, region: &str, activation_key: &str) -> Option<&StoredConnection> {
+        self.activation_keys
+            .get(activation_key)
+            .and_then(|connection_id| self.connection_in(region, connection_id))
+            .filter(|stored| !is_deleted_or_deleting(&stored.connection.state))
     }
 
     /// [`Self::connection_in`] for the operations that MUTATE the record they
@@ -990,6 +1009,21 @@ pub fn tag_write_violation(
 
 /// The terminal `ConnectionState` a completed `DeleteConnection` settles into.
 pub const DELETED_CONNECTION_STATE: &str = "deleted";
+
+/// The transient `ConnectionState` a `DeleteConnection` hands the connection to the
+/// clock in ("deleting: The connection is being deleted").
+pub const DELETING_CONNECTION_STATE: &str = "deleting";
+
+/// Whether a `DeleteConnection` has been made on a connection in `state`: it is
+/// either being torn down or has been.
+///
+/// Either way "the network connectivity provided by the Connection will cease to
+/// exist", so a handle whose whole subject is that connectivity names nothing from
+/// the moment the delete is called — while the record itself stays readable by its
+/// identifier, which is how a caller polling the delete sees the teardown.
+pub fn is_deleted_or_deleting(state: &str) -> bool {
+    state == DELETING_CONNECTION_STATE || state == DELETED_CONNECTION_STATE
+}
 
 /// Whether `stored` is the live resource `arn` names: the stored ARN matches field
 /// for field, and the connection has not reached the terminal deleted state.

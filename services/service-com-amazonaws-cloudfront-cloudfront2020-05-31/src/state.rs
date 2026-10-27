@@ -73,7 +73,8 @@ use crate::ops::types::{
     ContinuousDeploymentSingleHeaderConfig, ContinuousDeploymentSingleWeightConfig,
     CustomErrorResponse, CustomErrorResponses, CustomOriginConfig,
     Customizations, DefaultCacheBehavior, Distribution, DistributionConfig, DistributionSummary,
-    DistributionTenant, DistributionTenantSummary, DomainResult, EntityAlreadyExists,
+    DistributionTenant, DistributionTenantSummary, DomainConflict, DomainResult,
+    EntityAlreadyExists,
     EntityNotFound, FieldLevelEncryption, FieldLevelEncryptionConfig,
     FieldLevelEncryptionProfile, FieldLevelEncryptionProfileConfig,
     FieldLevelEncryptionProfileSummary, FieldLevelEncryptionSummary,
@@ -2491,6 +2492,25 @@ impl StoredDistributionTenant {
             .map(|certificate| certificate.arn.as_str())
     }
 
+    /// Whether a valid TLS certificate attached to this tenant covers `domain`.
+    ///
+    /// Two certificates can be attached to a distribution tenant: the ACM certificate its
+    /// customizations name — "the Certificate Manager (ACM) certificate" it overrides its
+    /// distribution's with — and the CloudFront managed certificate it requested. A managed
+    /// certificate is this service's OWN record, so both its status and the names it covers
+    /// are read from it ([`StoredManagedCertificate::covers_domain`]): one that is still
+    /// waiting for its domains to be validated secures nothing. A certificate named by ARN
+    /// is a resource of another service, whose covered names this service holds no record
+    /// of, so an attached one is taken at its word for the domain asked about — the same
+    /// reading [`names_custom_certificate`] gives a distribution's viewer certificate.
+    pub fn certificate_covers_domain(&self, domain: &str) -> bool {
+        self.customization_certificate_arn().is_some()
+            || self
+                .managed_certificate
+                .as_ref()
+                .is_some_and(|certificate| certificate.covers_domain(domain))
+    }
+
     /// The ARN of the WAF web ACL this tenant's customizations name, or `None` when its
     /// customizations name none — which includes a customization that DISABLES the web ACL
     /// it inherits, since disabling names no ARN.
@@ -2590,6 +2610,24 @@ impl StoredManagedCertificate {
         if self.status == CERTIFICATE_STATUS_PENDING_VALIDATION && now >= self.issued_due {
             self.status = CERTIFICATE_STATUS_ISSUED.to_string();
         }
+    }
+
+    /// Whether this certificate is one a viewer connection can be served over NOW, and
+    /// covers `domain`.
+    ///
+    /// A certificate secures a domain only once it has been ISSUED: while it is
+    /// [`CERTIFICATE_STATUS_PENDING_VALIDATION`] the domains it was requested for have not
+    /// been validated, so it covers none of them yet. Issued, it covers the names it was
+    /// minted over — one validation token each — and every name a wildcard among them
+    /// covers ([`certificate_covers`]).
+    pub fn covers_domain(&self, domain: &str) -> bool {
+        self.status == CERTIFICATE_STATUS_ISSUED
+            && certificate_covers(
+                self.validation_tokens
+                    .iter()
+                    .map(|token| token.domain.as_str()),
+                domain,
+            )
     }
 
     /// The `ManagedCertificateDetails` projection the certificate surface returns, read
@@ -4299,6 +4337,61 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
                     .iter()
                     .any(|alias| same_domain(alias, domain))
             })
+    }
+
+    /// Every domain association this store holds that conflicts with the domain
+    /// `requested`, as the `DomainConflict` each is reported as.
+    ///
+    /// A conflict is an association of a name that cannot be served beside `requested`:
+    /// the same name, or a wildcard alternate domain name that covers it — or that it
+    /// covers ([`domains_conflict`]). The associations CloudFront's domain surface
+    /// addresses are a standard distribution's alternate domain names and a distribution
+    /// tenant's domains, which is also the pair `DistributionResourceType` admits, so the
+    /// alias of a legacy RTMP distribution is none of them: there is no resource type to
+    /// report one under.
+    ///
+    /// One association is reported ONCE — the conflicts are the SET of (domain, resource)
+    /// associations — and they are ordered by the conflicting domain and then by the id of
+    /// the resource holding it, so the order is a property of the STORE rather than of the
+    /// walk and a resume point into it names the same place on every call.
+    pub fn domain_conflicts(&self, requested: &str) -> Vec<DomainConflict> {
+        let account_id = ::engine::emulator_account_id();
+        let mut conflicts: Vec<DomainConflict> = Vec::new();
+        let mut push = |domain: &str, resource_type: &str, resource_id: &str| {
+            conflicts.push(DomainConflict {
+                domain: domain.to_string(),
+                resource_type: resource_type.to_string(),
+                resource_id: resource_id.to_string(),
+                account_id: account_id.to_string(),
+            });
+        };
+        for distribution in self.distributions.values() {
+            let aliases = distribution
+                .config
+                .aliases
+                .as_ref()
+                .and_then(|aliases| aliases.items.as_deref())
+                .unwrap_or_default();
+            for alias in aliases {
+                if domains_conflict(alias, requested) {
+                    push(
+                        alias,
+                        DISTRIBUTION_RESOURCE_TYPE_DISTRIBUTION,
+                        &distribution.id,
+                    );
+                }
+            }
+        }
+        for tenant in self.distribution_tenants.values() {
+            for domain in &tenant.domains {
+                if domains_conflict(domain, requested) {
+                    push(domain, DISTRIBUTION_RESOURCE_TYPE_TENANT, &tenant.id);
+                }
+            }
+        }
+        conflicts.sort_by_key(conflict_order);
+        conflicts.dedup_by_key(|conflict| conflict_order(conflict));
+        conflicts
     }
 
     /// The CloudFront endpoint the DNS name `name` resolves to, or `None` when this
@@ -6924,6 +7017,76 @@ pub fn domain_name_refusal(domain: &str) -> Option<String> {
     None
 }
 
+/// `DistributionResourceType`'s value for a standard or multi-tenant DISTRIBUTION, as the
+/// model's enum spells it (`crate::ops::types::DISTRIBUTION_RESOURCE_TYPE_VALUES`, which
+/// `smithy_query(query="shape",shape="DistributionResourceType")` reports the same values
+/// for).
+pub const DISTRIBUTION_RESOURCE_TYPE_DISTRIBUTION: &str = "distribution";
+
+/// `DistributionResourceType`'s value for a DISTRIBUTION TENANT — the other value the
+/// model's enum admits beside [`DISTRIBUTION_RESOURCE_TYPE_DISTRIBUTION`].
+pub const DISTRIBUTION_RESOURCE_TYPE_TENANT: &str = "distribution-tenant";
+
+/// The key one reported domain conflict is ordered and deduplicated by: the conflicting
+/// domain, compared as DNS names are, and then the id of the resource holding it.
+///
+/// A domain can be associated with more than one resource in a store this service never
+/// refused the second association to, so the domain alone is no key; the pair is, because
+/// one resource holds one domain once.
+fn conflict_order(conflict: &DomainConflict) -> (String, String) {
+    (
+        conflict.domain.to_lowercase(),
+        conflict.resource_id.clone(),
+    )
+}
+
+/// Whether the alternate domain name `pattern` is a WILDCARD name that covers `name`.
+///
+/// A CloudFront wildcard alternate domain name replaces the whole leftmost label of a
+/// name: "if you provide `*.example.com` as input, the returned list can include ... any
+/// alternate domain names covered by that wildcard (for example, `www.example.com`,
+/// `test.example.com`, `dev.example.com`, and so on)". So a wildcard covers exactly the
+/// names that carry ONE label in place of the `*`, a name that is not a wildcard covers
+/// nothing but itself, and a wildcard does not cover another wildcard. The suffix is
+/// compared as DNS names are ([`same_domain`]).
+pub fn wildcard_covers(pattern: &str, name: &str) -> bool {
+    let Some(suffix) = pattern.strip_prefix("*.") else {
+        return false;
+    };
+    let Some((label, rest)) = name.split_once('.') else {
+        return false;
+    };
+    !label.is_empty() && label != "*" && same_domain(rest, suffix)
+}
+
+/// Whether the domain association `held` conflicts with the domain `requested`.
+///
+/// "Lists existing domain associations that conflict with the domain that you specify":
+/// two names conflict when CloudFront cannot route them separately — they are the same
+/// name, or one of them is a wildcard alternate domain name that covers the other, which
+/// is why the relation is symmetric. ONE rule for every surface that reports or refuses an
+/// overlapping domain.
+pub fn domains_conflict(held: &str, requested: &str) -> bool {
+    same_domain(held, requested)
+        || wildcard_covers(held, requested)
+        || wildcard_covers(requested, held)
+}
+
+/// Whether a certificate that covers the names in `covered` covers `domain`.
+///
+/// A certificate covers the names it was issued over, and a wildcard name among them
+/// covers every name under it ([`wildcard_covers`]) — the direction is what separates this
+/// from [`domains_conflict`]: a certificate for one name does not cover the wildcard that
+/// covers that name.
+pub fn certificate_covers<'a, I>(covered: I, domain: &str) -> bool
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    covered
+        .into_iter()
+        .any(|name| same_domain(name, domain) || wildcard_covers(name, domain))
+}
+
 /// Why `customizations` is no set of customizations a distribution tenant can carry, or
 /// `None` when it is one.
 ///
@@ -8045,16 +8208,7 @@ pub fn alias_certificate_mismatch(config: &DistributionConfig) -> Option<String>
         return None;
     }
     let certificate = config.viewer_certificate.as_ref();
-    // An empty string names no certificate: the member is "left empty" exactly as the
-    // default-certificate wording asks for.
-    let named = |value: Option<&String>| {
-        value
-            .map(String::as_str)
-            .filter(|value| !value.is_empty())
-            .is_some()
-    };
-    let acm = named(certificate.and_then(|certificate| certificate.acm_certificate_arn.as_ref()));
-    let iam = named(certificate.and_then(|certificate| certificate.iam_certificate_id.as_ref()));
+    let (acm, iam) = custom_certificate_members(certificate);
     let default = certificate
         .is_none_or(|certificate| certificate.cloud_front_default_certificate == Some(true));
     let aliases = aliases.join(", ");
@@ -8079,6 +8233,38 @@ pub fn alias_certificate_mismatch(config: &DistributionConfig) -> Option<String>
         )),
         _ => None,
     }
+}
+
+/// Which of the two CUSTOM certificate members a `ViewerCertificate` names: the ACM
+/// certificate ARN and the IAM certificate id, in that order.
+///
+/// An empty member names no certificate: it is "left empty" exactly as the
+/// default-certificate wording asks for. ONE reading of the pair, so the rule that binds a
+/// distribution's aliases to its certificate ([`alias_certificate_mismatch`]) and the
+/// question of whether a distribution carries a custom certificate at all
+/// ([`names_custom_certificate`]) cannot disagree about one configuration.
+fn custom_certificate_members(certificate: Option<&ViewerCertificate>) -> (bool, bool) {
+    let named = |value: Option<&String>| value.is_some_and(|value| !value.is_empty());
+    (
+        named(certificate.and_then(|certificate| certificate.acm_certificate_arn.as_ref())),
+        named(certificate.and_then(|certificate| certificate.iam_certificate_id.as_ref())),
+    )
+}
+
+/// Whether `certificate` names a CUSTOM certificate — one kept in ACM or in IAM — rather
+/// than CloudFront's own default certificate.
+///
+/// `ViewerCertificate` is the certificate a distribution serves its viewers over, and a
+/// custom one is what "validates the authorization to serve the domain name": CloudFront's
+/// own default certificate "serves only the distribution's own CloudFront domain name", so
+/// it covers no alternate domain name at all. Which names a certificate kept in ACM or IAM
+/// covers is no record of this service's, so a custom one counts for the domain asked
+/// about and the default certificate for none — the same reading
+/// [`StoredDistributionTenant::certificate_covers_domain`] gives a tenant's certificate
+/// ARN.
+pub fn names_custom_certificate(certificate: Option<&ViewerCertificate>) -> bool {
+    let (acm, iam) = custom_certificate_members(certificate);
+    acm || iam
 }
 
 /// A count in a submitted configuration that exceeds what this service stores, and the
