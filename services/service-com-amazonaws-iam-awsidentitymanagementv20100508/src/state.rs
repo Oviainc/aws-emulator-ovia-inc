@@ -489,6 +489,15 @@ pub const MARKER_SCOPE_ROLE_ATTACHED_POLICIES: &str = "role-attached-policies";
 /// see [`user_attached_policies_marker_scope`].
 pub const MARKER_SCOPE_USER_ATTACHED_POLICIES: &str = "user-attached-policies";
 
+/// The marker scope of ONE group's attached managed policies, which
+/// `ListAttachedGroupPolicies` pages over. It is its OWN scope, with the group's
+/// key following it, exactly as the user's and role's attachment scopes carry
+/// theirs, so a marker issued while paging one group's attachments names no
+/// position in another group's — nor in any user's or role's attachment order, nor
+/// among that group's EMBEDDED inline policies:
+/// see [`group_attached_policies_marker_scope`].
+pub const MARKER_SCOPE_GROUP_ATTACHED_POLICIES: &str = "group-attached-policies";
+
 /// The marker scope of ONE role's EMBEDDED inline policies, which
 /// `ListRolePolicies` pages over. The role's key follows it, exactly as it does
 /// for the attachment set, so a marker issued while paging one role's inline
@@ -1142,7 +1151,8 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// -> the attached policies' ARNs. Keyed and ordered exactly as
     /// [`Self::role_attached_policies`] is, and for the same reasons: a policy is
     /// attached to a group at most once, and the total ARN order is what lets a
-    /// reader of the set page over it. `AttachGroupPolicy` is what fills it.
+    /// reader of the set page over it. `AttachGroupPolicy` is what fills it, and
+    /// `ListAttachedGroupPolicies` is what pages over it.
     pub group_attached_policies: BTreeMap<String, BTreeSet<String>>,
     /// The persisted IAM OpenID Connect (OIDC) identity providers, keyed by their
     /// ARN — the handle every operation on one takes, and the value
@@ -2303,6 +2313,12 @@ pub fn group_members_marker_scope(group_key: &str) -> String {
 /// The marker scope of the attachment set of the user keyed by `user_key`.
 pub fn user_attached_policies_marker_scope(user_key: &str) -> String {
     format!("{MARKER_SCOPE_USER_ATTACHED_POLICIES}:{user_key}")
+}
+
+/// The marker scope of the attachment set of the group keyed by `group_key`.
+/// See [`MARKER_SCOPE_GROUP_ATTACHED_POLICIES`].
+pub fn group_attached_policies_marker_scope(group_key: &str) -> String {
+    format!("{MARKER_SCOPE_GROUP_ATTACHED_POLICIES}:{group_key}")
 }
 
 /// The marker scope of the inline-policy set of the role keyed by `role_key`.

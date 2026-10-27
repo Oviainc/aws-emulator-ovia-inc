@@ -35,6 +35,8 @@ mod custom_policy_context_keys;
 mod entities_for_policy;
 #[path = "all/group_attached_policies.rs"]
 mod group_attached_policies;
+#[path = "all/group_attached_policy_listing.rs"]
+mod group_attached_policy_listing;
 #[path = "all/group_creation.rs"]
 mod group_creation;
 #[path = "all/group_deletion.rs"]
