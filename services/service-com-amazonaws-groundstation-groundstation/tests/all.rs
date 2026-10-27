@@ -19,6 +19,8 @@ mod agent_configuration_reads;
 mod agent_lifecycle;
 #[path = "all/agent_registration_tags.rs"]
 mod agent_registration_tags;
+#[path = "all/agent_task_response_url.rs"]
+mod agent_task_response_url;
 #[path = "all/antenna_inventory.rs"]
 mod antenna_inventory;
 #[path = "all/available_contacts.rs"]

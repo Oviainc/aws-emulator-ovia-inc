@@ -33,14 +33,22 @@ const S3_AUTH: &str = "AWS4-HMAC-SHA256 Credential=AKIDTESTS3/20260101/us-east-1
 /// `tests/all/recording_bucket_refusal_message.rs` resolves buckets through the same two
 /// front doors, so this plumbing is written once rather than stood up twice.
 pub(crate) fn harness_with_object_storage() -> MultiServiceRouter {
+    harness_with_object_storage_and_engine().0
+}
+
+/// As [`harness_with_object_storage`], handing back the shared engine as well, for a suite
+/// that has to read this service's store to observe something no modelled read reports
+/// (`tests/all/agent_task_response_url.rs`).
+pub(crate) fn harness_with_object_storage_and_engine(
+) -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::clone(&engine)));
     router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
-        engine,
+        Arc::clone(&engine),
     ));
-    router
+    (router, engine)
 }
 
 /// `PUT /<bucket>` against the emulator's S3 front door — `CreateBucket`, path-style

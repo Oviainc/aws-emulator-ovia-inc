@@ -2,6 +2,10 @@
 
 //! End-to-end tests for the `Model` family: `CreateModel` and `GetModel`.
 //!
+//! The `CreateModel`/`GetModel` wire helpers below are this crate's `Model` harness and
+//! are shared with the `delete_model` suite, so every suite of the family drives the one
+//! wire path.
+//!
 //! Every case drives the real wire path — a `restJson1` HTTP request through the
 //! multi-service router into the mounted service — so what is asserted is what a client
 //! sees, not what a handler returns. [`Gateway`], `create_api`, `string_member` and
@@ -37,14 +41,14 @@ const NOT_FOUND: &str = "NotFoundException";
 const MAX_SCHEMA_CHARS: usize = 400 * 1024;
 
 /// `CreateModel` on `api`, with `request` as its body.
-async fn create_model(gateway: &Gateway, api: &str, request: Value) -> Answer {
+pub async fn create_model(gateway: &Gateway, api: &str, request: Value) -> Answer {
     gateway
         .call("POST", &format!("/restapis/{api}/models"), Some(request))
         .await
 }
 
 /// `CreateModel`, asserting the modelled 201 and answering the body it reported.
-async fn created_model(gateway: &Gateway, api: &str, case: &str, request: Value) -> Value {
+pub async fn created_model(gateway: &Gateway, api: &str, case: &str, request: Value) -> Value {
     let answer = create_model(gateway, api, request).await;
     assert_eq!(
         answer.status, 201,
@@ -55,7 +59,7 @@ async fn created_model(gateway: &Gateway, api: &str, case: &str, request: Value)
 }
 
 /// `GetModel` for `name` on `api`, resolving model references when `flatten` is set.
-async fn get_model(gateway: &Gateway, api: &str, name: &str, flatten: bool) -> Answer {
+pub async fn get_model(gateway: &Gateway, api: &str, name: &str, flatten: bool) -> Answer {
     let uri = if flatten {
         format!("/restapis/{api}/models/{name}?flatten=true")
     } else {

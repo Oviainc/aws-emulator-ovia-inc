@@ -125,6 +125,8 @@ mod member_invitation;
 mod member_monitoring;
 #[path = "all/member_monitoring_restart.rs"]
 mod member_monitoring_restart;
+#[path = "all/member_organization_auto_enable.rs"]
+mod member_organization_auto_enable;
 #[path = "all/modeled_constraint_refusals.rs"]
 mod modeled_constraint_refusals;
 #[path = "all/negative_class_rejections.rs"]
