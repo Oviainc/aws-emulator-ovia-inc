@@ -30,7 +30,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::dashboard_lifecycle::{call, error_code, ok_call, router};
+use super::dashboard_lifecycle::{call, error_code, managed_dashboard_count, ok_call, router};
 use super::scheduled_report_lifecycle::EXECUTION_ROLE_ARN;
 
 /// The wire error code every not-found answer of this service carries, on every operation
@@ -300,7 +300,7 @@ async fn an_unresolvable_arn_is_refused_with_400_and_the_requested_resource_id()
     let listed = ok_call(&router, "ListDashboards", &json!({})).await;
     assert_eq!(
         listed["dashboards"].as_array().map(Vec::len),
-        Some(1),
+        Some(1 + managed_dashboard_count()),
         "the refusals must neither create nor remove a dashboard: {listed}"
     );
 }

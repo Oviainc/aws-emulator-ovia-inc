@@ -369,8 +369,11 @@ async fn the_quota_refusal_is_audited() {
 
     let router = router();
     // A distinct name per create: a dashboard's name is unique within the account, so the
-    // quota is what must refuse the create past the ceiling.
-    for index in 0..MAX_DASHBOARDS {
+    // quota is what must refuse the create past the ceiling. The AWS-managed catalog a
+    // fresh store already holds counts against that same ceiling, so the account's own
+    // creates fill the room it leaves.
+    let room = MAX_DASHBOARDS - super::dashboard_lifecycle::managed_dashboard_count();
+    for index in 0..room {
         let request = json!({"name": format!("Quota Filler {index:04}"), "widgets": []});
         ok_call(&router, "CreateDashboard", &request).await;
     }

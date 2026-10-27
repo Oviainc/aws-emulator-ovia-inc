@@ -105,12 +105,20 @@ async fn create_tagged_report(
         .to_string()
 }
 
-/// How many dashboards this router holds, used to show a report stored nothing.
+/// How many dashboards of the ACCOUNT'S OWN this router holds, used to show a report
+/// stored nothing.
+///
+/// A fresh store already holds the AWS-managed catalog this service seeds, whose entries
+/// carry `type: AWS_MANAGED`; a dashboard a caller created carries `CUSTOM`, so counting
+/// those counts what a create or a read of this suite's own dashboards changed.
 async fn dashboard_count(router: &MultiServiceRouter) -> usize {
     let page = ok_call(router, "ListDashboards", &json!({"maxResults": 100})).await;
-    page["dashboards"]
-        .as_array()
-        .map_or(0, |dashboards| dashboards.len())
+    page["dashboards"].as_array().map_or(0, |dashboards| {
+        dashboards
+            .iter()
+            .filter(|item| item["type"].as_str() == Some("CUSTOM"))
+            .count()
+    })
 }
 
 /// One row of the tag table.

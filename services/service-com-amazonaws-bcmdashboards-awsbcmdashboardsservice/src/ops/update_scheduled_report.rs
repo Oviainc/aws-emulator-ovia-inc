@@ -219,6 +219,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let arn = input.arn;
 
+        // The modelled `@pattern` of the report's name and description is applied BEFORE
+        // the resource is resolved, which is where the boundary validator would have
+        // applied it had its regex engine compiled the negative lookahead both
+        // expressions open with (`crate::state::ConstrainedText`): a malformed request is
+        // refused as malformed whether or not the ARN it names resolves, and changes
+        // nothing on any stored record.
+        if let Some(message) = crate::state::text_pattern_refusal(
+            crate::state::report_text_members(None, input.name.as_deref(), input.description.as_deref()),
+        ) {
+            crate::state::record_state_change(ctx, Self::NAME, &arn, "ValidationException");
+            return Err(UpdateScheduledReportErrorModeled::ValidationException(
+                ValidationException { message },
+            )
+            .into());
+        }
+
         // Resolve the resource this call addresses FIRST: an ARN no report is stored
         // under is refused before any other member is looked at, and nothing is written
         // on that path.

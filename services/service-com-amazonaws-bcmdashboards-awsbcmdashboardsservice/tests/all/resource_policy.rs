@@ -4,8 +4,10 @@
 //! the dashboard the request names.
 //!
 //! The rule under test is that `GetResourcePolicy` reports the policy document stored on
-//! the dashboard its `resourceArn` names — the empty document while no policy is
-//! attached, since `policyDocument`'s modelled length starts at 0 — echoes that ARN,
+//! the dashboard its `resourceArn` names — and, where no policy is stored, the EMPTY JSON
+//! DOCUMENT `{}`, because `policyDocument` reports a policy document and a caller feeds it
+//! straight to a JSON parser, so "no policy" is the document that grants nothing rather
+//! than the empty string, which is not a document at all. It echoes that ARN,
 //! answers `ResourceNotFoundException` (HTTP 400, as `tests/all/resource_not_found.rs`
 //! pins) when this service holds no dashboard under
 //! the ARN, and (being `@readonly`) changes nothing a later caller can observe.
@@ -79,12 +81,20 @@ fn reported_arn(body: &Value) -> String {
         .to_string()
 }
 
-/// How many dashboards this router holds, used to show a read stored nothing.
+/// How many dashboards of the ACCOUNT'S OWN this router holds, used to show a read
+/// stored nothing.
+///
+/// A fresh store already holds the AWS-managed catalog this service seeds, whose entries
+/// carry `type: AWS_MANAGED`; a dashboard a caller created carries `CUSTOM`, so counting
+/// those counts what this suite's own calls changed.
 async fn dashboard_count(router: &MultiServiceRouter) -> usize {
     let page = ok_call(router, "ListDashboards", &json!({"maxResults": 100})).await;
-    page["dashboards"]
-        .as_array()
-        .map_or(0, |dashboards| dashboards.len())
+    page["dashboards"].as_array().map_or(0, |dashboards| {
+        dashboards
+            .iter()
+            .filter(|item| item["type"].as_str() == Some("CUSTOM"))
+            .count()
+    })
 }
 
 /// One row of the policy table: what is persisted, and what a read must report.
@@ -133,12 +143,12 @@ fn policy_cases() -> Vec<PolicyCase> {
         PolicyCase {
             label: "no policy attached at all",
             stored: None,
-            expected: String::new(),
+            expected: "{}".to_string(),
         },
         PolicyCase {
             label: "an attached but empty document (the 0-character minimum)",
             stored: Some(String::new()),
-            expected: String::new(),
+            expected: "{}".to_string(),
         },
         PolicyCase {
             label: "an empty JSON object",
@@ -235,7 +245,7 @@ async fn reported_document_is_the_document_persisted_on_the_dashboard() {
 }
 
 /// A dashboard created through the API carries no policy, whatever shape the create
-/// request took, so its policy reads back as the empty document — and the dashboard
+/// request took, so its policy reads back as the empty JSON document — and the dashboard
 /// itself is still readable afterwards.
 #[tokio::test]
 async fn a_dashboard_created_through_the_api_reports_the_empty_document() {
@@ -277,9 +287,10 @@ async fn a_dashboard_created_through_the_api_reports_the_empty_document() {
 
         let answer = ok_call(&router, "GetResourcePolicy", &json!({"resourceArn": arn})).await;
         let reported = reported_document(&answer);
-        assert!(
-            reported.is_empty(),
-            "case {label}: a dashboard with no policy attached must report the empty document, got {reported:?}"
+        assert_eq!(
+            reported, "{}",
+            "case {label}: a dashboard with no policy attached must report the empty JSON \
+             document, got {reported:?}"
         );
 
         // Round trip: the dashboard the policy was read for is untouched.

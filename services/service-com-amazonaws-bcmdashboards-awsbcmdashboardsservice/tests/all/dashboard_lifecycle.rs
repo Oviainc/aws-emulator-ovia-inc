@@ -123,6 +123,49 @@ pub(crate) fn error_code(body: &Value) -> String {
         .to_string()
 }
 
+/// The AWS-managed dashboard catalog a fresh store already holds, as `(arn, name)` pairs
+/// in ARN order.
+///
+/// These dashboards are the service's own: an account that has created nothing already
+/// lists them, so a test that states what a listing reports states its own dashboards
+/// AND these. Read from the one place that defines the catalog
+/// (`state::managed_dashboard_catalog`), so no count or ARN is written out here.
+pub(crate) fn managed_catalog() -> Vec<(String, String)> {
+    service_com_amazonaws_bcmdashboards_awsbcmdashboardsservice::state::managed_dashboard_catalog()
+        .into_values()
+        .map(|dashboard| (dashboard.arn, dashboard.name))
+        .collect()
+}
+
+/// Every ARN of the AWS-managed catalog, in ARN order.
+pub(crate) fn managed_dashboard_arns() -> Vec<String> {
+    managed_catalog().into_iter().map(|(arn, _)| arn).collect()
+}
+
+/// How many dashboards the AWS-managed catalog holds.
+pub(crate) fn managed_dashboard_count() -> usize {
+    managed_catalog().len()
+}
+
+/// `entries` together with the AWS-managed catalog, sorted: what a listing of the whole
+/// account reports once a test's own dashboards are stored beside the seeded ones.
+pub(crate) fn with_managed_catalog(
+    entries: impl IntoIterator<Item = (String, String)>,
+) -> Vec<(String, String)> {
+    let mut all: Vec<(String, String)> = entries.into_iter().chain(managed_catalog()).collect();
+    all.sort();
+    all
+}
+
+/// [`with_managed_catalog`] for a test that compares ARNs alone.
+pub(crate) fn arns_with_managed_catalog(
+    arns: impl IntoIterator<Item = String>,
+) -> Vec<String> {
+    let mut all: Vec<String> = arns.into_iter().chain(managed_dashboard_arns()).collect();
+    all.sort();
+    all
+}
+
 /// `DashboardArn`'s modelled `@pattern`, checked by hand because this crate has no
 /// regex dependency. Source: the `DashboardArn` member pattern reported by
 /// `smithy_query(query="operation",operation="CreateDashboard")` and OPERATIONS.md —
@@ -523,15 +566,15 @@ async fn a_second_create_under_a_stored_name_is_refused() {
     );
 
     let listed = ok_call(&router, "ListDashboards", &json!({})).await;
-    let arns: Vec<&str> = listed["dashboards"]
+    let arns: Vec<String> = listed["dashboards"]
         .as_array()
         .expect("dashboards")
         .iter()
-        .map(|item| item["arn"].as_str().unwrap_or("<none>"))
+        .map(|item| item["arn"].as_str().unwrap_or("<none>").to_string())
         .collect();
     assert_eq!(
         arns,
-        vec![first_arn.as_str()],
+        arns_with_managed_catalog([first_arn.clone()]),
         "the refused create must have stored nothing: {listed}"
     );
 }
@@ -625,8 +668,11 @@ async fn list_dashboards_pages_over_the_stored_dashboards() {
         .await;
         expected.push(created["arn"].as_str().expect("an arn").to_string());
     }
-    // The store is keyed by ARN, so the listing order is ARN order.
-    expected.sort();
+    // The store is keyed by ARN, so the listing order is ARN order — over the account's
+    // own dashboards AND the AWS-managed catalog a fresh store already holds, which pages
+    // by exactly the same rule.
+    let expected = arns_with_managed_catalog(expected);
+    let stored = expected.len();
 
     for page_size in [1_usize, 2, 3, 5, 100] {
         let mut collected: Vec<String> = Vec::new();
@@ -669,7 +715,7 @@ async fn list_dashboards_pages_over_the_stored_dashboards() {
                 break;
             }
             assert!(
-                pages <= names.len(),
+                pages <= stored,
                 "case page size {page_size}: pagination did not terminate"
             );
         }
@@ -678,19 +724,20 @@ async fn list_dashboards_pages_over_the_stored_dashboards() {
             collected, expected,
             "case page size {page_size}: paging must walk every dashboard exactly once, in order"
         );
-        let want_pages = names.len().div_ceil(page_size);
+        let want_pages = stored.div_ceil(page_size);
         assert_eq!(
             pages, want_pages,
             "case page size {page_size}: expected {want_pages} pages, walked {pages}"
         );
     }
 
-    // `maxResults` absent: the modelled default (20) covers all five, so no cursor.
+    // `maxResults` absent: the modelled default (20) covers every stored dashboard, so no
+    // cursor.
     let defaulted = ok_call(&router, "ListDashboards", &json!({})).await;
     let items = defaulted["dashboards"].as_array().expect("dashboards");
     assert_eq!(
         items.len(),
-        names.len(),
+        stored,
         "case default page size: expected every dashboard on one page: {defaulted}"
     );
     assert!(
@@ -939,15 +986,15 @@ async fn delete_dashboard_removes_the_record() {
     );
 
     let listed = ok_call(&router, "ListDashboards", &json!({})).await;
-    let remaining: Vec<&str> = listed["dashboards"]
+    let remaining: Vec<String> = listed["dashboards"]
         .as_array()
         .expect("dashboards")
         .iter()
-        .map(|item| item["arn"].as_str().unwrap_or("<none>"))
+        .map(|item| item["arn"].as_str().unwrap_or("<none>").to_string())
         .collect();
     assert_eq!(
         remaining,
-        vec![arns[0].as_str(), arns[2].as_str()],
+        arns_with_managed_catalog([arns[0].clone(), arns[2].clone()]),
         "ListDashboards must list exactly the surviving dashboards: {listed}"
     );
 
@@ -1058,7 +1105,10 @@ async fn create_dashboard_stops_at_the_dashboard_quota() {
     let filler = |index: usize| json!({"name": format!("Quota Filler {index:04}"), "widgets": []});
 
     let mut first_arn = None;
-    for index in 0..MAX_DASHBOARDS {
+    // The account's own creates fill the store to the quota ALONGSIDE the AWS-managed
+    // catalog it already holds, which counts against the same ceiling.
+    let room = MAX_DASHBOARDS - managed_dashboard_count();
+    for index in 0..room {
         let created = ok_call(&router, "CreateDashboard", &filler(index)).await;
         let arn = created["arn"].as_str().expect("an arn").to_string();
         if index == 0 {
@@ -1067,7 +1117,7 @@ async fn create_dashboard_stops_at_the_dashboard_quota() {
     }
     let first_arn = first_arn.expect("the first dashboard's arn");
 
-    let (status, body) = call(&router, "CreateDashboard", &filler(MAX_DASHBOARDS)).await;
+    let (status, body) = call(&router, "CreateDashboard", &filler(room)).await;
     assert_eq!(
         status, 402,
         "case at the quota: CreateDashboard must refuse past {MAX_DASHBOARDS} dashboards, got {status}: {body}"
@@ -1089,8 +1139,8 @@ async fn create_dashboard_stops_at_the_dashboard_quota() {
 
     // Freeing one record makes room for exactly one more.
     ok_call(&router, "DeleteDashboard", &json!({"arn": first_arn})).await;
-    ok_call(&router, "CreateDashboard", &filler(MAX_DASHBOARDS + 1)).await;
-    let (status, body) = call(&router, "CreateDashboard", &filler(MAX_DASHBOARDS + 2)).await;
+    ok_call(&router, "CreateDashboard", &filler(room + 1)).await;
+    let (status, body) = call(&router, "CreateDashboard", &filler(room + 2)).await;
     assert_eq!(
         status, 402,
         "case back at the quota: CreateDashboard must refuse again, got {status}: {body}"

@@ -14,7 +14,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::dashboard_lifecycle::{call, error_code, ok_call, router};
+use super::dashboard_lifecycle::{call, error_code, managed_dashboard_count, ok_call, router};
 use super::scheduled_report_lifecycle::{source_dashboard, EXECUTION_ROLE_ARN};
 
 /// Which resource map a listing pages over — the only thing that differs between the
@@ -137,11 +137,16 @@ async fn both_listings_page_by_the_same_rule() {
 
         // Before anything of this kind is stored the required list is empty and no
         // cursor is owed — except for dashboards, where the source dashboard is
-        // already stored.
-        let stored_already = match listing.resource {
+        // already stored beside the AWS-managed catalog a fresh store holds.
+        let own_already = match listing.resource {
             Resource::Dashboard => 1,
             Resource::ScheduledReport => 0,
         };
+        let stored_already = own_already
+            + match listing.resource {
+                Resource::Dashboard => managed_dashboard_count(),
+                Resource::ScheduledReport => 0,
+            };
         let empty = fetch_page(&router, &listing, None, None).await;
         assert_eq!(
             page_arns(&empty, &listing, case).len(),
@@ -154,7 +159,7 @@ async fn both_listings_page_by_the_same_rule() {
         );
 
         let mut expected: Vec<String> = page_arns(&empty, &listing, case);
-        for index in stored_already..5 {
+        for index in own_already..5 {
             expected.push(create_resource(&router, listing.resource, index, &dashboard_arn).await);
         }
         // Both maps are keyed by ARN, so both listings walk in ARN order.
