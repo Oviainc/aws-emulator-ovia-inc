@@ -1665,24 +1665,58 @@ pub fn auth_request_required(auth_type: &str) -> ValidationException {
     )
 }
 
+/// The sentence AppFabric refuses an ingestion with when the app bundle holds NO
+/// app authorization at all for the request's (application, tenant) pair.
+///
+/// FIXED TEXT, with no variable part: AppFabric says "the specified application
+/// and tenant" rather than echoing either value, so two refusals naming two
+/// different pairs read identically — the pair a caller asked for is in its own
+/// request, not in the service's sentence.
+pub const APP_AUTHORIZATION_NOT_FOUND_FOR_INGESTION: &str =
+    "The app authorization for the specified application and tenant was not found. \
+     Create an app authorization for the application and tenant before creating an ingestion.";
+
+/// The sibling sentence for the pair the bundle DOES hold an app authorization
+/// for, one that has not completed the connect handshake.
+///
+/// Same error shape, and the same value-free form, with the remediation naming
+/// the connect step instead of the create step. Unlike the sentence above, this
+/// wording is NOT observed: it keeps the two refusals distinguishable (which
+/// call does the caller still owe?) without putting a request value or a stored
+/// status in either, and it stays a known divergence until the service's own
+/// text for an unconnected pair can be observed.
+pub const APP_AUTHORIZATION_NOT_CONNECTED_FOR_INGESTION: &str =
+    "The app authorization for the specified application and tenant is not connected. \
+     Connect the app authorization for the application and tenant before creating an ingestion.";
+
+/// Which call a caller still owes before an ingestion of one (application,
+/// tenant) pair can be created — what the refusal below states, and the ONLY
+/// thing the handler tells it about the store: a stored status cannot be
+/// rendered into a message it never reaches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwedAuthorizationStep {
+    /// The app bundle holds no app authorization for the pair at all.
+    CreateAuthorization,
+    /// It holds one that has not completed the connect handshake.
+    ConnectAuthorization,
+}
+
 /// A modelled `ValidationException` refusing an ingestion of an (application,
 /// tenant) pair the app bundle holds no CONNECTED app authorization for.
 ///
-/// `status` is the state of the authorization the bundle does hold for that
-/// pair, or `None` when it holds none at all; the message is built from the
-/// request and from that stored state, which is what tells a caller whether it
-/// still has to create the authorization or only to connect it.
-pub fn app_authorization_not_connected(app: &str, status: Option<&str>) -> ValidationException {
-    precondition_not_met(match status {
-        Some(status) => format!(
-            "The app authorization for app {app} and the specified tenant is {status}, \
-             not {APP_AUTHORIZATION_STATUS_CONNECTED}"
-        ),
-        None => format!(
-            "No app authorization exists for app {app} and the specified tenant; \
-             create one and connect it before creating an ingestion"
-        ),
-    })
+/// `owed` selects which of the two sentences above the refusal carries — the one
+/// whose remediation the caller still owes. Neither sentence has a variable
+/// part, so nothing of the request or of the stored record reaches the message.
+pub fn app_authorization_not_connected(owed: OwedAuthorizationStep) -> ValidationException {
+    precondition_not_met(
+        match owed {
+            OwedAuthorizationStep::CreateAuthorization => APP_AUTHORIZATION_NOT_FOUND_FOR_INGESTION,
+            OwedAuthorizationStep::ConnectAuthorization => {
+                APP_AUTHORIZATION_NOT_CONNECTED_FOR_INGESTION
+            }
+        }
+        .to_string(),
+    )
 }
 
 /// A modelled `ValidationException` refusing an `app` outside the set of
