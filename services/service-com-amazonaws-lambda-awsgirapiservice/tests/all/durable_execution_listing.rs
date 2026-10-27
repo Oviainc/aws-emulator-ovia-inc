@@ -20,10 +20,9 @@
 //! entry, more than there are, the documented default and each published bound) and the
 //! marker a page continues from.
 //!
-//! No modelled operation starts a durable execution yet — `Invoke` minting one is its own
-//! open issue, `20261026T070343Z-events-lambda-sqs-lambda-invoke-on-a-durable-execution-function-returns`
-//! — so the executions under test are started through the service's own state, which is
-//! where that handler registers them.
+//! The executions under test are started through the service's own state, which is where
+//! the `Invoke` handler registers them; `durable_execution_start.rs` drives that handler
+//! end to end.
 //!
 //! The clock-driven half (a running execution whose `ExecutionTimeout` has fallen due) is
 //! exercised by moving the stored due instant into the past, so nothing here sleeps.
@@ -36,8 +35,9 @@ use aws_smithy_types::DateTime;
 use base64::Engine as _;
 use serde_json::{json, Value};
 use service_com_amazonaws_lambda_awsgirapiservice::state::{
-    ComAmazonawsLambdaAwsgirapiserviceState, EXECUTION_STATUS_FAILED, EXECUTION_STATUS_RUNNING,
-    EXECUTION_STATUS_STOPPED, EXECUTION_STATUS_SUCCEEDED, EXECUTION_STATUS_TIMED_OUT,
+    ComAmazonawsLambdaAwsgirapiserviceState, DurableExecutionStart, EXECUTION_STATUS_FAILED,
+    EXECUTION_STATUS_RUNNING, EXECUTION_STATUS_STOPPED, EXECUTION_STATUS_SUCCEEDED,
+    EXECUTION_STATUS_TIMED_OUT,
 };
 use service_com_amazonaws_lambda_awsgirapiservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -283,9 +283,10 @@ fn start_execution(
         .functions
         .get_mut(function)
         .unwrap_or_else(|| panic!("case {name}: the store must hold the function {function}"));
-    record
-        .start_durable_execution(name, version, started)
-        .unwrap_or_else(|| panic!("case {name}: starting the execution must answer its ARN"))
+    match record.start_durable_execution(name, version, &[], started) {
+        DurableExecutionStart::Started(arn) => arn,
+        other => panic!("case {name}: starting the execution must answer its ARN, got {other:?}"),
+    }
 }
 
 /// Settle one started execution into a terminal status that ended at `ended`, which is
@@ -518,12 +519,12 @@ async fn a_listed_execution_reports_the_record_the_store_holds() {
             .functions
             .get_mut("durable")
             .expect("the store must hold the function");
-        record.start_durable_execution("alpha", VERSION_LATEST, base)
+        record.start_durable_execution("alpha", VERSION_LATEST, &[], base)
     };
     assert!(
-        restarted.is_none(),
+        matches!(restarted, DurableExecutionStart::AlreadyStarted(_)),
         "case alpha: an execution name is unique within the function, so a second start \
-         must not replace it, got {restarted:?}"
+         must answer the execution already started rather than replace it, got {restarted:?}"
     );
 }
 
