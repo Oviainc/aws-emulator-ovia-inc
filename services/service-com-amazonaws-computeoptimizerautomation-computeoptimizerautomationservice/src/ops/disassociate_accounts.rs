@@ -183,10 +183,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The one rule on `accountIds` the model's constraints cannot carry.
-        // Each account id itself matched `AccountId`'s `^[0-9]{12}$` at the
-        // protocol boundary, so reaching here means every entry is well formed.
-        if let Some(message) = invalid_parameter(&input) {
+        // The one rule on `accountIds` the model's constraints cannot carry,
+        // judged where the paired association operation judges it too
+        // (`crate::state::account_ids_violation`). Each account id itself matched
+        // `AccountId`'s `^[0-9]{12}$` at the protocol boundary, so reaching here
+        // means every entry is well formed.
+        if let Some(message) = crate::state::account_ids_violation(&input.account_ids) {
             return Err(
                 DisassociateAccountsErrorModeled::InvalidParameterValueException(
                     InvalidParameterValueException {
@@ -197,16 +199,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // The accounts this request names, each ONCE and in the order the
-        // request first names them: an id repeated in the list names the same
-        // account, and an account is associated or it is not.
-        let mut seen: ::std::collections::HashSet<&str> = ::std::collections::HashSet::new();
-        let requested: Vec<String> = input
-            .account_ids
-            .iter()
-            .filter(|account_id| seen.insert(account_id.as_str()))
-            .cloned()
-            .collect();
+        // The accounts this request names, each once and in the order the
+        // request first names them (`crate::state::distinct_account_ids`).
+        let requested = crate::state::distinct_account_ids(&input.account_ids);
 
         let mut probe = input.clone();
         probe.client_token = None;
@@ -290,30 +285,3 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// Why this request's parameter values are not valid, if they are not.
-///
-/// The clause is the size of `accountIds`, which the `AccountIdList` shape
-/// carries no `@length` for: an organization-association request of this
-/// service names at least one account and at most
-/// [`crate::state::MAX_ACCOUNT_IDS_PER_REQUEST`] of them — the bound documented
-/// on the member of the paired request, which targets the same list shape — so
-/// a request naming none, and one naming more, is refused with the operation's
-/// `InvalidParameterValueException` rather than acting on a prefix of the list.
-fn invalid_parameter(input: &DisassociateAccountsInput) -> Option<String> {
-    if input.account_ids.is_empty() {
-        return Some(crate::state::constraint_report(
-            "accountIds",
-            "Member must have length greater than or equal to 1",
-        ));
-    }
-    if input.account_ids.len() > crate::state::MAX_ACCOUNT_IDS_PER_REQUEST {
-        return Some(crate::state::constraint_report(
-            "accountIds",
-            &format!(
-                "Member must have length less than or equal to {}",
-                crate::state::MAX_ACCOUNT_IDS_PER_REQUEST
-            ),
-        ));
-    }
-    None
-}
