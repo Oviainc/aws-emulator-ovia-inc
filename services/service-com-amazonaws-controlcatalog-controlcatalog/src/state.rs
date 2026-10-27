@@ -432,6 +432,89 @@ pub fn single_resource_filter_arn<Entry: ResourceFilterEntry>(
 }
 
 // ---------------------------------------------------------------------------
+// Parent summaries
+// ---------------------------------------------------------------------------
+
+/// A catalog record another record names as the parent it belongs to: the [`Domain`] an
+/// objective or a common control belongs to, and the [`Objective`] a common control
+/// supports.
+///
+/// The only thing a parent summary reports out of the parent record is its name, so
+/// that is all this trait exposes.
+pub trait CatalogParent {
+    /// The parent's stored name.
+    fn parent_name(&self) -> &str;
+}
+
+impl CatalogParent for Domain {
+    fn parent_name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl CatalogParent for Objective {
+    fn parent_name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// One of the modeled `Associated*Summary` structures: the summary of a parent record a
+/// listed child carries.
+///
+/// The service models one such structure per parent kind, each with the same two
+/// optional members, `Arn` and `Name`
+/// (`smithy_query(query="shape",shape="AssociatedDomainSummary,AssociatedObjectiveSummary")`),
+/// so this trait is what lets the one rule below build either of them.
+pub trait AssociatedParentSummary {
+    /// The summary reporting `arn` and `name`.
+    fn from_parts(arn: String, name: Option<String>) -> Self;
+}
+
+impl AssociatedParentSummary for crate::ops::types::AssociatedDomainSummary {
+    fn from_parts(arn: String, name: Option<String>) -> Self {
+        Self {
+            arn: Some(arn),
+            name,
+        }
+    }
+}
+
+impl AssociatedParentSummary for crate::ops::types::AssociatedObjectiveSummary {
+    fn from_parts(arn: String, name: Option<String>) -> Self {
+        Self {
+            arn: Some(arn),
+            name,
+        }
+    }
+}
+
+/// The summary of the parent `parent_arn` names, resolved out of `parents` — the same
+/// catalog collection the parent's own list operation reports.
+///
+/// Every listing that carries a parent summary carries the same kind of summary, so the
+/// rule is this one function rather than one copy per operation and member: the `Arn` is
+/// the ARN the CHILD stores, reported exactly as stored so every listing describes one
+/// parent the same way, and the `Name` is the stored parent's, reported only when that
+/// ARN resolves in the collection — both members are optional on every modeled
+/// `Associated*Summary`, so a parent the catalog does not hold leaves the name out
+/// instead of failing the listing.
+pub fn associated_parent_summary<Parent, Summary>(
+    parents: &BTreeMap<String, Parent>,
+    parent_arn: &str,
+) -> Summary
+where
+    Parent: CatalogParent,
+    Summary: AssociatedParentSummary,
+{
+    Summary::from_parts(
+        parent_arn.to_string(),
+        parents
+            .get(parent_arn)
+            .map(|parent| parent.parent_name().to_string()),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Pagination
 // ---------------------------------------------------------------------------
 

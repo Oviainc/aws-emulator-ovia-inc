@@ -84,24 +84,27 @@ const MAX_LIST_COMMON_CONTROLS_RESULTS: i32 = 100;
 /// Project a stored common control into the modeled `CommonControlSummary`, resolving
 /// its domain and objective out of the same catalog ListDomains and ListObjectives
 /// report.
+///
+/// Both parent summaries are built by `crate::state::associated_parent_summary` — the
+/// one rule for every parent summary this service reports, shared with the domain
+/// summary ListObjectives carries, because reporting the ARN the child stores and the
+/// parent's name only when that ARN resolves belongs to the class and not to one member.
 fn common_control_summary(
     common_control: &crate::state::CommonControl,
     state: &crate::state::ComAmazonawsControlcatalogControlcatalogState,
 ) -> CommonControlSummary {
-    let domain = state.domains.get(&common_control.domain_arn);
-    let objective = state.objectives.get(&common_control.objective_arn);
     CommonControlSummary {
         arn: common_control.arn.clone(),
         name: common_control.name.clone(),
         description: common_control.description.clone(),
-        domain: AssociatedDomainSummary {
-            arn: Some(common_control.domain_arn.clone()),
-            name: domain.map(|domain| domain.name.clone()),
-        },
-        objective: AssociatedObjectiveSummary {
-            arn: Some(common_control.objective_arn.clone()),
-            name: objective.map(|objective| objective.name.clone()),
-        },
+        domain: crate::state::associated_parent_summary(
+            &state.domains,
+            &common_control.domain_arn,
+        ),
+        objective: crate::state::associated_parent_summary(
+            &state.objectives,
+            &common_control.objective_arn,
+        ),
         create_time: ::aws_smithy_types::DateTime::from_secs(common_control.create_time),
         last_update_time: ::aws_smithy_types::DateTime::from_secs(
             common_control.last_update_time,
