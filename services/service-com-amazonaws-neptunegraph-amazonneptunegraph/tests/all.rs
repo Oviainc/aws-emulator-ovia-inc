@@ -57,6 +57,8 @@ mod import_task_minting;
 mod import_task_read;
 #[path = "all/pagination_token_codec.rs"]
 mod pagination_token_codec;
+#[path = "all/pass_role_authorization.rs"]
+mod pass_role_authorization;
 #[path = "all/private_graph_endpoint_lifecycle.rs"]
 mod private_graph_endpoint_lifecycle;
 #[path = "all/private_graph_endpoint_listing.rs"]

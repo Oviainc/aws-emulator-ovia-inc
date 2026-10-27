@@ -114,6 +114,11 @@
 //! * `ResourceNotFoundException` (HTTP 404) — A specified resource could not be located.
 //! * `ThrottlingException` (HTTP 429) — The exception was interrupted by throttling.
 //! * `ValidationException` (HTTP 400) — A resource could not be validated.
+//!
+//! The service's own `AccessDeniedException` (HTTP 403) is answered besides those: the
+//! `roleArn` this operation is handed is a role the service has to ASSUME, and whether
+//! the caller may pass it is an authorization decision taken ahead of every check
+//! above (see [`crate::service::pass_role`]).
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -129,9 +134,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-neptunegraph-amazonnept
 // here — hence the `StartImportTaskError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.neptunegraph#StartImportTask")]
+// `AccessDeniedException` is widened in from the SERVICE's own shapes, which this
+// operation's error list does not repeat: a role the caller may not pass is an
+// authorization failure (403), not a shape-level `ValidationException` (400), and the
+// decision is taken before any modelled constraint is read.
+#[smithy_macros::operation_error(
+    "com.amazonaws.neptunegraph#StartImportTask",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum StartImportTaskErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     ConflictException(ConflictException),
     InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
@@ -190,6 +203,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The `roleArn` is a role this service has to ASSUME to read the data it is
+        // asked to import, so whether the caller may hand it over is settled FIRST —
+        // before the store is reached and before any other member is read. The decision
+        // itself lives in `crate::state::pass_role_denial`, which every operation taking
+        // a pass-role member reaches, and `crate::service::pass_role` takes it on
+        // requests the boundary's constraint walk would otherwise refuse ahead of this
+        // handler.
+        if let Some(denial) = crate::state::pass_role_denial(ctx, &input.role_arn) {
+            return Err(StartImportTaskErrorModeled::AccessDeniedException(denial).into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(StartImportTaskErrorModeled::InternalServerException(
                 InternalServerException {
@@ -341,5 +365,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let output = Self::Output::from(&task);
         store.insert_import_task(task);
         Ok(output)
+    }
+}
+
+/// The role `StartImportTask` asks this service to assume, and the channel its denial
+/// travels in — what [`crate::service::pass_role::PassRoleGate`] needs to take that
+/// decision ahead of this operation's own validation.
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
+    crate::service::pass_role::PassesRole for StartImportTask<Eng>
+{
+    fn passed_role(input: &Self::Input) -> &str {
+        &input.role_arn
+    }
+
+    fn pass_role_denied(denial: AccessDeniedException) -> Self::Error {
+        StartImportTaskErrorModeled::AccessDeniedException(denial).into()
     }
 }
