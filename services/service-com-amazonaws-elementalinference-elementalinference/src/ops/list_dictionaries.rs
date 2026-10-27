@@ -129,21 +129,18 @@ const DEFAULT_MAX_RESULTS: usize = MAX_PAGE_SIZE;
 
 /// The name this operation's `nextToken` binds, so a token of another paginated
 /// operation of this service is not one a dictionary listing can be continued with.
-const TOKEN_OPERATION: &str = "ListDictionaries";
-
-/// The canonical criteria a `nextToken` of this operation binds: the selection the
-/// page it ends was computed over.
 ///
-/// A listing selects the dictionaries of the Region the request was signed for — the
-/// service is regional, so another Region's endpoint reports another set of
-/// dictionaries and a token issued by one does not continue a listing of the other.
-/// `maxResults` is not part of it: the model declares it as this operation's
+/// With it, the criteria a token of this operation binds are the selection the page it
+/// ends was computed over: a listing selects the dictionaries of the Region the request
+/// was signed for — the service is regional, so another Region's endpoint reports
+/// another set of dictionaries and a token issued by one does not continue a listing of
+/// the other. `maxResults` is not part of it: the model declares it as this operation's
 /// `@paginated` `pageSize`
 /// (`smithy_query(query="operation",operation="ListDictionaries")`), so asking the
-/// next batch for a different page size is the same listing.
-fn token_criteria(region: &str) -> String {
-    crate::state::page_criteria(&[TOKEN_OPERATION, region])
-}
+/// next batch for a different page size is the same listing. Which fields a
+/// region-scoped listing's token binds is stated once, in
+/// [`crate::state::region_page_criteria`].
+const TOKEN_OPERATION: &str = "ListDictionaries";
 
 /// The `ListDictionaries` operation.
 ///
@@ -198,7 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The token binds the listing it was issued for, so one that is not a
         // pagination token at all, or that belongs to a different request, cannot name
         // a page of this listing and is refused rather than read as the first page.
-        let criteria = token_criteria(&region);
+        let criteria = crate::state::region_page_criteria(TOKEN_OPERATION, &region);
         let resume_after = match input.next_token.as_deref() {
             None => None,
             Some(token) => match crate::state::decode_page_token(&criteria, token) {
@@ -213,13 +210,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             },
         };
-        // `maxResults` is modelled with range 1..100, so the boundary has already
-        // refused anything outside it; the clamp is the server-side bound that does
-        // not depend on that, so a page can never exceed MAX_PAGE_SIZE items.
-        let page_size = input
-            .max_results
-            .map_or(DEFAULT_MAX_RESULTS, |max| max.max(1) as usize)
-            .clamp(1, MAX_PAGE_SIZE);
+        // The page-size rule itself lives in `crate::state`, shared by every paginated
+        // operation of this service; this operation contributes only its own default
+        // and ceiling.
+        let page_size = crate::state::resolve_page_size(
+            input.max_results,
+            DEFAULT_MAX_RESULTS,
+            MAX_PAGE_SIZE,
+        );
 
         let mut state = state.lock();
         state.settle_due_transitions(std::time::Instant::now());
