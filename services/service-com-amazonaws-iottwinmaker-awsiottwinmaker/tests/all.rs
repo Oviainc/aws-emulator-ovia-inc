@@ -143,6 +143,9 @@ mod sync_job_listing;
 #[path = "all/sync_job_role_trust.rs"]
 mod sync_job_role_trust;
 
+#[path = "all/sync_resource_listing.rs"]
+mod sync_resource_listing;
+
 #[path = "all/time_series_property_refusal.rs"]
 mod time_series_property_refusal;
 
