@@ -3964,10 +3964,10 @@ pub struct ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
     pub invoices: BTreeMap<String, Invoice>,
     /// An `@idempotencyToken` `clientToken` to the resource it created, so a
     /// replayed create answers with the first resource instead of minting a
-    /// second one. `CreateAgreementRequest` keys it by the token itself;
-    /// `SendAgreementCancellationRequest` keys it by [`idempotency_key`], which
-    /// no `ClientToken` (`^[a-zA-Z0-9-]+$`) can imitate, so the two creates
-    /// cannot collide on one token.
+    /// second one. Every entry is keyed by [`idempotency_key`] — the operation
+    /// that minted the token and the token itself — because a `clientToken` is
+    /// unique within its own create rather than across the service, so one
+    /// create's token can never name another create's resource.
     pub idempotency: HashMap<String, String>,
     /// The counter every id this service mints is drawn from.
     pub id_sequence: u64,
