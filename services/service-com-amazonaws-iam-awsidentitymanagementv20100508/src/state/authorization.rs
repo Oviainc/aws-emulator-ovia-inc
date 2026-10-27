@@ -126,6 +126,9 @@ pub const LIST_ROLE_TAGS: &str = "iam:ListRoleTags";
 /// `iam:ListPolicyTags`.
 pub const LIST_POLICY_TAGS: &str = "iam:ListPolicyTags";
 
+/// `iam:TagPolicy`.
+pub const TAG_POLICY: &str = "iam:TagPolicy";
+
 /// `iam:UntagPolicy`.
 pub const UNTAG_POLICY: &str = "iam:UntagPolicy";
 

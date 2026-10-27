@@ -41,6 +41,11 @@ pub mod authorization;
 /// delivered telemetry it stores there.
 pub mod cw_log_delivery;
 
+/// The modelled constraints this service applies itself — the ones whose `@pattern` the
+/// boundary walk cannot compile — and the words every constraint refusal of this service
+/// is stated in.
+pub mod validation;
+
 /// This service's ARN namespace / sigv4 signing name (`OPERATIONS.md`,
 /// `## Wire protocol`: both are `rum`).
 pub const ARN_NAMESPACE: &str = "rum";
@@ -1756,55 +1761,7 @@ pub fn tagged_resource_not_found() -> ResourceNotFoundException {
 /// own frontend uses for an invalid request.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
-/// The `@pattern` the model declares on `TagKey` — the key shape of `TagMap`, which every
-/// `Tags` member of this service targets.
-///
-/// Source: `smithy_query(query="shape", shape="TagKey")`. It is the text a refusal quotes;
-/// the two halves applied below are [`TAG_KEY_RESERVED_PREFIX`] and the character class
-/// [`is_tag_key_character`] tests membership of. Its length bounds are
-/// [`TAG_KEY_MIN_LENGTH`] and [`TAG_KEY_MAX_LENGTH`].
-const TAG_KEY_PATTERN: &str = "^(?!aws:)[a-zA-Z+-=._:/]+$";
-
-/// The prefix [`TAG_KEY_PATTERN`]'s leading `(?!aws:)` excludes: AWS's reserved tag
-/// namespace. Applied as a `starts_with`, which is what a negative lookahead anchored at
-/// the start of the pattern says.
-const TAG_KEY_RESERVED_PREFIX: &str = "aws:";
-
-/// Whether `character` is one the class `[a-zA-Z+-=._:/]` of [`TAG_KEY_PATTERN`] admits.
-///
-/// That class admits the ASCII letters, `_`, and — because `+-=` inside a character class
-/// is the RANGE from `+` (0x2B) to `=` (0x3D) — every character in that range: the
-/// digits, `,`, `-`, `.`, `/`, `:`, `;`, `<` and `=`. The `.`, `:` and `/` the class also
-/// lists explicitly are inside that range too, so the three terms below are the whole
-/// class.
-///
-/// A character class is a MEMBERSHIP test, not a pattern language, so it is written
-/// directly: that keeps the check linear in the key's length by construction (no regex
-/// engine on a path that reads request text). The class is pinned from the outside rather
-/// than by this reading of it: the suites' `ADMITTED_TAG_KEYS` table has a row per
-/// character class the model admits and `REJECTED_TAG_KEYS` a row per way a key can fall
-/// outside it, both sourced from `smithy_query`.
-fn is_tag_key_character(character: char) -> bool {
-    character.is_ascii_alphabetic() || character == '_' || ('+'..='=').contains(&character)
-}
-
-/// Whether `key` satisfies the modelled `TagKey` `@pattern`: it is outside AWS's reserved
-/// `aws:` namespace AND it is a non-empty run of characters the class admits — which is
-/// exactly what the pattern's lookahead, class and `+` quantifier say between the `^` and
-/// the `$`.
-fn tag_key_matches_pattern(key: &str) -> bool {
-    !key.starts_with(TAG_KEY_RESERVED_PREFIX)
-        && !key.is_empty()
-        && key.chars().all(is_tag_key_character)
-}
-
-/// `TagKey`'s modelled `@length`: 1 to 128 CHARACTERS (a `@length` on a string counts
-/// characters, not bytes).
-/// Source: `smithy_query(query="shape", shape="TagKey")`.
-const TAG_KEY_MIN_LENGTH: usize = 1;
-const TAG_KEY_MAX_LENGTH: usize = 128;
-
-/// Why the key shape of `TagMap` rejects the key at `path`, worded as the framework's own
+/// Why the key shape of `TagMap` rejects the key at `path`, worded as the FRAMEWORK's own
 /// validation envelope — or `None` when the key satisfies every constraint `TagKey`
 /// declares.
 ///
@@ -1813,34 +1770,19 @@ const TAG_KEY_MAX_LENGTH: usize = 128;
 /// of the entry's VALUE and moves on (`write_leaf` in
 /// `vendor/smithy-schema-server/src/constraints.rs`: "the key itself is not a constrained
 /// leaf") — and `TagKey`'s `@pattern` would be unapplied even on a path that did validate
-/// it, because it opens with the negative lookahead `(?!aws:)`, the validator compiles a
-/// `@pattern` with the `regex` crate, which has no look-around, and it treats a pattern it
-/// cannot compile as matching (`pattern_matches` there). So the constraints the model
-/// declares on a tag key would otherwise never be applied at all.
+/// it, because it opens with a negative lookahead the validator's engine cannot compile.
+/// So the constraints the model declares on a tag key would otherwise never be applied at
+/// all.
 ///
-/// The checks ARE those constraints: the `@length` bounds and, through
-/// [`tag_key_matches_pattern`], both halves of the `@pattern`, so a clause — which quotes
-/// the model's own source text — cannot state a constraint this function does not apply.
-/// They are taken in the order the framework's own leaf walk takes them, length before
-/// pattern, and the first one a key fails is the one reported. `path` is the dotted member
+/// The CHECK is [`validation`]'s, which is where this service applies a modelled `@length`
+/// and `@pattern` itself; the WORDS stay the framework's. A tag key is only ever refused by
+/// the tagging frontend, whose wording is not this service's (see that module's docs and
+/// `crate::service`), so the clause here is the one the boundary would have produced —
+/// quoting the model's pattern as written, anchors and all. `path` is the dotted member
 /// path the framework would have reported for a `TagMap` entry, and the key is echoed into
 /// the clause exactly as the caller sent it.
 fn tag_key_violation(path: &str, key: &str) -> Option<String> {
-    let length = key.chars().count();
-    let kind = if length < TAG_KEY_MIN_LENGTH {
-        ::aws_smithy_schema_server::ViolationKind::MinLength(TAG_KEY_MIN_LENGTH as i64)
-    } else if length > TAG_KEY_MAX_LENGTH {
-        ::aws_smithy_schema_server::ViolationKind::MaxLength(TAG_KEY_MAX_LENGTH as i64)
-    } else if !tag_key_matches_pattern(key) {
-        ::aws_smithy_schema_server::ViolationKind::Pattern(TAG_KEY_PATTERN.to_string())
-    } else {
-        return None;
-    };
-    let violation = ::aws_smithy_schema_server::Violation {
-        path: path.to_string(),
-        kind,
-        value: Some(key.to_string()),
-    };
+    let violation = validation::string_violation(validation::ConstrainedString::TagKey, path, key)?;
     // `envelope` answers `None` only for an EMPTY violation list, which the one-element
     // slice below can never be. Fail closed anyway: a refused key stays refused, carrying
     // the clause on its own rather than no message at all.
