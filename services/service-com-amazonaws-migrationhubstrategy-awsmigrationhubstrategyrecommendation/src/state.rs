@@ -2213,36 +2213,92 @@ pub const NOTHING_TO_REPORT: &str = "Something went wrong, please try again late
 /// the boundary validator passes a non-conforming name and the handler enforces it.
 pub const BUCKET_NAME_PREFIX: &str = "migrationhub-strategy-";
 
-/// The refusal a bucket member naming a bucket this service cannot use earns, word for
+/// The refusal a bucket member naming a bucket this service may not REACH earns, word for
 /// word as Strategy Recommendations words it.
 ///
-/// It is the PERMISSIONS refusal: the service reaches the account's bucket across accounts
-/// and names the prefix a bucket it may reach has to carry, which is what the caller has to
-/// fix — a permanent condition, and deliberately not the not-found one, which says the
-/// service could not reach a bucket that may appear later and which a caller is expected to
-/// retry. The sentence names the prefix without its trailing separator, as the service
-/// states it, and interpolates nothing from the request: the caller already holds the name
-/// it sent.
+/// It is the PERMISSIONS refusal, for a bucket that IS there and that the service may not
+/// touch: it names the prefix a bucket it may reach has to carry, which is what the caller
+/// has to fix — a permanent condition, and so a different one from
+/// [`bucket_not_found`], which says the account holds no such bucket and which a caller
+/// fixes by creating it. The sentence names the prefix without its trailing separator, as
+/// the service states it, and interpolates nothing from the request: the condition is about
+/// the prefix and not about the name that missed it.
 pub const BUCKET_PERMISSIONS_REFUSAL: &str = "The service doesn't have permissions to \
      specified S3 Bucket Service doesn't hv permissions to access bucket, please make sure \
      bucket name begins with \"migrationhub-strategy\". [S3PermissionsIsIncorrect]";
 
-/// Refuse a bucket naming one this service cannot use.
+/// That refusal as the shape it is answered with.
+pub fn bucket_permissions_incorrect() -> ValidationException {
+    ValidationException {
+        message: Some(BUCKET_PERMISSIONS_REFUSAL.to_string()),
+    }
+}
+
+/// The refusal a bucket member naming a bucket the account does not hold earns, word for
+/// word as Strategy Recommendations words it.
+///
+/// Its one variable part is the bucket name, taken from the member that failed the check,
+/// so a caller that supplied both bucket members is told WHICH name resolved to nothing.
+/// It is the condition a caller fixes by creating or correcting the bucket and retrying,
+/// which is why it is reported separately from [`BUCKET_PERMISSIONS_REFUSAL`].
+pub fn bucket_not_found(bucket: &str) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "S3 bucket \"{bucket}\" does not exist or is not accessible [S3BucketNotFound]"
+        )),
+    }
+}
+
+/// Whether the account holds a bucket named `bucket`, asked of the emulator's own Amazon S3
+/// service through the in-process callback.
+///
+/// A HEAD of the bucket is S3's own "is it there, and can I reach it" question, so the
+/// answer is S3's own — read through the same seam an import's file read goes through
+/// ([`s3_client`]) rather than from a second copy of S3's inventory kept here, which
+/// nothing would write. A HEAD that cannot be answered at all is not a bucket this service
+/// can use either, which is what the not-found refusal's own wording states.
+pub async fn bucket_is_reachable(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    bucket: &str,
+) -> bool {
+    s3_client(ctx, region)
+        .head_bucket()
+        .bucket(bucket)
+        .send()
+        .await
+        .is_ok()
+}
+
+/// Refuse a bucket member naming one this service cannot use, with the refusal of the
+/// condition that actually holds.
 ///
 /// `Ok` for an absent member (nothing was named) and for a name carrying
-/// [`BUCKET_NAME_PREFIX`]; otherwise the `ValidationException` (HTTP 400) the service
-/// answers for a bucket it may not reach ([`BUCKET_PERMISSIONS_REFUSAL`]).
+/// [`BUCKET_NAME_PREFIX`] — the namespace this service's own role provisions buckets in, so
+/// a name inside it is taken to name a bucket the service can reach rather than refusing
+/// every start call and leaving the resource unreachable.
 ///
-/// The prefix is the whole of the check: it is the one property of a name this check can
-/// decide without a lookup, and a conforming name is taken to name a bucket the service
-/// can use rather than refusing every start call and leaving the resource unreachable.
-pub fn check_bucket_usable(value: Option<&str>) -> Result<(), ValidationException> {
-    match value {
-        Some(bucket) if !bucket.starts_with(BUCKET_NAME_PREFIX) => Err(ValidationException {
-            message: Some(BUCKET_PERMISSIONS_REFUSAL.to_string()),
-        }),
-        _ => Ok(()),
+/// For any OTHER name the condition is decided by looking the bucket up
+/// ([`bucket_is_reachable`]), because the two refusals tell a caller to do opposite things:
+/// a bucket the account does not hold is reported as the missing resource it is
+/// ([`bucket_not_found`], naming the bucket the request sent), and one the account does
+/// hold is reported as the permission failure its name earns
+/// ([`BUCKET_PERMISSIONS_REFUSAL`]). Both are `ValidationException` (HTTP 400).
+pub async fn check_bucket_usable(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    value: Option<&str>,
+) -> Result<(), ValidationException> {
+    let Some(bucket) = value else {
+        return Ok(());
+    };
+    if bucket.starts_with(BUCKET_NAME_PREFIX) {
+        return Ok(());
     }
+    if bucket_is_reachable(ctx, region, bucket).await {
+        return Err(bucket_permissions_incorrect());
+    }
+    Err(bucket_not_found(bucket))
 }
 
 /// The bounds `StartImportFileTaskRequest$name` declares: `@length(min: 1, max: 50)`

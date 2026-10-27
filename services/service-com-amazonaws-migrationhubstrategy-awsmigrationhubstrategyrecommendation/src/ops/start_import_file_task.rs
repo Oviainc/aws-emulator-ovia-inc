@@ -188,17 +188,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::check_bucket_name(input.s3bucket_for_report_data.as_deref())
             .map_err(StartImportFileTaskErrorModeled::ValidationException)?;
 
-        // The same documented prefix rule as `StartAssessment`, on this operation's own
-        // bucket members: `S3Bucket` is where the import file is read from and
-        // `s3bucketForReportData` where the import results would be uploaded. Both are
-        // only held to the prefix — the model marks `S3Bucket` `@required`, so the
-        // boundary validator has already refused its absence, and the report bucket is
-        // optional. Both run before the task is minted.
-        crate::state::check_bucket_usable(Some(input.s3_bucket.as_str()))
-            .map_err(StartImportFileTaskErrorModeled::ValidationException)?;
-        crate::state::check_bucket_usable(input.s3bucket_for_report_data.as_deref())
-            .map_err(StartImportFileTaskErrorModeled::ValidationException)?;
-
         // The same enum rule as `StartAssessment`, on this operation's own
         // enum-targeting members: `dataSourceType` (`DataSourceType`) and, one level
         // down, each `groupId` entry's `name` (`GroupName`). An undeclared value is
@@ -218,6 +207,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // for: the task is started there and is reported only by reads signed for that
         // same Region.
         let region = crate::state::request_region(ctx.parts());
+
+        // The same bucket rule as `StartAssessment`, on this operation's own bucket
+        // members: `S3Bucket` is where the import file is read from and
+        // `s3bucketForReportData` where the import results would be uploaded. A bucket
+        // this service cannot use is refused by the condition that holds
+        // ([`crate::state::check_bucket_usable`]) — the account holds no bucket of that
+        // name, or it holds one the service may not be reached under — and the model marks
+        // `S3Bucket` `@required`, so the boundary validator has already refused its
+        // absence. Both run before the task is minted, and before the store is locked:
+        // the lookup is an in-process call into the emulator's own S3 service.
+        crate::state::check_bucket_usable(ctx, &region, Some(input.s3_bucket.as_str()))
+            .await
+            .map_err(StartImportFileTaskErrorModeled::ValidationException)?;
+        crate::state::check_bucket_usable(ctx, &region, input.s3bucket_for_report_data.as_deref())
+            .await
+            .map_err(StartImportFileTaskErrorModeled::ValidationException)?;
 
         // The import file itself: `S3Bucket`/`s3key` name "the S3 bucket where the import
         // file is located" and "the Amazon S3 key name of the import file", so the import
