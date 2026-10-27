@@ -95,7 +95,7 @@ fn every_header_byte() -> Vec<u8> {
 
 /// Render a case's octets for an assertion message without pretending they are
 /// text.
-fn shown(octets: &[u8]) -> String {
+pub(crate) fn shown(octets: &[u8]) -> String {
     octets
         .iter()
         .map(|byte| format!("{byte:02x}"))

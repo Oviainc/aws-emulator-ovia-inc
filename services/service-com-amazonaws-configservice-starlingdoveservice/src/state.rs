@@ -715,6 +715,17 @@ pub const GET_CONFORMANCE_PACK_COMPLIANCE_DETAILS_PAGE_SIZE: usize = 100;
 /// what "the default is maximum" names.
 pub const AGGREGATE_CONFORMANCE_PACK_COMPLIANCE_SUMMARY_PAGE_SIZE: usize = 100;
 
+/// How many conformance pack compliance records one
+/// `DescribeAggregateComplianceByConformancePacks` page carries when the request does
+/// not ask for a page size, for the same reason as
+/// [`AGGREGATE_CONFORMANCE_PACK_COMPLIANCE_SUMMARY_PAGE_SIZE`]: `Limit` defaults to 0,
+/// which is "unspecified" rather than "no results"
+/// (`DescribeAggregateComplianceByConformancePacksRequest$Limit`: "The maximum number of
+/// conformance packs compliance details returned on each page. The default is maximum.
+/// If you specify 0, Config uses the default"), and 100 is that member's own maximum
+/// (`Limit`, range 0..100), which is what "the default is maximum" names.
+pub const AGGREGATE_COMPLIANCE_BY_CONFORMANCE_PACKS_PAGE_SIZE: usize = 100;
+
 /// Every `ComplianceType` a conformance pack's EVALUATION filter may name
 /// (`ConformancePackEvaluationFilters$ComplianceType`: "The allowed values are COMPLIANT
 /// and NON_COMPLIANT. INSUFFICIENT_DATA is not supported").

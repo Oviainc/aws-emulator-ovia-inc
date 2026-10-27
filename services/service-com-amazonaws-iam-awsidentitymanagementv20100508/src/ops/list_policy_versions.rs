@@ -224,11 +224,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // account's.
         let store = state.lock();
         let Some(resolved) = store.resolve_policy(&input.policy_arn) else {
-            if crate::state::is_aws_managed_policy_arn(&input.policy_arn) {
-                return Err(crate::scaffolded::Scaffolded::NotImplemented(
-                    crate::state::uncarried_aws_managed_policy(&input.policy_arn, "versions"),
-                ));
-            }
+            // An ARN this service can resolve no policy under "referenced a resource
+            // entity that does not exist" — the refusal this operation models for a
+            // policy it cannot report, whichever namespace the ARN is in, since a code
+            // outside its modelled set is one no SDK has a branch for.
             return Err(ListPolicyVersionsErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
                     message: Some(crate::state::policy_not_found(&input.policy_arn)),

@@ -4,6 +4,12 @@
 //! Reports one stored revision of an MSK configuration: the `server.properties`
 //! body, description and instant that revision was stored with.
 //!
+//! An `Arn` this endpoint resolves to no configuration — malformed, absent,
+//! already deleted, or another region's — is the configuration family's one
+//! unresolvable-reference `BadRequestException`
+//! ([`crate::state::configuration_arn_not_found`]), the same refusal the delete
+//! and the other configuration readers answer.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -159,20 +165,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
         let region = crate::state::request_region(ctx.parts());
-        if !crate::state::is_configuration_arn(&input.arn) {
-            return Err(
-                DescribeConfigurationRevisionErrorModeled::BadRequestException(
-                    BadRequestException {
-                        invalid_parameter: Some("Arn".to_string()),
-                        message: Some(format!(
-                            "{} is not a valid Amazon MSK configuration ARN.",
-                            input.arn
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
+
+        // Reporting only: nothing here writes. A configuration is stored
+        // `ACTIVE` and its revisions never change once stored, so the clock owes
+        // this read no transition to materialise.
+        let state = state.lock();
+        // ONE condition, one refusal: an `Arn` that resolves to no
+        // configuration of this endpoint's region is the configuration family's
+        // unresolvable-reference bad request, whether it is malformed, absent,
+        // already deleted, or another region's. The configuration is resolved
+        // FIRST, so a request that names no configuration is told that rather
+        // than being judged on the revision it asked of nothing.
+        let Some(configuration) = state.configuration_in(&region, &input.arn) else {
+            return Err(DescribeConfigurationRevisionErrorModeled::BadRequestException(
+                crate::state::configuration_arn_not_found(),
+            )
+            .into());
+        };
         // Revision numbers start at 1 (the revision a create stores), so a
         // number below that identifies no revision of any configuration — a
         // request this operation cannot parse rather than a revision it cannot
@@ -191,23 +200,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
-
-        // Reporting only: nothing here writes. A configuration is stored
-        // `ACTIVE` and its revisions never change once stored, so the clock owes
-        // this read no transition to materialise.
-        let state = state.lock();
-        let Some(configuration) = state.configuration_in(&region, &input.arn) else {
-            return Err(
-                DescribeConfigurationRevisionErrorModeled::NotFoundException(NotFoundException {
-                    invalid_parameter: Some("Arn".to_string()),
-                    message: Some(format!(
-                        "No configuration exists in {region} with the ARN {}",
-                        input.arn
-                    )),
-                })
-                .into(),
-            );
-        };
         // The configuration is there but holds no such revision, so the refusal
         // names the member actually at fault.
         let Some(revision) = configuration.revision(input.revision) else {

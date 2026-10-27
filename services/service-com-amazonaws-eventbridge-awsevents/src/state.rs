@@ -3857,15 +3857,12 @@ const ENVELOPE_LEVELS: usize = 1;
 /// `None` when the archived text is not a JSON object, which is text no rule
 /// could be matched against; the caller replays nothing for it rather than
 /// inventing an envelope. Reading the text DESCENDS into it, so the published
-/// [`MAX_DETAIL_DEPTH`] is charged here for the reason [`parse_detail`] gives,
-/// allowing for the levels the envelope itself adds, and the stack that depth
-/// needs is provided the same way ([`parse_json_document`]).
+/// [`MAX_DETAIL_DEPTH`] is charged for it and the stack that depth needs is
+/// provided — which is what [`parse_delivered_event`] is, so the bound on an
+/// event's text is stated once and holds for a replayed envelope as it does for
+/// a delivered one.
 pub fn replayed_envelope(archived: &str, replay_name: &str) -> Option<::serde_json::Value> {
-    let depth = json_nesting_depth(archived);
-    if depth > MAX_DETAIL_DEPTH + ENVELOPE_LEVELS {
-        return None;
-    }
-    let mut envelope = parse_json_document(archived, depth)?;
+    let mut envelope = parse_delivered_event(archived)?;
     envelope.as_object_mut()?.insert(
         REPLAY_NAME_FIELD.to_string(),
         ::serde_json::Value::String(replay_name.to_string()),
@@ -4468,6 +4465,26 @@ pub fn parse_detail(detail: &str) -> Option<::serde_json::Value> {
     }
     let value = parse_json_document(detail, depth)?;
     value.is_object().then_some(value)
+}
+
+/// The text a target was DELIVERED, as the parse tree a delivery reads it from.
+///
+/// A Kinesis data stream target's `PartitionKeyPath` selects a value out of the
+/// event the target is handed, so the delivery has to read that text back as a
+/// document. Any JSON document is one — the handover may carry the target's own
+/// `Input` rather than the event envelope — so the form is not narrowed here;
+/// `None` for text that is not a single JSON document, or that nests past the
+/// published bound, allowing for the level the envelope wraps a `Detail` in.
+///
+/// The depth is charged with the same byte walk [`parse_detail`] uses and before
+/// the parser is handed anything, and the stack that depth needs is provided
+/// ([`parse_json_document`]) — for the reasons [`parse_detail`] states.
+pub fn parse_delivered_event(text: &str) -> Option<::serde_json::Value> {
+    let depth = json_nesting_depth(text);
+    if depth > MAX_DETAIL_DEPTH + ENVELOPE_LEVELS {
+        return None;
+    }
+    parse_json_document(text, depth)
 }
 
 /// One clause of a `ValidationException` message: the value that was rejected,

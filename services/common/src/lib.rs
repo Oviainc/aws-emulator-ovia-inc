@@ -253,6 +253,10 @@ pub mod json_document;
 /// line and column — for every service whose refusal carries its JSON parser's own
 /// diagnostic.
 pub mod json_parse_fault;
+/// The ONE evaluation of a caller-supplied JSON path that has to name a SINGLE value,
+/// for every service whose API takes such a path as a string — bounded to a reference
+/// path, so what it costs is its segment count rather than the size of the document.
+pub mod json_reference_path;
 /// The ONE reading of a compact JWS (a JSON Web Token) a service is handed as a
 /// caller-supplied string, for every service that has to decide whether a value is a token
 /// at all before it reads a claim out of it.

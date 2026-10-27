@@ -43,6 +43,8 @@ mod delete_stack_instances;
 mod detect_resource_drift;
 #[path = "all/drift_and_resource_reads.rs"]
 mod drift_and_resource_reads;
+#[path = "all/dynamic_reference_names.rs"]
+mod dynamic_reference_names;
 #[path = "all/dynamic_references.rs"]
 mod dynamic_references;
 #[path = "all/ec2_network_identifiers_feed_rds.rs"]

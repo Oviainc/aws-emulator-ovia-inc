@@ -16,9 +16,11 @@
 //! configuration ARN, absent, already deleted, or belonging to another region — is a
 //! `BadRequestException` carrying
 //! [`crate::state::CONFIGURATION_ARN_NOT_FOUND_MESSAGE`], and NOT the
-//! `NotFoundException` the configuration readers answer: this delete reports an ARN it
-//! cannot resolve as a bad request. One lookup decides it, since only an ARN the
-//! registry minted can resolve at all.
+//! `NotFoundException` the other resource families answer: every operation of the
+//! configuration family, this delete included, reports an ARN it cannot resolve as a
+//! bad request, through the one [`crate::state::configuration_arn_not_found`]
+//! envelope. One lookup decides it, since only an ARN the registry minted can resolve
+//! at all.
 //!
 //! ## Shape of an operation
 //!
@@ -174,15 +176,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // lookup the readers use, so a delete and a describe agree on which
         // configurations this endpoint holds.
         if state.configuration_in(&region, &input.arn).is_none() {
-            return Err(
-                DeleteConfigurationErrorModeled::BadRequestException(BadRequestException {
-                    invalid_parameter: Some("Arn".to_string()),
-                    message: Some(
-                        crate::state::CONFIGURATION_ARN_NOT_FOUND_MESSAGE.to_string(),
-                    ),
-                })
-                .into(),
-            );
+            return Err(DeleteConfigurationErrorModeled::BadRequestException(
+                crate::state::configuration_arn_not_found(),
+            )
+            .into());
         }
 
         // A cluster created with this configuration still uses it, so the

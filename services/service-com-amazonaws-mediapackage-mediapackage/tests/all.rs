@@ -47,6 +47,8 @@ mod origin_endpoint_defaults;
 mod origin_endpoint_durations;
 #[path = "all/playback_path_is_one_rule.rs"]
 mod playback_path_is_one_rule;
+#[path = "all/refusal_order.rs"]
+mod refusal_order;
 #[path = "all/region_isolation.rs"]
 mod region_isolation;
 #[path = "all/reserved_and_malformed_tags.rs"]

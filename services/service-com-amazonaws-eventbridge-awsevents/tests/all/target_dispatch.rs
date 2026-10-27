@@ -41,11 +41,11 @@ use service_com_amazonaws_eventbridge_awsevents::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every request below is signed for.
-const REGION: &str = "eu-west-2";
+pub(crate) const REGION: &str = "eu-west-2";
 
 /// The source and detail type the rules below match on.
-const SOURCE: &str = "com.demo.orders";
-const DETAIL_TYPE: &str = "Order Created";
+pub(crate) const SOURCE: &str = "com.demo.orders";
+pub(crate) const DETAIL_TYPE: &str = "Order Created";
 const DETAIL: &str = r#"{"orderId":"A-1","amount":7}"#;
 
 /// A state machine definition that terminates on its own, so an execution
@@ -84,6 +84,9 @@ pub(crate) fn emulator() -> Emulator {
         service_com_amazonaws_cloudwatch_graniteserviceversion20100801::EmulatedService::new(
             Arc::clone(&engine),
         ),
+    );
+    router.register_service(
+        service_com_amazonaws_kinesis_kinesis_20131202::EmulatedService::new(Arc::clone(&engine)),
     );
     Emulator { router, engine }
 }
@@ -162,6 +165,58 @@ async fn cloudwatch(emulator: &Emulator, operation: &str, body: &Value) -> (u16,
         body,
     )
     .await
+}
+
+/// One Kinesis call, asserting a 200 and answering the body: the data plane a
+/// stream target's records are read back from (`Kinesis_20131202`, awsJson1_1).
+pub(crate) async fn kinesis(
+    emulator: &Emulator,
+    case: &str,
+    operation: &str,
+    body: &Value,
+) -> Value {
+    let (status, answer) = rpc(
+        emulator,
+        "kinesis",
+        "Kinesis_20131202",
+        "1.1",
+        operation,
+        body,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case}: {operation} answered {status} {answer}"
+    );
+    answer
+}
+
+/// Publish one entry per `details` text, each with the source and detail type the
+/// rules here match on, and answer the `EventId` of each in the request's order.
+pub(crate) async fn publish_details(emulator: &Emulator, details: &[String]) -> Vec<String> {
+    let entries: Vec<Value> = details
+        .iter()
+        .map(|detail| json!({ "Source": SOURCE, "DetailType": DETAIL_TYPE, "Detail": detail }))
+        .collect();
+    let (status, body) = events(emulator, "PutEvents", &json!({ "Entries": entries })).await;
+    assert_eq!(status, 200, "PutEvents answered {status} {body}");
+    assert_eq!(
+        body["FailedEntryCount"],
+        json!(0),
+        "PutEvents reported a failed entry: {body}"
+    );
+    body["Entries"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|entry| {
+            entry["EventId"]
+                .as_str()
+                .unwrap_or_else(|| panic!("no EventId in {entry}"))
+                .to_string()
+        })
+        .collect()
 }
 
 /// Percent-encode one form value the way an AWS SDK encodes an `awsQuery` body.
@@ -558,7 +613,7 @@ fn identity_policy(action: &str) -> String {
 
 /// A role trusting `principal`, carrying an inline policy allowing `allowed`
 /// when a row names one; answered with the ARN IAM persisted.
-async fn given_role(
+pub(crate) async fn given_role(
     emulator: &Emulator,
     name: &str,
     principal: &str,
