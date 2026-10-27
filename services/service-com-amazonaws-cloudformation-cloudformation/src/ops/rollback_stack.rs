@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RollbackStack
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RollbackStack`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: rolls a stack whose last operation FAILED back to its last known stable
+//! state — `ROLLBACK_IN_PROGRESS` and then the terminal `ROLLBACK_COMPLETE` for a stack
+//! that has no such state (the resources the failed create had provisioned are deleted
+//! again in the services that own them), `UPDATE_ROLLBACK_IN_PROGRESS` and then
+//! `UPDATE_ROLLBACK_COMPLETE` for one that has (the configuration in force before the
+//! failed update is put back there). A resource an owning service refuses to put back or to
+//! delete leaves the stack in the failed status for that rollback, rather than reporting a
+//! rollback that did not happen.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RollbackStack::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A stack in any other status is refused (HTTP 400 `ValidationError`), and so is a request
+//! whose `ClientRequestToken` an operation on that stack already claimed (the modelled
+//! `TokenAlreadyExistsException`).
 //!
 //! ## Shape of an operation
 //!
@@ -84,6 +87,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::status;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -153,18 +157,190 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RollbackStack` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RollbackStackErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RollbackStack"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no stack to roll back, and nothing
+            // was written.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("RollbackStack"));
+        };
+        // "The Amazon Resource Name (ARN) of an IAM role that CloudFormation assumes to
+        // rollback the stack": the rollback runs as that role, so one CloudFormation cannot
+        // assume is refused before the stack is touched — the same check `UpdateStack` makes.
+        crate::state::refuse_unassumable_role(&*self.engine, input.role_arn.as_deref())?;
+        let now = ::std::time::SystemTime::now();
+        // A stack name or id names a stack only in the Region the request was signed for:
+        // the same name in another Region is another stack, and this call must not roll it
+        // back.
+        let request_region = crate::state::request_region(ctx.parts());
+        // What a rollback has to put back is measured against the configuration in force, so
+        // a rollback the failure of an earlier update already made due is carried out first:
+        // it was owed at the instant that update failed, whether or not anybody called
+        // (`crate::state::settle_due_rollbacks`).
+        crate::state::settle_due_rollbacks(ctx, &*self.engine).await;
+
+        // The store lock is taken for the write and RELEASED at the end of this block: the
+        // calls that put the resources back — or delete them — run after it, and each of
+        // those reaches another service's own handler, which takes that service's lock.
+        let (stack_id, region, operation_id, provenance, work) = {
+            let mut store = state.lock();
+            store.settle(now);
+
+            let Some(previous) = store
+                .resolve(&request_region, &input.stack_name)
+                .filter(|stack| stack.is_live())
+            else {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::changed_stack_does_not_exist(&input.stack_name),
+                ));
+            };
+            // "Rolls back the specified stack to the last known stable state from
+            // CREATE_FAILED or UPDATE_FAILED stack statuses": a stack in any other status has
+            // no failed operation of that kind to clear up, so it is refused and left exactly
+            // where it is.
+            if previous.pending.is_some()
+                || !crate::state::status_takes_a_rollback(&previous.status)
+            {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::stack_cannot_be_rolled_back(
+                        &previous.stack_id,
+                        &previous.status,
+                    ),
+                ));
+            }
+            // "A unique identifier for this RollbackStack request": a token an operation on
+            // this stack already claimed names THAT operation, so presenting it here is the
+            // duplicate submission the modelled `TokenAlreadyExistsException` refuses, before
+            // anything is rolled back.
+            if let Some(message) = crate::state::reused_client_request_token(
+                previous,
+                input.client_request_token.as_deref(),
+            ) {
+                return Err(RollbackStackErrorModeled::TokenAlreadyExistsException(
+                    TokenAlreadyExistsException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+
+            let operation_id = crate::state::new_operation_id();
+            // "All events initiated by a given stack operation are assigned the same client
+            // request token": the caller's token when it named one, otherwise the one
+            // CloudFormation assigns the operation itself.
+            let client_request_token = input
+                .client_request_token
+                .clone()
+                .unwrap_or_else(crate::state::new_client_request_token);
+            // Resolved again for the write, this time mutably, in the Region the request is
+            // signed for.
+            let Some(stack) = store.resolve_mut(&request_region, &input.stack_name) else {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::changed_stack_does_not_exist(&input.stack_name),
+                ));
+            };
+            // The configuration this rollback runs under: the role whose credentials it makes
+            // its calls with ("CloudFormation uses the role's credentials to make calls on
+            // your behalf"), the deployment configuration it was asked for, and
+            // `RetainExceptOnCreate` as the request states it — which `DescribeStacks`
+            // reports and which every resource of this stack is already deleted under, since
+            // this service implements no `DeletionPolicy` for one to override.
+            if let Some(role_arn) = &input.role_arn {
+                stack.role_arn = Some(role_arn.clone());
+            }
+            if let Some(config) = input.deployment_config.as_ref() {
+                stack.deployment_config = crate::state::stored_deployment_config(Some(config));
+            }
+            if let Some(retain_except_on_create) = input.retain_except_on_create {
+                stack.retain_except_on_create = Some(retain_except_on_create);
+            }
+            stack.client_request_token = Some(client_request_token.clone());
+            // The rollback starts now and settles into its own terminal status once the clock
+            // makes that due; what it has to ask the owning services for comes back here.
+            let work = stack.begin_requested_rollback(
+                now,
+                operation_id.clone(),
+                client_request_token,
+            );
+            (
+                stack.stack_id.clone(),
+                // The stack's OWN Region, not the one this request was signed for: the
+                // resources live in the Region the stack lives in, so that is where they
+                // have to be put back or deleted.
+                stack.region.clone(),
+                operation_id,
+                stack.provenance(),
+                work,
+            )
+        };
+
+        let output = RollbackStackOutput {
+            stack_id: Some(stack_id.clone()),
+            operation_id: Some(operation_id),
+        };
+        match work {
+            // No last known stable state: "this operation will delete a stack if it doesn't
+            // contain a last known stable state" — what the failed create had provisioned is
+            // removed again in the services that own it, re-asked while one of them has not
+            // let a resource go yet, exactly as a failed create's own rollback removes it.
+            crate::state::RequestedRollback::Discard(resources) => {
+                let deleted = crate::state::provisioning::unwind(ctx, &region, &resources).await;
+                let mut store = state.lock();
+                if let Some(stack) = store.resolve_mut(&request_region, &stack_id) {
+                    // The resources' own transitions come BEFORE the stack's terminal event:
+                    // the event stream is what the rollback did, in the order it did it.
+                    stack.schedule_resource_events(&deleted.transitions);
+                    stack.record_materialised_resources(deleted.resources);
+                    if let Some(failure) = deleted.failure {
+                        // A resource the owning service refused to delete: the stack stops in
+                        // ROLLBACK_FAILED with that service's own refusal as the reason,
+                        // rather than reporting a rollback that removed what it did not.
+                        stack.fail_transition(
+                            ::std::time::SystemTime::now(),
+                            status::ROLLBACK_FAILED,
+                            failure,
+                        );
+                    }
+                }
+            }
+            // A last known stable state: the configuration in force before the failed
+            // operation is declared again in the services that own the resources, against
+            // what that operation left there.
+            crate::state::RequestedRollback::Revert(plan) => {
+                let reverted = crate::state::provisioning::reconcile(
+                    ctx,
+                    &region,
+                    &provenance,
+                    plan.previous.clone(),
+                    &plan.applied,
+                )
+                .await;
+                let mut store = state.lock();
+                if let Some(stack) = store.resolve_mut(&request_region, &stack_id) {
+                    stack.schedule_resource_events(&reverted.transitions);
+                    stack.record_materialised_resources(reverted.resources);
+                    // What the rollback left each resource in, which is what a client reads
+                    // back — and what says which resource a resumed rollback may skip.
+                    stack.record_rollback_resource_statuses(
+                        &reverted.transitions,
+                        ::std::time::SystemTime::now(),
+                    );
+                    if let Some(failure) = reverted.failure {
+                        // "A stack goes into the UPDATE_ROLLBACK_FAILED state when
+                        // CloudFormation can't roll back all changes after a failed stack
+                        // update": a resource the owning service would not put back leaves the
+                        // stack there — the state `ContinueUpdateRollback` resumes from — and
+                        // what those services are still holding is kept, because that is what
+                        // a resumed rollback has to put back.
+                        stack.fail_transition(
+                            ::std::time::SystemTime::now(),
+                            status::UPDATE_ROLLBACK_FAILED,
+                            failure,
+                        );
+                        stack.unreverted_rollback = Some(plan);
+                    }
+                }
+            }
+        }
+
+        Ok(output)
     }
 }

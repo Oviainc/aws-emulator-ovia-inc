@@ -123,6 +123,8 @@ mod rds_stack_resources;
 mod refused_stack_deletion;
 #[path = "all/regional_stack_namespace.rs"]
 mod regional_stack_namespace;
+#[path = "all/requested_rollback.rs"]
+mod requested_rollback;
 #[path = "all/resource_scan_lifecycle.rs"]
 mod resource_scan_lifecycle;
 #[path = "all/resource_scan_related_resources.rs"]

@@ -51,7 +51,7 @@ use crate::stack_lifecycle::{
 /// Read as PARALLEL member lists: every event reports both members, so the lists line up
 /// one-to-one, and a nesting-naive split of the `StackEvents` block into its `<member>`
 /// elements is not needed.
-async fn stack_events(
+pub(crate) async fn stack_events(
     case: &str,
     router: &MultiServiceRouter,
     stack_name: &str,
@@ -492,8 +492,8 @@ async fn continuing_a_rollback_leaves_the_skipped_resources_as_the_failed_update
 /// The `Timeout` the wait conditions this suite declares ask for, in seconds, and how long a
 /// case waits for one of them to run out: the declaration's own value plus the margin every
 /// other suite here allows a clock-owed transition.
-const GATE_TIMEOUT: &str = "1";
-const WAITED_OUT: Duration = Duration::from_millis(1_250);
+pub(crate) const GATE_TIMEOUT: &str = "1";
+pub(crate) const WAITED_OUT: Duration = Duration::from_millis(1_250);
 
 /// AWS Systems Manager's `X-Amz-Target` prefix, from its model's service shape
 /// (`com.amazonaws.ssm#AmazonSSM`), which speaks awsJson1_1.
@@ -502,7 +502,11 @@ const SSM_TARGET_PREFIX: &str = "AmazonSSM";
 /// One Systems Manager call over the awsJson1_1 wire its model declares, signed for `ssm` in
 /// the Region these stacks live in — so what a case reads back is the parameter the stack's
 /// own deployment really wrote.
-async fn ssm(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn ssm(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     let authorization = format!(
         "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/ssm/aws4_request, \
          SignedHeaders=host, Signature=0123456789abcdef"
@@ -530,7 +534,7 @@ async fn ssm(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16
 /// The value Parameter Store holds for `name`, or `None` when it holds no such parameter —
 /// which is what says whether a rollback put a resource back, left it as the failed update
 /// made it, or removed one the update had added.
-async fn parameter_value(router: &MultiServiceRouter, name: &str) -> Option<String> {
+pub(crate) async fn parameter_value(router: &MultiServiceRouter, name: &str) -> Option<String> {
     let (status_code, body) = ssm(router, "GetParameter", &json!({"Name": name})).await;
     if status_code != 200 {
         return None;
@@ -543,7 +547,7 @@ async fn parameter_value(router: &MultiServiceRouter, name: &str) -> Option<Stri
 /// The `AWS::SSM::Parameter` declaration these cases deploy: a parameter of Parameter Store
 /// under the name the template asks for, so a case reads the deployed value back through
 /// Systems Manager's own wire.
-fn parameter(name: &str, value: &str) -> Value {
+pub(crate) fn parameter(name: &str, value: &str) -> Value {
     json!({
         "Type": "AWS::SSM::Parameter",
         "Properties": {"Name": name, "Type": "String", "Value": value},
@@ -551,7 +555,7 @@ fn parameter(name: &str, value: &str) -> Value {
 }
 
 /// The template whose `Resources` section is `resources`.
-fn template(resources: Value) -> String {
+pub(crate) fn template(resources: Value) -> String {
     json!({"Resources": resources}).to_string()
 }
 
@@ -559,7 +563,7 @@ fn template(resources: Value) -> String {
 /// "doesn't proceed with a stack creation or update until resources receive the required
 /// number of signals or the timeout period is exceeded", so this is what holds the update
 /// open and then fails it with no call of the client's.
-fn template_with_an_unsignalled_gate(resources: Value) -> String {
+pub(crate) fn template_with_an_unsignalled_gate(resources: Value) -> String {
     let mut declared: Map<String, Value> = match resources {
         Value::Object(members) => members,
         other => panic!("a Resources section must be an object, got {other:?}"),
@@ -583,7 +587,7 @@ fn template_with_an_unsignalled_gate(resources: Value) -> String {
 }
 
 /// The `StackStatus` a stack reports right now.
-async fn status_of(router: &MultiServiceRouter, stack: &str) -> String {
+pub(crate) async fn status_of(router: &MultiServiceRouter, stack: &str) -> String {
     let (http_status, body) = call(router, "DescribeStacks", &[member("StackName", stack)]).await;
     assert_eq!(
         http_status, 200,
@@ -599,7 +603,7 @@ async fn reason_of(router: &MultiServiceRouter, stack: &str) -> String {
 }
 
 /// The `ResourceStatus` a stack reports for ONE of its resources.
-async fn resource_status_of(
+pub(crate) async fn resource_status_of(
     router: &MultiServiceRouter,
     stack: &str,
     logical_id: &str,
