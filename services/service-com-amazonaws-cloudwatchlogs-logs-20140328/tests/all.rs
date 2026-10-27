@@ -119,6 +119,8 @@ mod lookup_table_updates;
 mod lookup_tables;
 #[path = "all/metric_filter_enumeration.rs"]
 mod metric_filter_enumeration;
+#[path = "all/metric_filter_testing.rs"]
+mod metric_filter_testing;
 #[path = "all/metric_filters.rs"]
 mod metric_filters;
 #[path = "all/metric_transformation_exclusion_wording.rs"]
