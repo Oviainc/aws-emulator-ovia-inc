@@ -45,9 +45,11 @@
 //! and `null` when the code carries no message. See [`wire`].
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, BoxFuture, ErasedOperation, OperationContext, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 
 pub mod wire;
 
@@ -56,6 +58,150 @@ pub mod wire;
 /// a host-addressed request resolves to, beside the SigV4 signing name (`ses`) the
 /// generated identity carries.
 pub const ENDPOINT_PREFIX: &str = "email";
+
+/// The routing key the generated table holds `ListEmailIdentities` under.
+const LIST_EMAIL_IDENTITIES: &str = "ListEmailIdentities";
+
+/// The method and URI every AWS SDK, and the CLI, sends `ListEmailIdentities` on.
+///
+/// The checked-in model binds the operation to `POST /v2/email/list-identities`; the
+/// wire form the service answers is a GET over the identity collection, with the
+/// paging members in the query string. Both are served: the modelled route through
+/// the generated routing table, this one through [`SdkListIdentitiesRoute`].
+const SDK_LIST_IDENTITIES_METHOD: &str = "GET";
+
+/// The path segments of that URI, as [`request_path`] splits a request's own.
+const SDK_LIST_IDENTITIES_SEGMENTS: [&str; 3] = ["v2", "email", "identities"];
+
+/// The modelled route the adapted request is dispatched on.
+const MODELLED_LIST_IDENTITIES_URI: &str = "/v2/email/list-identities";
+
+/// `ListEmailIdentities`' paging members, which the GET form carries in the query
+/// string under these names and the modelled route carries in the request body.
+///
+/// `Filter` is not among them: the GET form has no query binding for a map, so a
+/// filtered listing is the modelled route's own.
+const LIST_IDENTITIES_QUERY_MEMBERS: [&str; 2] = ["NextToken", "PageSize"];
+
+/// Serves `GET /v2/email/identities` — the wire form of `ListEmailIdentities` real
+/// clients send — by running the modelled operation against the same request
+/// restated on the route the model binds.
+///
+/// The paging members are the only difference between the two forms: the GET carries
+/// `NextToken` and `PageSize` in the query string, the modelled route carries them in
+/// the body, so the adaptation is to move them and to leave everything else alone.
+/// Deserialization, validation and the handler itself are untouched — the handler is
+/// the one the modelled route resolves to.
+///
+/// Only the DISPATCHED request is restated; the [`OperationContext`] still carries the
+/// parts the client sent, so a handler reading the URI off `ctx` sees the original
+/// target.
+#[derive(Debug, Default)]
+struct SdkListIdentitiesRoute;
+
+impl ErasedOperation for SdkListIdentitiesRoute {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            let routed = svc
+                .definition()
+                .routing_table()
+                .get(LIST_EMAIL_IDENTITIES)
+                .and_then(|operation| Some((operation, on_modelled_route(req)?)));
+            match routed {
+                Some((operation, adapted)) => operation.run(svc, &adapted, ctx).await,
+                // The request could not be restated, so nothing modelled answers it
+                // after all; report it exactly as the framework would have.
+                None => svc.definition().routing_error_response(req),
+            }
+        })
+    }
+}
+
+/// The same `ListEmailIdentities` request on the route the model binds: a POST to
+/// [`MODELLED_LIST_IDENTITIES_URI`] whose body carries the paging members the GET
+/// form sent in its query string.
+///
+/// `None` when the request cannot be restated — its target did not parse, or the
+/// runtime API rejected the route — which the caller answers as the framework's own
+/// "named no modelled operation" rather than serving the operation a request it never
+/// received.
+fn on_modelled_route(req: &RtRequest) -> Option<RtRequest> {
+    let query = req
+        .uri()
+        .parse::<http::Uri>()
+        .ok()?
+        .query()
+        .unwrap_or_default()
+        .to_string();
+    let mut members = serde_json::Map::new();
+    for member in LIST_IDENTITIES_QUERY_MEMBERS {
+        if let Some(value) = query_value(&query, member) {
+            // `PageSize` is modelled as an integer and `NextToken` as a string: a
+            // query string carries both as text, so a value that reads as a whole
+            // number is restated as one and anything else is restated verbatim, for
+            // the deserializer to accept or refuse exactly as it would on the
+            // modelled route.
+            let restated = match value.parse::<i64>() {
+                Ok(number) => serde_json::Value::from(number),
+                Err(_) => serde_json::Value::String(value),
+            };
+            members.insert(member.to_string(), restated);
+        }
+    }
+    let body = serde_json::Value::Object(members).to_string();
+
+    let mut out = RtRequest::new(aws_smithy_types::body::SdkBody::from(body));
+    out.set_uri(MODELLED_LIST_IDENTITIES_URI).ok()?;
+    out.set_method("POST").ok()?;
+    for (name, value) in req.headers().iter() {
+        // The body is this function's own, so the headers describing the one the
+        // client sent are not carried over; everything else is kept, as the router's
+        // own request rebuild keeps it.
+        if name.eq_ignore_ascii_case("content-length") || name.eq_ignore_ascii_case("content-type") {
+            continue;
+        }
+        out.headers_mut().append(name.to_string(), value.to_string());
+    }
+    out.headers_mut().append("content-type", "application/json");
+    Some(out)
+}
+
+/// The value of the query parameter `name`, percent-decoded, or `None` when the query
+/// string does not carry it.
+///
+/// Decoded with the framework's own query decoder, so a value an SDK percent-encoded
+/// reads here exactly as it was sent.
+fn query_value(query: &str, name: &str) -> Option<String> {
+    query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .find_map(|pair| {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            (smithy_server_runtime::percent_decode(key) == name)
+                .then(|| smithy_server_runtime::percent_decode(value))
+        })
+}
+
+/// The path component of a request URI, split into its non-empty segments — the same
+/// view of the request the REST route table matches on. An unparsable URI has no
+/// segments, which claims nothing.
+fn request_segments(uri: &str) -> Vec<String> {
+    uri.parse::<http::Uri>()
+        .map(|parsed| {
+            parsed
+                .path()
+                .split('/')
+                .filter(|segment| !segment.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 /// The `com-amazonaws-sesv2-simpleemailservice-v2` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -68,6 +214,9 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// document of [`wire`]. Built once here because [`Service::override_protocol`]
     /// hands back a borrow of it.
     protocol: wire::NullMessageRestJson,
+    /// Serves `ListEmailIdentities` on the method and URI real clients send it on;
+    /// [`Service::override_operation`] hands such a request to it.
+    sdk_list_identities_route: SdkListIdentitiesRoute,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -78,6 +227,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             entry: crate::ServiceDefinition::new(engine),
             protocol: wire::NullMessageRestJson::new(),
+            sdk_list_identities_route: SdkListIdentitiesRoute,
         }
     }
 }
@@ -117,11 +267,21 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
+        // The model's own routing table resolves every route the model binds.
+        if self.entry.protocol().routing_key(req).is_ok() {
+            return None;
+        }
+        // What it cannot: `ListEmailIdentities`. The checked-in model binds it to
+        // `POST /v2/email/list-identities`, while the wire form the service answers —
+        // the one every AWS SDK and the CLI send, and the only one a paginator can
+        // follow — is a GET over the identity collection with the paging members in
+        // the query string. The route table resolves that request to no operation at
+        // all, so it is claimed here and served by the modelled operation itself.
+        if req.method() == SDK_LIST_IDENTITIES_METHOD
+            && request_segments(req.uri()) == SDK_LIST_IDENTITIES_SEGMENTS
+        {
+            return Some(&self.sdk_list_identities_route);
+        }
         None
     }
 
@@ -132,9 +292,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // client branches on for a malformed or incomplete request. The framework's
         // own structured wording is kept: it names the member and the rule it
         // broke, which is what the caller has to fix. The one difference SES makes
-        // to it — an enum clause states the member and its value set without the
-        // value that violated them — is single-homed in `crate::state`, so a
-        // refusal made at the boundary and one a handler makes itself read alike.
+        // to it — a clause about a value's FORM (its enum value set or its pattern)
+        // states the member and the requirement without the value that violated
+        // them — is single-homed in `crate::state`, so a refusal made at the
+        // boundary and one a handler makes itself read alike.
         match refusal {
             Refusal::Invalid(violations) => Some(Refused {
                 code: "BadRequestException".to_string(),
