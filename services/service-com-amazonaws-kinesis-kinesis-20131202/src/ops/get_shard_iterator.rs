@@ -407,9 +407,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A stream whose creation has not fallen due yet has no readable shard, and this
         // operation models no "the resource is not available yet" error: the position a
         // reader asked for is in no shard this account holds yet, which is the modelled
-        // not-found refusal, stating the status the stream is actually in.
+        // not-found refusal, stating the status the stream is actually in. A stream whose
+        // shard count is being changed DOES serve the read: "you can continue to read and
+        // write data to your stream while its status is UPDATING" (`UpdateShardCount`).
         let status = stream.status(now);
-        if status != crate::state::STREAM_ACTIVE {
+        if !stream.serves_shards(now) {
             return Err(not_found(crate::state::stream_not_active_message(
                 identifier, status,
             )));
