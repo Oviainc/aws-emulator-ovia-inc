@@ -47,14 +47,79 @@
 //! table names, so the header reaches a handler-returned modelled error, the scaffold's
 //! 501 and a refusal raised while serving it. Everything else about those paths — status,
 //! `__type`, `Message`, the whole success path — stays with the framework.
+//!
+//! A second seam is taken for the one thing this service words differently from the
+//! framework when it refuses a request at its boundary: see the `override_refusal` body
+//! below and [`stated_enum_values`].
 
 pub mod request_id_header;
 
 use request_id_header::RequestIdHeaderOperation;
 use smithy_server_runtime::{
-    http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service,
+    http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service, Violation,
+    ViolationKind,
 };
 use std::sync::Arc;
+
+/// The error code the framework answers a boundary constraint refusal with on this
+/// service's protocol, restated here so a reworded message always travels with the code a
+/// client branches on (`protocol_error_response_with` in
+/// `vendor/smithy-server-runtime/src/pre_dispatch.rs` picks it for `ProtocolError::Invalid`).
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// An enum's admissible wire values as a refusal of this service LISTS them: in
+/// DESCENDING order of the values themselves, which is not the model's declaration order
+/// and not ascending order either.
+///
+/// A validation clause states the value set as the remediation hint a caller is shown
+/// (`Member must satisfy enum value set: [<values>]`), and the order is the service's
+/// rather than the model's: the two recorded ds refusals whose enums have more than one
+/// value both list them highest-first — `ClientAuthenticationType`, declared
+/// `[SmartCard, SmartCardOrPassword]`, is stated as `[SmartCardOrPassword, SmartCard]`,
+/// and `UpdateType`, declared `[OS, NETWORK, SIZE]`, as `[SIZE, OS, NETWORK]`. The order
+/// is computed from the values, so it holds for every enum this service declares rather
+/// than for the two a recording happens to cover.
+fn stated_enum_values(allowed: &[String]) -> Vec<String> {
+    let mut values = allowed.to_vec();
+    values.sort_unstable();
+    values.reverse();
+    values
+}
+
+/// `refusal` stated the way this service states a boundary constraint refusal, or `None`
+/// to keep the framework's own wording.
+///
+/// The ONLY thing restated is the order of an enum's value list ([`stated_enum_values`]);
+/// the envelope, the clause, the member path, the echoed value and every other
+/// requirement are the framework's, built by handing it the violations back
+/// ([`::aws_smithy_schema_server::envelope`]), so a reworded refusal cannot drift from one
+/// the framework words. A refusal naming no enum value set is left alone entirely.
+fn enum_order_refusal(refusal: &Refusal) -> Option<Refused> {
+    let Refusal::Invalid(violations) = refusal else {
+        return None;
+    };
+    if !violations
+        .iter()
+        .any(|violation| matches!(violation.kind, ViolationKind::EnumValue(_)))
+    {
+        return None;
+    }
+    let restated: Vec<Violation> = violations
+        .iter()
+        .map(|violation| match &violation.kind {
+            ViolationKind::EnumValue(allowed) => Violation {
+                path: violation.path.clone(),
+                kind: ViolationKind::EnumValue(stated_enum_values(allowed)),
+                value: violation.value.clone(),
+            },
+            _ => violation.clone(),
+        })
+        .collect();
+    Some(Refused {
+        code: VALIDATION_EXCEPTION.to_string(),
+        message: ::aws_smithy_schema_server::envelope(&restated)?,
+    })
+}
 
 /// The `com-amazonaws-directoryservice-directoryservice-20150416` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -120,16 +185,20 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) to let this service
+        // reword it.
+        //
+        // One thing is reworded: a value outside an enumerated type's value set is
+        // refused with the framework's own envelope, clause, member path and echoed
+        // value, but the admissible values are LISTED the way this service lists them
+        // rather than the way the model declares them (see `stated_enum_values`). The
+        // code travels with it, unchanged from the one the framework picks for this
+        // refusal, so a client still branches on what it branched on before.
+        //
+        // Everything else — an absent member, a length, a pattern, a numeric bound, and
+        // an authentication refusal, which is not an input-constraint failure at all —
+        // keeps the framework's wording.
+        enum_order_refusal(refusal)
     }
 
     fn override_routing_error(
