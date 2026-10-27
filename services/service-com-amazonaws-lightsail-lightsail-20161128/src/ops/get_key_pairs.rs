@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetKeyPairs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetKeyPairs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the SSH key pairs the account holds — the public halves held under
+//! their names, each exactly as the single-record read reports it — one page at a
+//! time, with the account's Lightsail DEFAULT key pair reported only when the
+//! request asks for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetKeyPairs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +165,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetKeyPairs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetKeyPairsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetKeyPairs"))
+        // This operation reports what the ACCOUNT holds — "all key pairs in the
+        // user's account" — and takes nothing but a page token and the
+        // default-pair switch, so neither the Region of the request nor anything
+        // else `ctx` carries selects between the stored records. The same reason
+        // `GetKeyPair` addresses one key pair by name alone.
+        let _ = ctx;
+
+        // `pageToken` is the name the previous page stopped before, so a page is
+        // the reported key pairs from that name onward in the store's own total
+        // order. Using the name rather than an index means a key pair created or
+        // deleted between two pages cannot make the walk skip or repeat another
+        // one.
+        let page_token = input.page_token.unwrap_or_default();
+        // "whether to include the default key pair in the response of your
+        // request": the account's default pair is reported only when the request
+        // asks for it, so a request that does not ask reports the key pairs the
+        // caller made itself.
+        let include_default = input.include_default_key_pair.unwrap_or(false);
+
+        crate::state::with_state(&*self.engine, |store| {
+            let mut key_pairs = Vec::new();
+            let mut next_page_token = None;
+            for (name, key_pair) in store.key_pairs.range(page_token..) {
+                // The switch selects which records the listing REPORTS, so it is
+                // applied before the page is filled: a page the default pair is
+                // excluded from still carries a full page of the others.
+                if key_pair.is_default() && !include_default {
+                    continue;
+                }
+                if key_pairs.len() == crate::state::KEY_PAIR_PAGE_SIZE {
+                    next_page_token = Some(name.clone());
+                    break;
+                }
+                // The SAME view `GetKeyPair` reports: one stored record read by
+                // two operations, never a second rendering of a key pair.
+                key_pairs.push(key_pair.view());
+            }
+            GetKeyPairsOutput {
+                // An account holding no key pair reports an empty list, not an
+                // absent one: the caller asked what it has, and the answer is
+                // "nothing".
+                key_pairs: Some(key_pairs),
+                next_page_token,
+            }
+        })
+        .ok_or_else(unavailable)
     }
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> GetKeyPairsError {
+    GetKeyPairsErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail key pair store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }
