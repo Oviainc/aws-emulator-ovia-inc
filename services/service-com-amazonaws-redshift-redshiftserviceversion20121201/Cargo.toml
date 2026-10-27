@@ -31,6 +31,11 @@ hex = { workspace = true }
 # through, over the in-process callback into this same emulator (no network client
 # feature is enabled: the transport is the emulator's own inbound listener).
 aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# The SNS client an event notification is published through, over the same
+# in-process callback: a control-plane write raises the Redshift event its
+# published catalog lists for it, and every subscription scoped to that event is
+# published to on its topic.
+aws-sdk-sns = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -49,6 +54,10 @@ tokio = { workspace = true, features = ["time"] }
 # engine, because `CreateSnapshotCopyGrant` resolves the `KmsKeyId` it is given by
 # calling it.
 service-com-amazonaws-kms-trentservice = { workspace = true }
+# The event-notification suite mounts the SNS service beside Redshift on one
+# engine, because a raised Redshift event is published onto the subscription's
+# Amazon SNS topic. Another workspace member this repository already locks.
+service-com-amazonaws-sns-amazonsimplenotificationservice = { workspace = true }
 
 [lints]
 workspace = true

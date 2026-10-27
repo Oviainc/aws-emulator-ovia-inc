@@ -152,8 +152,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The restart holds the store's lock; the event it raises is published
+        // once that lock is released, because a publish is an in-process call
+        // into another service and must not run under it.
+        let output = self.reboot(&input)?;
+
+        // The cluster was restarted, which is the event this write raises: every
+        // subscription scoped to it is told, on its own topic.
+        crate::state::notifications::raise(
+            ctx,
+            &*self.engine,
+            crate::state::EVENT_ID_CLUSTER_REBOOTED,
+            &input.cluster_identifier,
+            &[(
+                crate::state::notifications::CLUSTER_NAME,
+                &input.cluster_identifier,
+            )],
+        )
+        .await;
+
+        Ok(output)
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RebootCluster<Eng> {
+    /// The restart itself: the output it reports.
+    ///
+    /// Everything that touches the store lives here, so the lock is held for the
+    /// write ALONE and nothing is awaited while it is.
+    fn reboot(&self, input: &RebootClusterInput) -> Result<RebootClusterOutput, RebootClusterError> {
         use crate::state as st;
 
         let Some(state) = st::service_state(&*self.engine) else {
@@ -227,9 +256,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &cluster_type,
             ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now()),
         );
+        let cluster = stored.cluster.clone();
 
         Ok(RebootClusterOutput {
-            cluster: Some(stored.cluster.clone()),
+            cluster: Some(cluster),
         })
     }
 }

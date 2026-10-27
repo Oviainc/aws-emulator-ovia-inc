@@ -22,23 +22,35 @@
 //!    resource the quota meters, the ceiling it reached and the `@required` `QuotaCode` /
 //!    `ServiceCode`, and records nothing — while the profiles inside the ceiling still
 //!    resolve.
+//! 3. THE TAG CEILING. A create stores at most as many tags as one resource of this
+//!    service may hold: rows up to that ceiling are recorded (a repeated key being one
+//!    tag and not two), rows past it are refused `400 ValidationException` naming the
+//!    `tags` member and record nothing, and a profile the create stored is still a full
+//!    member of the tagging plane — `TagResource` takes it from one below the ceiling to
+//!    the ceiling, and refuses a new key only once it is AT the ceiling. The rows differ
+//!    along the COUNT of tags the create carries, which is what the rule generalises
+//!    over.
 //!
 //! Requests go through the real `MultiServiceRouter`, so routing, restJson1
 //! (de)serialization, boundary constraint validation and the handler all run as they do in
 //! production. The HTTP client lives in `super::workload_harness`; the agent-profile
 //! request builders and the profile projection check live in `super::agent_goals`.
 
+use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use serde_json::{json, Value};
 
 use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state::{
-    AgentProfileRecord, MAX_AGENT_PROFILES,
+    AgentProfileRecord, MAX_AGENT_PROFILES, MAX_TAGS_PER_RESOURCE,
 };
 
 use super::agent_goals::{
-    assert_profile_projection, create_profile, get_profile, member, profile_body, PILLARS,
+    assert_profile_projection, create_profile, get_profile, member, profile_body, tags_by_key,
+    PILLARS,
 };
+use super::resource_tagging::tag;
+use super::resource_tags::{list_tags, reported_tags};
 use super::workload_harness::{Answer, Client, SIGNED_REGION};
 
 /// `ExceptionResourceType` for an agent profile: a free-form string, and this service
@@ -350,6 +362,297 @@ async fn a_token_resubmitted_with_different_parameters_is_a_conflict_that_record
         replay.body, first.body,
         "case \"replay-after-the-conflicts\": the token must still answer the original \
          profile, got {replay:?}"
+    );
+}
+
+/// `count` distinct tags, numbered so two rows differ only in HOW MANY they carry.
+///
+/// The pairs are kept as an ordered SEQUENCE rather than the map the sibling tag suites
+/// build, because a `Tags` list can name one key twice and a map cannot express that row.
+fn numbered_tags(count: usize) -> Vec<(String, String)> {
+    (0..count)
+        .map(|index| (format!("key-{index:03}"), format!("value-{index:03}")))
+        .collect()
+}
+
+/// The pairs as the wire form of `CreateAgentProfile$tags` — a `Tags` LIST of `Tag`
+/// structures, in the order given (`smithy_query(query="shape", shape="Tags,Tag")`),
+/// repeated keys included (see [`numbered_tags`]).
+fn sent_tags(tags: &[(String, String)]) -> Value {
+    Value::Array(
+        tags.iter()
+            .map(|(key, value)| json!({ "key": key, "value": value }))
+            .collect(),
+    )
+}
+
+/// The same pairs as the map a resource's tags are STORED and reported as — one entry per
+/// key, so a repeated key collapses the way the store does.
+fn stored_tags(tags: &[(String, String)]) -> BTreeMap<String, String> {
+    tags.iter().cloned().collect()
+}
+
+/// One ACCEPTED row of rule 3: what it is called, the tags the create sends, and the tags
+/// the profile must end up holding (the two differ where a row repeats a key).
+struct TagRow {
+    case: &'static str,
+    sent: Vec<(String, String)>,
+    stored: Vec<(String, String)>,
+}
+
+/// Rule 3, the accepting and the refusing half: the create stores at most the tags one
+/// resource of this service may hold. The rows differ along the COUNT the request carries
+/// — one, a handful, one below the ceiling, the ceiling itself, a list that repeats a key,
+/// then one, five and ten times the ceiling past it.
+#[tokio::test]
+async fn the_tag_ceiling_bounds_what_a_create_stores_and_the_refusal_records_nothing() {
+    // The ceiling a resource of this service is held at, read from the constant the
+    // handlers read: what this test pins is the BEHAVIOUR at and past it.
+    const CEILING: usize = MAX_TAGS_PER_RESOURCE;
+
+    let client = Client::new();
+    let sentence = format!(
+        "Value at tags failed to satisfy constraint: Member must not raise the agent \
+         profile's tag count above {CEILING}"
+    );
+
+    // A list that names one key twice: the resource holds one tag per key, so the repeat
+    // overwrites rather than counting twice, and the stored count stays at the ceiling.
+    let mut repeated = numbered_tags(CEILING);
+    repeated.push(("key-000".to_string(), "rewritten".to_string()));
+    let mut overwritten = numbered_tags(CEILING);
+    overwritten[0] = ("key-000".to_string(), "rewritten".to_string());
+
+    let accepted: Vec<TagRow> = vec![
+        TagRow {
+            case: "one tag",
+            sent: numbered_tags(1),
+            stored: numbered_tags(1),
+        },
+        TagRow {
+            case: "a handful of tags",
+            sent: numbered_tags(7),
+            stored: numbered_tags(7),
+        },
+        TagRow {
+            case: "one below the ceiling",
+            sent: numbered_tags(CEILING - 1),
+            stored: numbered_tags(CEILING - 1),
+        },
+        TagRow {
+            case: "at the ceiling",
+            sent: numbered_tags(CEILING),
+            stored: numbered_tags(CEILING),
+        },
+        TagRow {
+            case: "a repeated key at the ceiling",
+            sent: repeated,
+            stored: overwritten,
+        },
+    ];
+
+    let mut recorded = 0usize;
+    for (
+        row,
+        TagRow {
+            case,
+            sent,
+            stored,
+        },
+    ) in accepted.into_iter().enumerate()
+    {
+        let request = with_overrides(
+            profile_body(&format!("tag-ceiling-{row}"), &["SECURITY"], 1),
+            &json!({ "tags": sent_tags(&sent) }),
+        );
+        let answer = create_profile(&client, request).await;
+        let arn = created_arn(&answer, case);
+        recorded += 1;
+        assert_eq!(
+            tags_by_key(answer.body.get("tags")),
+            stored,
+            "case {case:?}: the create must answer the tags it stored, got {answer:?}"
+        );
+
+        // The stored profile reports them too, both through its own read and through the
+        // tagging plane.
+        let read_back = get_profile(&client, &arn).await;
+        assert_eq!(
+            read_back.status, 200,
+            "case {case:?}: the created profile must read back, got {read_back:?}"
+        );
+        assert_eq!(
+            tags_by_key(read_back.body.get("tags")),
+            stored,
+            "case {case:?}: GetAgentProfile must report the stored tags, got {read_back:?}"
+        );
+        let listed = list_tags(&client, &arn).await;
+        assert_eq!(
+            reported_tags(&listed, case),
+            stored_tags(&stored),
+            "case {case:?}: ListTagsForResource must report the stored tags, got {listed:?}"
+        );
+        assert_eq!(
+            stored_profiles(&client),
+            recorded,
+            "case {case:?}: an accepted create records exactly one more profile"
+        );
+    }
+
+    // Past the ceiling: refused 400 as a field validation naming the member the request
+    // carried, and nothing is recorded.
+    let token = "agent-profile-token-tag-ceiling";
+    let refused_rows: Vec<(&str, usize)> = vec![
+        ("one past the ceiling", CEILING + 1),
+        ("five past the ceiling", CEILING + 5),
+        ("ten times the ceiling", CEILING * 10),
+    ];
+    for (case, count) in refused_rows {
+        let request = with_overrides(
+            profile_body(&format!("past-the-tag-ceiling-{count}"), &["SECURITY"], 1),
+            &json!({
+                "tags": sent_tags(&numbered_tags(count)),
+                "clientToken": token,
+            }),
+        );
+        let refused = create_profile(&client, request).await;
+        assert_eq!(
+            refused.status, 400,
+            "case {case:?}: expected HTTP 400 for {count} tags, got {refused:?}"
+        );
+        assert_eq!(
+            refused.error_code, "ValidationException",
+            "case {case:?}: expected ValidationException, got {refused:?}"
+        );
+        assert_eq!(
+            member(&refused, "Reason"),
+            "FIELD_VALIDATION_FAILED",
+            "case {case:?}: a refused member value is a field validation, got {refused:?}"
+        );
+        assert_eq!(
+            refused.body.get("Fields"),
+            Some(&json!([{ "Name": "tags", "Message": sentence }])),
+            "case {case:?}: Fields must name the member and the ceiling, got {refused:?}"
+        );
+        assert_eq!(
+            member(&refused, "Message"),
+            format!("[Validation] {sentence}"),
+            "case {case:?}: the message must state the constraint once, got {refused:?}"
+        );
+        assert_eq!(
+            stored_profiles(&client),
+            recorded,
+            "case {case:?}: a refused create must record no profile"
+        );
+    }
+
+    // The refusals spent no idempotency token either: the same token still mints a
+    // profile once the request fits the ceiling.
+    let after = create_profile(
+        &client,
+        with_overrides(
+            profile_body("after-the-tag-refusals", &["SECURITY"], 1),
+            &json!({
+                "tags": sent_tags(&numbered_tags(2)),
+                "clientToken": token,
+            }),
+        ),
+    )
+    .await;
+    created_arn(&after, "after-the-tag-refusals");
+    assert_eq!(
+        stored_profiles(&client),
+        recorded + 1,
+        "case \"after-the-tag-refusals\": the token must still mint a profile"
+    );
+}
+
+/// Rule 3, the half that says what the bound is FOR: a profile the create stored is a full
+/// member of the tagging plane, held at the SAME ceiling `TagResource` holds every
+/// resource at. One created a tag below the ceiling takes a further key and then reports
+/// the ceiling; one created AT the ceiling refuses a new key and records an overwrite.
+#[tokio::test]
+async fn a_profile_the_create_tagged_is_taggable_up_to_the_same_ceiling() {
+    const CEILING: usize = MAX_TAGS_PER_RESOURCE;
+
+    let client = Client::new();
+    let extra: BTreeMap<String, String> = [("extra".to_string(), "yes".to_string())]
+        .into_iter()
+        .collect();
+
+    // One below the ceiling: a new key is recorded and the profile then reports the
+    // ceiling.
+    let below = create_profile(
+        &client,
+        with_overrides(
+            profile_body("taggable-below-the-ceiling", &["SECURITY"], 1),
+            &json!({ "tags": sent_tags(&numbered_tags(CEILING - 1)) }),
+        ),
+    )
+    .await;
+    let below_arn = created_arn(&below, "below the ceiling");
+    let tagged = tag(&client, &below_arn, &extra).await;
+    assert_eq!(
+        tagged.status, 200,
+        "case \"below the ceiling\": one more tag must be recorded, got {tagged:?}"
+    );
+    let listed = list_tags(&client, &below_arn).await;
+    assert_eq!(
+        reported_tags(&listed, "below the ceiling").len(),
+        CEILING,
+        "case \"below the ceiling\": the profile must now hold {CEILING} tags, got {listed:?}"
+    );
+
+    // At the ceiling: a new key is refused and changes nothing, while an overwrite of a
+    // key the profile carries keeps the count where it is and is recorded.
+    let at = create_profile(
+        &client,
+        with_overrides(
+            profile_body("taggable-at-the-ceiling", &["SECURITY"], 1),
+            &json!({ "tags": sent_tags(&numbered_tags(CEILING)) }),
+        ),
+    )
+    .await;
+    let at_arn = created_arn(&at, "at the ceiling");
+    let refused = tag(&client, &at_arn, &extra).await;
+    assert_eq!(
+        refused.status, 400,
+        "case \"at the ceiling\": a new key past the ceiling must be refused 400, \
+         got {refused:?}"
+    );
+    assert_eq!(
+        refused.error_code, "ValidationException",
+        "case \"at the ceiling\": expected ValidationException, got {refused:?}"
+    );
+    let unchanged = list_tags(&client, &at_arn).await;
+    assert_eq!(
+        reported_tags(&unchanged, "at the ceiling"),
+        stored_tags(&numbered_tags(CEILING)),
+        "case \"at the ceiling\": a refused tag must change nothing, got {unchanged:?}"
+    );
+
+    let overwrite: BTreeMap<String, String> = [("key-000".to_string(), "rewritten".to_string())]
+        .into_iter()
+        .collect();
+    let accepted = tag(&client, &at_arn, &overwrite).await;
+    assert_eq!(
+        accepted.status, 200,
+        "case \"at the ceiling/overwrite\": an overwrite must be recorded, got {accepted:?}"
+    );
+    let reported = reported_tags(
+        &list_tags(&client, &at_arn).await,
+        "at the ceiling/overwrite",
+    );
+    assert_eq!(
+        reported.len(),
+        CEILING,
+        "case \"at the ceiling/overwrite\": the count must stay at {CEILING}, got {reported:?}"
+    );
+    assert_eq!(
+        reported.get("key-000").map(String::as_str),
+        Some("rewritten"),
+        "case \"at the ceiling/overwrite\": the overwritten key takes the new value, \
+         got {reported:?}"
     );
 }
 

@@ -180,6 +180,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The delete holds the store's lock; the events it raises are published
+        // once that lock is released, because a publish is an in-process call
+        // into another service and must not run under it.
+        let (output, final_snapshot) = self.delete(&input, ctx)?;
+
+        // The cluster is gone, and a final snapshot of it was taken when the
+        // request asked for one: each is an event of its own source type, so a
+        // subscription scoped to either is told, on its own topic.
+        crate::state::notifications::raise(
+            ctx,
+            &*self.engine,
+            crate::state::EVENT_ID_CLUSTER_DELETED,
+            &input.cluster_identifier,
+            &[(
+                crate::state::notifications::CLUSTER_NAME,
+                &input.cluster_identifier,
+            )],
+        )
+        .await;
+        if let Some(snapshot_identifier) = final_snapshot.as_deref() {
+            crate::state::notifications::raise(
+                ctx,
+                &*self.engine,
+                crate::state::EVENT_ID_SNAPSHOT_CREATED,
+                snapshot_identifier,
+                &[
+                    (
+                        crate::state::notifications::SNAPSHOT_NAME,
+                        snapshot_identifier,
+                    ),
+                    (
+                        crate::state::notifications::CLUSTER_NAME,
+                        &input.cluster_identifier,
+                    ),
+                ],
+            )
+            .await;
+        }
+
+        Ok(output)
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteCluster<Eng> {
+    /// The delete itself: the output it reports, and the identifier of the final
+    /// snapshot it took when the request asked for one — the source of the second
+    /// event this write raises.
+    ///
+    /// Everything that touches the store lives here, so the lock is held for the
+    /// write ALONE and nothing is awaited while it is.
+    fn delete(
+        &self,
+        input: &DeleteClusterInput,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+    ) -> Result<(DeleteClusterOutput, Option<String>), DeleteClusterError> {
         use crate::state as st;
 
         let Some(state) = st::service_state(&*self.engine) else {
@@ -285,6 +340,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut removed = store.clusters.remove(position);
+        // The identifier of the final snapshot this delete took, when it took one:
+        // the snapshot's creation is an event of its own, raised below.
+        let mut final_snapshot: Option<String> = None;
         // The configuration a final snapshot captures is the cluster as it stood
         // when this call arrived, admin credentials included: a restore from
         // that snapshot rebuilds exactly this cluster. Cloned before the record
@@ -310,10 +368,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 available_at: started + st::PROVISIONING_SPAN,
                 source,
             });
+            final_snapshot = Some(identifier);
         }
 
-        Ok(DeleteClusterOutput {
-            cluster: Some(removed.cluster),
-        })
+        Ok((
+            DeleteClusterOutput {
+                cluster: Some(removed.cluster),
+            },
+            final_snapshot,
+        ))
     }
 }

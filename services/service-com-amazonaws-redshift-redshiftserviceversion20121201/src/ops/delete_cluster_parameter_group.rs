@@ -162,7 +162,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as st;
 
@@ -181,72 +181,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the request's spelling is folded before it is resolved.
         let name = st::normalized_parameter_group_name(&input.parameter_group_name);
 
-        let mut store = state.lock();
+        // The deletion, with the store's lock held for it ALONE: the event it
+        // raises is published below, and a publish is an in-process call into
+        // another service, which must not run under this store's lock.
+        {
+            let mut store = state.lock();
 
-        let Some(position) = store.parameter_group_position(&name) else {
-            return Err(
-                DeleteClusterParameterGroupErrorModeled::ClusterParameterGroupNotFoundFault(
-                    ClusterParameterGroupNotFoundFault {
-                        message: Some(format!(
-                            "Cluster parameter group not found: {}",
-                            input.parameter_group_name
-                        )),
-                    },
-                )
-                .into(),
-            );
-        };
+            let Some(position) = store.parameter_group_position(&name) else {
+                return Err(
+                    DeleteClusterParameterGroupErrorModeled::ClusterParameterGroupNotFoundFault(
+                        ClusterParameterGroupNotFoundFault {
+                            message: Some(format!(
+                                "Cluster parameter group not found: {}",
+                                input.parameter_group_name
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            };
 
-        // "Cannot delete a default cluster parameter group": Redshift owns it,
-        // not the account, so it is not the account's to remove.
-        if store.parameter_groups[position].default_group {
-            return Err(
-                DeleteClusterParameterGroupErrorModeled::InvalidClusterParameterGroupStateFault(
-                    InvalidClusterParameterGroupStateFault {
-                        message: Some(format!(
-                            "Cluster parameter group {name} is a default parameter group and cannot be deleted."
-                        )),
-                    },
-                )
-                .into(),
-            );
+            // "Cannot delete a default cluster parameter group": Redshift owns
+            // it, not the account, so it is not the account's to remove.
+            if store.parameter_groups[position].default_group {
+                return Err(
+                    DeleteClusterParameterGroupErrorModeled::InvalidClusterParameterGroupStateFault(
+                        InvalidClusterParameterGroupStateFault {
+                            message: Some(format!(
+                                "Cluster parameter group {name} is a default parameter group and cannot be deleted."
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            // "You cannot delete a parameter group if it is associated with a
+            // cluster" — the clusters this store holds are the whole of what can
+            // be associated with it.
+            let in_use_by: Vec<String> = store
+                .clusters
+                .iter()
+                .filter(|stored| {
+                    stored
+                        .cluster
+                        .cluster_parameter_groups
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|membership| {
+                            membership.parameter_group_name.as_deref() == Some(&name)
+                        })
+                })
+                .filter_map(|stored| stored.cluster.cluster_identifier.clone())
+                .collect();
+            if !in_use_by.is_empty() {
+                return Err(
+                    DeleteClusterParameterGroupErrorModeled::InvalidClusterParameterGroupStateFault(
+                        InvalidClusterParameterGroupStateFault {
+                            message: Some(format!(
+                                "Cluster parameter group {name} is in use by cluster(s) {}.",
+                                in_use_by.join(", ")
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            // The record leaves the store, which is what makes the deletion
+            // observable: every later read of this name reports it absent.
+            // `remove` keeps the insertion order the `Marker` cursor pages over.
+            store.parameter_groups.remove(position);
         }
 
-        // "You cannot delete a parameter group if it is associated with a
-        // cluster" — the clusters this store holds are the whole of what can be
-        // associated with it.
-        let in_use_by: Vec<String> = store
-            .clusters
-            .iter()
-            .filter(|stored| {
-                stored
-                    .cluster
-                    .cluster_parameter_groups
-                    .as_deref()
-                    .unwrap_or_default()
-                    .iter()
-                    .any(|membership| membership.parameter_group_name.as_deref() == Some(&name))
-            })
-            .filter_map(|stored| stored.cluster.cluster_identifier.clone())
-            .collect();
-        if !in_use_by.is_empty() {
-            return Err(
-                DeleteClusterParameterGroupErrorModeled::InvalidClusterParameterGroupStateFault(
-                    InvalidClusterParameterGroupStateFault {
-                        message: Some(format!(
-                            "Cluster parameter group {name} is in use by cluster(s) {}.",
-                            in_use_by.join(", ")
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
-
-        // The record leaves the store, which is what makes the deletion
-        // observable: every later read of this name reports it absent. `remove`
-        // keeps the insertion order the `Marker` cursor pages over.
-        store.parameter_groups.remove(position);
+        // The group is gone, which is the event this write raises: every
+        // subscription scoped to it is told, on its own topic.
+        st::notifications::raise(
+            ctx,
+            &*self.engine,
+            st::EVENT_ID_PARAMETER_GROUP_DELETED,
+            &name,
+            &[(st::notifications::PARAMETER_GROUP_NAME, &name)],
+        )
+        .await;
 
         Ok(DeleteClusterParameterGroupOutput)
     }
