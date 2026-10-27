@@ -599,8 +599,9 @@ fn protocol_body(published: &PublishedMessage) -> String {
     )
 }
 
-/// The deliveries `published` owes to the SQS queues among `subscriptions`, within what
-/// `budget` has left.
+/// The deliveries `published` owes to the SQS queues among `subscriptions` — the
+/// subscriptions that RECEIVE this message, which its caller has already decided —
+/// within what `budget` has left.
 ///
 /// The RAW form of the body is rendered at most once and shared by every raw subscriber, so a
 /// fan-out does not re-serialize it per subscriber; the ENVELOPED form is rendered per
