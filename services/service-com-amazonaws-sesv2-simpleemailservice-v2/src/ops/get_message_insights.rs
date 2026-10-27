@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMessageInsights
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMessageInsights`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMessageInsights::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation reports
+//!
+//! The outbound-message log entry the request's `MessageId` names: the message's
+//! from address, subject and tags as they were accepted, plus one `EmailInsights`
+//! entry per recipient. Reporting only — the log is read, never written.
+//!
+//! A `MessageId` names a message SES accepted, so it is refused the way every
+//! caller-supplied identifier in this service is: a value outside the form SES
+//! issues is a `BadRequestException`, and a well-formed id the account holds no
+//! message for is a `NotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +150,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMessageInsights` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMessageInsightsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMessageInsights"))
+        // Request metadata is not needed: a message is keyed by the id SES minted
+        // for it, inside the one emulated account.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // No store at all, which is not a modelled SES state: answer the
+            // scaffold's 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetMessageInsights without the shared emulator state",
+            ));
+        };
+
+        let message_id = input.message_id;
+        // A value outside the form SES issues names no message it could ever have
+        // accepted, so it is the caller's mistake rather than a message that has
+        // gone.
+        if !crate::state::message_id_is_well_formed(&message_id) {
+            return Err(GetMessageInsightsErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::invalid_message_id()),
+                },
+            )
+            .into());
+        }
+
+        // Reporting only: nothing about an accepted message falls due with the
+        // clock, so this read leaves the log exactly as a later caller finds it.
+        // (The documented once-per-second limit on this operation is measured on
+        // the caller rather than on anything stored, and no per-second throttle is
+        // applied anywhere in this slice.)
+        let store = state.lock();
+        let Some(message) = store
+            .sent_messages
+            .iter()
+            .find(|message| message.message_id == message_id)
+        else {
+            return Err(GetMessageInsightsErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::message_not_found(&message_id)),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetMessageInsightsOutput {
+            message_id: Some(message.message_id.clone()),
+            from_email_address: message.from.clone(),
+            // `EmailSubject` is a 1..998 string, so a message the log holds no
+            // subject for — a raw MIME document carries its own, inside the
+            // document — reports none rather than an empty one.
+            subject: message
+                .subject
+                .clone()
+                .filter(|subject| !subject.is_empty()),
+            email_tags: Some(message.email_tag_list()),
+            insights: Some(message.insights()),
+        })
     }
 }
