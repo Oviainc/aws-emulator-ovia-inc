@@ -247,12 +247,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The fingerprint is taken from the REQUEST, before the knowledge base is
         // resolved, so a retry whose token is known is answered out of the record
-        // the first call made even when the knowledge base it named is gone.
-        let fingerprint = crate::state::association_fingerprint(
-            &input.association_type,
-            knowledge_base_id,
-            &tags,
-        );
+        // the first call made even when the knowledge base it named is gone. It covers
+        // every member the record below is built from, with the tag map fingerprinted in
+        // key order (`crate::state::tags_fingerprint`).
+        let fingerprint = crate::state::request_fingerprint(&[
+            input.association_type.clone(),
+            knowledge_base_id.clone(),
+            crate::state::tags_fingerprint(&tags),
+        ]);
 
         // A retried create carrying the same `clientToken` answers with the
         // association the first call created, rather than making a second one.
@@ -260,24 +262,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // another assistant is a different create. An idempotency token
         // identifies ONE request, so the same token carrying a DIFFERENT request
         // is a conflict, not a retry.
-        if let Some(token) = input.client_token.as_deref() {
-            let replayed = state
-                .replayed_resource_id(Self::NAME, &assistant_id, token)
-                .cloned()
-                .and_then(|association_id| {
-                    state.assistant_association(&assistant_id, &association_id)
-                })
-                .map(|association| (association.fingerprint.clone(), association.to_data()));
-            if let Some((stored_fingerprint, association)) = replayed {
-                if stored_fingerprint != fingerprint {
-                    return Err(conflict(
-                        "The clientToken has already been used for a different request.",
-                    ));
-                }
-                return Ok(CreateAssistantAssociationOutput {
-                    assistant_association: Some(association),
-                });
+        match state.replayed_create(
+            Self::NAME,
+            &assistant_id,
+            input.client_token.as_deref(),
+            &fingerprint,
+        ) {
+            crate::state::Replay::Conflict => {
+                return Err(conflict(crate::state::MESSAGE_IDEMPOTENCY_CONFLICT))
             }
+            crate::state::Replay::Retry(created) => {
+                if let Some(association) = state
+                    .assistant_association(&assistant_id, &created)
+                    .map(crate::state::AssistantAssociation::to_data)
+                {
+                    return Ok(CreateAssistantAssociationOutput {
+                        assistant_association: Some(association),
+                    });
+                }
+            }
+            crate::state::Replay::Fresh => {}
         }
 
         // The knowledge base is one THIS account holds, so an id it holds none
@@ -324,7 +328,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             knowledge_base_id: knowledge_base.knowledge_base_id.clone(),
             knowledge_base_arn: knowledge_base.knowledge_base_arn.clone(),
             tags,
-            fingerprint,
             created_at: ::std::time::SystemTime::now(),
         });
         if !stored {
@@ -344,14 +347,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
-        if let Some(token) = input.client_token.as_deref() {
-            state.remember_client_token(
-                Self::NAME,
-                &assistant_id,
-                token,
-                &assistant_association_id,
-            );
-        }
+        state.remember_client_token(
+            Self::NAME,
+            &assistant_id,
+            input.client_token.as_deref(),
+            &fingerprint,
+            &assistant_association_id,
+        );
 
         // Answer from what was just persisted, so this response and a later
         // `GetAssistantAssociation` cannot disagree.

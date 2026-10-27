@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op NotifyRecommendationsReceived
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `NotifyRecommendationsReceived`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`NotifyRecommendationsReceived::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: acknowledges receipt of the named recommendations on one session of one
+//! assistant — every id the session's feed holds is removed from it and answered in
+//! `recommendationIds`, and every id it does not hold is answered as a per-entry
+//! `errors` member of the SAME successful response. The assistant and the session the
+//! route names are resolved first: a label this account holds neither under is the
+//! modelled `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -104,6 +101,18 @@ pub enum NotifyRecommendationsReceivedErrorModeled {
     ValidationException(ValidationException),
 }
 
+/// The modelled `ResourceNotFoundException` (HTTP 404), naming the resource the request
+/// addressed — the member the model provides for exactly that.
+fn not_found(message: &str, resource_name: &str) -> NotifyRecommendationsReceivedError {
+    NotifyRecommendationsReceivedErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: Some(message.to_string()),
+            resource_name: Some(resource_name.to_string()),
+        },
+    )
+    .into()
+}
+
 /// This operation's error channel, as the generated `impl Operation` names it
 /// (`crate::ops::notify_recommendations_received::NotifyRecommendationsReceivedError`). Wrapping the modeled enum is what
 /// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
@@ -155,18 +164,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `NotifyRecommendationsReceived` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(NotifyRecommendationsReceivedErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("NotifyRecommendationsReceived"))
+        // Both path labels' `UuidOrArn` patterns and `recommendationIds`' `len 0..25` are
+        // refused before this handler runs, so what is left here is the store's own rules.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in this emulator: the router builds one `InMemoryEngine` and
+            // hands it to every service.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "NotifyRecommendationsReceived",
+            ));
+        };
+        let mut store = state.lock();
+
+        // The assistant is the control-plane resource the route addresses, so a label
+        // this account holds no assistant under is the modelled not-found — worded as
+        // every other read of a missing assistant words it.
+        let Some(assistant_id) = store
+            .assistant(&input.assistant_id)
+            .map(|assistant| assistant.assistant_id.clone())
+        else {
+            return Err(not_found(
+                crate::state::MESSAGE_ASSISTANT_NOT_FOUND,
+                &input.assistant_id,
+            ));
+        };
+        let Some(assistant) = store.assistant_mut(&assistant_id) else {
+            // Unreachable: the id was just resolved out of this map while the lock is
+            // held.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "NotifyRecommendationsReceived",
+            ));
+        };
+        // A session is reachable only through its parent, so a label that assistant holds
+        // no session under is the same modelled not-found.
+        let Some(session) = assistant
+            .sessions
+            .get_mut(crate::state::resolve_id(&input.session_id))
+        else {
+            return Err(not_found(
+                crate::state::MESSAGE_SESSION_NOT_FOUND,
+                &input.session_id,
+            ));
+        };
+
+        // The acknowledgement itself: the ids the feed holds are REMOVED from it, which is
+        // what this operation does ("Removes the specified recommendations from the
+        // specified assistant's queue of newly available recommendations"), so a later
+        // `GetRecommendations` does not serve them again. An id the feed does not hold is
+        // NOT a refusal: it comes back as one entry of the `errors` list inside this same
+        // 200, which is what lets a client tell a bad assistant (a hard 404) from a
+        // recommendation it cannot acknowledge.
+        let (received, unknown) = session.recommendations.acknowledge(&input.recommendation_ids);
+
+        Ok(NotifyRecommendationsReceivedOutput {
+            recommendation_ids: Some(received),
+            errors: Some(
+                unknown
+                    .into_iter()
+                    .map(|recommendation_id| NotifyRecommendationsReceivedError2 {
+                        recommendation_id: Some(recommendation_id),
+                        message: Some(
+                            crate::state::MESSAGE_RECOMMENDATION_NOT_AVAILABLE.to_string(),
+                        ),
+                    })
+                    .collect(),
+            ),
+        })
     }
 }

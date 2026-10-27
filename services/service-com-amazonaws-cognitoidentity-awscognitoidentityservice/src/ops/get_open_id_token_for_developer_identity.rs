@@ -556,6 +556,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
             identity_pool_id: input.identity_pool_id.clone(),
             issued_at: now,
             expiration,
+            authenticated_by: providers.clone(),
             principal_tags: input
                 .principal_tags
                 .map(|tags| tags.into_iter().collect()),
