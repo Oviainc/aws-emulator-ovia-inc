@@ -34,6 +34,11 @@ aws-sdk-cloudformation = { version = "1", default-features = false, features = [
 # for a statement the request did not name one for, and the uuid `TemplateId`
 # CreateCloudFormationTemplate mints (`state::new_uuid`).
 sha2 = { workspace = true }
+# Computes the query-string SigV4 signature a published artifact locator carries, and the
+# one the document plane verifies before serving a byte (`state::presigned_artifact_url`).
+aws-sigv4 = { version = "1", features = ["http1"] }
+# The signing identity `aws-sigv4` takes: this service's own ephemeral document-plane key.
+aws-credential-types = "1"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

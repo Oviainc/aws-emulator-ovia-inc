@@ -9,9 +9,15 @@
 //! an address the caller can FOLLOW — `Version$TemplateUrl` is "A link to the template
 //! that can be used to deploy the application using AWS CloudFormation"
 //! (`smithy_query(query="doc", shape="Version", member="TemplateUrl")`), and the
-//! `TemplateUrl` of a prepared template is the same link — so a plain, unsigned `GET` of
-//! it answers HTTP 200 carrying exactly the bytes that publish retained, and a locator
-//! with nothing published behind it answers 404 rather than inventing any.
+//! `TemplateUrl` of a prepared template is the same link — so a `GET` of it, carrying no
+//! credential of the caller's own, answers HTTP 200 with exactly the bytes that publish
+//! retained, and a locator with nothing published behind it answers 404 rather than
+//! inventing any.
+//!
+//! What makes the locator followable is the query-string signature it was minted with
+//! (`presigned_locators.rs` holds the plane to it); this suite is about what is served at
+//! the address, so each locator here is the one an answer announced, or — where a case
+//! addresses something no publish announced — the same address signed the same way.
 //!
 //! What follows from that, and is asserted here:
 //!
@@ -19,7 +25,7 @@
 //!    readme — is served at the address its own publish announced, byte for byte;
 //! 2. the announced address is on the endpoint the publishing request arrived at, so a
 //!    client is never sent out of the emulator to fetch it, and it is served whether the
-//!    fetch is signed or not;
+//!    fetch carries the caller's own credential scope or none at all;
 //! 3. a fetch is a pure READ: two fetches answer the same bytes, and a `HEAD` reports the
 //!    same metadata without them;
 //! 4. an address with nothing published behind it — a body the publisher named by `*Url`
@@ -31,10 +37,35 @@
 //! control-plane calls here drive the same wire path the other suites do and the data
 //! plane reads the one store those calls wrote.
 
+use std::time::SystemTime;
+
 use serde_json::{json, Value};
+use service_com_amazonaws_serverlessapplicationrepository_serverlessapplicationrepository::state;
 
 use super::applications::{created, minimal, path_label, Answer, Fetched, Repo};
 use super::version_templates::SAM_TRANSFORM;
+
+/// The region every call of this suite is signed for, and the one the locators it builds
+/// by hand are signed under.
+const REGION: &str = "us-west-2";
+
+/// `address` as the document plane is handed it: with the query-string signature this
+/// service mints for a locator, so a case that addresses something no publish announced is
+/// still a locator this plane signed. The scope is the region the address itself names,
+/// which is the one the publish that announced it was made in. Used only for an address no
+/// answer reported.
+fn signed(address: &str) -> String {
+    let region = address
+        .split_once("/serverlessrepo-artifacts/")
+        .and_then(|(_endpoint, path)| path.split('/').next())
+        .unwrap_or(REGION);
+    state::presigned_artifact_url(
+        address,
+        region,
+        SystemTime::now(),
+        state::ARTIFACT_URL_LIFETIME,
+    )
+}
 
 /// A packaged SAM template as the JSON document a publisher sends inline.
 fn json_template(resource: &str) -> String {
@@ -107,6 +138,10 @@ async fn assert_serves(repo: &Repo, case: &str, url: &str, expected: &str, conte
         url.contains("/serverlessrepo-artifacts/"),
         "case {case:?}: an inline body is announced at an address this emulator serves, \
          got {url:?}"
+    );
+    assert!(
+        url.contains("X-Amz-Signature="),
+        "case {case:?}: an announced locator is a presigned download address, got {url:?}"
     );
     for signed in [false, true] {
         let got: Fetched = repo.follow("GET", url, signed).await;
@@ -392,8 +427,11 @@ async fn the_announced_locator_is_on_the_endpoint_the_publish_arrived_at() {
         )
         .await;
         let url = version_template_url(&created);
+        // The address the locator is signed over, which is the whole of it but the
+        // signature `presigned_locators.rs` holds to its own rule.
+        let address = url.split('?').next().unwrap_or_default();
         assert_eq!(
-            url,
+            address,
             format!(
                 "https://{expected_authority}/serverlessrepo-artifacts/us-west-2/\
                  000000000000/{name}/1.0.0/template.yaml"
@@ -491,15 +529,21 @@ async fn an_address_with_nothing_published_behind_it_is_not_found() {
     let cases: Vec<(&str, String)> = vec![
         (
             "a template whose publisher named it by TemplateUrl, so no body was retained",
-            format!("{prefix}/us-west-2/000000000000/artifact-by-url/1.0.0/template.yaml"),
+            signed(&format!(
+                "{prefix}/us-west-2/000000000000/artifact-by-url/1.0.0/template.yaml"
+            )),
         ),
         (
             "a license the publisher never supplied",
-            format!("{prefix}/us-west-2/000000000000/artifact-present/license.txt"),
+            signed(&format!(
+                "{prefix}/us-west-2/000000000000/artifact-present/license.txt"
+            )),
         ),
         (
             "an application the catalogue never held",
-            format!("{prefix}/us-west-2/000000000000/never-published/1.0.0/template.yaml"),
+            signed(&format!(
+                "{prefix}/us-west-2/000000000000/never-published/1.0.0/template.yaml"
+            )),
         ),
         (
             "an application that has since been deleted",
@@ -507,35 +551,51 @@ async fn an_address_with_nothing_published_behind_it_is_not_found() {
         ),
         (
             "a version the application never published",
-            format!("{prefix}/us-west-2/000000000000/artifact-present/9.9.9/template.yaml"),
+            signed(&format!(
+                "{prefix}/us-west-2/000000000000/artifact-present/9.9.9/template.yaml"
+            )),
         ),
         (
             "the catalogue of another region",
-            format!("{prefix}/eu-west-1/000000000000/artifact-present/1.0.0/template.yaml"),
+            signed(&format!(
+                "{prefix}/eu-west-1/000000000000/artifact-present/1.0.0/template.yaml"
+            )),
         ),
         (
             "the catalogue of another account",
-            format!("{prefix}/us-west-2/123456789012/artifact-present/1.0.0/template.yaml"),
+            signed(&format!(
+                "{prefix}/us-west-2/123456789012/artifact-present/1.0.0/template.yaml"
+            )),
         ),
         (
             "a template addressed without the version that published it",
-            format!("{prefix}/us-west-2/000000000000/artifact-present/template.yaml"),
+            signed(&format!(
+                "{prefix}/us-west-2/000000000000/artifact-present/template.yaml"
+            )),
         ),
         (
             "a readme addressed under a version, which no publish announces",
-            format!("{prefix}/us-west-2/000000000000/artifact-present/1.0.0/readme.md"),
+            signed(&format!(
+                "{prefix}/us-west-2/000000000000/artifact-present/1.0.0/readme.md"
+            )),
         ),
         (
             "a file name this service never mints",
-            format!("{prefix}/us-west-2/000000000000/artifact-present/1.0.0/secrets.env"),
+            signed(&format!(
+                "{prefix}/us-west-2/000000000000/artifact-present/1.0.0/secrets.env"
+            )),
         ),
         (
             "an empty segment",
-            format!("{prefix}/us-west-2/000000000000//1.0.0/template.yaml"),
+            signed(&format!(
+                "{prefix}/us-west-2/000000000000//1.0.0/template.yaml"
+            )),
         ),
         (
             "more segments than a locator carries",
-            format!("{prefix}/us-west-2/000000000000/artifact-present/1.0.0/deep/template.yaml"),
+            signed(&format!(
+                "{prefix}/us-west-2/000000000000/artifact-present/1.0.0/deep/template.yaml"
+            )),
         ),
     ];
 
@@ -629,10 +689,10 @@ async fn one_applications_document_is_not_anothers() {
         .await,
         "applicationId",
     );
-    let url = format!(
+    let url = signed(&format!(
         "https://{host}/serverlessrepo-artifacts/us-west-2/000000000000/republished/1.0.0/\
          template.yaml"
-    );
+    ));
     let deleted = repo.delete_application(&application_id).await;
     assert_eq!(deleted.status, 204, "deleting: got {}", deleted.body);
     let gone = repo.follow("GET", &url, false).await;

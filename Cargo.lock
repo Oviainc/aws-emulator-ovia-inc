@@ -14243,6 +14243,7 @@ dependencies = [
 name = "service-com-amazonaws-serverlessapplicationrepository-serverlessapplicationrepository"
 version = "0.1.0"
 dependencies = [
+ "aws-credential-types",
  "aws-emulator-build-support",
  "aws-emulator-emulator-telemetry",
  "aws-emulator-engine",
@@ -14251,6 +14252,7 @@ dependencies = [
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
  "aws-sdk-cloudformation",
+ "aws-sigv4",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
