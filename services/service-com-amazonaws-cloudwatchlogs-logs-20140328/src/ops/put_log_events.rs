@@ -177,8 +177,10 @@ impl From<PutLogEventsErrorModeled> for PutLogEventsError {
 /// bytes for each log event."
 const MAX_BATCH_BYTES: i64 = 1_048_576;
 
-/// The largest single event: "Each log event can be no larger than 1 MB."
-const MAX_EVENT_BYTES: i64 = 1_048_576;
+/// The largest single event: "Each log event can be no larger than 1 MB." The one number
+/// every member carrying a log event message is held to, so it lives beside the rest of
+/// this service's quotas ([`crate::state::MAX_LOG_EVENT_BYTES`]).
+const MAX_EVENT_BYTES: i64 = crate::state::MAX_LOG_EVENT_BYTES;
 
 /// Milliseconds in one day, the unit a log group's `retentionInDays` is expressed in.
 const MILLIS_PER_DAY: i64 = 24 * 60 * 60 * 1_000;
