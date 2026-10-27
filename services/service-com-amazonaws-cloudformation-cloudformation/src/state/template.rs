@@ -4056,6 +4056,9 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
 pub fn identity_is_service_assigned(resource_type: &str) -> bool {
     resource_type == APIGATEWAYV2_API
         || resource_type == APIGATEWAYV2_API_MAPPING
+        // An Amazon SNS subscription's identity is the ARN `Subscribe` answers with: it
+        // carries an id SNS mints per subscription, which no naming rule could compute.
+        || resource_type == SNS_SUBSCRIPTION
         || resource_type == FIS_EXPERIMENT_TEMPLATE
         || resource_type == WAF_REGIONAL_IP_SET
         || resource_type == WAFV2_WEB_ACL
@@ -4198,6 +4201,16 @@ pub const CLOUDWATCH_DASHBOARD: &str = "AWS::CloudWatch::Dashboard";
 /// The same for an Amazon SNS topic: the SNS model carries
 /// `awsService.cloudFormationName: SNS`.
 pub const SNS_TOPIC: &str = "AWS::SNS::Topic";
+
+/// An Amazon SNS subscription's resource type, under the same namespace: the type a
+/// template declares a subscriber of a topic with, beside the topic's own inline
+/// `Subscription` list.
+///
+/// It carries no [`return_values`] arm, so the computed physical id is the generated name
+/// — a stand-in that the create replaces with the subscription ARN Amazon SNS mints, which
+/// is this type's published return value ("Ref returns the subscription ARN") and the
+/// identifier `Unsubscribe`/`SetSubscriptionAttributes` address a subscription by.
+pub const SNS_SUBSCRIPTION: &str = "AWS::SNS::Subscription";
 
 /// An Amazon SES configuration set's resource type (the SES model:
 /// `awsService.cloudFormationName: SES`). This is the type `super::provisioning` creates
