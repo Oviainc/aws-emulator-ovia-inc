@@ -931,13 +931,22 @@ pub struct EnabledBaseline {
     pub baseline_version: String,
     pub target_identifier: String,
     pub parameters: Vec<(String, ::aws_smithy_types::Document)>,
-    /// `EnablementStatusSummary$status`, derived from the log by [`settle`].
+    /// `EnablementStatusSummary$status`, derived from `due_at` and the transitions parked
+    /// on this enablement by [`settle`].
     ///
     /// [`settle`]: ComAmazonawsControltowerAwscontroltowerapisState::settle
     pub status: EnablementStatus,
     /// `EnablementStatusSummary$lastOperationIdentifier`: the most recent operation
     /// started against this resource.
     pub last_operation_identifier: String,
+    /// The instant the clock owes this enablement its terminal status — the same instant
+    /// as that of every transition parked on it. Stored, never slept on: a reader
+    /// materialises the transition once it is due, and [`settle`] derives the reported
+    /// status from THIS rather than from the (bounded) operation log, so a record the log
+    /// has evicted cannot make an enablement still being changed read as settled.
+    ///
+    /// [`settle`]: ComAmazonawsControltowerAwscontroltowerapisState::settle
+    pub due_at: SystemTime,
     pub created_at: SystemTime,
     /// `EnabledBaselineDriftStatusSummary` -> `EnabledBaselineDriftTypes$inheritance` ->
     /// `EnabledBaselineInheritanceDrift$status`, or `None` when no inheritance drift is
@@ -958,6 +967,33 @@ pub struct EnabledBaseline {
     /// applied version and parameters change when the asynchronous update completes and
     /// not when the call that asked for it returned.
     pub pending_update: Option<PendingEnabledBaselineUpdate>,
+    /// The teardown a `DISABLE_BASELINE` still in flight will complete, or `None` while no
+    /// disable is running. [`settle`] removes the enablement once the clock makes it due,
+    /// so the resource stops existing when the asynchronous teardown completes and not
+    /// when the call that asked for it returned.
+    ///
+    /// [`settle`]: ComAmazonawsControltowerAwscontroltowerapisState::settle
+    pub pending_deletion: Option<PendingEnabledBaselineDeletion>,
+}
+
+/// A baseline teardown a `DISABLE_BASELINE` has started and the clock has not yet made
+/// due.
+///
+/// `DisableBaseline` "starts an asynchronous operation to remove all resources deployed as
+/// part of the baseline enablement" (model docs), so the enablement does not disappear
+/// when that call returns: it stays a reportable resource, `UNDER_CHANGE`, until [`settle`]
+/// removes it at `due_at` — the same instant the `DISABLE_BASELINE` record reaches its
+/// terminal status.
+///
+/// [`settle`]: ComAmazonawsControltowerAwscontroltowerapisState::settle
+#[derive(Debug, Clone)]
+pub struct PendingEnabledBaselineDeletion {
+    /// The `DISABLE_BASELINE` operation whose completion removes the enablement.
+    pub operation_identifier: String,
+    /// The instant the clock owes this removal — the same instant that operation becomes
+    /// due, held here so applying it never depends on the operation's record still being
+    /// in the (bounded) log. Stored, never slept on.
+    pub due_at: SystemTime,
 }
 
 /// A change `UpdateEnabledBaseline` accepted and the clock has yet to apply.
@@ -1278,26 +1314,42 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
             }
         }
 
-        // A DISABLE_BASELINE that has reached its terminal status has finished tearing
-        // its `EnabledBaseline` down, so the resource is gone whether or not anybody
-        // called; its operation record stays, and still resolves.
-        let torn_down: Vec<String> = self
-            .baseline_operations
-            .values()
-            .filter(|operation| {
-                operation.operation_type == BaselineOperationType::DisableBaseline
-                    && operation.status == BaselineOperationStatus::Succeeded
-            })
-            .map(|operation| operation.enabled_baseline_arn.clone())
-            .collect();
+        let baseline_operations = &self.baseline_operations;
+
+        // A DISABLE_BASELINE the clock has made due has finished tearing its
+        // `EnabledBaseline` down, so the resource is gone whether or not anybody called;
+        // its operation record stays, and still resolves. The due instant is the parked
+        // teardown's OWN, not read back off the operation log, for the same reason a
+        // landing zone's decommissioning and a control's teardown carry their own:
+        // `enforce_log_bound` evicts the oldest in-flight record when every record is in
+        // flight, and a removal the clock owes must still be applied when that record is
+        // the one dropped. A teardown whose own record FAILED removed nothing, so the
+        // enablement stays — the same reading the pending update below gives a failed
+        // operation.
+        let mut torn_down: Vec<String> = Vec::new();
+        for (arn, enabled_baseline) in self.enabled_baselines.iter_mut() {
+            let due = enabled_baseline
+                .pending_deletion
+                .take_if(|pending| now >= pending.due_at);
+            let Some(pending) = due else {
+                // Not due yet leaves the parked teardown where it is, unchanged.
+                continue;
+            };
+            if baseline_operations
+                .get(&pending.operation_identifier)
+                .is_some_and(|operation| operation.status == BaselineOperationStatus::Failed)
+            {
+                // A failed teardown removed nothing, so the enablement stays.
+                continue;
+            }
+            torn_down.push(arn.clone());
+        }
         for arn in torn_down {
             self.enabled_baselines.remove(&arn);
             // A tag entry never outlives the resource it tags, which is what keeps the
             // tag map bounded by the two resource stores.
             self.tags.remove(&arn);
         }
-
-        let baseline_operations = &self.baseline_operations;
 
         // An UPDATE_ENABLED_BASELINE the clock has made due has finished applying the
         // change it carried, so the new version and parameters are the resource's whether
@@ -1328,15 +1380,19 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
             }
         }
 
-        for (arn, enabled_baseline) in self.enabled_baselines.iter_mut() {
-            // A FAILED enablement is not re-derived from the log, for the same reason as
-            // a FAILED landing zone: a reader must not overwrite a failure.
+        for enabled_baseline in self.enabled_baselines.values_mut() {
+            // A FAILED enablement is not re-derived, for the same reason as a FAILED
+            // landing zone: a reader must not overwrite a failure.
             if enabled_baseline.status == EnablementStatus::Failed {
                 continue;
             }
-            enabled_baseline.status = if baseline_operation_in_flight(baseline_operations, arn)
-                .is_some()
-            {
+            // Whether an enablement is still being changed is a property of the RESOURCE:
+            // the clock owes it its terminal status at its own `due_at`, the instant every
+            // transition parked on it becomes due. Derived from that rather than from the
+            // operation log for the reason each parked transition states — a record the
+            // log evicted while the transition it started is still owed must not make the
+            // resource read as though nothing were changing it.
+            enabled_baseline.status = if now < enabled_baseline.due_at {
                 EnablementStatus::UnderChange
             } else {
                 EnablementStatus::Succeeded
@@ -1781,12 +1837,42 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
             .min()
     }
 
-    /// The identifier of the earliest-started baseline operation still `IN_PROGRESS`
-    /// against `arn`, or `None` when none is. Call [`settle`] first.
+    /// The identifier of the baseline operation still changing the enablement `arn` names,
+    /// or `None` when nothing is changing it. Call [`settle`] first.
+    ///
+    /// Read off the RESOURCE — the status [`settle`] derived from the transitions parked on
+    /// it — rather than off the operation log, for the same reason
+    /// [`deletion_in_flight_on`] reads a landing zone's parked removal:
+    /// [`enforce_log_bound`] can evict a record while the transition it started is still
+    /// owed, and a change in flight must not stop being reported because its record was
+    /// dropped. An enablement carries at most one operation at a time — every call that
+    /// starts one is refused while another is in flight — so the identifier of the one
+    /// changing it is the last one started against it.
     ///
     /// [`settle`]: Self::settle
-    pub fn baseline_operation_in_flight(&self, arn: &str) -> Option<String> {
-        baseline_operation_in_flight(&self.baseline_operations, arn)
+    /// [`deletion_in_flight_on`]: Self::deletion_in_flight_on
+    pub fn baseline_change_in_flight_on(&self, arn: &str) -> Option<String> {
+        self.enabled_baselines
+            .get(arn)
+            .filter(|enabled| enabled.status == EnablementStatus::UnderChange)
+            .map(|enabled| enabled.last_operation_identifier.clone())
+    }
+
+    /// The `operationIdentifier` of the `DISABLE_BASELINE` still tearing the enablement
+    /// `arn` names down, or `None` when that enablement is not being torn down. Call
+    /// [`settle`] first.
+    ///
+    /// Read off the parked teardown rather than the operation log, for the same reason
+    /// [`settle`] applies it from there: [`enforce_log_bound`] can evict the
+    /// `DISABLE_BASELINE` record while the removal the clock owes is still parked, and the
+    /// identifier a repeated disable reports must be the one that teardown carries.
+    ///
+    /// [`settle`]: Self::settle
+    pub fn baseline_deletion_in_flight_on(&self, arn: &str) -> Option<String> {
+        self.enabled_baselines
+            .get(arn)
+            .and_then(|enabled| enabled.pending_deletion.as_ref())
+            .map(|pending| pending.operation_identifier.clone())
     }
 
     /// Append a baseline operation to its log and return its `operationIdentifier`.
@@ -1854,12 +1940,17 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
                 // the status is derived from the log by `settle`, and seeded to match.
                 status: EnablementStatus::UnderChange,
                 last_operation_identifier: operation_identifier.clone(),
+                // The clock owes the enablement its terminal status when its
+                // ENABLE_BASELINE operation becomes due; `settle` derives the reported
+                // status from this instant.
+                due_at: now + OPERATION_SETTLE_AFTER,
                 created_at: now,
                 // Drift is a property of a DEPLOYED configuration, so nothing is assessed
                 // while the ENABLE_BASELINE operation is still in flight; `settle`
                 // materialises it once that operation is due.
                 inheritance_drift_status: None,
                 pending_update: None,
+                pending_deletion: None,
             },
         );
         Some(operation_identifier)
@@ -1978,16 +2069,62 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
         let operation_identifier =
             self.record_baseline_operation(BaselineOperationType::UpdateEnabledBaseline, arn, now);
         let enabled_baseline = self.enabled_baselines.get_mut(arn)?;
+        // ONE instant, held in both places that need it: the status the enablement reports
+        // while the update runs is owed at the same moment as the change itself, so the two
+        // cannot drift apart.
+        let due_at = now + OPERATION_SETTLE_AFTER;
         // The enablement is changing until the update is due; the status is derived from
-        // the log by `settle`, and set to match here so a caller reading straight after
-        // the call sees the transient state.
+        // that instant by `settle`, and set to match here so a caller reading straight
+        // after the call sees the transient state.
         enabled_baseline.status = EnablementStatus::UnderChange;
         enabled_baseline.last_operation_identifier = operation_identifier.clone();
+        enabled_baseline.due_at = due_at;
         enabled_baseline.pending_update = Some(PendingEnabledBaselineUpdate {
             operation_identifier: operation_identifier.clone(),
-            due_at: now + OPERATION_SETTLE_AFTER,
+            due_at,
             baseline_version: baseline_version.to_string(),
             parameters,
+        });
+        Some(operation_identifier)
+    }
+
+    /// Start a `DISABLE_BASELINE` against the enablement `arn` names, parking its removal
+    /// for [`settle`] to apply once the clock makes it due, and return the operation's
+    /// `operationIdentifier`.
+    ///
+    /// The enablement stays in the store, `UNDER_CHANGE`, until that instant: the teardown
+    /// is asynchronous, so while it runs the enablement is still a resource a reporting
+    /// call reports and a second mutating call collides with. It applies no configuration,
+    /// so unlike an update it parks no parameters — what it parks is the removal, exactly
+    /// as a control's teardown does ([`record_enabled_control_disable`]).
+    ///
+    /// `None` when `arn` names no stored enablement, so a handler answers the modelled
+    /// `ResourceNotFoundException` and NOTHING is written.
+    ///
+    /// [`settle`]: Self::settle
+    /// [`record_enabled_control_disable`]: Self::record_enabled_control_disable
+    pub fn record_enabled_baseline_disable(
+        &mut self,
+        arn: &str,
+        now: SystemTime,
+    ) -> Option<String> {
+        if !self.enabled_baselines.contains_key(arn) {
+            return None;
+        }
+
+        let operation_identifier =
+            self.record_baseline_operation(BaselineOperationType::DisableBaseline, arn, now);
+        let enabled_baseline = self.enabled_baselines.get_mut(arn)?;
+        // ONE instant, held in both places that need it: the status the enablement reports
+        // while the teardown runs is owed at the same moment as the removal itself, so the
+        // two cannot drift apart.
+        let due_at = now + OPERATION_SETTLE_AFTER;
+        enabled_baseline.status = EnablementStatus::UnderChange;
+        enabled_baseline.last_operation_identifier = operation_identifier.clone();
+        enabled_baseline.due_at = due_at;
+        enabled_baseline.pending_deletion = Some(PendingEnabledBaselineDeletion {
+            operation_identifier: operation_identifier.clone(),
+            due_at,
         });
         Some(operation_identifier)
     }
@@ -2023,11 +2160,12 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
         let operation_identifier =
             self.record_baseline_operation(BaselineOperationType::ResetEnabledBaseline, arn, now);
         let enabled_baseline = self.enabled_baselines.get_mut(arn)?;
-        // The enablement is changing until the reset is due; the status is derived from the
-        // log by `settle`, and set to match here so a caller reading straight after the call
-        // sees the transient state.
+        // The enablement is changing until the reset is due; the status is derived from that
+        // instant by `settle`, and set to match here so a caller reading straight after the
+        // call sees the transient state.
         enabled_baseline.status = EnablementStatus::UnderChange;
         enabled_baseline.last_operation_identifier = operation_identifier.clone();
+        enabled_baseline.due_at = now + OPERATION_SETTLE_AFTER;
         enabled_baseline.inheritance_drift_status = None;
         Some(operation_identifier)
     }
@@ -2109,29 +2247,6 @@ fn enforce_log_bound<R: OperationLogRecord>(log: &mut HashMap<String, R>, max_re
         };
         log.remove(&evicted);
     }
-}
-
-/// The identifier of the earliest-started operation in `operations` still `IN_PROGRESS`
-/// against the enabled baseline `arn`, or `None` when none is.
-///
-/// The single definition of "in flight" for baselines: `settle` derives an enabled
-/// baseline's status from it while holding a mutable borrow of the enabled baseline map,
-/// which is why it takes the operation map rather than `&self`.
-fn baseline_operation_in_flight(
-    operations: &HashMap<String, BaselineOperationRecord>,
-    arn: &str,
-) -> Option<String> {
-    operations
-        .values()
-        .filter(|operation| {
-            operation.enabled_baseline_arn == arn
-                && operation.status == BaselineOperationStatus::InProgress
-        })
-        .min_by(|a, b| {
-            (a.start_time, a.operation_identifier.as_str())
-                .cmp(&(b.start_time, b.operation_identifier.as_str()))
-        })
-        .map(|operation| operation.operation_identifier.clone())
 }
 
 /// Whether any operation in `operations` against `arn` is still `IN_PROGRESS`.

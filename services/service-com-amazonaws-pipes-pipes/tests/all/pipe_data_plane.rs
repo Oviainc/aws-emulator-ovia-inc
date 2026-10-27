@@ -823,3 +823,147 @@ async fn a_stopped_pipe_consumes_nothing_and_start_pipe_drains_its_backlog() {
         after.len()
     );
 }
+
+/// The enrichment template the rows below configure: an object built from two of the
+/// record's own values, which is what proves the enrichment saw the render and not the
+/// record.
+const RECORD_TEMPLATE: &str = r#"{"marker": "<$.body>", "source": "<$.eventSource>"}"#;
+
+/// RULE: a stage's `InputTemplate` is what that stage is handed INSTEAD of the event —
+/// "nothing from the event itself is passed" — so an enrichment configured with one sees
+/// the array of payloads the template rendered, not the record envelopes, and a target
+/// configured with one receives the payload its own template rendered.
+///
+/// The rows differ along which stage carries a template and what it renders (an object
+/// built from two of the record's values, the record's body alone, a value of the
+/// enrichment's answer), with the no-template row as the differential twin. The
+/// enrichment is the same documented aggregate used above, so what it reports is what it
+/// was handed and not what this test assumed.
+#[tokio::test]
+async fn an_input_template_is_what_the_stage_it_belongs_to_is_handed() {
+    // (case, whether the pipe has an enrichment, the enrichment's template, the target's
+    // template)
+    let rows: Vec<(&str, bool, Option<&str>, Option<&str>)> = vec![
+        ("no-template", true, None, None),
+        ("enrichment-template", true, Some(RECORD_TEMPLATE), None),
+        ("target-template", false, None, Some("<$.body>")),
+        (
+            "both-templates",
+            true,
+            Some(RECORD_TEMPLATE),
+            Some("<$.batch_len>"),
+        ),
+    ];
+    let router = emulator();
+    for (case, has_enrichment, enrichment_template, target_template) in rows {
+        let (source_url, source_arn) = given_queue(&router, &format!("{case}-source")).await;
+        let (target_url, target_arn) = given_queue(&router, &format!("{case}-target")).await;
+        let sent = markers(case, 2);
+        send(&router, &source_url, &sent).await;
+
+        let mut body = json!({
+            "Source": source_arn,
+            "Target": target_arn,
+            "RoleArn": ROLE,
+            "DesiredState": "RUNNING",
+            "SourceParameters": { "SqsQueueParameters": { "BatchSize": 2 } },
+        });
+        if has_enrichment {
+            let enrichment = given_express_workflow(
+                &router,
+                &format!("{case}-enrichment"),
+                AGGREGATE_DEFINITION,
+            )
+            .await;
+            body["Enrichment"] = json!(enrichment);
+        }
+        if let Some(template) = enrichment_template {
+            body["EnrichmentParameters"] = json!({ "InputTemplate": template });
+        }
+        if let Some(template) = target_template {
+            body["TargetParameters"] = json!({ "InputTemplate": template });
+        }
+        let created = create_pipe(&router, case, body).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: CreatePipe answered {} {}",
+            created.status, created.body
+        );
+
+        let delivered = collect_at_least(&router, &target_url, 1, BUDGET).await;
+        let first = delivered
+            .first()
+            .unwrap_or_else(|| panic!("case {case:?}: nothing was delivered"));
+
+        match target_template {
+            // No target template: the target receives the enrichment's answer itself,
+            // which reports the array the enrichment was handed.
+            None => {
+                let aggregate = envelope(case, first);
+                let handed = aggregate["batch"].as_str().unwrap_or_default().to_string();
+                let records: Vec<Value> = serde_json::from_str(&handed).unwrap_or_default();
+                assert_eq!(
+                    records.len(),
+                    sent.len(),
+                    "case {case:?}: the enrichment must be handed one payload per record, \
+                     got {handed:?}"
+                );
+                for record in &records {
+                    match enrichment_template {
+                        // The template's render, and nothing else from the record.
+                        Some(_) => {
+                            assert!(
+                                record["marker"].is_string()
+                                    && record.get("messageId").is_none()
+                                    && record.get("attributes").is_none(),
+                                "case {case:?}: the enrichment must be handed what its \
+                                 template renders and nothing from the record itself, \
+                                 got {record}"
+                            );
+                            assert!(
+                                sent.contains(
+                                    &record["marker"].as_str().unwrap_or_default().to_string()
+                                ),
+                                "case {case:?}: a placeholder must carry the record's own \
+                                 value, got {record}"
+                            );
+                            assert_eq!(
+                                record["source"].as_str().unwrap_or_default(),
+                                "aws:sqs",
+                                "case {case:?}: the template's placeholders must carry the \
+                                 record's values, got {record}"
+                            );
+                        }
+                        // No template: the record envelope, as before.
+                        None => assert_eq!(
+                            record["eventSource"].as_str().unwrap_or_default(),
+                            "aws:sqs",
+                            "case {case:?}: with no template the enrichment is handed the \
+                             record envelope, got {record}"
+                        ),
+                    }
+                }
+            }
+            // A target template: the body is exactly what it renders for the event the
+            // target stage was handed.
+            Some("<$.body>") => assert!(
+                sent.contains(first),
+                "case {case:?}: expected the record's body alone, got {first:?}"
+            ),
+            // `<$.batch_len>` reads a value of the aggregate the enrichment returned.
+            Some(_) => assert_eq!(
+                first,
+                &sent.len().to_string(),
+                "case {case:?}: expected the aggregate's batch length rendered by the \
+                 target template, got {first:?}"
+            ),
+        }
+
+        let left = wait_for_visible(&router, &source_url, 0, BUDGET).await;
+        assert_eq!(
+            left, 0,
+            "case {case:?}: expected every delivered record deleted from the source, \
+             {left} are still visible"
+        );
+    }
+}

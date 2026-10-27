@@ -13,8 +13,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
-    FilterCriteria, NotFoundException, Pipe, PipeEnrichmentParameters, PipeLogConfiguration,
-    PipeSourceParameters, PipeTargetParameters, ValidationException, ValidationExceptionField,
+    ConflictException, FilterCriteria, NotFoundException, Pipe, PipeEnrichmentParameters,
+    PipeLogConfiguration, PipeSourceParameters, PipeTargetParameters, ValidationException,
+    ValidationExceptionField,
 };
 
 /// The `PipeState` members this slice reports. Source: the `PipeState` enum of
@@ -345,6 +346,22 @@ pub fn validation_error(fields: Vec<ValidationExceptionField>) -> ValidationExce
     }
 }
 
+/// The `ConflictException` a lifecycle call is refused with when a move the pipe is
+/// already making has not landed yet.
+///
+/// ONE sentence, built from the request — the pipe the caller named interpolated into
+/// fixed text — and the same sentence for every such refusal: which operation was called,
+/// and which of its own states the pipe is passing through, are not the caller's business
+/// and do not change what the caller must do (wait for the move to land and ask again).
+/// So `StartPipe`, `StopPipe` and `UpdatePipe` all read alike here.
+pub fn pipe_conflict(pipe: &str) -> ConflictException {
+    ConflictException {
+        message: format!("Pipe {pipe} is updating concurrently."),
+        resource_id: pipe.to_string(),
+        resource_type: PIPE_RESOURCE_TYPE.to_string(),
+    }
+}
+
 /// The `NotFoundException` the NAME-addressed operations of this service answer with for
 /// a pipe this account does not hold.
 ///
@@ -599,9 +616,10 @@ fn cross_resource_field(
     }
 
     // A FIFO queue orders its messages by message group, and `SendMessage` to one requires
-    // the group to send in — which for a pipe is the target parameter, there being no event
-    // member to read it from. A FIFO queue is one whose NAME carries the suffix, which is
-    // the resource field of its ARN (`service_common::arn` reads both fields).
+    // the group to send in — which for a pipe is the target parameter, whether it carries
+    // the group literally or a path to read it from each event. A FIFO queue is one whose
+    // NAME carries the suffix, which is the resource field of its ARN
+    // (`service_common::arn` reads both fields).
     let fifo_target = ::service_common::arn::parse_of(target, PIPES_SERVICE_SQS)
         .is_some_and(|queue| queue.resource.ends_with(FIFO_QUEUE_SUFFIX));
     let message_group_id = target_parameters

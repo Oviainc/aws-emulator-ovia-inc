@@ -485,6 +485,10 @@ async fn lifecycle_states_settle_only_once_the_clock_owes_the_move() {
         "STOPPED",
         "StopPipe must record the desired state, got {stopped:?}"
     );
+    // The stop has to LAND before another move is asked for: a lifecycle call that
+    // arrives while one is in flight is refused with `ConflictException` (see
+    // `pipe_lifecycle_conflicts`).
+    tokio::time::sleep(PAST_SETTLE).await;
     let started = call(&router, "POST", "/v1/pipes/settling/start", None, REGION).await;
     assert_eq!(
         started.string("DesiredState"),
