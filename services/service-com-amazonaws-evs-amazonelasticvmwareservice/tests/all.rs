@@ -50,6 +50,8 @@ mod entitlement_connector;
 mod entitlements;
 #[path = "all/environment_child_change_stamps.rs"]
 mod environment_child_change_stamps;
+#[path = "all/environment_connector_health.rs"]
+mod environment_connector_health;
 #[path = "all/environment_deletion_cascade.rs"]
 mod environment_deletion_cascade;
 #[path = "all/environment_deletion_hosts.rs"]

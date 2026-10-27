@@ -113,6 +113,8 @@ mod pull_request_approval_rule_evaluation;
 mod pull_request_approval_rules;
 #[path = "all/pull_request_approval_state.rs"]
 mod pull_request_approval_state;
+#[path = "all/pull_request_approval_states_read.rs"]
+mod pull_request_approval_states_read;
 #[path = "all/pull_request_comments.rs"]
 mod pull_request_comments;
 #[path = "all/pull_request_creation.rs"]

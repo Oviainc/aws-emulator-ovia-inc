@@ -1234,6 +1234,41 @@ impl ComAmazonawsAmpAmazonprometheusserviceState {
             .map(|scraper| TaggedResource::Scraper(scraper.scraper_id.clone()))
     }
 
+    /// The refusal a scraper `destination` earns when the reference it carries does not
+    /// resolve — `None` when it does, or when it names a resource no local state speaks
+    /// for.
+    ///
+    /// A destination is a REFERENCE to another resource, and
+    /// `ResourceNotFoundException` is modelled on every operation that stores one for
+    /// exactly that: "The request references a resources that doesn't exist." The
+    /// reference this service can resolve is a workspace of its own in the account the
+    /// emulator serves, so one that names no workspace this store holds does not resolve
+    /// — reported the way every other unresolved workspace is, with the constant sentence
+    /// in `message`, the id in `resourceId` and the parent's AWS type in `resourceType`.
+    /// A destination in another account (which `roleConfiguration` exists to enable) or in
+    /// another service names a resource this store holds nothing about, so it is taken as
+    /// given.
+    pub fn unresolved_destination_workspace(
+        &self,
+        destination: &crate::ops::types::Destination,
+    ) -> Option<crate::ops::types::ResourceNotFoundException> {
+        let workspace_arn = destination_workspace_arn(destination)?;
+        if !names_this_account(workspace_arn) {
+            return None;
+        }
+        if matches!(
+            self.taggable_of_arn(workspace_arn),
+            Some(TaggedResource::Workspace(_))
+        ) {
+            return None;
+        }
+        Some(crate::ops::types::ResourceNotFoundException {
+            message: WORKSPACE_NOT_FOUND_MESSAGE.to_string(),
+            resource_id: workspace_id_of_arn(workspace_arn).to_string(),
+            resource_type: WORKSPACE_RESOURCE_TYPE.to_string(),
+        })
+    }
+
     /// The tag map the resource `resource_arn` names CARRIES, for a reader to report —
     /// `None` when the ARN names no resource this store holds.
     pub fn tags_of_arn(&self, resource_arn: &str) -> Option<&BTreeMap<String, String>> {
@@ -2552,6 +2587,21 @@ pub fn scraper_destination_arn(destination: &crate::ops::types::Destination) -> 
         crate::ops::types::Destination::cloudWatchConfiguration(cloud_watch) => {
             Some(cloud_watch.dataset_arn.as_str())
         }
+    }
+}
+
+/// The WORKSPACE ARN a destination names, when it names one.
+///
+/// `Destination` is a union: `ampConfiguration` sends the metrics to an Amazon Managed
+/// Service for Prometheus workspace, named by ARN — a resource of THIS service, which this
+/// store can resolve — while `cloudWatchConfiguration` names a CloudWatch dataset, a
+/// resource of another service this store holds nothing about. That is the difference from
+/// [`scraper_destination_arn`], which reports whichever ARN the destination carries because
+/// the `destinationArn` filter matches on the stored value rather than resolving it.
+pub fn destination_workspace_arn(destination: &crate::ops::types::Destination) -> Option<&str> {
+    match destination {
+        crate::ops::types::Destination::ampConfiguration(amp) => Some(amp.workspace_arn.as_str()),
+        crate::ops::types::Destination::cloudWatchConfiguration(_) => None,
     }
 }
 

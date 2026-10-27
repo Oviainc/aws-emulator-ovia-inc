@@ -58,6 +58,10 @@ fn stored_count(amp: &Amp) -> usize {
 
 /// An EKS source, as `EksConfiguration` models it: `clusterArn` and `subnetIds` are
 /// `@required`, and `securityGroupIds` is optional (both lists are `len 1..5`).
+///
+/// `pub(crate)` with the two destination builders below, because the other suites that
+/// drive `CreateScraper` send the same wire shapes: a second copy of them is a second set
+/// of rules about what a request body looks like.
 pub(crate) fn eks_source_json(
     region: &str,
     cluster: &str,
@@ -96,7 +100,7 @@ pub(crate) fn workspace_destination_json(workspace_arn: &str) -> serde_json::Val
 /// A CloudWatch dataset destination — the `Destination` union's other variant.
 /// `CloudWatchConfiguration$datasetArn` documents the default one: "To use the default
 /// dataset, specify `arn:aws:cloudwatch:<region>:<account-id>:dataset/default`".
-fn dataset_destination_json(region: &str, dataset: &str) -> serde_json::Value {
+pub(crate) fn dataset_destination_json(region: &str, dataset: &str) -> serde_json::Value {
     serde_json::json!({
         "cloudWatchConfiguration": {
             "datasetArn": format!(

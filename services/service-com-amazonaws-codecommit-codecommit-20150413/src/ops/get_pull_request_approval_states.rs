@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPullRequestApprovalStates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPullRequestApprovalStates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPullRequestApprovalStates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the approvals the stored pull request holds — the reviewers
+//! whose last recorded approval state is an approval — read out of `crate::state`
+//! and writing nothing, so a later caller finds the pull request exactly as this
+//! call found it.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +160,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPullRequestApprovalStates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPullRequestApprovalStatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPullRequestApprovalStates"))
+        let _ = ctx;
+        // Which ids address a pull request is `crate::state`'s rule, so every
+        // operation taking a `pullRequestId` agrees about it; this only maps each
+        // outcome onto the error THIS operation models for it.
+        let pull_request_id = crate::state::normalize_pull_request_id(&input.pull_request_id)
+            .map_err(|problem| match problem {
+                crate::state::PullRequestIdProblem::Missing => {
+                    GetPullRequestApprovalStatesErrorModeled::PullRequestIdRequiredException(
+                        PullRequestIdRequiredException {
+                            message: Some(
+                                crate::state::PULL_REQUEST_ID_REQUIRED_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                }
+                crate::state::PullRequestIdProblem::Invalid => {
+                    GetPullRequestApprovalStatesErrorModeled::InvalidPullRequestIdException(
+                        InvalidPullRequestIdException {
+                            message: Some(
+                                crate::state::INVALID_PULL_REQUEST_ID_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                }
+            })?;
+
+        // Which values can name a revision of a pull request is likewise
+        // `crate::state`'s rule. Reporting the approvals models no "not current"
+        // failure, so any id of that form is ANSWERED rather than refused: the
+        // approvals a pull request holds are the states its reviewers last recorded,
+        // which is what every later revision of it is reviewed with.
+        let _revision_id = crate::state::normalize_revision_id(&input.revision_id).map_err(
+            |problem| match problem {
+                crate::state::RevisionIdProblem::Missing => {
+                    GetPullRequestApprovalStatesErrorModeled::RevisionIdRequiredException(
+                        RevisionIdRequiredException {
+                            message: Some(crate::state::REVISION_ID_REQUIRED_MESSAGE.to_string()),
+                        },
+                    )
+                }
+                crate::state::RevisionIdProblem::Invalid => {
+                    GetPullRequestApprovalStatesErrorModeled::InvalidRevisionIdException(
+                        InvalidRevisionIdException {
+                            message: Some(crate::state::INVALID_REVISION_ID_MESSAGE.to_string()),
+                        },
+                    )
+                }
+            },
+        )?;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        // Reporting only: the answer is a lookup in stored state, so reading the
+        // approvals leaves the pull request exactly as the next caller would have
+        // found it.
+        let store = state.lock();
+        let pull_request = store.pull_request(pull_request_id).ok_or_else(|| {
+            GetPullRequestApprovalStatesErrorModeled::PullRequestDoesNotExistException(
+                PullRequestDoesNotExistException {
+                    message: Some(crate::state::pull_request_does_not_exist_message(
+                        &pull_request_id.to_string(),
+                    )),
+                },
+            )
+        })?;
+
+        Ok(GetPullRequestApprovalStatesOutput {
+            // A pull request holding no approvals answers an EMPTY list rather than
+            // no member at all: the question of which approvals it holds was
+            // answered, and the answer is none.
+            approvals: Some(pull_request.approvals_to_modeled()),
+        })
     }
 }
