@@ -40,9 +40,12 @@ const SIGNED_FOR_EU_WEST_1: &str = "AWS4-HMAC-SHA256 \
 /// The region [`SIGNED_FOR_EU_WEST_1`] signs for.
 const REGION: &str = "eu-west-1";
 
-/// The access key id [`SIGNED_FOR_EU_WEST_1`] carries — the caller identity a
-/// revocation records as the revoker, reported as an IAM principal ARN.
-const ACCESS_KEY_ID: &str = "AKIDREVOKER";
+/// The IAM principal the emulator resolves every signed request as, whatever
+/// access key id the request carried: the one IAM user whose credentials it
+/// publishes, which is the identity `sts:GetCallerIdentity` answers with.
+fn caller_principal() -> String {
+    format!("arn:aws:iam::{ACCOUNT_ID}:user/emulator")
+}
 
 /// The account id every generated emulator presents (`EMULATOR_ACCOUNT_ID`),
 /// spelled out here rather than imported so a wrong account in the handlers fails.
@@ -199,9 +202,10 @@ fn profile_cases() -> Vec<ProfileCase> {
                 "tags": { "owner": "iot", "tier": "gold" },
             }),
         },
-        // The container-image platform, with a YEARS period. That platform's
-        // profile holds the certificate its signatures are issued under, so the
-        // request names one (its published `requires_signing_material`).
+        // The container-image platform, with a YEARS period. AWS Signer issues
+        // the certificate for that platform itself, so its profiles need no
+        // `signingMaterial` — but naming one is still accepted, which is what
+        // this row carries.
         ProfileCase {
             name: "Container_Profile",
             request: json!({
@@ -533,8 +537,8 @@ async fn revoke_records_the_transition_and_every_read_reports_it() {
         );
         assert_eq!(
             record["revokedBy"],
-            json!(format!("arn:aws:iam::{ACCOUNT_ID}:user/{ACCESS_KEY_ID}")),
-            "case {}: expected revokedBy to name the calling identity as an IAM principal ARN, got {:?}",
+            json!(caller_principal()),
+            "case {}: expected revokedBy to name the resolved caller principal, got {:?}",
             case.name,
             record["revokedBy"]
         );

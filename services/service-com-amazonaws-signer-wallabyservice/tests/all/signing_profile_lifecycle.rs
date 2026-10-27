@@ -38,9 +38,13 @@ const SIGNED_FOR_US_WEST_2: &str = "AWS4-HMAC-SHA256 \
 /// The region [`SIGNED_FOR_US_WEST_2`] signs for.
 const REGION: &str = "us-west-2";
 
-/// The access key id [`SIGNED_FOR_US_WEST_2`] carries — the caller identity a
-/// signing job records as having requested it.
-const ACCESS_KEY_ID: &str = "AKIDEXAMPLE";
+/// The IAM principal the emulator resolves every signed request as: the one IAM
+/// user whose credentials it publishes, which is the identity
+/// `sts:GetCallerIdentity` answers with and what a job records as having
+/// requested it.
+fn caller_principal() -> String {
+    format!("arn:aws:iam::{ACCOUNT_ID}:user/emulator")
+}
 
 /// The account id every generated emulator presents (`EMULATOR_ACCOUNT_ID`),
 /// spelled out here rather than imported so a wrong account in the handlers fails.
@@ -776,8 +780,8 @@ async fn start_signing_job_is_idempotent_and_describe_reports_the_stored_job() {
     );
     assert_eq!(
         described.str_member("requestedBy"),
-        ACCESS_KEY_ID,
-        "expected requestedBy to name the signing caller, got {:?}",
+        caller_principal(),
+        "expected requestedBy to name the resolved caller principal, got {:?}",
         described.body["requestedBy"]
     );
     assert_eq!(

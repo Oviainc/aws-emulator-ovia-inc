@@ -35,15 +35,125 @@
 //!   body). The default returns `None`, keeping the entry's protocol-correct
 //!   rendering. Return `Some(resp)` to reword it if desired.
 //!
+//! `override_operation` is also where this service states the LENGTH of an answer
+//! that carries no body: the operations whose modelled output is `Unit` are served
+//! wrapped in [`StatedEmptyLength`], at the one place every response of theirs
+//! passes through rather than once per operation. See [`EMPTY_BODY_LENGTH`].
+//!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, BoxFuture, ErasedOperation, Operation, OperationContext, OperationRoutingTable, Refusal,
+    Refused, Service,
 };
 use std::sync::Arc;
+
+/// The length an answer with no body states.
+///
+/// A response that carries no body still has a length, and the recorded AWS
+/// answer to a Signer call whose output carries none states it: a client (or an
+/// intermediary) that frames a bodyless response by its stated length rather
+/// than by the status alone has nothing to read otherwise. The value is a fact
+/// about the body — it has no bytes — so it is stated for every such answer
+/// rather than per operation.
+///
+/// It is the LAST word only up to the transport: the HTTP/1.1 writer this
+/// emulator is served by removes `content-length` from a `204` (RFC 9110
+/// §15.3.5 forbids it there), and that writer is a dependency of the vendored
+/// HTTP layer rather than anything this crate decides — so a caller on the
+/// in-process front door (the inter-service callback path and the SDK
+/// connector, which both serve `dispatch`'s response unchanged) reads it, while
+/// one on a socket reads the status and the empty body alone.
+const EMPTY_BODY_LENGTH: &str = "0";
+
+/// The response header that states it.
+const CONTENT_LENGTH: &str = "content-length";
+
+/// The operations whose modelled output carries NO body, and whose answers
+/// therefore state [`EMPTY_BODY_LENGTH`].
+///
+/// Source: the three operations this model binds to `smithy.api#Unit`
+/// (`smithy_query(query="digest", model_path="services/\
+/// service-com-amazonaws-signer-wallabyservice/smithy-model/\
+/// com-amazonaws-signer-wallabyservice.json")` — `CancelSigningProfile`,
+/// `RevokeSignature` and `RevokeSigningProfile` are the ones whose `output` is
+/// `Unit`). Every other operation of this service answers a modelled structure,
+/// so its body is a document and its length is the document's.
+///
+/// The wrapper decides on the ANSWER rather than on the operation, so a response
+/// of one of these that does carry a body (a refusal's error document) keeps the
+/// length its renderer stated.
+macro_rules! frame_empty_answers {
+    ($table:expr, $engine:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
+        $(
+            $table.add_operation(
+                <crate::ops::$module::$operation<Eng> as Operation>::NAME,
+                ::std::boxed::Box::new(StatedEmptyLength::new(
+                    crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
+                )) as ::std::boxed::Box<dyn ErasedOperation>,
+            );
+        )+
+    };
+}
+
+/// One modelled operation, served with the length its empty answer has stated on
+/// it.
+///
+/// Everything else about the operation is the operation's: the request walk, the
+/// status, the body and every other header come from the wrapped
+/// `impl Operation`, and the auth schemes are the wrapped operation's own —
+/// wrapping must not change which schemes sign a request.
+struct StatedEmptyLength<O> {
+    operation: O,
+}
+
+impl<O> StatedEmptyLength<O> {
+    /// Wrap one operation, already constructed from the shared engine.
+    fn new(operation: O) -> Self {
+        Self { operation }
+    }
+}
+
+impl<O> ErasedOperation for StatedEmptyLength<O>
+where
+    O: Operation + ErasedOperation,
+{
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move { with_stated_length(self.operation.run(svc, req, ctx).await) })
+    }
+
+    /// The wrapped operation's modelled auth schemes.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        self.operation.auth_schemes()
+    }
+}
+
+/// `resp` with the length of an EMPTY body stated on it, and anything else left
+/// exactly as the operation answered it.
+///
+/// A body with bytes in it states the length its renderer stated, a header
+/// already present is left alone (whoever wrote it first is its one writer), and
+/// a streamed body — whose length is not known here — is left to the transport.
+/// The insert is FALLIBLE: a header the HTTP layer cannot represent is dropped
+/// rather than turned into a transport failure.
+fn with_stated_length(mut resp: RtResponse) -> RtResponse {
+    let empty_body = resp.body().bytes().is_some_and(<[u8]>::is_empty);
+    if empty_body && resp.headers().get(CONTENT_LENGTH).is_none() {
+        let _ = resp
+            .headers_mut()
+            .try_insert(CONTENT_LENGTH, EMPTY_BODY_LENGTH);
+    }
+    resp
+}
 
 /// The operation `GET /revocations` addresses, as the generated routing table keys
 /// it (the operation's own name).
@@ -81,6 +191,12 @@ fn addresses_revocation_status(req: &aws_smithy_runtime_api::http::Request) -> b
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The operations whose modelled output carries no body, each wrapped in
+    /// [`StatedEmptyLength`] so their empty answer states its length. Keyed by
+    /// the routing key the protocol resolves — the key the generated table uses
+    /// — and built from the SAME shared engine, so a wrapped operation reads and
+    /// writes the one store.
+    empty_answers: OperationRoutingTable,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -88,8 +204,17 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
+        let mut empty_answers = OperationRoutingTable::new();
+        frame_empty_answers!(
+            empty_answers,
+            engine,
+            cancel_signing_profile::CancelSigningProfile,
+            revoke_signature::RevokeSignature,
+            revoke_signing_profile::RevokeSigningProfile,
+        );
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            empty_answers,
         }
     }
 }
@@ -145,10 +270,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // the modelled 400 naming each absent member. A request that carries them all
         // resolves to this same operation through the routing table, so nothing else
         // changes.
-        if !addresses_revocation_status(req) {
-            return None;
+        if addresses_revocation_status(req) {
+            return self.entry.routing_table().get(GET_REVOCATION_STATUS);
         }
-        self.entry.routing_table().get(GET_REVOCATION_STATUS)
+
+        // NOT a re-route: the key is the one the generated table's own protocol
+        // resolves, and the operation it names is the one served — wrapped in
+        // `StatedEmptyLength` so an answer with no body states its length. A key
+        // no wrapped operation holds resolves to `None` here, so every other
+        // request is served by the generated table unchanged.
+        let key = self.entry.protocol().routing_key(req).ok()?;
+        self.empty_answers.get(key)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
