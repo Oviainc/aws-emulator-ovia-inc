@@ -169,6 +169,8 @@ mod instance_reboot;
 mod instance_restore_from_snapshot;
 #[path = "all/instance_snapshot_create.rs"]
 mod instance_snapshot_create;
+#[path = "all/instance_snapshot_delete.rs"]
+mod instance_snapshot_delete;
 #[path = "all/instance_snapshot_listing.rs"]
 mod instance_snapshot_listing;
 #[path = "all/instance_snapshot_read.rs"]

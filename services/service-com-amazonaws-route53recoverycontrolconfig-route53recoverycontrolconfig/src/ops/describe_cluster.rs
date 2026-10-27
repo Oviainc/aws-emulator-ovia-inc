@@ -3,7 +3,9 @@
 //! @op DescribeCluster
 //! Implemented: looks the stored cluster up by the ARN `CreateCluster` minted and
 //! answers with the same projection that create answered with; an ARN no cluster is
-//! stored under is `ResourceNotFoundException` (404).
+//! stored under is `ResourceNotFoundException` (404), and one naming another account's
+//! cluster is `AccessDeniedException` (403) decided before that lookup
+//! ([`crate::state::authorize_resource_arn`]).
 //!
 //! A pure read: the `Status` it reports is computed from the clock, so nothing is
 //! written here and a later caller sees exactly what this one saw.
@@ -150,6 +152,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // Whether the caller may act on the resource an ARN names is decided from the
+        // request alone, so it is decided BEFORE the ARN is looked up: an ARN of another
+        // account is refused without the answer saying whether a cluster is stored there.
+        crate::state::authorize_resource_arn(Self::NAME, &input.cluster_arn)
+            .map_err(DescribeClusterErrorModeled::AccessDeniedException)?;
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DescribeClusterErrorModeled::InternalServerException(
                 InternalServerException {

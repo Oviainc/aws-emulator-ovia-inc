@@ -27,6 +27,8 @@ mod not_found_error_body_members;
 mod quota_refusal_bodies;
 #[path = "all/regional_rule_isolation.rs"]
 mod regional_rule_isolation;
+#[path = "all/reserved_tag_keys.rs"]
+mod reserved_tag_keys;
 #[path = "all/resource_tag_pair_quota.rs"]
 mod resource_tag_pair_quota;
 #[path = "all/resource_tags.rs"]

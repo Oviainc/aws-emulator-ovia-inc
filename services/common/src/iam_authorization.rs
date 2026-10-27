@@ -31,6 +31,11 @@
 //! asks through [`identity_outcome_prepared`] / [`resource_outcome_prepared`], which answer
 //! that same decision together with the statements it was reached from ([`Outcome`]).
 //!
+//! How a refusal is WORDED lives here too, for the same reason the decision does:
+//! [`not_authorized_by_resource_policy`] is the one sentence an AWS service refuses an
+//! unauthorized request with, built from the principal, the action and the resource the
+//! request named.
+//!
 //! `Action`/`NotAction`, `Resource`/`NotResource` and `Principal`/`NotPrincipal` are each
 //! either one string or a list of them, and the `Not…` spelling matches everything its
 //! values do NOT. IAM compares action names case-insensitively and resource ARNs
@@ -368,6 +373,27 @@ pub fn account_principals(arn: &str) -> Vec<String> {
         format!("arn:{}:iam::{}:root", parsed.partition, parsed.account),
         parsed.account.to_string(),
     ]
+}
+
+/// The sentence AWS refuses a request with when the RESOURCE it names grants the calling
+/// principal nothing: the principal that signed, the action it asked for and the resource
+/// it asked for, each as the request carried them.
+///
+/// `action` is the fully qualified IAM action (`<service action namespace>:<ApiName>`), so
+/// the one sentence serves every service: the namespace is the caller's to supply, because
+/// only the service knows the namespace its own actions are published under. Nothing about
+/// the resource is looked up to state it — an authorization refusal is decided from the
+/// request alone, which is why it can be stated before the resource is resolved.
+///
+/// Several services inlined this sentence before it lived here —
+/// `grep -rln 'because no resource-based policy allows' services/*/src` lists them — and
+/// they are to be migrated onto this one rather than copied again.
+#[must_use]
+pub fn not_authorized_by_resource_policy(principal: &str, action: &str, resource: &str) -> String {
+    format!(
+        "User: {principal} is not authorized to perform: {action} on resource: {resource} \
+         because no resource-based policy allows the {action} action"
+    )
 }
 
 /// Whether `pattern` matches `value`, with IAM's `*` (any run of characters, including

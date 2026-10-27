@@ -145,6 +145,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // The authorization check this service's ARN-addressed operations share: decided
+        // from the request alone, so it runs before the ARN is looked up.
+        crate::state::authorize_resource_arn(Self::NAME, &input.control_panel_arn)
+            .map_err(DeleteControlPanelErrorModeled::AccessDeniedException)?;
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteControlPanelErrorModeled::InternalServerException(
                 InternalServerException {

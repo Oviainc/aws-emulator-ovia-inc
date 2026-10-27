@@ -43,7 +43,8 @@ use crate::ops::types::{
     CognitoOptions, CognitoOptionsStatus, ConflictException, ConnectionProperties,
     DataSource as LinkedDataSource, DataSourceAttachmentSummary, DataSourceDetails, DataSourceType,
     DeploymentStrategyOptions,
-    DeploymentStrategyOptionsStatus, DisabledOperationException, DomainConfig, DomainEndpointOptions,
+    DeploymentStrategyOptionsStatus, DirectQueryDataSourceType, DisabledOperationException,
+    DomainConfig, DomainEndpointOptions,
     DomainEndpointOptionsStatus, DomainInfo, DomainInformationContainer, DomainPackageDetails,
     DomainStatus, EBSOptions,
     EBSOptionsStatus,
@@ -583,6 +584,189 @@ impl DataSource {
             status: Some(self.status.clone()),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Direct query data sources
+//
+// A direct query data source belongs to the ACCOUNT rather than to a domain:
+// it is addressed by its own name ("a unique, user-defined label to identify the
+// data source within your OpenSearch Service environment") on paths that name no
+// domain at all. `AddDirectQueryDataSource` mints one and
+// `GetDirectQueryDataSource` reports it, both from the ONE
+// [`DirectQueryDataSourceRecord`] below, so neither can report a source the other
+// does not hold.
+// ---------------------------------------------------------------------------
+
+/// How many direct query data sources ONE account holds before
+/// `AddDirectQueryDataSource` refuses with the modelled `LimitExceededException`.
+///
+/// Like [`DATA_SOURCE_QUOTA`] this is the emulator's OWN bound on the store — it
+/// models neither Service Quotas nor an account's adjustments — and it is what stops
+/// a caller looping with fresh names from growing the state (or a listing's answer)
+/// without end: every record it counts is released by
+/// `DeleteDirectQueryDataSource`.
+pub const DIRECT_QUERY_DATA_SOURCE_QUOTA: usize = 20;
+
+/// The `LimitExceededException` payload for an add past
+/// [`DIRECT_QUERY_DATA_SOURCE_QUOTA`] — the modelled refusal for "trying to create more
+/// than the allowed number of resources or sub-resources", naming the bound that was
+/// reached.
+pub fn direct_query_data_source_quota_exceeded() -> LimitExceededException {
+    LimitExceededException {
+        message: Some(format!(
+            "this account already holds the maximum of {DIRECT_QUERY_DATA_SOURCE_QUOTA} \
+             direct query data sources"
+        )),
+    }
+}
+
+/// One direct query data source of this account, as this emulator persists it.
+///
+/// The members are the ones `DirectQueryDataSource` and
+/// `GetDirectQueryDataSourceResponse` report between them, so a read projects this
+/// record rather than rebuilding one from the request that made it.
+#[derive(Debug, Clone)]
+pub struct DirectQueryDataSourceRecord {
+    /// `DirectQueryDataSource$DataSourceName`. Unique within the account, so the name
+    /// IS the key the store holds the record under.
+    pub data_source_name: String,
+    /// `DirectQueryDataSource$DataSourceType`: the `DirectQueryDataSourceType` union
+    /// the call carried, stored as the modelled shape rather than a second mirror of
+    /// its members.
+    pub data_source_type: DirectQueryDataSourceType,
+    /// `DirectQueryDataSource$Description`, absent when the call named none.
+    pub description: Option<String>,
+    /// `DirectQueryDataSource$OpenSearchArns`, empty when the call named none.
+    pub open_search_arns: Vec<String>,
+    /// `GetDirectQueryDataSourceResponse$DataSourceAccessPolicy`: the IAM access
+    /// policy document the call carried, in the form [`stored_policy_document`] holds
+    /// it — the caller's own tokens and values, with the insignificant whitespace
+    /// between them dropped — and absent where the call named no document.
+    pub data_source_access_policy: Option<String>,
+    /// `DirectQueryDataSource$DataSourceArn`: "the unique, system-generated identifier
+    /// that represents the data source", minted by
+    /// [`direct_query_data_source_arn`] when the source is added and stable for the
+    /// life of the record.
+    pub arn: String,
+    /// `DirectQueryDataSource$TagList`: "a list of tags attached to a direct query
+    /// data source", as the add carried them and as the tagging operations read and
+    /// write them through
+    /// [`ComAmazonawsOpensearchAmazonopensearchserviceState::tagged_resource`].
+    pub tags: TagSet,
+}
+
+/// Which member of `DirectQueryDataSourceType` a data source is, as the model names
+/// that member — what a refusal about the type names.
+pub fn direct_query_data_source_type_name(
+    data_source_type: &DirectQueryDataSourceType,
+) -> &'static str {
+    match data_source_type {
+        DirectQueryDataSourceType::CloudWatchLog(_) => "CloudWatchLog",
+        DirectQueryDataSourceType::SecurityLake(_) => "SecurityLake",
+        DirectQueryDataSourceType::Prometheus(_) => "Prometheus",
+    }
+}
+
+/// Whether a data source of this type must name the OpenSearch collections it is
+/// associated with: `OpenSearchArns` "is required for CloudWatchLogs and SecurityLake
+/// datasource types"
+/// (`smithy_query(query="operation",operation="AddDirectQueryDataSource")`), and the
+/// remaining member of the union asks for none.
+pub fn requires_open_search_arns(data_source_type: &DirectQueryDataSourceType) -> bool {
+    matches!(
+        data_source_type,
+        DirectQueryDataSourceType::CloudWatchLog(_) | DirectQueryDataSourceType::SecurityLake(_)
+    )
+}
+
+/// A direct query data source's ARN:
+/// `arn:aws:es:<region>:<account-id>:datasource/<data-source-name>`.
+///
+/// Built through the same shared helper as [`domain_arn`], so it carries the
+/// partition, Region and account id every other ARN this service hands out does, under
+/// the `datasource` resource type that names a data source of this service.
+pub fn direct_query_data_source_arn(data_source_name: &str, region: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("datasource/{data_source_name}"),
+    )
+}
+
+/// The `ValidationException` payload for a name that names no direct query data
+/// source of this account.
+///
+/// Resolving the name a request carries is part of READING that request, so a name
+/// that resolves to nothing is a value the caller has to fix rather than a resource
+/// the service went looking for. Its wording is the service's own constant for that
+/// condition — a fixed sentence every caller that hits it gets, carrying no value of
+/// the request, the way [`concurrent_package_operation`] states its condition.
+pub fn direct_query_data_source_absent() -> ValidationException {
+    ValidationException {
+        message: Some("Data source not found".to_string()),
+    }
+}
+
+/// The `ValidationException` payload for an add naming a direct query data source the
+/// account already holds — the mirror of [`data_source_exists`], so one refusal reads
+/// like the other.
+pub fn direct_query_data_source_exists(data_source_name: &str) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "DirectQueryDataSource with name {data_source_name} already exists."
+        )),
+    }
+}
+
+/// The `ValidationException` payload for a data source whose type requires the
+/// OpenSearch collections it is associated with ([`requires_open_search_arns`]) and
+/// whose request named none. It names the member and the type that asks for it, so the
+/// caller can fix the request from the refusal alone.
+pub fn open_search_arns_required(data_source_type: &str) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "OpenSearchArns is required for the {data_source_type} data source type."
+        )),
+    }
+}
+
+/// The `ValidationException` payload for a policy document that is not JSON, naming
+/// the member that carried it.
+pub fn malformed_policy_document(member: &str) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "{member} must be a policy document in valid JSON format."
+        )),
+    }
+}
+
+/// A policy document as this service persists and reports it, or the refusal for one
+/// it cannot read: `None` where the request named no document at all.
+///
+/// A policy document "must be in valid JSON format and follow IAM policy syntax", so
+/// the text is READ as JSON: one that is not JSON is a malformed request
+/// ([`malformed_policy_document`]), a blank one names no policy, and one that IS JSON
+/// is held in the service's own rendering of the document it denotes — the tokens the
+/// caller wrote, in the order they were written, with the whitespace BETWEEN them (which
+/// denotes nothing) dropped. That rendering is [`::service_common::json_document`], the
+/// ONE such scan every service that stores an opaque JSON document shares, so no two of
+/// them report one document differently. No value is re-rendered from a parse: a number
+/// keeps the digits it was written with and a string its exact content, so a document's
+/// precision survives a round trip through the store.
+pub fn stored_policy_document(
+    member: &str,
+    document: Option<String>,
+) -> Result<Option<String>, ValidationException> {
+    let Some(document) = document else {
+        return Ok(None);
+    };
+    if document.trim().is_empty() {
+        return Ok(None);
+    }
+    ::serde_json::from_str::<::serde_json::Value>(&document)
+        .map_err(|_| malformed_policy_document(member))?;
+    Ok(Some(::service_common::json_document::minified(&document)))
 }
 
 // ---------------------------------------------------------------------------
@@ -6340,6 +6524,14 @@ pub struct ComAmazonawsOpensearchAmazonopensearchserviceState {
     /// Drives
     /// [`ComAmazonawsOpensearchAmazonopensearchserviceState::mint_attachment_id`].
     pub attachment_seq: u64,
+    /// Every direct query data source of this account, keyed by its
+    /// `DataSourceName` — "a unique, user-defined label to identify the data source
+    /// within your OpenSearch Service environment", so the name IS the key.
+    /// `AddDirectQueryDataSource` mints one and `GetDirectQueryDataSource` reports
+    /// it, from THIS one record. Iterating a `BTreeMap` is order-stable, which is
+    /// what lets two reads of the set report it in the same order. Bounded by
+    /// [`DIRECT_QUERY_DATA_SOURCE_QUOTA`].
+    pub direct_query_data_sources: BTreeMap<String, DirectQueryDataSourceRecord>,
 }
 
 impl Default for ComAmazonawsOpensearchAmazonopensearchserviceState {
@@ -6365,6 +6557,7 @@ impl Default for ComAmazonawsOpensearchAmazonopensearchserviceState {
             applications: BTreeMap::new(),
             application_seq: 0,
             attachment_seq: 0,
+            direct_query_data_sources: BTreeMap::new(),
         }
     }
 }
@@ -6790,8 +6983,9 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
 
     /// The tag set of the resource `arn` names, for a caller about to READ it.
     ///
-    /// A domain and an application are the taggable resources this store persists an
-    /// ARN for ([`domain_arn`], [`application_arn`]); the data source the tagging
+    /// A domain, an application and a direct query data source are the taggable
+    /// resources this store persists an ARN for ([`domain_arn`], [`application_arn`],
+    /// [`direct_query_data_source_arn`]); the data source of a DOMAIN that the tagging
     /// operations also name has no stored ARN to resolve against (it is addressed by
     /// its domain and name), so an ARN naming none of them resolves to nothing and the
     /// caller refuses it.
@@ -6806,6 +7000,12 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
                     .find(|application| application.arn == arn)
                     .map(|application| &application.tags)
             })
+            .or_else(|| {
+                self.direct_query_data_sources
+                    .values()
+                    .find(|data_source| data_source.arn == arn)
+                    .map(|data_source| &data_source.tags)
+            })
     }
 
     /// The tag set of the resource `arn` names, for a caller about to WRITE it —
@@ -6815,10 +7015,17 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
         if let Some(domain) = self.domains.values_mut().find(|domain| domain.arn == arn) {
             return Some(&mut domain.tags);
         }
-        self.applications
+        if let Some(application) = self
+            .applications
             .values_mut()
             .find(|application| application.arn == arn)
-            .map(|application| &mut application.tags)
+        {
+            return Some(&mut application.tags);
+        }
+        self.direct_query_data_sources
+            .values_mut()
+            .find(|data_source| data_source.arn == arn)
+            .map(|data_source| &mut data_source.tags)
     }
 
     /// The package `package_name` names, if the account holds one.

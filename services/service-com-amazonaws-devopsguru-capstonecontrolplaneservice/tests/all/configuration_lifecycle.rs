@@ -779,7 +779,8 @@ async fn repeating_a_read_reports_the_same_state() {
 /// exactly the config submitted; the SNS topic identifies the channel, so a second add
 /// of the same topic reports the id already registered for it instead of creating a
 /// second channel; `RemoveNotificationChannel` deletes it, after which the id names
-/// nothing and a repeat delete is refused with `ResourceNotFoundException` (404).
+/// nothing and a repeat delete is the same empty success, because the deletion is
+/// terminal and idempotent.
 ///
 /// The rows differ in the FORM of `Config.Filters` — absent, one list, the other list,
 /// both, and empty lists — which is what the round-trip generalises over.
@@ -861,13 +862,21 @@ async fn a_channel_round_trips_its_config_and_its_topic_is_unique() {
             "case {name:?}: expected the repeat to change nothing, got {listed_again}"
         );
 
-        // An unknown but well-formed id names no channel, so removing it is refused.
+        // An unknown but well-formed id already names no channel, so removing it is a
+        // no-op success that leaves the registered channel alone (the idempotency rule
+        // itself is pinned by `crate::notification_channel_removal`).
         let unknown = "00000000-0000-4000-8000-000000000000";
         let missing = emulator.remove_notification_channel(unknown).await;
         assert_eq!(
-            missing.status, 404,
-            "case {name:?}: removing an unknown id must be refused with 404, got {}",
+            missing.status, 200,
+            "case {name:?}: removing an unknown id must succeed, got {}",
             missing.raw
+        );
+        let after_missing = emulator.list_notification_channels(None).await;
+        let still_listed = after_missing.at("/Channels").cloned().unwrap_or(Value::Null);
+        assert_eq!(
+            still_listed, expected_channels,
+            "case {name:?}: expected the no-op removal to change nothing, got {still_listed}"
         );
 
         let removed = emulator.remove_notification_channel(&id).await;
@@ -892,8 +901,14 @@ async fn a_channel_round_trips_its_config_and_its_topic_is_unique() {
 
         let again = emulator.remove_notification_channel(&id).await;
         assert_eq!(
-            again.status, 404,
-            "case {name:?}: a repeat remove must be refused with 404, got {}",
+            again.status, 200,
+            "case {name:?}: a repeat remove must succeed, got {}",
+            again.raw
+        );
+        assert_eq!(
+            again.body,
+            json!({}),
+            "case {name:?}: a repeat remove must report the empty output, got {}",
             again.raw
         );
     }

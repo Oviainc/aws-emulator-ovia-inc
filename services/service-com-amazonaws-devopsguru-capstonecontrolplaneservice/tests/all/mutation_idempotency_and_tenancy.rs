@@ -92,13 +92,14 @@ pub(crate) fn minted_id(reply: &Reply) -> String {
 }
 
 /// RULE: a removal addressed by a resource identifier acts on the resource that
-/// identifier names, so a `RemoveNotificationChannel` whose `Id` names no stored channel
-/// is refused rather than reported as a deletion, and the id a removal freed names a
-/// modelled-looking channel id that still belongs to nothing.
+/// identifier names, so a `RemoveNotificationChannel` deletes the channel its `Id` names
+/// and frees that id, which then belongs to nothing — re-registering the topic mints a
+/// fresh, different `NotificationChannelId`.
 ///
 /// The rows differ in how many channels the store holds when the freed id is re-checked,
-/// so this pins the id-minting half of the rule; the refusal itself, over the set of
-/// inputs it generalises over, is pinned by [`crate::notification_channel_removal`].
+/// so this pins the id-minting half of the rule; the idempotency of the removal itself,
+/// over the set of inputs it generalises over, is pinned by
+/// [`crate::notification_channel_removal`].
 #[tokio::test]
 async fn a_removal_frees_its_id_and_the_topic_gets_a_fresh_one() {
     // (case name, how many channels stay alongside)
