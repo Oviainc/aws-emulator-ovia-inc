@@ -231,6 +231,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let source_configuration = crate::state::GraphConfiguration::from(graph);
         let data = graph.data.clone();
 
+        // The name a snapshot reserves is released when its deletion completes, so the
+        // removals the clock has already made due are materialised before the name is
+        // looked up: the index the conflict check below reads is the one a read taken at
+        // this instant would see.
+        store.materialise_snapshots(now);
+
         // `snapshotName` is unique within the account PER REGION: a second snapshot by
         // the same name conflicts with a stored snapshot of the same Region, while the
         // same name in another Region is another snapshot. Checked before the source
