@@ -38,7 +38,10 @@
 //! rate card to read here. What this emulator holds instead is an offer of its
 //! OWN, as DATA: [`RATE_CARD`] publishes the per-unit price of each product
 //! dimension it carries, at each contract length, [`TERM_PRICE_LIST`] the single
-//! price of each kind of term that carries one instead of a rate card, and
+//! price of each kind of term that carries one instead of a rate card,
+//! [`OFFER_RESOURCES`] the products the offer is for (the resources an agreement
+//! accepted from it is involved with, and the ones its entitlements are
+//! provisioned to), and
 //! [`OFFER_DOCUMENT`] what each kind of term proposes beyond those prices (its
 //! documents, policy text, durations, grants and ceilings). A quote prices the
 //! dimensions and terms those lists publish — quantity times the published rate
@@ -174,6 +177,63 @@ pub const ENTITLEMENT_PROVISIONING: Duration = Duration::from_millis(500);
 /// `AgreementEntitlement$licenseArn` is "the Amazon Resource Name (ARN) of the
 /// AWS License Manager license associated with the entitlement".
 pub const LICENSE_ARN_SERVICE: &str = "license-manager";
+
+/// The `EntitlementType` every entitlement this service provisions reports.
+///
+/// `AgreementEntitlement$type` is "the type of entitlement", and
+/// `EntitlementType` is a plain string (`@length(1, 64)`, `^[A-Za-z:]+$`) for
+/// which the model declares no value list. What an entitlement of this service
+/// IS, though, is stated by the member beside it: `licenseArn` is "the Amazon
+/// Resource Name (ARN) of the AWS License Manager license associated with the
+/// entitlement", so every entitlement an agreement here grants is a licence of
+/// that kind and that is the kind each reports — one published value, like
+/// [`AGREEMENT_TYPE`], rather than a per-request choice.
+pub const ENTITLEMENT_TYPE: &str = "License";
+
+/// How long the registration token an entitlement was provisioned with stays
+/// valid.
+///
+/// `AgreementEntitlement$registrationToken` is "a short-lived token required by
+/// acceptors to register their account with the product provider. The token is
+/// only valid for 30 minutes after creation": the duration is the model's own,
+/// not a span this emulator chose, so it keeps that value.
+pub const REGISTRATION_TOKEN_VALIDITY: Duration = Duration::from_secs(30 * 60);
+
+/// Mint the registration token one entitlement is provisioned with.
+///
+/// The token is a capability an acceptor presents to the product provider, so
+/// none of it is derived from the request, from the agreement or from anything
+/// else a caller can see. It is the SHA-256 digest (`sha2`) of three
+/// independent inputs, hex encoded (`hex`): a process-wide counter, so two
+/// tokens minted in the same instant differ; the wall clock in nanoseconds, so
+/// two processes differ; and the hash keys of a fresh `RandomState`, which the
+/// standard library seeds from the operating system, so the bytes are not
+/// derivable from the clock. Its 64 characters satisfy `RegistrationToken`'s
+/// `@length(1, 512)` and `^[A-Za-z0-9+/=.:_-]+$`.
+///
+/// The same mixing the `iotsecuretunneling` slice mints its own opaque tokens
+/// with (`minted_bytes` in that crate's `state.rs`): adequate for an emulator's
+/// opaque values, and drawn from the crates this service already carries.
+fn mint_registration_token() -> String {
+    use std::hash::{BuildHasher, Hasher};
+
+    static MINTED: AtomicU64 = AtomicU64::new(0);
+
+    let sequence = MINTED.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|since| since.as_nanos())
+        .unwrap_or_default();
+    let mut keyed = ::std::collections::hash_map::RandomState::new().build_hasher();
+    keyed.write_u64(sequence);
+    keyed.write_u128(nanos);
+
+    let mut digest = Sha256::new();
+    digest.update(sequence.to_be_bytes());
+    digest.update(nanos.to_be_bytes());
+    digest.update(keyed.finish().to_be_bytes());
+    ::hex::encode(digest.finalize())
+}
 
 /// The region an ARN this service mints is in when the caller signed for none —
 /// `::engine::emulator_arn`'s own documented default ("emulators default to
@@ -1335,6 +1395,57 @@ pub const OFFER_DOCUMENT: OfferDocument = OfferDocument {
     installments: 4,
 };
 
+/// The products the offer this emulator publishes is for, each as
+/// `(id, type)`.
+///
+/// SOURCE: the emulator's OWN catalog, on exactly the same footing as
+/// [`RATE_CARD`] and [`OFFER_DOCUMENT`] and for the same reason — the resources
+/// of an offer belong to the agreement proposal, which is a resource of a
+/// different AWS Marketplace API and is in neither this service's model nor its
+/// state, so there is nothing to read a seller's product list from and nothing
+/// to compute one from either. The ids have the `prod-` form a marketplace
+/// product id takes (`Resource$id`: "we mention the term resource, which is
+/// most commonly a product, so a `resourceId` is also a `productId`"), and the
+/// types are the ones `Resource$type` publishes ("the product (for example,
+/// `SaaSProduct`, `AmiProduct`, `ContainerProduct`)").
+///
+/// This is the list an agreement names in `ProposalSummary$resources` ("the
+/// list of resources involved in the agreement") when it inherits none, and the
+/// list its acceptance provisions one entitlement per — so it is never empty.
+pub const OFFER_RESOURCES: &[(&str, &str)] = &[
+    ("prod-emulatorsaas", "SaaSProduct"),
+    ("prod-emulatorami", "AmiProduct"),
+    ("prod-emulatorcontainer", "ContainerProduct"),
+];
+
+/// [`OFFER_RESOURCES`] as the model reports a resource.
+pub fn offer_resources() -> Vec<Resource> {
+    OFFER_RESOURCES
+        .iter()
+        .map(|(id, r#type)| Resource {
+            id: Some((*id).to_string()),
+            r#type: Some((*r#type).to_string()),
+        })
+        .collect()
+}
+
+/// The resources one agreement is involved with: the ones the agreement it
+/// derives from named, where it derives from an agreement that named any, and
+/// otherwise the products the published offer is for ([`OFFER_RESOURCES`]).
+///
+/// The single place that resolution is made, so the resources an agreement
+/// reports in `ProposalSummary$resources` and the resources its entitlements
+/// were provisioned to are the same list rather than two. An amendment or a
+/// replacement keeps the products of the chain it continues: the agreement it
+/// acts upon entitles its acceptor to those, and the amendment re-states the
+/// terms over them.
+pub fn agreement_resources(inherited: Option<&[Resource]>) -> Vec<Resource> {
+    match inherited {
+        Some(resources) if !resources.is_empty() => resources.to_vec(),
+        _ => offer_resources(),
+    }
+}
+
 /// The contract lengths a configured prepaid purchase is bought in, each with
 /// how long it lasts in days.
 ///
@@ -1931,29 +2042,53 @@ pub const TAX_ESTIMATION_DEFAULT: &str = "DISABLED";
 /// One entitlement an acceptance provisioned, as this emulator persists it.
 ///
 /// What is STORED is the entitlement's IDENTITY — the resource it was
-/// provisioned to, the licence it granted and the instant provisioning is due to
-/// finish. Its `status` and `statusReasonCode` are COMPUTED from the agreement
-/// it belongs to and the clock ([`Agreement::entitlement_state`]), so cancelling
-/// or replacing the agreement moves every entitlement it granted without a
-/// second copy of the agreement's own state to keep in step.
-#[derive(Debug, Clone)]
+/// provisioned to, the licence it granted, the registration token it was minted
+/// with and the instant provisioning is due to finish. Its `status` and
+/// `statusReasonCode` are COMPUTED from the agreement it belongs to and the
+/// clock ([`Agreement::entitlement_state`]), so cancelling or replacing the
+/// agreement moves every entitlement it granted without a second copy of the
+/// agreement's own state to keep in step.
+#[derive(Clone)]
 pub struct AgreementEntitlementRecord {
     /// "The resource that the entitlement is provisioned to, such as a product"
-    /// — one of the resources the agreement's proposal names, and absent for an
-    /// agreement whose proposal names none. The proposal is a resource of a
-    /// different AWS Marketplace API (see the module docs), so its products are
-    /// known only for an agreement derived from one that already carried them;
-    /// the member is left absent rather than naming an invented product.
-    pub resource: Option<Resource>,
+    /// — one of the resources the agreement is involved with
+    /// ([`agreement_resources`]), which is what the acceptance provisioned one
+    /// entitlement per.
+    pub resource: Resource,
     /// The AWS License Manager licence this entitlement granted, minted once
     /// when the entitlement was provisioned so every later report — this
     /// agreement's entitlements, `AgreementViewSummary$entitlements` and the
     /// `LicenseArn` search filter — names the same licence.
     pub license_arn: String,
+    /// "A short-lived token required by acceptors to register their account
+    /// with the product provider", minted once when the entitlement was
+    /// provisioned ([`mint_registration_token`]) — so two reads inside its
+    /// validity report the same token and no read mints one.
+    pub registration_token: String,
+    /// When that token stops being valid: the instant it was minted plus
+    /// [`REGISTRATION_TOKEN_VALIDITY`]. Past it the member is reported absent
+    /// rather than offering an acceptor a token that registers nothing.
+    pub registration_token_expires_at: SystemTime,
     /// When the `PENDING` this entitlement was provisioned in is due to become
     /// `PROVISIONED`: the acceptance instant plus [`ENTITLEMENT_PROVISIONING`].
     /// Stored rather than slept for.
     pub provisioned_at: SystemTime,
+}
+
+/// Prints every member but the registration token, which is a capability: a
+/// record that reaches a formatter must not carry it into a log.
+impl ::std::fmt::Debug for AgreementEntitlementRecord {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        f.debug_struct("AgreementEntitlementRecord")
+            .field("resource", &self.resource)
+            .field("license_arn", &self.license_arn)
+            .field(
+                "registration_token_expires_at",
+                &self.registration_token_expires_at,
+            )
+            .field("provisioned_at", &self.provisioned_at)
+            .finish_non_exhaustive()
+    }
 }
 
 /// One agreement, as this emulator persists it.
@@ -1986,8 +2121,7 @@ pub struct Agreement {
     /// charges.
     pub purchase_orders: Vec<PurchaseOrder>,
     /// The entitlements accepting this agreement provisioned — one per resource
-    /// its proposal names, and the single one the agreement grants when the
-    /// proposal names none (see
+    /// the agreement is involved with (see [`agreement_resources`] and
     /// [`ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State::provision_entitlements`]).
     pub entitlements: Vec<AgreementEntitlementRecord>,
     pub updated_at: SystemTime,
@@ -2141,26 +2275,23 @@ impl Agreement {
     /// The `GetAgreementEntitlements` projection of this agreement's
     /// entitlements at `now`, in the order they were provisioned in.
     ///
-    /// Two of `AgreementEntitlement`'s members are left absent rather than
-    /// invented, the way the module docs leave every amount absent:
-    ///
-    /// * `type` — "the type of entitlement". `EntitlementType` is a plain
-    ///   string, the model declares no values for it and AWS documents none, so
-    ///   there is no value to report rather than make up.
-    /// * `registrationToken` — "a short-lived token required by acceptors to
-    ///   register their account with the product provider". It is a capability
-    ///   redeemed with the provider, outside this service's model: no operation
-    ///   of this API consumes one, so a token this emulator minted would grant
-    ///   nothing and verify nothing.
+    /// Every member is read from the record the acceptance stored, except the
+    /// two the agreement and the clock decide (`status` and `statusReasonCode`)
+    /// and `registrationToken`, which is reported only while the token the
+    /// entitlement was minted with is still valid — it "is only valid for 30
+    /// minutes after creation", so past that instant it is absent rather than
+    /// offered to an acceptor it would no longer register with the provider.
+    /// Nothing here mints anything: a read reports what provisioning stored.
     pub fn to_entitlements(&self, now: SystemTime) -> Vec<AgreementEntitlement> {
         self.entitlements
             .iter()
             .map(|record| {
                 let (status, reason_code) = self.entitlement_state(record, now);
                 AgreementEntitlement {
-                    resource: record.resource.clone(),
-                    r#type: None,
-                    registration_token: None,
+                    resource: Some(record.resource.clone()),
+                    r#type: Some(ENTITLEMENT_TYPE.to_string()),
+                    registration_token: (now < record.registration_token_expires_at)
+                        .then(|| record.registration_token.clone()),
                     status: Some(status.to_string()),
                     status_reason_code: Some(reason_code.to_string()),
                     license_arn: Some(record.license_arn.clone()),
@@ -4162,34 +4293,31 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
     }
 
     /// The entitlements accepting an agreement provisions, each with its own
-    /// freshly minted licence and the instant its provisioning is due to finish.
+    /// freshly minted licence, its own registration token and the instant its
+    /// provisioning is due to finish.
     ///
     /// `AgreementEntitlement` "represents an entitlement associated with an
     /// agreement, including the provisioning status, resource, and type", and
     /// `Resource` is "the resource that the entitlement is provisioned to, such
-    /// as a product" — so an agreement grants one entitlement per resource its
-    /// proposal names. An agreement whose proposal names no resource still
-    /// entitles its acceptor to what it accepted, so it provisions the single
-    /// entitlement it grants, with `resource` absent rather than an invented
-    /// product (see [`AgreementEntitlementRecord::resource`]).
+    /// as a product" — so an agreement grants one entitlement per resource it
+    /// is involved with, which is the list [`agreement_resources`] resolves for
+    /// the agreement being accepted (never empty, so every agreement grants at
+    /// least one entitlement).
     pub fn provision_entitlements(
         &mut self,
-        resources: Option<&[Resource]>,
+        resources: &[Resource],
         region: &str,
         now: SystemTime,
     ) -> Vec<AgreementEntitlementRecord> {
         let provisioned_at = now + ENTITLEMENT_PROVISIONING;
-        let provisioned_to: Vec<Option<Resource>> = match resources {
-            Some(resources) if !resources.is_empty() => {
-                resources.iter().cloned().map(Some).collect()
-            }
-            _ => vec![None],
-        };
-        provisioned_to
-            .into_iter()
+        let registration_token_expires_at = now + REGISTRATION_TOKEN_VALIDITY;
+        resources
+            .iter()
             .map(|resource| AgreementEntitlementRecord {
-                resource,
+                resource: resource.clone(),
                 license_arn: self.mint_license_arn(region),
+                registration_token: mint_registration_token(),
+                registration_token_expires_at,
                 provisioned_at,
             })
             .collect()
