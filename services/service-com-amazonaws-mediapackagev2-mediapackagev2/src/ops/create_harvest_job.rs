@@ -14,7 +14,9 @@
 //! `INVALID_HARVEST_JOB_DURATION`; an unresolved parent chain is
 //! `ResourceNotFoundException` (404) with the service's fixed per-resource sentence; a
 //! name already taken on that endpoint is `ConflictException` (409); a harvested manifest
-//! the endpoint does not publish is `HARVESTED_MANIFEST_NOT_FOUND_ON_ENDPOINT`.
+//! the endpoint does not publish is `HARVESTED_MANIFEST_NOT_FOUND_ON_ENDPOINT`; an
+//! endpoint already holding as many jobs as it may is `ServiceQuotaExceededException`
+//! (402), worded by the crate's one quota refusal builder like every sibling create's.
 //!
 //! The job is created `QUEUED` and the CLOCK owes it `IN_PROGRESS` (see
 //! `state::HarvestJobRecord::materialise_due_transitions`). This emulator runs no
@@ -396,16 +398,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         // The endpoint's job map never shrinks (a finished job stays readable), so its
-        // size is bounded here rather than by how many requests arrive.
+        // size is bounded here rather than by how many requests arrive. The refusal is
+        // worded by the crate's one quota builder, like every other create's: it names
+        // the KIND whose quota is reached and neither the caller's names nor the ceiling
+        // itself.
         if endpoint.harvest_jobs.len() >= crate::state::MAX_HARVEST_JOBS_PER_ORIGIN_ENDPOINT {
             return Err(
                 CreateHarvestJobErrorModeled::ServiceQuotaExceededException(
-                    ServiceQuotaExceededException {
-                        message: Some(format!(
-                            "An origin endpoint holds at most {} harvest jobs",
-                            crate::state::MAX_HARVEST_JOBS_PER_ORIGIN_ENDPOINT
-                        )),
-                    },
+                    crate::state::quota_exceeded(crate::state::ResourceKind::HarvestJob),
                 )
                 .into(),
             );
