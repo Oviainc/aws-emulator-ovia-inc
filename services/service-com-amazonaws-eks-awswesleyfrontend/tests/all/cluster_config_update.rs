@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use service_com_amazonaws_eks_awswesleyfrontend::state::{
-    ComAmazonawsEksAwswesleyfrontendState, UpdateRecord, CLUSTER_ACTIVATION_DELAY,
+    ComAmazonawsEksAwswesleyfrontendState, UpdateRecord, UpdateScope, CLUSTER_ACTIVATION_DELAY,
     MAX_UPDATES_PER_CLUSTER, UPDATE_COMPLETION_DELAY, UPDATE_SUCCESSFUL,
 };
 use service_com_amazonaws_eks_awswesleyfrontend::EmulatedService;
@@ -1076,6 +1076,8 @@ fn seed_completed_history(
                     pending_config: None,
                     cancellation: None,
                     cancellation_request_token: None,
+                    // A configuration update is an update of the cluster itself.
+                    scope: UpdateScope::Cluster,
                 },
             );
             id

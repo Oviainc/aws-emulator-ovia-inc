@@ -444,13 +444,17 @@ pub const SANDBOX_STATUS_QUEUED: &str = "QUEUED";
 /// command-execution and connection operations a session to act on.
 pub const SANDBOX_STATUS_RUNNING: &str = "RUNNING";
 
-/// The terminal status a sandbox nobody stopped reaches once the
-/// `timeoutInMinutes` it carries has elapsed. `TIMED_OUT` is a `StatusType` value,
-/// which is the enum the model puts on a sandbox session's phase status.
-pub const SANDBOX_STATUS_TIMED_OUT: &str = "TIMED_OUT";
-
-/// The terminal status a sandbox `StopSandbox` ended reaches. `STOPPED` is a
-/// `StatusType` value, like [`SANDBOX_STATUS_TIMED_OUT`].
+/// The ONE terminal status a sandbox that stops running reaches — whether a
+/// `StopSandbox` call ended it or the wait its `timeoutInMinutes` documents ran out
+/// with nobody having marked it completed.
+///
+/// `Sandbox$status` targets a plain `String`, so the model pins no value set for it;
+/// recorded behaviour is what fixes the token, and CodeBuild reports the same one for
+/// both endings. Unlike a build, whose `buildStatus` separates a timeout from a stop,
+/// a sandbox is a live session: it either runs or it does not, so a client branches on
+/// this single token and reads `endTime` for when it stopped. `STOPPED` is also a
+/// `StatusType` value, which is the enum the model puts on a sandbox session's phase
+/// status.
 pub const SANDBOX_STATUS_STOPPED: &str = "STOPPED";
 
 /// What CodeBuild states as the reason a sandbox-addressing request names no sandbox
@@ -522,6 +526,36 @@ const PHASE_COMPLETED: &str = "COMPLETED";
 
 /// Milliseconds in one minute — what a documented `timeoutInMinutes` is converted by.
 const MILLIS_PER_MINUTE: i64 = 60_000;
+
+/// How far the wait a sandbox's `timeoutInMinutes` documents is compressed against the
+/// wall clock when the clock reaps an idle sandbox: one documented minute per second of
+/// real time.
+///
+/// What this scales is how long the EMULATOR keeps the sandbox live, not what the
+/// sandbox says its wait is — `timeoutInMinutes` is reported back exactly as the
+/// project stored it. `Sandbox$timeoutInMinutes` is "How long, in minutes, from 5 to
+/// 2160 (36 hours), for CodeBuild to wait before timing out this sandbox if it does not
+/// get marked as completed", so an uncompressed wait would hold a client that leaves a
+/// sandbox for CodeBuild to reap — and every test of one — for between five minutes and
+/// thirty-six hours before the reap became readable at all. The reap is therefore due on
+/// this compressed clock, clamped into
+/// [`MIN_SANDBOX_IDLE_SPAN_MILLIS`]..=[`MAX_SANDBOX_IDLE_SPAN_MILLIS`], which keeps the
+/// compression monotonic (a longer documented wait is never a shorter emulated one)
+/// while the live session stays observable and the reap arrives promptly.
+pub const SANDBOX_IDLE_CLOCK_SCALE: i64 = 60;
+
+/// The shortest a sandbox session stays live once it is provisioned, whatever its
+/// documented wait compresses to.
+///
+/// Never zero, and deliberately several poll intervals long: `RUNNING` is the status
+/// CodeBuild reports for every sandbox it provisions, so a client that polls a started
+/// sandbox — or starts a command execution in it — has to be able to SEE it. See
+/// [`SANDBOX_IDLE_CLOCK_SCALE`] for why the wait is compressed at all.
+pub const MIN_SANDBOX_IDLE_SPAN_MILLIS: i64 = 5_000;
+
+/// The longest a sandbox session stays live, whatever wait it carries. See
+/// [`SANDBOX_IDLE_CLOCK_SCALE`].
+pub const MAX_SANDBOX_IDLE_SPAN_MILLIS: i64 = 60_000;
 
 /// How long after `StartCommandExecution` the clock owes a command execution its move
 /// out of [`COMMAND_EXECUTION_STATUS_IN_PROGRESS`].
@@ -1057,8 +1091,8 @@ pub struct StoredSandboxConnection {
     /// [`StoredSandbox::timeout_due_millis`] — the end of the wait
     /// `Sandbox$timeoutInMinutes` documents, "How long, in minutes, from 5 to 2160 (36
     /// hours), for CodeBuild to wait before timing out this sandbox if it does not get
-    /// marked as completed". Past it the sandbox has timed out, so there is nothing
-    /// left for the token to authenticate a connection to.
+    /// marked as completed". Past it the clock has reaped the sandbox, so there is
+    /// nothing left for the token to authenticate a connection to.
     pub expires_millis: i64,
 }
 
@@ -1707,7 +1741,7 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
     /// Read a sandbox, first materialising the transitions the clock already owes
     /// it — the sandbox counterpart of [`Self::settled_build`], and the only write a
     /// reporting operation makes: the move out of `QUEUED` was due at
-    /// `settle_due_millis`, and the timeout at
+    /// `settle_due_millis`, and the idle reap at
     /// [`StoredSandbox::timeout_due_millis`], whether or not anybody called, and both
     /// are computed from the stored instants, so repeating them changes nothing.
     pub fn settled_sandbox(&mut self, id: &str, now_millis: i64) -> Option<&StoredSandbox> {
@@ -2009,13 +2043,25 @@ impl StoredSandbox {
             .unwrap_or(DEFAULT_BUILD_TIMEOUT_MINUTES)
     }
 
-    /// Epoch millis at which an un-stopped sandbox times out: its documented
-    /// `timeoutInMinutes` measured from the instant the session went live, since that
-    /// is the wait "before timing out this sandbox if it does not get marked as
-    /// completed".
+    /// How long this sandbox's session stays live before the clock reaps it: the wait
+    /// its [`Self::timeout_minutes`] documents, on the compressed clock
+    /// [`SANDBOX_IDLE_CLOCK_SCALE`] describes and inside the bounds it is clamped to.
+    ///
+    /// Monotonic in the documented wait, so a sandbox configured to wait longer is
+    /// never reaped sooner than one configured to wait less.
+    pub fn idle_span_millis(&self) -> i64 {
+        let documented = i64::from(self.timeout_minutes()).saturating_mul(MILLIS_PER_MINUTE);
+        (documented / SANDBOX_IDLE_CLOCK_SCALE)
+            .clamp(MIN_SANDBOX_IDLE_SPAN_MILLIS, MAX_SANDBOX_IDLE_SPAN_MILLIS)
+    }
+
+    /// Epoch millis at which a sandbox nobody stopped is reaped by the clock: its
+    /// [`Self::idle_span_millis`] measured from the instant the session went live, since
+    /// the wait AWS documents runs "before timing out this sandbox if it does not get
+    /// marked as completed".
     pub fn timeout_due_millis(&self) -> i64 {
         self.settle_due_millis
-            .saturating_add(i64::from(self.timeout_minutes()).saturating_mul(MILLIS_PER_MINUTE))
+            .saturating_add(self.idle_span_millis())
     }
 
     /// Materialise the transitions the clock already owes this sandbox.
@@ -2028,8 +2074,9 @@ impl StoredSandbox {
     ///   [`SANDBOX_STATUS_RUNNING`], sitting in the [`SANDBOX_PHASE_RUN_SANDBOX`]
     ///   phase, which is where it STAYS, because a sandbox is a live session rather
     ///   than a job with an outcome;
-    /// * from [`Self::timeout_due_millis`] it has run past its own
-    ///   `timeoutInMinutes` without being marked completed, so it times out.
+    /// * from [`Self::timeout_due_millis`] it has sat out its own wait without being
+    ///   marked completed, so CodeBuild reaps it — which ends it in exactly the status
+    ///   an explicit `StopSandbox` would have, [`SANDBOX_STATUS_STOPPED`].
     ///
     /// A sandbox a caller already stopped is terminal and is left alone.
     pub fn settle(&mut self, now_millis: i64) {
@@ -2037,9 +2084,9 @@ impl StoredSandbox {
             return;
         }
         self.run();
-        let timed_out_at = self.timeout_due_millis();
-        if now_millis >= timed_out_at {
-            self.end(SANDBOX_STATUS_TIMED_OUT, timed_out_at);
+        let reaped_at = self.timeout_due_millis();
+        if now_millis >= reaped_at {
+            self.end(SANDBOX_STATUS_STOPPED, reaped_at);
         }
     }
 
@@ -2058,10 +2105,10 @@ impl StoredSandbox {
     }
 
     /// End this sandbox at `ended_millis` with the terminal `status` the session's
-    /// open phase took — `TIMED_OUT` for the timeout the clock owed it, `STOPPED` for
-    /// a `StopSandbox`. The phase that takes the status is whichever one the sandbox
-    /// was sitting in: the queue if it never got provisioned, the live session if it
-    /// did.
+    /// open phase took — [`SANDBOX_STATUS_STOPPED`], whether the clock reaped it or a
+    /// `StopSandbox` call ended it. The phase that takes the status is whichever one the
+    /// sandbox was sitting in: the queue if it never got provisioned, the live session
+    /// if it did.
     pub fn end(&mut self, status: &str, ended_millis: i64) {
         if self.is_terminal() {
             return;
@@ -2856,8 +2903,8 @@ fn running_session_phases(requested_millis: i64, started_millis: i64) -> Vec<San
 }
 
 /// The phases of a sandbox session that was live and has ended: the `RUN_SANDBOX`
-/// phase closes with the status the session ended in (`TIMED_OUT` or `STOPPED`), and
-/// the terminal `COMPLETED` marker opens at that instant.
+/// phase closes with the status the session ended in, and the terminal `COMPLETED`
+/// marker opens at that instant.
 fn ended_session_phases(
     requested_millis: i64,
     started_millis: i64,

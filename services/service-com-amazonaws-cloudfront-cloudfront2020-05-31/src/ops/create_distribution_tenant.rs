@@ -108,7 +108,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use std::collections::BTreeSet;
 use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -209,42 +208,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stored.
 
         // "The domains associated with the distribution tenant. You must specify at least
-        // one domain in the request." `DomainList` carries no `@length`, so an empty list
-        // satisfies every modelled constraint and is refused here instead.
+        // one domain in the request", at most the documented per-tenant quota, each a domain
+        // name, and none named twice — the ONE rule every call that binds a tenant's domains
+        // runs, decided from the request alone and counted BEFORE anything walks the list,
+        // so neither the work this request causes nor the record it would store grows with a
+        // list the caller chose the length of.
         let domains: Vec<String> = input
             .domains
             .iter()
             .map(|item| item.domain.clone())
             .collect();
-        if domains.is_empty() {
-            return Err(invalid_argument(
-                "you must specify at least one domain for a distribution tenant".to_string(),
-            ));
-        }
-        // "Each distribution tenant can have up to 5 domains" — refused HERE, before the
-        // per-domain shape check and before the store-wide conflict scan below, so neither
-        // the work this request causes nor the record it would store grows with a list the
-        // caller chose the length of.
-        if domains.len() > crate::state::MAX_DOMAINS_PER_TENANT {
-            return Err(invalid_argument(format!(
-                "a distribution tenant holds at most {} domains but the request names {}",
-                crate::state::MAX_DOMAINS_PER_TENANT,
-                domains.len()
-            )));
-        }
-
-        // A domain is where viewers reach the tenant, so each one has to be a domain name
-        // at all, and a request that names one twice describes no single association.
-        let mut seen: BTreeSet<String> = BTreeSet::new();
-        for domain in &domains {
-            if let Some(reason) = crate::state::domain_name_refusal(domain) {
-                return Err(invalid_argument(reason));
-            }
-            if !seen.insert(domain.to_ascii_lowercase()) {
-                return Err(invalid_argument(format!(
-                    "the domain {domain} is named more than once"
-                )));
-            }
+        if let Some(reason) = crate::state::tenant_domains_refusal(&domains) {
+            return Err(invalid_argument(reason));
         }
 
         // The parameter values and the customizations are both caller-chosen lists that
@@ -252,13 +227,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // one bound on how many values a tenant may carry, one on the locations a
         // geographic restriction may name.
         let parameters = input.parameters.unwrap_or_default();
-        if parameters.len() > crate::state::MAX_PARAMETERS_PER_TENANT {
-            return Err(invalid_argument(format!(
-                "a distribution tenant carries at most {} parameter values but the request \
-                 names {}",
-                crate::state::MAX_PARAMETERS_PER_TENANT,
-                parameters.len()
-            )));
+        if let Some(reason) = crate::state::tenant_parameter_count_refusal(&parameters) {
+            return Err(invalid_argument(reason));
         }
         if let Some(reason) = input
             .customizations

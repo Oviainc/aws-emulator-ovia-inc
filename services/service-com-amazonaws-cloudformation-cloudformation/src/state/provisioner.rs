@@ -237,6 +237,17 @@
 //!   ([`APIGATEWAYV2_IMPORT_PROPERTIES`]) is a different call on a different URI and is
 //!   REFUSED rather than created without it.
 //!
+//! * `AWS::SES::ConfigurationSet`'s one property that reaches a call of this service is
+//!   `TrackingOptions`: a configuration set's own create takes nothing but the name
+//!   CloudFormation decides, and the custom open-and-click domain declared beside it is the
+//!   `CreateConfigurationSetTrackingOptions` a client makes next on the set just created
+//!   ([`create_ses_configuration_set`]). Every other published property of the type reaches
+//!   no Amazon SES operation this emulator implements YET, so a declaration carrying one
+//!   is REFUSED rather than reported as a set created without it, and a tracking domain
+//!   Amazon SES refuses leaves no half-configured set behind. Its identity is
+//!   CloudFormation's own — "Ref returns the configuration set name" — so the delete and
+//!   the drift read address the set by the resource's physical id.
+//!
 //! * `AWS::CodeCommit::Repository`'s properties are `CreateRepository`'s own members with a
 //!   lower-case initial (`RepositoryDescription`, `KmsKeyId`), with the repository's name
 //!   the one CloudFormation decides and `Tags` sent as that create's tag MAP. `Triggers` is
@@ -298,7 +309,8 @@ use super::template::{
     ROUTE53RESOLVER_RULE_ASSOCIATION,
     S3VECTORS_BUCKET_SEGMENT, S3VECTORS_INDEX,
     S3VECTORS_VECTOR_BUCKET, SAGEMAKER_MODEL_PACKAGE_GROUP, SCHEDULER_SCHEDULE,
-    SCHEDULER_SCHEDULE_GROUP, SNS_TOPIC, SQS_QUEUE, SQS_QUEUE_INLINE_POLICY, SQS_QUEUE_POLICY,
+    SCHEDULER_SCHEDULE_GROUP, SES_CONFIGURATION_SET,
+    SNS_TOPIC, SQS_QUEUE, SQS_QUEUE_INLINE_POLICY, SQS_QUEUE_POLICY,
     SSM_PARAMETER, STEP_FUNCTIONS_ACTIVITY,
     TRANSFER_SERVER, WAFV2_IP_SET, WAFV2_REGEX_PATTERN_SET, WAFV2_RULE_GROUP, WAFV2_WEB_ACL,
     WAF_REGIONAL_IP_SET,
@@ -410,6 +422,7 @@ pub(super) enum Provisioner {
     ApiGatewayV2DomainName,
     ApiGatewayV2ApiMapping,
     CodeCommitRepository,
+    SesConfigurationSet,
 }
 
 /// The provisioner that owns a template resource type, or `None` for a type this emulator
@@ -475,6 +488,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         APIGATEWAYV2_DOMAIN_NAME => Some(Provisioner::ApiGatewayV2DomainName),
         APIGATEWAYV2_API_MAPPING => Some(Provisioner::ApiGatewayV2ApiMapping),
         CODECOMMIT_REPOSITORY => Some(Provisioner::CodeCommitRepository),
+        SES_CONFIGURATION_SET => Some(Provisioner::SesConfigurationSet),
         _ => None,
     }
 }
@@ -693,6 +707,13 @@ impl Provisioner {
             }
             Self::CodeCommitRepository => {
                 create_codecommit_repository(ctx, region, resource, propagated).await
+            }
+            // `AWS::SES::ConfigurationSet` publishes `Name`, `DeliveryOptions`,
+            // `ReputationOptions`, `SendingOptions`, `SuppressionOptions`,
+            // `TrackingOptions` and `VdmOptions` and no `Tags`: the type is not taggable,
+            // so no tags are propagated to a configuration set.
+            Self::SesConfigurationSet => {
+                create_ses_configuration_set(ctx, region, resource).await
             }
         }
     }
@@ -1084,6 +1105,9 @@ impl Provisioner {
             Self::CodeCommitRepository => {
                 delete_codecommit_repository(ctx, region, physical_resource_id).await
             }
+            Self::SesConfigurationSet => {
+                delete_ses_configuration_set(ctx, region, physical_resource_id).await
+            }
         }
     }
 
@@ -1292,6 +1316,9 @@ impl Provisioner {
             }
             Self::CodeCommitRepository => {
                 describe_codecommit_repository(ctx, region, physical_resource_id).await
+            }
+            Self::SesConfigurationSet => {
+                describe_ses_configuration_set(ctx, region, physical_resource_id).await
             }
         }
     }
@@ -13197,6 +13224,191 @@ async fn call_kms(
         AWS_JSON_1_1,
         &format!("{KMS_TARGET_PREFIX}.{operation}"),
         request,
+    )
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// Amazon SES: AWS::SES::ConfigurationSet
+// ---------------------------------------------------------------------------
+
+/// Amazon SES's signing name and API version, from its model (`sigv4Name: ses`, service
+/// shape `SimpleEmailService`, `version: 2010-12-01`), which speaks `awsQuery` — so its
+/// calls ride on [`call_query`] rather than on [`call_json_rpc`].
+const SES_SIGNING_NAME: &str = "ses";
+const SES_API_VERSION: &str = "2010-12-01";
+
+/// The error code Amazon SES answers for a configuration set it does not hold:
+/// `ConfigurationSetDoesNotExistException`'s own `awsQueryError` code
+/// (`smithy_query(query="operation", operation="DeleteConfigurationSet")`), which is what an
+/// awsQuery client branches on.
+const CONFIGURATION_SET_DOES_NOT_EXIST: &str = "ConfigurationSetDoesNotExist";
+
+/// The `AWS::SES::ConfigurationSet` properties this arm maps onto a call of the owning
+/// service, each as the awsQuery member of the call that takes it.
+///
+/// Source: that type's CloudFormation resource reference against
+/// `smithy_query(operation="CreateConfigurationSet,CreateConfigurationSetTrackingOptions")`.
+/// `TrackingOptions` is the only one, because `CreateConfigurationSet` takes nothing but the
+/// set's `Name` — which CloudFormation decides, and which
+/// [`CONFIGURATION_SET_PROPERTIES_NOT_SENT`] therefore lifts out — and the custom
+/// open-and-click domain declared beside it is a second call on the set. Every other
+/// published property of the type (`DeliveryOptions`, `ReputationOptions`, `SendingOptions`,
+/// `SuppressionOptions`, `VdmOptions`) reaches no operation this emulator implements YET —
+/// the first three are modelled operations that are still scaffolds, and the last two belong
+/// to the v2 API — so [`query_members`] REFUSES a declaration carrying one rather than
+/// reporting a set created without it.
+const CONFIGURATION_SET_PROPERTIES: &[(&str, QueryMember)] =
+    &[("TrackingOptions", QueryMember::Structure)];
+
+/// The `AWS::SES::ConfigurationSet` property the arm pushes itself: the set's name, which is
+/// this resource's physical id ("Ref returns the configuration set name").
+const CONFIGURATION_SET_PROPERTIES_NOT_SENT: &[&str] = &["Name"];
+
+/// The one member of a declared `TrackingOptions` that is a member of this service's own
+/// `TrackingOptions` shape (`smithy_query(query="shape", shape="TrackingOptions")`), as the
+/// awsQuery parameter [`push_structure`] writes it under. The type's other published member
+/// of that structure reaches no operation of this service, so it is refused rather than sent
+/// to be dropped.
+const CONFIGURATION_SET_TRACKING_MEMBER: &str = "TrackingOptions.CustomRedirectDomain";
+
+/// The attribute group `DescribeConfigurationSet` has to be ASKED for to report the set's
+/// tracking options: a value of its own `ConfigurationSetAttribute` enum
+/// (`smithy_query(query="shape", shape="ConfigurationSetAttribute")`).
+const CONFIGURATION_SET_TRACKING_ATTRIBUTE: &str = "trackingOptions";
+
+/// Create the configuration set an `AWS::SES::ConfigurationSet` declares, under the name
+/// CloudFormation decided for it — this resource's physical id, which is what `Ref` returns
+/// for the type.
+///
+/// The declared `TrackingOptions` is no member of that create at all: a set's custom
+/// open-and-click domain is written by the `CreateConfigurationSetTrackingOptions` a client
+/// makes next, so the arm makes that second call on the set it just created. A domain the
+/// owning service refuses fails the resource with the set removed again, so the failed
+/// resource leaves no configuration set behind that carries none of the tracking options its
+/// declaration asked for.
+async fn create_ses_configuration_set(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    let tracking = query_members(
+        &resource.properties,
+        CONFIGURATION_SET_PROPERTIES,
+        &[],
+        CONFIGURATION_SET_PROPERTIES_NOT_SENT,
+        SES_CONFIGURATION_SET,
+    )?;
+    if let Some((member, _)) = tracking
+        .iter()
+        .find(|(member, _)| member != CONFIGURATION_SET_TRACKING_MEMBER)
+    {
+        return Err(Refusal {
+            code: NOT_IMPLEMENTED.to_string(),
+            message: format!(
+                "this emulator does not send {SES_CONFIGURATION_SET}'s {member} property to \
+                 the service that owns the type, so the resource was not created"
+            ),
+        });
+    }
+    let name = &resource.physical_resource_id;
+    call_ses(
+        ctx,
+        region,
+        "CreateConfigurationSet",
+        &[("ConfigurationSet.Name".to_string(), name.clone())],
+    )
+    .await?;
+    if !tracking.is_empty() {
+        let mut parameters = vec![("ConfigurationSetName".to_string(), name.clone())];
+        parameters.extend(tracking);
+        if let Err(refusal) =
+            call_ses(ctx, region, "CreateConfigurationSetTrackingOptions", &parameters).await
+        {
+            // The set this arm created a moment ago is removed before the refusal is
+            // reported, exactly as the Amazon EKS access-entry arm removes the entry whose
+            // policy association was refused.
+            let _ = delete_ses_configuration_set(ctx, region, name).await;
+            return Err(refusal);
+        }
+    }
+    // "Ref returns the configuration set name", which is the physical id the set was created
+    // under, and the type publishes no `Fn::GetAtt` attribute.
+    Ok(Created::default())
+}
+
+/// Delete the configuration set a stack created, addressed by its NAME — this resource's
+/// physical id.
+async fn delete_ses_configuration_set(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let parameters = vec![(
+        "ConfigurationSetName".to_string(),
+        physical_resource_id.to_string(),
+    )];
+    match call_ses(ctx, region, "DeleteConfigurationSet", &parameters).await {
+        Ok(_) => Ok(()),
+        // A set the owning service no longer holds is already in the state the delete asks
+        // for, judged on the CODE its modelled does-not-exist error carries and never on a
+        // message, which interpolates the request's own name.
+        Err(refusal) if refusal.code == CONFIGURATION_SET_DOES_NOT_EXIST => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The configuration set as Amazon SES reports it NOW, for drift detection, keyed by the
+/// property names the declaring type spells them with. One it no longer holds was deleted.
+///
+/// `DescribeConfigurationSet` reports an attribute group only where the request NAMES it, so
+/// the read asks for the one group a declaration of this type can carry
+/// ([`CONFIGURATION_SET_PROPERTIES`]). A group the set holds no association for is reported
+/// absent, and a property the actual document does not carry is not evidence of anything
+/// (see [`super::drift`]).
+async fn describe_ses_configuration_set(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let parameters = vec![
+        (
+            "ConfigurationSetName".to_string(),
+            physical_resource_id.to_string(),
+        ),
+        (
+            "ConfigurationSetAttributeNames.member.1".to_string(),
+            CONFIGURATION_SET_TRACKING_ATTRIBUTE.to_string(),
+        ),
+    ];
+    let answered = match call_ses(ctx, region, "DescribeConfigurationSet", &parameters).await {
+        Ok(answered) => answered,
+        Err(refusal) if refusal.code == CONFIGURATION_SET_DOES_NOT_EXIST => return Ok(None),
+        Err(refusal) => return Err(refusal),
+    };
+    let mut reported = Map::new();
+    reported.extend(xml_scalar_children(&answered, "ConfigurationSet"));
+    let tracking = xml_scalar_children(&answered, "TrackingOptions");
+    if !tracking.is_empty() {
+        reported.insert("TrackingOptions".to_string(), Value::Object(tracking));
+    }
+    Ok(Some(Value::Object(reported)))
+}
+
+/// Call one Amazon SES operation on the awsQuery wire its model declares.
+async fn call_ses(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    action: &str,
+    parameters: &[(String, String)],
+) -> Result<String, Refusal> {
+    call_query(
+        ctx,
+        SES_SIGNING_NAME,
+        region,
+        SES_API_VERSION,
+        action,
+        parameters,
     )
     .await
 }
