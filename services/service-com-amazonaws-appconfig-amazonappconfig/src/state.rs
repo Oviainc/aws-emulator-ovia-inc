@@ -1484,6 +1484,22 @@ impl Environment {
         self.deployments.values().find(|d| d.is_active())
     }
 
+    /// The most recent deployment of `configuration_profile_id` into this environment,
+    /// in whatever state it stands — still rolling out, complete, or undone by a
+    /// caller's stop — and `None` when that profile has never been deployed here.
+    ///
+    /// Whether a configuration profile HAS been deployed into an environment is a
+    /// different question from which of its deployments is in force
+    /// ([`Self::in_force_deployment`]): a stopped deployment no longer supplies the
+    /// configuration a consumer is served, but it is still a deployment of that profile
+    /// the environment holds.
+    pub fn latest_deployment_of(&self, configuration_profile_id: &str) -> Option<&Deployment> {
+        self.deployments
+            .values()
+            .filter(|deployment| deployment.configuration_profile_id == configuration_profile_id)
+            .max_by_key(|deployment| deployment.deployment_number)
+    }
+
     /// The deployment whose configuration is in force for `configuration_profile_id`:
     /// the most recent deployment of that profile into this environment whose
     /// configuration AppConfig is still serving

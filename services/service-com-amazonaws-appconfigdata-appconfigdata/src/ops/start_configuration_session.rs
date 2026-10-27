@@ -4,7 +4,8 @@
 //!
 //! Implemented: resolves the requested (application, environment, configuration
 //! profile) triple against the AppConfig control plane's own state, refuses an
-//! unresolvable level with the modelled `ResourceNotFoundException`, and otherwise
+//! unresolvable level — and a triple into which that configuration profile has never
+//! been deployed — with the modelled `ResourceNotFoundException`, and otherwise
 //! mints a configuration session over that triple and persists it in this service's
 //! engine state, keyed by the opaque token it returns. `GetLatestConfiguration`
 //! resolves that token back to the session.
@@ -185,7 +186,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // before anything is minted: each is "the ID or the name" of its level, and a
         // level that does not exist cannot be polled, so an unresolvable one is
         // refused here rather than surfacing later as a poll that never succeeds.
-        let Some(resolution) = crate::state::resolve_triple(
+        //
+        // A session is over a DEPLOYED configuration, so the control plane is also
+        // asked whether the configuration profile has been deployed into that
+        // environment at all: for a triple that resolves but has no deployment there is
+        // no configuration to poll, the missing resource is the deployment, and no token
+        // is minted (a client bootstrapping against the service reads that refusal as
+        // "nothing deployed yet" and keeps waiting).
+        let Some(resolution) = crate::state::resolve_deployed_triple(
             &*self.engine,
             &input.application_identifier,
             &input.environment_identifier,
@@ -210,11 +218,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
             return Err(StartConfigurationSessionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(unresolved.message),
+                    message: Some(unresolved.message.clone()),
                     resource_type: Some(unresolved.resource_type.to_string()),
-                    referenced_by: unresolved.referenced_by.map(|(member, identifier)| {
-                        std::collections::HashMap::from([(member.to_string(), identifier)])
-                    }),
+                    referenced_by: unresolved.referenced_by(),
                 },
             )
             .into());
