@@ -300,7 +300,8 @@ fn make_activation_due(engine: &Arc<engine::InMemoryEngine>) {
 }
 
 /// The association `GetFunctionCodeSigningConfig` reports: the ARN, or `None` when the
-/// member is reported empty because the function is associated with no configuration.
+/// body carries no `CodeSigningConfigArn` member because the function is associated with
+/// no configuration.
 async fn reported(case: &str, router: &MultiServiceRouter, reference: &str) -> Option<String> {
     let answer = get_association(router, reference).await;
     assert_eq!(
@@ -313,12 +314,13 @@ async fn reported(case: &str, router: &MultiServiceRouter, reference: &str) -> O
     );
     let arn = answer.string("CodeSigningConfigArn");
     assert!(
-        arn.is_some(),
-        "case {case:?}: GetFunctionCodeSigningConfig must report the required \
-         CodeSigningConfigArn member, got {}",
+        !arn.as_deref().is_some_and(str::is_empty),
+        "case {case:?}: GetFunctionCodeSigningConfig must omit CodeSigningConfigArn for a \
+         function holding none rather than report a value the member's own pattern does \
+         not admit, got {}",
         answer.text()
     );
-    arn.filter(|arn| !arn.is_empty())
+    arn
 }
 
 /// One row of the removal table: the function, how it came to hold an association, which
@@ -501,15 +503,19 @@ async fn removing_a_functions_code_signing_configuration_leaves_it_holding_none(
                 "case {label:?}: after removal {attempt} the function must report no \
                  configuration, got {after:?}"
             );
-            // `CodeSigningConfigArn` is a required output member, so "no configuration" is
-            // reported as the one value its own length constraint (`@length(min: 0)`)
-            // admits that names none — the empty string — and never as a missing member.
+            // "No configuration" is the member's ABSENCE: `CodeSigningConfigArn` names a
+            // configuration and its own pattern admits no string standing for none, so
+            // the body carries the member only while the function holds one — and still
+            // names the function the report is about.
             let raw = get_association(&router, case.function).await;
             assert_eq!(
-                raw.string("CodeSigningConfigArn"),
-                Some(String::new()),
-                "case {label:?}: after removal {attempt} the required CodeSigningConfigArn \
-                 member must be present and empty, got {}",
+                (
+                    raw.json().get("CodeSigningConfigArn").cloned(),
+                    raw.string("FunctionName")
+                ),
+                (None, Some(case.function.to_string())),
+                "case {label:?}: after removal {attempt} the body must name the function \
+                 and carry no CodeSigningConfigArn member, got {}",
                 raw.text()
             );
         }

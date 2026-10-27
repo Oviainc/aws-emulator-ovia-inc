@@ -277,7 +277,8 @@ fn make_activation_due(engine: &Arc<engine::InMemoryEngine>) {
 }
 
 /// The association `GetFunctionCodeSigningConfig` reports: the ARN, or `None` when the
-/// member is reported empty because the function is associated with no configuration.
+/// body carries no `CodeSigningConfigArn` member because the function is associated with
+/// no configuration.
 async fn reported(case: &str, router: &MultiServiceRouter, reference: &str) -> Option<String> {
     let answer = get_association(router, reference).await;
     assert_eq!(
@@ -290,12 +291,13 @@ async fn reported(case: &str, router: &MultiServiceRouter, reference: &str) -> O
     );
     let arn = answer.string("CodeSigningConfigArn");
     assert!(
-        arn.is_some(),
-        "case {case:?}: GetFunctionCodeSigningConfig must report the required \
-         CodeSigningConfigArn member, got {}",
+        !arn.as_deref().is_some_and(str::is_empty),
+        "case {case:?}: GetFunctionCodeSigningConfig must omit CodeSigningConfigArn for a \
+         function holding none rather than report a value the member's own pattern does \
+         not admit, got {}",
         answer.text()
     );
-    arn.filter(|arn| !arn.is_empty())
+    arn
 }
 
 /// One row of the association table: the function, how its association is set, and the
