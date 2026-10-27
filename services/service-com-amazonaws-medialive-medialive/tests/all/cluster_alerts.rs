@@ -548,7 +548,8 @@ async fn a_created_cluster_round_trips_through_describe_cluster() {
             "/prod/channels",
             Some(json!({
                 "name": format!("channel-{case}"),
-                "anywhereSettings": { "clusterId": id, "channelPlacementGroupId": "pg-1" }
+                "anywhereSettings": { "clusterId": id, "channelPlacementGroupId": "pg-1" },
+                "encoderSettings": crate::support::channel_encoder_settings(),
             })),
         )
         .await;

@@ -372,6 +372,7 @@ async fn a_listed_group_is_the_group_describe_reports() {
                 Some(json!({
                     "name": "uses-the-group",
                     "channelSecurityGroups": [id.clone()],
+                    "encoderSettings": crate::support::channel_encoder_settings(),
                 })),
             )
             .await;

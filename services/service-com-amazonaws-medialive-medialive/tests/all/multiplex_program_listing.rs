@@ -394,6 +394,7 @@ async fn a_listed_program_is_the_program_describe_reports() {
                             "programName": program_name,
                         },
                     }],
+                    "encoderSettings": crate::support::channel_encoder_settings(),
                 })),
             )
             .await;

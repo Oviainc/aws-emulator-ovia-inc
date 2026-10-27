@@ -648,11 +648,11 @@ impl ChannelSchedule {
 
 /// One entry of `UnprocessableEntityException$ValidationErrors`: where the
 /// problem is (`ElementPath` is "Path to the source of the error") and what it is.
+///
+/// The shape of a reported problem is stated ONCE for the whole service
+/// ([`super::validation_problem`]); this is the schedule slice's name for it.
 fn problem(element_path: &str, error_message: &str) -> ValidationError {
-    ValidationError {
-        element_path: Some(element_path.to_string()),
-        error_message: Some(error_message.to_string()),
-    }
+    super::validation_problem(element_path, error_message)
 }
 
 /// How many of the 17 action types `settings` selects.

@@ -871,6 +871,7 @@ async fn a_programs_channel_is_the_channel_whose_destination_names_it() {
                     "programName": "news",
                 },
             }],
+            "encoderSettings": crate::support::channel_encoder_settings(),
         })),
     )
     .await;

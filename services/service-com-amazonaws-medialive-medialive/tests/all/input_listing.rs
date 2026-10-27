@@ -418,6 +418,7 @@ async fn a_listed_input_is_the_input_describe_reports() {
                     "inputAttachments": [
                         { "inputId": id.clone(), "inputAttachmentName": "slot-0" },
                     ],
+                    "encoderSettings": crate::support::channel_encoder_settings(),
                 })),
             )
             .await;

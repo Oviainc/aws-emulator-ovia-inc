@@ -174,6 +174,7 @@ async fn feeding_channel(
                     "programName": program_name,
                 },
             }],
+            "encoderSettings": crate::support::channel_encoder_settings(),
         })),
     )
     .await;

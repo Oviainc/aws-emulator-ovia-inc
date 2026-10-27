@@ -425,7 +425,10 @@ async fn a_delete_of_a_network_id_nothing_minted_is_not_found() {
         &router,
         "POST",
         "/prod/channels",
-        Some(json!({ "name": "neighbour" })),
+        Some(json!({
+            "name": "neighbour",
+            "encoderSettings": crate::support::channel_encoder_settings(),
+        })),
     )
     .await;
     assert_eq!(
