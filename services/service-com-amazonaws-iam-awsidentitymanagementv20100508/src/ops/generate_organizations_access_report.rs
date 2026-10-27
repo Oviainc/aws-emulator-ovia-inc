@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GenerateOrganizationsAccessReport
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GenerateOrganizationsAccessReport`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GenerateOrganizationsAccessReport::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts a service-last-accessed report for the Organizations entity the request's
+//! `EntityPath` names and answers the `JobId` that report is read back by
+//! (`GetOrganizationsAccessReport`). The job is a record of the account: its generation is
+//! DUE a short span after this call ([`crate::state::ACCESS_REPORT_GENERATION_SECONDS`]),
+//! so a caller polling straight afterwards sees it `IN_PROGRESS`, and from the due instant
+//! the read reports it `COMPLETED`.
 //!
 //! ## Shape of an operation
 //!
@@ -181,18 +179,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GenerateOrganizationsAccessReport` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GenerateOrganizationsAccessReportErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GenerateOrganizationsAccessReport"))
+        // `ctx` carries request metadata only; nothing about the report depends on it —
+        // IAM is global, and the entity the report is about is named by the request.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models no server error, so an unreachable store is reported
+            // through the crate's generic refusal channel rather than as a report job
+            // nothing recorded.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the IAM store is unavailable",
+            ));
+        };
+        let mut store = state.lock();
+
+        // "The maximum number of concurrent requests for this account are already
+        // running" (`ReportGenerationLimitExceededException`): a caller cannot start
+        // report generations without limit, so while that many jobs are still in flight
+        // the generate is refused and no job is recorded.
+        let now = crate::state::now();
+        let in_flight = store
+            .organizations_access_reports
+            .values()
+            .filter(|job| {
+                crate::state::access_report_job_status(job, now)
+                    == crate::state::JOB_STATUS_IN_PROGRESS
+            })
+            .count();
+        if in_flight >= crate::state::MAX_CONCURRENT_ACCESS_REPORT_JOBS {
+            return Err(
+                GenerateOrganizationsAccessReportErrorModeled::ReportGenerationLimitExceededException(
+                    ReportGenerationLimitExceededException {
+                        message: Some(format!(
+                            "Cannot exceed quota for ConcurrentReportGenerations: {}",
+                            crate::state::MAX_CONCURRENT_ACCESS_REPORT_JOBS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "You can generate a report for … the entity path of the root, OU or account":
+        // the request's own `EntityPath` and the optional SCP it narrows the report to are
+        // what the job is ABOUT, so both are recorded with it and the read reports the
+        // report of THIS job rather than of the last one asked for.
+        let created = now;
+        let completes = ::aws_smithy_types::DateTime::from_secs(
+            created.secs() + crate::state::ACCESS_REPORT_GENERATION_SECONDS,
+        );
+        let job_id = store.next_access_report_job_id();
+        store.organizations_access_reports.insert(
+            job_id.clone(),
+            crate::state::OrganizationsAccessReportJob {
+                entity_path: input.entity_path,
+                organizations_policy_id: input.organizations_policy_id,
+                created,
+                completes,
+            },
+        );
+        // A finished report is kept for a caller to read again, but the account retains a
+        // bounded number of them: past that, the oldest finished jobs are dropped, so
+        // repeated generates cannot grow the store without end.
+        while store.organizations_access_reports.len()
+            > crate::state::MAX_RETAINED_ACCESS_REPORT_JOBS
+        {
+            let Some(oldest) = store
+                .organizations_access_reports
+                .iter()
+                .min_by_key(|(id, job)| (job.created.secs(), (*id).clone()))
+                .map(|(id, _)| id.clone())
+            else {
+                break;
+            };
+            store.organizations_access_reports.remove(&oldest);
+        }
+
+        Ok(GenerateOrganizationsAccessReportOutput {
+            job_id: Some(job_id),
+        })
     }
 }

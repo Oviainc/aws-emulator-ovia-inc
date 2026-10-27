@@ -306,33 +306,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Every supplied document has to be a policy document before anything is
-        // decided from it: the rule is the shared one every operation taking a policy
-        // document applies (`crate::state::is_policy_document`).
+        // decided from it: the rule, and the fixed sentence each way of breaking it is
+        // refused with, are the shared ones every operation taking a policy document
+        // applies (`crate::state::policy_document_defect`), so the refusal carries
+        // neither the member that supplied the document nor anything read out of it.
         let supplied = input.policy_input_list.unwrap_or_default();
         let boundary = input.permissions_boundary_policy_input_list.unwrap_or_default();
-        for (member, documents) in [
-            ("PolicyInputList", &supplied),
-            ("PermissionsBoundaryPolicyInputList", &boundary),
-        ] {
-            if let Some(position) = documents
-                .iter()
-                .position(|document| !crate::state::is_policy_document(document))
-            {
-                return Err(invalid_input(format!(
-                    "Syntax errors in policy: {member} member {} must be a JSON object \
-                     carrying a Statement element",
-                    position + 1
-                )));
-            }
-        }
-        if let Some(document) = input.resource_policy.as_deref() {
-            if !crate::state::is_policy_document(document) {
-                return Err(invalid_input(
-                    "Syntax errors in policy: ResourcePolicy must be a JSON object \
-                     carrying a Statement element"
-                        .to_string(),
-                ));
-            }
+        let mut documents = supplied
+            .iter()
+            .chain(boundary.iter())
+            .chain(input.resource_policy.iter());
+        if let Some(defect) = documents.find_map(|document| {
+            crate::state::policy_document_defect(document)
+        }) {
+            return Err(invalid_input(defect.message().to_string()));
         }
         // "An IAM entity can only have one permissions boundary in effect at a time.
         // You can input only one permissions boundary when you pass a policy to this

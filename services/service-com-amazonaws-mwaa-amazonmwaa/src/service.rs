@@ -20,9 +20,10 @@
 //!   request's resolved route key against this service's signing name. Edit it
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
-//! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//! - `override_operation` — EDITED HERE: not a re-route. The key and the handler stay the
+//!   generated ones; an operation the model hosts on the ENVIRONMENT data endpoint is
+//!   served wrapped in that endpoint's front door ([`env_endpoint`]), which answers the one
+//!   refusal that front door owns — a name it cannot resolve — the way it answers it.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -44,6 +45,8 @@ use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+pub mod env_endpoint;
 
 /// The error code this service answers an input-constraint violation with: the modeled
 /// `ValidationException`, which every operation that can be refused declares with
@@ -115,6 +118,10 @@ fn constraint_envelope(violations: &[Violation]) -> Option<String> {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The environment data endpoint's front door, which `override_operation` hands back
+    /// for the operations the model hosts on it. Built once, because that seam returns a
+    /// reference to it.
+    environment_data: env_endpoint::EnvironmentDataEndpoint,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -124,6 +131,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            environment_data: env_endpoint::EnvironmentDataEndpoint,
         }
     }
 }
@@ -150,14 +158,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Every request this service serves resolves through the generated routing table,
-        // and every answer — including the not-found refusal of the operation the model
-        // declares as a PROXY to an environment's Apache Airflow web server — is rendered
-        // by the framework's own restJson1 serializer, so each error travels in the
-        // envelope an AWS SDK's error parser reads: an object carrying the modelled code
-        // and the message. No operation is routed around that here.
-        let _ = req;
-        None
+        // An operation the model hosts on the ENVIRONMENT data endpoint (`@endpoint` host
+        // prefix `env.`) is served through that endpoint's front door: the generated
+        // routing table still names the operation and the framework still owns its whole
+        // walk, and the wrapper answers the one refusal the front door itself owns — a
+        // name it cannot resolve to an environment — the way that front door answers it
+        // (see [`env_endpoint`]). Every other request, the control-plane lookups included,
+        // resolves through the generated routing table untouched.
+        env_endpoint::routes(&self.entry, req).then_some(&self.environment_data as _)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

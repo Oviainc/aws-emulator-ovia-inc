@@ -170,7 +170,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteResourcePolicyErrorModeled::InternalServerException(
                 InternalServerException {
@@ -219,6 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let workspace_status = workspace.status_code.clone();
+        let workspace_arn = workspace.arn.clone();
 
         // Nothing to delete: the policy is the resource that doesn't exist (404). That
         // includes a deletion that has already run to completion — the policy is gone,
@@ -299,6 +299,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             policy.status_code = crate::state::POLICY_STATUS_DELETING.to_string();
             policy.transition_due = Some(now + crate::state::TRANSITION_DELAY);
             policy.delete_token = input.client_token;
+            // This call CHANGED this service's state, so it leaves the audit record
+            // every mutating handler of this crate leaves: the operation, the resource
+            // it changed and the access-key id the REQUEST presented — see
+            // [`crate::state::record_state_change`]. A replay of the pending deletion
+            // writes nothing, so it records nothing. The policy has no ARN of its own,
+            // so the resource is the workspace it was attached to.
+            crate::state::record_state_change(Self::NAME, &workspace_arn, ctx.parts());
         }
 
         Ok(DeleteResourcePolicyOutput)

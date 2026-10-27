@@ -395,6 +395,17 @@ const S3_BUCKET: &str = "AWS::S3::Bucket";
 /// `AWS::IAM::Role`: "Ref returns the role name".
 const IAM_ROLE: &str = "AWS::IAM::Role";
 
+/// `AWS::IAM::User`: "Ref returns the user name", so a resource of this type is an IAM
+/// user addressed by its physical resource id.
+const IAM_USER: &str = "AWS::IAM::User";
+
+/// `AWS::IAM::ManagedPolicy`: "Ref returns the ARN of the managed policy" — the handle
+/// every IAM operation on a managed policy takes — which is why
+/// [`super::template::identity_is_service_assigned`] names this type: the ARN carries the
+/// account and the path IAM built it from, and it is what a template passes to another
+/// resource's `ManagedPolicyArns` or `PermissionsBoundary`.
+const IAM_MANAGED_POLICY: &str = "AWS::IAM::ManagedPolicy";
+
 /// `AWS::CodePipeline::Pipeline`: "Ref returns the pipeline name".
 const CODEPIPELINE_PIPELINE: &str = "AWS::CodePipeline::Pipeline";
 
@@ -443,6 +454,8 @@ pub(super) enum Provisioner {
     S3VectorsIndex,
     EmrCluster,
     IamRole,
+    IamUser,
+    IamManagedPolicy,
     CodePipelinePipeline,
     EcsCluster,
     SqsQueue,
@@ -528,6 +541,8 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         S3VECTORS_INDEX => Some(Provisioner::S3VectorsIndex),
         EMR_CLUSTER => Some(Provisioner::EmrCluster),
         IAM_ROLE => Some(Provisioner::IamRole),
+        IAM_USER => Some(Provisioner::IamUser),
+        IAM_MANAGED_POLICY => Some(Provisioner::IamManagedPolicy),
         CODEPIPELINE_PIPELINE => Some(Provisioner::CodePipelinePipeline),
         ECS_CLUSTER => Some(Provisioner::EcsCluster),
         SQS_QUEUE => Some(Provisioner::SqsQueue),
@@ -639,6 +654,10 @@ impl Provisioner {
             }
             Self::S3VectorsIndex => create_index(ctx, region, resource, propagated).await,
             Self::IamRole => create_role(ctx, region, resource, propagated).await,
+            Self::IamUser => create_iam_user(ctx, region, resource, propagated).await,
+            // `AWS::IAM::ManagedPolicy` publishes no `Tags` property and `CreatePolicy`
+            // takes none from this arm, so no tags are propagated to a policy.
+            Self::IamManagedPolicy => create_managed_policy(ctx, region, resource).await,
             Self::CodePipelinePipeline => {
                 create_pipeline(ctx, region, resource, propagated).await
             }
@@ -918,6 +937,7 @@ impl Provisioner {
         let refuses_reserved_keys = matches!(
             self,
             Self::IamRole
+                | Self::IamUser
                 | Self::CodePipelinePipeline
                 | Self::EcsCluster
                 | Self::EcrPublicRepository
@@ -1053,6 +1073,19 @@ impl Provisioner {
             // changed declaration is applied to the role the stack created rather than
             // replacing it ([`update_role`]).
             Self::IamRole => update_role(ctx, region, resource, declared).await,
+            // A user's identity is its NAME, and every other property of `AWS::IAM::User`
+            // has an IAM call that changes it on the user that name belongs to — its path
+            // through `UpdateUser`, which keeps the user's unique identifier — so a
+            // changed declaration is applied to the user the stack created rather than
+            // replacing it ([`update_iam_user`]).
+            Self::IamUser => update_iam_user(ctx, region, resource, declared).await,
+            // A managed policy's identity is its ARN, and the document it grants from is
+            // changed by adding a new DEFAULT version to the policy that ARN names, so a
+            // changed declaration is applied to the policy the stack created rather than
+            // replacing it ([`update_managed_policy`]).
+            Self::IamManagedPolicy => {
+                update_managed_policy(ctx, region, resource, declared).await
+            }
             // Every property of a KMS key that can change on an existing one has a KMS
             // call that changes it — its description, its key policy, and the two switches
             // — so a changed declaration is applied to the key the stack created rather
@@ -1135,6 +1168,9 @@ impl Provisioner {
             // [`update_role`] does not carry them: this is the one place the tag set a role
             // is to end up with is reconciled.
             Self::IamRole => retag_role(ctx, region, resource, declared, propagated).await,
+            // A user's tags are IAM's own `TagUser`/`UntagUser`, for the same reason a
+            // role's are not carried by [`update_iam_user`].
+            Self::IamUser => retag_iam_user(ctx, region, resource, declared, propagated).await,
             // A key's tags are KMS's own `TagResource`/`UntagResource`, which is why
             // [`update_kms_key`] does not carry them either.
             Self::KmsKey => retag_kms_key(ctx, region, resource, declared, propagated).await,
@@ -1193,6 +1229,12 @@ impl Provisioner {
             // The role's policies have to go first, and only the resource's own record
             // says which ones there are.
             Self::IamRole => delete_role(ctx, region, resource).await,
+            // The user's password, policies and memberships have to go first, and only the
+            // resource's own record says which ones there are.
+            Self::IamUser => delete_iam_user(ctx, region, resource).await,
+            // The policy's attachments and its non-default versions have to go first, and
+            // only the resource's own record says which entities it was attached to.
+            Self::IamManagedPolicy => delete_managed_policy(ctx, region, resource).await,
             Self::CodePipelinePipeline => {
                 delete_pipeline(ctx, region, physical_resource_id).await
             }
@@ -1423,6 +1465,10 @@ impl Provisioner {
             Self::S3VectorsIndex => describe_index(ctx, region, physical_resource_id).await,
             Self::EmrCluster => describe_job_flow(ctx, region, physical_resource_id).await,
             Self::IamRole => describe_role(ctx, region, physical_resource_id).await,
+            Self::IamUser => describe_iam_user(ctx, region, physical_resource_id).await,
+            Self::IamManagedPolicy => {
+                describe_managed_policy(ctx, region, physical_resource_id).await
+            }
             Self::CodePipelinePipeline => {
                 describe_pipeline(ctx, region, physical_resource_id).await
             }
@@ -3759,6 +3805,985 @@ fn declared_list<'a>(properties: &'a Value, property: &str) -> &'a [Value] {
         .get(property)
         .and_then(Value::as_array)
         .map_or(&[][..], Vec::as_slice)
+}
+
+// ---------------------------------------------------------------------------
+// IAM: AWS::IAM::ManagedPolicy
+// ---------------------------------------------------------------------------
+
+/// The properties an `AWS::IAM::ManagedPolicy` lists the entities it is attached to under,
+/// each applied with the IAM call that attaches a managed policy to an entity of that kind
+/// ([`attach_managed_policy_to`], [`detach_managed_policy_from`]).
+///
+/// "Groups — the name (friendly name, not ARN) of the group to attach the policy to", and
+/// the same for `Roles` and `Users`: a declaration listing one is asking for the attachment
+/// a client makes with `AttachGroupPolicy`/`AttachRolePolicy`/`AttachUserPolicy`, so the
+/// policy's deployment makes those very calls and its deletion undoes them.
+const MANAGED_POLICY_HOLDERS: &[&str] = &["Groups", "Roles", "Users"];
+
+/// Attach the managed policy `policy_arn` to one entity of the kind `holder_property`
+/// names, through IAM's own attach call for that kind.
+async fn attach_managed_policy_to(
+    client: &::aws_sdk_iam::Client,
+    holder_property: &str,
+    entity: &str,
+    policy_arn: &str,
+) -> Result<(), Refusal> {
+    let sent = match holder_property {
+        "Groups" => client
+            .attach_group_policy()
+            .group_name(entity)
+            .policy_arn(policy_arn)
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|error| refusal_of(&error)),
+        "Roles" => client
+            .attach_role_policy()
+            .role_name(entity)
+            .policy_arn(policy_arn)
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|error| refusal_of(&error)),
+        _ => client
+            .attach_user_policy()
+            .user_name(entity)
+            .policy_arn(policy_arn)
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|error| refusal_of(&error)),
+    };
+    sent
+}
+
+/// Detach the managed policy `policy_arn` from one entity of the kind `holder_property`
+/// names. An entity, or an attachment, IAM no longer has is already in the state the
+/// detach asks for, judged on IAM's own not-found CODE.
+async fn detach_managed_policy_from(
+    client: &::aws_sdk_iam::Client,
+    holder_property: &str,
+    entity: &str,
+    policy_arn: &str,
+) -> Result<(), Refusal> {
+    let sent = match holder_property {
+        "Groups" => client
+            .detach_group_policy()
+            .group_name(entity)
+            .policy_arn(policy_arn)
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|error| refusal_of(&error)),
+        "Roles" => client
+            .detach_role_policy()
+            .role_name(entity)
+            .policy_arn(policy_arn)
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|error| refusal_of(&error)),
+        _ => client
+            .detach_user_policy()
+            .user_name(entity)
+            .policy_arn(policy_arn)
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|error| refusal_of(&error)),
+    };
+    match sent {
+        Err(refusal) if refusal.code == NO_SUCH_ENTITY => Ok(()),
+        other => other,
+    }
+}
+
+/// The name the managed policy is created under: the `ManagedPolicyName` the declaration
+/// asks for, and otherwise the name CloudFormation generated for the resource, which
+/// [`super::template`] records as its `Name`.
+///
+/// Read from the declaration rather than from the resource's physical id, because for this
+/// type that id is the policy's ARN — the identity IAM mints — and not a name any create
+/// could be addressed with.
+fn managed_policy_name(resource: &StoredResource) -> Result<String, Refusal> {
+    property(resource, "ManagedPolicyName")
+        .or_else(|| {
+            resource
+                .attributes
+                .get("Name")
+                .filter(|name| !name.is_empty())
+                .cloned()
+        })
+        .ok_or_else(|| Refusal {
+            code: MISSING_PROPERTY_CODE.to_string(),
+            message: format!("{} declares no ManagedPolicyName", resource.resource_type),
+        })
+}
+
+/// Create the customer managed policy an `AWS::IAM::ManagedPolicy` declares, and attach it
+/// to every entity the declaration lists.
+///
+/// `PolicyDocument` is REQUIRED on this resource type and on IAM's own `CreatePolicy`, so a
+/// declaration carrying none describes no policy that could be created: the resource is
+/// refused here, naming the property, rather than a policy being created with a document
+/// this module invented.
+///
+/// The resource's identity is IAM's own: "Ref returns the ARN of the managed policy", which
+/// is the handle every IAM operation on a managed policy takes (`GetPolicy$PolicyArn`,
+/// `AttachRolePolicy$PolicyArn`) — so what the stack reports for the resource is the ARN
+/// `CreatePolicy` answered with, and a template that passes that `Ref` to another resource's
+/// `ManagedPolicyArns` or `PermissionsBoundary` passes an ARN IAM will resolve.
+async fn create_managed_policy(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    let Some(document) = resource.properties.get("PolicyDocument").and_then(document_text) else {
+        return Err(Refusal {
+            code: MISSING_PROPERTY_CODE.to_string(),
+            message: format!(
+                "Property PolicyDocument cannot be empty for resource of type {}",
+                resource.resource_type
+            ),
+        });
+    };
+    let client = iam_client(ctx, region);
+    let created = client
+        .create_policy()
+        .policy_name(managed_policy_name(resource)?)
+        .policy_document(document)
+        // `Path` and `Description` are spelled the same on the resource type and on
+        // `CreatePolicy`; a property the template leaves out is not sent.
+        .set_path(resource.properties.get("Path").and_then(scalar_text))
+        .set_description(resource.properties.get("Description").and_then(scalar_text))
+        .send()
+        .await
+        .map_err(|error| refusal_of(&error))?;
+    let policy = created.policy();
+    let Some(arn) = policy.and_then(|policy| policy.arn()) else {
+        // The create answered 2xx without the ARN its output models. Nothing addresses a
+        // managed policy without one, so this is reported as a failure rather than
+        // recorded as a resource with a physical id nothing minted.
+        return Err(Refusal {
+            code: UNIDENTIFIED_FAILURE.to_string(),
+            message: "IAM answered no Arn for the managed policy it created".to_string(),
+        });
+    };
+    let mut attributes = BTreeMap::new();
+    attributes.insert("PolicyArn".to_string(), arn.to_string());
+    // `PolicyId` is the UNIQUE ID IAM mints for a policy, which only IAM can know.
+    if let Some(policy_id) = policy.and_then(|policy| policy.policy_id()) {
+        attributes.insert("PolicyId".to_string(), policy_id.to_string());
+    }
+    // Every entity the declaration lists gets the attachment a client would make. IAM is
+    // what judges whether it can be made, so an entity it refuses fails the resource
+    // rather than leaving the stack complete over a grant that does not exist.
+    for holder in MANAGED_POLICY_HOLDERS {
+        for entity in declared_list(&resource.properties, holder)
+            .iter()
+            .filter_map(scalar_text)
+        {
+            attach_managed_policy_to(&client, holder, &entity, arn).await?;
+        }
+    }
+    Ok(Created {
+        physical_resource_id: Some(arn.to_string()),
+        attributes,
+    })
+}
+
+/// The properties of `AWS::IAM::ManagedPolicy` a deployment can change on the policy the
+/// stack already has, each through the IAM call that changes that one thing on an existing
+/// policy: the document with `CreatePolicyVersion` (set as the default version, which is
+/// what the policy grants from then on) and the attachment lists with the attach and detach
+/// calls.
+///
+/// `ManagedPolicyName`, `Path` and `Description` are deliberately NOT here: the name IS what
+/// the resource is created under, the path decides the ARN, and no IAM call moves either on
+/// an existing policy — nor the description, which only `CreatePolicy` takes — so a
+/// deployment that changes one is reported as not applied rather than as a success that
+/// dropped it.
+const MANAGED_POLICY_IN_PLACE_PROPERTIES: &[&str] =
+    &["PolicyDocument", "Groups", "Roles", "Users"];
+
+/// Apply a CHANGED `AWS::IAM::ManagedPolicy` declaration to the policy the stack already
+/// has, through the IAM calls that change each property on an existing policy.
+///
+/// The policy therefore keeps its identity — the same ARN and the same `PolicyId` — so
+/// every attachment it already has, and every attribute the stack published for it, still
+/// resolves. Only what the two revisions state differently is sent.
+///
+/// `Ok(None)` is a change no IAM call makes to an existing policy — a property outside
+/// [`MANAGED_POLICY_IN_PLACE_PROPERTIES`] — which the deployment then reports as not
+/// applied.
+async fn update_managed_policy(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+) -> Result<Option<Created>, Refusal> {
+    let held = &resource.properties;
+    // A declaration that spells out the name the policy ALREADY has is no change to the
+    // name: this call is reached only for a resource that kept its identity.
+    let changed: Vec<String> = changed_properties(held, declared)
+        .into_iter()
+        .filter(|changed_property| {
+            changed_property != "ManagedPolicyName"
+                || declared
+                    .get("ManagedPolicyName")
+                    .and_then(scalar_text)
+                    .is_some_and(|name| {
+                        property(resource, "ManagedPolicyName").as_deref() != Some(name.as_str())
+                    })
+        })
+        .collect();
+    if changed
+        .iter()
+        .any(|property| !MANAGED_POLICY_IN_PLACE_PROPERTIES.contains(&property.as_str()))
+    {
+        return Ok(None);
+    }
+    let client = iam_client(ctx, region);
+    let policy_arn = &resource.physical_resource_id;
+
+    // "Creates a new version of the specified managed policy": the declared document
+    // becomes a new version of the policy the stack already has, set as the DEFAULT one —
+    // "the operation sets this version as the policy's default version" — so every entity
+    // the policy is attached to is governed by the document the template now declares.
+    if changed.iter().any(|property| property == "PolicyDocument") {
+        let Some(document) = declared.get("PolicyDocument").and_then(document_text) else {
+            return Err(Refusal {
+                code: MISSING_PROPERTY_CODE.to_string(),
+                message: format!(
+                    "Property PolicyDocument cannot be empty for resource of type {}",
+                    resource.resource_type
+                ),
+            });
+        };
+        client
+            .create_policy_version()
+            .policy_arn(policy_arn)
+            .policy_document(document)
+            .set_as_default(true)
+            .send()
+            .await
+            .map_err(|error| refusal_of(&error))?;
+    }
+
+    // An entity the deployment adds to a list gets the attachment; one it no longer lists
+    // has it removed, which is how a template revokes a grant it once declared.
+    for holder in MANAGED_POLICY_HOLDERS {
+        if !changed.iter().any(|property| property == holder) {
+            continue;
+        }
+        let held_entities: Vec<String> = declared_list(held, holder)
+            .iter()
+            .filter_map(scalar_text)
+            .collect();
+        let declared_entities: Vec<String> = declared_list(declared, holder)
+            .iter()
+            .filter_map(scalar_text)
+            .collect();
+        for entity in declared_entities
+            .iter()
+            .filter(|entity| !held_entities.contains(entity))
+        {
+            attach_managed_policy_to(&client, holder, entity, policy_arn).await?;
+        }
+        for entity in held_entities
+            .iter()
+            .filter(|entity| !declared_entities.contains(entity))
+        {
+            detach_managed_policy_from(&client, holder, entity, policy_arn).await?;
+        }
+    }
+
+    // The policy is the one the stack created, under the same ARN: its identity and its
+    // `PolicyId` are the ones the create already recorded, so this reports no attribute of
+    // its own.
+    Ok(Some(Created::default()))
+}
+
+/// Delete the managed policy a stack created, addressed by the ARN that is its physical id.
+///
+/// "Before you can delete a managed policy, you must first detach the policy from all
+/// users, groups, and roles that it is attached to" and "you must delete all the policy's
+/// versions" — so every attachment the declaration asked for is detached and every
+/// non-default version is deleted before the policy itself goes. A policy, an attachment or
+/// a version IAM no longer has is already in the state the delete asks for, judged on IAM's
+/// own not-found code.
+async fn delete_managed_policy(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<(), Refusal> {
+    let client = iam_client(ctx, region);
+    let policy_arn = &resource.physical_resource_id;
+    for holder in MANAGED_POLICY_HOLDERS {
+        for entity in declared_list(&resource.properties, holder)
+            .iter()
+            .filter_map(scalar_text)
+        {
+            detach_managed_policy_from(&client, holder, &entity, policy_arn).await?;
+        }
+    }
+    // Every version but the default, which `DeletePolicy` deletes with the policy itself.
+    // A deployment that changed the document left the earlier versions behind, exactly as
+    // a client's own `CreatePolicyVersion` does.
+    match client
+        .list_policy_versions()
+        .policy_arn(policy_arn)
+        .send()
+        .await
+    {
+        Ok(answer) => {
+            for version in answer.versions() {
+                if version.is_default_version() {
+                    continue;
+                }
+                let Some(version_id) = version.version_id() else {
+                    continue;
+                };
+                if let Err(error) = client
+                    .delete_policy_version()
+                    .policy_arn(policy_arn)
+                    .version_id(version_id)
+                    .send()
+                    .await
+                {
+                    let refusal = refusal_of(&error);
+                    if refusal.code != NO_SUCH_ENTITY {
+                        return Err(refusal);
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            let refusal = refusal_of(&error);
+            if refusal.code != NO_SUCH_ENTITY {
+                return Err(refusal);
+            }
+        }
+    }
+    match client.delete_policy().policy_arn(policy_arn).send().await {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            let refusal = refusal_of(&error);
+            if refusal.code == NO_SUCH_ENTITY {
+                return Ok(());
+            }
+            Err(refusal)
+        }
+    }
+}
+
+/// The managed policy's configuration as IAM reports it, for drift detection.
+///
+/// A policy IAM no longer holds (`NoSuchEntity`) was deleted. The members compared are the
+/// ones the resource type and `GetPolicy` spell identically and the create sends — `Path`
+/// and `Description` — so a policy whose description was changed outside the stack is
+/// MODIFIED.
+async fn describe_managed_policy(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let answer = match iam_client(ctx, region)
+        .get_policy()
+        .policy_arn(physical_resource_id)
+        .send()
+        .await
+    {
+        Ok(answer) => answer,
+        Err(error) => {
+            let refusal = refusal_of(&error);
+            if refusal.code == NO_SUCH_ENTITY {
+                return Ok(None);
+            }
+            return Err(refusal);
+        }
+    };
+    let mut actual = Map::new();
+    if let Some(policy) = answer.policy() {
+        if let Some(path) = policy.path() {
+            actual.insert("Path".to_string(), Value::String(path.to_string()));
+        }
+        if let Some(description) = policy.description() {
+            actual.insert(
+                "Description".to_string(),
+                Value::String(description.to_string()),
+            );
+        }
+    }
+    Ok(Some(Value::Object(actual)))
+}
+
+// ---------------------------------------------------------------------------
+// IAM: AWS::IAM::User
+// ---------------------------------------------------------------------------
+
+/// The `LoginProfile` an `AWS::IAM::User` declaration carries, as the two members
+/// `CreateLoginProfile` takes: "a login profile is created when you create a password for
+/// the user", and the type declares that password beside the flag that forces a change at
+/// the next sign-in.
+fn declared_login_profile(properties: &Value) -> Option<(String, Option<bool>)> {
+    let profile = properties.get("LoginProfile")?;
+    let password = profile.get("Password").and_then(scalar_text)?;
+    let reset_required = profile.get("PasswordResetRequired").and_then(Value::as_bool);
+    Some((password, reset_required))
+}
+
+/// The groups an `AWS::IAM::User` declaration lists, each the friendly name
+/// `AddUserToGroup` takes.
+fn declared_groups(properties: &Value) -> Vec<String> {
+    declared_list(properties, "Groups")
+        .iter()
+        .filter_map(scalar_text)
+        .collect()
+}
+
+/// Create the user an `AWS::IAM::User` declares, with its path, its permissions boundary,
+/// its inline policies, its attached managed policies, its group memberships and its
+/// console password — each through the IAM call a client makes for it.
+///
+/// A name IAM will not create a user under — `EntityAlreadyExists`, which is what an IAM
+/// name the ACCOUNT already holds answers, since user names are account-global — fails the
+/// resource like any other refusal: the user that is there is not this stack's, and a stack
+/// never reports a resource it did not create.
+///
+/// The user carries the tags the declaration asks for plus the ones CloudFormation gives
+/// the resource ([`tags_of`]), as `CreateUser`'s own `Tags` member.
+async fn create_iam_user(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let client = iam_client(ctx, region);
+    let user_name = &resource.physical_resource_id;
+    let mut user_tags = Vec::new();
+    for (key, value) in tags_of(&resource.properties, propagated) {
+        user_tags.push(
+            ::aws_sdk_iam::types::Tag::builder()
+                .key(&key)
+                .value(&value)
+                .build()
+                .map_err(|error| Refusal {
+                    code: UNIDENTIFIED_FAILURE.to_string(),
+                    message: format!("the tag {key} cannot be sent to IAM: {error}"),
+                })?,
+        );
+    }
+    let created = client
+        .create_user()
+        .user_name(user_name)
+        // `Path` and `PermissionsBoundary` are spelled the same on the resource type and
+        // on `CreateUser`; a property the template leaves out is not sent.
+        .set_path(resource.properties.get("Path").and_then(scalar_text))
+        .set_permissions_boundary(
+            resource
+                .properties
+                .get("PermissionsBoundary")
+                .and_then(scalar_text),
+        )
+        .set_tags((!user_tags.is_empty()).then_some(user_tags))
+        .send()
+        .await;
+    let mut attributes = BTreeMap::new();
+    match created {
+        Ok(answer) => {
+            // What IAM answered wins over the computed ARN and id: they are the user's
+            // real identity, and `UserId` — "the stable and unique string identifying the
+            // user" — is one only IAM can know.
+            if let Some(user) = answer.user() {
+                attributes.insert("Arn".to_string(), user.arn().to_string());
+                attributes.insert("UserId".to_string(), user.user_id().to_string());
+            }
+        }
+        Err(error) => return Err(refusal_of(&error)),
+    }
+    // "Policies — adds or updates an inline policy document that is embedded in the
+    // specified IAM user", each entry a `{PolicyName, PolicyDocument}` pair.
+    for policy in inline_policies(&resource.properties) {
+        let (Some(name), Some(body)) = (
+            policy.get("PolicyName").and_then(scalar_text),
+            policy.get("PolicyDocument").and_then(document_text),
+        ) else {
+            continue;
+        };
+        client
+            .put_user_policy()
+            .user_name(user_name)
+            .policy_name(name)
+            .policy_document(body)
+            .send()
+            .await
+            .map_err(|error| refusal_of(&error))?;
+    }
+    // "ManagedPolicyArns — a list of ARNs of the IAM managed policies that you want to
+    // attach to the user", each applied with the call that attaches one.
+    for policy_arn in managed_policy_arns(&resource.properties) {
+        client
+            .attach_user_policy()
+            .user_name(user_name)
+            .policy_arn(policy_arn)
+            .send()
+            .await
+            .map_err(|error| refusal_of(&error))?;
+    }
+    // "Groups — a list of group names that the user is added to", each the membership
+    // `AddUserToGroup` writes.
+    for group in declared_groups(&resource.properties) {
+        client
+            .add_user_to_group()
+            .user_name(user_name)
+            .group_name(group)
+            .send()
+            .await
+            .map_err(|error| refusal_of(&error))?;
+    }
+    // "LoginProfile — creates a login profile for the user, so that the user can access
+    // the Amazon Web Services Management Console": the password the declaration carries is
+    // the one `CreateLoginProfile` takes.
+    if let Some((password, reset_required)) = declared_login_profile(&resource.properties) {
+        client
+            .create_login_profile()
+            .user_name(user_name)
+            .password(password)
+            .set_password_reset_required(reset_required)
+            .send()
+            .await
+            .map_err(|error| refusal_of(&error))?;
+    }
+    Ok(Created::attributes(attributes))
+}
+
+/// The properties of `AWS::IAM::User` a deployment can change on the user the stack already
+/// has, each through the IAM call that changes that one thing on an existing user.
+///
+/// These are the type's no-interruption properties: the user keeps its name, and so its
+/// `UserId`, its credentials and everything attached to it. `Path` is among them because
+/// `UpdateUser` moves it on an existing user ("updates the name and/or the path of the
+/// specified IAM user") while "the user's unique identifier remains the same" — which is
+/// exactly what a path update must not disturb. `Tags` is one of them too, applied in
+/// [`retag_iam_user`] rather than here, where every tag the user is to carry is reconciled
+/// at once.
+///
+/// `UserName` is deliberately not here: the name IS the resource's physical id, so a
+/// changed one is a different resource to [`super::provisioning::is_same_resource`] and
+/// never reaches [`update_iam_user`] at all. `PermissionsBoundary` is not here either,
+/// because this emulator applies the boundary at CREATE time through `CreateUser` and
+/// claiming to apply a change to it would record a configuration nothing put in force.
+const USER_IN_PLACE_PROPERTIES: &[&str] = &[
+    "Groups",
+    "LoginProfile",
+    "ManagedPolicyArns",
+    "Path",
+    "Policies",
+    "Tags",
+];
+
+/// Apply a CHANGED `AWS::IAM::User` declaration to the user the stack already has, through
+/// the IAM call that changes each property on an existing user — the path with
+/// `UpdateUser`, the inline policies with `PutUserPolicy`/`DeleteUserPolicy`, the attached
+/// managed policies with `AttachUserPolicy`/`DetachUserPolicy`, the memberships with
+/// `AddUserToGroup`/`RemoveUserFromGroup` and the console password with
+/// `CreateLoginProfile`/`UpdateLoginProfile`/`DeleteLoginProfile`.
+///
+/// The user therefore keeps its identity: the same name and the same `UserId`, so an output
+/// that published either still resolves and every credential the user holds goes on
+/// working.
+///
+/// `Ok(None)` is a change no IAM call makes to an existing user — a property outside
+/// [`USER_IN_PLACE_PROPERTIES`] — which the deployment then reports as not applied.
+async fn update_iam_user(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+) -> Result<Option<Created>, Refusal> {
+    let held = &resource.properties;
+    // A declaration that spells out the name the user ALREADY has is no change to the
+    // name: this call is reached only for a resource that kept its physical id, which for
+    // this type IS the user's name.
+    let changed: Vec<String> = changed_properties(held, declared)
+        .into_iter()
+        .filter(|property| {
+            property != "UserName"
+                || declared.get("UserName").and_then(scalar_text).as_deref()
+                    != Some(resource.physical_resource_id.as_str())
+        })
+        .collect();
+    if changed
+        .iter()
+        .any(|property| !USER_IN_PLACE_PROPERTIES.contains(&property.as_str()))
+    {
+        return Ok(None);
+    }
+    let client = iam_client(ctx, region);
+    let user_name = &resource.physical_resource_id;
+    let is_changed = |property: &str| changed.iter().any(|name| name == property);
+
+    // "Updates the name and/or the path of the specified IAM user": only the path is sent,
+    // because a changed name is a different resource. A path the deployment no longer
+    // declares goes back to the one IAM gives a user created without one, so a dropped
+    // property is reset rather than silently kept.
+    if is_changed("Path") {
+        client
+            .update_user()
+            .user_name(user_name)
+            .new_path(
+                declared
+                    .get("Path")
+                    .and_then(scalar_text)
+                    .unwrap_or_else(|| DEFAULT_IAM_PATH.to_string()),
+            )
+            .send()
+            .await
+            .map_err(|error| refusal_of(&error))?;
+    }
+
+    // "Policies": a policy this deployment declares with a new document is put again under
+    // the same name, and one it no longer declares is deleted off the user.
+    if is_changed("Policies") {
+        let held_policies = inline_policies(held);
+        let declared_policies = inline_policies(declared);
+        for policy in declared_policies {
+            let (Some(name), Some(body)) = (
+                policy.get("PolicyName").and_then(scalar_text),
+                policy.get("PolicyDocument").and_then(document_text),
+            ) else {
+                continue;
+            };
+            if held_policies.iter().any(|held| held == policy) {
+                continue;
+            }
+            client
+                .put_user_policy()
+                .user_name(user_name)
+                .policy_name(name)
+                .policy_document(body)
+                .send()
+                .await
+                .map_err(|error| refusal_of(&error))?;
+        }
+        for name in dropped_policy_names(held_policies, declared_policies) {
+            client
+                .delete_user_policy()
+                .user_name(user_name)
+                .policy_name(name)
+                .send()
+                .await
+                .map_err(|error| refusal_of(&error))?;
+        }
+    }
+
+    // "ManagedPolicyArns": one the deployment adds is attached, one it no longer lists is
+    // detached.
+    if is_changed("ManagedPolicyArns") {
+        let held_arns = managed_policy_arns(held);
+        let declared_arns = managed_policy_arns(declared);
+        for policy_arn in declared_arns.iter().filter(|arn| !held_arns.contains(arn)) {
+            client
+                .attach_user_policy()
+                .user_name(user_name)
+                .policy_arn(policy_arn)
+                .send()
+                .await
+                .map_err(|error| refusal_of(&error))?;
+        }
+        for policy_arn in held_arns
+            .iter()
+            .filter(|arn| !declared_arns.contains(arn))
+        {
+            client
+                .detach_user_policy()
+                .user_name(user_name)
+                .policy_arn(policy_arn)
+                .send()
+                .await
+                .map_err(|error| refusal_of(&error))?;
+        }
+    }
+
+    // "Groups": a group the deployment adds the user to is a membership written, one it no
+    // longer lists is a membership removed.
+    if is_changed("Groups") {
+        let held_groups = declared_groups(held);
+        let declared_in = declared_groups(declared);
+        for group in declared_in.iter().filter(|group| !held_groups.contains(group)) {
+            client
+                .add_user_to_group()
+                .user_name(user_name)
+                .group_name(group)
+                .send()
+                .await
+                .map_err(|error| refusal_of(&error))?;
+        }
+        for group in held_groups
+            .iter()
+            .filter(|group| !declared_in.contains(group))
+        {
+            client
+                .remove_user_from_group()
+                .user_name(user_name)
+                .group_name(group)
+                .send()
+                .await
+                .map_err(|error| refusal_of(&error))?;
+        }
+    }
+
+    // The console password: declared where the user had none is a profile CREATED,
+    // declared differently is the one call that replaces a password on a user that has one
+    // (`UpdateLoginProfile`), and no longer declared is the profile DELETED — so a template
+    // that stops granting console access takes it away.
+    if is_changed("LoginProfile") {
+        match (
+            declared_login_profile(held),
+            declared_login_profile(declared),
+        ) {
+            (None, Some((password, reset_required))) => {
+                client
+                    .create_login_profile()
+                    .user_name(user_name)
+                    .password(password)
+                    .set_password_reset_required(reset_required)
+                    .send()
+                    .await
+                    .map_err(|error| refusal_of(&error))?;
+            }
+            (Some(_), Some((password, reset_required))) => {
+                client
+                    .update_login_profile()
+                    .user_name(user_name)
+                    .password(password)
+                    .set_password_reset_required(reset_required)
+                    .send()
+                    .await
+                    .map_err(|error| refusal_of(&error))?;
+            }
+            (Some(_), None) => {
+                client
+                    .delete_login_profile()
+                    .user_name(user_name)
+                    .send()
+                    .await
+                    .map_err(|error| refusal_of(&error))?;
+            }
+            (None, None) => {}
+        }
+    }
+
+    // The user is the one the stack created, under the same name: its ARN and its `UserId`
+    // are the ones the create already recorded, so this reports no attribute of its own.
+    Ok(Some(Created::default()))
+}
+
+/// The path IAM gives a user created without one ("if it is not included, it defaults to a
+/// slash", `CreateUser$Path`), which is what a user goes back to when a deployment stops
+/// declaring `Path`.
+///
+/// Read from the IAM crate, which owns that default and applies it to every entity it
+/// creates, so the two cannot drift apart.
+const DEFAULT_IAM_PATH: &str =
+    ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state::DEFAULT_PATH;
+
+/// Bring the tags of the user a resource record names to the ones this deployment gives it,
+/// through IAM's own `TagUser` and `UntagUser`.
+///
+/// The set is the declaration's own `Tags` beside the ones CloudFormation propagates
+/// ([`tags_of`]) — the same set [`create_iam_user`] applied — read back from `GetUser`,
+/// which reports a user's tags on the user itself. Where the two sets already agree nothing
+/// is called at all, which is what makes this safe to ask on every deployment. The same
+/// reconciliation [`retag_role`] makes for a role's tags.
+async fn retag_iam_user(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+    propagated: &[(String, String)],
+) -> Result<(), Refusal> {
+    let desired = tags_of(declared, propagated);
+    let client = iam_client(ctx, region);
+    let user_name = &resource.physical_resource_id;
+    let held: Vec<(String, String)> = match client.get_user().user_name(user_name).send().await {
+        Ok(answer) => answer
+            .user()
+            .map(|user| {
+                user.tags()
+                    .iter()
+                    .map(|tag| (tag.key().to_string(), tag.value().to_string()))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Err(error) => {
+            let refusal = refusal_of(&error);
+            if refusal.code == NO_SUCH_ENTITY {
+                return Ok(());
+            }
+            return Err(refusal);
+        }
+    };
+    let mut added = Vec::new();
+    for (key, value) in desired.iter().filter(|(key, value)| {
+        held.iter()
+            .find(|(held_key, _)| held_key == key)
+            .is_none_or(|(_, held_value)| held_value != value)
+    }) {
+        added.push(
+            ::aws_sdk_iam::types::Tag::builder()
+                .key(key)
+                .value(value)
+                .build()
+                .map_err(|error| Refusal {
+                    code: UNIDENTIFIED_FAILURE.to_string(),
+                    message: format!("the tag {key} cannot be sent to IAM: {error}"),
+                })?,
+        );
+    }
+    let removed: Vec<String> = held
+        .iter()
+        .filter(|(key, _)| !desired.iter().any(|(wanted, _)| wanted == key))
+        .map(|(key, _)| key.clone())
+        .collect();
+    if !added.is_empty() {
+        client
+            .tag_user()
+            .user_name(user_name)
+            .set_tags(Some(added))
+            .send()
+            .await
+            .map_err(|error| refusal_of(&error))?;
+    }
+    if !removed.is_empty() {
+        client
+            .untag_user()
+            .user_name(user_name)
+            .set_tag_keys(Some(removed))
+            .send()
+            .await
+            .map_err(|error| refusal_of(&error))?;
+    }
+    Ok(())
+}
+
+/// Delete the user a stack created. "You must delete the items attached to the user
+/// manually, or the deletion fails" (`DeleteUser`) — the console password, the inline
+/// policies, the attached managed policies and the group memberships the template declared
+/// each go first, in the order that operation's own documentation lists them. A user, a
+/// policy or a membership IAM no longer has is already in the state the delete asks for.
+async fn delete_iam_user(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<(), Refusal> {
+    let client = iam_client(ctx, region);
+    let user_name = &resource.physical_resource_id;
+    if declared_login_profile(&resource.properties).is_some() {
+        if let Err(error) = client
+            .delete_login_profile()
+            .user_name(user_name)
+            .send()
+            .await
+        {
+            tolerated_absence(&error)?;
+        }
+    }
+    for policy in inline_policies(&resource.properties) {
+        let Some(name) = policy.get("PolicyName").and_then(scalar_text) else {
+            continue;
+        };
+        if let Err(error) = client
+            .delete_user_policy()
+            .user_name(user_name)
+            .policy_name(name)
+            .send()
+            .await
+        {
+            tolerated_absence(&error)?;
+        }
+    }
+    for policy_arn in managed_policy_arns(&resource.properties) {
+        if let Err(error) = client
+            .detach_user_policy()
+            .user_name(user_name)
+            .policy_arn(policy_arn)
+            .send()
+            .await
+        {
+            tolerated_absence(&error)?;
+        }
+    }
+    for group in declared_groups(&resource.properties) {
+        if let Err(error) = client
+            .remove_user_from_group()
+            .user_name(user_name)
+            .group_name(group)
+            .send()
+            .await
+        {
+            tolerated_absence(&error)?;
+        }
+    }
+    match client.delete_user().user_name(user_name).send().await {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            let refusal = refusal_of(&error);
+            if refusal.code == NO_SUCH_ENTITY {
+                return Ok(());
+            }
+            Err(refusal)
+        }
+    }
+}
+
+/// The refusal of a delete step that the resource is already PAST: IAM no longer has the
+/// entity, the policy or the membership the step would have removed, which is the state the
+/// step asks for. Judged on IAM's own not-found CODE, never on a message, exactly as
+/// [`Provisioner::delete`] judges a resource its service no longer holds.
+fn tolerated_absence<E>(error: &E) -> Result<(), Refusal>
+where
+    E: ::aws_smithy_types::error::metadata::ProvideErrorMetadata + ::std::fmt::Display,
+{
+    let refusal = refusal_of(error);
+    if refusal.code == NO_SUCH_ENTITY {
+        return Ok(());
+    }
+    Err(refusal)
+}
+
+/// The user's configuration as IAM reports it, for drift detection.
+///
+/// A user IAM no longer holds (`NoSuchEntity`) was deleted. The one member compared is the
+/// one the resource type and `GetUser` spell identically and the create sends — `Path` — so
+/// a user moved to another path outside the stack is MODIFIED.
+async fn describe_iam_user(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let answer = match iam_client(ctx, region)
+        .get_user()
+        .user_name(physical_resource_id)
+        .send()
+        .await
+    {
+        Ok(answer) => answer,
+        Err(error) => {
+            let refusal = refusal_of(&error);
+            if refusal.code == NO_SUCH_ENTITY {
+                return Ok(None);
+            }
+            return Err(refusal);
+        }
+    };
+    let mut actual = Map::new();
+    if let Some(user) = answer.user() {
+        actual.insert("Path".to_string(), Value::String(user.path().to_string()));
+    }
+    Ok(Some(Value::Object(actual)))
 }
 
 // ---------------------------------------------------------------------------

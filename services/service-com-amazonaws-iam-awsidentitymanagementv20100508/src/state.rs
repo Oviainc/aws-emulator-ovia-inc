@@ -1027,6 +1027,33 @@ pub struct LoginProfileRecord {
     pub password_reset_required: bool,
 }
 
+/// One Organizations service-last-accessed report job the account has asked for, keyed in
+/// [`ComAmazonawsIamAwsidentitymanagementv20100508State::organizations_access_reports`] by
+/// the `JobId` the generate answered with.
+///
+/// `GenerateOrganizationsAccessReport` "generates a report for service last accessed data
+/// for Organizations" and answers only a job id: the report itself is what
+/// `GetOrganizationsAccessReport` reports, which is why the job is a stored record rather
+/// than an answer computed on the spot.
+#[derive(Debug, Clone)]
+pub struct OrganizationsAccessReportJob {
+    /// "The path of the Organizations entity (root, OU, or account)"
+    /// (`GenerateOrganizationsAccessReport$EntityPath`) the report was asked for, which
+    /// the report's own entries name.
+    pub entity_path: String,
+    /// "The identifier of the Organizations service control policy (SCP)" the request
+    /// narrowed the report to, when it named one.
+    pub organizations_policy_id: Option<String>,
+    /// "The date and time, in ISO 8601 date-time format, when the report job was created"
+    /// (`GetOrganizationsAccessReport$JobCreationDate`).
+    pub created: ::aws_smithy_types::DateTime,
+    /// The instant the generation is DUE: until it, the read reports the job
+    /// `IN_PROGRESS`; from it, `COMPLETED` with this instant as its
+    /// `JobCompletionDate`. Stored rather than slept for, so a caller that polls
+    /// straight after the generate still sees the job in flight.
+    pub completes: ::aws_smithy_types::DateTime,
+}
+
 /// One persisted server certificate: the metadata every operation reports about it,
 /// beside the PEM material a read may hand back.
 ///
@@ -1251,6 +1278,17 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// `^[\w-]+$` and the identifier is minted rather than named by a caller, so there
     /// is no case to fold and no [`name_key`] to build.
     pub delegation_requests: BTreeMap<String, DelegationRequest>,
+    /// The Organizations service-last-accessed report jobs the account has asked for,
+    /// keyed by the `JobId` [`GenerateOrganizationsAccessReport`] answered with — "the job
+    /// identifier … use this parameter in the GetOrganizationsAccessReport operation" —
+    /// which is the handle the read takes.
+    ///
+    /// `GenerateOrganizationsAccessReport` is what fills this map and
+    /// `GetOrganizationsAccessReport` what reports one entry.
+    pub organizations_access_reports: BTreeMap<String, OrganizationsAccessReportJob>,
+    /// Monotonic counter feeding
+    /// [`next_access_report_job_id`](Self::next_access_report_job_id).
+    pub organizations_access_report_seq: u64,
     /// Monotonic counter feeding
     /// [`next_saml_provider_uuid`](Self::next_saml_provider_uuid).
     pub saml_provider_uuid_seq: u64,
@@ -1337,6 +1375,8 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
             account_alias: None,
             account_properties: BTreeMap::new(),
             delegation_requests: BTreeMap::new(),
+            organizations_access_reports: BTreeMap::new(),
+            organizations_access_report_seq: 0,
             saml_provider_uuid_seq: 0,
             saml_private_key_id_seq: 0,
             user_id_seq: 0,
@@ -1420,6 +1460,26 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
     pub fn next_group_id(&mut self) -> String {
         self.group_id_seq += 1;
         unique_id(GROUP_ID_PREFIX, self.group_id_seq)
+    }
+
+    /// Mint the next access-report job's `JobId`.
+    ///
+    /// `jobIDType` is exactly 36 characters, which is the 8-4-4-4-12 grouping of 128 bits
+    /// AWS reports a job id in, so the id is built as that grouping over two bijectively
+    /// mixed words of the counter — unique for the same reason
+    /// [`next_user_id`](Self::next_user_id) is, and minted once, then stored with the job.
+    pub fn next_access_report_job_id(&mut self) -> String {
+        self.organizations_access_report_seq += 1;
+        let high = splitmix64(self.organizations_access_report_seq);
+        let low = splitmix64(self.organizations_access_report_seq ^ JOB_ID_LOW_WORD_KEY);
+        format!(
+            "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+            high >> 32,
+            (high >> 16) & 0xFFFF,
+            high & 0xFFFF,
+            low >> 48,
+            low & 0xFFFF_FFFF_FFFF
+        )
     }
 
     /// Mint the next SAML provider's `SAMLProviderUUID`.
@@ -2030,6 +2090,62 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
             create_date: held.create_date,
             password_reset_required: held.password_reset_required,
         })
+    }
+
+    /// Move the user keyed by `from_key` to `user_name` and `path`, carrying everything
+    /// the account holds ABOUT that user with it.
+    ///
+    /// `UpdateUser` "updates the name and/or the path of the specified IAM user", and
+    /// "the user's unique identifier remains the same" — which is the whole point of the
+    /// move: a user that kept its `UserId` keeps the credentials, policies, memberships
+    /// and console password it held, so every collection keyed by the user's name or
+    /// carrying its key is re-pointed rather than left behind. The user's ARN is REBUILT,
+    /// because it is derived from the path and the name ("if you change the user's name or
+    /// path, you must update the policies that refer to it" — the ARN moves with them).
+    ///
+    /// One definition, so the rename cannot leave a collection behind: a caller adds to
+    /// [`Self`] and this method is where the new collection joins the move.
+    ///
+    /// Answers `false` when `from_key` names no user, and does nothing.
+    pub fn rename_user(&mut self, from_key: &str, user_name: &str, path: &str) -> bool {
+        let Some(mut user) = self.users.remove(from_key) else {
+            return false;
+        };
+        let to_key = name_key(user_name);
+        user.arn = user_arn(path, user_name);
+        user.user_name = user_name.to_string();
+        user.path = path.to_string();
+        self.users.insert(to_key.clone(), user);
+        if let Some(policies) = self.user_inline_policies.remove(from_key) {
+            self.user_inline_policies.insert(to_key.clone(), policies);
+        }
+        if let Some(attached) = self.user_attached_policies.remove(from_key) {
+            self.user_attached_policies.insert(to_key.clone(), attached);
+        }
+        if let Some(profile) = self.login_profiles.remove(from_key) {
+            self.login_profiles.insert(to_key.clone(), profile);
+        }
+        for members in self.group_members.values_mut() {
+            if members.remove(from_key) {
+                members.insert(to_key.clone());
+            }
+        }
+        for record in self.access_keys.values_mut() {
+            if record.user_key == from_key {
+                record.user_key = to_key.clone();
+            }
+        }
+        for record in self.signing_certificates.values_mut() {
+            if record.user_key == from_key {
+                record.user_key = to_key.clone();
+            }
+        }
+        for credential in self.service_specific_credentials.values_mut() {
+            if name_key(&credential.user_name) == from_key {
+                credential.user_name = user_name.to_string();
+            }
+        }
+        true
     }
 }
 
@@ -3619,6 +3735,80 @@ pub fn policy_version_not_found(arn: &str, version_id: &str) -> String {
     format!("Policy {arn} version {version_id} does not exist or is not attachable.")
 }
 
+/// The message IAM refuses a permissions-boundary put with when the `PermissionsBoundary`
+/// ARN names no policy the boundary could be set from — the fixed text `Scope ARN: ` and
+/// ` does not exist or is not attachable.` around the ARN the request supplied.
+///
+/// What a boundary call names is a SCOPE on an entity's permissions rather than an
+/// attachment of a policy to it, and IAM words the two differently: the attachment family
+/// opens its sentence with `Policy ` ([`policy_not_attachable`]) and a boundary put with
+/// `Scope ARN: `. ONE wording, shared by both boundary puts, so a caller matching IAM's
+/// text sees one sentence whether it set the boundary of a role or of a user.
+pub fn boundary_scope_not_attachable(arn: &str) -> String {
+    format!("Scope ARN: {arn} does not exist or is not attachable.")
+}
+
+/// How IAM refuses a delete whose entity still holds an ATTACHED MANAGED policy: one
+/// fixed sentence naming the class of subordinate entity to remove, and nothing of the
+/// entity, the policy or how many there are.
+///
+/// Every delete-conflict refusal in this crate is one of the constants here, for the same
+/// reason: IAM's `DeleteConflictException` text is fixed per class of blocking dependent
+/// ("The error message describes these entities" — the CLASS, not their names), so a
+/// client branching on the sentence to decide whether to detach, to delete or to remove a
+/// membership and retry sees the same text whichever entity kind it addressed.
+pub const DELETE_CONFLICT_DETACH_POLICIES: &str =
+    "Cannot delete entity, must detach all policies first.";
+
+/// How IAM refuses a delete whose entity still EMBEDS an inline policy.
+pub const DELETE_CONFLICT_DELETE_POLICIES: &str =
+    "Cannot delete entity, must delete policies first.";
+
+/// How IAM refuses a delete blocked by an instance profile: the role is still in one, or
+/// the instance profile still holds a role. One sentence for both, because what has to
+/// change is the same binding.
+pub const DELETE_CONFLICT_REMOVE_ROLES_FROM_INSTANCE_PROFILE: &str =
+    "Cannot delete entity, must remove roles from instance profile first.";
+
+/// How IAM refuses a delete blocked by a group membership.
+pub const DELETE_CONFLICT_REMOVE_USERS_FROM_GROUP: &str =
+    "Cannot delete entity, must remove users from group first.";
+
+/// How IAM refuses a delete whose user still holds an access key.
+pub const DELETE_CONFLICT_DELETE_ACCESS_KEYS: &str =
+    "Cannot delete entity, must delete access keys first.";
+
+/// How IAM refuses a delete whose user still holds a signing certificate.
+pub const DELETE_CONFLICT_DELETE_SIGNING_CERTIFICATES: &str =
+    "Cannot delete entity, must delete signing certificates first.";
+
+/// How IAM refuses a delete whose user still has a console password.
+pub const DELETE_CONFLICT_DELETE_LOGIN_PROFILE: &str =
+    "Cannot delete entity, must delete login profile first.";
+
+/// The message IAM refuses a MANAGED policy document past its size quota with — the fixed
+/// text `Cannot exceed quota for PolicySize: ` and the quota itself.
+///
+/// A managed policy's document is measured against an ACCOUNT quota (`PolicySize`), so the
+/// refusal names that quota and nothing of the policy, exactly as every other
+/// `Cannot exceed quota for <quota>: <limit>` refusal in this crate does. An INLINE
+/// policy's document is measured against the embedding entity instead, and is worded with
+/// that entity ([`inline_policy_size_exceeded`]).
+pub fn policy_size_quota_exceeded(quota: usize) -> String {
+    format!("Cannot exceed quota for PolicySize: {quota}")
+}
+
+/// The message IAM refuses an INLINE policy document past the embedding entity's
+/// policy-size quota with — the fixed text `Maximum policy size of `, ` bytes exceeded for
+/// ` and the entity kind and name the request named.
+///
+/// The unit is `bytes`, which is IAM's own word in this refusal, and the entity is named
+/// because the quota is the ENTITY's (a user's 2048, a role's 10240, a group's 5120)
+/// rather than the account's.
+pub fn inline_policy_size_exceeded(quota: usize, entity_kind: &str, entity_name: &str) -> String {
+    format!("Maximum policy size of {quota} bytes exceeded for {entity_kind} {entity_name}")
+}
+
 /// Encode a state map key as the opaque pagination `Marker` a client echoes back.
 ///
 /// The codec is `aws_smithy_types::base64` — already in this crate's dependency
@@ -3756,6 +3946,60 @@ fn splitmix64(seq: u64) -> u64 {
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
 }
+
+/// What the LOW word of a 128-bit job id is keyed with, so the two words of one id are
+/// drawn from independent mixes of the same counter rather than repeating it
+/// ([`ComAmazonawsIamAwsidentitymanagementv20100508State::next_access_report_job_id`]).
+/// The HIGH word carries all 64 bits of the counter's bijective mix, which is what makes
+/// two distinct counter values yield two distinct ids.
+const JOB_ID_LOW_WORD_KEY: u64 = 0xA076_1D64_78BD_642F;
+
+/// How long after the request an Organizations access report's generation is due.
+///
+/// AWS publishes no duration for it — "this operation … might take a few minutes" is all
+/// `GenerateOrganizationsAccessReport` says — so the span is the emulator's own, chosen
+/// short enough for a caller to poll through and long enough that a caller reading straight
+/// after the generate still sees the job `IN_PROGRESS`, which is the state AWS answers
+/// there.
+pub const ACCESS_REPORT_GENERATION_SECONDS: i64 = 3;
+
+/// How many access-report jobs may be generating AT ONCE.
+///
+/// `ReportGenerationLimitExceededException` is "the maximum number of concurrent requests
+/// for this account are already running", which is the quota this is: a caller that asks
+/// for one report after another is refused with that modelled error rather than being
+/// allowed to start work without limit. AWS publishes no figure for it, so the bound is
+/// the emulator's own.
+pub const MAX_CONCURRENT_ACCESS_REPORT_JOBS: usize = 5;
+
+/// How many FINISHED access-report jobs the account keeps.
+///
+/// A report job is a record a caller can ask for again, so a finished one is kept — but not
+/// forever: past this many the oldest are dropped, so the store cannot grow without end on
+/// repeated generates. The emulator's own bound; AWS publishes no retention for a report.
+pub const MAX_RETAINED_ACCESS_REPORT_JOBS: usize = 100;
+
+/// The `JobStatus` an access-report job is in at `now`: `IN_PROGRESS` until its generation
+/// is due, `COMPLETED` from then on.
+///
+/// The ONE reading of that clock, so the status a read reports and the
+/// `JobCompletionDate` beside it cannot disagree.
+pub fn access_report_job_status(
+    job: &OrganizationsAccessReportJob,
+    now: ::aws_smithy_types::DateTime,
+) -> &'static str {
+    if now.as_secs_f64() < job.completes.as_secs_f64() {
+        JOB_STATUS_IN_PROGRESS
+    } else {
+        JOB_STATUS_COMPLETED
+    }
+}
+
+/// The `jobStatusType` value of a job whose generation is not due yet.
+pub const JOB_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
+
+/// The `jobStatusType` value of a job whose generation is done.
+pub const JOB_STATUS_COMPLETED: &str = "COMPLETED";
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
@@ -3954,11 +4198,58 @@ pub fn remove_tags<'a, I: IntoIterator<Item = &'a str>>(
 /// accepts a policy document (`PutUserPolicy`'s inline policy, `CreateRole`'s trust
 /// policy).
 pub fn is_policy_document(document: &str) -> bool {
-    ::serde_json::from_str::<::serde_json::Value>(document).is_ok_and(|document| {
-        document
-            .as_object()
-            .is_some_and(|document| document.contains_key("Statement"))
-    })
+    policy_document_defect(document).is_none()
+}
+
+/// WHY a value supplied where an IAM policy document is expected is not one.
+///
+/// IAM distinguishes the two, and words each with a sentence of its own
+/// ([`Self::message`]): a text that is no JSON object at all failed to PARSE, while a
+/// JSON object that carries no `Statement` parsed and described no statement. A client
+/// matching the refusal's text is what the distinction is for — the first is a
+/// serialization bug on the caller's side, the second a policy that would grant nothing —
+/// so one sentence for both would lose it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyDocumentDefect {
+    /// The value does not parse as a JSON object: it is not JSON, or it is JSON that is
+    /// not an object (a list, a number, a string), neither of which can carry the
+    /// top-level elements of the IAM JSON policy grammar.
+    Syntax,
+    /// The value IS a JSON object, and carries no `Statement` element — the one element
+    /// that grammar requires.
+    NoStatements,
+}
+
+/// The fixed sentence IAM refuses a document that does not parse as a JSON object with.
+pub const SYNTAX_ERRORS_IN_POLICY: &str = "Syntax errors in policy.";
+
+/// The fixed sentence IAM refuses a JSON object carrying no `Statement` element with.
+pub const POLICY_HAS_NO_STATEMENTS: &str = "Policy has no statements";
+
+impl PolicyDocumentDefect {
+    /// How IAM words this defect in the modelled `MalformedPolicyDocumentException`: a
+    /// FIXED sentence per defect, carrying nothing of the document and nothing of the
+    /// member that supplied it, so every operation taking a policy document refuses the
+    /// same text for the same defect.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Syntax => SYNTAX_ERRORS_IN_POLICY,
+            Self::NoStatements => POLICY_HAS_NO_STATEMENTS,
+        }
+    }
+}
+
+/// Why `document` is not an IAM policy document, or `None` when it is one.
+///
+/// The ONE reader of the rule [`is_policy_document`] states, so the refusal an operation
+/// answers and the decision it answers it on cannot drift apart.
+pub fn policy_document_defect(document: &str) -> Option<PolicyDocumentDefect> {
+    match ::serde_json::from_str::<::serde_json::Value>(document) {
+        Ok(::serde_json::Value::Object(elements)) => {
+            (!elements.contains_key("Statement")).then_some(PolicyDocumentDefect::NoStatements)
+        }
+        Ok(_) | Err(_) => Some(PolicyDocumentDefect::Syntax),
+    }
 }
 
 /// What IAM reads out of a SAML provider's metadata document.
