@@ -67,6 +67,8 @@ mod findings_archive_state;
 mod findings_feedback;
 #[path = "all/findings_statistics.rs"]
 mod findings_statistics;
+#[path = "all/free_trial_days.rs"]
+mod free_trial_days;
 #[path = "all/investigation_lifecycle.rs"]
 mod investigation_lifecycle;
 #[path = "all/investigation_listing.rs"]

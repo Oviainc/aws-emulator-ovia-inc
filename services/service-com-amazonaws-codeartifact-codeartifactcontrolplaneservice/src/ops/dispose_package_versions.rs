@@ -9,6 +9,8 @@
 //! * the addressed domain, repository and package are resolved first; one this caller does
 //!   not hold is `ResourceNotFoundException` (404), so a request that names no package is
 //!   refused rather than reported as a list of per-version failures;
+//! * an `expectedStatus` naming a state no stored version carries is `ValidationException`
+//!   (400) ahead of any of that ([`crate::state::input_package_version_status_refusal`]);
 //! * each named version is decided on its own and reported in ONE of the two modelled
 //!   maps, because this operation answers 200 with a per-version outcome rather than
 //!   failing the call: a version the package does not hold is `NOT_FOUND`, a version whose
@@ -206,6 +208,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // `expectedStatus` is modelled as the whole `PackageVersionStatus` enum, so the
+        // boundary validator admits every value a RESPONSE can report. A precondition
+        // naming a state no stored version carries can never hold, so it is a bad request
+        // rather than a per-version mismatch — refused from the shared input/report split.
+        if let Some(expected) = input.expected_status.as_deref() {
+            if let Some(refusal) = crate::state::input_package_version_status_refusal(expected) {
+                return Err(
+                    DisposePackageVersionsErrorModeled::ValidationException(refusal).into(),
+                );
+            }
+        }
 
         let mut store = state.lock();
         let Some(domain) = store.domain_mut(&input.domain, input.domain_owner.as_deref()) else {

@@ -255,6 +255,25 @@ pub const PACKAGE_VERSION_STATUS_DISPOSED: &str = "Disposed";
 /// the call that removed it and by nothing that reads a stored record.
 pub const PACKAGE_VERSION_STATUS_DELETED: &str = "Deleted";
 
+/// The `PackageVersionStatus` values a request may SUPPLY as the status of a package
+/// version — the statuses a stored version can carry, which is every modelled value
+/// except the one no record ever holds ([`PACKAGE_VERSION_STATUS_DELETED`]).
+///
+/// `PackageVersionStatus` is one enum used in both directions: a response REPORTS the
+/// state a version reached, while a request's `status`/`expectedStatus` states which
+/// stored versions it means. The report is the wider of the two, so the input set is
+/// named once here rather than re-derived per handler — see
+/// [`input_package_version_status_refusal`], which every handler taking such a member
+/// calls. (`PackageVersionStatus`' whole catalog is
+/// `crate::ops::types::PACKAGE_VERSION_STATUS_VALUES`.)
+pub const INPUT_PACKAGE_VERSION_STATUSES: &[&str] = &[
+    PACKAGE_VERSION_STATUS_ARCHIVED,
+    PACKAGE_VERSION_STATUS_DISPOSED,
+    PACKAGE_VERSION_STATUS_PUBLISHED,
+    PACKAGE_VERSION_STATUS_UNFINISHED,
+    PACKAGE_VERSION_STATUS_UNLISTED,
+];
+
 /// The `AllowPublish`/`AllowUpstream` value that permits the action.
 pub const ORIGIN_RESTRICTION_ALLOW: &str = "ALLOW";
 
@@ -2317,6 +2336,26 @@ pub fn package_group_pattern_refusal(pattern: &str) -> Option<ValidationExceptio
             pattern,
             PACKAGE_GROUP_PATTERN_REQUIREMENT,
         ),
+        reason: Some(VALIDATION_REASON_FIELD_FAILED.to_string()),
+    })
+}
+
+/// The refusal a caller-supplied package-version status owes when it is not a status a
+/// request can carry, or `None` when it is one.
+///
+/// The boundary validator admits the whole `PackageVersionStatus` enum, because the enum
+/// is also what responses report; a value outside
+/// [`INPUT_PACKAGE_VERSION_STATUSES`] names a state no stored version is ever in, so a
+/// request supplying it is a bad REQUEST — never a filter that matches nothing or a
+/// precondition that fails per version. Decided here rather than per handler: every
+/// operation that takes a status as input takes the same set.
+pub fn input_package_version_status_refusal(status: &str) -> Option<ValidationException> {
+    if INPUT_PACKAGE_VERSION_STATUSES.contains(&status) {
+        return None;
+    }
+    Some(ValidationException {
+        // The value as it ARRIVED, in the model's own casing, ahead of the fixed text.
+        message: format!("{status} is not a valid input status"),
         reason: Some(VALIDATION_REASON_FIELD_FAILED.to_string()),
     })
 }
