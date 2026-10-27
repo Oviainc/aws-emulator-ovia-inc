@@ -29,7 +29,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    ApprovalRule, ApprovalRuleEventMetadata, ApprovalRuleOverriddenEventMetadata,
+    Approval, ApprovalRule, ApprovalRuleEventMetadata, ApprovalRuleOverriddenEventMetadata,
     ApprovalRuleTemplate, ApprovalStateChangedEventMetadata, Comment, Location, MergeMetadata,
     OriginApprovalRuleTemplate, PullRequest, PullRequestCreatedEventMetadata, PullRequestEvent,
     PullRequestMergedStateChangedEventMetadata, PullRequestSourceReferenceUpdatedEventMetadata,
@@ -2602,6 +2602,26 @@ impl PullRequestRecord {
             .iter()
             .filter(|(_, state)| state.as_str() == APPROVAL_STATE_APPROVE)
             .map(|(reviewer, _)| reviewer.as_str())
+            .collect()
+    }
+
+    /// The approvals this pull request holds, as the modeled `Approval` shapes, in
+    /// reviewer order.
+    ///
+    /// An approval is one reviewer holding [`APPROVAL_STATE_APPROVE`], so only the
+    /// approvers are reported: the model documents the state an `Approval` carries
+    /// as "The state of the approval, APPROVE or REVOKE. REVOKE states are not
+    /// stored", and a reviewer whose last recorded state is a revoke holds no
+    /// approval to report. Built from the very set an approval rule's conditions
+    /// are counted against ([`Self::approvers`]), so a reader of the approvals and
+    /// a merge of the pull request cannot disagree about which ones it holds.
+    pub fn approvals_to_modeled(&self) -> Vec<Approval> {
+        self.approvers()
+            .into_iter()
+            .map(|reviewer| Approval {
+                user_arn: Some(reviewer.to_string()),
+                approval_state: Some(APPROVAL_STATE_APPROVE.to_string()),
+            })
             .collect()
     }
 

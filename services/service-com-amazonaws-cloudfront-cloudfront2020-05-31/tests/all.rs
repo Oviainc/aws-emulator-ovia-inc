@@ -103,6 +103,8 @@ mod function_publish;
 mod function_update;
 #[path = "all/invalidation_list.rs"]
 mod invalidation_list;
+#[path = "all/key_group_config_read.rs"]
+mod key_group_config_read;
 #[path = "all/key_group_lifecycle.rs"]
 mod key_group_lifecycle;
 #[path = "all/key_value_store_delete.rs"]

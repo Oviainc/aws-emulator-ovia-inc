@@ -3,15 +3,19 @@
 //! `Connector$checks` and the `Connector$status` roll-up, end to end over awsJson1_0.
 //!
 //! THE RULE under test: a connector's connectivity health is DERIVED from its own stored
-//! record. A connector whose connection attempt has concluded reports one
-//! `ConnectorCheck` per check type the record decides — `CONNECTOR_HEALTH`, which every
-//! connector runs, and the reachability check of the appliance type it connects to — each
-//! carrying a `result` the connector's `ConnectorState` decides, a `lastCheckAttempt`
-//! stamped at the instant that attempt concluded, and an `impairedSince` exactly when
-//! that result is `FAILED`; a connector whose attempt has not concluded reports no check
-//! at all. `status` is the ROLL-UP of those results: `FAILED` when any check failed,
-//! otherwise `PASSED` when any check passed, and `UNKNOWN` when no check decided
-//! anything.
+//! record, and the checks it reports are the ones whose subject is THAT connector. A
+//! connector whose connection attempt has concluded reports one `ConnectorCheck` — the
+//! reachability check of the appliance type it connects to — carrying a `result` the
+//! connector's `ConnectorState` decides, a `lastCheckAttempt` stamped at the instant that
+//! attempt concluded, and an `impairedSince` exactly when that result is `FAILED`; a
+//! connector whose attempt has not concluded reports no check at all. `status` is the
+//! ROLL-UP of those results: `FAILED` when any check failed, otherwise `PASSED` when any
+//! check passed, and `UNKNOWN` when no check decided anything.
+//!
+//! `CONNECTOR_HEALTH` is NOT one of them: the model documents it as "Aggregate health
+//! across all connectors in the environment", so its subject is the environment and it is
+//! reported once per environment (`tests/all/environment_connector_health.rs` owns that
+//! rule). This suite pins that no connector carries it as a result of its own.
 //!
 //! Where each clause comes from (`smithy_query(query="shape",
 //! shape="Connector,ConnectorCheck,CheckType,CheckResult,ConnectorState,ConnectorType")`):
@@ -24,9 +28,10 @@
 //!   connection stands, and "Amazon EVS requires an active connector to SDDC Manager or
 //!   VCF Operations Manager to monitor environment health and license compliance"
 //!   (`CreateEnvironmentConnector`) is why a caller polls it.
-//! * `CheckType` declares `CONNECTOR_HEALTH` and one reachability type per
-//!   `ConnectorType` — `VCENTER_REACHABILITY`, `SDDC_MANAGER_REACHABILITY`,
-//!   `OPERATIONS_MANAGER_REACHABILITY`.
+//! * `CheckType` declares one reachability type per `ConnectorType` —
+//!   `VCENTER_REACHABILITY`, `SDDC_MANAGER_REACHABILITY`,
+//!   `OPERATIONS_MANAGER_REACHABILITY` — beside the environment-scoped
+//!   `CONNECTOR_HEALTH`.
 //! * "The date and time of the last check attempt" (`ConnectorCheck$lastCheckAttempt`)
 //!   and "The time when connector health began to be impaired"
 //!   (`ConnectorCheck$impairedSince`).
@@ -66,15 +71,16 @@ const SECRET_ARN: &str = "arn:aws:secretsmanager:us-west-2:000000000000:secret:e
 /// A secret given as a bare name, the other form it accepts.
 const SECRET_NAME: &str = "evs/vcf-appliance-credentials";
 
-/// The check type run on every connector whatever appliance it connects to, and the
-/// reachability check type of each modelled `ConnectorType` — written out here from the
-/// model's own `CheckType` enumeration (`smithy_query(query="shape",
-/// shape="CheckType")`), so this suite states the mapping instead of reading it back out
-/// of the code under test.
-const CONNECTOR_HEALTH: &str = "CONNECTOR_HEALTH";
+/// The check type whose subject is the ENVIRONMENT and not one connector, written out
+/// here from the model's own `Check$type` documentation (`smithy_query(query="shape",
+/// shape="Check")`: "<code>CONNECTOR_HEALTH</code>: Aggregate health across all connectors
+/// in the environment"), so this suite can pin that no connector reports it.
+pub(crate) const CONNECTOR_HEALTH: &str = "CONNECTOR_HEALTH";
 
 /// The reachability check type of the appliance a connector of `connector_type` connects
-/// to. See [`CONNECTOR_HEALTH`] for where the values come from.
+/// to — written out here from the model's own `CheckType` enumeration
+/// (`smithy_query(query="shape", shape="CheckType")`), so this suite states the mapping
+/// instead of reading it back out of the code under test.
 fn reachability_check_type(connector_type: &str) -> &'static str {
     match connector_type {
         "VCENTER" => "VCENTER_REACHABILITY",
@@ -84,10 +90,10 @@ fn reachability_check_type(connector_type: &str) -> &'static str {
     }
 }
 
-/// The check types a connector of `connector_type` reports once its record has decided,
-/// in the order the service reports them.
+/// The check types a connector of `connector_type` reports once its record has decided:
+/// the reachability check of the appliance it connects to, and nothing else.
 fn expected_check_types(connector_type: &str) -> Vec<&'static str> {
-    vec![CONNECTOR_HEALTH, reachability_check_type(connector_type)]
+    vec![reachability_check_type(connector_type)]
 }
 
 /// An appliance FQDN for a connector of `connector_type`, of the modelled `ApplianceFqdn`
@@ -100,7 +106,7 @@ fn fqdn_for(connector_type: &str) -> String {
 }
 
 /// Create one connector in `environment_id` and return the record the create reported.
-async fn create_connector(
+pub(crate) async fn create_connector(
     router: &Emulator,
     case: &str,
     environment_id: &str,
@@ -178,7 +184,12 @@ fn assert_member(case: &str, reported: &Value, member: &str, expected: &Value) {
 /// Force one stored connector to `state`, so the health a record in that state decides is
 /// exercised whatever operation could put it there: no operation of this service stages a
 /// failed connection, so `CREATE_FAILED` and `UPDATE_FAILED` are reachable no other way.
-fn force_connector_state(router: &Emulator, environment_id: &str, connector_id: &str, state: &str) {
+pub(crate) fn force_connector_state(
+    router: &Emulator,
+    environment_id: &str,
+    connector_id: &str,
+    state: &str,
+) {
     let store = evs::state::service_state(&*router.engine)
         .expect("the in-memory engine carries this service's store");
     let mut store = store.lock();
@@ -230,6 +241,11 @@ fn assert_decided(case: &str, connector_type: &str, result: &str, connector: &Va
         assert!(
             CHECK_TYPES.contains(&check_type),
             "case {case:?}: {check_type:?} is no value of the modelled CheckType enum"
+        );
+        assert_ne!(
+            check_type, CONNECTOR_HEALTH,
+            "case {case:?}: {CONNECTOR_HEALTH} aggregates the environment's connectors, so \
+             no single connector reports it: {check}"
         );
         assert_eq!(
             check["result"],

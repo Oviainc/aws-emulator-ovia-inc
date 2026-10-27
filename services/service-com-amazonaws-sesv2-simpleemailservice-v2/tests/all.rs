@@ -51,6 +51,8 @@ mod list_tenants;
 mod multi_region_endpoints;
 #[path = "all/reputation_entities.rs"]
 mod reputation_entities;
+#[path = "all/request_claim.rs"]
+mod request_claim;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/suppressed_destinations.rs"]
