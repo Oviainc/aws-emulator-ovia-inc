@@ -46,6 +46,18 @@ const PAST_THE_SETTLE_SPAN: Duration =
 /// in epoch millis.
 const MILLIS_PER_MINUTE: i64 = 60_000;
 
+/// How long a sandbox carrying `timeout_minutes` stays live: the wait AWS documents in
+/// minutes, on the compressed clock this emulator reaps a sandbox on and inside the
+/// bounds that clock publishes. A record carrying no member falls back to the project
+/// build-timeout default AWS documents.
+fn live_span_millis(timeout_minutes: Option<i32>) -> i64 {
+    let minutes = i64::from(timeout_minutes.unwrap_or(state::DEFAULT_BUILD_TIMEOUT_MINUTES));
+    (minutes * MILLIS_PER_MINUTE / state::SANDBOX_IDLE_CLOCK_SCALE).clamp(
+        state::MIN_SANDBOX_IDLE_SPAN_MILLIS,
+        state::MAX_SANDBOX_IDLE_SPAN_MILLIS,
+    )
+}
+
 /// The shortest a Session Manager token may read and still be the opaque, encrypted
 /// value `SSMSession$tokenValue` documents ("An encrypted token value containing
 /// session and caller information") rather than an identifier.
@@ -213,18 +225,18 @@ fn connection_count(engine: &Arc<engine::InMemoryEngine>) -> usize {
     guard.sandbox_connections.len()
 }
 
-/// Persist a sandbox whose session went live `age_minutes` ago, carrying
+/// Persist a sandbox whose session went live `age_millis` ago, carrying
 /// `timeout_minutes` — the way `StartSandbox` persists one, but with the instants placed
-/// in the past so a wait AWS measures in minutes is observable in a test. Returns the
-/// instant its session went live at.
+/// in the past, so a test reads a sandbox of any age without waiting for one. Returns
+/// the instant its session went live at.
 fn seed_live_sandbox(
     engine: &Arc<engine::InMemoryEngine>,
     project: &str,
     id: &str,
     timeout_minutes: Option<i32>,
-    age_minutes: i64,
+    age_millis: i64,
 ) -> i64 {
-    let started = state::now_millis() - age_minutes * MILLIS_PER_MINUTE;
+    let started = state::now_millis() - age_millis;
     let requested = started - state::SANDBOX_SETTLE_MILLIS;
     let state_handle = engine.state::<CodeBuildState>();
     state_handle.lock().insert_sandbox(
@@ -416,28 +428,31 @@ async fn every_connection_to_a_live_sandbox_starts_its_own_persisted_session() {
 /// RULE: a connection's token is in force only while the sandbox session it connects to
 /// is — it stops being in force at the end of the wait `Sandbox$timeoutInMinutes`
 /// documents ("How long, in minutes, from 5 to 2160 (36 hours), for CodeBuild to wait
-/// before timing out this sandbox if it does not get marked as completed"), measured from
-/// the instant that session went live.
+/// before timing out this sandbox if it does not get marked as completed", served on the
+/// emulator's compressed sandbox clock), measured from the instant that session went
+/// live.
 ///
-/// The table spans that documented wait: its published bounds, a value between them, and
-/// the project default a sandbox carries when the member was never set.
+/// The table spans that wait: its published bounds, a value between them, and the
+/// project default a sandbox carries when the member was never set.
 #[tokio::test]
 async fn a_connection_token_is_in_force_only_while_its_sandbox_session_is() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let router = emulator_on(Arc::clone(&engine));
     create_project(&router, "ttl-proj", json!({})).await;
 
-    // (case, the sandbox's timeoutInMinutes, the minutes it has been live)
-    let cases: Vec<(&str, Option<i32>, i64)> = vec![
-        ("the documented minimum", Some(5), 1),
-        ("a value between the bounds", Some(480), 7),
-        ("the documented maximum", Some(2160), 30),
-        ("no timeout member, the project default", None, 2),
+    // (case, the sandbox's timeoutInMinutes)
+    let cases: Vec<(&str, Option<i32>)> = vec![
+        ("the documented minimum", Some(5)),
+        ("a quarter of an hour", Some(15)),
+        ("a value between the bounds", Some(480)),
+        ("the documented maximum", Some(2160)),
+        ("no timeout member, the project default", None),
     ];
 
-    for (index, (case, timeout_minutes, age_minutes)) in cases.iter().enumerate() {
+    for (index, (case, timeout_minutes)) in cases.iter().enumerate() {
         let id = format!("ttl-proj:case-{index:02}");
-        let started = seed_live_sandbox(&engine, "ttl-proj", &id, *timeout_minutes, *age_minutes);
+        // Seeded a second into its session, which every wait outlives.
+        let started = seed_live_sandbox(&engine, "ttl-proj", &id, *timeout_minutes, 1_000);
 
         let (status, body) = start_connection(&router, REGION, &id).await;
         let session = reported_session(case, status, &body);
@@ -445,23 +460,21 @@ async fn a_connection_token_is_in_force_only_while_its_sandbox_session_is() {
 
         let held = stored_connection(&engine, &session_id)
             .unwrap_or_else(|| panic!("case {case:?}: the session must be persisted"));
-        // 60 minutes is the build timeout AWS documents as a project's default, which is
-        // what a sandbox carrying no `timeoutInMinutes` falls back to.
-        let documented = i64::from(timeout_minutes.unwrap_or(60));
-        let expected_expiry = started + documented * MILLIS_PER_MINUTE;
+        let span = live_span_millis(*timeout_minutes);
+        let expected_expiry = started + span;
         assert_eq!(
             held.expires_millis, expected_expiry,
             "case {case:?}: the token must stop being in force when the session does, \
-             {documented} minutes after it went live, got {held:?}"
+             {span} ms after it went live, got {held:?}"
         );
 
         // In force right up to that instant, and never past it.
         for (moment, offset, in_force) in [
             ("as it was started", 0, true),
-            ("a minute before the session ends", -MILLIS_PER_MINUTE, true),
+            ("a second before the session ends", -1_000, true),
             ("a millisecond before the session ends", -1, true),
             ("exactly when the session ends", 0, false),
-            ("a minute after the session ends", MILLIS_PER_MINUTE, false),
+            ("a second after the session ends", 1_000, false),
         ] {
             let at = if in_force && offset == 0 {
                 held.started_millis
@@ -476,24 +489,18 @@ async fn a_connection_token_is_in_force_only_while_its_sandbox_session_is() {
             );
         }
 
-        // Past the wait the sandbox has timed out, so there is no session left to
+        // Past the wait the clock has reaped the sandbox, so there is no session left to
         // connect to at all.
-        let timed_out = format!("ttl-proj:expired-{index:02}");
-        seed_live_sandbox(
-            &engine,
-            "ttl-proj",
-            &timed_out,
-            *timeout_minutes,
-            documented + 1,
-        );
-        let (status, body) = start_connection(&router, REGION, &timed_out).await;
+        let reaped = format!("ttl-proj:reaped-{index:02}");
+        seed_live_sandbox(&engine, "ttl-proj", &reaped, *timeout_minutes, span + 1_000);
+        let (status, body) = start_connection(&router, REGION, &reaped).await;
         assert_eq!(
             status, 400,
             "case {case:?}: a sandbox past its own wait cannot be connected to, got \
              {status} with {body}"
         );
         assert!(
-            connection_ids_of(&engine, &timed_out).is_empty(),
+            connection_ids_of(&engine, &reaped).is_empty(),
             "case {case:?}: a refused connection must persist nothing"
         );
     }
@@ -534,9 +541,15 @@ async fn a_sandbox_outside_its_run_phase_cannot_be_connected_to() {
         "StopSandbox: expected 200, got {status} with {body}"
     );
 
-    // Timed out on its own, with nobody having called.
-    let timed_out = "phase-proj:timed-out".to_string();
-    seed_live_sandbox(&engine, "phase-proj", &timed_out, Some(5), 9);
+    // Reaped by the clock on its own, with nobody having called.
+    let reaped = "phase-proj:reaped".to_string();
+    seed_live_sandbox(
+        &engine,
+        "phase-proj",
+        &reaped,
+        Some(5),
+        live_span_millis(Some(5)) + 1_000,
+    );
 
     // Still in the queue: its container is not provisioned yet. Started last, so the
     // provisioning span the clock owes it has not elapsed when it is asked for below.
@@ -547,7 +560,7 @@ async fn a_sandbox_outside_its_run_phase_cannot_be_connected_to() {
         ("still in the queue", queued),
         ("stopped out of the queue", stopped_from_queue),
         ("stopped while live", stopped_while_live),
-        ("timed out on its own", timed_out),
+        ("reaped by the clock on its own", reaped),
     ];
 
     for (case, id) in &cases {

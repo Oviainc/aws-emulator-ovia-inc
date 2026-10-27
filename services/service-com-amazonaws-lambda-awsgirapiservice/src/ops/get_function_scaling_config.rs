@@ -12,9 +12,12 @@
 //! The qualifier is read exactly as the write reads it (see
 //! [`crate::state::FunctionRecord::published_qualifier`]), so the two operations agree on
 //! which qualifiers exist, and one naming none is refused the modelled 404. A qualifier
-//! that exists but holds no configuration is not an error: the function is there, so the
-//! answer reports its ARN and no scaling configuration at all, because nothing invents
-//! bounds nobody set.
+//! that exists but has had no `PutFunctionScalingConfig` call is not an error: the
+//! function is there, so the answer reports the configuration the SERVICE scales that
+//! qualifier by — a Managed Instances function is scaled from the moment it exists, so its
+//! requested configuration is the service-managed one, while a function that runs on no
+//! capacity provider is scaled by no such configuration and none is invented for it (see
+//! [`crate::state::FunctionRecord::reported_function_scaling_config`]).
 //!
 //! ## Shape of an operation
 //!
@@ -186,18 +189,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         };
 
-        // Answered out of the stored record, so a configuration that was accepted but
-        // never persisted reports nothing here. A qualifier nobody has configured carries
-        // no configuration, and none is invented for it.
-        let arn = record.published_qualifier_arn(&qualifier);
-        match record.function_scaling_configs.get(&qualifier) {
-            Some(stored) => Ok(stored.reported(arn)),
-            None => Ok(GetFunctionScalingConfigOutput {
-                function_arn: Some(arn),
-                applied_function_scaling_config: None,
-                requested_function_scaling_config: None,
-            }),
-        }
+        // Answered out of the record, so a configuration that was accepted but never
+        // persisted reports nothing here, and the bounds a qualifier nobody configured
+        // reports are the ones the service itself scales it by rather than any this call
+        // invents.
+        Ok(record.reported_function_scaling_config(&qualifier))
     }
 }
 

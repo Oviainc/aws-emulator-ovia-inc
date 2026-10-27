@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AbortMultipartUpload
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AbortMultipartUpload`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AbortMultipartUpload::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this is the DISCARD of the multipart upload loop — it resolves
+//! `(Bucket, Key, UploadId)` against the uploads `CreateMultipartUpload` recorded in this
+//! service's state ([`crate::state::MultipartUpload`]), removes that one upload with every
+//! part it held and answers the modelled 204, and refuses an upload this emulator does not
+//! have in progress under that id and key with `NoSuchUpload`.
 //!
 //! ## Shape of an operation
 //!
@@ -140,14 +137,63 @@ use super::types::*;
 // `AbortMultipartUploadError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `AbortMultipartUploadError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#AbortMultipartUpload")]
+/// This operation's output, as the wire carries it: NO body at all.
+///
+/// A successful abort answers the 204 the model binds, and an HTTP 204 response has no
+/// body. The modelled `AbortMultipartUploadOutput` cannot be used for it: the protocol
+/// leaves the body empty only for a `smithy.api#Unit` output shape
+/// (`rest_xml::serialize_output`), so the generated shape serializes an empty
+/// `<AbortMultipartUploadOutput>` document into that 204. This LOCAL shape keeps the Unit
+/// shape id — hence the empty body — the way [`crate::ops::delete_object`]'s own no-content
+/// shape does, and `with_http` carries the modelled 204, without which the status falls
+/// back to the protocol default of 200.
+///
+/// It declares no member: the only member the model binds on this output is
+/// `x-amz-request-charged`, a Requester Pays charge nothing here makes — and a request that
+/// asks to be charged is refused rather than served — so there is nothing to report.
+#[derive(Debug, Clone, Default)]
+pub struct AbortMultipartUploadNoContent;
+
+impl AbortMultipartUploadNoContent {
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static("smithy.api#Unit", "smithy.api", "Unit"),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[],
+    )
+    .with_http(::aws_smithy_schema::traits::HttpTrait::new(
+        "DELETE",
+        "/{Bucket}/{Key+}?x-id=AbortMultipartUpload",
+        Some(204u16),
+    ));
+}
+
+pub static ABORT_MULTIPART_UPLOAD_NO_CONTENT_SCHEMA: &::aws_smithy_schema::Schema =
+    &AbortMultipartUploadNoContent::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for AbortMultipartUploadNoContent {
+    fn serialize_members(
+        &self,
+        _serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        Ok(())
+    }
+}
+
+// The operation's MODELED errors — this operation declares ONE,
+// `NoSuchUpload` (`smithy_query(query="operation",operation="AbortMultipartUpload")`
+// reports `errors [NoSuchUpload (client, httpError 404)]`), widened with `extra_errors` by
+// the one shape this SERVICE models for the other address an abort can miss: the bucket
+// itself (`com.amazonaws.s3#NoSuchBucket`, "The specified bucket does not exist", HTTP
+// 404), the same widening `ListParts` and `CreateMultipartUpload` take. Without it an
+// abort against a bucket this emulator does not hold would have to claim it discarded an
+// upload of a bucket that does not exist.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#AbortMultipartUpload",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum AbortMultipartUploadErrorModeled {
+    NoSuchBucket(NoSuchBucket),
     NoSuchUpload(NoSuchUpload),
 }
 
@@ -189,12 +235,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for AbortMultipartUpload<Eng>
 {
     type Input = AbortMultipartUploadInput;
-    type Output = AbortMultipartUploadOutput;
+    type Output = AbortMultipartUploadNoContent;
     type Error = AbortMultipartUploadError;
 
     const NAME: &'static str = "AbortMultipartUpload";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::ABORT_MULTIPART_UPLOAD_INPUT_SCHEMA;
-    const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::ABORT_MULTIPART_UPLOAD_OUTPUT_SCHEMA;
+    const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = ABORT_MULTIPART_UPLOAD_NO_CONTENT_SCHEMA;
     const SUCCESS_STATUS: u16 = 204u16;
 
     async fn handle(
@@ -202,18 +248,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AbortMultipartUpload` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AbortMultipartUploadErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AbortMultipartUpload"))
+        // An abort needs nothing from the request beyond its deserialized input: the
+        // upload it discards is named by the bucket, the key and the upload id alone.
+        let _ = ctx;
+
+        // What this emulator cannot carry out faithfully, refused rather than answered
+        // with a 204 that would claim it: `RequestPayer` asks to be charged for the
+        // request, which nothing here does (`ListParts` and `UploadPart` refuse it
+        // identically), and `IfMatchInitiatedTime` is a conditional whose own
+        // documentation says it "is only supported for directory buckets" — this store
+        // holds general purpose buckets only, so honouring it is not possible and
+        // ignoring it would abort an upload the condition meant to protect.
+        if let Some(unserved) = unserved_feature(&input) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                "AbortMultipartUpload with {unserved}"
+            )));
+        }
+
+        // "If the account ID that you provide does not match the actual owner of the
+        // bucket, the request fails with the HTTP status code 403 Forbidden (access
+        // denied)" — `AbortMultipartUploadRequest$ExpectedBucketOwner`, judged the way
+        // every other operation here judges it: this emulator serves one account.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                403,
+                "Access Denied",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Without the store the upload cannot be discarded at all, and neither
+            // modelled error says that — both would be a false statement about the
+            // upload — so the documented code for a request this emulator could not carry
+            // out goes out rather than a 501, which would claim this operation is
+            // unwritten.
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INTERNAL_ERROR_CODE,
+                crate::state::INTERNAL_ERROR_STATUS,
+                "the shared S3 store is unreachable from this engine",
+            ));
+        };
+
+        // The store reports what the abort did, because it may refuse: a bucket this
+        // emulator does not hold, and an upload it has none of in progress under that id
+        // and key. Only the named upload is removed, so every other upload the bucket has
+        // in progress stays listed.
+        let outcome =
+            state
+                .lock()
+                .abort_multipart_upload(&input.bucket, &input.upload_id, &input.key);
+        let Some(outcome) = outcome else {
+            return Err(AbortMultipartUploadErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+        match outcome {
+            crate::state::UploadAbort::Discarded => {}
+            // An upload id this bucket never had in progress, one initiated for another
+            // key, and one a completion or an earlier abort already took away all name no
+            // upload — which is the single failure this operation models: "The specified
+            // multipart upload does not exist" (`NoSuchUpload`, HTTP 404).
+            crate::state::UploadAbort::NoSuchUpload => {
+                return Err(AbortMultipartUploadErrorModeled::NoSuchUpload(NoSuchUpload {}).into());
+            }
+        }
+
+        // The 204 the model binds, with no body and no bound header: the one member this
+        // operation's output can carry (`RequestCharged`) reports a Requester Pays charge
+        // nothing here makes, and a request that asked to be charged is refused above.
+        Ok(AbortMultipartUploadNoContent)
     }
+}
+
+/// The feature `input` asks for that this emulator does not serve, if any — named for the
+/// 501 that refuses it, the way `ListParts` and `UploadPart` name their own.
+fn unserved_feature(input: &AbortMultipartUploadInput) -> Option<&'static str> {
+    [
+        (input.request_payer.is_some(), "RequestPayer"),
+        (
+            input.if_match_initiated_time.is_some(),
+            "IfMatchInitiatedTime",
+        ),
+    ]
+    .into_iter()
+    .find_map(|(asked, name)| asked.then_some(name))
 }
