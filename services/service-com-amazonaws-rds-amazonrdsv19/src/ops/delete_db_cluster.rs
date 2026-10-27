@@ -226,7 +226,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = store.db_clusters.get(&key) else {
             return Err(DeleteDBClusterErrorModeled::DBClusterNotFoundFault(
                 DBClusterNotFoundFault {
-                    message: Some(format!("DBCluster {identifier} not found.")),
+                    message: Some(crate::state::db_cluster_cannot_be_accessed_message(
+                        &input.db_cluster_identifier,
+                    )),
                 },
             )
             .into());
@@ -273,12 +275,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 MAX_FINAL_DB_SNAPSHOT_IDENTIFIER_LEN,
             )
             .map_err(DeleteDBClusterError::invalid_parameter_value)?;
-            // The request is well formed and asks for a DB cluster snapshot to outlive the
-            // cluster. A DB cluster snapshot is a resource of its own and this crate holds
-            // no store for one, so the honest answer is the 501 channel: accepting the
-            // delete here would report a snapshot nothing took, and the modelled
-            // `DBClusterSnapshotAlreadyExistsFault` / `SnapshotQuotaExceededFault` could
-            // never fire. `SkipFinalSnapshot=true` — the teardown path — is served below.
+            // The request is well formed and asks for a DB cluster snapshot to OUTLIVE the
+            // cluster. Taking that final snapshot is not written yet, so the honest answer
+            // is the 501 channel: accepting the delete here would report a snapshot nothing
+            // took. The store the snapshot would be written to is the one
+            // `CreateDBClusterSnapshot` writes (`store.db_cluster_snapshots`), so this path
+            // is a stub of its own rather than a missing resource.
+            // `SkipFinalSnapshot=true` — the teardown path — is served below.
             return Err(crate::scaffolded::Scaffolded::not_implemented(
                 "DeleteDBCluster with a FinalDBSnapshotIdentifier (taking a final DB cluster \
                  snapshot)",

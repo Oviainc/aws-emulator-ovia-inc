@@ -191,7 +191,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     DescribeDBClustersError::from(
                         DescribeDBClustersErrorModeled::DBClusterNotFoundFault(
                             DBClusterNotFoundFault {
-                                message: Some(format!("DBCluster {requested} not found.")),
+                                message: Some(crate::state::db_cluster_not_found_message(
+                                    requested,
+                                )),
                             },
                         ),
                     )
