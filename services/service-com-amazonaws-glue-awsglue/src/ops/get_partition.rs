@@ -209,9 +209,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(partition) = table.partition(&input.partition_values) else {
                 return Err(GetPartitionErrorModeled::EntityNotFoundException(
                     EntityNotFoundException {
-                        message: Some(crate::state::messages::partition_not_found(
-                            &input.partition_values,
-                        )),
+                        message: Some(
+                            crate::state::messages::PARTITION_NOT_FOUND.to_string(),
+                        ),
                         from_federation_source: None,
                     },
                 )

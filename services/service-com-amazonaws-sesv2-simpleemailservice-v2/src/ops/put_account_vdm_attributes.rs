@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutAccountVdmAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutAccountVdmAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutAccountVdmAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the account-level VDM attributes this service persists with the ones the
+//! request carries: the status of the account's VDM configuration, and the Dashboard
+//! and Guardian sub-attributes. `PUT /v2/email/account/vdm` addresses the account's
+//! VDM sub-resource as a whole, so what the request states is what the account holds
+//! afterwards and a member it leaves out is cleared. `GetAccount` reads the result
+//! back from the same record. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +132,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutAccountVdmAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutAccountVdmAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutAccountVdmAttributes"))
+        // The account these attributes belong to is the one the request was signed
+        // for, and the emulator serves one, so nothing in `ctx` selects a record.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The engine is not the shared in-memory engine, so this service has no
+            // store to write to. That is not a modelled SES state: answer the
+            // scaffold's 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutAccountVdmAttributes without the shared emulator state",
+            ));
+        };
+
+        // Every member of `VdmAttributes` carries a `FeatureStatus`, which the
+        // generated input type holds as a plain string, so the value set is this
+        // handler's to enforce, with the `BadRequestException` the model binds for
+        // "the input you provided is invalid". All of them are checked BEFORE
+        // anything is persisted: a refused request leaves the account as it was.
+        let attributes = input.vdm_attributes;
+        let vdm_enabled = enum_value("VdmEnabled", attributes.vdm_enabled, FEATURE_STATUS_VALUES)?;
+        let dashboard_attributes = match attributes.dashboard_attributes {
+            // The Dashboard attributes can be carried with no status inside them,
+            // which states no engagement-metrics preference at all.
+            Some(dashboard) => Some(DashboardAttributes {
+                engagement_metrics: match dashboard.engagement_metrics {
+                    Some(status) => {
+                        Some(enum_value("EngagementMetrics", status, FEATURE_STATUS_VALUES)?)
+                    }
+                    None => None,
+                },
+            }),
+            None => None,
+        };
+        let guardian_attributes = match attributes.guardian_attributes {
+            Some(guardian) => Some(GuardianAttributes {
+                optimized_shared_delivery: match guardian.optimized_shared_delivery {
+                    Some(status) => Some(enum_value(
+                        "OptimizedSharedDelivery",
+                        status,
+                        FEATURE_STATUS_VALUES,
+                    )?),
+                    None => None,
+                },
+            }),
+            None => None,
+        };
+
+        let mut store = state.lock();
+        store.account.vdm_enabled = vdm_enabled;
+        store.account.vdm_dashboard_attributes = dashboard_attributes;
+        store.account.vdm_guardian_attributes = guardian_attributes;
+
+        // `PutAccountVdmAttributesResponse` carries no members: what was persisted
+        // is read back with `GetAccount`.
+        Ok(PutAccountVdmAttributesOutput {})
     }
 }
+
+/// `value` when it is one of `allowed`, and this operation's input error otherwise.
+///
+/// The wording is the service's shared one, lifted into this operation's error
+/// channel, so every member refuses an unmodelled value the same way.
+fn enum_value(
+    member: &str,
+    value: String,
+    allowed: &[&str],
+) -> Result<String, PutAccountVdmAttributesError> {
+    crate::state::modelled_enum_value(member, value, allowed).map_err(|message| {
+        PutAccountVdmAttributesErrorModeled::BadRequestException(BadRequestException {
+            message: Some(message),
+        })
+        .into()
+    })
+}
+

@@ -73,6 +73,8 @@ mod managed_insight_rules;
 mod metric_data;
 #[path = "all/metric_math.rs"]
 mod metric_math;
+#[path = "all/metric_stream_additional_statistics.rs"]
+mod metric_stream_additional_statistics;
 #[path = "all/metric_streams.rs"]
 mod metric_streams;
 #[path = "all/metrics_and_alarms.rs"]

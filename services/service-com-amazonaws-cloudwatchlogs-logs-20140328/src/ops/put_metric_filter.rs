@@ -228,10 +228,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // pattern."
         let pattern_regexes = crate::state::filter_pattern_regex_count(&input.filter_pattern);
         if pattern_regexes > crate::state::MAX_REGEX_PATTERNS_PER_FILTER_PATTERN {
-            return Err(invalid(format!(
-                "a single filter pattern can contain at most {} regular expression patterns",
-                crate::state::MAX_REGEX_PATTERNS_PER_FILTER_PATTERN
-            )));
+            return Err(invalid(
+                crate::state::filter_pattern_regex_quota_message(),
+            ));
         }
 
         // "A list of system fields to emit as additional dimensions in the generated

@@ -6,7 +6,9 @@
 //! status, whether member accounts are included, the reason, and when it was written —
 //! and answers with the status and reason it stored, which `GetEnrollmentStatus` reports.
 //! A call that includes member accounts writes that same status to every member account the
-//! organization holds, which `GetEnrollmentStatusesForOrganization` reports.
+//! organization holds, which `GetEnrollmentStatusesForOrganization` reports — and is refused
+//! when the caller manages no organization, because it then asks to enroll member accounts
+//! that do not exist.
 //!
 //! ## Shape of an operation
 //!
@@ -208,6 +210,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut guard = state.lock();
+
+        // `includeMemberAccounts` "Indicates whether to enroll member accounts of the
+        // organization if the account is the management account of an organization": the
+        // member accounts it enrolls exist only for a caller that manages an organization, so
+        // a caller that manages none is refused rather than answered as though an
+        // organization-wide enrollment had happened. Refused before anything is written, so
+        // the caller's own enrollment is left exactly as it was.
+        if let Some(message) = guard.include_member_accounts_rejection(input.include_member_accounts)
+        {
+            return Err(
+                UpdateEnrollmentStatusErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(message.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let now = crate::state::now_secs();
         let enrollment = &mut guard.enrollment;
         enrollment.status = input.status.clone();

@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetColumnStatisticsTaskRuns
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetColumnStatisticsTaskRuns`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetColumnStatisticsTaskRuns::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the column statistics task runs of ONE stored table: the runs
+//! [`crate::state`] holds whose covered catalog, database and table are the ones the
+//! request addressed, a page at a time. `StartColumnStatisticsTaskRun` is what records
+//! them and `GetColumnStatisticsTaskRun` reports one by its id; this is the same
+//! projection, for every run of a table.
+//!
+//! A reporting operation, so the only write it makes is the one the CLOCK already owed:
+//! the terminal status a run was due at its own instant
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::settle_due_column_statistics_task_runs`]),
+//! materialised before the runs are read so the page reports the status the clock had
+//! already reached.
 //!
 //! ## Shape of an operation
 //!
@@ -77,6 +80,13 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::ColumnStatisticsTaskRunEntry;
+
+/// The largest page `MaxResults` accepts, from the member's own range
+/// (`GetColumnStatisticsTaskRunsRequest$MaxResults`, `PageSize` range 1..1000) — and so
+/// the page size for a request that names none.
+const MAX_PAGE_SIZE: i32 = 1000;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -146,18 +156,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetColumnStatisticsTaskRuns` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetColumnStatisticsTaskRunsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetColumnStatisticsTaskRuns"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models no server fault, so an unreachable store is reported
+            // as the operation's own timeout error, the same way `GetCrawler` reports it.
+            return Err(
+                GetColumnStatisticsTaskRunsErrorModeled::OperationTimeoutException(
+                    OperationTimeoutException {
+                        message: Some("the Glue Data Catalog store is unavailable".into()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "The maximum size of the response" (`MaxResults`, range 1..1000). Absent, the
+        // page is the largest the model accepts for it; the clamp re-states that range
+        // here so the page size is never 0 even if the boundary validator ever stops
+        // enforcing it.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(MAX_PAGE_SIZE as usize)
+            .clamp(1, MAX_PAGE_SIZE as usize);
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The only write a read makes: the run statuses the clock had already made due, so
+        // the page reports the status each run had already reached.
+        store.settle_due_column_statistics_task_runs(now);
+
+        // "Retrieves information about all runs associated with the specified table":
+        // `DatabaseName` and `TableName` are `@required`, and the names are matched folded,
+        // the way the catalog stores them. A table this account has no run of has no run
+        // history to report — the operation models no miss for it, so that is an empty
+        // page rather than a refusal.
+        let database = crate::state::fold_name(&input.database_name);
+        let table = crate::state::fold_name(&input.table_name);
+        // Each matching run is paired with its ordering key ONCE, so neither the sort nor
+        // the cursor comparison below rebuilds a key per probe.
+        let mut ordered: Vec<(String, &ColumnStatisticsTaskRunEntry)> = store
+            .column_statistics_task_runs
+            .iter()
+            .filter(|run| {
+                run.catalog_id == catalog_id
+                    && run.database_name == database
+                    && run.table_name == table
+            })
+            .map(|run| (page_cursor(run), run))
+            .collect();
+        // The model states no order for this listing, so the runs are reported newest
+        // first — the order this service's other run history documents ("GetJobRuns
+        // returns the job runs in chronological order, with the newest jobs returned
+        // first") — with the run's id breaking a tie between two runs started in the same
+        // nanosecond so the order is total and the same on every call.
+        ordered.sort_by(|(left, _), (right, _)| right.cmp(left));
+
+        // The token is the ordering key of the last run of the previous page, so the page
+        // resumes at the first run strictly older than it — which stays correct across
+        // runs started or dropped between two calls, exactly as the sibling run listing's
+        // token does. A token this service never issued is DELIBERATELY a position in that
+        // order rather than a refusal, for the same reason: the cursor is a key in the
+        // listing's own order, so every string names one.
+        let start = match input.next_token.as_deref() {
+            Some(cursor) => ordered.partition_point(|(key, _)| key.as_str() >= cursor),
+            None => 0,
+        };
+        let end = start.saturating_add(page_size).min(ordered.len());
+        let page = &ordered[start..end];
+
+        // Element for element the SAME projection the single-run read serves, so a client
+        // that works from a listing is never less informed than one that re-reads each
+        // run.
+        let column_statistics_task_runs: Vec<ColumnStatisticsTaskRun> = page
+            .iter()
+            .map(|(_, run)| run.to_column_statistics_task_run())
+            .collect();
+        // The token names the last entry of the page, taken from the page itself so there
+        // is no index arithmetic to underflow on an empty page, and is absent once the
+        // page reaches the end of the listing.
+        let next_token = if end < ordered.len() {
+            page.last().map(|(key, _)| key.clone())
+        } else {
+            None
+        };
+
+        Ok(GetColumnStatisticsTaskRunsOutput {
+            column_statistics_task_runs: Some(column_statistics_task_runs),
+            next_token,
+        })
     }
+}
+
+/// One run's place in this listing, as the continuation token renders it: the shared
+/// history cursor ([`crate::state::history_page_cursor`]) over the instant this run
+/// started and its own id — the same token format the sibling run history pages by.
+///
+/// Ordering runs by this key DESCENDING is the newest-first order the page is served in,
+/// and comparing a token against it is what resumes a page — so any string a request sends
+/// names a well-defined place in that order.
+fn page_cursor(run: &ColumnStatisticsTaskRunEntry) -> String {
+    crate::state::history_page_cursor(run.start_time, &run.id)
 }
