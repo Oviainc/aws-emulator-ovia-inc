@@ -12,7 +12,8 @@
 //! forms, or capacity counts the members' documentation does not admit (an `mcuCount`
 //! outside the documented value set, auto-scaling worker and task counts that do not
 //! bound each other) is a `BadRequestException`, as is a `currentVersion` that is not the
-//! connector's or a connector that is not `RUNNING`.
+//! connector's, a connector that is not `RUNNING`, or a `connectorArn` that is not a
+//! well-formed ARN of this service.
 //!
 //! ## Shape of an operation
 //!
@@ -178,6 +179,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let mut state = store.lock();
         state.settle_due();
+
+        // A value that is not a kafkaconnect ARN at all names no connector, so
+        // it is incorrect input rather than a resource that is absent: the
+        // modelled 400, blaming the member that carried it.
+        if let Some(message) = crate::state::arn_syntax_refusal(
+            "connectorArn",
+            &input.connector_arn,
+            crate::state::ARN_SERVICE,
+        ) {
+            return Err(UpdateConnectorErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+            .into());
+        }
 
         // "For request body, specify only one parameter: either capacity or
         // connectorConfiguration" — this operation's own documentation. The

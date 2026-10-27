@@ -2,7 +2,9 @@
 
 //! @op DeleteCustomPlugin
 //! Starts the deletion of the stored plugin the ARN names: the plugin moves to `DELETING`
-//! and the clock drops it `crate::state::TRANSITION_SPAN` later. An ARN no stored plugin
+//! and the clock drops it `crate::state::TRANSITION_SPAN` later. A `customPluginArn` that
+//! is not a well-formed ARN of this service is a `BadRequestException`; a well-formed one
+//! no stored plugin
 //! carries is a `NotFoundException`. Idempotent: a repeat while the plugin is already
 //! `DELETING` answers the same state without moving the due instant.
 //!
@@ -163,6 +165,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let mut state = store.lock();
         state.settle_due();
+
+        // A value that is not a kafkaconnect ARN at all names no plugin, so it
+        // is incorrect input rather than a resource that is absent: the
+        // modelled 400, blaming the member that carried it. Refused before any
+        // state is touched, so nothing is marked for deletion.
+        if let Some(message) = crate::state::arn_syntax_refusal(
+            "customPluginArn",
+            &input.custom_plugin_arn,
+            crate::state::ARN_SERVICE,
+        ) {
+            return Err(DeleteCustomPluginErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
 
         // A regional endpoint resolves only its own region's plugins, so a
         // customPluginArn minted in another region deletes nothing and is

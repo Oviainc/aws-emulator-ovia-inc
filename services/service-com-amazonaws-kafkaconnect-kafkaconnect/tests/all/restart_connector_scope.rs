@@ -23,8 +23,8 @@
 //! The table spans what the rule generalises over: the two capacity forms a connector can
 //! be created in, a connector with and without a description, and each form
 //! `RestartConnector$onlyFailedTasks` takes (absent, false, true). The 404 table spans
-//! every form of a `connectorArn` this emulator holds no connector of, including one it
-//! held until a delete finished.
+//! every form of a WELL-FORMED `connectorArn` this emulator holds no connector of,
+//! including one it held until a delete finished.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -464,10 +464,19 @@ async fn a_restart_of_a_connector_this_emulator_does_not_hold_is_the_modelled_no
             ),
         ),
         (
-            "another service's ARN",
-            format!("arn:aws:iam::{ACCOUNT}:role/not-a-connector"),
+            "a well-formed ARN naming another of this service's resource kinds",
+            format!(
+                "arn:aws:kafkaconnect:{REGION}:{ACCOUNT}:custom-plugin/not-a-connector/{}",
+                "0".repeat(8)
+            ),
         ),
-        ("a value that is no ARN at all", "not-an-arn".to_string()),
+        (
+            "the same ARN in another account",
+            format!(
+                "arn:aws:kafkaconnect:{REGION}:123456789012:connector/never-made/{}/1",
+                "0".repeat(8)
+            ),
+        ),
         ("a connector whose delete has finished", gone.clone()),
     ];
 

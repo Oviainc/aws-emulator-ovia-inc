@@ -3,9 +3,10 @@
 //! @op ListConnectorOperations
 //! Reports one `ConnectorOperationSummary` per operation stored against the connector
 //! the request names, oldest first, paged by `maxResults` with an opaque `nextToken`, so
-//! paging through a connector's operations returns each one exactly once. A connector
-//! this emulator does not hold is a `NotFoundException`, and a token this service did not
-//! emit a `BadRequestException`.
+//! paging through a connector's operations returns each one exactly once. A well-formed
+//! `connectorArn` this emulator does not hold is a `NotFoundException`; a `connectorArn`
+//! that is not an ARN of this service, and a token this service did not
+//! emit, are both a `BadRequestException`.
 //!
 //! ## Shape of an operation
 //!
@@ -168,6 +169,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let mut state = store.lock();
         state.settle_due();
+
+        // A value that is not a kafkaconnect ARN at all names no connector, so
+        // it is incorrect input rather than a resource that is absent: the
+        // modelled 400, blaming the member that carried it.
+        if let Some(message) = crate::state::arn_syntax_refusal(
+            "connectorArn",
+            &input.connector_arn,
+            crate::state::ARN_SERVICE,
+        ) {
+            return Err(ListConnectorOperationsErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
 
         // The operations are listed OF a connector, so a `connectorArn` naming
         // no connector this region holds — one never created, or one created

@@ -808,8 +808,10 @@ async fn an_arn_naming_no_stored_operation_is_the_modelled_not_found() {
 
     // Every form of a `connectorOperationArn` this emulator holds no operation of: the ARN
     // of each of this service's other resource kinds, an operation ARN of the right shape
-    // that was never minted, the same ARN in another region and another account, an ARN of
-    // another service, and a value that is no ARN at all.
+    // that was never minted, the same ARN in another region and another account, and an
+    // operation ARN whose resource field names another kind. Every row is a WELL-FORMED
+    // kafkaconnect ARN, so each names a resource that is absent; a value that is not an
+    // ARN at all is incorrect input instead, which `arn_label_refusals` pins.
     let absent = [
         ("a connector's own ARN", connector_arn.clone()),
         ("a custom plugin's ARN", plugin_arn.clone()),
@@ -827,10 +829,9 @@ async fn an_arn_naming_no_stored_operation_is_the_modelled_not_found() {
             operation_arn.replace(ACCOUNT, "123456789012"),
         ),
         (
-            "an ARN of another service",
-            format!("arn:aws:iam::{ACCOUNT}:role/not-an-operation"),
+            "a kafkaconnect ARN of no resource kind this service mints",
+            format!("arn:aws:kafkaconnect:{REGION}:{ACCOUNT}:not-an-operation"),
         ),
-        ("no ARN at all", "not-an-arn".to_string()),
     ];
 
     for (case, arn) in &absent {

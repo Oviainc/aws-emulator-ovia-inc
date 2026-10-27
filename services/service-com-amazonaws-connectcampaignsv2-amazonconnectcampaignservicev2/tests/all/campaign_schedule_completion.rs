@@ -30,7 +30,7 @@ use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::sta
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::common::{call, error_code, router};
+use super::common::{call, error_code, router, Harness};
 
 /// Now, as seconds since the Unix epoch.
 fn unix_secs() -> f64 {
@@ -74,7 +74,10 @@ fn telephony_request(client_token: &str) -> Value {
 /// Onboard `instance` and wait out the span the clock owes its onboarding job, so the
 /// instance is a campaign target by the time this returns: `CreateCampaign` mints a
 /// campaign only for an instance whose job has SUCCEEDED.
-async fn onboard(router: &MultiServiceRouter, region: &str, instance: &str) {
+async fn onboard(router: &Harness, region: &str, instance: &str) {
+    // Onboarding resolves the `connectInstanceId` against the account's Connect
+    // instance registry, so the instance is registered there first.
+    router.register_connect_instance(region, instance);
     let (status, body) = call(
         router,
         region,

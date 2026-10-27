@@ -65,6 +65,8 @@ mod instance_communication_limits_isolation;
 mod instance_mutation_audit;
 #[path = "all/instance_onboarding.rs"]
 mod instance_onboarding;
+#[path = "all/instance_onboarding_requires_a_connect_instance.rs"]
+mod instance_onboarding_requires_a_connect_instance;
 #[path = "all/instance_onboarding_tags_and_outbound_requests.rs"]
 mod instance_onboarding_tags_and_outbound_requests;
 #[path = "all/onboarding_job_deletion.rs"]

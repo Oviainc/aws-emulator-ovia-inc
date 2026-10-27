@@ -5,7 +5,8 @@
 //! Resolves the image the request names, then mints and persists one
 //! [`crate::state::Microvm`]. The MicroVM is persisted `PENDING` with the instant its
 //! provisioning completes recorded; a later read materialises `RUNNING` once the clock
-//! has made it due.
+//! has made it due. Its `endpoint` is the address this emulator publishes the MicroVM
+//! on and answers requests at — see `crate::state::microvm_endpoint`.
 //!
 //! ## Shape of an operation
 //!
@@ -211,6 +212,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::Instant::now();
         let started_at = crate::state::now_datetime();
 
+        // `endpoint` is "the HTTPS endpoint URL for communicating with the MicroVM", so
+        // it is published on the address this emulator ANSWERS on — its own MicroVM
+        // endpoint listener, opened on first use and shared by every MicroVM of the
+        // store (`crate::state::microvm_endpoint`). Opened before the store is locked,
+        // because opening it is asynchronous.
+        let Some(endpoint_base) =
+            crate::state::microvm_endpoint::ensure_base_url(&*self.engine, &state).await
+        else {
+            return Err(endpoint_unavailable());
+        };
+
         let mut store = state.lock();
         store.materialize_due(now);
 
@@ -325,7 +337,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let microvm_id = store.next_microvm_id();
         let microvm_arn = crate::state::microvm_arn(&region, &microvm_id);
-        let endpoint = crate::state::microvm_endpoint(&region, &microvm_id);
+        let endpoint = crate::state::microvm_endpoint::endpoint_url(&endpoint_base, &microvm_id);
         store
             .microvm_arn_index
             .insert(microvm_arn.clone(), microvm_id.clone());
@@ -378,6 +390,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 fn unavailable() -> RunMicrovmError {
     RunMicrovmErrorModeled::InternalServerException(InternalServerException {
         message: Some("the MicroVM store is unavailable".to_string()),
+        retry_after_seconds: None,
+    })
+    .into()
+}
+
+/// The modelled server error for a MicroVM endpoint this emulator could not open: a
+/// MicroVM whose `endpoint` nothing answers on is not a MicroVM a client can use, so
+/// the launch is refused rather than reported with an address that serves nothing.
+fn endpoint_unavailable() -> RunMicrovmError {
+    RunMicrovmErrorModeled::InternalServerException(InternalServerException {
+        message: Some("the MicroVM endpoint could not be opened".to_string()),
         retry_after_seconds: None,
     })
     .into()

@@ -1917,6 +1917,25 @@ pub fn is_arn_for(value: &str, service: &str) -> bool {
     ::service_common::arn::is_resource_arn_of(value, service)
 }
 
+/// The message a refusal of `member` carries when the value it holds is not a
+/// well-formed ARN of `service` ([`is_arn_for`]), or `None` when it is one.
+///
+/// Every member this service documents as carrying an ARN — the ones bound to a
+/// URI path as well as the ones a request body holds — is modelled a plain
+/// `__string` with no `@pattern`, so the framework cannot refuse a value that is
+/// not an ARN at the boundary and the handler is where it has to be refused.
+///
+/// A value that is not an ARN of the service owning the resource it is meant to
+/// name names NO resource at all: that is incorrect INPUT, so it is refused on
+/// the member that carried it with [`INVALID_ARN`] — the reason this service's
+/// own recorded rejection of an ARN-typed member carries — and the modelled 400.
+/// A WELL-FORMED ARN the store holds nothing at is a different answer: the
+/// resource is absent, so that one keeps [`RESOURCE_DOES_NOT_EXIST`] and the
+/// modelled 404. One seam, so every ARN-carrying member renders the one form.
+pub fn arn_syntax_refusal(member: &str, value: &str, service: &str) -> Option<String> {
+    (!is_arn_for(value, service)).then(|| invalid_parameter_because(member, INVALID_ARN))
+}
+
 /// The name of the bucket the ARN `value` names, or `None` when `value` is not
 /// an S3 bucket ARN.
 ///

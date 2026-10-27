@@ -71,6 +71,8 @@ mod container_image_push_and_register;
 mod container_image_registry;
 #[path = "all/container_image_registry_login.rs"]
 mod container_image_registry_login;
+#[path = "all/container_service_delete.rs"]
+mod container_service_delete;
 #[path = "all/container_service_deployment.rs"]
 mod container_service_deployment;
 #[path = "all/container_service_lifecycle.rs"]
