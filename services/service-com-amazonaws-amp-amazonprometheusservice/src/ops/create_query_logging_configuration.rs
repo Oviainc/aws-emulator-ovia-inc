@@ -150,7 +150,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 CreateQueryLoggingConfigurationErrorModeled::InternalServerException(
@@ -262,7 +261,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let response = CreateQueryLoggingConfigurationOutput {
             status: crate::state::query_logging_status(&configuration),
         };
+        // A query logging configuration has no ARN of its own, so the resource this call
+        // changed is the workspace it is created for.
+        let workspace_arn = crate::state::workspace_arn(&region, &input.workspace_id);
         store.query_logging.insert(input.workspace_id, configuration);
+        // This call CHANGED this service's state, so it leaves the audit record every
+        // mutating handler of this crate leaves: the operation, the resource it changed
+        // and the access-key id the REQUEST presented — nothing of the configuration
+        // itself (see [`crate::state::record_state_change`]). The replayed `clientToken`
+        // above wrote nothing, so it records nothing.
+        crate::state::record_state_change(Self::NAME, &workspace_arn, ctx.parts());
         Ok(response)
     }
 }
