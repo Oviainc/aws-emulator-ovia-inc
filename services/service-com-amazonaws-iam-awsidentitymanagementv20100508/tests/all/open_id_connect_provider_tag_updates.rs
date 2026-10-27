@@ -45,7 +45,7 @@ use crate::user_lifecycle::{account_id, call, element, elements, error_code, rou
 /// Create the provider for `url` carrying `initial`, plus one client ID and one
 /// thumbprint so a tag call can be shown to leave the provider's other members alone,
 /// and answer the ARN it is held under.
-async fn create_provider(
+pub(crate) async fn create_provider(
     router: &MultiServiceRouter,
     url: &str,
     initial: &[(String, String)],
@@ -75,7 +75,7 @@ async fn create_provider(
 }
 
 /// One `TagOpenIDConnectProvider` call: the HTTP status and the XML body.
-async fn tag_provider(
+pub(crate) async fn tag_provider(
     router: &MultiServiceRouter,
     arn: &str,
     list: &[(String, String)],
@@ -87,7 +87,7 @@ async fn tag_provider(
 /// The tag set `GetOpenIDConnectProvider` reports for `arn`, as a map, plus the tag keys
 /// in the order the response carried them — so a duplicated key cannot hide inside a map
 /// and the reported ORDER is assertable.
-async fn stored_tags(
+pub(crate) async fn stored_tags(
     router: &MultiServiceRouter,
     arn: &str,
 ) -> (BTreeMap<String, String>, Vec<String>) {
@@ -106,7 +106,7 @@ async fn stored_tags(
 }
 
 /// Assert the reporting half reports `expected`, sorted by tag key.
-async fn assert_reads(
+pub(crate) async fn assert_reads(
     router: &MultiServiceRouter,
     case: &str,
     arn: &str,
