@@ -45,6 +45,8 @@ mod error_contract;
 mod event_api;
 #[path = "all/function_delete.rs"]
 mod function_delete;
+#[path = "all/function_list.rs"]
+mod function_list;
 #[path = "all/function_update.rs"]
 mod function_update;
 #[path = "all/functions.rs"]
