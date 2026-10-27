@@ -18,7 +18,7 @@ use bigdecimal::BigDecimal;
 
 use crate::ops::types::{
     AttributeDefinition, AttributeValue, AttributeValueUpdate, BackupDescription, BackupDetails,
-    BackupSummary, BillingModeSummary, CancellationReason, Capacity,
+    BackupSummary, BillingModeSummary, CancellationReason, Capacity, Condition,
     ConsumedCapacity, ContinuousBackupsDescription, ContributorInsightsSummary,
     ExpectedAttributeValue,
     ExportSummary,
@@ -749,6 +749,25 @@ pub struct ItemKey {
     pub sort: Option<AttributeValueKey>,
 }
 
+/// Where one item sits in the order a read of a SECONDARY INDEX walks it: the index's
+/// own key, and then the table's primary key.
+///
+/// `Ord` compares the index key first, so sorting by this orders an index's entries the
+/// way a read of that index reports them — each index partition contiguous, in index
+/// sort-key order — and the table's primary key breaks the tie, because nothing makes a
+/// secondary index's key unique and two items that share one are still two entries. It
+/// is also exactly the pair of keys an index read reports as `LastEvaluatedKey` and
+/// resumes from ([`Table::index_key_attributes`]).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct IndexItemKey {
+    /// The index's key values: the `HASH` elements it declares, then the `RANGE` ones,
+    /// each group in the order the index declared it. An index may declare several of
+    /// each ([`MAX_INDEX_PARTITION_KEYS`]), so this is a list rather than a pair.
+    pub index: Vec<AttributeValueKey>,
+    /// The primary key of the table item this entry projects.
+    pub table: ItemKey,
+}
+
 /// The role one attribute plays in a key schema, and the documented size limit that
 /// goes with it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1142,7 +1161,7 @@ impl VectorIndex {
         &self,
         table_key_schema: &[KeySchemaElement],
     ) -> Option<BTreeSet<String>> {
-        if self.projection.projection_type.as_deref().unwrap_or("ALL") == "ALL" {
+        if projects_all(&self.projection) {
             return None;
         }
         let mut names: BTreeSet<String> = self
@@ -1246,6 +1265,62 @@ impl LocalSecondaryIndex {
     }
 }
 
+/// One secondary index a READ can be served from, whichever kind it is: the key schema
+/// and the projection that decide what the index holds, and whether it is global.
+///
+/// The two stored kinds ([`GlobalSecondaryIndex`], [`LocalSecondaryIndex`]) differ in
+/// what can be done TO them — a global index has its own lifecycle and throughput — but
+/// a read of either is decided by the same three facts, so a reader resolves an
+/// `IndexName` to this once ([`Table::secondary_index`]) and never branches on the kind
+/// again.
+#[derive(Debug, Clone, Copy)]
+pub struct SecondaryIndex<'a> {
+    /// The index's own name, as the table declared it.
+    pub name: &'a str,
+    /// The key schema the index orders its entries by.
+    pub key_schema: &'a [KeySchemaElement],
+    /// Which of a covered item's attributes the index stores.
+    pub projection: &'a Projection,
+    /// Whether this is a GLOBAL secondary index. "The ConsistentRead parameter is not
+    /// supported on global secondary indexes" and a read of one "cannot fetch attributes
+    /// from the parent table" (`Scan$ConsistentRead`, `Scan$Select`), so a reader needs
+    /// to know which kind it resolved even though it walks both the same way.
+    pub global: bool,
+}
+
+impl SecondaryIndex<'_> {
+    /// Whether this index holds an entry for `item` at all ([`index_covers`]).
+    pub fn covers(&self, item: &Item) -> bool {
+        index_covers(self.key_schema, item)
+    }
+
+    /// Whether this index STORES the attribute `name` of an item it covers
+    /// ([`index_projects`]).
+    pub fn projects(&self, table_key_schema: &[KeySchemaElement], name: &str) -> bool {
+        index_projects(self.key_schema, self.projection, table_key_schema, name)
+    }
+
+    /// Whether this index projects EVERY attribute of the items it covers: "ALL - All of
+    /// the table attributes are projected into the index" (`Projection$ProjectionType`),
+    /// which is the only projection a read of every item attribute can be served from.
+    pub fn projects_all(&self) -> bool {
+        projects_all(self.projection)
+    }
+
+    /// The entry this index holds for one item it covers ([`index_entry`]).
+    pub fn entry(&self, item: &Item, table_key_schema: &[KeySchemaElement]) -> Item {
+        index_entry(self.key_schema, self.projection, table_key_schema, item)
+    }
+}
+
+/// Whether an index with this projection stores every attribute of the items it covers.
+///
+/// The default is `ALL`, which is what `CreateTable` stores for an index whose request
+/// named no `ProjectionType`, so the default is stated once here.
+fn projects_all(projection: &Projection) -> bool {
+    projection.projection_type.as_deref().unwrap_or("ALL") == "ALL"
+}
+
 /// Whether `item` reaches an index with this key schema: an item is projected into a
 /// secondary index only when it carries every attribute of the index's key schema
 /// ("Not all items will qualify: For example, a partition key cannot have any duplicate
@@ -1288,23 +1363,40 @@ fn index_projects(
                 .any(|kept| kept == name))
 }
 
-/// The bytes an index stores for one covered item: the attributes the index projects,
-/// which are the index and table key attributes plus whatever `Projection` adds.
+/// The entry an index with this key schema and projection HOLDS for one covered item:
+/// the attributes it projects and no others ([`index_projects`]).
+///
+/// One rendering for every question about that entry — what a read of the index answers,
+/// how big it is, and whether a write changed it — so the three answers cannot drift
+/// apart.
+fn index_entry(
+    key_schema: &[KeySchemaElement],
+    projection: &Projection,
+    table_key_schema: &[KeySchemaElement],
+    item: &Item,
+) -> Item {
+    if projects_all(projection) {
+        return item.clone();
+    }
+    item.iter()
+        .filter(|(name, _)| index_projects(key_schema, projection, table_key_schema, name))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect()
+}
+
+/// The bytes an index stores for one covered item: the size of the entry it holds for it
+/// ([`index_entry`]), so what an index is sized by and what a read of it reports are the
+/// same projection.
 fn index_projected_size(
     key_schema: &[KeySchemaElement],
     projection: &Projection,
     item: &Item,
     table_key_schema: &[KeySchemaElement],
 ) -> i64 {
-    if projection.projection_type.as_deref().unwrap_or("ALL") == "ALL" {
+    if projects_all(projection) {
         return item_size(item);
     }
-    let projected: Item = item
-        .iter()
-        .filter(|(name, _)| index_projects(key_schema, projection, table_key_schema, name))
-        .map(|(name, value)| (name.clone(), value.clone()))
-        .collect();
-    item_size(&projected)
+    item_size(&index_entry(key_schema, projection, table_key_schema, item))
 }
 
 /// Whether a write CHANGES what an index stores for an item it covers both before and
@@ -3935,6 +4027,132 @@ impl Table {
             .collect()
     }
 
+    /// The secondary index an `IndexName` names, whichever kind it is, or `None` when
+    /// this table declares no index by that name.
+    ///
+    /// "This index can be any local secondary index or global secondary index"
+    /// (`Scan$IndexName`), so both lists answer; an index name is unique across the two
+    /// of them, because a create refuses a name either list already holds.
+    pub fn secondary_index(&self, name: &str) -> Option<SecondaryIndex<'_>> {
+        let global = self
+            .global_secondary_indexes
+            .iter()
+            .find(|index| index.name == name)
+            .map(|index| SecondaryIndex {
+                name: index.name.as_str(),
+                key_schema: &index.key_schema,
+                projection: &index.projection,
+                global: true,
+            });
+        global.or_else(|| {
+            self.local_secondary_indexes
+                .iter()
+                .find(|index| index.name == name)
+                .map(|index| SecondaryIndex {
+                    name: index.name.as_str(),
+                    key_schema: &index.key_schema,
+                    projection: &index.projection,
+                    global: false,
+                })
+        })
+    }
+
+    /// One index key schema's elements in the order the index orders its entries by:
+    /// every `HASH` element the schema declares, then every `RANGE` one, each group in
+    /// the order the schema declared it — "HASH - partition key ... RANGE - sort key"
+    /// (`KeySchemaElement$KeyType`), and an index may declare several of each
+    /// ([`MAX_INDEX_PARTITION_KEYS`]).
+    fn index_key_elements(
+        key_schema: &[KeySchemaElement],
+    ) -> impl Iterator<Item = &KeySchemaElement> {
+        key_schema
+            .iter()
+            .filter(|element| element.key_type == "HASH")
+            .chain(key_schema.iter().filter(|element| element.key_type != "HASH"))
+    }
+
+    /// Where `item`, stored under the primary key `key`, sits in the order a read of
+    /// `index` walks it — or `None` when the index holds no entry for it.
+    ///
+    /// Every index key value was held to this table's declared type for it, to
+    /// non-emptiness and to the documented key-value limits when the item was written
+    /// ([`Self::check_index_keys`]), so encoding one cannot fail for a stored item; one
+    /// this table could not encode is not in the index, exactly as an item that leaves an
+    /// index key attribute out is not ([`index_covers`]).
+    pub fn index_item_key(
+        &self,
+        index: &SecondaryIndex<'_>,
+        key: &ItemKey,
+        item: &Item,
+    ) -> Option<IndexItemKey> {
+        let mut values = Vec::with_capacity(index.key_schema.len());
+        for element in Self::index_key_elements(index.key_schema) {
+            let name = element.attribute_name.as_str();
+            values.push(self.key_value(name, item.get(name)?).ok()?);
+        }
+        Some(IndexItemKey {
+            index: values,
+            table: key.clone(),
+        })
+    }
+
+    /// The key attributes a read of `index` reports as `LastEvaluatedKey`, and resumes
+    /// from: the index's own key attributes together with this table's, which is what
+    /// addresses one entry of a secondary index — the index key alone does not, since
+    /// nothing makes it unique.
+    pub fn index_key_attributes(&self, index: &SecondaryIndex<'_>, item: &Item) -> Item {
+        Self::index_key_elements(index.key_schema)
+            .chain(self.key_schema.iter())
+            .filter_map(|element| {
+                item.get_key_value(&element.attribute_name)
+                    .map(|(name, value)| (name.clone(), value.clone()))
+            })
+            .collect()
+    }
+
+    /// The place in `index`'s order an `ExclusiveStartKey` resumes a read from.
+    ///
+    /// A resume token is read back through the two schemas the read reported it from, so
+    /// a map that names an attribute neither declares, leaves one of them out, or carries
+    /// one with a type other than the table declared is the INVALID RESUME TOKEN it is
+    /// ([`START_KEY_INVALID_MESSAGE`]) — the same way a base-table token is
+    /// ([`Self::key_of_start_key`]).
+    pub fn index_key_of_start_key(
+        &self,
+        index: &SecondaryIndex<'_>,
+        key: &Item,
+    ) -> Result<IndexItemKey, RequestError> {
+        let named: BTreeSet<&str> = Self::index_key_elements(index.key_schema)
+            .chain(self.key_schema.iter())
+            .map(|element| element.attribute_name.as_str())
+            .collect();
+        if key.len() != named.len() || key.keys().any(|name| !named.contains(name.as_str())) {
+            return Err(KeySource::StartKey.mismatch());
+        }
+        let mut values = Vec::with_capacity(index.key_schema.len());
+        for element in Self::index_key_elements(index.key_schema) {
+            let name = element.attribute_name.as_str();
+            let value = key.get(name).ok_or_else(|| KeySource::StartKey.mismatch())?;
+            if self
+                .declared_type(name)
+                .is_some_and(|declared| declared != attribute_value_type(value))
+            {
+                return Err(KeySource::StartKey.mismatch());
+            }
+            values.push(
+                self.key_value(name, value)
+                    .map_err(|_| KeySource::StartKey.mismatch())?,
+            );
+        }
+        // The table's own half of the token is read through the one walk every
+        // `ExclusiveStartKey` is read through, over just the attributes it declares.
+        let table = self.key_of_start_key(&self.key_attributes(key))?;
+        Ok(IndexItemKey {
+            index: values,
+            table,
+        })
+    }
+
     /// The number of items stored right now.
     fn live_item_count(&self) -> i64 {
         i64::try_from(self.items.len()).unwrap_or(i64::MAX)
@@ -6276,22 +6494,6 @@ pub fn consumed_write_capacity(
         Some("INDEXES") => true,
         _ => return None,
     };
-    let breakdown = |units: &BTreeMap<String, f64>| -> Option<HashMap<String, Capacity>> {
-        (detail && !units.is_empty()).then(|| {
-            units
-                .iter()
-                .map(|(name, units)| {
-                    (
-                        name.clone(),
-                        Capacity {
-                            capacity_units: Some(*units),
-                            ..Capacity::default()
-                        },
-                    )
-                })
-                .collect()
-        })
-    };
     Some(ConsumedCapacity {
         table_name: Some(table_name.to_string()),
         capacity_units: Some(capacity.total()),
@@ -6299,9 +6501,33 @@ pub fn consumed_write_capacity(
             capacity_units: Some(capacity.table),
             ..Capacity::default()
         }),
-        local_secondary_indexes: breakdown(&capacity.local_secondary_indexes),
-        global_secondary_indexes: breakdown(&capacity.global_secondary_indexes),
+        local_secondary_indexes: detail
+            .then(|| capacity_breakdown(&capacity.local_secondary_indexes))
+            .flatten(),
+        global_secondary_indexes: detail
+            .then(|| capacity_breakdown(&capacity.global_secondary_indexes))
+            .flatten(),
         ..ConsumedCapacity::default()
+    })
+}
+
+/// One per-index `ConsumedCapacity` map, or `None` when no index of that kind was
+/// reached at all — an index an operation did not touch consumed nothing on it, so it is
+/// left out rather than reported as zero.
+fn capacity_breakdown(units: &BTreeMap<String, f64>) -> Option<HashMap<String, Capacity>> {
+    (!units.is_empty()).then(|| {
+        units
+            .iter()
+            .map(|(name, units)| {
+                (
+                    name.clone(),
+                    Capacity {
+                        capacity_units: Some(*units),
+                        ..Capacity::default()
+                    },
+                )
+            })
+            .collect()
     })
 }
 
@@ -6339,6 +6565,45 @@ pub fn size_estimate_range_gb(bytes: i64) -> Vec<f64> {
     let whole_gb = bytes.max(0) / BYTES_PER_GB;
     let lower = f64::from(u32::try_from(whole_gb).unwrap_or(u32::MAX));
     vec![lower, lower + 1.0]
+}
+
+/// The `ConsumedCapacity` a read SERVED FROM A SECONDARY INDEX reports, or `None` when
+/// the request asked for `NONE` (or did not ask at all).
+///
+/// `INDEXES` asks for "the aggregate ConsumedCapacity for the operation, together with
+/// ConsumedCapacity for each table and secondary index that was accessed" (the
+/// `ReturnConsumedCapacity` doc): a read of an index spends its units ON THAT INDEX, so
+/// the index carries the aggregate and the table's own line is zero — the read did not go
+/// to the table (`Scan$Select`: a read served from the index "reads only the index and not
+/// the table"). Which of the two per-index maps the index appears under is its kind.
+pub fn consumed_index_capacity(
+    requested: Option<&str>,
+    table_name: &str,
+    index: &SecondaryIndex<'_>,
+    units: f64,
+) -> Option<ConsumedCapacity> {
+    let detail = match requested {
+        Some("TOTAL") => false,
+        Some("INDEXES") => true,
+        _ => return None,
+    };
+    let mut per_index: BTreeMap<String, f64> = BTreeMap::new();
+    per_index.insert(index.name.to_string(), units);
+    let breakdown = detail.then(|| capacity_breakdown(&per_index)).flatten();
+    Some(ConsumedCapacity {
+        table_name: Some(table_name.to_string()),
+        capacity_units: Some(units),
+        // The read did not go to the table, so its own line is zero rather than absent:
+        // `INDEXES` asks for "each table and secondary index that was accessed", and the
+        // table that holds the index is named by every line of the breakdown.
+        table: detail.then(|| Capacity {
+            capacity_units: Some(0.0),
+            ..Capacity::default()
+        }),
+        local_secondary_indexes: (!index.global).then(|| breakdown.clone()).flatten(),
+        global_secondary_indexes: index.global.then_some(breakdown).flatten(),
+        ..ConsumedCapacity::default()
+    })
 }
 
 /// The `ConsumedCapacity` a READ that asked for it gets back, or `None` when it
@@ -6418,6 +6683,28 @@ pub const MAX_EXPRESSION_DEPTH: usize = 16;
 /// number of entries a request body can carry. Reaching it is the ordinary
 /// `ValidationException`.
 pub const MAX_UPDATE_ACTIONS: usize = MAX_EXPRESSION_TOKENS / 3;
+
+/// The most entries one LEGACY CONDITION MAP — `ScanFilter`, `QueryFilter`, `Expected`
+/// — may state.
+///
+/// The expression member each of those was replaced by is already bounded by the
+/// ceilings above, and a legacy map carries no modelled length; without this the number
+/// of comparisons one request can ask the service to evaluate FOR EVERY ITEM IT READS
+/// would be the number of entries a request body can carry. The bound is that same
+/// token ceiling read as comparisons — the shortest comparison an expression can spell
+/// takes three tokens, a name, an operator and a value — so one legacy map is held to
+/// what one expression of the documented size could state. Reaching it is the ordinary
+/// `ValidationException`.
+pub const MAX_LEGACY_CONDITIONS: usize = MAX_EXPRESSION_TOKENS / 3;
+
+/// The most values one `IN` comparison may list: "The list can contain up to 100
+/// values, separated by commas" (the Developer Guide's comparison-operator reference
+/// for `IN`).
+///
+/// One ceiling for the legacy spelling of that comparison, whose `AttributeValueList`
+/// has no modelled length, so what one `IN` entry costs per item read is a constant of
+/// the service rather than of the request body.
+pub const MAX_IN_OPERANDS: usize = 100;
 
 /// The most members one COLLECTION attribute — a set, a list or a map — may carry,
 /// whether a request sent it or an update computed it. This is the EMULATOR's own
@@ -8824,24 +9111,30 @@ pub fn write_condition_satisfied(
     }
 }
 
-/// Whether the legacy `Expected` map holds for the stored item.
+/// How the entries of a legacy condition map are combined: "AND - If all of the
+/// conditions evaluate to true ... OR - If at least one of the conditions evaluate to
+/// true" (`ConditionalOperator`), with `AND` the default — answering whether ANY entry
+/// holding is enough.
 ///
-/// "ConditionalOperator ... AND - If all of the conditions evaluate to true ... OR -
-/// If at least one of the conditions evaluate to true"; `AND` is the default.
+/// One reading for every legacy surface that carries the member (`Expected`,
+/// `ScanFilter`), so a value outside the model's enum is refused in one wording.
+pub fn conditional_operator_any(conditional_operator: Option<&str>) -> Result<bool, RequestError> {
+    match conditional_operator {
+        None | Some("AND") => Ok(false),
+        Some("OR") => Ok(true),
+        Some(other) => Err(RequestError::Validation(format!(
+            "ConditionalOperator must be AND or OR, got {other}"
+        ))),
+    }
+}
+
+/// Whether the legacy `Expected` map holds for the stored item.
 fn expected_satisfied(
     expected: &HashMap<String, ExpectedAttributeValue>,
     conditional_operator: Option<&str>,
     item: Option<&Item>,
 ) -> Result<bool, RequestError> {
-    let any = match conditional_operator {
-        None | Some("AND") => false,
-        Some("OR") => true,
-        Some(other) => {
-            return Err(RequestError::Validation(format!(
-                "ConditionalOperator must be AND or OR, got {other}"
-            )))
-        }
-    };
+    let any = conditional_operator_any(conditional_operator)?;
     let absent = Item::new();
     let item = item.unwrap_or(&absent);
     let mut satisfied = !any;
@@ -8906,42 +9199,12 @@ fn expected_entry_satisfied(
 
 /// Whether one legacy `ComparisonOperator` holds between the stored attribute and the
 /// request's `AttributeValueList`, as the `ComparisonOperator` doc defines each one.
-/// The operand count is part of that definition, so a request that gives the wrong
-/// number of them is refused rather than guessed at.
 pub fn legacy_comparison_matches(
     operator: &str,
     held: Option<&AttributeValue>,
     operands: &[AttributeValue],
 ) -> Result<bool, RequestError> {
-    let required = match operator {
-        "NULL" | "NOT_NULL" => 0,
-        "BETWEEN" => 2,
-        "IN" => usize::MAX,
-        "EQ" | "NE" | "LE" | "LT" | "GE" | "GT" | "CONTAINS" | "NOT_CONTAINS" | "BEGINS_WITH" => 1,
-        other => {
-            return Err(RequestError::Validation(format!(
-                "ComparisonOperator must be one of EQ, NE, IN, LE, LT, GE, GT, BETWEEN, NOT_NULL, \
-                 NULL, CONTAINS, NOT_CONTAINS or BEGINS_WITH, got {other}"
-            )))
-        }
-    };
-    let count_ok = if required == usize::MAX {
-        !operands.is_empty()
-    } else {
-        operands.len() == required
-    };
-    if !count_ok {
-        return Err(RequestError::Validation(format!(
-            "One or more parameter values were invalid: {operator} takes {} value(s) in \
-             AttributeValueList, got {}",
-            if required == usize::MAX {
-                "one or more".to_string()
-            } else {
-                required.to_string()
-            },
-            operands.len()
-        )));
-    }
+    check_legacy_comparison(operator, operands)?;
     Ok(match operator {
         // "NOT_NULL : the attribute exists"; "NULL : the attribute does not exist".
         "NOT_NULL" => held.is_some(),
@@ -8981,6 +9244,129 @@ pub fn legacy_comparison_matches(
             }
         }
     })
+}
+
+/// Whether one legacy comparison is one the service serves at all, and whether it was
+/// given the operands its operator takes — the facts of the REQUEST, so a reader that
+/// evaluates a legacy condition map against many items settles them once, before it
+/// reads anything.
+///
+/// The operand count is part of each operator's definition in the `ComparisonOperator`
+/// doc, so a request that gives the wrong number of them is refused rather than guessed
+/// at.
+pub fn check_legacy_comparison(
+    operator: &str,
+    operands: &[AttributeValue],
+) -> Result<(), RequestError> {
+    let required = match operator {
+        "NULL" | "NOT_NULL" => 0,
+        "BETWEEN" => 2,
+        "IN" => usize::MAX,
+        "EQ" | "NE" | "LE" | "LT" | "GE" | "GT" | "CONTAINS" | "NOT_CONTAINS" | "BEGINS_WITH" => 1,
+        other => {
+            return Err(RequestError::Validation(format!(
+                "ComparisonOperator must be one of EQ, NE, IN, LE, LT, GE, GT, BETWEEN, NOT_NULL, \
+                 NULL, CONTAINS, NOT_CONTAINS or BEGINS_WITH, got {other}"
+            )))
+        }
+    };
+    let count_ok = if required == usize::MAX {
+        !operands.is_empty()
+    } else {
+        operands.len() == required
+    };
+    if !count_ok {
+        return Err(RequestError::Validation(format!(
+            "One or more parameter values were invalid: {operator} takes {} value(s) in \
+             AttributeValueList, got {}",
+            if required == usize::MAX {
+                "one or more".to_string()
+            } else {
+                required.to_string()
+            },
+            operands.len()
+        )));
+    }
+    // The one operator whose operand count the request chooses, held to the documented
+    // ceiling on that list ([`MAX_IN_OPERANDS`]).
+    if required == usize::MAX && operands.len() > MAX_IN_OPERANDS {
+        return Err(RequestError::Validation(format!(
+            "One or more parameter values were invalid: {operator} takes at most \
+             {MAX_IN_OPERANDS} value(s) in AttributeValueList, got {}",
+            operands.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Hold a legacy condition MAP to what one request may ask the service to evaluate for
+/// every item it reads, and settle every fact of the request its entries carry: how many
+/// entries there are ([`MAX_LEGACY_CONDITIONS`]), whether each names a comparison this
+/// service serves with the operands that comparison takes
+/// ([`check_legacy_comparison`]), and whether the `ConditionalOperator` combining them is
+/// one the model declares.
+///
+/// Settled ONCE, before anything is read, so the work the evaluator below does per item
+/// is a function of this service's constants rather than of the request body.
+pub fn check_legacy_conditions(
+    conditions: &HashMap<String, Condition>,
+    conditional_operator: Option<&str>,
+) -> Result<(), RequestError> {
+    if conditions.len() > MAX_LEGACY_CONDITIONS {
+        return Err(RequestError::Validation(format!(
+            "One or more parameter values were invalid: a filter may state at most \
+             {MAX_LEGACY_CONDITIONS} conditions, got {}",
+            conditions.len()
+        )));
+    }
+    for condition in conditions.values() {
+        check_legacy_comparison(
+            &condition.comparison_operator,
+            legacy_operands(condition),
+        )?;
+    }
+    conditional_operator_any(conditional_operator)?;
+    Ok(())
+}
+
+/// The operands one entry of a legacy condition map compares against.
+pub fn legacy_operands(condition: &Condition) -> &[AttributeValue] {
+    condition
+        .attribute_value_list
+        .as_deref()
+        .unwrap_or_default()
+}
+
+/// Whether a legacy CONDITION MAP — the pre-expression filter surface (`ScanFilter`,
+/// `QueryFilter`) — selects `item`, its entries combined by `ConditionalOperator`.
+///
+/// Each entry is read by the same comparison the legacy conditional writes are read by
+/// ([`legacy_comparison_matches`]), which is what makes a `NOT_NULL` or `NULL` entry
+/// select exactly the items `attribute_exists` and `attribute_not_exists` select: both
+/// forms ask one question of one attribute, through one evaluator.
+///
+/// The walk stops as soon as the answer is settled — the first entry that fails an `AND`
+/// or holds for an `OR` — so what one item costs is bounded by the first decisive entry
+/// rather than by the whole map. Whether an entry is one this service can evaluate at all
+/// is settled before any item is read ([`check_legacy_conditions`]), so stopping early
+/// cannot hide a refusal the request had coming.
+pub fn legacy_conditions_match(
+    conditions: &HashMap<String, Condition>,
+    conditional_operator: Option<&str>,
+    item: &Item,
+) -> Result<bool, RequestError> {
+    let any = conditional_operator_any(conditional_operator)?;
+    for (name, condition) in conditions {
+        let holds = legacy_comparison_matches(
+            &condition.comparison_operator,
+            item.get(name),
+            legacy_operands(condition),
+        )?;
+        if holds == any {
+            return Ok(any);
+        }
+    }
+    Ok(!any)
 }
 
 /// The `Attributes` a write reports, by the `ReturnValues` the request asked for.
