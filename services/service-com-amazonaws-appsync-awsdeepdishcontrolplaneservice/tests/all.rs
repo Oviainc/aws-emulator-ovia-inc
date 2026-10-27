@@ -85,5 +85,7 @@ mod start_schema_merge;
 mod state_roundtrip;
 #[path = "all/tag_resource.rs"]
 mod tag_resource;
+#[path = "all/untag_resource.rs"]
+mod untag_resource;
 #[path = "all/flush_api_cache.rs"]
 mod flush_api_cache;
