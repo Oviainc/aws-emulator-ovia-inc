@@ -38,8 +38,10 @@ const MISSING_GROUP: &str = "get-profile-window-never-created";
 /// that the group serves a profile over a range that IS an interval.
 const WIDE_WINDOW: &str = "?startTime=2000-01-01T00:00:00Z&endTime=2099-01-01T00:00:00Z";
 
-/// The profile every case here posts, in the representation it is posted under.
-const PROFILE: &[u8] = br#"{"callgraph":{"A":{}},"samples":1}"#;
+/// The profile every case here posts, in the representation it is posted under. It
+/// carries the `start` a submitted profile must state, which is what `PostAgentProfile`
+/// parses out of it.
+const PROFILE: &[u8] = br#"{"start":1600000000000,"callgraph":{"A":{}},"samples":1}"#;
 const JSON: &str = "application/json";
 
 /// How a `GetProfile` request names the window it selects over.

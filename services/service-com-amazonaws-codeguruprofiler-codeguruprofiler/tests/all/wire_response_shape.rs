@@ -462,7 +462,7 @@ async fn every_timestamp_of_the_analysis_and_listing_responses_is_a_date_time_st
     );
     assert_eq!(
         harness
-            .post_agent_profile(name, br#"{"frames":["A"]}"#.to_vec())
+            .post_agent_profile(name, br#"{"start":1600000000000,"frames":["A"]}"#.to_vec())
             .await
             .status,
         204,
@@ -729,7 +729,7 @@ async fn a_create_omits_profiling_status_until_something_has_been_reported() {
         if case.post_profile {
             assert_eq!(
                 harness
-                    .post_agent_profile(name, br#"{"frames":["A"]}"#.to_vec())
+                    .post_agent_profile(name, br#"{"start":1600000000000,"frames":["A"]}"#.to_vec())
                     .await
                     .status,
                 204,
@@ -858,7 +858,7 @@ async fn an_analysis_with_nothing_to_report_omits_both_analysis_lists() {
     }
     assert_eq!(
         harness
-            .post_agent_profile(profiled, br#"{"frames":["A"]}"#.to_vec())
+            .post_agent_profile(profiled, br#"{"start":1600000000000,"frames":["A"]}"#.to_vec())
             .await
             .status,
         204,

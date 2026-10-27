@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 use aws_smithy_types::DateTime;
 use aws_smithy_types::date_time::Format;
 
-use crate::profile_times::place_receipts;
+use crate::profile_times::{place_profile, place_receipts};
 use crate::profiling_group_lifecycle::{Answer, Harness};
 
 /// 2020-06-01T00:00:00Z, the reference instant these cases place receipts around. It is a
@@ -248,13 +248,28 @@ pub(crate) async fn frame_metric_data(
         .await
 }
 
-/// A group holding one posted profile with `body` as its document, received at `at`.
-async fn group_with_profile(harness: &Harness, name: &str, body: Vec<u8>, at: i64) {
+/// A group holding one profile with `body` as its document, received at `at`.
+///
+/// `submittable` says whether `body` is a profile a caller could submit: `PostAgentProfile`
+/// parses the data it is handed and refuses data that is not an agent profile, so a case
+/// about what a READER tallies for bytes that are NO profile document places them in the
+/// store directly ([`crate::profile_times::place_profile`]) instead of posting them.
+async fn group_with_profile(
+    harness: &Harness,
+    name: &str,
+    body: Vec<u8>,
+    at: i64,
+    submittable: bool,
+) {
     assert_eq!(
         create_group(harness, name).await.status,
         201,
         "creating group {name} must succeed"
     );
+    if !submittable {
+        place_profile(harness, name, "application/json", body, at);
+        return;
+    }
     assert_eq!(
         harness
             .post_agent_profile(name, "application/json", None, body)
@@ -276,8 +291,22 @@ struct ValueCase {
     expected: f64,
 }
 
-/// A profile document, as JSON bytes.
+/// The epoch-millisecond `start` every submitted profile states: a profile states the
+/// start of the period it covers, and `PostAgentProfile` parses the submitted data and
+/// refuses a profile without it. The instant itself is immaterial to a frame metric,
+/// which is computed from the counts the document records.
+const PROFILE_START_MILLIS: i64 = 1_600_000_000_000;
+
+/// A profile document, as JSON bytes: the frames the case records, under the `start` a
+/// submitted profile carries.
 fn document(value: serde_json::Value) -> Vec<u8> {
+    let mut value = value;
+    if let Some(fields) = value.as_object_mut() {
+        fields.insert(
+            "start".to_string(),
+            serde_json::json!(PROFILE_START_MILLIS),
+        );
+    }
     serde_json::to_vec(&value).expect("a serializable document")
 }
 
@@ -457,7 +486,19 @@ async fn a_frame_metric_is_the_frames_counts_over_the_profiles_counts() {
     for (index, case) in value_cases().into_iter().enumerate() {
         let label = case.label;
         let name = format!("frame-values-{index}");
-        group_with_profile(&harness, &name, case.body.clone(), DAY_START + 60).await;
+        // A row whose bytes are no document at all cannot be POSTED — `PostAgentProfile`
+        // parses the data it is handed — so it is placed in the store directly, which is
+        // the only way such bytes get there; every other row is submitted the way an
+        // agent submits one.
+        let submittable = serde_json::from_slice::<serde_json::Value>(&case.body).is_ok();
+        group_with_profile(
+            &harness,
+            &name,
+            case.body.clone(),
+            DAY_START + 60,
+            submittable,
+        )
+        .await;
 
         let requested = frame_metric(case.frame_name, &case.thread_states);
         let answer = frame_metric_data(
@@ -569,7 +610,7 @@ async fn the_steps_are_the_aligned_windows_of_the_reported_resolution() {
     for (index, case) in resolution_cases().into_iter().enumerate() {
         let label = case.label;
         let name = format!("frame-steps-{index}");
-        group_with_profile(&harness, &name, body.clone(), DAY_START + 60).await;
+        group_with_profile(&harness, &name, body.clone(), DAY_START + 60, true).await;
 
         let mut query = format!(
             "?startTime={}&endTime={}",
@@ -819,6 +860,7 @@ async fn a_request_that_names_no_metric_still_reports_the_period_and_its_steps()
         name,
         document(serde_json::json!({ "callgraph": { "A": { "RUNNABLE": 1 } } })),
         DAY_START + 60,
+        true,
     )
     .await;
 
@@ -938,6 +980,7 @@ async fn the_reported_period_is_the_one_the_request_names() {
         name,
         document(serde_json::json!({ "callgraph": { "A": { "RUNNABLE": 1 } } })),
         DAY_START + 60,
+        true,
     )
     .await;
 
@@ -1004,6 +1047,7 @@ async fn a_period_far_from_the_epoch_is_still_a_bounded_series() {
         name,
         document(serde_json::json!({ "callgraph": { "A": { "RUNNABLE": 1 } } })),
         DAY_START + 60,
+        true,
     )
     .await;
 
@@ -1277,6 +1321,7 @@ async fn a_request_the_operation_cannot_report_on_is_refused() {
         group,
         document(serde_json::json!({ "callgraph": { "A": { "RUNNABLE": 1 } } })),
         DAY_START + 60,
+        true,
     )
     .await;
 

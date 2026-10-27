@@ -254,7 +254,12 @@ async fn a_pair_of_bounds_that_is_not_an_interval_is_refused_by_every_ranged_ope
     // and the operations have something to report rather than only an absence.
     assert_eq!(
         harness
-            .post_agent_profile(GROUP, "application/json", None, b"{\"frames\":[]}".to_vec())
+            .post_agent_profile(
+                GROUP,
+                "application/json",
+                None,
+                b"{\"start\":1600000000000,\"frames\":[]}".to_vec(),
+            )
             .await
             .status,
         204,
@@ -341,7 +346,12 @@ async fn a_refused_interval_changes_nothing_a_later_caller_sees() {
     create_group(&harness, GROUP).await;
     assert_eq!(
         harness
-            .post_agent_profile(GROUP, "application/json", None, b"{\"frames\":[]}".to_vec())
+            .post_agent_profile(
+                GROUP,
+                "application/json",
+                None,
+                b"{\"start\":1600000000000,\"frames\":[]}".to_vec(),
+            )
             .await
             .status,
         204,

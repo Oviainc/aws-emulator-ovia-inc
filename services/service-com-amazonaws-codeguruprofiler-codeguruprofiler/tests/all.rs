@@ -45,6 +45,8 @@ mod pending_aggregation;
 mod permission_writes;
 #[path = "all/policy_surface.rs"]
 mod policy_surface;
+#[path = "all/posted_profile_validation.rs"]
+mod posted_profile_validation;
 #[path = "all/principal_arn_validation.rs"]
 mod principal_arn_validation;
 #[path = "all/profile_representations.rs"]

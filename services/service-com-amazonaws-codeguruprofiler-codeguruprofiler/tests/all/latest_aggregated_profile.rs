@@ -274,7 +274,8 @@ async fn a_group_reports_the_latest_aggregated_profile_its_stored_receipts_deriv
                         &name,
                         "application/json",
                         Some(&format!("ptok-{index}-{post}")),
-                        format!("{{\"profile\":\"{name}-{post}\"}}").into_bytes(),
+                        format!("{{\"start\":1600000000000,\"profile\":\"{name}-{post}\"}}")
+                            .into_bytes(),
                     )
                     .await
                     .status,
@@ -385,7 +386,8 @@ async fn a_pending_aggregation_is_no_aggregated_profile_until_it_falls_due() {
                         &name,
                         "application/json",
                         Some(&format!("ptok-{index}-{post}")),
-                        format!("{{\"profile\":\"{post}\"}}").into_bytes(),
+                        format!("{{\"start\":1600000000000,\"profile\":\"{post}\"}}")
+                            .into_bytes(),
                     )
                     .await
                     .status,

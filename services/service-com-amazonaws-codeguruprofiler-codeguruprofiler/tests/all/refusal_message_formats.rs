@@ -169,7 +169,7 @@ impl Harness {
                 "POST",
                 &format!("/profilingGroups/{name}/agentProfile?profileToken=tok-{at}"),
                 "application/json",
-                b"{\"profile\":\"payload\"}".to_vec(),
+                b"{\"start\":1600000000000,\"profile\":\"payload\"}".to_vec(),
             )
             .await;
         assert_eq!(
@@ -815,7 +815,7 @@ async fn a_group_that_does_hold_a_profile_in_the_range_is_still_served() {
     );
     assert_eq!(
         profile.body,
-        b"{\"profile\":\"payload\"}".to_vec(),
+        b"{\"start\":1600000000000,\"profile\":\"payload\"}".to_vec(),
         "the served profile must be the bytes posted, got {}",
         String::from_utf8_lossy(&profile.body)
     );

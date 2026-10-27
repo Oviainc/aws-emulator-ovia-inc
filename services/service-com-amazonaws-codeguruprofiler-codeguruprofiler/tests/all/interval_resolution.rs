@@ -139,7 +139,12 @@ async fn the_interval_rule_compares_both_bounds_at_their_full_precision() {
     // only an absence.
     assert_eq!(
         harness
-            .post_agent_profile(GROUP, "application/json", None, b"{\"frames\":[]}".to_vec())
+            .post_agent_profile(
+                GROUP,
+                "application/json",
+                None,
+                b"{\"start\":1600000000000,\"frames\":[]}".to_vec(),
+            )
             .await
             .status,
         204,

@@ -23,7 +23,9 @@
 //! The harness is the one [`crate::profiling_group_lifecycle`] already builds, and the
 //! aggregation is let fall due through the one shared helper every suite uses.
 
-use crate::profiling_group_lifecycle::{Answer, Harness};
+use crate::profiling_group_lifecycle::{
+    Answer, Harness, PROFILE_START_MILLIS, ion_profile, json_profile,
+};
 
 /// The fixed text a 404 about absent profile DATA carries
 /// (`state::NO_PROFILES_IN_TIME_RANGE`), restated here so this suite pins the wire text
@@ -81,9 +83,24 @@ struct Row {
     /// aggregation is due.
     query: String,
     content_type: &'static str,
-    bytes: Vec<u8>,
+    /// How many bytes of padding the posted profile carries, which is what makes the rows
+    /// differ in payload size.
+    filler: usize,
     /// How many profiles the group is posted, each with its own `profileToken`.
     posts: usize,
+}
+
+impl Row {
+    /// The bytes of post `post`: a profile stating its own `start`, in the representation
+    /// this row posts under, so no two posts of a row carry the same bytes.
+    fn posted_bytes(&self, post: usize) -> Vec<u8> {
+        let start = PROFILE_START_MILLIS + i64::try_from(post).unwrap_or(0);
+        if self.content_type == "application/x-amzn-ion" {
+            ion_profile(start, self.filler)
+        } else {
+            json_profile(start, self.filler)
+        }
+    }
 }
 
 fn rows() -> Vec<Row> {
@@ -95,49 +112,49 @@ fn rows() -> Vec<Row> {
             label: "no parameters",
             query: String::new(),
             content_type: "application/json",
-            bytes: br#"{"frames":["A"]}"#.to_vec(),
+            filler: 0,
             posts: 1,
         },
         Row {
             label: "period PT5M alone",
             query: "?period=PT5M".to_string(),
             content_type: "application/json",
-            bytes: vec![b'{'],
+            filler: 1,
             posts: 1,
         },
         Row {
             label: "period PT1H alone",
             query: "?period=PT1H".to_string(),
             content_type: "application/x-amzn-ion",
-            bytes: (0..=255u8).collect(),
+            filler: 255,
             posts: 2,
         },
         Row {
             label: "period P1D alone",
             query: "?period=P1D".to_string(),
             content_type: "application/x-amzn-ion",
-            bytes: (0..4_096u32).map(|i| (i % 251) as u8).collect(),
+            filler: 4_096,
             posts: 1,
         },
         Row {
             label: "both bounds",
             query: format!("?startTime={WIDE_START}&endTime={WIDE_END}"),
             content_type: "application/json",
-            bytes: br#"{"frames":["A","B","C"]}"#.to_vec(),
+            filler: 24,
             posts: 3,
         },
         Row {
             label: "a start bound alone",
             query: format!("?startTime={WIDE_START}"),
             content_type: "application/json",
-            bytes: br#"{"frames":[]}"#.to_vec(),
+            filler: 0,
             posts: 1,
         },
         Row {
             label: "an end bound alone",
             query: format!("?endTime={WIDE_END}"),
             content_type: "application/x-amzn-ion",
-            bytes: vec![0xe0, 0x01, 0x00, 0xea],
+            filler: 0,
             posts: 2,
         },
     ]
@@ -167,8 +184,7 @@ async fn a_posted_profile_is_served_only_once_its_aggregation_is_due() {
 
         let mut last = Vec::new();
         for post in 0..row.posts {
-            let mut bytes = row.bytes.clone();
-            bytes.push(u8::try_from(post % 256).unwrap_or(0));
+            let bytes = row.posted_bytes(post);
             assert_eq!(
                 harness
                     .post_agent_profile(
@@ -278,7 +294,7 @@ async fn reading_a_pending_aggregation_changes_nothing_a_later_caller_sees() {
         201,
         "create must succeed"
     );
-    let bytes = br#"{"frames":["A"]}"#.to_vec();
+    let bytes = br#"{"start":1600000000000,"frames":["A"]}"#.to_vec();
     assert_eq!(
         harness
             .post_agent_profile(name, "application/json", None, bytes.clone())

@@ -271,7 +271,7 @@ async fn the_reported_profile_span_is_the_retained_profiles_inside_the_window() 
     let base: i64 = 1_590_969_600;
     let received_at = [base, base + 600, base + 3_600];
     for index in 0..received_at.len() {
-        let body = format!("{{\"profile\":{index}}}").into_bytes();
+        let body = format!("{{\"start\":1600000000000,\"profile\":{index}}}").into_bytes();
         assert_eq!(
             harness.post_agent_profile(name, body).await.status,
             204,
