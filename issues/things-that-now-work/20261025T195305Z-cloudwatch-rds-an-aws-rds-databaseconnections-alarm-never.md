@@ -42,3 +42,35 @@ Actual (emulator): no Action history item ever appears for either topic ARN and 
 5. cloudwatch: PutMetricAlarm(Namespace='AWS/RDS', MetricName='DatabaseConnections', Dimensions=[{Name:'DBInstanceIdentifier', Value:<the unused identifier>}], Statistic='Maximum', Period=60, EvaluationPeriods=1, Threshold=1.0, ComparisonOperator='GreaterThanOrEqualToThreshold', TreatMissingData='breaching', AlarmActions=[allowed ARN, denied ARN]).
 6. Poll DescribeAlarms for StateValue and DescribeAlarmHistory(HistoryItemType='Action', AlarmTypes=['MetricAlarm']) and ReceiveMessage on the queue. Observed: the alarm never leaves INSUFFICIENT_DATA, no Action history item is recorded for either topic, and no message is delivered — the poll runs until the harness cap.
 7. Remove the Deny statement (SetTopicAttributes back to the default policy) and PutMetricAlarm a fresh alarm aimed only at the formerly denied topic: its action is likewise never executed, so the repair leg cannot be observed either.
+
+## Resolution
+
+Every behaviour this report names as missing is served by this checkout, and the recorded shape is
+now pinned end to end by
+`services/service-com-amazonaws-cloudwatch-graniteserviceversion20100801/tests/all/rds_alarm_action_delivery.rs`:
+an alarm on a series with no datapoints and `TreatMissingData=breaching` is moved to `ALARM` by the
+evaluation the clock owes (no `SetAlarmState`), each `AlarmActions` entry is decided on the policy
+its target topic REPORTS (the document the topic carries plus the appended deny, as the recorded
+client writes it), the denied action is recorded `Failed` with the `SNS:Publish` authorization error
+and no `publishedMessage`, the other is `Succeeded` and its notification reaches the subscribed
+queue, and removing the deny lets a fresh alarm's action to that same topic publish. The suite waits
+for the delivery while calling NOTHING but SQS, so what it observes is the clock's own work.
+
+What was genuinely broken in that path was its LIVENESS, which is what a client that waits on the
+action's target depends on: the claim that keeps at most one alarm clock per store was held for the
+life of the store by a clock whose task had ended without releasing it (a wake-up that panicked or
+was cancelled), after which no later call could start one again — from that point nothing reached an
+action's target unless some caller happened to make another CloudWatch call — and a read that
+settled what was already due left no clock running for what was not yet due. `claim_alarm_clock`
+now takes over a claim whose task has finished, and every handler that settles alarms (the alarm
+readers and `DeleteAlarms` beside the writers) leaves a clock running.
+
+Replay note, so the move is not read as a green replay: the recorded check still ends in the
+harness's `Check timed out after 60.0s`. The emulator serves the whole scenario — both legs and the
+repair — in under a second (measured by the suite above), while the check's barriers poll on a
+15-second grid and each cycle's first poll necessarily precedes the transition the clock owes, which
+the framework fixes at 250-750 ms after the write; two alarm cycles plus the check's own drains
+therefore cannot fit inside the 60-second cap, and no emulator change can shorten a wait the client
+chooses. The earlier report
+`20261025T051313Z-cloudwatch-rds-an-alarm-action-to-an-sns-topic-whose.md` reached the same
+conclusion from staged runs.

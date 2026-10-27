@@ -5,7 +5,8 @@
 //! [`crate::state::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::workloads`],
 //! so `GetWorkload`, `ListWorkloads`, `UpdateWorkload` and `DeleteWorkload` all see it.
 //! A `ReviewTemplateArns` entry is resolved against the stored review templates, and the
-//! lenses (and notes) of an applied template carry over to the new workload. Every lens
+//! lenses, notes and recorded review content (the answers, and each lens review's notes
+//! and pillar notes) of an applied template carry over to the new workload. Every lens
 //! the request names is resolved against the service's lens catalog first.
 //!
 //! ## Shape of an operation
@@ -322,9 +323,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             "ArchitecturalDesign": &input.architectural_design,
             "AwsRegions": &aws_regions,
             "Description": &input.description,
+            // The discovery configuration and the Jira configuration the workload is
+            // created with are part of what a request asks for — both land in the stored
+            // workload below and both are read back by `GetWorkload` — so two requests
+            // that differ in either are DIFFERENT requests, even under one
+            // `ClientRequestToken`.
+            "DiscoveryConfig": discovery_config_fingerprint(input.discovery_config.as_ref()),
             "Environment": &input.environment,
             "Industry": &input.industry,
             "IndustryType": &input.industry_type,
+            "JiraConfiguration": jira_configuration_fingerprint(input.jira_configuration.as_ref()),
             "Lenses": &input.lenses,
             "NonAwsRegions": &non_aws_regions,
             "Notes": &input.notes,
@@ -440,6 +448,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // their product, and neither caller-chosen list length multiplies the other.
         let mut lenses = input.lenses;
         let mut notes = input.notes;
+        // The review content the applied templates contribute to the created workload,
+        // by lens alias: a template is applied to PRE-POPULATE the workload's review, so
+        // what it recorded about each of its lenses — the answers, and the notes of that
+        // lens review and its pillars — is carried over with the lens itself
+        // (`crate::state::ReviewTemplateRecord::carry_review_content_into`).
+        let mut carried: std::collections::BTreeMap<
+            String,
+            crate::state::CarriedLensReviewContent,
+        > = std::collections::BTreeMap::new();
         if !review_template_arns.is_empty() {
             let mut attached: std::collections::HashSet<String> = lenses
                 .iter()
@@ -464,6 +481,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if notes.is_none() {
                     notes = template.notes.clone();
                 }
+                template.carry_review_content_into(&mut carried);
             }
         }
 
@@ -492,7 +510,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // from the one place that rule lives
         // (`crate::state::applied_workload_lens_reviews`), as of the same instant the
         // lenses were resolved against the catalog above.
-        let lens_reviews = store.applied_workload_lens_reviews(&lenses, now);
+        let mut lens_reviews = store.applied_workload_lens_reviews(&lenses, now);
+        // The answers and the per-lens notes an applied review template pre-populated the
+        // workload's reviews with, written onto the reviews just created.
+        let answers = crate::state::apply_carried_review_content(carried, &mut lens_reviews);
 
         let workload_id = store.mint_workload_id();
         let record = crate::state::WorkloadRecord {
@@ -530,13 +551,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             applications,
             discovery_config: input.discovery_config,
             jira_configuration: input.jira_configuration,
-            // A new workload's lens reviews carry no answers yet: every question of
-            // every attached lens is UNANSWERED until one is recorded.
-            answers: std::collections::BTreeMap::new(),
+            // A new workload's lens reviews carry no answers of their own: every question
+            // of every attached lens is UNANSWERED until one is recorded — except the
+            // questions an applied review template already answered, which the template
+            // pre-populates the workload's review with (see `carried` above).
+            answers,
             // One review per associated lens, each against the version of that lens the
-            // association pinned above and with nothing written to it yet: a review also
-            // carries the notes and the Jira question selection `UpdateLensReview`
-            // records, and no caller has recorded any against a workload being created.
+            // association pinned above: a review also carries the notes an applied review
+            // template contributed and the Jira question selection `UpdateLensReview`
+            // records, which no caller has recorded against a workload being created.
             lens_review_records: lens_reviews,
             // The profiles the workload is reviewed against: the associations the
             // request's `ProfileArns` resolved to above, each pinned at the version its
@@ -583,3 +606,36 @@ fn field_validation(member: &str, constraint: &str) -> CreateWorkloadError {
 /// The member this operation requires by documentation rather than by model
 /// (`CreateWorkloadInput$ReviewOwner`).
 const REVIEW_OWNER_MEMBER: &str = "ReviewOwner";
+
+/// The request's `DiscoveryConfig` as a JSON value, for `parameter_fingerprint`: every
+/// member of `WorkloadDiscoveryConfig` in one fixed order, so two create requests
+/// fingerprint alike exactly when they ask for the same discovery configuration, and
+/// `null` for a request that carried none.
+///
+/// `WorkloadResourceDefinition` is fingerprinted AS SENT rather than as a set: the list
+/// is stored and reported back in the order the request gave it, so two orders are two
+/// different stored workloads.
+fn discovery_config_fingerprint(config: Option<&WorkloadDiscoveryConfig>) -> serde_json::Value {
+    config.map_or(serde_json::Value::Null, |config| {
+        serde_json::json!({
+            "TrustedAdvisorIntegrationStatus": &config.trusted_advisor_integration_status,
+            "WorkloadResourceDefinition": &config.workload_resource_definition,
+        })
+    })
+}
+
+/// The request's `JiraConfiguration` as a JSON value, for `parameter_fingerprint`: every
+/// member of `WorkloadJiraConfigurationInput` in one fixed order, so two create requests
+/// fingerprint alike exactly when they ask for the same Jira configuration, and `null`
+/// for a request that carried none.
+fn jira_configuration_fingerprint(
+    configuration: Option<&WorkloadJiraConfigurationInput>,
+) -> serde_json::Value {
+    configuration.map_or(serde_json::Value::Null, |configuration| {
+        serde_json::json!({
+            "IssueManagementStatus": &configuration.issue_management_status,
+            "IssueManagementType": &configuration.issue_management_type,
+            "JiraProjectKey": &configuration.jira_project_key,
+        })
+    })
+}

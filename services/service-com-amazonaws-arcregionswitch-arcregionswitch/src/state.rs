@@ -34,8 +34,8 @@ use std::time::{Duration, SystemTime};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    AbbreviatedExecution, AbbreviatedPlan, ExecutionBlockConfiguration, ExecutionEvent, Plan,
-    Route53HealthCheck, Step, StepState,
+    AbbreviatedExecution, AbbreviatedPlan, ExecutionBlockConfiguration, ExecutionEvent,
+    MinimalWorkflow, Plan, ResourceWarning, Route53HealthCheck, Step, StepState,
 };
 
 /// How long after the call that starts one the clock owes an execution its NEXT
@@ -161,6 +161,24 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// been observed for it: `unknown` is the modelled value for exactly that. Reporting
 /// `healthy` or `unhealthy` would claim an observation nothing made.
 pub const HEALTH_CHECK_STATUS_UNKNOWN: &str = "unknown";
+
+/// The `EvaluationStatus` of a plan whose stored configuration raised no warning, from
+/// the model's `EvaluationStatus` enum
+/// (`smithy_query(query="shape", shape="EvaluationStatus", model_path="services/service-com-amazonaws-arcregionswitch-arcregionswitch/smithy-model/com-amazonaws-arcregionswitch-arcregionswitch.json")`).
+pub const EVALUATION_PASSED: &str = "passed";
+
+/// The `EvaluationStatus` of a plan carrying at least one active warning: part of the
+/// plan has to be corrected before a switch can shift traffic.
+pub const EVALUATION_ACTION_REQUIRED: &str = "actionRequired";
+
+/// The `ResourceWarningStatus` of a warning the plan's CURRENT version still raises,
+/// from the model's `ResourceWarningStatus` enum
+/// (`smithy_query(query="shape", shape="ResourceWarningStatus", model_path="services/service-com-amazonaws-arcregionswitch-arcregionswitch/smithy-model/com-amazonaws-arcregionswitch-arcregionswitch.json")`).
+///
+/// Every warning this emulator reports is derived from the stored plan, so a warning the
+/// configuration no longer raises is not reported at all; `resolved` would claim a
+/// history of warnings that nothing records.
+pub const WARNING_STATUS_ACTIVE: &str = "active";
 
 /// The most plans this emulator stores. Not an AWS quota — AWS publishes its own, which
 /// this does not claim to reproduce — but the ceiling that keeps an unauthenticated
@@ -394,6 +412,287 @@ impl StoredPlan {
             )
             .collect()
     }
+
+    /// The plan's current evaluation warnings, as `GetPlanEvaluationStatus` reports them:
+    /// one active [`ResourceWarning`] for every workflow step whose execution block leaves
+    /// one of the plan's Regions unconfigured, and one for every regional resource it
+    /// configures in a Region the plan does not cover.
+    ///
+    /// A plan covers exactly two Regions (`regions` is `@length(min: 2, max: 2)`) and a
+    /// switch shifts traffic between them in either direction, so a step that drives
+    /// regional resources needs one configured in EACH of them. Every execution block that
+    /// drives such resources says which Region each one is for — a Region-keyed map
+    /// (`RegionAuroraClusterMap`, `RdsDbInstanceArnMap`, `RegionEventSourceMappingMap`,
+    /// `RegionSsmDocumentMap`, `RegionAndRoutingControls`, `RegionAuroraInstanceArnMap`), a
+    /// resource ARN whose fourth segment is its Region, or a record set's own `region` —
+    /// and several of those maps are modelled `@length(min: 1)`, so a configuration naming
+    /// only one of the two Regions passes validation and is exactly what an evaluation has
+    /// to flag. A block that drives nothing regional (a manual approval, a nested plan) has
+    /// no Region to leave out and raises nothing.
+    ///
+    /// The warnings are derived from the stored plan on every read, so they are a function
+    /// of the record: [`ResourceWarning::version`] is the plan version they were derived
+    /// from and `warningUpdatedTime` is when that version was written, which is when the
+    /// configuration last changed.
+    pub fn evaluation_warnings(&self) -> Vec<ResourceWarning> {
+        let version = self.version();
+        let updated_at = self.plan.updated_at.unwrap_or(DateTime::from_secs(0));
+        let covered: BTreeSet<&str> = self.plan.regions.iter().map(String::as_str).collect();
+        let regions = self.plan.regions.join(", ");
+        let mut warnings = Vec::new();
+        for workflow in &self.plan.workflows {
+            // A stored workflow carries no `name` member, so the warning names it the only
+            // two ways the record can: the action it performs and its own description.
+            let origin = MinimalWorkflow {
+                action: Some(workflow.workflow_target_action.clone()),
+                name: workflow.workflow_description.clone(),
+            };
+            for step in flattened_steps(workflow.steps.as_deref().unwrap_or_default()) {
+                let resources = regional_resources(&step.execution_block_configuration);
+                if resources.is_empty() {
+                    continue;
+                }
+                let block = &step.execution_block_type;
+                let named: BTreeSet<&str> =
+                    resources.iter().map(|r| r.region.as_str()).collect();
+                for region in &self.plan.regions {
+                    if named.contains(region.as_str()) {
+                        continue;
+                    }
+                    warnings.push(ResourceWarning {
+                        workflow: Some(origin.clone()),
+                        version: version.clone(),
+                        step_name: Some(step.name.clone()),
+                        resource_arn: None,
+                        warning_status: WARNING_STATUS_ACTIVE.to_string(),
+                        warning_updated_time: updated_at,
+                        warning_message: format!(
+                            "The {block} execution block of step {} configures no resource in \
+                             {region}. A Region switch shifts traffic between both of the \
+                             plan's Regions ({regions}), so the step needs a resource \
+                             configured in each of them.",
+                            step.name
+                        ),
+                    });
+                }
+                for resource in resources.iter().filter(|r| !covered.contains(r.region.as_str()))
+                {
+                    let subject = match resource.arn.as_deref() {
+                        Some(arn) => format!("the resource {arn}"),
+                        None => "a resource".to_string(),
+                    };
+                    warnings.push(ResourceWarning {
+                        workflow: Some(origin.clone()),
+                        version: version.clone(),
+                        step_name: Some(step.name.clone()),
+                        resource_arn: resource.arn.clone(),
+                        warning_status: WARNING_STATUS_ACTIVE.to_string(),
+                        warning_updated_time: updated_at,
+                        warning_message: format!(
+                            "The {block} execution block of step {} configures {subject} in {}, \
+                             which is not one of the plan's Regions ({regions}).",
+                            step.name, resource.region
+                        ),
+                    });
+                }
+            }
+        }
+        warnings
+    }
+}
+
+/// The `EvaluationStatus` of a plan whose evaluation produced `warnings`: a plan with an
+/// active warning needs a correction, and one with none passed.
+///
+/// It is decided from EVERY warning of the plan, never from one page of them.
+pub fn evaluation_state(warnings: &[ResourceWarning]) -> String {
+    if warnings
+        .iter()
+        .any(|warning| warning.warning_status == WARNING_STATUS_ACTIVE)
+    {
+        EVALUATION_ACTION_REQUIRED.to_string()
+    } else {
+        EVALUATION_PASSED.to_string()
+    }
+}
+
+/// One regional resource an execution block configures: the Region it is configured for,
+/// and the ARN identifying it when the configuration records one.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct RegionalResource {
+    region: String,
+    arn: Option<String>,
+}
+
+impl RegionalResource {
+    /// The resource an ARN names, or `None` when the ARN names no Region — a global
+    /// resource (an IAM role, a Region switch plan) is not configured for a Region, so it
+    /// is not evidence that any Region is covered.
+    fn of_arn(arn: &str) -> Option<Self> {
+        Some(Self {
+            region: arn_region(arn)?.to_string(),
+            arn: Some(arn.to_string()),
+        })
+    }
+
+    /// The resource a Region-keyed configuration entry names: the Region is the key the
+    /// configuration files it under, whatever Region its own ARN names.
+    fn of_region(region: &str, arn: Option<&str>) -> Self {
+        Self {
+            region: region.to_string(),
+            arn: arn.map(str::to_string),
+        }
+    }
+}
+
+/// The Region an ARN names, or `None` when its Region segment is empty.
+///
+/// An ARN is `arn:<partition>:<service>:<region>:<account>:<resource>`, so the Region is
+/// its fourth colon-separated segment; a global resource leaves that segment empty.
+fn arn_region(arn: &str) -> Option<&str> {
+    arn.split(':').nth(3).filter(|region| !region.is_empty())
+}
+
+/// The regional resources one execution block configures, sorted and deduplicated so the
+/// warnings derived from them are in the same order on every read (several of the
+/// configurations hold their entries in a hash map).
+///
+/// A block that drives nothing regional yields none: a manual approval waits inside this
+/// service, a nested Region switch plan is named by a Region-less ARN, and a parallel
+/// block holds only the steps walked separately by [`flattened_steps`].
+fn regional_resources(config: &ExecutionBlockConfiguration) -> Vec<RegionalResource> {
+    let mut resources: Vec<RegionalResource> = match config {
+        ExecutionBlockConfiguration::customActionLambdaConfig(config) => config
+            .lambdas
+            .iter()
+            .filter_map(|lambda| RegionalResource::of_arn(lambda.arn.as_deref()?))
+            .collect(),
+        ExecutionBlockConfiguration::ec2AsgCapacityIncreaseConfig(config) => config
+            .asgs
+            .iter()
+            .filter_map(|asg| RegionalResource::of_arn(asg.arn.as_deref()?))
+            .collect(),
+        ExecutionBlockConfiguration::ecsCapacityIncreaseConfig(config) => config
+            .services
+            .iter()
+            .flat_map(|service| [service.service_arn.as_deref(), service.cluster_arn.as_deref()])
+            .flatten()
+            .filter_map(RegionalResource::of_arn)
+            .collect(),
+        ExecutionBlockConfiguration::eksResourceScalingConfig(config) => config
+            .eks_clusters
+            .iter()
+            .flatten()
+            .filter_map(|cluster| RegionalResource::of_arn(&cluster.cluster_arn))
+            .collect(),
+        ExecutionBlockConfiguration::globalAuroraConfig(config) => config
+            .database_cluster_arns
+            .iter()
+            .filter_map(|arn| RegionalResource::of_arn(arn))
+            .collect(),
+        ExecutionBlockConfiguration::documentDbConfig(config) => config
+            .database_cluster_arns
+            .iter()
+            .filter_map(|arn| RegionalResource::of_arn(arn))
+            .collect(),
+        ExecutionBlockConfiguration::arcRoutingControlConfig(config) => config
+            .region_and_routing_controls
+            .iter()
+            .flat_map(|(region, controls)| {
+                // A Region with no routing control still names the Region it is
+                // configured for.
+                if controls.is_empty() {
+                    return vec![RegionalResource::of_region(region, None)];
+                }
+                controls
+                    .iter()
+                    .map(|control| {
+                        RegionalResource::of_region(region, Some(&control.routing_control_arn))
+                    })
+                    .collect()
+            })
+            .collect(),
+        ExecutionBlockConfiguration::lambdaEventSourceMappingConfig(config) => config
+            .region_event_source_mappings
+            .iter()
+            .map(|(region, mapping)| RegionalResource::of_region(region, Some(&mapping.arn)))
+            .collect(),
+        ExecutionBlockConfiguration::auroraServerlessScalingConfig(config) => config
+            .region_database_cluster_arns
+            .iter()
+            .map(|(region, arn)| RegionalResource::of_region(region, Some(arn)))
+            .collect(),
+        ExecutionBlockConfiguration::auroraProvisionedScalingConfig(config) => config
+            .region_database_cluster_arns
+            .iter()
+            .chain(config.instance_arns.iter())
+            .map(|(region, arn)| RegionalResource::of_region(region, Some(arn)))
+            .collect(),
+        ExecutionBlockConfiguration::neptuneGlobalDatabaseConfig(config) => config
+            .region_database_cluster_arns
+            .iter()
+            .map(|(region, arn)| RegionalResource::of_region(region, Some(arn)))
+            .collect(),
+        ExecutionBlockConfiguration::rdsPromoteReadReplicaConfig(config) => config
+            .db_instance_arn_map
+            .iter()
+            .map(|(region, arn)| RegionalResource::of_region(region, Some(arn)))
+            .collect(),
+        ExecutionBlockConfiguration::rdsCreateCrossRegionReadReplicaConfig(config) => config
+            .db_instance_arn_map
+            .iter()
+            .map(|(region, arn)| RegionalResource::of_region(region, Some(arn)))
+            .collect(),
+        ExecutionBlockConfiguration::rdsSwitchoverReadReplicaConfig(config) => config
+            .db_instance_arn_map
+            .iter()
+            .map(|(region, arn)| RegionalResource::of_region(region, Some(arn)))
+            .collect(),
+        ExecutionBlockConfiguration::ssmSendCommandConfig(config) => config
+            .region_documents
+            .iter()
+            .map(|(region, document)| {
+                RegionalResource::of_region(region, Some(&document.document_arn))
+            })
+            .collect(),
+        ExecutionBlockConfiguration::route53HealthCheckConfig(config) => config
+            .record_sets
+            .iter()
+            .flatten()
+            .filter_map(|record_set| {
+                Some(RegionalResource::of_region(
+                    record_set.region.as_deref()?,
+                    None,
+                ))
+            })
+            .collect(),
+        ExecutionBlockConfiguration::executionApprovalConfig(_)
+        | ExecutionBlockConfiguration::regionSwitchPlanConfig(_)
+        | ExecutionBlockConfiguration::parallelConfig(_) => Vec::new(),
+    };
+    resources.sort();
+    resources.dedup();
+    resources
+}
+
+/// Every step `steps` holds, in document order, descending into the steps a `Parallel`
+/// block nests — each nested step is a step of the workflow and is evaluated as one.
+///
+/// The walk keeps its own stack rather than recursing: how deeply `parallelConfig` nests
+/// is chosen by whoever created the plan, so recursion would let one request grow the
+/// call stack.
+fn flattened_steps(steps: &[Step]) -> Vec<&Step> {
+    let mut flattened = Vec::new();
+    let mut pending: Vec<&Step> = steps.iter().rev().collect();
+    while let Some(step) = pending.pop() {
+        flattened.push(step);
+        if let ExecutionBlockConfiguration::parallelConfig(nested) =
+            &step.execution_block_configuration
+        {
+            pending.extend(nested.steps.iter().rev());
+        }
+    }
+    flattened
 }
 
 /// Collect the `(hostedZoneId, recordName, region)` triples the `Route53HealthCheck`

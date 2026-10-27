@@ -2,12 +2,9 @@
 
 //! @op Subscribe
 //!
-//! NOT YET EVALUATED: a `FilterPolicy` in `Attributes` is persisted with the
-//! subscription but no delivery decision reads it, so `Publish` records every message
-//! against every confirmed subscription of the topic. Nothing a client can call reads
-//! the delivery log yet, so no response misreports a filtered delivery today;
-//! evaluating the filter-policy language is its own gap issue, together with
-//! `ConfirmSubscription` and `SetSubscriptionAttributes`.
+//! A `FilterPolicy` in `Attributes` is persisted with the subscription and is what
+//! decides, per published message, whether this subscription receives it: see
+//! [`crate::state::filter_policy::admits`].
 //!
 //! ## Shape of an operation
 //!
@@ -438,14 +435,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> Subscribe<Eng> {
         let attributes = input.attributes.unwrap_or_default();
         // SNS defines a closed set of subscription attribute names and refuses any
         // other; the closed set is also what keeps one subscription record from
-        // growing for ever.
-        if attributes
-            .keys()
-            .any(|name| !state::is_subscription_attribute(name))
+        // growing for ever. The refusal is built from the request — the member the
+        // map arrived in, and the key that was not recognised — so the caller can
+        // find the entry it has to fix.
+        if let Some(unknown) =
+            state::unknown_attribute_name(&attributes, state::is_subscription_attribute)
         {
             return Err(SubscribeErrorModeled::InvalidParameterException(
                 InvalidParameterException {
-                    message: Some(state::INVALID_ATTRIBUTE_NAME_REFUSAL.to_string()),
+                    message: Some(state::unknown_attribute_refusal(
+                        state::ATTRIBUTES_MEMBER,
+                        unknown,
+                    )),
                 },
             )
             .into());

@@ -87,7 +87,11 @@ const GUARDRAIL_CONTENT_FILTER_TYPE: &[&str] = &[
 /// The whole message a request with ONE enum-constrained member outside its set is refused
 /// with: the AWS envelope over the position and the admitted set, with the value the member
 /// held not echoed.
-fn expected_message(member: &str, values: &[&str]) -> String {
+///
+/// `pub(crate)` because `tests/all/enum_value_set_listing.rs` — the suite for the ORDER the
+/// set is listed in — reads a refusal through these same three readers rather than through a
+/// second copy of them.
+pub(crate) fn expected_message(member: &str, values: &[&str]) -> String {
     format!(
         "1 validation error detected: Value at '{member}' failed to satisfy constraint: \
          Member must satisfy enum value set: [{}]",
@@ -96,7 +100,7 @@ fn expected_message(member: &str, values: &[&str]) -> String {
 }
 
 /// The `message` a refused answer carries.
-fn message(case: &str, reply: &crate::support::Reply) -> String {
+pub(crate) fn message(case: &str, reply: &crate::support::Reply) -> String {
     reply
         .get("message")
         .as_str()
@@ -105,14 +109,20 @@ fn message(case: &str, reply: &crate::support::Reply) -> String {
 }
 
 /// The values a clause brackets, read back out of the message it stated.
-fn bracketed(case: &str, message: &str) -> Vec<String> {
+///
+/// Up to the bracket that CLOSES the set rather than off the end of the message, so a set
+/// stated inside a collection's nested element-constraint set (`… constraint: [… enum value
+/// set: [ … ]]`) is read the same way as one stated on its own. Every row that states the
+/// set at the end of the message asserts the whole message besides.
+pub(crate) fn bracketed(case: &str, message: &str) -> Vec<String> {
     let opened = message
         .split_once("enum value set: [")
         .unwrap_or_else(|| panic!("case {case:?}: the message states no enum value set: {message:?}"))
         .1;
     let set = opened
-        .strip_suffix(']')
-        .unwrap_or_else(|| panic!("case {case:?}: the value set is not closed: {message:?}"));
+        .split_once(']')
+        .unwrap_or_else(|| panic!("case {case:?}: the value set is not closed: {message:?}"))
+        .0;
     set.split(", ").map(str::to_string).collect()
 }
 

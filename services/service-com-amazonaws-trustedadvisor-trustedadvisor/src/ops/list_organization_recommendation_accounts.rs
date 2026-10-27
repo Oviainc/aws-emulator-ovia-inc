@@ -224,7 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = state.lock();
 
         let identifier = &input.organization_recommendation_identifier;
-        let Some(entry) = state.organization_recommendations.get(identifier) else {
+        if !state.organization_recommendations.contains_key(identifier) {
             return Err(
                 ListOrganizationRecommendationAccountsErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
@@ -235,7 +235,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             );
-        };
+        }
 
         // The accounts that own the resources of this aggregate recommendation
         // are the accounts of the member recommendations it aggregates: each is
@@ -243,12 +243,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // account wrote is what this list reports for it. A member ARN the store
         // does not hold names no recommendation, and so no account.
         //
-        // The stored member list is an unordered set, so the page order is
-        // member-recommendation-ARN order — a stable sequence a cursor can point
+        // The members come from
+        // [`crate::state::ComAmazonawsTrustedadvisorTrustedadvisorState::member_recommendations_of`],
+        // which hands back that set ONCE per member recommendation and in ARN
+        // order — one row per member, in the stable sequence a cursor can point
         // into, as in every other list of this service.
-        let mut matching: Vec<(String, AccountRecommendationLifecycleSummary)> = entry
-            .member_recommendation_arns
-            .iter()
+        let matching: Vec<(String, AccountRecommendationLifecycleSummary)> = state
+            .member_recommendations_of(identifier)
+            .into_iter()
             .filter(|member_arn| {
                 input
                     .affected_account_id
@@ -257,10 +259,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .filter_map(|member_arn| {
                 let member = state.recommendations.get(member_arn)?;
-                Some((member_arn.clone(), account_lifecycle_summary(member)))
+                Some((member_arn.to_string(), account_lifecycle_summary(member)))
             })
             .collect();
-        matching.sort_by(|(left, _), (right, _)| left.cmp(right));
 
         // The cursor's scope names this organization recommendation AND this
         // read's filter, so a token issued for one organization

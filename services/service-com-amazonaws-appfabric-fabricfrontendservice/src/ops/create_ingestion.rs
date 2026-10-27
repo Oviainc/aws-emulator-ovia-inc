@@ -238,22 +238,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // AppFabric's resource chain is authorize → connect → ingest: an
         // ingestion reads one application's data for one tenant, which it can
         // only do through an app authorization of that (app, tenant) pair that
-        // has completed the connect handshake. A pair the bundle holds no
-        // CONNECTED authorization for — whether it holds none at all or one
-        // still `PendingConnect` — cannot be ingested, and the refusal is the
-        // modelled `ValidationException` (HTTP 400): the request names a
-        // dependency that is not satisfied, so nothing is written.
-        let authorization_state = store
-            .app_bundles
-            .get(&bundle_key)
-            .and_then(|bundle| bundle.authorization_for(&input.app, &input.tenant_id))
-            .map(|authorization| authorization.status.clone());
-        if authorization_state.as_deref() != Some(crate::state::APP_AUTHORIZATION_STATUS_CONNECTED) {
+        // has completed the connect handshake — the lookup
+        // `crate::state::AppBundleRecord::connected_authorization` is. A pair
+        // the bundle holds no CONNECTED authorization for — whether it holds
+        // none at all or one still `PendingConnect` — cannot be ingested, and
+        // the refusal is the modelled `ValidationException` (HTTP 400): the
+        // request names a dependency that is not satisfied, so nothing is
+        // written. Only that refusal needs the status the bundle DOES hold for
+        // the pair, which is what tells the caller whether it still has to
+        // create the authorization or only to connect it.
+        let parent = store.app_bundles.get(&bundle_key);
+        if parent
+            .and_then(|bundle| bundle.connected_authorization(&input.app, &input.tenant_id))
+            .is_none()
+        {
+            let held_status = parent
+                .and_then(|bundle| bundle.authorization_for(&input.app, &input.tenant_id))
+                .map(|authorization| authorization.status.clone());
             return Err(CreateIngestionErrorModeled::ValidationException(
-                crate::state::app_authorization_not_connected(
-                    &input.app,
-                    authorization_state.as_deref(),
-                ),
+                crate::state::app_authorization_not_connected(&input.app, held_status.as_deref()),
             )
             .into());
         }
