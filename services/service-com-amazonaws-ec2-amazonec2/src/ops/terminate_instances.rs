@@ -179,8 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            deduplicate_ids, require_known_instance, require_service_state, user_initiated_reason,
-            InstanceStateName, PendingTransition, MAX_RESOURCE_IDS,
+            deduplicate_ids, require_known_instance, require_service_state, MAX_RESOURCE_IDS,
         };
 
         let _ = ctx;
@@ -233,23 +232,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut changes: Vec<InstanceStateChange> = Vec::new();
         for instance_id in &instance_ids {
-            let Some(instance) = store.instances.get_mut(instance_id) else {
+            // The ONE writer of a termination: an instance already on its way to (or at)
+            // `terminated` is reported unchanged; termination is idempotent.
+            let Some(previous) = store.begin_instance_termination(instance_id, now) else {
                 continue;
             };
-            let previous = instance.state;
-            // An instance already on its way to (or at) `terminated` is reported
-            // unchanged; termination is idempotent.
-            if !previous.is_terminating() {
-                instance.state = InstanceStateName::ShuttingDown;
-                instance.pending_transition = Some(PendingTransition::starting_now(
-                    InstanceStateName::Terminated,
-                ));
-                instance.state_transition_reason = Some(user_initiated_reason(now));
-                instance.state_reason = Some((
-                    "Client.UserInitiatedShutdown".to_string(),
-                    "Client.UserInitiatedShutdown: User initiated shutdown".to_string(),
-                ));
-            }
+            let Some(instance) = store.instances.get(instance_id) else {
+                continue;
+            };
             changes.push(InstanceStateChange {
                 instance_id: Some(instance_id.clone()),
                 previous_state: Some(previous.view()),

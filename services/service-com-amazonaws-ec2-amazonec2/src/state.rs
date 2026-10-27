@@ -6416,6 +6416,35 @@ impl ComAmazonawsEc2Amazonec2State {
         self.mint_launched_root_volume(&instance_id);
     }
 
+    /// Start the termination of the instance `instance_id` names, as of `at`, and answer the
+    /// state it was in — `None` when this store holds no such instance.
+    ///
+    /// The ONE writer of a termination, so every path that terminates an instance (a caller
+    /// naming it, or a Spot Fleet cancellation terminating what the fleet launched) leaves
+    /// the same record behind: `shutting-down` with the clock owing `terminated`, and the
+    /// reason EC2 records for a shutdown somebody asked for. A termination is IDEMPOTENT — an
+    /// instance already on its way to, or at, `terminated` keeps the transition it has — so
+    /// the state answered here is the one a caller is told it was in.
+    pub fn begin_instance_termination(
+        &mut self,
+        instance_id: &str,
+        at: SystemTime,
+    ) -> Option<InstanceStateName> {
+        let instance = self.instances.get_mut(instance_id)?;
+        let previous = instance.state;
+        if !previous.is_terminating() {
+            instance.state = InstanceStateName::ShuttingDown;
+            instance.pending_transition =
+                Some(PendingTransition::starting_now(InstanceStateName::Terminated));
+            instance.state_transition_reason = Some(user_initiated_reason(at));
+            instance.state_reason = Some((
+                INSTANCE_STATE_REASON_USER_INITIATED_SHUTDOWN.to_string(),
+                INSTANCE_STATE_REASON_MESSAGE_USER_INITIATED_SHUTDOWN.to_string(),
+            ));
+        }
+        Some(previous)
+    }
+
     /// Queue one reboot for the instance `instance_id` names, as of `at`.
     ///
     /// The ONE writer of a queued reboot, so one `RebootInstances` call records one reboot
@@ -8377,6 +8406,15 @@ pub fn architecture_for(instance_type: &str) -> String {
 pub fn user_initiated_reason(at: SystemTime) -> String {
     format!("User initiated ({})", iso8601_utc(at))
 }
+
+/// The `StateReason$Code` EC2 records on an instance a caller asked to shut down.
+pub const INSTANCE_STATE_REASON_USER_INITIATED_SHUTDOWN: &str = "Client.UserInitiatedShutdown";
+
+/// The `StateReason$Message` that goes with [`INSTANCE_STATE_REASON_USER_INITIATED_SHUTDOWN`]:
+/// "the message for the state change" EC2 spells as the code followed by its description
+/// (`StateReason$Message`).
+pub const INSTANCE_STATE_REASON_MESSAGE_USER_INITIATED_SHUTDOWN: &str =
+    "Client.UserInitiatedShutdown: User initiated shutdown";
 
 /// `at` as an RFC 3339 / ISO 8601 UTC timestamp.
 pub fn iso8601_utc(at: SystemTime) -> String {
@@ -30885,6 +30923,32 @@ pub const SPOT_STATUS_MESSAGE_SCHEDULE_EXPIRED: &str =
 pub const SPOT_STATUS_MESSAGE_CAPACITY_NOT_AVAILABLE: &str =
     "There is no Spot capacity available that matches your request.";
 
+/// The `canceled-before-fulfillment` Spot request status code, one of the Spot request status
+/// codes `SpotInstanceStatus$Code` points at: a request cancelled while it was still waiting
+/// to be fulfilled.
+pub const SPOT_STATUS_CANCELED_BEFORE_FULFILLMENT: &str = "canceled-before-fulfillment";
+
+/// The description [`SPOT_STATUS_CANCELED_BEFORE_FULFILLMENT`] carries.
+pub const SPOT_STATUS_MESSAGE_CANCELED_BEFORE_FULFILLMENT: &str =
+    "Your Spot request was canceled before it was fulfilled.";
+
+/// The `request-canceled-and-instance-running` Spot request status code: a fulfilled request
+/// that was cancelled while the instance it launched was left running.
+pub const SPOT_STATUS_REQUEST_CANCELED_AND_INSTANCE_RUNNING: &str =
+    "request-canceled-and-instance-running";
+
+/// The description [`SPOT_STATUS_REQUEST_CANCELED_AND_INSTANCE_RUNNING`] carries.
+pub const SPOT_STATUS_MESSAGE_REQUEST_CANCELED_AND_INSTANCE_RUNNING: &str =
+    "Your Spot request is canceled, but your instance is still running.";
+
+/// The `instance-terminated-by-user` Spot request status code: the instance the request
+/// launched was terminated on a caller's own instruction.
+pub const SPOT_STATUS_INSTANCE_TERMINATED_BY_USER: &str = "instance-terminated-by-user";
+
+/// The description [`SPOT_STATUS_INSTANCE_TERMINATED_BY_USER`] carries.
+pub const SPOT_STATUS_MESSAGE_INSTANCE_TERMINATED_BY_USER: &str =
+    "Your Spot Instance was terminated at your request.";
+
 /// The id prefix of a Spot Instance request, the form
 /// `SpotInstanceRequest$SpotInstanceRequestId` carries.
 pub const SPOT_INSTANCE_REQUEST_ID_PREFIX: &str = "sir";
@@ -31566,6 +31630,73 @@ pub const SPOT_FLEET_STATE_SUBMITTED: &str = "submitted";
 /// that is placing and holding capacity.
 pub const SPOT_FLEET_STATE_ACTIVE: &str = "active";
 
+/// The `modifying` member of [`crate::ops::types::BATCH_STATE_VALUES`]: a Spot Fleet request
+/// whose target capacity is being changed.
+pub const SPOT_FLEET_STATE_MODIFYING: &str = "modifying";
+
+/// The `cancelled_running` member of [`crate::ops::types::BATCH_STATE_VALUES`]: "the Spot
+/// Fleet request enters the `cancelled_running` state and the instances continue to run until
+/// they are interrupted or you terminate them manually" (`CancelSpotFleetRequests`).
+pub const SPOT_FLEET_STATE_CANCELLED_RUNNING: &str = "cancelled_running";
+
+/// The `cancelled_terminating` member of [`crate::ops::types::BATCH_STATE_VALUES`]: "if you
+/// choose to terminate the instances, the Spot Fleet request enters the
+/// `cancelled_terminating` state" (`CancelSpotFleetRequests`).
+pub const SPOT_FLEET_STATE_CANCELLED_TERMINATING: &str = "cancelled_terminating";
+
+/// The `cancelled` member of [`crate::ops::types::BATCH_STATE_VALUES`]: where a cancelled
+/// Spot Fleet request that has no running Spot Instance left ends up.
+pub const SPOT_FLEET_STATE_CANCELLED: &str = "cancelled";
+
+/// The `BatchState` members a Spot Fleet request can be CANCELLED from: one that is holding
+/// capacity, one that has just been accepted and one whose capacity is being changed. Every
+/// other member is a fleet whose cancellation has already been asked for or that failed, so
+/// there is nothing left to cancel.
+pub const SPOT_FLEET_CANCELLABLE_STATES: &[&str] = &[
+    SPOT_FLEET_STATE_SUBMITTED,
+    SPOT_FLEET_STATE_ACTIVE,
+    SPOT_FLEET_STATE_MODIFYING,
+];
+
+/// The most Spot Fleet requests ONE `CancelSpotFleetRequests` call may name: "you can delete
+/// up to 100 fleets in a single request. If you exceed the specified number, no fleets are
+/// deleted" (`CancelSpotFleetRequests`), which is also the constraint
+/// `CancelSpotFleetRequestsRequest$SpotFleetRequestIds` states ("you can specify up to 100
+/// IDs in a single request").
+pub const MAX_SPOT_FLEET_REQUESTS_PER_CANCEL: usize = 100;
+
+/// Whether a Spot Fleet request in `state` can be cancelled
+/// ([`SPOT_FLEET_CANCELLABLE_STATES`]).
+pub fn spot_fleet_request_state_is_cancellable(state: &str) -> bool {
+    SPOT_FLEET_CANCELLABLE_STATES.contains(&state)
+}
+
+/// The `fleetRequestIdDoesNotExist` member of
+/// [`crate::ops::types::CANCEL_BATCH_ERROR_CODE_VALUES`]: the per-fleet code
+/// `CancelSpotFleetRequests` reports for an id this account holds no Spot Fleet request for.
+pub const CANCEL_BATCH_FLEET_REQUEST_ID_DOES_NOT_EXIST: &str = "fleetRequestIdDoesNotExist";
+
+/// The `fleetRequestIdMalformed` member of
+/// [`crate::ops::types::CANCEL_BATCH_ERROR_CODE_VALUES`]: the per-fleet code for something
+/// that is not a Spot Fleet request id at all.
+pub const CANCEL_BATCH_FLEET_REQUEST_ID_MALFORMED: &str = "fleetRequestIdMalformed";
+
+/// The `fleetRequestNotInCancellableState` member of
+/// [`crate::ops::types::CANCEL_BATCH_ERROR_CODE_VALUES`]: the per-fleet code for a fleet in a
+/// `BatchState` it cannot be cancelled from ([`SPOT_FLEET_CANCELLABLE_STATES`]).
+pub const CANCEL_BATCH_FLEET_REQUEST_NOT_IN_CANCELLABLE_STATE: &str =
+    "fleetRequestNotInCancellableState";
+
+/// The `unexpectedError` member of [`crate::ops::types::CANCEL_BATCH_ERROR_CODE_VALUES`]: the
+/// per-fleet code for a fleet the cancellation did not carry out for a reason that is none of
+/// the others, so no id a call named is ever left out of both of its answer's sets.
+pub const CANCEL_BATCH_UNEXPECTED_ERROR: &str = "unexpectedError";
+
+/// The message the per-fleet [`CANCEL_BATCH_UNEXPECTED_ERROR`] carries.
+pub fn spot_fleet_request_unexpected_error_message(request_id: &str) -> String {
+    format!("An unexpected error occurred cancelling the spot fleet request '{request_id}'")
+}
+
 /// The `pending_fulfillment` member of the modelled `ActivityStatus` catalog
 /// ([`crate::ops::types::ACTIVITY_STATUS_VALUES`]): "After all requests are placed, the
 /// status is `pending_fulfillment`" (`SpotFleetRequestConfig$ActivityStatus`).
@@ -31575,6 +31706,11 @@ pub const SPOT_FLEET_ACTIVITY_PENDING_FULFILLMENT: &str = "pending_fulfillment";
 /// the fleet is equal to or greater than its target capacity, the status is `fulfilled`"
 /// (`SpotFleetRequestConfig$ActivityStatus`).
 pub const SPOT_FLEET_ACTIVITY_FULFILLED: &str = "fulfilled";
+
+/// The `pending_termination` member of [`crate::ops::types::ACTIVITY_STATUS_VALUES`]: "if the
+/// size of the fleet is decreased, the status is `pending_termination` while Spot Instances
+/// are terminating" (`SpotFleetRequestConfig$ActivityStatus`).
+pub const SPOT_FLEET_ACTIVITY_PENDING_TERMINATION: &str = "pending_termination";
 
 /// The `request` member of [`FLEET_TYPE_VALUES`]: a Spot Fleet request that "only places the
 /// required requests" and does not replenish them
@@ -31636,6 +31772,25 @@ pub fn spot_fleet_request_id_is_well_formed(id: &str) -> bool {
     uuid_suffixed_id_is_well_formed(id, SPOT_FLEET_REQUEST_ID_PREFIX)
 }
 
+/// The message EC2 refuses something that is not a Spot Fleet request id at all with, and the
+/// one the per-fleet [`CANCEL_BATCH_FLEET_REQUEST_ID_MALFORMED`] carries: one definition, so a
+/// request-level refusal and a per-fleet error cannot word it two ways.
+pub fn spot_fleet_request_id_malformed_message(request_id: &str) -> String {
+    format!("Invalid id: \"{request_id}\"")
+}
+
+/// The message EC2 refuses a Spot Fleet request id this account holds no fleet for with, and
+/// the one the per-fleet [`CANCEL_BATCH_FLEET_REQUEST_ID_DOES_NOT_EXIST`] carries.
+pub fn spot_fleet_request_not_found_message(request_id: &str) -> String {
+    format!("The spot fleet request ID '{request_id}' does not exist")
+}
+
+/// The message the per-fleet [`CANCEL_BATCH_FLEET_REQUEST_NOT_IN_CANCELLABLE_STATE`] carries:
+/// one sentence, with the fleet from the request and the `BatchState` from the store.
+pub fn spot_fleet_request_not_cancellable_message(request_id: &str, state: &str) -> String {
+    format!("The spot fleet request '{request_id}' is in the state '{state}' and cannot be canceled")
+}
+
 /// Refuse something that is not a Spot Fleet request id at all: HTTP 400
 /// [`INVALID_SPOT_FLEET_REQUEST_ID_MALFORMED`], answered BEFORE any lookup so a caller can
 /// tell a typo from a fleet the account does not hold.
@@ -31643,7 +31798,7 @@ pub fn invalid_spot_fleet_request_id_malformed<E>(request_id: &str) -> Scaffolde
     Scaffolded::service_error(
         INVALID_SPOT_FLEET_REQUEST_ID_MALFORMED,
         400,
-        format!("Invalid id: \"{request_id}\""),
+        spot_fleet_request_id_malformed_message(request_id),
     )
 }
 
@@ -31653,7 +31808,7 @@ pub fn invalid_spot_fleet_request_id_not_found<E>(request_id: &str) -> Scaffolde
     Scaffolded::service_error(
         INVALID_SPOT_FLEET_REQUEST_ID_NOT_FOUND,
         400,
-        format!("The spot fleet request ID '{request_id}' does not exist"),
+        spot_fleet_request_not_found_message(request_id),
     )
 }
 
@@ -31730,11 +31885,18 @@ impl SpotFleetRequestRecord {
     /// Both are owed to the CLOCK rather than to a caller — the move was due at this instant
     /// whether or not anybody called, and the fulfilled capacity is derived from the Spot
     /// Instance requests the fleet placed — so a reporting operation may apply them.
-    fn apply_due_move(&mut self, now: Instant, fulfilled: f64) {
+    ///
+    /// `running_instances` is whether any Spot Instance this fleet launched is still held by
+    /// the instance store ([`spot_fleet_has_running_instances`]), which is what a CANCELLED
+    /// fleet's completion waits for: a cancelled fleet is `cancelled` once it has no running
+    /// Spot Instance left, so its move is due to the clock AND to those instances, while every
+    /// other move is due to the clock alone.
+    fn apply_due_move(&mut self, now: Instant, fulfilled: f64, running_instances: bool) {
         let due = self
             .pending
             .as_ref()
             .filter(|pending| now >= pending.due_at)
+            .filter(|pending| pending.to != SPOT_FLEET_STATE_CANCELLED || !running_instances)
             .map(|pending| pending.to);
         if let Some(to) = due {
             self.view.spot_fleet_request_state = Some(to.to_string());
@@ -31748,11 +31910,17 @@ impl SpotFleetRequestRecord {
         if let Some(config) = self.view.spot_fleet_request_config.as_mut() {
             config.fulfilled_capacity = Some(fulfilled);
         }
+        // "If the size of the fleet is decreased, the status is `pending_termination` while
+        // Spot Instances are terminating" — which is where a fleet cancelled WITH its
+        // instances sits until they are gone.
+        let terminating = self.state() == SPOT_FLEET_STATE_CANCELLED_TERMINATING;
         // "If the size of the fleet is equal to or greater than its target capacity, the
         // status is `fulfilled`" — and until then the requests are placed and waiting, which
         // is `pending_fulfillment`.
         self.view.activity_status = Some(
-            if fulfilled + on_demand >= target {
+            if terminating && running_instances {
+                SPOT_FLEET_ACTIVITY_PENDING_TERMINATION
+            } else if fulfilled + on_demand >= target {
                 SPOT_FLEET_ACTIVITY_FULFILLED
             } else {
                 SPOT_FLEET_ACTIVITY_PENDING_FULFILLMENT
@@ -31783,6 +31951,45 @@ pub fn spot_fleet_fulfilled_capacity(
         })
         .map(|placement| placement.weighted_capacity)
         .sum()
+}
+
+/// Every Spot Instance one Spot Fleet's `placements` launched, in placement order: the
+/// `InstanceId` each placed Spot Instance request reports, for the requests that have one.
+///
+/// The ONE way the instances of a fleet are reached, so the cancellation that terminates them
+/// and the derivation that waits for them read one set.
+pub fn spot_fleet_instance_ids(
+    placements: &[SpotFleetPlacement],
+    requests: &BTreeMap<String, SpotInstanceRequestRecord>,
+) -> Vec<String> {
+    placements
+        .iter()
+        .filter_map(|placement| {
+            requests
+                .get(&placement.spot_instance_request_id)
+                .and_then(|record| record.view.instance_id.clone())
+        })
+        .collect()
+}
+
+/// Whether any Spot Instance one Spot Fleet's `placements` launched is STILL RUNNING: an
+/// instance this account's instance store holds that has not reached `terminated`.
+///
+/// What a cancelled fleet's completion waits for — a cancelled Spot Fleet request is
+/// `cancelled` once it has no running Spot Instance — and what tells a fleet whose instances
+/// are terminating from one whose instances are gone.
+pub fn spot_fleet_has_running_instances(
+    placements: &[SpotFleetPlacement],
+    requests: &BTreeMap<String, SpotInstanceRequestRecord>,
+    instances: &HashMap<String, InstanceRecord>,
+) -> bool {
+    spot_fleet_instance_ids(placements, requests)
+        .iter()
+        .any(|instance_id| {
+            instances
+                .get(instance_id)
+                .is_some_and(|instance| instance.state != InstanceStateName::Terminated)
+        })
 }
 
 /// How many Spot Instances each pool of a Spot Fleet places to cover `spot_target` capacity
@@ -32135,6 +32342,106 @@ impl ComAmazonawsEc2Amazonec2State {
         placements
     }
 
+    /// Cancel the Spot Fleet request `fleet_id` names, and answer the `BatchState` it was in
+    /// and the one it is in now — `None` when this store holds no such fleet or it is in a
+    /// state it cannot be cancelled from ([`spot_fleet_request_state_is_cancellable`]).
+    ///
+    /// The one way a Spot Fleet request is cancelled, so what a cancellation does cannot be
+    /// built two ways:
+    ///
+    /// * "after you cancel a Spot Fleet request, the Spot Fleet launches no new instances"
+    ///   (`CancelSpotFleetRequests`) — so every Spot Instance request the fleet placed is
+    ///   cancelled and owes no fulfillment, which is what stops the next clock pass launching
+    ///   an instance for it;
+    /// * "if you choose to terminate the instances, the Spot Fleet request enters the
+    ///   `cancelled_terminating` state. Otherwise, the Spot Fleet request enters the
+    ///   `cancelled_running` state and the instances continue to run until they are
+    ///   interrupted or you terminate them manually" — so `terminate_instances` decides both
+    ///   the state the fleet enters and whether the instances it launched are terminated;
+    /// * a cancelled fleet reaches `cancelled` once it has no running Spot Instance left,
+    ///   which is owed to the clock and to those instances
+    ///   ([`SpotFleetRequestRecord::apply_due_move`]).
+    pub fn cancel_spot_fleet_request(
+        &mut self,
+        fleet_id: &str,
+        terminate_instances: bool,
+    ) -> Option<(String, String)> {
+        let record = self.spot_fleet_requests.get(fleet_id)?;
+        let previous_state = record.state().to_string();
+        if !spot_fleet_request_state_is_cancellable(&previous_state) {
+            return None;
+        }
+        let placements = record.placements.clone();
+
+        let at = SystemTime::now();
+        for placement in &placements {
+            let Some(request) = self
+                .spot_instance_requests
+                .get_mut(&placement.spot_instance_request_id)
+            else {
+                continue;
+            };
+            // A request that has already left `open` or `active` — one whose validity ran
+            // out, or one already cancelled — has nothing left to cancel.
+            let state = request.view.state.as_deref().unwrap_or_default();
+            if state != SPOT_REQUEST_STATE_OPEN && state != SPOT_REQUEST_STATE_ACTIVE {
+                continue;
+            }
+            let (code, message) = match (request.view.instance_id.is_some(), terminate_instances) {
+                // Nothing was launched for this request, so it is cancelled before it was
+                // ever fulfilled.
+                (false, _) => (
+                    SPOT_STATUS_CANCELED_BEFORE_FULFILLMENT,
+                    SPOT_STATUS_MESSAGE_CANCELED_BEFORE_FULFILLMENT,
+                ),
+                (true, true) => (
+                    SPOT_STATUS_INSTANCE_TERMINATED_BY_USER,
+                    SPOT_STATUS_MESSAGE_INSTANCE_TERMINATED_BY_USER,
+                ),
+                (true, false) => (
+                    SPOT_STATUS_REQUEST_CANCELED_AND_INSTANCE_RUNNING,
+                    SPOT_STATUS_MESSAGE_REQUEST_CANCELED_AND_INSTANCE_RUNNING,
+                ),
+            };
+            request.view.state = Some(SPOT_REQUEST_STATE_CANCELLED.to_string());
+            request.view.status = Some(SpotInstanceStatus {
+                code: Some(code.to_string()),
+                message: Some(message.to_string()),
+                update_time: Some(system_time_to_date_time(at)),
+            });
+            // The fleet places no new instance for a request it has cancelled.
+            request.fulfillment = None;
+        }
+        if terminate_instances {
+            // "Terminating an instance is permanent and irreversible": the instances the fleet
+            // launched, read through the ONE way a fleet's instances are reached.
+            for instance_id in spot_fleet_instance_ids(&placements, &self.spot_instance_requests) {
+                self.begin_instance_termination(&instance_id, at);
+            }
+        }
+
+        let current_state = if terminate_instances {
+            SPOT_FLEET_STATE_CANCELLED_TERMINATING
+        } else {
+            SPOT_FLEET_STATE_CANCELLED_RUNNING
+        };
+        let record = self.spot_fleet_requests.get_mut(fleet_id)?;
+        record.view.spot_fleet_request_state = Some(current_state.to_string());
+        // The `active` the clock owed a `submitted` fleet is not owed a cancelled one; what it
+        // owes now is the `cancelled` the fleet reaches when its instances are gone.
+        record.pending = Some(SpotFleetRequestTransition::starting_now(
+            SPOT_FLEET_STATE_CANCELLED,
+        ));
+        // Read the activity status back through the one derivation of it, so the cancellation
+        // reports what a describe in the same instant reports.
+        self.materialize_due_spot_fleet_requests(Instant::now());
+        let current_state = self
+            .spot_fleet_requests
+            .get(fleet_id)
+            .map_or_else(|| current_state.to_string(), |record| record.state().to_string());
+        Some((previous_state, current_state))
+    }
+
     /// Apply what the clock owes every stored Spot Fleet request, as of `now`.
     ///
     /// Called by [`Self::materialize_due_transitions`] AFTER the Spot Instance requests have
@@ -32145,22 +32452,27 @@ impl ComAmazonawsEc2Amazonec2State {
         if self.spot_fleet_requests.is_empty() {
             return;
         }
-        // One immutable pass to derive each fleet's fulfilled capacity from the Spot Instance
-        // request store, then one mutable pass to write it: a fleet's capacity cannot be read
-        // off the request store while that fleet is being mutated.
-        let derived: Vec<(String, f64)> = self
+        // One immutable pass to derive each fleet's fulfilled capacity and whether any
+        // instance it launched is still running, then one mutable pass to write it: neither
+        // can be read off the request and instance stores while that fleet is being mutated.
+        let derived: Vec<(String, f64, bool)> = self
             .spot_fleet_requests
             .iter()
             .map(|(fleet_id, record)| {
                 (
                     fleet_id.clone(),
                     spot_fleet_fulfilled_capacity(&record.placements, &self.spot_instance_requests),
+                    spot_fleet_has_running_instances(
+                        &record.placements,
+                        &self.spot_instance_requests,
+                        &self.instances,
+                    ),
                 )
             })
             .collect();
-        for (fleet_id, fulfilled) in derived {
+        for (fleet_id, fulfilled, running_instances) in derived {
             if let Some(record) = self.spot_fleet_requests.get_mut(&fleet_id) {
-                record.apply_due_move(now, fulfilled);
+                record.apply_due_move(now, fulfilled, running_instances);
             }
         }
     }

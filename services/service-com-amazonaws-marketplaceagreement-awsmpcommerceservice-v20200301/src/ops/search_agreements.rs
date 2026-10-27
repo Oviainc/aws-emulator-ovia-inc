@@ -275,8 +275,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The token resumes THIS search: a token minted for a different query
         // would index into a different sequence.
-        let scope =
-            crate::state::search_scope(input.catalog.as_deref(), &filters, &sort_by, &sort_order);
+        let scope = crate::state::search_scope(
+            Self::NAME,
+            input.catalog.as_deref(),
+            &filters,
+            &sort_by,
+            &sort_order,
+        );
         let offset = match input.next_token.as_deref() {
             None => 0,
             Some(token) => match crate::state::page_offset(&scope, token) {

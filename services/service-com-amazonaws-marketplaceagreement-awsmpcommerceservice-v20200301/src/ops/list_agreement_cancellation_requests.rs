@@ -268,16 +268,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             matched.push(request);
         }
 
-        // The token resumes THIS listing: a token minted for a different set of
-        // filters, or for a different party type, would index into a different
-        // sequence.
-        let scope = crate::state::query_scope(&[
+        // The token resumes THIS listing: the scope names the operation as well
+        // as every selector, so a token minted for a different set of filters,
+        // for a different party type, or by the sibling listing over
+        // seller-submitted requests cannot index into this sequence.
+        let scope = crate::state::submitted_request_scope(
+            Self::NAME,
             &input.party_type,
-            input.agreement_id.as_deref().unwrap_or_default(),
-            input.status.as_deref().unwrap_or_default(),
-            input.agreement_type.as_deref().unwrap_or_default(),
-            input.catalog.as_deref().unwrap_or_default(),
-        ]);
+            input.agreement_id.as_deref(),
+            input.agreement_type.as_deref(),
+            input.catalog.as_deref(),
+            input.status.as_deref(),
+        );
         let offset = match input.next_token.as_deref() {
             None => 0,
             Some(token) => match crate::state::page_offset(&scope, token) {

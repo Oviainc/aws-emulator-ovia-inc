@@ -39,7 +39,11 @@ use crate::transcription_jobs::Reply;
 
 /// The refusal a start whose media names no S3 object is answered with, as the service
 /// words it for that error class.
-const MEDIA_NAMES_NO_OBJECT: &str =
+///
+/// `pub(crate)` so the Call Analytics start suite
+/// (`crate::call_analytics_job_start_preconditions`) asserts the same wording from one
+/// home rather than restating it.
+pub(crate) const MEDIA_NAMES_NO_OBJECT: &str =
     "The URI that you provided doesn't point to an S3 object. Make sure that the object \
      exists and try your request again.";
 
