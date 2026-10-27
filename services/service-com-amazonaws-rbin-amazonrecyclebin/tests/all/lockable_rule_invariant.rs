@@ -165,7 +165,7 @@ fn unlockable_rows() -> Vec<Row> {
 fn create_body(row: &Row, unlock_delay: Option<i64>) -> Value {
     let mut body = json!({
         "ResourceType": row.resource_type,
-        "RetentionPeriod": retention(30),
+        "RetentionPeriod": retention(7),
     });
     if !row.resource_tags.is_null() {
         body["ResourceTags"] = row.resource_tags.clone();
@@ -333,7 +333,7 @@ async fn a_region_level_rule_without_exclusion_tags_is_locked_through_either_doo
         for unlock_delay in [UNLOCK_DELAY_MIN, UNLOCK_DELAY_MAX] {
             rows.push((
                 format!("{resource_type} rule, unlock delay {unlock_delay}"),
-                json!({ "ResourceType": resource_type, "RetentionPeriod": retention(30) }),
+                json!({ "ResourceType": resource_type, "RetentionPeriod": retention(7) }),
                 unlock_delay,
             ));
         }
@@ -342,7 +342,7 @@ async fn a_region_level_rule_without_exclusion_tags_is_locked_through_either_doo
         "rule whose selection members are both sent empty".to_string(),
         json!({
             "ResourceType": RESOURCE_TYPES[0],
-            "RetentionPeriod": retention(30),
+            "RetentionPeriod": retention(7),
             "ResourceTags": [],
             "ExcludeResourceTags": [],
         }),

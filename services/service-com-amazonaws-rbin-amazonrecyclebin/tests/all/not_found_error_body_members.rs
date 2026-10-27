@@ -167,7 +167,7 @@ async fn an_absent_rule_is_reported_with_message_and_no_reason() {
     let (deleted, _) = created_rule(
         &router,
         "a rule that is then deleted",
-        json!({ "ResourceType": "EBS_VOLUME", "RetentionPeriod": retention(9) }),
+        json!({ "ResourceType": "EBS_VOLUME", "RetentionPeriod": retention(6) }),
     )
     .await;
     let (status, _) = delete_rule(&router, &deleted).await;
