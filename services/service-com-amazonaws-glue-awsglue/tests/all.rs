@@ -91,6 +91,8 @@ mod glossaries;
 mod glossary_term_listing;
 #[path = "all/glossary_terms.rs"]
 mod glossary_terms;
+#[path = "all/job_deletion.rs"]
+mod job_deletion;
 #[path = "all/job_listing.rs"]
 mod job_listing;
 #[path = "all/job_regions.rs"]

@@ -125,3 +125,5 @@ mod vocabulary_filter_delete_requires_the_filter;
 mod vocabulary_filter_file_uri;
 #[path = "all/vocabulary_update_term_source.rs"]
 mod vocabulary_update_term_source;
+#[path = "all/vocabulary_update_terminal_state.rs"]
+mod vocabulary_update_terminal_state;

@@ -1518,6 +1518,21 @@ impl ComAmazonawsGlueAwsglueState {
             .insert(entry.name.clone(), entry);
     }
 
+    /// Remove the job definition `name` from the Region `region`, answering the record
+    /// that was removed, or `None` when that Region holds no job under that name.
+    ///
+    /// The whole record goes: a job's tags and the runs started of it are held ON the
+    /// entry ([`JobEntry::tags`], [`JobEntry::runs`]), so the name a delete frees carries
+    /// neither into the next create under it. The removed entry is handed back rather
+    /// than dropped, for symmetry with [`Self::remove_connection`] — today's caller only
+    /// needs to know WHETHER a record went. Matched by name and Region exactly as the
+    /// read path matches them ([`Self::job`]).
+    pub fn remove_job(&mut self, region: &str, name: &str) -> Option<JobEntry> {
+        self.jobs
+            .get_mut(region)
+            .and_then(|jobs| jobs.remove(name))
+    }
+
     /// Every job definition the Region `region` holds, in name order.
     pub fn jobs_in(&self, region: &str) -> Vec<&JobEntry> {
         let mut found: Vec<&JobEntry> = self

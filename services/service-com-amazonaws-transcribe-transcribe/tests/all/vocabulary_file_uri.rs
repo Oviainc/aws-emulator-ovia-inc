@@ -383,6 +383,12 @@ async fn an_update_switches_a_vocabulary_between_its_two_term_sources() {
         .await
         .ok("create the vocabulary from inline terms");
 
+    // The precondition the update publishes: "Your custom vocabulary must be in a
+    // terminal state (READY or FAILED) before you can update it"
+    // (`smithy_query(query="doc", shape="UpdateVocabulary")`), so the first row waits
+    // out the create's own build before replacing its terms.
+    std::thread::sleep(PAST_THE_TRANSITION);
+
     // Each row is one `UpdateVocabulary`, the state its rebuild must reach once the
     // clock makes it due, and whether a vocabulary rebuilt that way has a file to
     // download. The rows alternate between the two sources, so each direction of the
