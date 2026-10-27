@@ -464,6 +464,10 @@ mod security_groups;
 mod snapshot_block_public_access;
 #[path = "all/spot_datafeed_subscription.rs"]
 mod spot_datafeed_subscription;
+// What `CancelSpotFleetRequests` does to one Spot Fleet request and the Spot Instance requests
+// it placed, and what it reports per fleet.
+#[path = "all/spot_fleet_request_cancellation.rs"]
+mod spot_fleet_request_cancellation;
 #[path = "all/spot_fleet_requests.rs"]
 mod spot_fleet_requests;
 #[path = "all/spot_instance_requests.rs"]
