@@ -436,6 +436,21 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
+/// How a send refuses a sending identity this account has not verified, for every
+/// operation that reports a failed verification check.
+///
+/// SES identities are per Region ([`request_region`]), so the refusal names the Region
+/// whose identity list the check failed in — upper-cased, as the service writes it —
+/// and then the identities that failed it. One wording, so two send paths cannot
+/// disagree about how the same failed check reads.
+pub fn unverified_identities_message(region: &str, identities: &str) -> String {
+    format!(
+        "Email address is not verified. The following identities failed the check in \
+         region {}: {identities}",
+        region.to_uppercase()
+    )
+}
+
 /// `arn:aws:ses:<region>:<account>:tenant/<name>/<id>` — the ARN SES reports for a
 /// tenant: the resource part names the tenant AND its id, so the ARN identifies
 /// the tenant record even after a tenant of the same name is recreated. Minted

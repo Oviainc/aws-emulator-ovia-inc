@@ -391,9 +391,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let waiting = planned.waiting;
+        let parked = planned.parked;
         let task_bytes = waiting
             .as_ref()
-            .map_or(0, crate::state::PlannedActivityTask::measure);
+            .map_or(0, crate::state::PlannedActivityTask::measure)
+            + parked.as_ref().map_or(0, crate::state::PlannedJob::measure);
         let map_runs = planned.map_runs;
         let map_run_bytes = crate::state::planned_map_run_bytes(&map_runs);
         match store.redrive_execution(
@@ -420,6 +422,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &crate::state::arn_region(&machine_arn),
                     map_runs,
                 );
+                // The re-run started a run-a-job task's job again and PARKED at it,
+                // which is polled to its end exactly as a first attempt's is.
+                if let Some(parked) = parked {
+                    let region = crate::state::arn_region(&machine_arn);
+                    store.park_job(&input.execution_arn, parked, &region);
+                    drop(store);
+                    crate::state::run_a_job::watch(
+                        std::sync::Arc::clone(&self.engine),
+                        ctx.callback().clone(),
+                        crate::state::integration::chain_depth(ctx),
+                        input.execution_arn.clone(),
+                    );
+                }
                 Ok(RedriveExecutionOutput {
                     redrive_date: crate::state::to_date_time(redrive_date),
                 })

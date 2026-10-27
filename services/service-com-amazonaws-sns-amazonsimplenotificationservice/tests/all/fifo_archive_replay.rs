@@ -117,7 +117,7 @@ async fn given_archiving_topic(emulator: &Emulator, name: &str, days: &str) -> (
 /// The value of one attribute of an awsQuery attribute map response, if the map carries
 /// it: the entries are `<entry><key>…</key><value>…</value></entry>` pairs, which the
 /// positional element reader of this suite cannot pair up on its own.
-fn attribute(body: &str, name: &str) -> Option<String> {
+pub(crate) fn attribute(body: &str, name: &str) -> Option<String> {
     let needle = format!("<key>{name}</key>");
     let start = body.find(&needle)? + needle.len();
     let rest = &body[start..];

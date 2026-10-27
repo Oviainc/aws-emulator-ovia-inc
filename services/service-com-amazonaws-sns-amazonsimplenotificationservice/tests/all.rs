@@ -122,6 +122,9 @@ mod subscription_attributes;
 #[path = "all/subscription_dead_letter_queue.rs"]
 mod subscription_dead_letter_queue;
 
+#[path = "all/subscription_endpoint_rebinding.rs"]
+mod subscription_endpoint_rebinding;
+
 #[path = "all/subscription_filter_policy_delivery.rs"]
 mod subscription_filter_policy_delivery;
 

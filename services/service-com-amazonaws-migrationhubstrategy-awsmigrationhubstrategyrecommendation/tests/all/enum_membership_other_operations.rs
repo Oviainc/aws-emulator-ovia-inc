@@ -317,11 +317,13 @@ async fn an_undeclared_enum_value_is_refused_on_every_other_enum_member() {
 /// EVERY value each enumeration declares is accepted on the same path, so the refusal
 /// above is scoped to values the catalog really does not hold.
 ///
-/// A FRESH emulator per member, because what one member's rows leave behind is not part of
-/// the next member's case: a `StartRecommendationReportGeneration` row puts a report
-/// generation task in flight, and `PutPortfolioPreferences` refuses a save made while a
-/// task of the account is still running (`preferences_conflict.rs`), which has nothing to
-/// do with the enum value under test here.
+/// A FRESH emulator per ROW, because what one row leaves behind is not part of the next
+/// row's case: a `StartRecommendationReportGeneration` row puts a report generation task
+/// in flight, and both `StartRecommendationReportGeneration` (only one report generation
+/// runs at a time, `recommendation_report.rs`) and `PutPortfolioPreferences` (no save
+/// while a task of the account is running, `preferences_conflict.rs`) refuse a call made
+/// while that task is still running — which has nothing to do with the enum value under
+/// test here.
 #[tokio::test]
 async fn every_value_these_enumerations_declare_is_accepted() {
     for EnumMember {
@@ -331,8 +333,8 @@ async fn every_value_these_enumerations_declare_is_accepted() {
         declared,
     } in enum_members()
     {
-        let router = router_with_one_server();
         for value in declared {
+            let router = router_with_one_server();
             let answer = call(&router, "POST", uri, Some(request(value))).await;
             assert_eq!(
                 answer.status, 200,

@@ -294,6 +294,28 @@ impl RestApiEntry {
             .collect()
     }
 
+    /// This API's models in creation order — the oldest model first, by the creation rank
+    /// stamped on each record, exactly as this crate's other collections of an API's
+    /// children are ordered. The records are KEYED by model name, so their map order is
+    /// name order rather than the order the models were created in.
+    pub fn models_in_creation_order(&self) -> Vec<&ModelEntry> {
+        let mut ordered: Vec<&ModelEntry> = self.models.values().collect();
+        ordered.sort_by(|left, right| {
+            (left.sequence, left.name.as_str()).cmp(&(right.sequence, right.name.as_str()))
+        });
+        ordered
+    }
+
+    /// The names of [`Self::models_in_creation_order`], the stable sequence [`page_of`]
+    /// cuts a `GetModels` page out of. A model's NAME is its key — the label `GetModel`
+    /// addresses it by — so it is also the `position` cursor a page hands back.
+    pub fn model_names_in_creation_order(&self) -> Vec<String> {
+        self.models_in_creation_order()
+            .into_iter()
+            .map(|model| model.name.clone())
+            .collect()
+    }
+
     /// The names of this API's stages ASSOCIATED with `deployment_id`, in stage-name
     /// order: the one record that decides whether a deployment is still in use.
     ///

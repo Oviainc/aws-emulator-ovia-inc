@@ -421,7 +421,7 @@ fn write_composite_alarm(
         carried_state.unwrap_or_else(|| {
             (
                 Some(crate::state::ALARM_STATE_INSUFFICIENT_DATA.to_string()),
-                Some("Unchecked: initial alarm creation".to_string()),
+                Some(crate::state::INITIAL_STATE_REASON.to_string()),
                 None,
                 Some(crate::state::to_timestamp(now)),
                 Some(crate::state::to_timestamp(now)),
