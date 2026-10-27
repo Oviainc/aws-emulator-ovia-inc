@@ -7,7 +7,10 @@
 //! `Budget.LastUpdatedTime` with the time of the call. The name is unique within an
 //! account, so a second create for the same pair is a `DuplicateRecordException`, and a
 //! set of notifications or subscribers above the limits a budget can hold is a
-//! `CreationLimitExceededException`. A `ResourceTags` list naming one key twice is an
+//! `CreationLimitExceededException`. What a notification alerts on identifies it, so a
+//! `NotificationsWithSubscribers` list that names one notification twice is a
+//! `DuplicateRecordException` as well ([`crate::state::attaches_duplicate_notification`]).
+//! A `ResourceTags` list naming one key twice is an
 //! `InvalidParameterException`, since "each key must be unique for the resource"
 //! ([`crate::state::duplicate_tag_key_violation`]).
 //!
@@ -249,6 +252,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         })?;
+
+        // What a notification alerts on identifies it
+        // ([`crate::state::same_notification`]), so a budget holds at most one
+        // notification per identity: a set that names one notification twice names a
+        // notification the budget would already hold, which is the duplicate record the
+        // single-notification write path answers for exactly this input — not a second
+        // notification, and not an overwrite of the first entry's subscribers. Refused
+        // before anything is stored, so a budget this call cannot hold whole is not
+        // created at all.
+        if crate::state::attaches_duplicate_notification(
+            // A create starts the budget empty, so the only notifications the attached
+            // set can repeat are its own earlier entries.
+            &[],
+            input.notifications_with_subscribers.as_deref().unwrap_or(&[]),
+        ) {
+            return Err(CreateBudgetErrorModeled::DuplicateRecordException(
+                DuplicateRecordException {
+                    message: Some(crate::state::duplicate_notification_refusal(
+                        &input.budget.budget_name,
+                    )),
+                },
+            )
+            .into());
+        }
 
         // "Each tag consists of a key and a value, and each key must be unique for the
         // resource" (`ResourceTags`) — the tag set this create ESTABLISHES on the budget

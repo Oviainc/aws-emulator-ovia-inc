@@ -7,15 +7,16 @@
 //! RedshiftData.<Operation>` dispatched through the router, so what a suite
 //! asserts is the emulator's HTTP behaviour and not a handler's return value.
 //!
-//! This module holds NO tests; it exists so that `statement_lifecycle` and
-//! `batch_execute_statement` share one harness rather than two copies of it.
+//! This module holds NO tests; it exists so that every suite in this crate
+//! shares ONE harness rather than a copy of it each.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use service_com_amazonaws_redshiftdata_redshiftdata::state::MAX_ENGINE_DEADLINE;
 use service_com_amazonaws_redshiftdata_redshiftdata::EmulatedService;
 
 /// An `Id` in the shape the `UUID` pattern accepts that no statement was ever
@@ -35,16 +36,53 @@ pub const LONGER_THAN_A_QUICK_STATEMENT: Duration = Duration::from_millis(900);
 pub const SLOW_SQL: &str = "WITH RECURSIVE counter(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM \
                             counter WHERE x < 3000000) SELECT count(*) FROM counter";
 
-/// The `WaitTimeSeconds` every test that waits for a statement asks for: inside
-/// the modelled 1..30 range and far longer than the engine's own deadline, so a
-/// statement's recorded outcome is the engine's verdict and never the request
-/// running out of patience on a loaded machine.
-pub const WAIT_SECONDS: i32 = 10;
+/// A statement that runs until a bound stops it: it counts for ever and emits a
+/// single row, so neither the row cap nor the byte cap can end it and the only
+/// thing that can is the engine's own execution bound.
+pub const UNBOUNDED_SQL: &str = "WITH RECURSIVE counter(x) AS (SELECT 1 UNION ALL SELECT x + 1 \
+                                FROM counter) SELECT count(*) FROM counter";
+
+/// The longest wait the model admits: `WaitTimeSeconds` carries the range 1..30,
+/// and its documentation states "The maximum value is 30 seconds."
+pub const LONGEST_MODELLED_WAIT_SECONDS: i32 = 30;
+
+/// The `WaitTimeSeconds` every test that waits for a statement asks for: the
+/// most patience the model admits, which is strictly longer than the engine's
+/// own execution bound, so a statement's recorded outcome is the engine's
+/// verdict and never the request running out of patience on a loaded machine.
+///
+/// A waited request answers as soon as the execution reports, so asking for the
+/// longest wait costs a statement that finishes sooner nothing.
+pub const WAIT_SECONDS: i32 = LONGEST_MODELLED_WAIT_SECONDS;
+
+/// A wait no longer than the engine's own execution bound cannot see a statement
+/// that bound stops: the execution is armed after the request starts waiting, so
+/// it reports at the earliest when that wait is already over, and the waiting
+/// caller reads the non-terminal status instead. Which bound stops a statement
+/// first otherwise depends on the instruction rate the host sustains, so a
+/// waiting suite would pass on one machine and fail on another. Checked here so
+/// the two bounds cannot drift back together unnoticed.
+const _: () = assert!(
+    WAIT_SECONDS > 0 && MAX_ENGINE_DEADLINE.as_secs() < WAIT_SECONDS.unsigned_abs() as u64,
+    "the wait a waiting test asks for must outlast the engine's own execution bound"
+);
 
 /// A lower bound, in seconds, on how long a statement that produced a result
 /// ran for: its `UpdatedAt` is the instant its execution finished, so it is at
 /// or after the instant it was submitted.
 pub const RUN_TIME_LOWER_BOUND_SECONDS: f64 = 0.0;
+
+/// The statuses a statement's lifecycle ends at.
+pub const TERMINAL_STATUSES: [&str; 3] = ["FINISHED", "FAILED", "ABORTED"];
+
+/// How long [`wait_for_terminal`] gives a submitted statement: the engine's own
+/// execution bound and room to spare, so a poll gives up because a statement
+/// never terminated and never because the machine running the test was busy.
+const TERMINAL_STATUS_BUDGET: Duration =
+    MAX_ENGINE_DEADLINE.saturating_add(Duration::from_secs(30));
+
+/// How long to wait between two polls of a statement's status.
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// One emulator: a router with only this service mounted, over one shared engine.
 pub struct Emulator {
@@ -137,6 +175,28 @@ impl Emulator {
         let mut request = request.clone();
         request["WaitTimeSeconds"] = json!(WAIT_SECONDS);
         self.ok("BatchExecuteStatement", &request).await
+    }
+}
+
+/// Poll `id` until it reports a terminal status, and answer the record it
+/// reported. Gives up once [`TERMINAL_STATUS_BUDGET`] has passed: an execution
+/// runs independently of the request that submitted it, so a statement that
+/// never reaches a decision is a defect and not a slow machine.
+pub async fn wait_for_terminal(emulator: &Emulator, case: &str, id: &str) -> Value {
+    let started = Instant::now();
+    loop {
+        let described = emulator.ok("DescribeStatement", &json!({"Id": id})).await;
+        let status = described["Status"].as_str().unwrap_or_default().to_string();
+        if TERMINAL_STATUSES.contains(&status.as_str()) {
+            return described;
+        }
+        assert!(
+            started.elapsed() < TERMINAL_STATUS_BUDGET,
+            "case {case}: {id} reported {status:?} for {:?} and never reached a terminal \
+             status: {described}",
+            started.elapsed()
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
 

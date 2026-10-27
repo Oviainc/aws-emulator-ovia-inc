@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteReservation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteReservation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteReservation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +170,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteReservation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteReservationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteReservation"))
+        // `ctx` carries request metadata only: a reservation stays in the region
+        // it was purchased in — that region is on the record and in its ARN — so
+        // this delete reads nothing off the region it was signed for.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        // `settle` first, as every operation does: it materialises only what the
+        // clock had already made due, so it never changes what a later caller
+        // would otherwise have seen. The reservation's own lease needs no write
+        // at all — its `State` is derived from its `End` and this instant, and
+        // that derived state is what this delete is judged against.
+        state.settle(now);
+
+        // "Delete an expired reservation": an id the account holds no
+        // reservation for leaves nothing to delete, which is this operation's
+        // modelled 404, and a reservation whose lease is still running is the
+        // resource being in a state that prevents the action, which is the
+        // modelled 409 — and that refusal writes nothing, so a refused delete
+        // is never a no-op. A reservation already deleted is already in the
+        // state the caller asked for, so a repeat is idempotent.
+        let reservation = state
+            .delete_reservation(&input.reservation_id, now)
+            .map_err(|refusal| match refusal {
+                crate::state::ReservationDeleteRefusal::Unknown => not_found(
+                    crate::state::not_found_message("Reservation", &input.reservation_id),
+                ),
+                crate::state::ReservationDeleteRefusal::NotExpired { state } => {
+                    still_leased(crate::state::reservation_not_expired_message(
+                        &input.reservation_id,
+                        state,
+                    ))
+                }
+            })?;
+
+        // The deleted reservation read back out of the STORE, through the one
+        // projection a purchase, `DescribeReservation` and `ListReservations`
+        // also answer from: the record is kept in the terminal `DELETED` state
+        // its own enum declares, so those readers go on reporting the
+        // reservation there and cannot drift from what this delete answered.
+        Ok(DeleteReservationOutput {
+            arn: reservation.arn,
+            count: reservation.count,
+            currency_code: reservation.currency_code,
+            duration: reservation.duration,
+            duration_units: reservation.duration_units,
+            end: reservation.end,
+            fixed_price: reservation.fixed_price,
+            name: reservation.name,
+            offering_description: reservation.offering_description,
+            offering_id: reservation.offering_id,
+            offering_type: reservation.offering_type,
+            region: reservation.region,
+            renewal_settings: reservation.renewal_settings,
+            reservation_id: reservation.reservation_id,
+            resource_specification: reservation.resource_specification,
+            start: reservation.start,
+            state: reservation.state,
+            tags: reservation.tags,
+            usage_price: reservation.usage_price,
+        })
     }
+}
+
+/// A `ReservationId` naming no reservation this account holds, as the 404
+/// `NotFoundException` this operation models.
+fn not_found(message: String) -> DeleteReservationError {
+    DeleteReservationErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// A reservation whose lease has not run out, as the 409 `ConflictException`
+/// this operation models — the answer this service gives a resource whose
+/// current state prevents the action asked of it (the same answer
+/// `DeleteChannel` and `DeleteMultiplex` give one that is not idle).
+fn still_leased(message: String) -> DeleteReservationError {
+    DeleteReservationErrorModeled::ConflictException(ConflictException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to delete the reservation from. A modelled server error,
+/// never a fresh engine (which would drop the deletion on return).
+fn unavailable() -> DeleteReservationError {
+    DeleteReservationErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }

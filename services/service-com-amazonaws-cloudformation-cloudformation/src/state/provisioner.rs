@@ -269,6 +269,28 @@
 //!   property, which commits a bundle from Amazon S3 into the new repository, is mapped onto
 //!   no call here and is REFUSED rather than dropped.
 //!
+//! * `AWS::Route53::HostedZone`'s properties reach `CreateHostedZone` member by member —
+//!   the zone's `Name`, its `HostedZoneConfig`'s comment and the first of the `VPCs` a
+//!   private zone answers for, each further one an `AssociateVPCWithHostedZone` of its own —
+//!   beside the `CallerReference` every such create requires and the type publishes no
+//!   property for ([`hosted_zone_caller_reference`]). Its `HostedZoneTags` are no member of
+//!   that create at all: a zone is tagged by `ChangeTagsForResource`, in the batches that
+//!   call's own bound admits. The zone's identity is Route 53's OWN — "Ref returns the hosted
+//!   zone ID", which that create MINTS and no naming rule could compute — so the id it
+//!   answered with is what the stack reports for the resource, and that is the value
+//!   `GetHostedZone`, `TestDNSAnswer` and a record set's `HostedZoneId` all take.
+//!
+//! * `AWS::Route53::RecordSet`'s properties ARE the members of the `ResourceRecordSet` a
+//!   change batch carries ([`RECORD_SET_MEMBERS`]), spelled identically on both sides, with
+//!   one shaped differently — `ResourceRecords` is a list of record VALUES in a template and
+//!   a list of `ResourceRecord` structures on the wire — and three that are no members of it:
+//!   `HostedZoneId`/`HostedZoneName` say which zone holds the record (the first IS the id,
+//!   the second is resolved through `ListHostedZonesByName` as a client resolves it), and
+//!   `Comment` is the change batch's own. A record set is created by the `CREATE` action and
+//!   removed by the `DELETE` one, which Route 53 matches against the record's own values, so
+//!   the delete carries the declaration the create was made from. Its identity is
+//!   CloudFormation's ("Ref returns the record name"), so the create answers none of its own.
+//!
 //! ## The tags every created resource carries
 //!
 //! Beside what its declaration asks for, a resource CloudFormation creates carries the tags
@@ -302,8 +324,8 @@ use std::collections::BTreeMap;
 use serde_json::{Map, Value};
 
 use super::provisioning::{
-    call_json_rpc, call_query, call_rest_json, percent_encoded, xml_element, xml_entry_map,
-    xml_scalar_children, Created, Refusal, AWS_JSON_1_0, AWS_JSON_1_1,
+    call_json_rpc, call_query, call_rest_json, call_rest_xml, percent_encoded, xml_element,
+    xml_entry_map, xml_leaf, xml_scalar_children, Created, Refusal, AWS_JSON_1_0, AWS_JSON_1_1,
 };
 use super::template::{
     ACM_ACME_ENDPOINT, AOSS_COLLECTION, AOSS_SECURITY_POLICY, APIGATEWAYV2_API,
@@ -317,7 +339,7 @@ use super::template::{
     ELASTIC_BEANSTALK_ENVIRONMENT, GRAFANA_WORKSPACE, GUARDDUTY_DETECTOR, KMS_KEY,
     MQ_BROKER, MSK_CLUSTER,
     MSK_SERVERLESS_CLUSTER, ROUTE53RESOLVER_ENDPOINT, ROUTE53RESOLVER_RULE,
-    ROUTE53RESOLVER_RULE_ASSOCIATION,
+    ROUTE53RESOLVER_RULE_ASSOCIATION, ROUTE53_HOSTED_ZONE, ROUTE53_RECORD_SET,
     S3VECTORS_BUCKET_SEGMENT, S3VECTORS_INDEX,
     S3VECTORS_VECTOR_BUCKET, SAGEMAKER_MODEL_PACKAGE_GROUP, SCHEDULER_SCHEDULE,
     SCHEDULER_SCHEDULE_GROUP, SES_CONFIGURATION_SET, SNS_SUBSCRIPTION,
@@ -423,6 +445,8 @@ pub(super) enum Provisioner {
     Route53ResolverEndpoint,
     Route53ResolverRule,
     Route53ResolverRuleAssociation,
+    Route53HostedZone,
+    Route53RecordSet,
     ElasticBeanstalkApplication,
     ElasticBeanstalkApplicationVersion,
     ElasticBeanstalkEnvironment,
@@ -489,6 +513,8 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         ROUTE53RESOLVER_ENDPOINT => Some(Provisioner::Route53ResolverEndpoint),
         ROUTE53RESOLVER_RULE => Some(Provisioner::Route53ResolverRule),
         ROUTE53RESOLVER_RULE_ASSOCIATION => Some(Provisioner::Route53ResolverRuleAssociation),
+        ROUTE53_HOSTED_ZONE => Some(Provisioner::Route53HostedZone),
+        ROUTE53_RECORD_SET => Some(Provisioner::Route53RecordSet),
         ELASTIC_BEANSTALK_APPLICATION => Some(Provisioner::ElasticBeanstalkApplication),
         ELASTIC_BEANSTALK_APPLICATION_VERSION => {
             Some(Provisioner::ElasticBeanstalkApplicationVersion)
@@ -679,6 +705,13 @@ impl Provisioner {
             Self::Route53ResolverRuleAssociation => {
                 associate_resolver_rule(ctx, region, resource).await
             }
+            Self::Route53HostedZone => {
+                create_hosted_zone(ctx, region, resource, propagated).await
+            }
+            // `AWS::Route53::RecordSet` publishes no `Tags` property — Route 53 tags a
+            // hosted zone, not a record set — so the type is not taggable and no tags are
+            // propagated to one.
+            Self::Route53RecordSet => create_record_set(ctx, region, resource).await,
             // `AWS::ElasticBeanstalk::Application` publishes `ApplicationName`,
             // `Description` and `ResourceLifecycleConfig` and no `Tags`: the type is not
             // taggable, so no tags are propagated to it. The same goes for
@@ -1081,6 +1114,12 @@ impl Provisioner {
             Self::Route53ResolverRuleAssociation => {
                 disassociate_resolver_rule(ctx, region, resource).await
             }
+            Self::Route53HostedZone => {
+                delete_hosted_zone(ctx, region, physical_resource_id).await
+            }
+            // Route 53 removes a record set by its own values, which only the resource's
+            // own record carries — as is the zone its declaration names.
+            Self::Route53RecordSet => delete_record_set(ctx, region, resource).await,
             Self::ElasticBeanstalkApplication => {
                 delete_eb_application(ctx, region, physical_resource_id).await
             }
@@ -1275,6 +1314,12 @@ impl Provisioner {
             Self::Route53ResolverRuleAssociation => {
                 describe_resolver_rule_association(ctx, region, physical_resource_id).await
             }
+            Self::Route53HostedZone => {
+                describe_hosted_zone(ctx, region, physical_resource_id).await
+            }
+            // The read is addressed by the record's own name, type and set identifier in the
+            // zone its declaration names, which only the resource's own record carries.
+            Self::Route53RecordSet => describe_record_set(ctx, region, resource).await,
             Self::ElasticBeanstalkApplication => {
                 describe_eb_application(ctx, region, physical_resource_id).await
             }
@@ -13891,9 +13936,1008 @@ async fn call_ses(
     .await
 }
 
+// ---------------------------------------------------------------------------
+// Amazon Route 53: AWS::Route53::HostedZone and AWS::Route53::RecordSet
+// ---------------------------------------------------------------------------
+
+/// Route 53's signing name, from its model (`sigv4Name: route53`), which speaks `restXml`.
+const ROUTE53_SIGNING_NAME: &str = "route53";
+
+/// The API-version prefix every Route 53 operation's URI carries, from the HTTP bindings
+/// its model declares (`POST /2013-04-01/hostedzone`).
+const ROUTE53_URI_PREFIX: &str = "/2013-04-01";
+
+/// The namespace a Route 53 request document carries: that model's own
+/// `xmlNamespace.uri`.
+const ROUTE53_XML_NAMESPACE: &str = "https://route53.amazonaws.com/doc/2013-04-01/";
+
+/// The error code Route 53 answers for a hosted zone it does not hold: "No hosted zone
+/// exists with the ID that you specified" (`NoSuchHostedZone`).
+const NO_SUCH_HOSTED_ZONE: &str = "NoSuchHostedZone";
+
+/// The prefix Route 53 wraps a hosted zone id in where it reports one
+/// (`HostedZone$Id` comes back as `/hostedzone/Z…`), and which every operation that TAKES a
+/// zone id accepts beside the bare form.
+const HOSTED_ZONE_ID_PATH_PREFIX: &str = "/hostedzone/";
+
+/// The `ResourceType` a tagging call names a hosted zone under: "The resource type for
+/// hosted zones is `hostedzone`" (`ChangeTagsForResource$ResourceType`).
+const HOSTED_ZONE_TAG_RESOURCE_TYPE: &str = "hostedzone";
+
+/// The most tags one `ChangeTagsForResource` carries: its `AddTags` list is
+/// `@length(min: 1, max: 10)`, so a larger set is applied in that many calls.
+const MAX_TAGS_PER_TAG_CHANGE: usize = 10;
+
+/// The two change-batch actions this module asks for: "CREATE: Creates a resource record
+/// set that has the specified values" and "DELETE: Deletes a existing resource record set"
+/// (`Change$Action`).
+const RECORD_SET_CREATE: &str = "CREATE";
+const RECORD_SET_DELETE: &str = "DELETE";
+
+/// The properties of `AWS::Route53::HostedZone` this arm maps onto `CreateHostedZone` and
+/// the calls beside it.
+///
+/// Source: AWS's CloudFormation resource reference for the type. `Name` is the zone's DNS
+/// name, `HostedZoneConfig` carries the zone's comment, `VPCs` are the Amazon VPCs a private
+/// zone answers for, and `HostedZoneTags` are the zone's own tags. The one published
+/// property NOT here is `QueryLoggingConfig`, which is a `CreateQueryLoggingConfig` of its
+/// own that this emulator does not serve yet — a declaration carrying it is REFUSED rather
+/// than reported as a zone created without the query logging it asked for.
+const HOSTED_ZONE_PROPERTIES: &[&str] = &["Name", "HostedZoneConfig", "VPCs", "HostedZoneTags"];
+
+/// Call one Route 53 operation in process, on the URI its model binds that operation to.
+async fn call_route53(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    method: &'static str,
+    uri: &str,
+    body: Option<&str>,
+) -> Result<String, Refusal> {
+    call_rest_xml(
+        ctx,
+        ROUTE53_SIGNING_NAME,
+        region,
+        method,
+        &format!("{ROUTE53_URI_PREFIX}{uri}"),
+        body,
+    )
+    .await
+}
+
+/// One Route 53 request document: the operation's input shape as the root element, under
+/// the namespace that model declares, wrapping the members already rendered.
+fn route53_request(root: &str, members: &str) -> String {
+    format!("<{root} xmlns=\"{ROUTE53_XML_NAMESPACE}\">{members}</{root}>")
+}
+
+/// A hosted zone id in the BARE form every `ResourceId` member is bounded for: the
+/// `/hostedzone/` prefix a Route 53 answer wraps one in, stripped.
+///
+/// A value that does not carry the prefix is already bare, which is what a template that
+/// states a zone id literally writes.
+fn bare_hosted_zone_id(id: &str) -> &str {
+    id.strip_prefix(HOSTED_ZONE_ID_PATH_PREFIX).unwrap_or(id)
+}
+
+/// A DNS name in the fully-qualified form Route 53 compares names in: lower case with a
+/// trailing dot, since "Route 53 treats `www.example.com` (without a trailing dot) and
+/// `www.example.com.` (with a trailing dot) as identical" (`ResourceRecordSet$Name`).
+fn fully_qualified(name: &str) -> String {
+    let name = name.to_ascii_lowercase();
+    if name.ends_with('.') {
+        name
+    } else {
+        format!("{name}.")
+    }
+}
+
+/// The refusal for a declared property no arm maps onto the owning API's request, naming
+/// which property it was: refusing is what keeps a resource from being reported as created
+/// with less than its declaration asked for.
+fn refuse_unmapped_properties(
+    resource: &StoredResource,
+    mapped: &[&str],
+) -> Result<(), Refusal> {
+    let Value::Object(properties) = &resource.properties else {
+        return Ok(());
+    };
+    for property in properties.keys() {
+        if !mapped.contains(&property.as_str()) {
+            return Err(Refusal {
+                code: NOT_IMPLEMENTED.to_string(),
+                message: format!(
+                    "this emulator does not apply the {property} property of {}",
+                    resource.resource_type
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The `CallerReference` CloudFormation sends with `CreateHostedZone`.
+///
+/// That member is REQUIRED ("a unique string that identifies the request and that allows
+/// failed CreateHostedZone requests to be retried without the risk of executing the
+/// operation twice") and the resource type publishes no property for it, so it is
+/// CloudFormation's to supply. It is derived from the stack this resource belongs to and its
+/// place in it — the two tags CloudFormation records on every resource it provisions — so it
+/// is unique per stack and logical id, and the SAME string if this deployment is attempted
+/// again, which is exactly the retry that member exists for. The digest keeps it inside the
+/// `Nonce` bound (1..128) whatever the stack is called.
+fn hosted_zone_caller_reference(
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> String {
+    let stack = propagated
+        .iter()
+        .find(|(key, _)| key == super::provisioning::STACK_ID_TAG)
+        .map(|(_, value)| value.as_str())
+        .unwrap_or_default();
+    super::template::content_digest(
+        "route53-hosted-zone",
+        &format!("{stack}/{}", resource.logical_id),
+        32,
+    )
+}
+
+/// Each Amazon VPC a hosted zone's declaration names, as the `VPC` element `CreateHostedZone`
+/// and `AssociateVPCWithHostedZone` both take.
+///
+/// `VPCs` is a list of `{VPCId, VPCRegion}`, spelled exactly as that shape's own members
+/// are, so each entry is rendered member by member. A declaration whose `VPCs` is not a list
+/// of such structures describes no VPC association and is refused.
+fn hosted_zone_vpcs(resource: &StoredResource) -> Result<Vec<String>, Refusal> {
+    let Some(declared) = resource.properties.get("VPCs") else {
+        return Ok(Vec::new());
+    };
+    let Value::Array(entries) = declared else {
+        return Err(malformed_property("VPCs"));
+    };
+    let mut elements = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Value::Object(members) = entry else {
+            return Err(malformed_property("VPCs"));
+        };
+        let mut rendered = String::new();
+        // In the order the `VPC` shape declares them.
+        for member in ["VPCRegion", "VPCId"] {
+            if let Some(value) = members.get(member).and_then(scalar_text) {
+                rendered.push_str(&xml_leaf(member, &value));
+            }
+        }
+        elements.push(format!("<VPC>{rendered}</VPC>"));
+    }
+    Ok(elements)
+}
+
+/// Create the hosted zone an `AWS::Route53::HostedZone` declares, so a client reading the
+/// stack's outputs and then calling Route 53 with that value — `GetHostedZone`,
+/// `TestDNSAnswer`, a record set's own `HostedZoneId` — reaches the zone the template asked
+/// for.
+///
+/// `Ref` on this resource returns the hosted zone ID, which `CreateHostedZone` MINTS and
+/// reports in its `/hostedzone/`-prefixed form, so the bare id that answer carries replaces
+/// the computed physical id and the type's `Id` attribute is read off it
+/// ([`super::provisioning::adopt_minted_identity`]).
+///
+/// A private zone's first declared VPC is carried on the create — "if you are associating a
+/// VPC with a hosted zone with this request, the paramaters VPCId and VPCRegion are also
+/// required" — and each further one is an `AssociateVPCWithHostedZone` of its own on the zone
+/// just created, the same second call a client makes. The zone carries the tags its
+/// declaration asks for plus the ones CloudFormation gives the resource ([`tags_of`]),
+/// applied through `ChangeTagsForResource`, which is how Route 53 tags a zone:
+/// `CreateHostedZone` takes no tags at all.
+async fn create_hosted_zone(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    refuse_unmapped_properties(resource, HOSTED_ZONE_PROPERTIES)?;
+    // Required by the type and by the create alike: a declaration with no name describes no
+    // zone that could be created, so it is refused here rather than with a request Route 53
+    // would have to reject.
+    let name = property(resource, "Name").ok_or_else(|| Refusal {
+        code: MISSING_PROPERTY_CODE.to_string(),
+        message: format!(
+            "Property Name cannot be empty for resource of type {}",
+            resource.resource_type
+        ),
+    })?;
+    let vpcs = hosted_zone_vpcs(resource)?;
+    // In the order `CreateHostedZoneRequest` declares its members.
+    let mut members = xml_leaf("Name", &name);
+    if let Some(first) = vpcs.first() {
+        members.push_str(first);
+    }
+    members.push_str(&xml_leaf(
+        "CallerReference",
+        &hosted_zone_caller_reference(resource, propagated),
+    ));
+    // The type's `HostedZoneConfig` publishes `Comment` alone; whether the zone is private
+    // follows from the VPCs it names, which is what `CreateHostedZone` reads it from.
+    if let Some(comment) = resource
+        .properties
+        .get("HostedZoneConfig")
+        .and_then(|config| config.get("Comment"))
+        .and_then(scalar_text)
+    {
+        members.push_str(&format!(
+            "<HostedZoneConfig>{}</HostedZoneConfig>",
+            xml_leaf("Comment", &comment)
+        ));
+    }
+    let answered = call_route53(
+        ctx,
+        region,
+        "POST",
+        "/hostedzone",
+        Some(&route53_request("CreateHostedZoneRequest", &members)),
+    )
+    .await?;
+    let reported = xml_scalar_children(&answered, "HostedZone");
+    let id = reported
+        .get("Id")
+        .and_then(Value::as_str)
+        .map(bare_hosted_zone_id)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| Refusal {
+            code: UNIDENTIFIED_FAILURE.to_string(),
+            message: "CreateHostedZone answered no HostedZone.Id".to_string(),
+        })?
+        .to_string();
+    for vpc in vpcs.iter().skip(1) {
+        call_route53(
+            ctx,
+            region,
+            "POST",
+            &format!("/hostedzone/{}/associatevpc", percent_encoded(&id)),
+            Some(&route53_request(
+                "AssociateVPCWithHostedZoneRequest",
+                vpc,
+            )),
+        )
+        .await?;
+    }
+    change_hosted_zone_tags(ctx, region, &id, &hosted_zone_tags(resource, propagated)).await?;
+    Ok(Created {
+        physical_resource_id: Some(id),
+        attributes: BTreeMap::new(),
+    })
+}
+
+/// The tags a hosted zone is to carry: the ones its declaration asks for plus the ones
+/// CloudFormation gives the resource.
+///
+/// This type spells its tag property `HostedZoneTags` rather than `Tags`, so the declared
+/// list is read under the name [`tags_of`] — the one place the declared and the propagated
+/// halves are merged — looks for.
+fn hosted_zone_tags(
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Vec<(String, String)> {
+    let declared = resource
+        .properties
+        .get("HostedZoneTags")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let mut properties = Map::new();
+    properties.insert("Tags".to_string(), declared);
+    tags_of(&Value::Object(properties), propagated)
+}
+
+/// Add `tags` to the hosted zone `id`, in the batches `ChangeTagsForResource` takes
+/// ([`MAX_TAGS_PER_TAG_CHANGE`]). A zone to carry no tags at all has nothing called about
+/// it: that call's `AddTags` is `@length(min: 1, …)`.
+async fn change_hosted_zone_tags(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    id: &str,
+    tags: &[(String, String)],
+) -> Result<(), Refusal> {
+    for batch in tags.chunks(MAX_TAGS_PER_TAG_CHANGE) {
+        let mut added = String::new();
+        for (key, value) in batch {
+            added.push_str(&format!(
+                "<Tag>{}{}</Tag>",
+                xml_leaf("Key", key),
+                xml_leaf("Value", value)
+            ));
+        }
+        call_route53(
+            ctx,
+            region,
+            "POST",
+            &format!(
+                "/tags/{HOSTED_ZONE_TAG_RESOURCE_TYPE}/{}",
+                percent_encoded(id)
+            ),
+            Some(&route53_request(
+                "ChangeTagsForResourceRequest",
+                &format!("<AddTags>{added}</AddTags>"),
+            )),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Delete the hosted zone a stack created, by the id its create minted. A zone Route 53 no
+/// longer holds (`NoSuchHostedZone`) is already in the state the delete asks for.
+///
+/// "You can delete a hosted zone only if it contains no resource record sets other than the
+/// default SOA record and NS resource record sets": a stack that declares record sets in its
+/// own zone deletes them FIRST, because [`super::provisioning::delete`] deletes a stack's
+/// resources in the reverse of the order they were created in, and a record set depends on
+/// the zone that holds it.
+async fn delete_hosted_zone(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    match call_route53(
+        ctx,
+        region,
+        "DELETE",
+        &format!("/hostedzone/{}", percent_encoded(physical_resource_id)),
+        None,
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == NO_SUCH_HOSTED_ZONE => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The hosted zone's configuration as Route 53 reports it, for drift detection. An id it no
+/// longer holds a zone for (`NoSuchHostedZone`) was deleted.
+///
+/// Only the members `GetHostedZone` reports in the same shape the type declares them in are
+/// compared: the zone's `Name`, which is the one property of this type that is also a scalar
+/// member of the reported zone. The declared `VPCs` and `HostedZoneTags` are not members of
+/// it at all, and a property the actual document does not carry is not evidence of anything
+/// ([`super::drift::differs`]).
+async fn describe_hosted_zone(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let answered = match call_route53(
+        ctx,
+        region,
+        "GET",
+        &format!("/hostedzone/{}", percent_encoded(physical_resource_id)),
+        None,
+    )
+    .await
+    {
+        Ok(answered) => answered,
+        Err(refusal) if refusal.code == NO_SUCH_HOSTED_ZONE => return Ok(None),
+        Err(refusal) => return Err(refusal),
+    };
+    let reported = Value::Object(xml_scalar_children(&answered, "HostedZone"));
+    Ok(Some(reported_as_properties(&reported, &[("Name", "Name")])))
+}
+
+/// What one published property of `AWS::Route53::RecordSet` is on the `ResourceRecordSet`
+/// the change batch carries.
+#[derive(Debug, Clone, Copy)]
+enum RecordSetMember {
+    /// A scalar member, written as its own element carrying the declared text.
+    Scalar,
+    /// The record's VALUES: a list of strings in a template, a list of `ResourceRecord`
+    /// structures on the wire ("`Value` — the current or new DNS record value").
+    Records,
+    /// A nested structure, whose own members are these.
+    Structure(&'static [(&'static str, RecordSetMember)]),
+}
+
+/// `GeoLocation`'s members, spelled identically on the type and in the model.
+const GEO_LOCATION_MEMBERS: &[(&str, RecordSetMember)] = &[
+    ("ContinentCode", RecordSetMember::Scalar),
+    ("CountryCode", RecordSetMember::Scalar),
+    ("SubdivisionCode", RecordSetMember::Scalar),
+];
+
+/// `Coordinates`' members, the latitude and longitude a geoproximity rule is measured from.
+const COORDINATES_MEMBERS: &[(&str, RecordSetMember)] = &[
+    ("Latitude", RecordSetMember::Scalar),
+    ("Longitude", RecordSetMember::Scalar),
+];
+
+/// `GeoProximityLocation`'s members.
+const GEO_PROXIMITY_MEMBERS: &[(&str, RecordSetMember)] = &[
+    ("AWSRegion", RecordSetMember::Scalar),
+    ("LocalZoneGroup", RecordSetMember::Scalar),
+    ("Coordinates", RecordSetMember::Structure(COORDINATES_MEMBERS)),
+    ("Bias", RecordSetMember::Scalar),
+];
+
+/// `AliasTarget`'s members — the zone and the DNS name an alias routes to, and whether it
+/// inherits that target's health.
+const ALIAS_TARGET_MEMBERS: &[(&str, RecordSetMember)] = &[
+    ("HostedZoneId", RecordSetMember::Scalar),
+    ("DNSName", RecordSetMember::Scalar),
+    ("EvaluateTargetHealth", RecordSetMember::Scalar),
+];
+
+/// `CidrRoutingConfig`'s members.
+const CIDR_ROUTING_MEMBERS: &[(&str, RecordSetMember)] = &[
+    ("CollectionId", RecordSetMember::Scalar),
+    ("LocationName", RecordSetMember::Scalar),
+];
+
+/// Every published property of `AWS::Route53::RecordSet` that is a member of the
+/// `ResourceRecordSet` the change batch carries, in the order the model declares those
+/// members.
+///
+/// The type's properties ARE that shape's members, spelled identically on both sides, with
+/// one exception: `ResourceRecords` is a list of record VALUES in a template and a list of
+/// `ResourceRecord` structures on the wire. The three published properties that are NOT
+/// members of it are handled by the arm itself — `HostedZoneId` and `HostedZoneName` say
+/// which zone the record belongs to (the URI label the operation binds), and `Comment` is
+/// the `ChangeBatch`'s own.
+const RECORD_SET_MEMBERS: &[(&str, RecordSetMember)] = &[
+    ("Name", RecordSetMember::Scalar),
+    ("Type", RecordSetMember::Scalar),
+    ("SetIdentifier", RecordSetMember::Scalar),
+    ("Weight", RecordSetMember::Scalar),
+    ("Region", RecordSetMember::Scalar),
+    ("GeoLocation", RecordSetMember::Structure(GEO_LOCATION_MEMBERS)),
+    ("Failover", RecordSetMember::Scalar),
+    ("MultiValueAnswer", RecordSetMember::Scalar),
+    ("TTL", RecordSetMember::Scalar),
+    ("ResourceRecords", RecordSetMember::Records),
+    ("AliasTarget", RecordSetMember::Structure(ALIAS_TARGET_MEMBERS)),
+    ("HealthCheckId", RecordSetMember::Scalar),
+    ("CidrRoutingConfig", RecordSetMember::Structure(CIDR_ROUTING_MEMBERS)),
+    (
+        "GeoProximityLocation",
+        RecordSetMember::Structure(GEO_PROXIMITY_MEMBERS),
+    ),
+];
+
+/// The properties of `AWS::Route53::RecordSet` this arm maps onto a change batch: the
+/// members of the record set itself, plus the three that are not members of it.
+fn record_set_properties() -> Vec<&'static str> {
+    let mut mapped: Vec<&'static str> = RECORD_SET_MEMBERS.iter().map(|(name, _)| *name).collect();
+    mapped.extend(["HostedZoneId", "HostedZoneName", "Comment"]);
+    mapped
+}
+
+/// One member of a record set as the change batch carries it, or `None` for a property the
+/// declaration does not state.
+fn record_set_member(
+    name: &str,
+    member: RecordSetMember,
+    declared: &Value,
+) -> Result<Option<String>, Refusal> {
+    match member {
+        RecordSetMember::Scalar => Ok(scalar_text(declared)
+            .filter(|text| !text.is_empty())
+            .map(|text| xml_leaf(name, &text))),
+        RecordSetMember::Records => {
+            let Value::Array(values) = declared else {
+                return Err(malformed_property(name));
+            };
+            let mut records = String::new();
+            for value in values {
+                let value = scalar_text(value).ok_or_else(|| malformed_property(name))?;
+                records.push_str(&format!(
+                    "<ResourceRecord>{}</ResourceRecord>",
+                    xml_leaf("Value", &value)
+                ));
+            }
+            Ok(Some(format!("<{name}>{records}</{name}>")))
+        }
+        RecordSetMember::Structure(members) => {
+            let Value::Object(declared) = declared else {
+                return Err(malformed_property(name));
+            };
+            let mut rendered = String::new();
+            for (member_name, member) in members {
+                if let Some(value) = declared.get(*member_name) {
+                    if let Some(written) = record_set_member(member_name, *member, value)? {
+                        rendered.push_str(&written);
+                    }
+                }
+            }
+            // A member of the structure the catalogue does not name is no member of the
+            // shape: refused rather than dropped, so a record set is never created with
+            // less than its declaration asked for.
+            for member_name in declared.keys() {
+                if !members.iter().any(|(known, _)| known == member_name) {
+                    return Err(malformed_property(&format!("{name}.{member_name}")));
+                }
+            }
+            Ok(Some(format!("<{name}>{rendered}</{name}>")))
+        }
+    }
+}
+
+/// The `ResourceRecordSet` element one `AWS::Route53::RecordSet` declares.
+fn record_set_element(resource: &StoredResource) -> Result<String, Refusal> {
+    refuse_unmapped_properties(resource, &record_set_properties())?;
+    for required in ["Name", "Type"] {
+        if property(resource, required).is_none() {
+            return Err(Refusal {
+                code: MISSING_PROPERTY_CODE.to_string(),
+                message: format!(
+                    "Property {required} cannot be empty for resource of type {}",
+                    resource.resource_type
+                ),
+            });
+        }
+    }
+    let mut rendered = String::new();
+    for (name, member) in RECORD_SET_MEMBERS {
+        let Some(declared) = resource.properties.get(*name) else {
+            continue;
+        };
+        if let Some(written) = record_set_member(name, *member, declared)? {
+            rendered.push_str(&written);
+        }
+    }
+    Ok(format!("<ResourceRecordSet>{rendered}</ResourceRecordSet>"))
+}
+
+/// The hosted zone a record set's declaration names, as the id Route 53 addresses it by.
+///
+/// A declaration states one of the two published properties: `HostedZoneId`, which IS that
+/// id — and is what a reference to a zone of the same template resolves to — or
+/// `HostedZoneName`, the zone's DNS name, which `ListHostedZonesByName` resolves to the id
+/// the same way a client does. A declaration that states neither names no zone to write the
+/// record in and is refused.
+async fn record_set_zone_id(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<String, Refusal> {
+    if let Some(id) = property(resource, "HostedZoneId") {
+        return Ok(bare_hosted_zone_id(&id).to_string());
+    }
+    let Some(name) = property(resource, "HostedZoneName") else {
+        return Err(Refusal {
+            code: MISSING_PROPERTY_CODE.to_string(),
+            message: format!(
+                "{} declares neither HostedZoneId nor HostedZoneName",
+                resource.resource_type
+            ),
+        });
+    };
+    let wanted = fully_qualified(&name);
+    let answered = call_route53(
+        ctx,
+        region,
+        "GET",
+        &format!(
+            "/hostedzonesbyname?dnsname={}&maxitems=1",
+            percent_encoded(&wanted)
+        ),
+        None,
+    )
+    .await?;
+    // The listing starts at the name asked for, so the first zone it reports is the one
+    // that name belongs to — if the account holds it at all.
+    let reported = xml_scalar_children(&answered, "HostedZone");
+    let found = reported
+        .get("Name")
+        .and_then(Value::as_str)
+        .filter(|held| fully_qualified(held) == wanted)
+        .and_then(|_| reported.get("Id"))
+        .and_then(Value::as_str)
+        .map(bare_hosted_zone_id);
+    found.map(ToString::to_string).ok_or_else(|| Refusal {
+        code: NO_SUCH_HOSTED_ZONE.to_string(),
+        message: format!("No hosted zone found with DNS name {wanted}"),
+    })
+}
+
+/// Apply one change to the record set an `AWS::Route53::RecordSet` declares, in the zone its
+/// declaration names.
+async fn change_record_set(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    action: &str,
+) -> Result<(), Refusal> {
+    let zone = record_set_zone_id(ctx, region, resource).await?;
+    let record = record_set_element(resource)?;
+    // "Optional: Any comments you want to include about a change batch request"
+    // (`ChangeBatch$Comment`), which is the type's own `Comment` property.
+    let comment = property(resource, "Comment")
+        .map(|comment| xml_leaf("Comment", &comment))
+        .unwrap_or_default();
+    let batch = format!(
+        "<ChangeBatch>{comment}<Changes><Change>{}{record}</Change></Changes></ChangeBatch>",
+        xml_leaf("Action", action)
+    );
+    call_route53(
+        ctx,
+        region,
+        "POST",
+        &format!("/hostedzone/{}/rrset", percent_encoded(&zone)),
+        Some(&route53_request("ChangeResourceRecordSetsRequest", &batch)),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Create the record set an `AWS::Route53::RecordSet` declares, so a DNS query for that name
+/// — `TestDNSAnswer`, or a resolver reading the zone — is answered with the values the
+/// template declared.
+///
+/// `Ref` on this resource returns the record's name, which is the `Name` its declaration
+/// states and the physical id CloudFormation's naming rules already computed, so the create
+/// answers no identity of its own. The type publishes no `Tags` property — Route 53 tags a
+/// hosted zone, not a record set — so no tags are propagated to one.
+async fn create_record_set(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    change_record_set(ctx, region, resource, RECORD_SET_CREATE).await?;
+    Ok(Created::attributes(BTreeMap::new()))
+}
+
+/// Delete the record set a stack created, by the same change batch that created it: Route 53
+/// removes a record set by its own values ("if the current value does not match the actual
+/// value, an error is returned"), so the delete carries the declaration the create was made
+/// from.
+///
+/// A record set Route 53 no longer holds is already in the state the delete asks for, and
+/// that is decided by READING it back — Route 53 models no not-found error for a record set,
+/// reporting a change batch it cannot apply as one refusal class whatever the problem was.
+/// A zone the service no longer holds holds no record set either.
+async fn delete_record_set(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<(), Refusal> {
+    match describe_record_set(ctx, region, resource).await {
+        Ok(None) => return Ok(()),
+        Ok(Some(_)) => {}
+        Err(refusal) if refusal.code == NO_SUCH_HOSTED_ZONE => return Ok(()),
+        Err(refusal) => return Err(refusal),
+    }
+    match change_record_set(ctx, region, resource, RECORD_SET_DELETE).await {
+        Ok(()) => Ok(()),
+        Err(refusal) if refusal.code == NO_SUCH_HOSTED_ZONE => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The record set's configuration as Route 53 reports it, for drift detection, and `None`
+/// where the zone no longer holds a record set of that name and type — including where it
+/// holds no such ZONE any more (`NoSuchHostedZone`), since a zone that is gone holds no
+/// record set either and that is the `DELETED` drift status rather than a failed check.
+///
+/// `ListResourceRecordSets` reports the record sets of a zone from the position the request
+/// names ("the results begin with the first resource record set in the list whose name is
+/// greater than or equal to Name, and whose type is greater than or equal to Type"), so the
+/// read starts at this record's own name, type and set identifier and takes the first — which
+/// is this record set when the zone still holds it.
+///
+/// Only the scalar members the answer reports in the same shape the type declares them in
+/// are compared; the declared `ResourceRecords` and the nested routing structures are not
+/// scalars of the reported record set, and a property the actual document does not carry is
+/// not evidence of anything ([`super::drift::differs`]).
+async fn describe_record_set(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Option<Value>, Refusal> {
+    let zone = match record_set_zone_id(ctx, region, resource).await {
+        Ok(zone) => zone,
+        Err(refusal) if refusal.code == NO_SUCH_HOSTED_ZONE => return Ok(None),
+        Err(refusal) => return Err(refusal),
+    };
+    let (Some(name), Some(record_type)) = (
+        property(resource, "Name"),
+        property(resource, "Type"),
+    ) else {
+        return Err(Refusal {
+            code: MISSING_PROPERTY_CODE.to_string(),
+            message: format!(
+                "{} declares no Name and Type to read the record set back by",
+                resource.resource_type
+            ),
+        });
+    };
+    let mut uri = format!(
+        "/hostedzone/{}/rrset?name={}&type={}&maxitems=1",
+        percent_encoded(&zone),
+        percent_encoded(&name),
+        percent_encoded(&record_type)
+    );
+    if let Some(identifier) = property(resource, "SetIdentifier") {
+        uri.push_str(&format!("&identifier={}", percent_encoded(&identifier)));
+    }
+    let answered = match call_route53(ctx, region, "GET", &uri, None).await {
+        Ok(answered) => answered,
+        // The zone itself is gone, so neither is the record set in it.
+        Err(refusal) if refusal.code == NO_SUCH_HOSTED_ZONE => return Ok(None),
+        Err(refusal) => return Err(refusal),
+    };
+    let reported = xml_scalar_children(&answered, "ResourceRecordSet");
+    let holds_this_record = reported
+        .get("Name")
+        .and_then(Value::as_str)
+        .is_some_and(|held| fully_qualified(held) == fully_qualified(&name))
+        && reported.get("Type").and_then(Value::as_str) == Some(record_type.as_str());
+    if !holds_this_record {
+        return Ok(None);
+    }
+    Ok(Some(reported_as_properties(
+        &Value::Object(reported),
+        &[
+            ("Name", "Name"),
+            ("Type", "Type"),
+            ("TTL", "TTL"),
+            ("SetIdentifier", "SetIdentifier"),
+            ("Weight", "Weight"),
+            ("Region", "Region"),
+            ("Failover", "Failover"),
+            ("MultiValueAnswer", "MultiValueAnswer"),
+            ("HealthCheckId", "HealthCheckId"),
+        ],
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One declared `AWS::Route53::RecordSet` as the record-set renderer takes it.
+    fn declared_record_set(properties: Value) -> StoredResource {
+        StoredResource {
+            logical_id: "Record".to_string(),
+            resource_type: ROUTE53_RECORD_SET.to_string(),
+            physical_resource_id: "a.example.com".to_string(),
+            attributes: BTreeMap::new(),
+            metadata: None,
+            properties,
+            materialised: false,
+        }
+    }
+
+    /// One row of the record-set rendering table: the case, the properties a template
+    /// declares, and the element they render as — `None` where the declaration is refused.
+    type RecordSetRow = (&'static str, fn() -> Value, Option<&'static str>);
+
+    /// The `ResourceRecordSet` a change batch carries is the declaration's own members, with
+    /// the record VALUES wrapped as the `ResourceRecord` structures the wire takes and every
+    /// nested routing structure rendered member by member — and a property or nested member
+    /// the catalogue does not name is REFUSED rather than dropped.
+    ///
+    /// The rows span the shapes [`RECORD_SET_MEMBERS`] distinguishes: scalars, one and
+    /// several record values, each nested structure the type publishes, a value carrying XML
+    /// markup, a property of a different resource type, and a member no structure has.
+    #[test]
+    fn a_record_set_renders_the_members_its_declaration_states() {
+        // (case, the declared properties, the element it renders or None where it is refused)
+        let rows: &[RecordSetRow] = &[
+            (
+                "a simple record with one value",
+                || {
+                    serde_json::json!({
+                        "Name": "a.example.com",
+                        "Type": "A",
+                        "TTL": "300",
+                        "ResourceRecords": ["192.0.2.10"],
+                        "HostedZoneId": "Z0123456789ABCD"
+                    })
+                },
+                Some(
+                    "<ResourceRecordSet><Name>a.example.com</Name><Type>A</Type>\
+                     <TTL>300</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.10</Value>\
+                     </ResourceRecord></ResourceRecords></ResourceRecordSet>",
+                ),
+            ),
+            (
+                "a weighted record with several values and a set identifier",
+                || {
+                    serde_json::json!({
+                        "Name": "mx.example.com",
+                        "Type": "MX",
+                        "SetIdentifier": "primary",
+                        "Weight": 70,
+                        "TTL": 60,
+                        "ResourceRecords": ["10 one.example.com.", "20 two.example.com."],
+                        "HostedZoneName": "example.com."
+                    })
+                },
+                Some(
+                    "<ResourceRecordSet><Name>mx.example.com</Name><Type>MX</Type>\
+                     <SetIdentifier>primary</SetIdentifier><Weight>70</Weight><TTL>60</TTL>\
+                     <ResourceRecords><ResourceRecord><Value>10 one.example.com.</Value>\
+                     </ResourceRecord><ResourceRecord><Value>20 two.example.com.</Value>\
+                     </ResourceRecord></ResourceRecords></ResourceRecordSet>",
+                ),
+            ),
+            (
+                "an alias record, whose target is a nested structure and which has no TTL",
+                || {
+                    serde_json::json!({
+                        "Name": "alias.example.com",
+                        "Type": "A",
+                        "AliasTarget": {
+                            "HostedZoneId": "Z2FDTNDATAQYW2",
+                            "DNSName": "d111111abcdef8.cloudfront.net.",
+                            "EvaluateTargetHealth": false
+                        }
+                    })
+                },
+                Some(
+                    "<ResourceRecordSet><Name>alias.example.com</Name><Type>A</Type>\
+                     <AliasTarget><HostedZoneId>Z2FDTNDATAQYW2</HostedZoneId>\
+                     <DNSName>d111111abcdef8.cloudfront.net.</DNSName>\
+                     <EvaluateTargetHealth>false</EvaluateTargetHealth></AliasTarget>\
+                     </ResourceRecordSet>",
+                ),
+            ),
+            (
+                "a geolocation record and a health check",
+                || {
+                    serde_json::json!({
+                        "Name": "geo.example.com",
+                        "Type": "A",
+                        "SetIdentifier": "africa",
+                        "GeoLocation": {"ContinentCode": "AF"},
+                        "TTL": "60",
+                        "ResourceRecords": ["192.0.2.11"],
+                        "HealthCheckId": "a-health-check"
+                    })
+                },
+                Some(
+                    "<ResourceRecordSet><Name>geo.example.com</Name><Type>A</Type>\
+                     <SetIdentifier>africa</SetIdentifier>\
+                     <GeoLocation><ContinentCode>AF</ContinentCode></GeoLocation>\
+                     <TTL>60</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.11</Value>\
+                     </ResourceRecord></ResourceRecords>\
+                     <HealthCheckId>a-health-check</HealthCheckId></ResourceRecordSet>",
+                ),
+            ),
+            (
+                "a geoproximity record, whose coordinates nest one structure inside another",
+                || {
+                    serde_json::json!({
+                        "Name": "near.example.com",
+                        "Type": "A",
+                        "SetIdentifier": "coast",
+                        "TTL": "60",
+                        "ResourceRecords": ["192.0.2.12"],
+                        "GeoProximityLocation": {
+                            "Coordinates": {"Latitude": "47.6", "Longitude": "-122.3"},
+                            "Bias": "10"
+                        }
+                    })
+                },
+                Some(
+                    "<ResourceRecordSet><Name>near.example.com</Name><Type>A</Type>\
+                     <SetIdentifier>coast</SetIdentifier><TTL>60</TTL>\
+                     <ResourceRecords><ResourceRecord><Value>192.0.2.12</Value></ResourceRecord>\
+                     </ResourceRecords><GeoProximityLocation>\
+                     <Coordinates><Latitude>47.6</Latitude><Longitude>-122.3</Longitude>\
+                     </Coordinates><Bias>10</Bias></GeoProximityLocation></ResourceRecordSet>",
+                ),
+            ),
+            (
+                "a CIDR-routed record, and a failover member beside a latency region",
+                || {
+                    serde_json::json!({
+                        "Name": "cidr.example.com",
+                        "Type": "A",
+                        "SetIdentifier": "block",
+                        "Region": "us-west-2",
+                        "Failover": "PRIMARY",
+                        "MultiValueAnswer": true,
+                        "TTL": "60",
+                        "ResourceRecords": ["192.0.2.13"],
+                        "CidrRoutingConfig": {
+                            "CollectionId": "a-collection",
+                            "LocationName": "a-location"
+                        }
+                    })
+                },
+                Some(
+                    "<ResourceRecordSet><Name>cidr.example.com</Name><Type>A</Type>\
+                     <SetIdentifier>block</SetIdentifier><Region>us-west-2</Region>\
+                     <Failover>PRIMARY</Failover><MultiValueAnswer>true</MultiValueAnswer>\
+                     <TTL>60</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.13</Value>\
+                     </ResourceRecord></ResourceRecords>\
+                     <CidrRoutingConfig><CollectionId>a-collection</CollectionId>\
+                     <LocationName>a-location</LocationName></CidrRoutingConfig>\
+                     </ResourceRecordSet>",
+                ),
+            ),
+            (
+                "a TXT value carrying XML markup, which reaches the wire escaped",
+                || {
+                    serde_json::json!({
+                        "Name": "txt.example.com",
+                        "Type": "TXT",
+                        "TTL": "60",
+                        "ResourceRecords": ["\"a & <b>\""]
+                    })
+                },
+                Some(
+                    "<ResourceRecordSet><Name>txt.example.com</Name><Type>TXT</Type>\
+                     <TTL>60</TTL><ResourceRecords><ResourceRecord>\
+                     <Value>&quot;a &amp; &lt;b&gt;&quot;</Value></ResourceRecord>\
+                     </ResourceRecords></ResourceRecordSet>",
+                ),
+            ),
+            (
+                "a property this type does not publish",
+                || {
+                    serde_json::json!({
+                        "Name": "a.example.com",
+                        "Type": "A",
+                        "TTL": "60",
+                        "ResourceRecords": ["192.0.2.14"],
+                        "TrafficPolicyInstanceId": "an-instance"
+                    })
+                },
+                None,
+            ),
+            (
+                "a member no nested structure of this type has",
+                || {
+                    serde_json::json!({
+                        "Name": "alias.example.com",
+                        "Type": "A",
+                        "AliasTarget": {"DNSName": "a.example.com.", "Zone": "Z0123"}
+                    })
+                },
+                None,
+            ),
+            (
+                "a declaration with no Type at all",
+                || serde_json::json!({ "Name": "a.example.com", "TTL": "60" }),
+                None,
+            ),
+            (
+                "record values that are not a list",
+                || {
+                    serde_json::json!({
+                        "Name": "a.example.com",
+                        "Type": "A",
+                        "TTL": "60",
+                        "ResourceRecords": "192.0.2.15"
+                    })
+                },
+                None,
+            ),
+        ];
+
+        for (case, declared, expected) in rows {
+            let resource = declared_record_set(declared());
+            let rendered = record_set_element(&resource);
+            match expected {
+                Some(expected) => {
+                    let rendered = rendered
+                        .as_ref()
+                        .map(String::as_str)
+                        .unwrap_or_else(|refusal| {
+                            panic!("case {case:?}: expected an element, got {refusal:?}")
+                        });
+                    assert_eq!(
+                        rendered, *expected,
+                        "case {case:?}: expected {expected:?}, got {rendered:?}"
+                    );
+                }
+                None => {
+                    assert!(
+                        rendered.is_err(),
+                        "case {case:?}: expected a refusal, got {rendered:?}"
+                    );
+                }
+            }
+        }
+    }
 
     /// Every property name becomes the API member it is, and only the first letter moves.
     #[test]

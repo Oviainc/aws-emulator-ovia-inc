@@ -254,12 +254,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // What a notification alerts on identifies it, so a budget cannot hold two
             // of them: a repeat of one it already has is the duplicate record — not a
             // second notification, and not an overwrite of the first one's subscribers.
+            // The same rule holds over the SET a `CreateBudget` attaches
+            // ([`crate::state::attaches_duplicate_notification`]), so both paths refuse
+            // it in the same words.
             if crate::state::find_notification(stored, &input.notification).is_some() {
                 return Err(CreateNotificationErrorModeled::DuplicateRecordException(
                     DuplicateRecordException {
-                        message: Some(format!(
-                            "Unable to create notification: {} - the notification already exists.",
-                            input.budget_name
+                        message: Some(crate::state::duplicate_notification_refusal(
+                            &input.budget_name,
                         )),
                     },
                 )

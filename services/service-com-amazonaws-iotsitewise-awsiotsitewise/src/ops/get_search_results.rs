@@ -1,15 +1,32 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSearchResults
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSearchResults`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Answers the ranked results of one search `StartSearch` started, read from
+//! `crate::state` under the workspace and the id the request names. A pure READ: every
+//! result is COMPUTED, on each call, from what the store holds — the search's own
+//! natural-language `queryStatement` and filters, and the data segments the named
+//! workspace's datasets hold — so nothing is stored beside the search and no reader can
+//! be told about data the store does not hold.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSearchResults::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A result is "a single matching segment of time-series data": one data segment of a
+//! dataset of this workspace, naming the dataset that contains it, the time series it
+//! covers and the span it covers of it. Which segments the search read is the search's
+//! own filters (`datasetIds`, `timeSeriesIds`, `timeIntervals`); WHICH of those match,
+//! and how strongly, is a CHOSEN lexical relevance — the share of the query's terms the
+//! text the store holds about a segment carries — because the real service matches the
+//! CONTENT of the data and this store holds none. [`DatasetMatch`] states plainly what
+//! that can and cannot be, as [`top_timestamp`] does for the instant a result reports;
+//! neither stands in for content the store does not have, so a query no stored text
+//! carries a term of matches nothing at all.
+//!
+//! Results "are available only after the search has reached the SUCCEEDED status": a
+//! search the clock has not yet taken there is the modelled `InvalidRequestException`
+//! (HTTP 400), and a `(workspaceName, searchId)` pair no search is stored under — as a
+//! search of ANOTHER workspace is — the modelled `ResourceNotFoundException` (HTTP 404),
+//! as is a workspace this service does not hold.
+//!
+//! The page is bounded by `maxResults` ([`DEFAULT_MAX_RESULTS`] when the call names
+//! none) and resumed by the `nextToken` the previous page issued.
 //!
 //! ## Shape of an operation
 //!
@@ -164,20 +181,380 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSearchResults` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSearchResultsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSearchResults"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            internal_failure("the IoT SiteWise store is unavailable".to_string())
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        // A READ: the page below is DERIVED, on this call, from the stored search
+        // and the data segments the store holds, so answering it moves no search
+        // on and two readers of one store cannot disagree about what a search
+        // matched. What that costs is stated plainly: a write that lands between
+        // two pages of one result changes the segments behind it, exactly as it
+        // changes what a fresh first page answers.
+        let store = state.lock();
+
+        // The results belong to a search OF a workspace, so the workspace the path
+        // names is resolved first, as every handler in this crate resolves the
+        // resource its path names before anything else: a request that is wrong in
+        // both ways reports the resource that is absent.
+        if !store.workspaces.contains_key(&input.workspace_name) {
+            return Err(not_found(crate::state::not_found_message(
+                crate::state::RESOURCE_WORKSPACE,
+                &input.workspace_name,
+            )));
+        }
+        // A search lives in ONE workspace, so a search of another workspace is a
+        // pair this store holds nothing under — the same refusal as a search id
+        // nothing was ever started under.
+        let search = store
+            .search(&input.workspace_name, &input.search_id)
+            .ok_or_else(|| {
+                not_found(crate::state::not_found_message(
+                    crate::state::RESOURCE_SEARCH,
+                    &input.search_id,
+                ))
+            })?;
+
+        // "Results are available only after the search has reached the SUCCEEDED
+        // status. Calling this on a search that exists but has not yet completed
+        // returns InvalidRequestException." The status compared against is the one
+        // the CLOCK has made due — the same one a read of the search reports — so
+        // this refusal and a poll taken at the same instant cannot disagree, and
+        // the refusal itself names the status the caller has to wait out.
+        let status = search.status(now);
+        if status != crate::state::SEARCH_SUCCEEDED {
+            return Err(invalid_request(format!(
+                "The search {} is in the {status} status; its results are available only \
+                 after it has reached the {} status.",
+                search.search_id,
+                crate::state::SEARCH_SUCCEEDED
+            )));
+        }
+
+        let ranked = ranked_results(&store, search);
+
+        // `nextToken` is the index of the first result of the next page, hex-encoded
+        // so the token stays opaque to the caller and matches the modelled
+        // `^[A-Za-z0-9+/=]+$`. A token is issued only for a result this page HAS, so
+        // an index at or past the end is one this operation never issued — including
+        // every index at all for a search that matched nothing.
+        let start = match input.next_token.as_deref() {
+            Some(token) => {
+                let resume = decode_token(token)?;
+                if resume >= ranked.len() {
+                    return Err(invalid_token());
+                }
+                resume
+            }
+            None => 0,
+        };
+        // `maxResults` carries the modelled range 1..10000, which the runtime
+        // validates BEFORE this handler runs, so a value that arrives here is
+        // already in range and nothing is being coerced; `max(1)` only keeps the
+        // slice arithmetic below total.
+        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
+        let end = start.saturating_add(max_results).min(ranked.len());
+
+        Ok(GetSearchResultsOutput {
+            search_results: ranked[start..end].to_vec(),
+            // "Absent when there are no more results."
+            next_token: (end < ranked.len()).then(|| encode_token(end)),
+        })
     }
+}
+
+/// How many results one page carries when the caller gives no `maxResults` — "if
+/// omitted, a service-defined default is used".
+///
+/// CHOSEN, not documented: the member says only that it bounds one page. It is the
+/// default this service's other paginated reads already answer with, so a client
+/// that pages without asking for a size sees one page size across the service.
+const DEFAULT_MAX_RESULTS: i32 = 50;
+
+/// Every result the search `search` matched, most relevant first.
+///
+/// What a result IS, from the model: "a single matching segment of time-series
+/// data", naming "the dataset that contains the matching data", the time series it
+/// covers and the span it covers of it. So the candidates are the data segments of
+/// the datasets this store holds IN the search's own workspace — a dataset of
+/// another workspace, or one no workspace contains, holds none of the data this
+/// search read.
+///
+/// The search's own `searchFilters` then narrow those candidates, each filter
+/// exactly as the model documents it: `datasetIds` "restricts the search to these
+/// datasets", `timeSeriesIds` "to these time series" and `timeIntervals` "to these
+/// time intervals" — a segment is in the last when its covered span OVERLAPS one of
+/// the intervals, since that is the part of the interval the search had data for.
+/// A filter the search did not carry narrows nothing.
+///
+/// Of the candidates that remain, the ones the query MATCHES are the results; see
+/// [`DatasetMatch`] for what matching means here and what it cannot mean.
+fn ranked_results(
+    store: &crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState,
+    search: &crate::state::SearchRecord,
+) -> Vec<SearchResult> {
+    let wanted = terms(&search.query_statement);
+    let filters = search.search_filters.as_ref();
+    let mut matched: Vec<SearchResult> = Vec::new();
+
+    for (dataset_id, segments) in &store.dataset_data_segments {
+        let Some(dataset) = store.datasets.get(dataset_id) else {
+            continue;
+        };
+        if dataset.workspace_name.as_deref() != Some(search.workspace_name.as_str()) {
+            continue;
+        }
+        if !restricted_to(
+            filters.and_then(|filters| filters.dataset_ids.as_deref()),
+            dataset_id,
+        ) {
+            continue;
+        }
+        // What the query matches in this dataset's own text, computed ONCE per
+        // dataset: the text is the same for every segment the dataset holds, and
+        // this is what keeps the per-segment work below bounded by the length of
+        // the segment's own id rather than by the length of the query.
+        let about_dataset = DatasetMatch::new(&wanted, &dataset_terms(dataset));
+
+        for segment in segments {
+            if !restricted_to(
+                filters.and_then(|filters| filters.time_series_ids.as_deref()),
+                &segment.time_series_id,
+            ) {
+                continue;
+            }
+            if !within_intervals(
+                filters.and_then(|filters| filters.time_intervals.as_deref()),
+                segment,
+            ) {
+                continue;
+            }
+            let score = about_dataset.relevance(segment);
+            // A segment the query matches nothing of is NOT a result: a search
+            // answers the data that matched it, never everything it was allowed to
+            // read.
+            if score <= 0.0 {
+                continue;
+            }
+            matched.push(SearchResult {
+                search_id: search.search_id.clone(),
+                workspace_name: search.workspace_name.clone(),
+                dataset_id: dataset_id.clone(),
+                time_series_id: segment.time_series_id.clone(),
+                start_timestamp: segment.start_timestamp.clone(),
+                end_timestamp: segment.end_timestamp.clone(),
+                top_timestamp: top_timestamp(segment),
+                score,
+            });
+        }
+    }
+
+    // "Ordered by descending relevance score" — "higher scores indicate a stronger
+    // match". Equal scores are ordered by the segment's own identity (the series it
+    // covers, then its span, then the dataset holding it), which is what makes the
+    // enumeration stable enough for `nextToken` to resume it.
+    matched.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| result_key(left).cmp(&result_key(right)))
+    });
+    matched
+}
+
+/// The order equally relevant results are reported in: the time series a result
+/// covers, then the span it covers of it, then the dataset that contains it.
+fn result_key(result: &SearchResult) -> (&str, (i64, i32), (i64, i32), &str) {
+    (
+        result.time_series_id.as_str(),
+        crate::state::timestamp_key(&result.start_timestamp),
+        crate::state::timestamp_key(&result.end_timestamp),
+        result.dataset_id.as_str(),
+    )
+}
+
+/// Whether `value` is one of the values a filter restricts the search to — `true`
+/// for a filter the search did not carry, which restricts nothing.
+///
+/// A filter list the search DID carry holds at least one value: every one of them
+/// is modelled `@length(min: 1, max: 100)` (`smithy_query(query="shape",
+/// shape="SearchFilters")`), and the runtime refuses an empty one before a start is
+/// ever stored, so "present and empty" is not a state a stored search can be in.
+fn restricted_to(filter: Option<&[String]>, value: &str) -> bool {
+    filter.is_none_or(|wanted| wanted.iter().any(|one| one == value))
+}
+
+/// Whether `segment` holds data inside one of the intervals the search restricted
+/// itself to — `true` when it carried no interval filter at all.
+///
+/// A segment's span is HALF-OPEN (`[start, end)`), so it holds data inside an
+/// interval exactly when the two OVERLAP: the segment starts before the interval
+/// ends and the interval starts before the segment ends. An interval that spans no
+/// time therefore contains no segment, which is the same reading
+/// `BatchDeleteDatasetDataSegments` and the capture-source spans give a span.
+fn within_intervals(
+    filter: Option<&[TimeInterval]>,
+    segment: &crate::state::DataSegmentRecord,
+) -> bool {
+    let segment_start = crate::state::timestamp_key(&segment.start_timestamp);
+    let segment_end = crate::state::timestamp_key(&segment.end_timestamp);
+    filter.is_none_or(|intervals| {
+        intervals.iter().any(|interval| {
+            segment_start < crate::state::timestamp_key(&interval.end_time)
+                && crate::state::timestamp_key(&interval.start_time) < segment_end
+        })
+    })
+}
+
+/// How strongly a query matches the segments of ONE dataset: what the query already
+/// matched in that dataset's own text, and what it has left for a segment's own id
+/// to match.
+///
+/// This is a LEXICAL relevance, CHOSEN, and the module doc says why it is the one
+/// this emulator can compute: a `queryStatement` is "the natural-language query
+/// describing the data to search for", which the real service answers by searching
+/// the CONTENT of the stored time-series and video data — semantically, not by
+/// words. This store holds no such content, only the data's identity and the text a
+/// caller gave the dataset that contains it, so the score is computed from exactly
+/// that: the terms of the dataset's name, description, type and metadata, plus the
+/// terms of the `TimeSeriesId` a segment covers. Nothing here stands in for content
+/// the store does not have — a query whose terms appear in none of that stored text
+/// matches nothing, and a search over a workspace whose datasets carry no
+/// descriptive text at all answers no results rather than invented ones. It is
+/// therefore a weaker matcher than the real service's, never a different answer
+/// dressed as one.
+///
+/// Built ONCE per dataset ([`Self::new`]) so scoring one segment
+/// ([`Self::relevance`]) costs the length of that segment's own id and not the
+/// length of the query: the query's terms are walked once per dataset, never once
+/// per segment.
+struct DatasetMatch {
+    /// How many of the query's distinct terms the dataset's own text carries.
+    matched: usize,
+    /// The query's remaining terms — the ones only a segment's own `TimeSeriesId`
+    /// could still match.
+    unmatched: ::std::collections::BTreeSet<String>,
+    /// How many distinct terms the query has at all. A query with none (text the
+    /// tokenizer finds no alphanumeric run in) matches nothing, rather than
+    /// everything.
+    wanted: usize,
+}
+
+impl DatasetMatch {
+    /// What the query `wanted` matches in a dataset whose text is `about_dataset`.
+    fn new(
+        wanted: &::std::collections::BTreeSet<String>,
+        about_dataset: &::std::collections::BTreeSet<String>,
+    ) -> Self {
+        let unmatched: ::std::collections::BTreeSet<String> = wanted
+            .iter()
+            .filter(|term| !about_dataset.contains(*term))
+            .cloned()
+            .collect();
+        Self {
+            matched: wanted.len() - unmatched.len(),
+            unmatched,
+            wanted: wanted.len(),
+        }
+    }
+
+    /// How strongly the query matches `segment`: the fraction of its distinct terms
+    /// carried either by the dataset's text or by the segment's own `TimeSeriesId`,
+    /// from `0.0` (nothing of the query matched) to `1.0` (every term of it did).
+    fn relevance(&self, segment: &crate::state::DataSegmentRecord) -> f32 {
+        if self.wanted == 0 {
+            return 0.0;
+        }
+        // Walked the other way round — the segment's own terms against what the
+        // query has left — so one segment costs the length of its id, which the
+        // modelled `TimeSeriesId` bounds, whatever the query's length.
+        let also_matched = terms(&segment.time_series_id)
+            .iter()
+            .filter(|term| self.unmatched.contains(*term))
+            .count();
+        (self.matched + also_matched) as f32 / self.wanted as f32
+    }
+}
+
+/// The terms the store holds about one dataset: everything a caller named it by —
+/// its name and description, the `DatasetTypeEnum` it was created as, and the keys
+/// and values of its `metadata` — as the terms [`terms`] reads out of them.
+fn dataset_terms(dataset: &crate::state::DatasetRecord) -> ::std::collections::BTreeSet<String> {
+    let mut held = terms(&dataset.name);
+    held.extend(terms(dataset.description.as_deref().unwrap_or_default()));
+    held.extend(terms(dataset.dataset_type.as_deref().unwrap_or_default()));
+    for (key, value) in &dataset.metadata {
+        held.extend(terms(key));
+        held.extend(terms(value));
+    }
+    held
+}
+
+/// The distinct terms of `text`: its maximal runs of alphanumeric characters,
+/// lower-cased so matching is case-insensitive the way a natural-language search
+/// is. Punctuation, whitespace and separators (the `/` of a property alias, the `-`
+/// of an id) divide one term from the next.
+fn terms(text: &str) -> ::std::collections::BTreeSet<String> {
+    text.split(|character: char| !character.is_alphanumeric())
+        .filter(|term| !term.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// The instant a result reports as "the most relevant point within the matching
+/// segment": the MIDDLE instant of the span the segment covers.
+///
+/// CHOSEN, and for the same reason [`DatasetMatch`] is lexical: ranking the instants
+/// INSIDE a segment needs the data the segment covers, which this store does not
+/// hold. The middle of the span is derived from the segment itself and nothing
+/// else, and it always satisfies what the member means — it lies inside the
+/// half-open span the same result reports, since that span covers time (the one
+/// writer of a segment refuses a span that does not).
+fn top_timestamp(segment: &crate::state::DataSegmentRecord) -> TimeInNanos {
+    let start = crate::state::timestamp_nanos(&segment.start_timestamp);
+    let end = crate::state::timestamp_nanos(&segment.end_timestamp);
+    crate::state::timestamp_at_nanos(start + (end - start) / 2)
+}
+
+/// A `nextToken` for the result the next page resumes from: its index in the ranked
+/// enumeration, written out and hex-encoded so the token matches the modelled
+/// `^[A-Za-z0-9+/=]+$`.
+fn encode_token(resume: usize) -> String {
+    ::hex::encode(resume.to_string().as_bytes())
+}
+
+/// Decode a `nextToken` back into the index it resumes from.
+fn decode_token(token: &str) -> Result<usize, GetSearchResultsError> {
+    ::hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|resume| resume.parse().ok())
+        .ok_or_else(invalid_token)
+}
+
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never
+/// issued: text that is not one of its tokens, or an index at or past the end of
+/// the results it was issued for.
+fn invalid_token() -> GetSearchResultsError {
+    invalid_request("The nextToken is not a token this operation issued.".to_string())
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> GetSearchResultsError {
+    GetSearchResultsErrorModeled::InvalidRequestException(InvalidRequestException { message }).into()
+}
+
+/// HTTP 404 `ResourceNotFoundException` carrying `message`.
+fn not_found(message: String) -> GetSearchResultsError {
+    GetSearchResultsErrorModeled::ResourceNotFoundException(ResourceNotFoundException { message })
+        .into()
+}
+
+/// HTTP 500 `InternalFailureException` carrying `message`.
+fn internal_failure(message: String) -> GetSearchResultsError {
+    GetSearchResultsErrorModeled::InternalFailureException(InternalFailureException { message })
+        .into()
 }

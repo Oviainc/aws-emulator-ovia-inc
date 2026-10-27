@@ -25,6 +25,8 @@ mod action_type_catalog;
 mod action_type_declarations;
 #[path = "all/action_type_definitions.rs"]
 mod action_type_definitions;
+#[path = "all/action_type_provider_entitlement.rs"]
+mod action_type_provider_entitlement;
 #[path = "all/approval_result_messages.rs"]
 mod approval_result_messages;
 #[path = "all/custom_action_job_results.rs"]
@@ -43,6 +45,8 @@ mod execution_engine;
 mod pipeline_lifecycle;
 #[path = "all/pipeline_state.rs"]
 mod pipeline_state;
+#[path = "all/probe.rs"]
+mod probe;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/rollback_stage.rs"]

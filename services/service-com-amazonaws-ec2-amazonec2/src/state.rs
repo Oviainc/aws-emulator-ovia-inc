@@ -36489,22 +36489,14 @@ pub fn flow_log_delivery_role_required<E>(log_destination_type: &str) -> Scaffol
     )
 }
 
-/// The ARN of the CloudWatch Logs log group a flow log publishes to:
-/// `arn:aws:logs:<region>:<account>:log-group:<name>`, the form
-/// `CreateFlowLogsRequest$LogDestination` documents ("If the destination type is
-/// cloud-watch-logs, specify the ARN of a CloudWatch Logs log group. For example:
-/// arn:aws:logs:region:account_id:log-group:my_group Alternatively, use the LogGroupName
-/// parameter").
-///
-/// The two members name ONE destination, so this is how the one a caller gave by name is
-/// also reported as an ARN.
-pub fn flow_log_group_arn(region: &str, log_group_name: &str) -> String {
-    ::engine::emulator_arn("logs", region, &format!("log-group:{log_group_name}"))
-}
-
 /// The name of the log group a `log-group:` CloudWatch Logs ARN names, or `None` when the
-/// ARN names something else — the inverse of [`flow_log_group_arn`], for the caller that
-/// gave the destination as an ARN rather than by name.
+/// ARN names something else — for the caller that gave the destination as an ARN rather
+/// than by name ("If the destination type is cloud-watch-logs, specify the ARN of a
+/// CloudWatch Logs log group. For example: arn:aws:logs:region:account_id:log-group:my_group
+/// Alternatively, use the LogGroupName parameter" —
+/// `CreateFlowLogsRequest$LogDestination`). The name is READ OUT of the ARN the request
+/// carried; there is no inverse, because an ARN cannot be composed from a group name
+/// without a Region and an account the request never named.
 ///
 /// A log-group ARN may carry a further segment after the name — the log-stream wildcard
 /// `…:log-group:my_group:*` that a CloudWatch Logs resource ARN conventionally ends with —
@@ -36601,7 +36593,9 @@ pub struct FlowLogSpec {
     /// the request named none.
     pub log_destination_type: String,
     /// "The Amazon Resource Name (ARN) of the destination for the flow log data"
-    /// (`FlowLog$LogDestination`).
+    /// (`FlowLog$LogDestination`) — the ARN the REQUEST carried, and `None` for a request
+    /// that named a CloudWatch Logs group by name instead, which is the one way the
+    /// destination can be given without an ARN.
     pub log_destination: Option<String>,
     /// "The name of the flow log group" (`FlowLog$LogGroupName`) — set only for a
     /// CloudWatch Logs destination, which is the one destination type the member is valid

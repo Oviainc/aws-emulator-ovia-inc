@@ -11,6 +11,11 @@
 //! resource is the modelled `NotFoundException` (404) and a value that is not a
 //! MediaConvert resource ARN is the modelled `BadRequestException` (400).
 //!
+//! The tests a tag set takes belong to the RECORD rather than to one operation, so the
+//! four `Create*` doors onto a record's tags are covered here beside `TagResource`: each
+//! stores only a set whose keys carry characters and whose size is within the
+//! per-resource cap, and refuses anything else with the same modelled error.
+//!
 //! Every case drives the real restJson1 wire path — the router picks the service from
 //! the request's SigV4 scope, the framework deserializes and validates, the handler
 //! runs, and the response is serialized — so what is asserted is the bytes a client
@@ -303,6 +308,327 @@ impl Emulator {
             reply.status, reply.body
         );
         arn(&format!("jobs/{}", reply.string("/job/id")))
+    }
+
+    /// A `Create*` call on one of the four doors onto a record's tag set, carrying exactly
+    /// the `Tags` member a case states (`None` for a request that carries no `Tags` at
+    /// all). Unlike the fixtures above this asserts nothing, so a case can be about the
+    /// refusal a create earns.
+    async fn create(&self, door: CreateDoor, name: &str, tags: Option<&Value>) -> Reply {
+        let mut body = door.body(name);
+        if let (Some(tags), Some(object)) = (tags, body.as_object_mut()) {
+            object.insert("tags".to_string(), tags.clone());
+        }
+        self.send("POST", door.collection(), Some(body)).await
+    }
+}
+
+/// A door onto a record's tag set that MINTS the record: the four `Create*` operations
+/// whose `Tags` member is written straight onto the record `TagResource`,
+/// `UntagResource` and `ListTagsForResource` then work on.
+#[derive(Clone, Copy, Debug)]
+enum CreateDoor {
+    Queue,
+    Job,
+    Preset,
+    JobTemplate,
+}
+
+impl CreateDoor {
+    /// Every create door this service has, from the operations whose input the model
+    /// gives a `Tags` member (`smithy_query(query="digest")`: `CreateQueue`, `CreateJob`,
+    /// `CreatePreset`, `CreateJobTemplate`), so a case is stated once and run against each.
+    const ALL: [Self; 4] = [Self::Queue, Self::Job, Self::Preset, Self::JobTemplate];
+
+    /// The collection the create POSTs to.
+    fn collection(self) -> &'static str {
+        match self {
+            Self::Queue => "/2017-08-29/queues",
+            Self::Job => "/2017-08-29/jobs",
+            Self::Preset => "/2017-08-29/presets",
+            Self::JobTemplate => "/2017-08-29/jobTemplates",
+        }
+    }
+
+    /// The smallest request body this create takes, without any `Tags`: the settings
+    /// graphs come from the fixtures the job and job-template suites already publish.
+    fn body(self, name: &str) -> Value {
+        match self {
+            Self::Queue => json!({ "name": name }),
+            Self::Job => json!({
+                "role": ROLE,
+                "settings": crate::job_lifecycle::settings("s3://example-bucket/in/a.mp4", "_a")
+            }),
+            Self::Preset => json!({
+                "name": name,
+                "settings": { "containerSettings": { "container": "MP4" } }
+            }),
+            Self::JobTemplate => {
+                json!({ "name": name, "settings": crate::job_template_crud::settings(1, 1) })
+            }
+        }
+    }
+
+    /// The ARN of the resource a create of `name` would mint — read out of the reply for a
+    /// job, whose id the service mints, and built from the name for the three kinds whose
+    /// name is their key.
+    fn created_arn(self, name: &str, reply: &Reply) -> String {
+        match self {
+            Self::Queue => arn(&format!("queues/{name}")),
+            Self::Job => arn(&format!("jobs/{}", reply.string("/job/id"))),
+            Self::Preset => arn(&format!("presets/{name}")),
+            Self::JobTemplate => arn(&format!("jobTemplates/{name}")),
+        }
+    }
+}
+
+/// What a tag set earns from a door onto a record's tags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TagOutcome {
+    /// It is stored, and reads back as the set the record carries.
+    Stored,
+    /// The modelled `BadRequestException` (400): a key that carries no characters names
+    /// nothing a later `UntagResource` could address.
+    BadRequest,
+    /// The modelled `ServiceQuotaExceededException` (402): the record would carry more
+    /// tags than one holds.
+    Quota,
+}
+
+impl TagOutcome {
+    /// The status a REFUSED outcome answers with, or `None` when it is stored.
+    fn refusal_status(self) -> Option<u16> {
+        match self {
+            Self::Stored => None,
+            Self::BadRequest => Some(400),
+            Self::Quota => Some(402),
+        }
+    }
+
+    /// The `x-amzn-errortype` a refused outcome answers with.
+    fn error_type(self) -> Option<&'static str> {
+        match self {
+            Self::Stored => None,
+            Self::BadRequest => Some("BadRequestException"),
+            Self::Quota => Some("ServiceQuotaExceededException"),
+        }
+    }
+}
+
+/// `count` distinct pairs, as a `Tags` member.
+fn tag_map(count: usize) -> Value {
+    let mut map = serde_json::Map::new();
+    for index in 0..count {
+        map.insert(format!("key-{index}"), Value::String(index.to_string()));
+    }
+    Value::Object(map)
+}
+
+/// The same, with a key that carries no characters added to it.
+fn tag_map_with_empty_key(count: usize) -> Value {
+    let mut map = tag_map(count);
+    if let Some(object) = map.as_object_mut() {
+        object.insert(String::new(), Value::String("v".to_string()));
+    }
+    map
+}
+
+/// The pairs a `Tags` member carries, as the sorted map `ListTagsForResource` is compared
+/// against.
+fn pairs_of(tags: Option<&Value>) -> BTreeMap<String, String> {
+    tags.and_then(Value::as_object)
+        .map(|map| {
+            map.iter()
+                .map(|(key, value)| {
+                    (
+                        key.clone(),
+                        value.as_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The tests a tag set takes belong to the RECORD, not to one operation: every door that
+/// writes a record's tags — the four `Create*` paths and `TagResource` — stores a set
+/// whose keys all carry characters and whose size is within the per-resource cap, and
+/// refuses anything else with the same modelled error.
+///
+/// The table spans the class: rows differ in whether `Tags` is sent at all, in the number
+/// of pairs (none, one, exactly the cap, one past it, far past it), in the shape of a pair
+/// (a key with an empty value, a non-ASCII key and value, a key with no characters) and in
+/// whether a bad key arrives alone, beside good ones, or inside an over-cap map. Each row
+/// runs against all four create doors AND against `TagResource` on a record that already
+/// exists, so the two kinds of door cannot disagree.
+#[tokio::test]
+async fn every_door_onto_a_records_tags_stores_only_a_set_the_record_can_carry() {
+    /// One row of the table.
+    struct Case {
+        case: &'static str,
+        /// The `Tags` member to send, or `None` for a request that carries none.
+        tags: Option<Value>,
+        want: TagOutcome,
+    }
+
+    // The cap the state module publishes, so this test cannot drift from it.
+    let cap = service_com_amazonaws_mediaconvert_mediaconvert::state::MAX_TAGS_PER_RESOURCE;
+    let cases = vec![
+        Case {
+            case: "no Tags member at all",
+            tags: None,
+            want: TagOutcome::Stored,
+        },
+        Case {
+            case: "an empty Tags map",
+            tags: Some(json!({})),
+            want: TagOutcome::Stored,
+        },
+        Case {
+            case: "one pair",
+            tags: Some(json!({ "env": "prod" })),
+            want: TagOutcome::Stored,
+        },
+        Case {
+            // "You can tag resources with a key-value pair or with only a key."
+            case: "a key with an empty value",
+            tags: Some(json!({ "archived": "" })),
+            want: TagOutcome::Stored,
+        },
+        Case {
+            case: "a non-ASCII key and value",
+            tags: Some(json!({ "équipe": "vidéo" })),
+            want: TagOutcome::Stored,
+        },
+        Case {
+            case: "exactly the cap",
+            tags: Some(tag_map(cap)),
+            want: TagOutcome::Stored,
+        },
+        Case {
+            case: "one key past the cap",
+            tags: Some(tag_map(cap + 1)),
+            want: TagOutcome::Quota,
+        },
+        Case {
+            case: "ten times the cap",
+            tags: Some(tag_map(cap * 10)),
+            want: TagOutcome::Quota,
+        },
+        Case {
+            case: "a key with no characters, alone",
+            tags: Some(json!({ "": "v" })),
+            want: TagOutcome::BadRequest,
+        },
+        Case {
+            case: "a key with no characters beside good ones",
+            tags: Some(json!({ "": "v", "env": "prod" })),
+            want: TagOutcome::BadRequest,
+        },
+        Case {
+            // A problem in the request is answered as such even when the same set is also
+            // over the cap.
+            case: "a key with no characters inside an over-cap map",
+            tags: Some(tag_map_with_empty_key(cap + 1)),
+            want: TagOutcome::BadRequest,
+        },
+    ];
+
+    for case in &cases {
+        for door in CreateDoor::ALL {
+            // A store of its own per row and door, so what a refused create left behind is
+            // exactly what is asserted below.
+            let emulator = Emulator::new();
+            let name = "tagged-at-create";
+            let created = emulator.create(door, name, case.tags.as_ref()).await;
+
+            match case.want.refusal_status() {
+                None => {
+                    assert_eq!(
+                        created.status, 201,
+                        "case {:?}/{door:?}: expected HTTP 201, got {} with body {}",
+                        case.case, created.status, created.body
+                    );
+                    let resource_arn = door.created_arn(name, &created);
+                    let listed = emulator.list_tags(&resource_arn).await;
+                    assert_eq!(
+                        listed.reported_tags(),
+                        pairs_of(case.tags.as_ref()),
+                        "case {:?}/{door:?}: expected the create's own set to be the stored \
+                         one, got {}",
+                        case.case,
+                        listed.body
+                    );
+                }
+                Some(status) => {
+                    assert_eq!(
+                        created.status, status,
+                        "case {:?}/{door:?}: expected HTTP {status}, got {} with body {}",
+                        case.case, created.status, created.body
+                    );
+                    assert_eq!(
+                        created.error_type.as_deref(),
+                        case.want.error_type(),
+                        "case {:?}/{door:?}: expected {:?}, got {:?} with body {}",
+                        case.case,
+                        case.want.error_type(),
+                        created.error_type,
+                        created.body
+                    );
+                    // A refused create persists NOTHING: the resource it would have minted
+                    // is not there to be read, and a job the service never accepted leaves
+                    // the job list empty.
+                    let probe = match door {
+                        CreateDoor::Job => emulator.send("GET", "/2017-08-29/jobs", None).await,
+                        _ => emulator.list_tags(&door.created_arn(name, &created)).await,
+                    };
+                    match door {
+                        CreateDoor::Job => assert_eq!(
+                            probe.at("/jobs").as_array().map(Vec::len),
+                            Some(0),
+                            "case {:?}/{door:?}: a refused create must store no job, got {}",
+                            case.case,
+                            probe.body
+                        ),
+                        _ => assert_eq!(
+                            probe.status, 404,
+                            "case {:?}/{door:?}: a refused create must store no resource, got \
+                             {} with body {}",
+                            case.case, probe.status, probe.body
+                        ),
+                    }
+                }
+            }
+        }
+
+        // The OTHER door onto the same map answers the same set the same way: a set a
+        // create stores is a set `TagResource` merges (HTTP 200 rather than the create's
+        // 201), and a set a create refuses is the same refusal here. `Tags` is required on
+        // `TagResource`, so the row that sends no member at all has nothing to send.
+        let Some(tags) = case.tags.as_ref() else {
+            continue;
+        };
+        let emulator = Emulator::new();
+        let resource_arn = emulator.queue("already-there", json!({})).await;
+        let tagged = emulator.tag(&resource_arn, tags.clone()).await;
+        assert_eq!(
+            tagged.status,
+            case.want.refusal_status().unwrap_or(200),
+            "case {:?}/TagResource: expected HTTP {}, got {} with body {}",
+            case.case,
+            case.want.refusal_status().unwrap_or(200),
+            tagged.status,
+            tagged.body
+        );
+        assert_eq!(
+            tagged.error_type.as_deref(),
+            case.want.error_type(),
+            "case {:?}/TagResource: expected {:?}, got {:?} with body {}",
+            case.case,
+            case.want.error_type(),
+            tagged.error_type,
+            tagged.body
+        );
     }
 }
 

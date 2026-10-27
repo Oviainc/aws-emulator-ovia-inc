@@ -158,7 +158,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
-        let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
+        let access_key_id = ::service_common::request_access_key_id(ctx.parts());
         // "Returns details about the IAM user or role whose credentials are used to call
         // the operation": a key that names no session here is an IAM user's own
         // long-term key, resolved against the IAM store (read before the session lock is

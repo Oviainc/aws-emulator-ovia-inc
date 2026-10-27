@@ -410,6 +410,11 @@ mod resiliencehub_signing_name_routing;
 // stable.
 #[path = "all/route53_health_check_status_metric.rs"]
 mod route53_health_check_status_metric;
+// Declared beside the suite above for the same reason its own comment gives: this is a
+// quiet span of the sorted list, while the tail of this file and the `c` span are where
+// every concurrently landing suite puts its line.
+#[path = "all/cloudformation_provisions_route53_hosted_zones.rs"]
+mod cloudformation_provisions_route53_hosted_zones;
 #[path = "all/s3files_create_file_system_bucket.rs"]
 mod s3files_create_file_system_bucket;
 #[path = "all/scheduler_execution_role.rs"]

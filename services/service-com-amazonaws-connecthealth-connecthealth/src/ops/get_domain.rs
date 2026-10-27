@@ -218,10 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 arn: domain.arn.clone(),
                 name: domain.name.clone(),
                 kms_key_arn: domain.kms_key_arn.clone(),
-                encryption_context: Some(EncryptionContext {
-                    encryption_type: domain.encryption_type.as_wire().to_string(),
-                    kms_key_arn: domain.kms_key_arn.clone(),
-                }),
+                encryption_context: Some(domain.encryption_context()),
                 status: domain.status.as_wire().to_string(),
                 web_app_url: domain.web_app_url.clone(),
                 web_app_configuration: domain

@@ -2847,6 +2847,16 @@ pub fn platform_application_arn(region: &str, platform: &str, name: &str) -> Str
     )
 }
 
+/// "The credential received from the notification service"
+/// (`SetPlatformApplicationAttributesInput$Attributes` doc): the secret of the push
+/// credential pair, which every platform's own doc clause names.
+pub const PLATFORM_CREDENTIAL_ATTRIBUTE: &str = "PlatformCredential";
+
+/// "The principal received from the notification service"
+/// (`SetPlatformApplicationAttributesInput$Attributes` doc): the public half of the
+/// push credential pair, which the GCM clause of that doc has none of.
+pub const PLATFORM_PRINCIPAL_ATTRIBUTE: &str = "PlatformPrincipal";
+
 /// The platform-application attributes a caller WRITES and SNS never reads back.
 ///
 /// `PlatformCredential` is "the credential received from the notification service"
@@ -2856,12 +2866,247 @@ pub fn platform_application_arn(region: &str, platform: &str, name: &str) -> Str
 /// [`PlatformApplicationRecord::reported_attributes`], so a stored credential is
 /// never published back to a caller.
 pub const PLATFORM_CREDENTIAL_ATTRIBUTE_NAMES: &[&str] =
-    &["PlatformCredential", "PlatformPrincipal"];
+    &[PLATFORM_CREDENTIAL_ATTRIBUTE, PLATFORM_PRINCIPAL_ATTRIBUTE];
 
 /// Whether `name` names one of the write-only credential attributes listed on
 /// [`PLATFORM_CREDENTIAL_ATTRIBUTE_NAMES`].
 pub fn is_platform_credential_attribute(name: &str) -> bool {
     PLATFORM_CREDENTIAL_ATTRIBUTE_NAMES.contains(&name)
+}
+
+/// The attribute names SNS defines for a platform application, from the
+/// `SetPlatformApplicationAttributesInput$Attributes` doc: the credential pair, the
+/// four `Event*` topics an endpoint lifecycle event is published to, the two feedback
+/// role ARNs with their sample rate, and the two APNs token-based `ApplePlatform*`
+/// names. SNS refuses any other name, and so does this emulator: the closed set is
+/// also what stops a caller inventing fresh attribute names to grow one application
+/// record for ever.
+///
+/// The names `GetPlatformApplicationAttributes` reports and no caller writes
+/// (`AppleCertificateExpiryDate`, `AuthenticationMethod`) are deliberately NOT here:
+/// the service derives those from the credential material it was given.
+pub const PLATFORM_APPLICATION_ATTRIBUTE_NAMES: &[&str] = &[
+    "ApplePlatformBundleID",
+    "ApplePlatformTeamID",
+    PLATFORM_APPLICATION_ENABLED_ATTRIBUTE,
+    "EventDeliveryFailure",
+    "EventEndpointCreated",
+    "EventEndpointDeleted",
+    "EventEndpointUpdated",
+    "FailureFeedbackRoleArn",
+    PLATFORM_CREDENTIAL_ATTRIBUTE,
+    PLATFORM_PRINCIPAL_ATTRIBUTE,
+    "SuccessFeedbackRoleArn",
+    "SuccessFeedbackSampleRate",
+];
+
+/// Whether SNS sends notifications through this platform application: the
+/// application's counterpart of [`ENDPOINT_ENABLED_ATTRIBUTE`], spelled the same way
+/// and carrying the same two words. An application SNS has just registered is
+/// ENABLED, so the create writes the flag and every report of the application carries
+/// it.
+pub const PLATFORM_APPLICATION_ENABLED_ATTRIBUTE: &str = ENDPOINT_ENABLED_ATTRIBUTE;
+
+/// Whether `name` is an attribute SNS defines for a platform application.
+pub fn is_platform_application_attribute(name: &str) -> bool {
+    PLATFORM_APPLICATION_ATTRIBUTE_NAMES.contains(&name)
+}
+
+/// The name a refusal gives a platform application record, for the shared
+/// attribute-map ceiling ([`attribute_bytes_refusal`]).
+pub const PLATFORM_APPLICATION_RECORD: &str = "a platform application";
+
+/// The push notification services a platform application may target, each spelled as
+/// its documentation spells it.
+///
+/// `CreatePlatformApplicationInput$Platform` names ADM, APNS, APNS_SANDBOX and GCM,
+/// and the operation's own doc adds the per-platform credential clauses for Baidu,
+/// MPNS and WNS; a value that names none of them names no notification service SNS
+/// registers an application with. A request's value is resolved against this list
+/// without regard to case ([`canonical_platform_name`]), so a service is the same
+/// service whichever case a client spelled its name in, and the entry here — not the
+/// spelling the request used — is what the application's ARN and record carry.
+pub const PLATFORM_NAMES: &[&str] = &[
+    "ADM",
+    "APNS",
+    "APNS_SANDBOX",
+    "Baidu",
+    "GCM",
+    "MPNS",
+    "WNS",
+];
+
+/// The entry of [`PLATFORM_NAMES`] `platform` names, or `None` when it names none of
+/// them.
+///
+/// One platform is one application namespace: resolving the request's value to the
+/// documented spelling is what keeps two spellings of one service from addressing two
+/// records under two ARNs.
+pub fn canonical_platform_name(platform: &str) -> Option<&'static str> {
+    PLATFORM_NAMES
+        .iter()
+        .copied()
+        .find(|known| known.eq_ignore_ascii_case(platform))
+}
+
+/// Whether `platform` names one of the push notification services listed on
+/// [`PLATFORM_NAMES`].
+pub fn is_platform_name(platform: &str) -> bool {
+    canonical_platform_name(platform).is_some()
+}
+
+/// The push services whose credential pair carries NO principal: "For GCM (Firebase
+/// Cloud Messaging), there is no PlatformPrincipal"
+/// (`SetPlatformApplicationAttributesInput$Attributes` doc), where every other
+/// platform's clause names one.
+pub const PLATFORMS_WITHOUT_A_PRINCIPAL: &[&str] = &["GCM"];
+
+/// Whether the credential pair of `platform` carries a principal beside its
+/// credential — true for every service except those on
+/// [`PLATFORMS_WITHOUT_A_PRINCIPAL`].
+pub fn platform_takes_a_principal(platform: &str) -> bool {
+    !PLATFORMS_WITHOUT_A_PRINCIPAL
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(platform))
+}
+
+/// The sentence SNS refuses credential material a platform cannot authenticate with:
+/// the member the material arrived in and the reason it was not usable, with none of
+/// the (secret) material echoed back.
+pub const INVALID_PLATFORM_CREDENTIALS_REFUSAL: &str =
+    "Invalid parameter: Attributes Reason: Platform credentials are invalid";
+
+/// The opening of a PEM-encoded block, the form the certificate and private-key
+/// credential material of a push service is carried in (RFC 7468's `-----BEGIN
+/// <label>-----` encapsulation boundary).
+const PEM_BLOCK_OPENING: &str = "-----BEGIN ";
+
+/// The push services whose `PlatformCredential` is a private key: "For APNS and
+/// APNS_SANDBOX using certificate credentials, PlatformPrincipal is SSL certificate
+/// and PlatformCredential is private key. For APNS and APNS_SANDBOX using token
+/// credentials, PlatformPrincipal is signing key ID and PlatformCredential is signing
+/// key. … For MPNS, PlatformPrincipal is TLS certificate and PlatformCredential is
+/// private key" (`CreatePlatformApplication` doc) — a key, whichever credential type
+/// the application uses, so the material is PEM-encoded.
+pub const PLATFORMS_WITH_A_KEY_CREDENTIAL: &[&str] = &["APNS", "APNS_SANDBOX", "MPNS"];
+
+/// The push service whose `PlatformCredential` is an API key or a key FILE: "For GCM
+/// (Firebase Cloud Messaging) using key credentials … The PlatformCredential is API
+/// key. For GCM (Firebase Cloud Messaging) using token credentials … The
+/// PlatformCredential is a JSON formatted private key file"
+/// (`CreatePlatformApplication` doc).
+pub const PLATFORM_WITH_AN_API_KEY_CREDENTIAL: &str = "GCM";
+
+/// The opening of the API key the notification service's console issues, and the
+/// length it issues one with: Google publishes an API key as a 39-character URL-safe
+/// string beginning `AIza` (the form every key in the Google Cloud console's
+/// credentials page takes), which is the `API key` the GCM key-credential clause of
+/// the `CreatePlatformApplication` doc names.
+///
+/// The form is what makes the clause checkable at all: the doc names TWO credential
+/// types for that platform, an API key and "a JSON formatted private key file", and a
+/// value that is neither is material the notification service has no key in — which is
+/// why presence alone cannot be the rule here, where it is the rule for a platform
+/// whose clause names an opaque secret.
+const API_KEY_PREFIX: &str = "AIza";
+
+/// The length of the API key described on [`API_KEY_PREFIX`].
+const API_KEY_LEN: usize = 39;
+
+/// Whether `value` has the form of the API key the notification service's console
+/// issues ([`API_KEY_PREFIX`]).
+fn is_api_key(value: &str) -> bool {
+    value.len() == API_KEY_LEN
+        && value.starts_with(API_KEY_PREFIX)
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Whether `credential` could be the artifact `platform`'s documented credential type
+/// is, and so material that platform could authenticate a notification with.
+///
+/// Checked where the credential type has a PUBLISHED form — a PEM-encoded key for the
+/// services on [`PLATFORMS_WITH_A_KEY_CREDENTIAL`], and an API key or a JSON key file
+/// for [`PLATFORM_WITH_AN_API_KEY_CREDENTIAL`]. For a service whose clause names an
+/// opaque secret instead (a client secret, a secret key), the material has no form to
+/// read, so anything the caller holds is material only that service can judge.
+fn platform_credential_is_usable(platform: &str, credential: &str) -> bool {
+    if PLATFORMS_WITH_A_KEY_CREDENTIAL
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(platform))
+    {
+        return credential.contains(PEM_BLOCK_OPENING);
+    }
+    if PLATFORM_WITH_AN_API_KEY_CREDENTIAL.eq_ignore_ascii_case(platform) {
+        return is_api_key(credential) || json_object(credential).is_some();
+    }
+    true
+}
+
+/// The refusal for the credential material `attributes` offers for `platform`, or
+/// `None` when that platform could authenticate with it.
+///
+/// Two clauses, both from the per-platform credential clauses of the
+/// `CreatePlatformApplication` doc. The pair has to be THERE: "You must specify
+/// PlatformPrincipal and PlatformCredential attributes when using the
+/// CreatePlatformApplication action", with the principal the exception those clauses
+/// state ([`PLATFORMS_WITHOUT_A_PRINCIPAL`]) and a blank value offering nothing to
+/// authenticate with, so it counts as absent. And the credential has to BE the
+/// artifact the platform's credential type names ([`platform_credential_is_usable`]):
+/// a value that could not be that artifact is credential material no push service
+/// would accept, whoever holds it.
+pub fn platform_credential_refusal(
+    platform: &str,
+    attributes: &HashMap<String, String>,
+) -> Option<String> {
+    let offered = |name: &str| {
+        attributes
+            .get(name)
+            .map(String::as_str)
+            .filter(|value| !value.trim().is_empty())
+    };
+    let usable = offered(PLATFORM_CREDENTIAL_ATTRIBUTE)
+        .is_some_and(|credential| platform_credential_is_usable(platform, credential))
+        && (!platform_takes_a_principal(platform)
+            || offered(PLATFORM_PRINCIPAL_ATTRIBUTE).is_some());
+    (!usable).then(|| INVALID_PLATFORM_CREDENTIALS_REFUSAL.to_string())
+}
+
+/// The longest platform application name SNS accepts: "must be between 1 and 256
+/// characters long" (`CreatePlatformApplicationInput$Name` doc).
+pub const MAX_PLATFORM_APPLICATION_NAME_LEN: usize = 256;
+
+/// Whether `name` satisfies the name rule SNS documents for a platform application:
+/// "Application names must be made up of only uppercase and lowercase ASCII letters,
+/// numbers, underscores, hyphens, and periods, and must be between 1 and 256
+/// characters long" (`CreatePlatformApplicationInput$Name` doc) — the topic name rule
+/// plus the period, which a topic name takes only as the FIFO suffix.
+pub fn platform_application_name_is_valid(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_PLATFORM_APPLICATION_NAME_LEN
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.')
+}
+
+/// The sentence SNS refuses an unacceptable platform application name with: the member
+/// the name arrived in and the documented rule it failed, with none of the name echoed
+/// back — the same shape as every other `Reason:` clause of this service.
+pub const INVALID_PLATFORM_APPLICATION_NAME_REFUSAL: &str =
+    "Invalid parameter: Name Reason: Application names must be made up of only uppercase \
+     and lowercase ASCII letters, numbers, underscores, hyphens, and periods, and must be \
+     between 1 and 256 characters long";
+
+/// The sentence SNS refuses a platform that names no push notification service it
+/// registers an application with: the member, and a reason naming the value that was
+/// not one of them — the value is the push service's own name, so a caller reading the
+/// refusal is told which name it is that SNS does not serve.
+///
+/// Recorded evidence: `CreatePlatformApplication` for a platform that names no push
+/// service answers `400 InvalidParameter` with exactly this sentence.
+pub fn unsupported_platform_refusal(platform: &str) -> String {
+    format!("Invalid parameter: Platform Reason: {platform} is not supported")
 }
 
 /// One platform application object of the calling account, as

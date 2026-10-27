@@ -180,7 +180,7 @@ pub const USER_ADMIN_SCOPE: &str = "aws.cognito.signin.user.admin";
 pub const MISSING_REQUIRED_SCOPES_MESSAGE: &str = "Access Token does not have required scopes";
 
 /// `UserPoolTierType` defaults to `ESSENTIALS` (`CreateUserPool.UserPoolTier`).
-const DEFAULT_USER_POOL_TIER: &str = "ESSENTIALS";
+const DEFAULT_USER_POOL_TIER: &str = ESSENTIALS_USER_POOL_TIER;
 
 /// The feature plan threat-protection (`userAuthEvents`) activity logs need:
 /// `LogConfigurationType.EventSource` is "info-level logs about threat-protection
@@ -402,6 +402,52 @@ pub const DEFAULT_MANAGED_LOGIN_VERSION: i32 = HOSTED_UI_CLASSIC_BRANDING;
 /// `UserPoolTierType` values.
 pub const LITE_USER_POOL_TIER: &str = "LITE";
 
+/// The feature plan email message MFA needs: `EmailMfaConfigType` is "To
+/// activate this setting, your user pool must be in the Essentials tier or
+/// higher" (this service's model); one of the modelled
+/// [`crate::ops::types::USER_POOL_TIER_TYPE_VALUES`].
+pub const ESSENTIALS_USER_POOL_TIER: &str = "ESSENTIALS";
+
+/// The modelled feature plans ([`crate::ops::types::USER_POOL_TIER_TYPE_VALUES`])
+/// in INCLUSION order, cheapest first: a plan includes every feature the plans
+/// before it include, which is what "the Essentials tier or higher"
+/// (`EmailMfaConfigType`) and "the Plus feature plan"
+/// (`LogConfigurationType.EventSource`) each name a floor of.
+const USER_POOL_TIER_ORDER: [&str; 3] = [
+    LITE_USER_POOL_TIER,
+    ESSENTIALS_USER_POOL_TIER,
+    PLUS_USER_POOL_TIER,
+];
+
+/// Whether a pool on `tier` includes a feature whose floor is the plan
+/// `minimum`: the plans are ordered by inclusion, so every plan from `minimum`
+/// upwards includes it and every plan below it does not. An unmodelled `tier`
+/// includes nothing beyond the cheapest plan, so a gated feature is refused
+/// rather than granted.
+#[must_use]
+pub fn user_pool_tier_includes(tier: &str, minimum: &str) -> bool {
+    let rank = |plan: &str| {
+        USER_POOL_TIER_ORDER
+            .iter()
+            .position(|known| *known == plan)
+            .unwrap_or(0)
+    };
+    rank(tier) >= rank(minimum)
+}
+
+/// The refusal a feature whose floor is the plan `minimum` owes a pool on
+/// `tier`, or `None` when that pool's plan includes the feature.
+///
+/// Every operation that configures a plan-gated feature asks this one question,
+/// so the boundary and the sentence it is reported with cannot disagree between
+/// them. `feature` is the feature's display name, as
+/// [`feature_unavailable_in_tier_message`] renders it.
+#[must_use]
+pub fn feature_plan_refusal(tier: &str, minimum: &str, feature: &str) -> Option<String> {
+    (!user_pool_tier_includes(tier, minimum))
+        .then(|| feature_unavailable_in_tier_message(tier, feature))
+}
+
 /// The message a `FeatureUnavailableInTierException` carries: a tier refusal
 /// reports the pool's configured feature plan and the feature that plan does not
 /// include, in one template, so a caller can parse the feature out of it and
@@ -412,6 +458,13 @@ pub const LITE_USER_POOL_TIER: &str = "LITE";
 pub fn feature_unavailable_in_tier_message(tier: &str, feature: &str) -> String {
     format!("The following feature is not available for the {tier} pricing tier configured: {feature}")
 }
+
+/// The feature a tier refusal names for user pool email message MFA: the
+/// `EmailMfaConfiguration` member of `SetUserPoolMfaConfig` configures "user
+/// pool email message MFA and sign-in with one-time passwords (OTPs)"
+/// (`EmailMfaConfigType`), reported through
+/// [`feature_unavailable_in_tier_message`] the way every other tier refusal is.
+pub const EMAIL_MFA_FEATURE: &str = "Email MFA";
 
 /// The feature name a tier refusal gives for a `ManagedLoginVersion` of
 /// `version`: the branding version is part of the feature asked for, since only

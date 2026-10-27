@@ -250,6 +250,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(sms_configuration_required());
         }
 
+        // A factor the pool's feature plan does not include cannot be
+        // configured on it at all: email message MFA "activate[s]" only where
+        // "your user pool must be in the Essentials tier or higher"
+        // (`EmailMfaConfigType`), so a request carrying it against a pool on a
+        // cheaper plan is refused and NOTHING of the request is stored. Asked
+        // before the first write, so the refusal leaves the pool exactly as the
+        // call found it.
+        if input.email_mfa_configuration.is_some() {
+            if let Some(message) = crate::state::feature_plan_refusal(
+                &pool.user_pool_tier,
+                crate::state::ESSENTIALS_USER_POOL_TIER,
+                crate::state::EMAIL_MFA_FEATURE,
+            ) {
+                return Err(feature_unavailable_in_tier(message));
+            }
+        }
+
         pool.mfa_configuration = mfa_configuration;
 
         // This call SETS the pool's MFA and passkey configuration, so each factor's
@@ -302,6 +319,18 @@ fn sms_configuration_required() -> SetUserPoolMfaConfigError {
         ),
         reason_code: None,
     })
+    .into()
+}
+
+/// This operation's `FeatureUnavailableInTierException` for a factor the pool's
+/// feature plan does not include, reported with the same template every tier
+/// refusal of this service uses.
+fn feature_unavailable_in_tier(message: String) -> SetUserPoolMfaConfigError {
+    SetUserPoolMfaConfigErrorModeled::FeatureUnavailableInTierException(
+        FeatureUnavailableInTierException {
+            message: Some(message),
+        },
+    )
     .into()
 }
 

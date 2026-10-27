@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListResolverQueryLogConfigs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListResolverQueryLogConfigs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListResolverQueryLogConfigs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! SCAFFOLD REPLACED: implemented. Enumerates the query logging configuration
+//! records in [`crate::state`], filtered, ordered and paged.
 //!
 //! ## Shape of an operation
 //!
@@ -122,6 +115,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use ::std::collections::HashSet;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -196,18 +190,197 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListResolverQueryLogConfigs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListResolverQueryLogConfigsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListResolverQueryLogConfigs"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListResolverQueryLogConfigsErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some("the Route 53 Resolver store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Resolve and bound every filter BEFORE touching the store, exactly as
+        // `ListResolverEndpoints` does: a request carrying more filter terms than
+        // any query needs is refused up front rather than multiplying the scan
+        // the store lock is held for, and a name outside the documented catalog
+        // is refused rather than silently ignored. Each filter's values are
+        // folded into a set ONCE, here, so the per-record test below is a lookup
+        // and not a walk of the values.
+        let requested_filters = input.filters.as_ref().map_or(0, Vec::len);
+        if requested_filters > crate::state::MAX_FILTERS {
+            return Err(
+                ListResolverQueryLogConfigsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: format!(
+                            "ListResolverQueryLogConfigs accepts at most {} filters",
+                            crate::state::MAX_FILTERS
+                        ),
+                        field_name: Some("Filters".to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+        let requested_values: usize = input
+            .filters
+            .iter()
+            .flatten()
+            .map(|filter| filter.values.as_ref().map_or(0, Vec::len))
+            .sum();
+        if requested_values > crate::state::MAX_FILTER_VALUES {
+            return Err(
+                ListResolverQueryLogConfigsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: format!(
+                            "ListResolverQueryLogConfigs accepts at most {} filter values in total",
+                            crate::state::MAX_FILTER_VALUES
+                        ),
+                        field_name: Some("Values".to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut filters: Vec<(crate::state::QueryLogConfigFilterKey, HashSet<String>)> = Vec::new();
+        for filter in input.filters.iter().flatten() {
+            let name = filter.name.clone().unwrap_or_default();
+            let Some(key) = crate::state::QueryLogConfigFilterKey::parse(&name) else {
+                return Err(
+                    ListResolverQueryLogConfigsErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: format!(
+                                "'{name}' is not a valid filter name for ListResolverQueryLogConfigs"
+                            ),
+                            field_name: Some("Name".to_string()),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            let values = filter.values.clone().unwrap_or_default();
+            filters.push((key, values.into_iter().collect()));
+        }
+
+        // `SortBy` is "the element that you want Resolver to sort query logging
+        // configurations by", and the model bounds its length only, so an
+        // element outside the documented catalog is refused here rather than
+        // silently leaving the page in creation order.
+        let sort_by = match input.sort_by.as_deref() {
+            None => None,
+            Some(requested) => match crate::state::QueryLogConfigSortKey::parse(requested) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(
+                        ListResolverQueryLogConfigsErrorModeled::InvalidParameterException(
+                            InvalidParameterException {
+                                message: format!(
+                                    "'{requested}' is not a valid SortBy for ListResolverQueryLogConfigs"
+                                ),
+                                field_name: Some("SortBy".to_string()),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            },
+        };
+
+        // `SortOrder` is a modelled enum, so a value outside it is refused by
+        // the boundary validator before this handler runs; what reaches here is
+        // one of the two orders the model declares.
+        let descending = input.sort_order.as_deref() == Some(crate::state::SORT_ORDER_DESCENDING);
+
+        // A pure read: the page is computed from the stored records and the
+        // cursor is a pure function of the offset, so nothing is written. The
+        // scan is O(stored configurations x filter keys), both of which are
+        // capped, and the store lock is released as soon as the page is built.
+        let (total_count, total_filtered_count, page) = {
+            let store = state.lock();
+            let now = ::std::time::Instant::now();
+            // "The total number of query logging configurations that were
+            // created by the current account in the specified Region": every
+            // stored configuration, whatever the filters then select.
+            let total_count = store.resolver_query_log_configs.len();
+
+            let mut matching: Vec<&crate::state::ResolverQueryLogConfigRecord> = store
+                .query_log_configs_in_creation_order()
+                .into_iter()
+                // Filters combine with AND; one matches when any value the
+                // configuration presents for that member is among its values.
+                .filter(|record| {
+                    filters
+                        .iter()
+                        .all(|(key, values)| record.matches_filter(*key, values, now))
+                })
+                .collect();
+            // "...and that match the filters that were specified in the
+            // ListResolverQueryLogConfigs request": counted over the whole
+            // selection, not over the page cut out of it.
+            let total_filtered_count = matching.len();
+
+            // Ordered only when the request names an element to sort by;
+            // otherwise the collection keeps the creation order every other
+            // list operation of this service pages. The sort is stable, so
+            // configurations that tie on the sorted element stay in creation
+            // order.
+            if let Some(key) = sort_by {
+                matching.sort_by(|left, right| {
+                    let ordering = left.sort_value(key, now).cmp(&right.sort_value(key, now));
+                    if descending {
+                        ordering.reverse()
+                    } else {
+                        ordering
+                    }
+                });
+            }
+
+            let selected: Vec<ResolverQueryLogConfig> = matching
+                .into_iter()
+                .map(|record| record.to_query_log_config(now))
+                .collect();
+
+            // The cursor is scoped to this query: the collection it indexes is
+            // the filtered, ordered one, so a cursor minted under a different
+            // `Filters`, `SortBy` or `SortOrder` is not one this query accepts.
+            let scope = crate::state::query_log_config_list_scope(
+                &filters,
+                sort_by,
+                input.sort_order.as_deref(),
+            );
+            let page = crate::state::paginate(
+                selected,
+                &scope,
+                input.max_results,
+                input.next_token.as_deref(),
+            );
+            (total_count, total_filtered_count, page)
+        };
+
+        let Some(page) = page else {
+            return Err(
+                ListResolverQueryLogConfigsErrorModeled::InvalidNextTokenException(
+                    InvalidNextTokenException {
+                        message: Some(
+                            "The NextToken you provided was not issued by this service for this query"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(ListResolverQueryLogConfigsOutput {
+            next_token: page.next_token,
+            total_count: i32::try_from(total_count).unwrap_or(i32::MAX),
+            total_filtered_count: i32::try_from(total_filtered_count).unwrap_or(i32::MAX),
+            // A page is always reported as a list, so a caller iterating it
+            // needs no special case for an account that has created none.
+            resolver_query_log_configs: Some(page.items),
+        })
     }
 }

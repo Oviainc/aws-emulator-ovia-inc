@@ -287,6 +287,9 @@ mod post_delete_mutation_classification;
 #[path = "all/rejection_messages.rs"]
 mod rejection_messages;
 
+#[path = "all/reservation_deletion.rs"]
+mod reservation_deletion;
+
 #[path = "all/reservation_listing.rs"]
 mod reservation_listing;
 

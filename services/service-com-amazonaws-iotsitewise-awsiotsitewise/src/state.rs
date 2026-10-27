@@ -2607,10 +2607,13 @@ impl SearchRecord {
     ///
     /// This status is a RECORD of the lifecycle the start owed, not a report on
     /// work something performed: the search's query is persisted but nothing
-    /// evaluates it, and the results read is honestly refused while it is
-    /// unimplemented. An operation that comes to answer a search's results must
-    /// derive them from the store and this record's own query, never synthesise
-    /// them to match the status reached here.
+    /// evaluates it here. The results read
+    /// (`crate::ops::get_search_results`) is where that query is answered, and it
+    /// holds to the same rule: it DERIVES the matching segments from this store
+    /// and this record's own query and filters, and never synthesises results to
+    /// match the status reached here — until this status is
+    /// [`SEARCH_SUCCEEDED`] it answers no results at all, the way the operation
+    /// documents it.
     pub fn status(&self, now: SystemTime) -> &'static str {
         if now < self.running_at {
             SEARCH_QUEUED
@@ -6487,15 +6490,47 @@ pub fn resolution_seconds(resolution: &str) -> Option<i64> {
 
 /// A `TimeInNanos` as whole nanoseconds since the Unix epoch, so a sample and a
 /// modelled `Timestamp` bound compare at the precision the sample carries.
-fn timestamp_nanos(timestamp: &TimeInNanos) -> i128 {
-    i128::from(timestamp.time_in_seconds) * 1_000_000_000
+///
+/// Also what an operation that has to do ARITHMETIC on a span reads it through
+/// (the instant inside a data segment `GetSearchResults` reports), with
+/// [`timestamp_at_nanos`] the inverse — the service's conversion pair, so a
+/// handler that converts a whole instant uses these rather than writing the
+/// arithmetic again. The interpolation path keeps its own inverse, because an
+/// instant the model cannot express has to make that operation SKIP the interval
+/// rather than report a saturated one.
+pub fn timestamp_nanos(timestamp: &TimeInNanos) -> i128 {
+    i128::from(timestamp.time_in_seconds) * NANOS_PER_SECOND
         + i128::from(timestamp.offset_in_nanos.unwrap_or(0))
+}
+
+/// How many nanoseconds one whole second is, as the two members of a
+/// `TimeInNanos` divide an instant: `timeInSeconds` whole seconds plus an
+/// `offsetInNanos` of `0..=999999999`.
+const NANOS_PER_SECOND: i128 = 1_000_000_000;
+
+/// The inverse of [`timestamp_nanos`]: whole nanoseconds since the Unix epoch as
+/// the modelled `TimeInNanos` — whole seconds plus the nanosecond offset inside
+/// that second.
+///
+/// The split is EUCLIDEAN, so the offset is never negative and never the
+/// `1_000_000_000` the modelled `OffsetInNanos` range (0..999999999) excludes,
+/// whichever side of the epoch the instant falls.
+pub fn timestamp_at_nanos(nanos: i128) -> TimeInNanos {
+    let seconds = nanos.div_euclid(NANOS_PER_SECOND);
+    TimeInNanos {
+        // Saturating in BOTH directions: an instant too far past the epoch reports
+        // the largest second the member can carry and one too far before it the
+        // smallest, rather than the wrong end of the range.
+        time_in_seconds: i64::try_from(seconds)
+            .unwrap_or(if seconds.is_negative() { i64::MIN } else { i64::MAX }),
+        offset_in_nanos: i32::try_from(nanos.rem_euclid(NANOS_PER_SECOND)).ok(),
+    }
 }
 
 /// A modelled `Timestamp` as whole nanoseconds since the Unix epoch; see
 /// [`timestamp_nanos`].
 pub fn date_time_nanos(at: &::aws_smithy_types::DateTime) -> i128 {
-    i128::from(at.secs()) * 1_000_000_000 + i128::from(at.subsec_nanos())
+    i128::from(at.secs()) * NANOS_PER_SECOND + i128::from(at.subsec_nanos())
 }
 
 /// What one aggregate query asks of one stored series: the window grid to bucket

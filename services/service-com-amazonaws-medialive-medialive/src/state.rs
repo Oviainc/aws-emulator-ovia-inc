@@ -441,9 +441,9 @@ pub use offerings::{
 pub mod reservations;
 
 pub use reservations::{
-    reservation_start, reservation_state, reservation_time, NewReservation, ReservationRecord,
-    ReservationRefusal, ReservationStartRefusal, ReservationUpdate, DEFAULT_AUTOMATIC_RENEWAL,
-    MAX_RESERVATIONS,
+    reservation_not_expired_message, reservation_start, reservation_state, reservation_time,
+    NewReservation, ReservationDeleteRefusal, ReservationRecord, ReservationRefusal,
+    ReservationStartRefusal, ReservationUpdate, DEFAULT_AUTOMATIC_RENEWAL, MAX_RESERVATIONS,
 };
 
 /// The ENGINE VERSION slice: the encoder engine versions available to this
@@ -4350,12 +4350,13 @@ impl ComAmazonawsMedialiveMedialiveState {
                 .get_mut(&id)
                 .filter(|record| !record.is_delete_accepted())
                 .map(|record| &mut record.tags),
-            // No delete filter: nothing in this service deletes a reservation
-            // yet (`DeleteReservation` is a scaffold with an issue of its own),
-            // so there is no dead id to filter out here.
+            // A reservation this account has DELETED is a tombstone: its record
+            // stays readable but names no resource a caller may still change, so
+            // its tags are no longer writable either.
             TaggedResource::Reservation(id) => self
                 .reservations
                 .get_mut(&id)
+                .filter(|record| !record.is_deleted())
                 .map(|record| &mut record.tags),
         }
     }

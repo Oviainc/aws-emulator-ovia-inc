@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCatalog
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCatalog`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCatalog::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registers one catalog resource in the Data Catalog of the account this endpoint serves
+//! ([`crate::state::CatalogDefinition`]): the whole definition comes from the request's
+//! `CatalogInput`, the name must be free, and the catalog is then addressed by the id the
+//! create derives from the account and the name ([`crate::state::child_catalog_id`]).
+//! `GetCatalog` reads the record back.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +156,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCatalog` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCatalogErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCatalog"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on.
+            return Err(CreateCatalogErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue Data Catalog store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // The request carries no parent id, so the catalog is created in the Data Catalog
+        // of the account this endpoint serves — the catalog a request that names none
+        // addresses.
+        let account_id = crate::state::resolve_catalog_id(None);
+        // The name's modelled `@pattern` reaches this handler unchecked — the framework's
+        // regex engine cannot compile its negative look-ahead and treats a pattern it
+        // cannot compile as matching every value — so the constraint is applied here
+        // (`crate::state::is_catalog_name`) rather than letting a name the model forbids
+        // reach the store.
+        if !crate::state::is_catalog_name(&input.name) {
+            return Err(CreateCatalogErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::messages::malformed_catalog_name(&input.name)),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+        // "Cannot be the same as the account ID" (`Catalog$Name`): that id already
+        // addresses the account's own Data Catalog, so no catalog inside it may take it.
+        if input.name == account_id {
+            return Err(CreateCatalogErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::messages::CATALOG_NAME_IS_ACCOUNT_ID.to_string()),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+
+        // The catalog is keyed by its folded name, so a read reaches it under any casing
+        // ("This should be all lowercase" — `GetCatalog`), while the id and the name it
+        // reports are the ones the client chose.
+        let key =
+            crate::state::child_catalog_id(&account_id, &crate::state::fold_name(&input.name));
+        let definition = crate::state::CatalogDefinition::from_create_input(
+            &input.name,
+            crate::state::child_catalog_id(&account_id, &input.name),
+            &input.catalog_input,
+            input.tags.as_ref(),
+            ::std::time::SystemTime::now(),
+        );
+
+        let mut store = state.lock();
+        // A catalog name is unique inside the Data Catalog that holds it: a create for a
+        // name already taken is refused rather than overwriting the stored definition.
+        if store
+            .catalogs
+            .get(&key)
+            .is_some_and(|catalog| catalog.definition.is_some())
+        {
+            return Err(CreateCatalogErrorModeled::AlreadyExistsException(
+                AlreadyExistsException {
+                    message: Some(crate::state::messages::CATALOG_ALREADY_EXISTS.to_string()),
+                },
+            )
+            .into());
+        }
+        // The store is resident memory and this create is reachable by any caller, so the
+        // number of catalogs one process will hold is bounded. Past the ceiling the
+        // request is refused with the operation's own modelled limit error.
+        let Some(catalog) = store.catalog_mut_for_create(&key) else {
+            return Err(
+                CreateCatalogErrorModeled::ResourceNumberLimitExceededException(
+                    ResourceNumberLimitExceededException {
+                        message: Some(format!(
+                            "This account already holds the maximum of {} Data Catalogs",
+                            crate::state::MAX_CATALOGS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        catalog.definition = Some(definition);
+        ::tracing::info!(
+            operation = "CreateCatalog",
+            catalog_id = %key,
+            "created a Data Catalog catalog"
+        );
+
+        Ok(CreateCatalogOutput {})
     }
 }

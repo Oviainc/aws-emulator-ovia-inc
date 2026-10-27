@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePlatformApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePlatformApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePlatformApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -95,6 +86,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{self, PlatformApplicationRecord};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -161,23 +153,139 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CREATE_PLATFORM_APPLICATION_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Register a platform application object of the calling account and answer its
+    /// ARN.
+    ///
+    /// A MUTATION the spec names: "Creates a platform application object for one of
+    /// the supported push notification services … You can use the returned
+    /// PlatformApplicationArn as an attribute for the CreatePlatformEndpoint action".
+    /// The record it writes is what every other mobile-push call reads: the ARN is the
+    /// key, so a second create naming the same platform and name addresses the SAME
+    /// application and applies what it carries to it rather than minting a second
+    /// record under one ARN.
+    ///
+    /// Three rules are argument validation, judged before the store is consulted and
+    /// each answered with the operation's one modelled client error
+    /// (`InvalidParameterException`, HTTP 400): the application NAME satisfies the
+    /// documented character and length rule, the PLATFORM names a push notification
+    /// service SNS registers an application with, and the ATTRIBUTES carry only names
+    /// SNS defines for an application, among them the credential pair the platform
+    /// documents. The platform is resolved to the name its documentation spells, so
+    /// one push service is one application namespace whichever case the request
+    /// spelled it in.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePlatformApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePlatformApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePlatformApplication"))
+        let refuse = |message: String| -> Self::Error {
+            CreatePlatformApplicationErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        };
+
+        if !state::platform_application_name_is_valid(&input.name) {
+            return Err(refuse(
+                state::INVALID_PLATFORM_APPLICATION_NAME_REFUSAL.to_string(),
+            ));
+        }
+        let Some(platform) = state::canonical_platform_name(&input.platform) else {
+            return Err(refuse(state::unsupported_platform_refusal(&input.platform)));
+        };
+        // SNS defines a closed set of platform-application attribute names and refuses
+        // any other; the refusal is built from the request — the member the map arrived
+        // in and the key that was not recognised — so the caller can find the entry it
+        // has to fix.
+        if let Some(unknown) = state::unknown_attribute_name(
+            &input.attributes,
+            state::is_platform_application_attribute,
+        ) {
+            return Err(refuse(state::unknown_attribute_refusal(
+                state::ATTRIBUTES_MEMBER,
+                unknown,
+            )));
+        }
+        if let Some(message) =
+            state::platform_credential_refusal(platform, &input.attributes)
+        {
+            return Err(refuse(message));
+        }
+
+        let Some(store) = state::service_state(&*self.engine) else {
+            return Err(
+                CreatePlatformApplicationErrorModeled::InternalErrorException(
+                    InternalErrorException {
+                        message: Some("the SNS store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let region = state::request_region(ctx.parts());
+        let arn = state::platform_application_arn(&region, platform, &input.name);
+
+        let mut store = store.lock();
+        let held_records = store.platform_applications.len();
+        // ONE lookup decides both branches. Either way the map the record WOULD hold is
+        // measured BEFORE it is stored, so a repeated create cannot grow one record
+        // past the per-record ceiling.
+        match store.platform_applications.entry(arn.clone()) {
+            // A create addressed at an application that already exists APPLIES what it
+            // carries to that record — fresh credential material, an event topic it did
+            // not hold yet — the way an attribute write would, so no caller input is
+            // dropped under a success status.
+            ::std::collections::hash_map::Entry::Occupied(mut occupied) => {
+                let mut attributes = occupied.get().attributes.clone();
+                attributes.extend(
+                    input
+                        .attributes
+                        .iter()
+                        .map(|(name, value)| (name.clone(), value.clone())),
+                );
+                if let Some(message) = state::attribute_bytes_refusal(
+                    state::PLATFORM_APPLICATION_RECORD,
+                    &attributes,
+                ) {
+                    return Err(refuse(message));
+                }
+                occupied.get_mut().attributes = attributes;
+            }
+            ::std::collections::hash_map::Entry::Vacant(slot) => {
+                if held_records >= state::MAX_RECORDS_PER_STORE {
+                    return Err(refuse(state::limit_exceeded_message(
+                        "platform applications",
+                    )));
+                }
+                // An application SNS has just registered sends notifications, so a
+                // fresh record carries the delivery flag from the moment it exists —
+                // under the request's own value when the create asked for one.
+                let mut attributes = ::std::collections::HashMap::from([(
+                    state::PLATFORM_APPLICATION_ENABLED_ATTRIBUTE.to_string(),
+                    state::attribute_flag(true),
+                )]);
+                attributes.extend(input.attributes);
+                if let Some(message) = state::attribute_bytes_refusal(
+                    state::PLATFORM_APPLICATION_RECORD,
+                    &attributes,
+                ) {
+                    return Err(refuse(message));
+                }
+                slot.insert(PlatformApplicationRecord {
+                    arn: arn.clone(),
+                    platform: platform.to_string(),
+                    name: input.name,
+                    attributes,
+                    created_at: ::std::time::SystemTime::now(),
+                });
+            }
+        }
+
+        Ok(CreatePlatformApplicationOutput {
+            platform_application_arn: Some(arn),
+        })
     }
 }
