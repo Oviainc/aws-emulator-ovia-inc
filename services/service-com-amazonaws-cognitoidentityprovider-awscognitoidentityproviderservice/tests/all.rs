@@ -167,6 +167,8 @@ mod user_pool_replica_deletion;
 mod user_pool_replicas;
 #[path = "all/verification_code_pipeline.rs"]
 mod verification_code_pipeline;
+#[path = "all/web_authn_credential_registration.rs"]
+mod web_authn_credential_registration;
 #[path = "all/web_authn_registration.rs"]
 mod web_authn_registration;
 #[path = "all/zz_probe.rs"]

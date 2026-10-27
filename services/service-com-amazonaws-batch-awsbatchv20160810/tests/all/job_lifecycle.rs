@@ -22,6 +22,7 @@
 //!   only when no status is given);
 //! * paging with `maxResults`/`nextToken` sees every item exactly once.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -319,6 +320,171 @@ pub(crate) async fn describe_job(batch: &Batch, job_id: &str) -> Value {
     jobs[0].clone()
 }
 
+/// The one record `DescribeComputeEnvironments` reports for `name`.
+pub(crate) async fn describe_compute_environment(batch: &Batch, name: &str) -> Value {
+    let body = batch
+        .ok(
+            "/v1/describecomputeenvironments",
+            json!({"computeEnvironments": [name]}),
+        )
+        .await;
+    let listed = body["computeEnvironments"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        listed.len(),
+        1,
+        "case describe compute environment {name}: expected exactly one record, got {body}"
+    );
+    listed[0].clone()
+}
+
+/// The one record `DescribeJobQueues` reports for `name`.
+pub(crate) async fn describe_job_queue(batch: &Batch, name: &str) -> Value {
+    let body = batch
+        .ok("/v1/describejobqueues", json!({"jobQueues": [name]}))
+        .await;
+    let listed = body["jobQueues"].as_array().cloned().unwrap_or_default();
+    assert_eq!(
+        listed.len(),
+        1,
+        "case describe job queue {name}: expected exactly one record, got {body}"
+    );
+    listed[0].clone()
+}
+
+/// One call, BRACKETED by the instant the test read the clock before it and the instant it
+/// read it after: the emulator read its own clock somewhere between the two, so whatever
+/// this call did, it did at an instant in `before..=after`.
+pub(crate) struct Bracketed<T> {
+    /// What the call answered.
+    pub(crate) value: T,
+    /// The clock, read before the call.
+    pub(crate) before: i64,
+    /// The clock, read after the call.
+    pub(crate) after: i64,
+}
+
+impl<T> Bracketed<T> {
+    /// The same bracket around a value DERIVED from this call's answer — the one record a
+    /// listing's page carries, say — so a status assertion about that record is judged
+    /// against the instant the call that answered it was made.
+    pub(crate) fn with_value<U>(&self, value: U) -> Bracketed<U> {
+        Bracketed {
+            value,
+            before: self.before,
+            after: self.after,
+        }
+    }
+
+    /// When a clock-owed transition THIS call started can fall due: one span
+    /// ([`state::JOB_PHASE_MILLIS`]) after the call, which this bracket pins to an
+    /// interval — earliest first.
+    pub(crate) fn due_window(&self) -> (i64, i64) {
+        (
+            self.before + state::JOB_PHASE_MILLIS,
+            self.after + state::JOB_PHASE_MILLIS,
+        )
+    }
+}
+
+/// Make `call`, bracketed by two readings of the same clock the emulator reads.
+pub(crate) async fn bracketed<Fut: Future>(call: Fut) -> Bracketed<Fut::Output> {
+    let before = state::now_millis();
+    let value = call.await;
+    let after = state::now_millis();
+    Bracketed {
+        value,
+        before,
+        after,
+    }
+}
+
+/// What [`assert_clock_owed_status`] was able to assert about one read, so a case can show
+/// its table is not vacuous.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Asserted {
+    /// The read certainly happened before the transition could fall due, so the transient
+    /// status was required.
+    Transient,
+    /// The read certainly happened after the transition must have fallen due, so the
+    /// settled status was required.
+    Settled,
+    /// The read straddled the due instant (or the kind has no single settled status), where
+    /// either answer is correct: nothing was asserted.
+    Straddled,
+}
+
+/// Assert that the record `read` answered carries the status the clock owes it AT THE
+/// INSTANT OF THAT READ: `transient` when the read certainly happened before the
+/// transition could fall due, `settled` when it certainly happened after it must have,
+/// and — because a read straddling the due instant may legitimately answer either —
+/// nothing at all in between.
+///
+/// `due` is the window from the bracket of the call that STARTED the transition
+/// ([`Bracketed::due_window`]), so a case asserts a clock-owed status only about the
+/// resource it read and the span that resource's own call started, never one inferred
+/// from a sibling started at another instant.
+pub(crate) fn assert_clock_owed_status(
+    case: &str,
+    read: &Bracketed<Value>,
+    due: (i64, i64),
+    transient: &str,
+    settled: Option<&str>,
+) -> Asserted {
+    let (earliest_due, latest_due) = due;
+    let status = read.value["status"].as_str();
+    let record = &read.value;
+    let certainly_settled = read.before >= latest_due;
+    if read.after < earliest_due {
+        assert_eq!(
+            status,
+            Some(transient),
+            "case {case}: a record read {} ms before its span could elapse still reports \
+             {transient}, got {record}",
+            earliest_due - read.after
+        );
+        Asserted::Transient
+    } else if let Some(settled) = settled.filter(|_| certainly_settled) {
+        assert_eq!(
+            status,
+            Some(settled),
+            "case {case}: a record read {} ms after its span elapsed reports {settled}, got \
+             {record}",
+            read.before - latest_due
+        );
+        Asserted::Settled
+    } else {
+        Asserted::Straddled
+    }
+}
+
+/// Assert that two reads made back to back did not change what a later caller sees: a read
+/// moves nothing.
+///
+/// This holds UNCONDITIONALLY — either the two answers are identical, or the CLOCK itself
+/// owed the difference, which requires the second read to be at or past the earliest
+/// instant the owed move can fall due (`due`'s first instant). So the pair is always
+/// checked; what the bracket decides is only whether a difference is allowed to exist.
+pub(crate) fn assert_reads_agree(
+    case: &str,
+    first: &Bracketed<Value>,
+    second: &Bracketed<Value>,
+    due: (i64, i64),
+) {
+    if first.value == second.value {
+        return;
+    }
+    assert!(
+        second.after >= due.0,
+        "case {case}: two reads made before the clock owed anything must answer identically, \
+         got {} then {}",
+        first.value,
+        second.value
+    );
+}
+
 /// How many times [`until_status`] looks before it gives up.
 ///
 /// Each clock-owed move falls due [`state::JOB_PHASE_MILLIS`] after the one before it and
@@ -358,8 +524,11 @@ async fn wait_for_resting() {
 async fn job_submission_lifecycle_round_trips_through_persisted_state() {
     let batch = Batch::new();
 
-    // 1. The compute environment is minted once and reported identically afterwards.
-    let environment_arn = compute_environment(&batch, "ce-demo").await;
+    // 1. The compute environment is minted once and reported identically afterwards. The
+    // create is BRACKETED, so the status assertion below knows the window the move out of
+    // the transient status falls due in.
+    let created_environment = bracketed(compute_environment(&batch, "ce-demo")).await;
+    let environment_arn = created_environment.value.clone();
     assert_eq!(
         environment_arn,
         arn("compute-environment/ce-demo"),
@@ -393,18 +562,18 @@ async fn job_submission_lifecycle_round_trips_through_persisted_state() {
         "case MANAGED without computeResources: expected 400, got {status} {body}"
     );
 
-    // Straight after the create, the environment is still in the transient status the
-    // clock owes a move out of.
-    let created = batch
-        .ok(
-            "/v1/describecomputeenvironments",
-            json!({"computeEnvironments": ["ce-demo"]}),
-        )
-        .await;
-    assert_eq!(
-        created["computeEnvironments"][0]["status"].as_str(),
-        Some(state::STATUS_CREATING),
-        "case describe straight after create: expected CREATING, got {created}"
+    // The environment is where its OWN span puts it: still in the transient status the
+    // clock owes a move out of while this read is certainly before that move fell due, and
+    // `VALID` once the read is certainly after it. How long the refusals above took is the
+    // machine's business, so the bracket — not the order of the calls — is what decides
+    // which of the two this case asserts.
+    let read = bracketed(describe_compute_environment(&batch, "ce-demo")).await;
+    assert_clock_owed_status(
+        "describe the created compute environment",
+        &read,
+        created_environment.due_window(),
+        state::STATUS_CREATING,
+        Some(state::STATUS_VALID),
     );
 
     // 2. The queue stores the environment NORMALISED to its ARN.
@@ -495,19 +664,21 @@ async fn job_submission_lifecycle_round_trips_through_persisted_state() {
         );
     }
 
-    // 4. Submit resolves the queue and the definition against persisted state.
-    let submitted = batch
-        .ok(
-            "/v1/submitjob",
-            json!({
-                "jobName": "j1",
-                "jobQueue": "q-demo",
-                "jobDefinition": "jd-demo",
-                "containerOverrides": {"command": ["echo", "overridden"]},
-                "tags": {"team": "batch"},
-            }),
-        )
-        .await;
+    // 4. Submit resolves the queue and the definition against persisted state. Bracketed,
+    // because the job's own clock-owed move out of `SUBMITTED` falls due one span after
+    // THIS call.
+    let accepted = bracketed(batch.ok(
+        "/v1/submitjob",
+        json!({
+            "jobName": "j1",
+            "jobQueue": "q-demo",
+            "jobDefinition": "jd-demo",
+            "containerOverrides": {"command": ["echo", "overridden"]},
+            "tags": {"team": "batch"},
+        }),
+    ))
+    .await;
+    let submitted = accepted.value.clone();
     let job_id = submitted["jobId"].as_str().unwrap_or_default().to_string();
     assert!(
         !job_id.is_empty(),
@@ -525,7 +696,8 @@ async fn job_submission_lifecycle_round_trips_through_persisted_state() {
     );
 
     // 5. Describe reports exactly what was submitted, from the stored record.
-    let detail = describe_job(&batch, &job_id).await;
+    let read = bracketed(describe_job(&batch, &job_id)).await;
+    let detail = read.value.clone();
     assert_eq!(
         detail["jobQueue"].as_str(),
         Some(queue_arn.as_str()),
@@ -536,10 +708,15 @@ async fn job_submission_lifecycle_round_trips_through_persisted_state() {
         Some(second_arn.as_str()),
         "case describe: a bare name resolves to the latest ACTIVE revision, got {detail}"
     );
-    assert_eq!(
-        detail["status"].as_str(),
-        Some(state::JOB_SUBMITTED),
-        "case describe straight after submit: the transient status is observable, got {detail}"
+    // The job is where its own span puts it: the transient status a submit stores while
+    // this read is certainly before the move out of it fell due, `RUNNABLE` once the read
+    // is certainly after it.
+    assert_clock_owed_status(
+        "describe the submitted job",
+        &read,
+        accepted.due_window(),
+        state::JOB_SUBMITTED,
+        Some(state::JOB_RUNNABLE),
     );
     assert_eq!(
         detail["container"]["command"],
@@ -1028,39 +1205,54 @@ async fn job_status_only_moves_forward_and_never_because_of_a_read() {
     let queue_arn = job_queue(&batch, "q-progress", &environment_arn).await;
     job_definition(&batch, "jd-progress", container_properties()).await;
 
-    let first = batch
-        .ok(
-            "/v1/submitjob",
-            json!({"jobName": "p1", "jobQueue": &queue_arn, "jobDefinition": "jd-progress"}),
-        )
-        .await;
-    let first_id = first["jobId"].as_str().unwrap_or_default().to_string();
-    let dependent = batch
-        .ok(
-            "/v1/submitjob",
-            json!({
-                "jobName": "p2",
-                "jobQueue": &queue_arn,
-                "jobDefinition": "jd-progress",
-                "dependsOn": [{"jobId": &first_id}],
-            }),
-        )
-        .await;
-    let dependent_id = dependent["jobId"].as_str().unwrap_or_default().to_string();
+    let first = bracketed(batch.ok(
+        "/v1/submitjob",
+        json!({"jobName": "p1", "jobQueue": &queue_arn, "jobDefinition": "jd-progress"}),
+    ))
+    .await;
+    let first_id = first.value["jobId"].as_str().unwrap_or_default().to_string();
+    let dependent = bracketed(batch.ok(
+        "/v1/submitjob",
+        json!({
+            "jobName": "p2",
+            "jobQueue": &queue_arn,
+            "jobDefinition": "jd-progress",
+            "dependsOn": [{"jobId": &first_id}],
+        }),
+    ))
+    .await;
+    let dependent_id = dependent.value["jobId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
 
-    for (case, job_id) in [("independent", &first_id), ("dependent", &dependent_id)] {
+    // Each job's first move falls due one span after ITS OWN submit, and the two submits
+    // are different instants: the independent job leaves `SUBMITTED` for `RUNNABLE`, the
+    // dependent one for `PENDING` behind it.
+    for (case, job_id, submit, next) in [
+        (
+            "independent",
+            &first_id,
+            &first,
+            Some(state::JOB_RUNNABLE),
+        ),
+        (
+            "dependent",
+            &dependent_id,
+            &dependent,
+            Some(state::JOB_PENDING),
+        ),
+    ] {
         // Two reads back to back: a read must not advance anything.
-        let before = describe_job(&batch, job_id).await;
-        let after = describe_job(&batch, job_id).await;
-        assert_eq!(
-            before["status"].as_str(),
-            after["status"].as_str(),
-            "case {case} read twice: a read must not move the status, got {after}"
-        );
-        assert_eq!(
-            before["status"].as_str(),
-            Some(state::JOB_SUBMITTED),
-            "case {case} straight after submit: expected SUBMITTED, got {before}"
+        let before = bracketed(describe_job(&batch, job_id)).await;
+        let after = bracketed(describe_job(&batch, job_id)).await;
+        assert_reads_agree(case, &before, &after, submit.due_window());
+        assert_clock_owed_status(
+            case,
+            &before,
+            submit.due_window(),
+            state::JOB_SUBMITTED,
+            next,
         );
     }
 

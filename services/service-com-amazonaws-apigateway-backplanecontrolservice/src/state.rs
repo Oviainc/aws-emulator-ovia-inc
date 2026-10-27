@@ -3241,13 +3241,12 @@ pub fn no_such_model(model_name: &str) -> String {
 /// than replacing the model the first one stored (replacing it is `UpdateModel`'s own
 /// call).
 ///
-/// AWS publishes no fixed sentence for this condition, so the message is BUILT FROM THE
-/// REQUEST the way
-/// [`crate::ops::create_documentation_version::version_clash_message`] is: it names the
-/// model name that already exists, which is the one thing the caller has to change.
-pub fn model_already_exists(name: &str) -> String {
-    format!("Model name already exists: {name}")
-}
+/// API Gateway words this condition as ONE sentence of entirely fixed text, naming the
+/// resource class and the SCOPE a model name is unique within — the REST API that holds
+/// the model — and quoting back neither the name the request sent nor the API it was sent
+/// to, in the shape of the sibling collision sentences this service answers with
+/// ([`BASE_PATH_MAPPING_ALREADY_EXISTS`]).
+pub const MODEL_NAME_ALREADY_EXISTS: &str = "Model name already exists for this REST API";
 
 /// The `BadRequestException` message for a `name` that is not a model name: "The name of
 /// the model. Must be alphanumeric." (`CreateModel$name`), so a name carrying anything

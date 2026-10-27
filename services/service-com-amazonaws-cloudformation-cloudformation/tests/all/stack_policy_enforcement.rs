@@ -21,6 +21,10 @@
 //! statement conditioned on the resource type (matching and not), a policy with no `Allow`
 //! at all, and a resource the policy says nothing about.
 //!
+//! The same policy governs the OTHER operation that deploys an update to a live stack,
+//! `ExecuteChangeSet`, which is held to the plan its change set stored: the last case here
+//! is that one, down to the change set being left in the modelled `EXECUTE_FAILED`.
+//!
 //! **The second rule under test.** A changed declaration of a resource the stack already has
 //! is applied THROUGH the owning service's own API, so the resource keeps its physical id:
 //! for an `AWS::SNS::Topic` every property is an attribute of the topic, and a changed,
@@ -591,6 +595,105 @@ async fn a_during_update_policy_overrides_the_stored_one_for_that_update_alone()
         reported,
         status::UPDATE_ROLLBACK_COMPLETE,
         "case {case:?}: expected the un-overridden update to be denied again, got {reported:?}"
+    );
+}
+
+#[tokio::test]
+async fn executing_a_change_set_is_held_to_the_stack_policy_too() {
+    let router = router();
+    let case = "an UPDATE change set modifying a protected resource";
+    let stack = "policy-change-set";
+    let change_set = "protected-change";
+    let created = template(&protected_name(stack), "v1", "v1");
+    deploy(&router, stack, &created).await;
+
+    // The plan the execution would carry out, computed and stored when the change set was
+    // created — which is what the policy in force is weighed against.
+    let updated = template(&protected_name(stack), "v2", "v1");
+    let (http_status, body) = call(
+        &router,
+        "CreateChangeSet",
+        &[
+            member("StackName", stack),
+            member("ChangeSetName", change_set),
+            member("TemplateBody", &updated),
+        ],
+    )
+    .await;
+    assert_eq!(
+        http_status, 200,
+        "case {case:?}: expected CreateChangeSet to succeed, got {http_status} {body}"
+    );
+    wait_for_the_transition().await;
+
+    let deny = policy_of(&[
+        ALLOW_EVERYTHING,
+        r#"{"Effect":"Deny","Action":"Update:*","Principal":"*",
+            "Resource":"LogicalResourceId/Protected"}"#,
+    ]);
+    set_policy(&router, case, stack, &deny).await;
+
+    let (http_status, body) = call(
+        &router,
+        "ExecuteChangeSet",
+        &[
+            member("StackName", stack),
+            member("ChangeSetName", change_set),
+        ],
+    )
+    .await;
+    assert_eq!(
+        http_status, 200,
+        "case {case:?}: expected ExecuteChangeSet to be accepted, got {http_status} {body}"
+    );
+    wait_for_the_transition().await;
+    wait_for_the_transition().await;
+
+    let reported = stack_status(&router, case, stack).await;
+    let log = events(&router, case, stack).await;
+    assert_eq!(
+        reported,
+        status::UPDATE_ROLLBACK_COMPLETE,
+        "case {case:?}: expected the denied execution to roll the stack back, got \
+         {reported:?} with {log:?}"
+    );
+    let wanted = "Action denied by stack policy: Statement [#1] does not allow \
+                  [Update:Modify] for resource [LogicalResourceId/Protected];";
+    assert!(
+        log.iter().any(|(resource, status_value, reason)| {
+            resource == "Protected"
+                && status_value == resource_status::UPDATE_FAILED
+                && reason == wanted
+        }),
+        "case {case:?}: expected the protected resource to report {wanted:?}, got {log:?}"
+    );
+    // Nothing of the change set was applied: the stack still carries the template it was
+    // created with.
+    assert_eq!(
+        stored_template(&router, case, stack).await,
+        created,
+        "case {case:?}: expected the denied execution to leave the template alone"
+    );
+    // The execution was attempted and did not go through, so the change set is not left as
+    // one nothing has executed yet.
+    let (http_status, body) = call(
+        &router,
+        "DescribeChangeSet",
+        &[
+            member("StackName", stack),
+            member("ChangeSetName", change_set),
+        ],
+    )
+    .await;
+    assert_eq!(
+        http_status, 200,
+        "case {case:?}: expected DescribeChangeSet to succeed, got {http_status} {body}"
+    );
+    assert_eq!(
+        xml_text(&body, "ExecutionStatus").as_deref(),
+        Some("EXECUTE_FAILED"),
+        "case {case:?}: expected the refused execution to leave the change set \
+         EXECUTE_FAILED, got {body}"
     );
 }
 

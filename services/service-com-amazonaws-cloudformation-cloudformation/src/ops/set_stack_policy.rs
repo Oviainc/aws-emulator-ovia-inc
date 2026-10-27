@@ -2,7 +2,11 @@
 
 //! @op SetStackPolicy
 //! IMPLEMENTED: stores the stack policy body a caller sets on the named stack, which is
-//! what `GetStackPolicy` then reports back. A policy named by URL would have to be fetched
+//! what `GetStackPolicy` then reports back and what every later update of that stack is
+//! held to: the policy in force decides which of the stack's resources an update may act
+//! on and which action it may take on each ([`crate::state::stack_policy`]), so a document
+//! set here protects those resources from the next `UpdateStack` or `ExecuteChangeSet`.
+//! A policy named by URL would have to be fetched
 //! from Amazon S3, which this emulator does not do, so that request is answered 501.
 //!
 //! ## Shape of an operation

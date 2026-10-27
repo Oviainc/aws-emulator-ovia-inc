@@ -15,6 +15,8 @@
 mod bounds;
 #[path = "all/cancel_job.rs"]
 mod cancel_job;
+#[path = "all/clock_owed_spans_are_per_resource.rs"]
+mod clock_owed_spans_are_per_resource;
 #[path = "all/compute_environment_update.rs"]
 mod compute_environment_update;
 #[path = "all/consumable_resource_listing.rs"]

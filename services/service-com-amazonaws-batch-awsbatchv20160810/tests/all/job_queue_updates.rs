@@ -33,7 +33,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_batch_awsbatchv20160810::state;
 
 use crate::job_lifecycle::{
-    arn, compute_environment, container_properties, describe_job, job_definition, job_queue, Batch,
+    arn, assert_clock_owed_status, assert_reads_agree, bracketed, compute_environment,
+    container_properties, describe_job, job_definition, job_queue, Batch,
 };
 
 /// The envelope AWS Batch wraps only the refusals it is recorded to wrap in — so a
@@ -546,24 +547,29 @@ async fn an_accepted_update_leaves_updating_until_the_clock_moves_it() {
         "case before the update: expected VALID, got {valid}"
     );
 
-    batch
-        .ok(
-            "/v1/updatejobqueue",
-            json!({"jobQueue": "q-clock", "priority": 77, "state": "DISABLED"}),
-        )
-        .await;
+    let accepted = bracketed(batch.ok(
+        "/v1/updatejobqueue",
+        json!({"jobQueue": "q-clock", "priority": 77, "state": "DISABLED"}),
+    ))
+    .await;
 
-    let updating = describe_queue(&batch, "q-clock").await;
-    assert_eq!(
-        updating["status"].as_str(),
-        Some(state::STATUS_UPDATING),
-        "case straight after the update: expected UPDATING, got {updating}"
+    // The span is never zero, so a caller observes the transient status — judged against
+    // the bracket of the update that started it, which is what makes the answer certain.
+    let updating = bracketed(describe_queue(&batch, "q-clock")).await;
+    assert_clock_owed_status(
+        "the accepted update",
+        &updating,
+        accepted.due_window(),
+        state::STATUS_UPDATING,
+        Some(state::STATUS_VALID),
     );
     // A read changes nothing a later read sees.
-    let again = describe_queue(&batch, "q-clock").await;
-    assert_eq!(
-        again, updating,
-        "case two reads at the same instant: expected the same detail, got {again} and {updating}"
+    let again = bracketed(describe_queue(&batch, "q-clock")).await;
+    assert_reads_agree(
+        "the accepted update",
+        &updating,
+        &again,
+        accepted.due_window(),
     );
 
     tokio::time::sleep(Duration::from_millis(span * 3)).await;

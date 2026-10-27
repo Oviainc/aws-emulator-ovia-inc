@@ -22,10 +22,11 @@
 //! `NotAuthorizedException`.
 //!
 //! A passkey credential comes into existence through
-//! `CompleteWebAuthnRegistration`, which is still a scaffold in this emulator, so
-//! the rows that need a user with passkeys already registered PLANT the credential
-//! state that call will write, the way the other suites of this crate plant state
-//! for writers that are not implemented yet. The pools, app clients, users,
+//! `CompleteWebAuthnRegistration`; the rows here need a user ALREADY holding
+//! passkeys of a given count and transports, so they plant that credential state
+//! directly rather than driving a registration ceremony per credential (the
+//! completing call is exercised end-to-end by this crate's
+//! `web_authn_credential_registration` suite). The pools, app clients, users,
 //! domains, passkey configurations and access tokens are all real: they come from
 //! `CreateUserPool`, `CreateUserPoolClient`, `CreateUserPoolDomain`,
 //! `SetUserPoolMfaConfig`, `AdminCreateUser` and `InitiateAuth`.
