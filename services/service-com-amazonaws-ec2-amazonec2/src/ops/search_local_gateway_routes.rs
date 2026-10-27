@@ -265,7 +265,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .clamp(1, crate::state::MAX_PAGE_SIZE),
         };
 
-        let store = state.lock();
+        let mut store = state.lock();
+
+        // A route `CreateLocalGatewayRoute` answered as `pending` is `active` once its due
+        // instant has passed, whether or not anybody called, so the moves the clock already
+        // owes are materialised BEFORE the table is read
+        // ([`crate::state::ComAmazonawsEc2Amazonec2State::materialize_due_transitions`]) —
+        // this search reports the state each route is in now rather than the one it was
+        // written in, and it changes nothing a later caller would not have seen anyway.
+        store.materialize_due_transitions();
 
         // "Searches for routes in the specified local gateway route table"
         // (`SearchLocalGatewayRoutes`): the table is the thing being read, so an id the
@@ -308,7 +316,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             for (index, block) in search.blocks.iter().enumerate() {
                 let mut best: Option<u32> = None;
-                for route in routes.values() {
+                for route in routes.values().map(|record| &record.view) {
                     if !budget.spend() {
                         break;
                     }
@@ -333,7 +341,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // carries must then hold ("If you specify multiple filters, the filters are joined
         // with an AND" — `Filter`).
         let mut selected: Vec<(&str, &LocalGatewayRoute)> = Vec::new();
-        for (destination_key, route) in routes {
+        for (destination_key, route) in routes.iter().map(|(key, record)| (key, &record.view)) {
             if budget.exhausted() {
                 break;
             }
