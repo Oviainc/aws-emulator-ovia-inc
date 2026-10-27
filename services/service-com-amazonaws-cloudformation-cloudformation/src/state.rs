@@ -230,6 +230,11 @@ pub mod provisioning;
 /// declares.
 pub mod template;
 
+/// What a submitted template is held to before a stack operation acts on it: the
+/// template-validation rules CloudFormation applies synchronously, and the refusal each
+/// one answers.
+pub mod template_validation;
+
 /// The `AWS::Serverless-2016-10-31` (AWS SAM) transform: the resources that macro's
 /// expansion puts in place of a template's `AWS::Serverless::*` declarations, applied
 /// before anything reads the template.
@@ -601,6 +606,45 @@ pub fn validate_resource_types(template_body: &str) -> Result<(), String> {
         Some(template) => resource_types::refuse_unrecognized(&template),
         None => Ok(()),
     }
+}
+
+/// `Err(message)` for a submitted template body CloudFormation refuses outright — the
+/// template-validation rules every operation that SUBMITS a body is held to, before
+/// anything is created ([`template_validation`] is where they live).
+///
+/// `processed` is the stage the submitting operation computed for this body, which is the
+/// document the semantic rules read: a template whose transforms this service cannot apply
+/// has none, and is left to the stack's own failure rather than refused here.
+pub fn validate_submitted_template(
+    template_body: &str,
+    processed: &template::Processed,
+    parameters: &BTreeMap<String, String>,
+    region: &str,
+) -> Result<(), String> {
+    match template_validation::refusal(template_body, processed, parameters, region) {
+        Some(message) => Err(message),
+        None => Ok(()),
+    }
+}
+
+/// How CloudFormation words the status of a stack whose failed create it is unwinding: the
+/// failure the create reported, and then the clause saying the rollback was asked for.
+///
+/// `CreateStackInput$OnFailure` documents `ROLLBACK` as the default behaviour of a failed
+/// create, so the rollback is something the REQUEST asked for — which is what the service
+/// says when it reports one. The clause goes where the failure's own sentence leaves room
+/// for it, whether that sentence is the resource-failure summary
+/// ([`resource_failure_summary`], which ends with its separating space) or a reason of this
+/// service's own.
+///
+/// Worded once, and public so a suite asserting a rolled-back stack's reason reads the same
+/// wording rather than spelling a second copy of it.
+pub fn rollback_requested(reason: &str) -> String {
+    let stated = reason.trim_end();
+    format!(
+        "{}. Rollback requested by user.",
+        stated.strip_suffix('.').unwrap_or(stated)
+    )
 }
 
 /// The message CloudFormation answers when a mutating stack operation presents a
@@ -2798,7 +2842,13 @@ impl StoredStack {
         self.record_event(
             now,
             status::ROLLBACK_IN_PROGRESS,
-            Some(reason.clone()),
+            // What the EVENT says is what the rollback is: the failure that caused it, and
+            // that CloudFormation rolled the create back because that is what `OnFailure`
+            // asked for — the clause the summary sentence leaves room for
+            // ([`rollback_requested`]). The stack's own `StackStatusReason` keeps the
+            // failure alone, which is the field a client parses to recover the set of failed
+            // logical ids ([`resource_failure_summary`]).
+            Some(rollback_requested(&reason)),
             operation_id.clone(),
             client_request_token.clone(),
         );

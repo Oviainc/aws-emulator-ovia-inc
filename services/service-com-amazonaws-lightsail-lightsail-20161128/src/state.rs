@@ -5516,6 +5516,11 @@ pub struct StoredDiskSnapshot {
     pub due: Option<DueNamedState>,
     /// What the snapshot was taken of.
     pub source: DiskSnapshotSource,
+    /// Whether this snapshot was created from an AUTOMATIC snapshot, which is
+    /// what `DiskSnapshot$isFromAutoSnapshot` reports: false for a snapshot the
+    /// caller asked the service to take, true for one copied from a copy the
+    /// `AutoSnapshot` add-on took.
+    pub is_from_auto_snapshot: bool,
 }
 
 impl StoredDiskSnapshot {
@@ -5546,9 +5551,7 @@ impl StoredDiskSnapshot {
             from_disk_arn,
             from_instance_name,
             from_instance_arn,
-            // `CreateDiskSnapshot` is an explicit snapshot the caller asked
-            // for, so it is not one the `AutoSnapshot` add-on took.
-            is_from_auto_snapshot: Some(false),
+            is_from_auto_snapshot: Some(self.is_from_auto_snapshot),
         }
     }
 }
@@ -5599,6 +5602,11 @@ pub struct StoredInstanceSnapshot {
     /// storage disks", and a disk later detached from the instance was still
     /// part of what this snapshot captured.
     pub from_attached_disks: Vec<StoredDisk>,
+    /// Whether this snapshot was created from an AUTOMATIC snapshot, which is
+    /// what `InstanceSnapshot$isFromAutoSnapshot` reports: false for a snapshot
+    /// the caller asked the service to take, true for one copied from a copy the
+    /// `AutoSnapshot` add-on took.
+    pub is_from_auto_snapshot: bool,
 }
 
 impl StoredInstanceSnapshot {
@@ -5627,9 +5635,7 @@ impl StoredInstanceSnapshot {
             from_instance_arn: Some(self.from_instance_arn.clone()),
             from_blueprint_id: Some(self.from_blueprint_id.clone()),
             from_bundle_id: Some(self.from_bundle_id.clone()),
-            // `CreateInstanceSnapshot` is an explicit snapshot the caller asked
-            // for, so it is not one the `AutoSnapshot` add-on took.
-            is_from_auto_snapshot: Some(false),
+            is_from_auto_snapshot: Some(self.is_from_auto_snapshot),
             size_in_gb: Some(self.size_in_gb),
         }
     }
@@ -5666,12 +5672,14 @@ pub struct StoredAutoSnapshot {
     /// The status the clock owes this copy, while one is outstanding.
     pub due: Option<DueNamedState>,
     /// The block storage disks attached to the INSTANCE this copy was taken of
-    /// at the instant it was taken, which `AutoSnapshotDetails$fromAttachedDisks`
-    /// reports as "the block storage disks attached to the instance when the
-    /// automatic snapshot was created" — an empty list for an instance that had
+    /// at the instant it was taken, captured whole — `CopySnapshot` turns one of
+    /// these copies into a manual instance snapshot, which describes the disks it
+    /// captured as the resources they are. `AutoSnapshotDetails$fromAttachedDisks`
+    /// reports them as "the block storage disks attached to the instance when the
+    /// automatic snapshot was created": an empty list for an instance that had
     /// none, and `None` for a copy of a DISK, which is one volume and has no
     /// disks attached to it.
-    pub from_attached_disks: Option<Vec<AttachedDisk>>,
+    pub from_attached_disks: Option<Vec<StoredDisk>>,
 }
 
 impl StoredAutoSnapshot {
@@ -5681,7 +5689,17 @@ impl StoredAutoSnapshot {
             date: Some(self.date.clone()),
             created_at: Some(timestamp(self.created_at_ms)),
             status: Some(self.status.to_string()),
-            from_attached_disks: self.from_attached_disks.clone(),
+            // What the modelled `AttachedDisk` carries of each captured disk:
+            // the device path it was mounted at and its size.
+            from_attached_disks: self.from_attached_disks.as_ref().map(|disks| {
+                disks
+                    .iter()
+                    .map(|disk| AttachedDisk {
+                        path: disk.path.clone(),
+                        size_in_gb: Some(disk.size_in_gb),
+                    })
+                    .collect()
+            }),
         }
     }
 }
@@ -5712,7 +5730,7 @@ impl StoredAutoSnapshots {
     ///
     /// One copy a day: an automatic snapshot is addressed by its date, so a date
     /// this resource already holds a copy for is not copied a second time.
-    fn take(&mut self, at_ms: i64, from_attached_disks: Option<Vec<AttachedDisk>>) {
+    fn take(&mut self, at_ms: i64, from_attached_disks: Option<Vec<StoredDisk>>) {
         let date = utc_date(at_ms);
         if self.taken.iter().any(|taken| taken.date == date) {
             return;
@@ -12351,17 +12369,15 @@ impl ComAmazonawsLightsailLightsail20161128State {
             .collect()
     }
 
-    /// The same disks as [`Self::disks_attached_to`], as the modelled
-    /// `AttachedDisk` an automatic snapshot of the instance records: the device
-    /// path the disk was mounted at and its size, which is what
-    /// `AutoSnapshotDetails$fromAttachedDisks` carries.
-    fn attached_disk_captures(&self, instance_name: &str) -> Vec<AttachedDisk> {
+    /// The same disks as [`Self::disks_attached_to`], captured whole for an
+    /// automatic snapshot of the instance: a copy of that snapshot describes the
+    /// disks it captured as the resources they are, so the records are kept
+    /// rather than reduced to what `AutoSnapshotDetails$fromAttachedDisks`
+    /// reports of them.
+    fn attached_disk_captures(&self, instance_name: &str) -> Vec<StoredDisk> {
         self.disks_attached_to(instance_name)
             .into_iter()
-            .map(|disk| AttachedDisk {
-                path: disk.path.clone(),
-                size_in_gb: Some(disk.size_in_gb),
-            })
+            .cloned()
             .collect()
     }
 
@@ -13770,6 +13786,33 @@ impl ComAmazonawsLightsailLightsail20161128State {
         location: &StoredLocation,
     ) -> StoredOperation {
         self.log_operation(now_ms, None, resource_type, resource_name, location, None)
+    }
+
+    /// Build and record a NON-TERMINAL operation against `resource_name` that
+    /// reports no `operationType`, which the clock owes its terminal status at
+    /// `settles_at_ms`.
+    ///
+    /// The counterpart of [`Self::record_untyped_operation`] for a call the
+    /// modelled `OperationType` enum declares no value for whose work is NOT
+    /// finished when the call returns — copying a snapshot, where the copy is
+    /// still being taken as the call answers, so the entry stays `Started` until
+    /// the clock settles it.
+    pub fn start_untyped_operation(
+        &mut self,
+        now_ms: i64,
+        resource_type: &str,
+        resource_name: &str,
+        location: &StoredLocation,
+        settles_at_ms: i64,
+    ) -> StoredOperation {
+        self.log_operation(
+            now_ms,
+            None,
+            resource_type,
+            resource_name,
+            location,
+            Some(settles_at_ms),
+        )
     }
 
     /// The one place an operation-log entry is built, so every entry this

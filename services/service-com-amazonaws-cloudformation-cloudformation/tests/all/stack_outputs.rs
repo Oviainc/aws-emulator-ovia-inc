@@ -1158,6 +1158,12 @@ fn output_cases() -> Vec<OutputCase> {
                 "    Type: String\n",
                 "  EngineName:\n",
                 "    Type: String\n",
+                // Declared and left unsupplied, so it has no value in force: a parameter
+                // the template DOES declare, which is what makes the engine below
+                // unresolvable rather than a name the template never declared (that is a
+                // template error the request is refused for).
+                "  UnsuppliedEngine:\n",
+                "    Type: String\n",
                 "Resources:\n",
                 "  FixedPortCluster:\n",
                 "    Type: AWS::RDS::DBCluster\n",
@@ -1174,7 +1180,7 @@ fn output_cases() -> Vec<OutputCase> {
                 "    Type: AWS::RDS::DBCluster\n",
                 "    Properties:\n",
                 "      DBClusterIdentifier: probe-unknown-engine\n",
-                "      Engine: !Ref NoSuchParameter\n",
+                "      Engine: !Ref UnsuppliedEngine\n",
                 "Outputs:\n",
                 "  FixedPort:\n",
                 "    Value: !GetAtt FixedPortCluster.Endpoint.Port\n",
@@ -1200,16 +1206,12 @@ fn output_cases() -> Vec<OutputCase> {
             stack_name: "unresolved",
             template: r#"{"Parameters":{"Unsupplied":{"Type":"String"}},
                  "Outputs":{"Imported":{"Value":{"Fn::ImportValue":"other-stack-export"}},
-                   "Dangling":{"Value":{"Ref":"NoSuchThing"}},
-                   "Missing":{"Value":{"Ref":"Unsupplied"}},
-                   "Attribute":{"Value":{"Fn::GetAtt":["NoSuchThing","Arn"]}}}}"#
+                   "Missing":{"Value":{"Ref":"Unsupplied"}}}}"#
                 .to_string(),
             parameters: vec![],
             expected: vec![
                 ("Imported", Expected::NoValue),
-                ("Dangling", Expected::NoValue),
                 ("Missing", Expected::NoValue),
-                ("Attribute", Expected::NoValue),
             ],
         },
     ]
@@ -1345,9 +1347,9 @@ async fn a_template_declaring_no_outputs_reports_none() {
         ),
         ("an empty template", "silent-empty", "{}"),
         (
-            "a body that is neither json nor yaml",
-            "silent-unreadable",
-            "\tResources: [unclosed\n  - : :\n",
+            "a body declaring only a description",
+            "silent-description",
+            "Description: a stack with nothing to report\n",
         ),
     ];
 
@@ -1619,20 +1621,32 @@ async fn a_deleted_stacks_outputs_are_gone() {
 }
 
 /// A template body built to explode the parse is read as NO template — the request is
-/// answered, the process is still serving, and the stack simply carries no outputs.
+/// ANSWERED, with the template-format refusal a body this service will not read is owed, and
+/// the process is still serving.
 ///
 /// Nesting is what matters here: the YAML loader descends once per level and cannot be
 /// aborted from the event stream, so the nesting a YAML body can reach is bounded before
-/// the parser sees it. Each row is a different way to buy depth cheaply.
+/// the parser sees it. Each row is a different way to buy depth cheaply, and each is past
+/// one of the bounds, so every one of them is refused rather than read.
 #[tokio::test]
 async fn a_template_body_built_to_explode_the_parse_is_read_as_no_template() {
     let router = router();
     // The documented `TemplateBody` maximum, so each body is as large as a caller can
     // make one.
     let body_max = TEMPLATE_BODY_MAX_BYTES;
+    // Each row: the case, the body and its index. Every one of them is past a bound the
+    // reader puts on a document, so every one is refused.
     let cases: Vec<(&str, String, usize)> = vec![
-        ("flow sequences, one byte per level", "[".repeat(body_max), 1),
-        ("flow mappings, one byte per level", "{".repeat(body_max), 2),
+        (
+            "flow sequences, one byte per level",
+            "[".repeat(body_max),
+            1,
+        ),
+        (
+            "flow mappings, one byte per level",
+            "{".repeat(body_max),
+            2,
+        ),
         (
             "compact block sequences, two bytes per level",
             "- ".repeat(body_max / 2),
@@ -1646,6 +1660,8 @@ async fn a_template_body_built_to_explode_the_parse_is_read_as_no_template() {
             4,
         ),
         (
+            // Valid JSON, but nested past what either reader will build: refused for its
+            // form, not read as a document declaring nothing.
             "well-formed json nested past what any template needs",
             format!("{}1{}", "[".repeat(2_000), "]".repeat(2_000)),
             5,
@@ -1660,8 +1676,8 @@ async fn a_template_body_built_to_explode_the_parse_is_read_as_no_template() {
         (
             // The worst case the opener count permits: every closer is quoted, so the
             // running depth never rises, and the loader really does descend once per
-            // level. Just inside MAX_TEMPLATE_FLOW_OPENERS, so this is the deepest
-            // document the guard lets through — and the service answers it.
+            // level. The YAML reader stops in it, and the position it stopped at is what
+            // the refusal reports.
             "the deepest nesting the opener count allows, every closer quoted",
             format!("Outputs: {}", "[\"]\",".repeat(2_000)),
             7,
@@ -1680,19 +1696,31 @@ async fn a_template_body_built_to_explode_the_parse_is_read_as_no_template() {
     for (case, template, index) in cases {
         let name = format!("exploding-{index}");
         let (status_code, body) = create_stack(&router, &name, &template, &[]).await;
+        // A body this service will not READ at all is refused as a template FORM error —
+        // and the request is ANSWERED rather than taking the process down, which is what
+        // the bounds are for.
         assert_eq!(
-            status_code, 200,
-            "case {case:?}: expected CreateStack to be answered, got {status_code} {body}"
+            status_code, 400,
+            "case {case:?}: a body this service will not read must be refused, got \
+             {status_code} {body}"
         );
-        wait_for_the_transition().await;
-        let (status_code, body) = describe_stack(&router, &name).await;
         assert_eq!(
-            status_code, 200,
-            "case {case:?}: expected DescribeStacks to be answered, got {status_code} {body}"
+            xml_text(&body, "Code").as_deref(),
+            Some("ValidationError"),
+            "case {case:?}: a body this service will not read is refused a template \
+             format error, got {status_code} {body}"
         );
+        let message = xml_text(&body, "Message").unwrap_or_default();
         assert!(
-            wire_outputs(&body).is_empty(),
-            "case {case:?}: a body this service will not read declares no outputs, got {body}"
+            message.starts_with("Template format error"),
+            "case {case:?}: the refusal must be a template format error, got {message:?}"
+        );
+        // And nothing was created for it: the name is still free.
+        let (status_code, described) = describe_stack(&router, &name).await;
+        assert_eq!(
+            status_code, 400,
+            "case {case:?}: a refused body must leave no stack, got {status_code} \
+             {described}"
         );
     }
 }

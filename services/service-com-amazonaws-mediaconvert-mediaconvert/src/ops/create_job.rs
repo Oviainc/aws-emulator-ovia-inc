@@ -214,9 +214,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        if input.role.trim().is_empty() {
+        if crate::state::carries_no_characters(&input.role) {
             return Err(CreateJobErrorModeled::BadRequestException(BadRequestException {
-                message: Some("Role must not be empty.".to_string()),
+                message: Some(crate::state::blank_member_message("Role")),
             })
             .into());
         }
@@ -226,9 +226,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // value they meant, so an empty one is refused rather than quietly dropped, as
         // `CreateJobTemplate` refuses an empty `Queue`. The reference itself is resolved
         // against the store below, where the template's settings are read with it.
-        if input.job_template.as_deref().map(str::trim) == Some("") {
+        if input
+            .job_template
+            .as_deref()
+            .is_some_and(crate::state::carries_no_characters)
+        {
             return Err(CreateJobErrorModeled::BadRequestException(BadRequestException {
-                message: Some("JobTemplate must not be empty.".to_string()),
+                message: Some(crate::state::blank_member_message("JobTemplate")),
+            })
+            .into());
+        }
+
+        // "Optional. When you create a job, you can specify a queue to send it to. If you
+        // don't specify, the job will go to the default queue." A `Queue` carrying no
+        // characters is neither a queue this account holds nor the member left out, so it
+        // is the same problem in the request `CreateJobTemplate` answers for its own
+        // `Queue` rather than a lookup of a name nothing could hold.
+        if input
+            .queue
+            .as_deref()
+            .is_some_and(crate::state::carries_no_characters)
+        {
+            return Err(CreateJobErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::blank_member_message("Queue")),
             })
             .into());
         }

@@ -497,6 +497,19 @@ pub fn rule_not_found_message(rule_arn: &str) -> String {
 /// code and its HTTP 403; this is the service's own wording for it.
 pub const OPT_IN_REQUIRED_MESSAGE: &str = "Aws account is not registered for recommendation.";
 
+/// The message every `AccessDeniedException` of this service carries.
+///
+/// FIXED and request-independent: it is the sentence the shape itself documents
+/// (`smithy_query(query="shape",shape="AccessDeniedException")`). AWS's own text
+/// embeds the caller's ARN and the action, which is account-specific; the
+/// requirement is the code and its HTTP 403, so the modelled sentence is what
+/// this states. Worded here, like every other client error of this service, so
+/// the authorization refusal the dispatch seam renders (`crate::service`) and
+/// the one a handler raises cannot drift apart — and so the refusal names
+/// neither the resource the request reached for nor the account it belongs to.
+pub const ACCESS_DENIED_MESSAGE: &str =
+    "You do not have sufficient permissions to perform this action.";
+
 /// The message every `IdempotentParameterMismatchException` of this service
 /// carries — the service's own wire wording for "this client token was first
 /// used with a different request", FIXED and derived from nothing in the
@@ -3015,6 +3028,30 @@ impl ComAmazonawsComputeoptimizerautomationComputeoptimizerautomationserviceStat
     pub fn is_associated(&self, account_id: &str) -> bool {
         self.enrollment(account_id).reported_organization_rule_mode()
             == ORGANIZATION_RULE_MODE_ANY_ALLOWED
+    }
+
+    /// May the caller initiate automation work in `account_id`?
+    ///
+    /// The operations that INITIATE work in an account — the on-demand
+    /// automation of a recommended action, and the rollback of an automation
+    /// event — each document that a management account or a delegated
+    /// administrator "can only initiate" that work "for associated member
+    /// accounts", and point at `AssociateAccounts` as the remedy. So work in
+    /// ANOTHER account is initiated only while that account's association is in
+    /// place ([`Self::is_associated`]).
+    ///
+    /// Judged per call, never taken from the stored resource: a disassociation
+    /// removes the association and leaves the member's events and analysed
+    /// actions exactly where they were ([`Self::disassociate_account`]), so a
+    /// resource of that account stays reachable by id after the organization
+    /// has stopped reaching into it.
+    ///
+    /// The caller's own account is nobody's associated MEMBER account, and what
+    /// the restriction is about is reaching into another account, so an
+    /// automation of the caller's own resources needs no association. The
+    /// caller's enrollment is a separate gate ([`Self::opt_in_required`]).
+    pub fn may_initiate_in(&self, account_id: &str) -> bool {
+        account_id == caller_account_id() || self.is_associated(account_id)
     }
 
     /// How many of `account_ids` the enrollment store does not hold an entry for
