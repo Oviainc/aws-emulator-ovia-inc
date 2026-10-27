@@ -475,6 +475,13 @@ pub struct ConfigurationSet {
     /// (`UpdateConfigurationSetSendingEnabled`); a send that names it is refused
     /// with `ConfigurationSetSendingPausedException` while it is false.
     pub sending_enabled: bool,
+    /// Whether Amazon SES publishes reputation metrics (bounce and complaint
+    /// rates) to Amazon CloudWatch for this set
+    /// (`UpdateConfigurationSetReputationMetricsEnabled`), reported as
+    /// `ReputationOptions$ReputationMetricsEnabled`. Per set: the member
+    /// documents "The default value is false", and one set's flag says nothing
+    /// about another's.
+    pub reputation_metrics_enabled: bool,
     /// The custom open-and-click redirect domain of this set's `TrackingOptions`
     /// sub-resource.
     ///
@@ -893,6 +900,12 @@ impl ComAmazonawsSesSimpleemailserviceState {
                     // refuses a send naming it only after
                     // `UpdateConfigurationSetSendingEnabled` disables it.
                     sending_enabled: true,
+                    // And it publishes no reputation metrics:
+                    // `ReputationOptions$ReputationMetricsEnabled` documents
+                    // "The default value is false", so a set starts off until
+                    // `UpdateConfigurationSetReputationMetricsEnabled` enables
+                    // it.
+                    reputation_metrics_enabled: false,
                     // And it carries no `TrackingOptions` sub-resource:
                     // `CreateConfigurationSetTrackingOptions` is what adds one.
                     custom_redirect_domain: None,
