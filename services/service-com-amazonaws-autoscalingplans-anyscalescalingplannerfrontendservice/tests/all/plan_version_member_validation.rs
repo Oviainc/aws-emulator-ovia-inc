@@ -44,7 +44,10 @@ const RESOURCE_ID: &str = "autoScalingGroup/my-asg";
 /// plan. Currently, the only valid value is 1", so the rows span that type's MAGNITUDE and
 /// SIGN: the version below the documented one, the one above it, a negative version,
 /// versions past 32 and past 53 bits, and both ends of the type.
-fn rejected_versions() -> [(&'static str, i64); 7] {
+///
+/// `pub(crate)` so every suite driving this member spans the same values — including the
+/// collection read in [`crate::describe_scaling_plans_version_member`].
+pub(crate) fn rejected_versions() -> [(&'static str, i64); 7] {
     [
         ("version zero", ONLY_VERSION - 1),
         ("the next version up", ONLY_VERSION + 1),
