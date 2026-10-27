@@ -10,6 +10,13 @@
 //! [`crate::state::TranscriptionJobRecord`], which `GetTranscriptionJob` and
 //! `ListTranscriptionJobs` read back.
 //!
+//! A start made while the family's concurrency ceiling is reached
+//! ([`crate::state::MAX_CONCURRENT_TRANSCRIPTION_JOBS`]) is accepted into the queue
+//! `JobExecutionSettings.AllowDeferredExecution` opts into, and refused the modelled
+//! `LimitExceededException` when it deferred nothing or when the queue is already as
+//! deep as this emulator keeps it
+//! ([`crate::state::MAX_QUEUED_TRANSCRIPTION_JOBS`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -487,12 +494,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a job that has reached
         // a terminal status has released its slot (see
         // [`crate::state::jobs_in_flight`], which materialises the transitions the
-        // clock already owed each record before counting). A start made while that
-        // many jobs are in flight is refused with the error this operation models for
-        // an exceeded quota.
-        if crate::state::jobs_in_flight(&mut store.transcription_jobs, &region, now)
-            >= crate::state::MAX_CONCURRENT_TRANSCRIPTION_JOBS
-        {
+        // clock already owed each record before counting).
+        //
+        // Reaching it is not by itself a refusal, because this family has job queueing
+        // and the model names the member that opts into it: "When AllowDeferredExecution
+        // is set to true, transcription job requests are placed in a queue until the
+        // number of jobs falls below the concurrent request limit. If
+        // AllowDeferredExecution is set to false and the number of transcription job
+        // requests exceed the concurrent request limit, you get a
+        // LimitExceededException error" (model doc for
+        // `JobExecutionSettings$AllowDeferredExecution`). So at the ceiling a start that
+        // deferred its execution is accepted into that queue while the queue has room
+        // for it — a waiting job holds no running slot, so it is bounded by the queue's
+        // own depth, [`crate::state::MAX_QUEUED_TRANSCRIPTION_JOBS`] — and a start that
+        // deferred nothing is refused with the error this operation models for an
+        // exceeded quota. Below the ceiling there is nothing to wait for, so the member
+        // queues nothing (see [`crate::state::admit_start`]).
+        let defers_execution = input
+            .job_execution_settings
+            .as_ref()
+            .and_then(|settings| settings.allow_deferred_execution)
+            .unwrap_or(false);
+        let admission = crate::state::admit_start(
+            &mut store.transcription_jobs,
+            &region,
+            now,
+            crate::state::MAX_CONCURRENT_TRANSCRIPTION_JOBS,
+            defers_execution.then_some(crate::state::MAX_QUEUED_TRANSCRIPTION_JOBS),
+        );
+        if admission == crate::state::StartAdmission::Refuse {
             return Err(StartTranscriptionJobErrorModeled::LimitExceededException(
                 LimitExceededException {
                     message: Some(crate::state::concurrency_limit_message(
@@ -505,9 +535,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The Region comes from the request's own (unauthenticated) credential scope, so
-        // the concurrency quota above and the retention bound below bound this family's
-        // store only together with a cap on how many Regions it keeps job records for
-        // (see [`crate::state::MAX_REGIONS`]).
+        // the concurrency quota above, the queue depth beside it and the retention bound
+        // below bound this family's store only together with a cap on how many Regions
+        // it keeps job records for (see [`crate::state::MAX_REGIONS`]).
         if store.transcription_jobs.region_bucket_exhausted(&region) {
             return Err(StartTranscriptionJobErrorModeled::LimitExceededException(
                 LimitExceededException {
@@ -521,35 +551,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let sequence = store.next_sequence();
-        // Job queueing is what `JobExecutionSettings.AllowDeferredExecution` asks
-        // for, so such a job starts QUEUED and begins processing when the clock says
-        // it did; every other job is processing from the moment it is started.
-        let queued = input
-            .job_execution_settings
-            .as_ref()
-            .and_then(|settings| settings.allow_deferred_execution)
-            .unwrap_or(false);
-        let (status, start_time, queued_until, completion_due) = if queued {
-            let starts_at = now + crate::state::JOB_TRANSITION_DELAY;
-            (
-                crate::state::STATUS_QUEUED.to_string(),
-                None,
-                Some(starts_at),
-                starts_at + crate::state::JOB_TRANSITION_DELAY,
-            )
-        } else {
-            (
-                crate::state::STATUS_IN_PROGRESS.to_string(),
-                Some(now),
-                None,
-                now + crate::state::JOB_TRANSITION_DELAY,
-            )
-        };
+        // Only the ceiling puts a job in the queue: below it there is nothing to wait
+        // for, so a start that deferred its execution is processing like any other.
+        let lifecycle =
+            crate::state::start_lifecycle(now, admission == crate::state::StartAdmission::Queue);
 
         let record = crate::state::TranscriptionJobRecord {
             name: input.transcription_job_name.clone(),
             sequence,
-            status,
+            status: lifecycle.status,
             language_code: input.language_code,
             media: input.media,
             media_format: input.media_format,
@@ -587,10 +597,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             transcript: None,
             failure_reason: None,
             creation_time: now,
-            start_time,
+            start_time: lifecycle.start_time,
             completion_time: None,
-            queued_until,
-            completion_due,
+            queued_until: lifecycle.queued_until,
+            completion_due: lifecycle.completion_due,
             tags: input.tags.unwrap_or_default(),
         };
 

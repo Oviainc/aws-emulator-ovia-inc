@@ -11,6 +11,10 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+#[path = "all/chipset_generation_form.rs"]
+mod chipset_generation_form;
+#[path = "all/gone_image_delete_refusal.rs"]
+mod gone_image_delete_refusal;
 #[path = "all/image_build_read_path.rs"]
 mod image_build_read_path;
 #[path = "all/image_listing.rs"]
@@ -25,6 +29,8 @@ mod list_tags_read_path;
 mod managed_base_image_catalogue;
 #[path = "all/managed_base_image_versions.rs"]
 mod managed_base_image_versions;
+#[path = "all/managed_namespace_authorization.rs"]
+mod managed_namespace_authorization;
 #[path = "all/microvm_image_and_instance_paths.rs"]
 mod microvm_image_and_instance_paths;
 #[path = "all/microvm_lifecycle.rs"]

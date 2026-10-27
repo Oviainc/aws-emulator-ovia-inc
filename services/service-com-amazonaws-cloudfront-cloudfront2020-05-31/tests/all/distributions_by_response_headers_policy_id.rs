@@ -27,7 +27,6 @@
 
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
     MANAGED_RESPONSE_HEADERS_POLICIES, MAX_ITEMS, NO_SUCH_RESPONSE_HEADERS_POLICY_MESSAGE,
-    RESPONSE_HEADERS_POLICY_ID_FORMAT_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -569,9 +568,10 @@ async fn a_policy_aws_published_lists_what_attaches_it() {
 }
 
 /// An id no response headers policy holds is `NoSuchResponseHeadersPolicy`, whatever shape the
-/// id takes — never an empty page, which would claim the policy exists. The refusal's MESSAGE
-/// states which of the two conditions it is: an identifier outside the shape a response
-/// headers policy id takes is unusable, while a well-formed id simply names no policy.
+/// id takes — never an empty page, which would claim the policy exists. This listing resolves
+/// the id as a lookup KEY into the distributions it serves rather than addressing a policy by
+/// it, so no precheck of the identifier's shape stands in front of the lookup and every such
+/// id carries the ONE absent-policy sentence.
 #[tokio::test]
 async fn an_id_no_policy_holds_is_refused() {
     let router = emulator();
@@ -581,35 +581,25 @@ async fn an_id_no_policy_holds_is_refused() {
     let mut flipped: Vec<char> = known.chars().collect();
     let last = flipped.len() - 1;
     flipped[last] = if flipped[last] == 'a' { 'b' } else { 'a' };
-    let absent: [(&str, String, &str); 5] = [
+    let absent: [(&str, String); 5] = [
         (
             "a UUID never minted",
             "00000000-0000-0000-0000-000000000000".to_string(),
-            NO_SUCH_RESPONSE_HEADERS_POLICY_MESSAGE,
         ),
         (
             "a known id with one character changed",
             flipped.into_iter().collect(),
-            NO_SUCH_RESPONSE_HEADERS_POLICY_MESSAGE,
         ),
-        (
-            "a known id in upper case",
-            known.to_uppercase(),
-            RESPONSE_HEADERS_POLICY_ID_FORMAT_MESSAGE,
-        ),
-        (
-            "a token that is no UUID",
-            "not-a-policy-id".to_string(),
-            RESPONSE_HEADERS_POLICY_ID_FORMAT_MESSAGE,
-        ),
+        ("a known id in upper case", known.to_uppercase()),
+        ("a token that is no UUID", "not-a-policy-id".to_string()),
         (
             "a policy name rather than an id",
             "by-response-headers-policy-0".to_string(),
-            RESPONSE_HEADERS_POLICY_ID_FORMAT_MESSAGE,
         ),
     ];
 
-    for (case, candidate, expected) in absent {
+    let expected = NO_SUCH_RESPONSE_HEADERS_POLICY_MESSAGE;
+    for (case, candidate) in absent {
         let answer = list_by_policy(&router, &candidate, "").await;
         assert_eq!(
             answer.status, 404,

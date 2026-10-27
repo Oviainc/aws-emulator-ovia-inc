@@ -4,7 +4,8 @@
 //!
 //! Sets the threat-protection (risk) configuration of one user pool, or of one app
 //! client of it, and answers the configuration that level holds afterwards, read
-//! back from what was stored.
+//! back from what was stored. Only the compromised-credentials setting needs the
+//! pool's threat-protection add-on to be on.
 //!
 //! ## Shape of an operation
 //!
@@ -200,6 +201,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let client_id = input.client_id.clone();
         let now = ::std::time::SystemTime::now();
 
+        // Which settings the request carries decides whether the pool's
+        // threat-protection add-on is a precondition of this write: the
+        // compromised-credentials setting is the one the add-on pays for, so only
+        // a request that carries it needs the add-on on. Read before the three
+        // settings are moved into the stored configuration below.
+        let needs_add_ons = input.compromised_credentials_risk_configuration.is_some();
+
         // This call SETS the whole configuration of the level it names, so the
         // stored settings are exactly the ones the request carries: a request
         // that carries none of the three stores a configuration with nothing in
@@ -221,10 +229,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .pool_mut(&input.user_pool_id)
             .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
 
-        // Threat protection is configurable only while the pool's add-ons are
-        // enabled. Asked AFTER the lookup, so a request that names no pool is a
-        // 404 whatever the pool it named would have reported.
-        if !pool.add_ons_enabled() {
+        // The add-on precondition is scoped to the setting it governs, not to the
+        // operation: a write that carries the compromised-credentials setting is
+        // refused while the pool's add-ons are off, and a write that carries only
+        // the adaptive-authentication or IP-address settings is stored whatever
+        // the pool's add-on state. Asked AFTER the lookup, so a request that names
+        // no pool is a 404 whatever the pool it named would have reported.
+        if needs_add_ons && !pool.add_ons_enabled() {
             return Err(add_ons_not_enabled());
         }
 
@@ -279,7 +290,8 @@ fn client_not_found(client_id: &str) -> SetRiskConfigurationError {
     .into()
 }
 
-/// This operation's refusal on a pool whose user pool add-ons are off.
+/// This operation's refusal of a compromised-credentials write on a pool whose
+/// user pool add-ons are off.
 fn add_ons_not_enabled() -> SetRiskConfigurationError {
     SetRiskConfigurationErrorModeled::UserPoolAddOnNotEnabledException(
         UserPoolAddOnNotEnabledException {

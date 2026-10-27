@@ -79,7 +79,10 @@ async fn emulator_with_rule() -> Emulator {
 
 /// Seed `results` as the evaluation results recorded against the rule `rule`, reaching
 /// the store the way a handler does.
-fn seed(emulator: &Emulator, rule: &str, results: &[EvaluationResultEntry]) {
+///
+/// `pub(crate)` because every suite about what a rule's RECORDED results are reported as
+/// needs exactly this seed (`conformance_pack_compliance_details` is the other one).
+pub(crate) fn seed(emulator: &Emulator, rule: &str, results: &[EvaluationResultEntry]) {
     let state = service_state(&*emulator.engine).expect("the test engine is the shared engine");
     let mut store = state.lock();
     let entry = store
@@ -183,7 +186,10 @@ fn expected(rule: &str, results: &[EvaluationResultEntry], wanted: &[&str]) -> V
 
 /// The sizes of the pages `total` results are served in at `limit` per page: a page
 /// carries at most `limit`, and a rule with no results still answers one empty page.
-fn page_sizes(total: usize, limit: usize) -> Vec<usize> {
+///
+/// `pub(crate)` because every paged evaluation-details read serves its pages this way
+/// (`conformance_pack_compliance_details` is the other suite that walks them).
+pub(crate) fn page_sizes(total: usize, limit: usize) -> Vec<usize> {
     if total == 0 {
         return vec![0];
     }

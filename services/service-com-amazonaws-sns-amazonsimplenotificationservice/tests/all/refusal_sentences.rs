@@ -179,6 +179,45 @@ async fn a_refused_condition_answers_the_services_sentence_for_it() {
                       specified. Use only one or the other.",
         },
         Refusal {
+            case: "Publish declaring the json structure over a body that is not JSON",
+            action: "Publish",
+            params: params(&[
+                ("TopicArn", &topic),
+                ("Message", "not json"),
+                ("MessageStructure", "json"),
+            ]),
+            status: 400,
+            code: "InvalidParameter",
+            message: "Invalid parameter: Message Structure - JSON message body failed to \
+                      parse",
+        },
+        Refusal {
+            case: "Publish declaring the json structure over JSON that is not an object",
+            action: "Publish",
+            params: params(&[
+                ("TopicArn", &topic),
+                ("Message", r#"["default"]"#),
+                ("MessageStructure", "json"),
+            ]),
+            status: 400,
+            code: "InvalidParameter",
+            message: "Invalid parameter: Message Structure - JSON message body failed to \
+                      parse",
+        },
+        Refusal {
+            case: "Publish declaring the json structure over a document with no default",
+            action: "Publish",
+            params: params(&[
+                ("TopicArn", &topic),
+                ("Message", r#"{"sqs":"s"}"#),
+                ("MessageStructure", "json"),
+            ]),
+            status: 400,
+            code: "InvalidParameter",
+            message: "Invalid parameter: Message Structure - No default entry in JSON \
+                      message body",
+        },
+        Refusal {
             case: "Publish with a Subject one character past the bound",
             action: "Publish",
             params: params(&[

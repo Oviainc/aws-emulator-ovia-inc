@@ -41,7 +41,10 @@ const DEVICES: [&str; 3] = ["/dev/sdf", "/dev/xvdb", "xvdh"];
 
 /// `CreateWorkspaceInstance` in `region`, placed in `zone` when one is given, returning
 /// the minted id.
-async fn create_instance(
+///
+/// `pub(crate)`: the sibling `volume_attachment` suite creates the instances of its
+/// per-Region rows through this one rather than writing a second copy of it.
+pub(crate) async fn create_instance(
     router: &MultiServiceRouter,
     region: &str,
     case: &str,

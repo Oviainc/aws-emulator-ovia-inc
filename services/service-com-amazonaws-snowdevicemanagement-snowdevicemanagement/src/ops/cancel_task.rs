@@ -183,8 +183,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A task that already finished or was already cancelled has nothing left
-        // to stop; its record keeps the state and the instant it reached it.
-        let task_running = task.state == "IN_PROGRESS";
+        // to stop; its record keeps the state and the instant it reached it. The
+        // predicate is the record's own ([`crate::state::Task::is_in_flight`]),
+        // which the quota path counts with too, so both read one definition of
+        // "this task still holds work".
+        let task_running = task.is_in_flight();
 
         // Only the executions no device has started yet can be stopped: a cancel
         // that lands after the command was dispatched is too late for that

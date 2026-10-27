@@ -404,6 +404,19 @@ async fn an_omitted_name_updates_the_signing_users_key() {
                 member_of(&listed, updated, "Status")
             );
         }
+        // The loop above left the SIGNING key `Inactive`, and `UpdateAccessKey$Status`
+        // documents that an `Inactive` key "cannot be used" for programmatic calls — so
+        // it is returned to `Active` here, through a request that names the user rather
+        // than being signed by that key, before anything signs with it again. (That the
+        // deactivated key is refused is
+        // `access_key_status_authentication::a_key_the_account_moved_off_active_cannot_sign_a_call`'s
+        // claim, not this test's; this test is about which key a nameless update reaches.)
+        let (status, body) = update_status(&router, user, &held[0], ACTIVE).await;
+        assert_eq!(
+            status, 200,
+            "case {user:?}: expected the signing key to be returned to {ACTIVE}, \
+             got {status}: {body}"
+        );
     }
 
     // A nameless request signed by one holder cannot reach the other's key: the id
@@ -463,13 +476,14 @@ async fn an_omitted_name_updates_the_signing_users_key() {
     }
 
     // Every refusal above left the stored statuses where the accepted updates put
-    // them.
+    // them: each holder's second key `Inactive`, and its signing key back at `Active`.
     for (user, held) in &holders {
         let listed = list_keys(&router, user, user).await;
-        for id in held {
+        for (index, id) in held.iter().enumerate() {
+            let expected = if index == 0 { ACTIVE } else { "Inactive" };
             assert_eq!(
                 member_of(&listed, id, "Status"),
-                "Inactive",
+                expected,
                 "case {user:?}: a refused update moved the stored status of {id:?}, got {:?}",
                 member_of(&listed, id, "Status")
             );

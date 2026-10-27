@@ -45,7 +45,9 @@
 
 use ::serde_json::{Map, Value};
 
-use crate::ops::types::{AlarmHistoryItem, CompositeAlarm, Dimension, MetricAlarm};
+use crate::ops::types::{
+    AlarmHistoryItem, CompositeAlarm, Dimension, MetricAlarm, MetricDataQuery,
+};
 /// The ARN namespace of Amazon SNS, whose topics are the action kind this module delivers to.
 const SNS_ARN_NAMESPACE: &str = "sns";
 
@@ -912,6 +914,16 @@ fn triggering_children(children: &[super::ChildAlarmState]) -> Value {
 
 /// A metric alarm's `Trigger`: the configuration the evaluation applied, so a consumer of the
 /// notification can see which metric crossed which threshold.
+///
+/// An alarm defines WHAT it evaluates in one of two forms, and the trigger reports the form the
+/// alarm carries: "Each item in the Metrics array either retrieves a metric or performs a math
+/// expression. One item in the Metrics array is the expression that the alarm watches." …
+/// "If you use the Metrics parameter, you cannot include the Namespace, MetricName, Dimensions,
+/// Period, Unit, Statistic, or ExtendedStatistic parameters" (`PutMetricAlarmInput$Metrics`) —
+/// so a query-array alarm reports its queries where a single-metric alarm reports its metric,
+/// and the threshold it is compared against is likewise the query named by `ThresholdMetricId`
+/// rather than a static `Threshold`. Every member is reported only when the alarm carries it,
+/// so neither form is ever reported with the other's members.
 fn metric_trigger_document(alarm: &MetricAlarm) -> Value {
     let mut trigger = Map::new();
     insert(
@@ -945,6 +957,13 @@ fn metric_trigger_document(alarm: &MetricAlarm) -> Value {
     insert(&mut trigger, "Period", alarm.period.map(Value::from));
     insert(
         &mut trigger,
+        "Metrics",
+        alarm.metrics.as_deref().map(|queries| {
+            Value::Array(queries.iter().map(metric_query_document).collect())
+        }),
+    );
+    insert(
+        &mut trigger,
         "EvaluationPeriods",
         alarm.evaluation_periods.map(Value::from),
     );
@@ -961,6 +980,11 @@ fn metric_trigger_document(alarm: &MetricAlarm) -> Value {
     insert(&mut trigger, "Threshold", alarm.threshold.map(Value::from));
     insert(
         &mut trigger,
+        "ThresholdMetricId",
+        alarm.threshold_metric_id.as_deref().map(Value::from),
+    );
+    insert(
+        &mut trigger,
         "TreatMissingData",
         alarm.treat_missing_data.as_deref().map(Value::from),
     );
@@ -973,6 +997,64 @@ fn metric_trigger_document(alarm: &MetricAlarm) -> Value {
             .map(Value::from),
     );
     Value::Object(trigger)
+}
+
+/// One query of a `Metrics` alarm as the notification's `Trigger` carries it: the members the
+/// query carries, under the names `MetricDataQuery` gives them.
+///
+/// Not the history document's query writer (`super::metric_query_document`): a history document
+/// spells every member in lower camel case, where a notification spells it the way the model
+/// does, so the two are the same data in two wire forms rather than one writer with two
+/// callers.
+fn metric_query_document(query: &MetricDataQuery) -> Value {
+    let mut document = Map::new();
+    document.insert("Id".to_string(), Value::from(query.id.as_str()));
+    insert(
+        &mut document,
+        "Expression",
+        query.expression.as_deref().map(Value::from),
+    );
+    insert(&mut document, "Label", query.label.as_deref().map(Value::from));
+    insert(
+        &mut document,
+        "ReturnData",
+        query.return_data.map(Value::from),
+    );
+    insert(&mut document, "Period", query.period.map(Value::from));
+    insert(
+        &mut document,
+        "AccountId",
+        query.account_id.as_deref().map(Value::from),
+    );
+    insert(
+        &mut document,
+        "MetricStat",
+        query.metric_stat.as_ref().map(|stat| {
+            let mut metric = Map::new();
+            insert(
+                &mut metric,
+                "Namespace",
+                stat.metric.namespace.as_deref().map(Value::from),
+            );
+            insert(
+                &mut metric,
+                "MetricName",
+                stat.metric.metric_name.as_deref().map(Value::from),
+            );
+            insert(
+                &mut metric,
+                "Dimensions",
+                stat.metric.dimensions.as_deref().map(dimensions_document),
+            );
+            let mut document = Map::new();
+            document.insert("Metric".to_string(), Value::Object(metric));
+            document.insert("Period".to_string(), Value::from(stat.period));
+            document.insert("Stat".to_string(), Value::from(stat.stat.as_str()));
+            insert(&mut document, "Unit", stat.unit.as_deref().map(Value::from));
+            Value::Object(document)
+        }),
+    );
+    Value::Object(document)
 }
 
 /// A dimension list as the notification's `Trigger` carries it.

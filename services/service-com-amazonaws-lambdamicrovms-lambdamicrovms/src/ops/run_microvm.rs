@@ -219,6 +219,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Ok(output_of(vm));
         }
 
+        // The AUTHORIZATION verdict on the image the request names, decided BEFORE its
+        // version is resolved: an identifier in the AWS-OWNED namespace names a
+        // resource of AWS's own catalogue — something to BUILD on through
+        // `CreateMicrovmImage$baseImageArn`, not something this account may run — so it
+        // is DENIED rather than reported as an image with no active version.
+        if crate::state::is_managed_microvm_image_arn(&input.image_identifier) {
+            return Err(RunMicrovmErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(crate::state::ACCESS_DENIED_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
         // A MicroVM runs a BUILT image version. With no `imageVersion` named, the
         // precondition is the resolution of the image's ACTIVE version — and that
         // resolution fails identically whether the account holds no such image or the

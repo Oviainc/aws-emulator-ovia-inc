@@ -32,6 +32,9 @@ use smithy_server_runtime::MultiServiceRouter;
 // RFC 3986's unreserved characters literal, which is what an AWS SDK sends. It lives in
 // `all/query_wire.rs`, the module every awsQuery suite here reads the wire through.
 use crate::query_wire::form_encode;
+use service_com_amazonaws_cloudformation_cloudformation::state::{
+    failed_action, resource_failure_summary,
+};
 
 /// Keep this at or above `boot_serve.rs`'s stack: the same assembly runs here.
 const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
@@ -527,10 +530,26 @@ fn a_stack_whose_repository_cannot_be_created_fails_and_says_which_one() {
                 "expected the failed create to be rolled back, got {status} {reason:?}"
             );
             let reason = reason.unwrap_or_default();
+            // The stack's own reason is the summary naming the resource that failed; what
+            // the owning service answered is on that resource's event.
+            assert_eq!(
+                reason,
+                resource_failure_summary(failed_action::CREATE, ["Repo"]),
+                "expected the stack reason to summarise which resource failed, got \
+                 {reason:?}"
+            );
+            let (_, events) = cloudformation(
+                &router,
+                &runtime,
+                "DescribeStackEvents",
+                &[("StackName", "cfn-taken")],
+            );
             assert!(
-                reason.contains("Repo") && reason.contains("RepositoryAlreadyExistsException"),
-                "expected the reason to name the resource and what the service answered, \
-                 got {reason:?}"
+                xml_texts(&events, "ResourceStatusReason")
+                    .iter()
+                    .any(|reported| reported.contains("already exists")),
+                "expected the failing resource's event to carry what the service answered, \
+                 got {events}"
             );
             // The repository that was already there is untouched: the stack created
             // nothing, so its deletion deletes nothing.

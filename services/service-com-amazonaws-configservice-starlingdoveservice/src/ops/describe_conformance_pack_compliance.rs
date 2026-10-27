@@ -296,18 +296,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Config rule that you passed in the filter does not exist": a filtered name
         // this pack deployed no rule for is REFUSED rather than skipped, and the refusal
-        // names every such name the request carried.
-        let missing: Vec<String> = filtered_names
+        // names the first such name the request carried, with the pack it asked about.
+        let missing = filtered_names
             .iter()
-            .filter(|name| !rule_compliance.contains_key(*name))
-            .cloned()
-            .collect();
-        if !missing.is_empty() {
+            .find(|name| !rule_compliance.contains_key(*name));
+        if let Some(missing) = missing {
             return Err(
                 DescribeConformancePackComplianceErrorModeled::NoSuchConfigRuleInConformancePackException(
                     NoSuchConfigRuleInConformancePackException {
                         message: Some(
-                            crate::state::no_such_config_rule_in_conformance_pack_message(&missing),
+                            crate::state::no_such_config_rule_in_conformance_pack_message(
+                                missing,
+                                &pack.name,
+                            ),
                         ),
                     },
                 )

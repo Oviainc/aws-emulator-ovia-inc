@@ -37,6 +37,8 @@ mod modeled_validation_exception;
 mod multi_region_cluster_status;
 #[path = "all/multi_region_witness.rs"]
 mod multi_region_witness;
+#[path = "all/nested_arn_not_found.rs"]
+mod nested_arn_not_found;
 #[path = "all/pagination_token_refusal.rs"]
 mod pagination_token_refusal;
 #[path = "all/policy_document_class.rs"]

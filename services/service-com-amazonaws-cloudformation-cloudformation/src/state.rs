@@ -4780,6 +4780,46 @@ pub fn new_request_id() -> String {
     new_identifier("request")
 }
 
+/// The verbs a stack operation's resource-failure summary is worded with
+/// ([`resource_failure_summary`]): what the operation was doing to the resources it could
+/// not carry through.
+pub mod failed_action {
+    /// A create — the resources a `CreateStack` (or a change set that creates them) could
+    /// not bring into existence.
+    pub const CREATE: &str = "create";
+    /// An update — the resources an `UpdateStack` could not change.
+    pub const UPDATE: &str = "update";
+    /// A delete — the resources a `DeleteStack` (or a rollback) could not remove.
+    pub const DELETE: &str = "delete";
+}
+
+/// The `StackStatusReason` a stack operation reports when its RESOURCES are what failed it.
+///
+/// The field is a free-form string, and what CloudFormation puts in it for this class of
+/// failure is one SUMMARY sentence: the fixed text around the comma-separated
+/// `LogicalResourceId`s of the resources the operation could not carry through, and nothing
+/// else. The sentence ends with its separating space, which is where CloudFormation's own
+/// follow-on clause about the stack would go — never the failing resource's diagnosis.
+///
+/// That diagnosis is a per-RESOURCE field: `StackEvent$ResourceStatusReason` is the
+/// "success/failure message associated with the resource", so the owning service's refusal
+/// (its error code, its message) is carried there, on the event for the resource that
+/// failed, and is read through `DescribeStackEvents` and `DescribeStackResource`. Folding it
+/// into the stack-level summary would make the one field a client parses to recover the set
+/// of failed logical ids depend on provider error text instead.
+///
+/// `action` is what the operation was doing ([`failed_action`]).
+pub fn resource_failure_summary<'a>(
+    action: &str,
+    logical_ids: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let named: Vec<&str> = logical_ids.into_iter().collect();
+    format!(
+        "The following resource(s) failed to {action}: [{}]. ",
+        named.join(", ")
+    )
+}
+
 /// The message CloudFormation answers when a request names a stack that is not
 /// addressable: no live stack has that name and no stack has that id.
 pub fn stack_does_not_exist(name_or_id: &str) -> String {

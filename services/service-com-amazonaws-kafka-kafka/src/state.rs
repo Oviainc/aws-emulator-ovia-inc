@@ -50,7 +50,10 @@
 //! reader then reports. The operation itself is kept in the cluster-operation
 //! registry, which is what its `ClusterOperationArn` names and what
 //! `DescribeClusterOperation` renders with
-//! [`ClusterOperation::to_cluster_operation_info`].
+//! [`ClusterOperation::to_cluster_operation_info`] and
+//! `DescribeClusterOperationV2` with
+//! [`ClusterOperation::to_cluster_operation_v2`] — one stored record, two
+//! renderings, so the V1 and V2 readers of one operation cannot disagree.
 //!
 //! The channel registry lives beside it, keyed by channel ARN and indexed by
 //! (cluster ARN, channel name) — a channel is a sub-resource of the cluster it
@@ -94,7 +97,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     BrokerEBSVolumeInfo, BrokerNodeGroupInfo, BrokerNodeInfo, BrokerSoftwareInfo,
-    ChannelLoggingInfo, ClientAuthentication, ClusterInfo, ClusterOperationInfo, Configuration,
+    ChannelLoggingInfo, ClientAuthentication, ClusterInfo, ClusterOperationInfo, ClusterOperationV2,
+    ClusterOperationV2Provisioned, Configuration,
     ConfigurationInfo, ConfigurationRevision, ConnectivityInfo, ConsumerGroupReplicationUpdate,
     CreateChannelInput,
     CreateClusterInput, CreateConfigurationInput, CreateReplicatorInput, CreateVpcConnectionInput,
@@ -153,6 +157,9 @@ pub const OPERATION_TYPE_UPDATE_STORAGE: &str = "UPDATE_STORAGE";
 
 /// The `OperationType` an `UpdateBrokerStorage` call records, in the same form.
 pub const OPERATION_TYPE_UPDATE_BROKER_STORAGE: &str = "UPDATE_BROKER_STORAGE";
+
+/// The `OperationType` an `UpdateConnectivity` call records, in the same form.
+pub const OPERATION_TYPE_UPDATE_CONNECTIVITY: &str = "UPDATE_CONNECTIVITY";
 
 /// The state MSK reports for a cluster operation that is still running.
 pub const OPERATION_STATE_IN_PROGRESS: &str = "UPDATE_IN_PROGRESS";
@@ -1023,6 +1030,12 @@ pub struct ClusterOperation {
     /// The region the operation ran in — the signing region of the call that
     /// started it, and the region segment of its ARN.
     pub region: String,
+    /// A `ClusterType` value: which kind of cluster the operation acted on,
+    /// taken off that cluster's record when the operation was filed. The V2
+    /// reader reports it as `ClusterOperationV2$ClusterType` and derives the
+    /// per-kind detail arm from it, so the kind is stored rather than assumed
+    /// from what filed the operation.
+    pub cluster_type: String,
     /// A `ClusterOperationInfo$OperationType` value.
     pub operation_type: String,
     pub creation_time: SystemTime,
@@ -1073,6 +1086,47 @@ impl ClusterOperation {
             // A VPC connection is described only by the operations that manage
             // one.
             vpc_connection_info: None,
+        }
+    }
+
+    /// The same stored operation as `ClusterOperationV2`, the shape
+    /// `DescribeClusterOperationV2` reports: the members every cluster kind
+    /// shares, plus the one per-kind detail arm this operation's
+    /// [`Self::cluster_type`] names.
+    ///
+    /// Derived from the SAME record [`Self::to_cluster_operation_info`] renders
+    /// and at the same reading instant, so the V1 and V2 views of one operation
+    /// cannot disagree about when it started, what it changes or how far along
+    /// it is.
+    pub fn to_cluster_operation_v2(&self, now: SystemTime) -> ClusterOperationV2 {
+        ClusterOperationV2 {
+            cluster_arn: Some(self.cluster_arn.clone()),
+            cluster_type: Some(self.cluster_type.clone()),
+            start_time: Some(::aws_smithy_types::DateTime::from(self.creation_time)),
+            end_time: (now >= self.end_due)
+                .then(|| ::aws_smithy_types::DateTime::from(self.end_due)),
+            // Nothing fails an emulated update, so there is no error to describe.
+            error_info: None,
+            operation_arn: Some(self.arn.clone()),
+            operation_state: Some(self.operation_state(now).to_string()),
+            operation_type: Some(self.operation_type.clone()),
+            provisioned: (self.cluster_type == CLUSTER_TYPE_PROVISIONED).then(|| {
+                ClusterOperationV2Provisioned {
+                    // No step list, for the reason the V1 view reports none:
+                    // this emulator runs no broker-by-broker steps.
+                    operation_steps: None,
+                    source_cluster_info: Some(self.source_cluster_info.clone()),
+                    target_cluster_info: Some(self.target_cluster_info.clone()),
+                    // A VPC connection is described only by the operations that
+                    // manage one.
+                    vpc_connection_info: None,
+                }
+            }),
+            // The serverless arm reports a serverless cluster's connectivity
+            // before and after the operation, and every operation this registry
+            // holds was filed by an update that a serverless cluster is refused
+            // on, so no stored operation has that detail to report.
+            serverless: None,
         }
     }
 }
@@ -2414,43 +2468,50 @@ impl ComAmazonawsKafkaKafkaState {
             .filter(|operation| operation.region == region)
     }
 
-    /// Start a storage update on the cluster `arn` names, as an endpoint for
-    /// `region` sees it: record the cluster operation, move the cluster to
-    /// `UPDATING`, and hand it the change the clock will apply at
-    /// [`CLUSTER_UPDATE_DELAY`]. Answers the new operation's ARN, or `None` when
-    /// this region holds no cluster for `arn`.
+    /// Start an update on the cluster `arn` names, as an endpoint for `region`
+    /// sees it: record the cluster operation, move the cluster to `UPDATING`,
+    /// and hand it the change the clock will apply at [`CLUSTER_UPDATE_DELAY`].
+    /// Answers the new operation's ARN, or `None` when this region holds no
+    /// cluster for `arn`.
     ///
     /// The cluster is resolved through [`Self::settled_cluster_in_mut`], so a
     /// writer is scoped to its own region exactly as every reader is, and it
     /// updates a record whose clock-owed transitions have landed.
     ///
-    /// The one path that starts a storage update — `UpdateStorage` and
-    /// `UpdateBrokerStorage` both come through it, each naming its own
-    /// `operation_type` — so the operation record, the cluster's pending change,
-    /// its active operation ARN and its operation history cannot drift apart. The
-    /// history is bounded where every update's record is filed, in
+    /// `plan` turns the stored cluster into what the operation reports and what
+    /// it changes: the attributes it touches as they are now, the same
+    /// attributes as the update leaves them, and the change itself.
+    ///
+    /// The ONE path that starts a cluster update, so an operation ARN an update
+    /// call hands back always names a record this registry holds — whichever
+    /// update began it — and the operation record, the cluster's pending change,
+    /// its active operation ARN and its operation history cannot drift apart.
+    /// The history is bounded where every update's record is filed, in
     /// [`Self::file_cluster_operation`].
-    pub fn start_storage_update(
+    fn start_cluster_update<Plan>(
         &mut self,
         region: &str,
         arn: &str,
         now: SystemTime,
         operation_type: &str,
-        change: StorageChange,
-    ) -> Option<String> {
+        plan: Plan,
+    ) -> Option<String>
+    where
+        Plan: FnOnce(&Cluster) -> (MutableClusterInfo, MutableClusterInfo, ClusterChange),
+    {
         let cluster = self.settled_cluster_in_mut(region, arn, now)?;
         let cluster_arn = cluster.arn.clone();
         let operation_region = cluster.region.clone();
-        let source_cluster_info = cluster.storage_cluster_info();
-        let target_cluster_info = cluster.storage_cluster_info_after(&change);
-        // The cluster mints the operation's ARN and holds the pending change,
-        // the same way `UpdateConnectivity` starts its own: one in-flight update
-        // per cluster, whatever began it.
-        let operation_arn = cluster.begin_storage_update(now, change);
+        let cluster_type = cluster.cluster_type.clone();
+        let (source_cluster_info, target_cluster_info, change) = plan(cluster);
+        // The cluster mints the operation's ARN and holds the pending change:
+        // one in-flight update per cluster, whatever began it.
+        let operation_arn = cluster.begin_update(now, change);
         let operation = ClusterOperation {
             arn: operation_arn.clone(),
             cluster_arn,
             region: operation_region,
+            cluster_type,
             operation_type: operation_type.to_string(),
             creation_time: now,
             end_due: now + CLUSTER_UPDATE_DELAY,
@@ -2461,16 +2522,31 @@ impl ComAmazonawsKafkaKafkaState {
         Some(operation_arn)
     }
 
-    /// Start a broker-type update on the cluster `arn` names, as an endpoint for
-    /// `region` sees it: record the cluster operation, move the cluster to
-    /// `UPDATING`, and hand it the instance type the clock will apply at
-    /// [`CLUSTER_UPDATE_DELAY`]. Answers the new operation's ARN, or `None` when
-    /// this region holds no cluster for `arn`.
-    ///
-    /// The same shape as [`Self::start_storage_update`], and for the same
-    /// reasons: the cluster is resolved through [`Self::settled_cluster_in_mut`],
-    /// it mints the operation ARN and holds the pending change, and the record is
-    /// filed through [`Self::file_cluster_operation`].
+    /// Start a storage update: the volume size, provisioned throughput and
+    /// storage mode `change` names, reported by an operation of
+    /// `operation_type` — `UpdateStorage` and `UpdateBrokerStorage` both come
+    /// through here, each naming its own type.
+    pub fn start_storage_update(
+        &mut self,
+        region: &str,
+        arn: &str,
+        now: SystemTime,
+        operation_type: &str,
+        change: StorageChange,
+    ) -> Option<String> {
+        self.start_cluster_update(region, arn, now, operation_type, |cluster| {
+            let source_cluster_info = cluster.storage_cluster_info();
+            let target_cluster_info = cluster.storage_cluster_info_after(&change);
+            (
+                source_cluster_info,
+                target_cluster_info,
+                ClusterChange::Storage(change),
+            )
+        })
+    }
+
+    /// Start a broker-type update: every broker of the cluster moves to
+    /// `instance_type` once the clock owes the operation its completion.
     pub fn start_broker_type_update(
         &mut self,
         region: &str,
@@ -2478,24 +2554,54 @@ impl ComAmazonawsKafkaKafkaState {
         now: SystemTime,
         instance_type: String,
     ) -> Option<String> {
-        let cluster = self.settled_cluster_in_mut(region, arn, now)?;
-        let cluster_arn = cluster.arn.clone();
-        let operation_region = cluster.region.clone();
-        let source_cluster_info = cluster.broker_type_cluster_info();
-        let target_cluster_info = broker_type_cluster_info(&instance_type);
-        let operation_arn = cluster.begin_broker_type_update(now, instance_type);
-        let operation = ClusterOperation {
-            arn: operation_arn.clone(),
-            cluster_arn,
-            region: operation_region,
-            operation_type: OPERATION_TYPE_UPDATE_BROKER_TYPE.to_string(),
-            creation_time: now,
-            end_due: now + CLUSTER_UPDATE_DELAY,
-            source_cluster_info,
-            target_cluster_info,
-        };
-        self.file_cluster_operation(operation);
-        Some(operation_arn)
+        self.start_cluster_update(
+            region,
+            arn,
+            now,
+            OPERATION_TYPE_UPDATE_BROKER_TYPE,
+            |cluster| {
+                let source_cluster_info = cluster.broker_type_cluster_info();
+                let target_cluster_info = broker_type_cluster_info(&instance_type);
+                (
+                    source_cluster_info,
+                    target_cluster_info,
+                    ClusterChange::BrokerType { instance_type },
+                )
+            },
+        )
+    }
+
+    /// Start a connectivity update: the broker access configuration, the
+    /// ZooKeeper access setting, or both, as the request named them.
+    pub fn start_connectivity_update(
+        &mut self,
+        region: &str,
+        arn: &str,
+        now: SystemTime,
+        connectivity_info: Option<ConnectivityInfo>,
+        zookeeper_access: Option<ZookeeperAccess>,
+    ) -> Option<String> {
+        self.start_cluster_update(
+            region,
+            arn,
+            now,
+            OPERATION_TYPE_UPDATE_CONNECTIVITY,
+            |cluster| {
+                let source_cluster_info = cluster.connectivity_cluster_info();
+                let target_cluster_info = cluster.connectivity_cluster_info_after(
+                    connectivity_info.as_ref(),
+                    zookeeper_access.as_ref(),
+                );
+                (
+                    source_cluster_info,
+                    target_cluster_info,
+                    ClusterChange::Connectivity {
+                        connectivity_info,
+                        zookeeper_access,
+                    },
+                )
+            },
+        )
     }
 
     /// File `operation` in the registry and in its own cluster's history, so the
@@ -3848,62 +3954,49 @@ impl Cluster {
         broker_type_cluster_info(&self.broker_node_group_info.instance_type)
     }
 
-    /// Start a storage update: the cluster enters `UPDATING` with the returned
-    /// operation as its active one, and the submitted storage settings become
-    /// its own when [`Self::settle`] finds the operation due — the same
-    /// acceptance the real service gives an `UpdateStorage` call, which reports
-    /// the new volume size, throughput or storage mode and the new cluster
-    /// version only once that operation finishes.
-    ///
-    /// A member `change` does not name is left alone, so an update of one
-    /// storage attribute does not reset the others.
-    pub fn begin_storage_update(&mut self, now: SystemTime, change: StorageChange) -> String {
-        self.begin_update(now, ClusterChange::Storage(change))
+    /// The cluster's broker access configuration and ZooKeeper access setting
+    /// as the `MutableClusterInfo` a cluster operation reports: the attributes
+    /// an `UpdateConnectivity` call changes, and only those — the same rule
+    /// [`Self::storage_cluster_info`] follows.
+    pub fn connectivity_cluster_info(&self) -> MutableClusterInfo {
+        connectivity_cluster_info(
+            self.broker_node_group_info.connectivity_info.clone(),
+            self.zookeeper_access_enabled,
+        )
     }
 
-    /// Start a broker-type update: the cluster enters `UPDATING` with the
-    /// returned operation as its active one, and every broker moves to
-    /// `instance_type` when [`Self::settle`] finds the operation due — the
-    /// acceptance the real service gives an `UpdateBrokerType` call, which
-    /// reports the new instance type and the new cluster version only once that
-    /// operation finishes.
-    pub fn begin_broker_type_update(&mut self, now: SystemTime, instance_type: String) -> String {
-        self.begin_update(now, ClusterChange::BrokerType { instance_type })
-    }
-
-    /// Start a connectivity update: the cluster enters `UPDATING` with the
-    /// returned operation as its active one, and the submitted settings become
-    /// its own when [`Self::settle`] finds the operation due.
-    ///
-    /// Nothing the readers report changes yet — the real service accepts the
-    /// call, hands back a cluster operation, and reports the new configuration
-    /// and the new cluster version only once that operation finishes.
+    /// The same attributes as a submitted connectivity update leaves them.
     ///
     /// A submitted `ConnectivityInfo` REPLACES the cluster's broker access
-    /// configuration (the request carries the whole shape, so a member it omits
-    /// falls back to that member's default), while an omitted one leaves the
-    /// configuration alone; `ZookeeperAccess` is independent of it.
-    pub fn begin_connectivity_update(
-        &mut self,
-        now: SystemTime,
-        connectivity_info: Option<ConnectivityInfo>,
-        zookeeper_access: Option<ZookeeperAccess>,
-    ) -> String {
-        self.begin_update(
-            now,
-            ClusterChange::Connectivity {
-                connectivity_info,
-                zookeeper_access,
-            },
+    /// configuration while an omitted one leaves it alone, and
+    /// `ZookeeperAccess$Enabled` is optional, so a request naming the shape
+    /// without it leaves access on — the resolution [`Self::apply_change`]
+    /// performs when the operation comes due, so what the operation reports as
+    /// its target is what the cluster then runs.
+    pub fn connectivity_cluster_info_after(
+        &self,
+        connectivity_info: Option<&ConnectivityInfo>,
+        zookeeper_access: Option<&ZookeeperAccess>,
+    ) -> MutableClusterInfo {
+        connectivity_cluster_info(
+            connectivity_info
+                .cloned()
+                .or_else(|| self.broker_node_group_info.connectivity_info.clone()),
+            zookeeper_access.map_or(self.zookeeper_access_enabled, |access| {
+                access.enabled.unwrap_or(true)
+            }),
         )
     }
 
     /// Record `change` as the cluster's one in-flight update and move it to
     /// `UPDATING`, handing back the ARN of the operation that will apply it.
     ///
-    /// The one path that starts an update, so a cluster is `UPDATING` with an
-    /// active operation ARN exactly while it holds a [`PendingUpdate`], whichever
-    /// update operation recorded it.
+    /// Reached only through
+    /// [`ComAmazonawsKafkaKafkaState::start_cluster_update`], which files the
+    /// operation this ARN names in the registry: a cluster is `UPDATING` with an
+    /// active operation ARN exactly while it holds a [`PendingUpdate`], and that
+    /// ARN always resolves for a cluster-operation reader, whichever update
+    /// operation recorded it.
     fn begin_update(&mut self, now: SystemTime, change: ClusterChange) -> String {
         let operation_arn = self.operation_arn(self.revision + 1);
         self.pending_update = Some(PendingUpdate {
@@ -4377,6 +4470,26 @@ fn storage_cluster_info(
 fn broker_type_cluster_info(instance_type: &str) -> MutableClusterInfo {
     MutableClusterInfo {
         instance_type: Some(instance_type.to_string()),
+        ..MutableClusterInfo::default()
+    }
+}
+
+/// The connectivity attributes a cluster operation reports, as
+/// `MutableClusterInfo`.
+///
+/// The broker access configuration and the ZooKeeper access setting are what a
+/// connectivity update touches, so they are the only members set, and the
+/// ZooKeeper setting is reported resolved rather than absent — the same rule
+/// [`storage_cluster_info`] follows.
+fn connectivity_cluster_info(
+    connectivity_info: Option<ConnectivityInfo>,
+    zookeeper_access_enabled: bool,
+) -> MutableClusterInfo {
+    MutableClusterInfo {
+        connectivity_info,
+        zookeeper_access: Some(ZookeeperAccess {
+            enabled: Some(zookeeper_access_enabled),
+        }),
         ..MutableClusterInfo::default()
     }
 }

@@ -30,7 +30,10 @@ use service_com_amazonaws_iam_awsidentitymanagementv20100508::state;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::identity_policy_enforcement::{principal, statement};
-use crate::user_lifecycle::{call, call_signed_by, element, elements, error_code, router};
+use crate::user_lifecycle::{
+    account_id, assert_access_denied_message, call, call_signed_by, element, elements, error_code,
+    router,
+};
 
 /// The fixture user set: names spanning the whole `^[\w+=,.@-]+$` alphabet and both
 /// cases (`smithy_query(query="operation", operation="AddUserToGroup")` gives that
@@ -671,11 +674,25 @@ async fn the_policies_of_a_group_are_in_force_on_its_members() {
                         case.iam_action
                     )
                 };
-                let message = element(&body, "Message");
-                assert!(
-                    message.ends_with(&reason),
-                    "case {:?}: expected a refusal ending {reason:?}, got {message:?}",
-                    case.case
+                // The resource an account-wide listing is decided on is the collection
+                // its entities live in, which is the ARN the refusal names.
+                let collection = match case.action {
+                    "ListRoles" => "role/",
+                    "ListUsers" => "user/",
+                    "ListGroups" => "group/",
+                    other => panic!(
+                        "case {:?}: this suite does not know which collection {other} is \
+                         decided on",
+                        case.case
+                    ),
+                };
+                assert_access_denied_message(
+                    case.case,
+                    &element(&body, "Message"),
+                    &format!("arn:aws:iam::{}:user/{user_name}", account_id()),
+                    case.iam_action,
+                    &format!("arn:aws:iam::{}:{collection}", account_id()),
+                    &reason,
                 );
             }
         }

@@ -1250,12 +1250,16 @@ impl Cadence {
     /// The magnitude of a value is judged where the request STATES it, so the
     /// refusal names the member the caller used — the body member or the
     /// `PolicyDetails` one. The ordering is judged on the pair the policy would
-    /// run on, so an update stating one of the two is compared against the value
-    /// already stored for the other. A member NOTHING has stated takes the
-    /// documented default ([`DEFAULT_CREATE_INTERVAL`] /
-    /// [`DEFAULT_RETAIN_INTERVAL`], which satisfy the ordering), and a default
-    /// the service chose is not a value the caller stated: it is left out of the
-    /// comparison rather than turned into a refusal of the one member stated.
+    /// RUN on, which is exactly the pair a read of it reports
+    /// ([`LifecyclePolicyRecord::effective_policy_details`]): each member as
+    /// this request states it, else the value already stored for it (for an
+    /// update that keeps its configuration), else the default that member's
+    /// documentation publishes ([`DEFAULT_CREATE_INTERVAL`] /
+    /// [`DEFAULT_RETAIN_INTERVAL`]). A default the service fills in is a value
+    /// the policy runs on just as much as one the caller spelled out, so it
+    /// takes part in the comparison: a cadence is refused precisely when the
+    /// configuration it would leave stored breaks the ordering, whether the
+    /// caller stated both members, one, or neither.
     pub fn violation(&self) -> Option<InvalidRequestException> {
         for (prefix, create_interval, retain_interval) in [
             ("", self.body_create_interval, self.body_retain_interval),
@@ -1288,19 +1292,19 @@ impl Cadence {
         let create_interval = self
             .body_create_interval
             .or(self.details_create_interval)
-            .or(self.stored_create_interval);
+            .or(self.stored_create_interval)
+            .unwrap_or(DEFAULT_CREATE_INTERVAL);
         let retain_interval = self
             .body_retain_interval
             .or(self.details_retain_interval)
-            .or(self.stored_retain_interval);
-        if let (Some(create_interval), Some(retain_interval)) = (create_interval, retain_interval) {
-            if retain_interval <= create_interval {
-                return Some(invalid_request(format!(
-                    "The parameter RetainInterval ({retain_interval} days) must be greater than \
-                     the creation frequency CreateInterval ({create_interval} days) to ensure \
-                     that the policy retains at least 1 snapshot or AMI at any given time."
-                )));
-            }
+            .or(self.stored_retain_interval)
+            .unwrap_or(DEFAULT_RETAIN_INTERVAL);
+        if retain_interval <= create_interval {
+            return Some(invalid_request(format!(
+                "The parameter RetainInterval ({retain_interval} days) must be greater than \
+                 the creation frequency CreateInterval ({create_interval} days) to ensure \
+                 that the policy retains at least 1 snapshot or AMI at any given time."
+            )));
         }
         None
     }

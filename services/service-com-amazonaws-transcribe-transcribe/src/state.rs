@@ -260,9 +260,10 @@ pub fn jobs_in_flight<R: JobLifecycle>(
 /// as waiting.
 ///
 /// A queued job is in flight ([`jobs_in_flight`]) without occupying one of the slots a
-/// family's concurrency ceiling bounds, so for the one family whose start documents a
-/// queue it is this count, not that ceiling, that caps how many records one caller can
-/// hold unfinished at once (see [`MAX_QUEUED_CALL_ANALYTICS_JOBS`]).
+/// family's concurrency ceiling bounds, so for a family whose start documents a queue it
+/// is this count, not that ceiling, that caps how many records one caller can hold
+/// unfinished at once (see [`MAX_QUEUED_TRANSCRIPTION_JOBS`] and
+/// [`MAX_QUEUED_CALL_ANALYTICS_JOBS`]).
 pub fn jobs_waiting_in_queue<R: JobLifecycle>(
     jobs: &mut RegionalStore<R>,
     region: &str,
@@ -276,6 +277,95 @@ pub fn jobs_waiting_in_queue<R: JobLifecycle>(
         }
     }
     waiting
+}
+
+/// What a start operation does with the request in front of it: run the job, park it
+/// in its family's queue, or refuse it for the family's concurrency quota.
+///
+/// See [`admit_start`], which decides between the three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartAdmission {
+    /// The family is below its ceiling, so the job is processing from the moment it is
+    /// started.
+    Process,
+    /// The ceiling is reached and the request opted into the queue its family's start
+    /// documents, so the job waits in [`STATUS_QUEUED`].
+    Queue,
+    /// The ceiling is reached with no queue for this request to enter, so the start
+    /// answers the `LimitExceededException` its operation models for an exceeded quota.
+    Refuse,
+}
+
+/// Whether a start made at `now` runs, queues or is refused, given `region`'s share of
+/// this family's `jobs`.
+///
+/// The ceiling a start is refused for bounds the jobs of the family the service is
+/// still WORKING ON ([`jobs_in_flight`]), so reaching it is not by itself a refusal:
+/// where a family's start models an opt-in into job queueing, a start carrying it is
+/// placed in a queue until the number of jobs falls below that ceiling, and only a
+/// start without it gets the quota error. `queue` is `Some(depth)` exactly when this
+/// request opted in, carrying how many jobs that queue holds; `None` when it opted into
+/// nothing, or when the family models no such member at all.
+///
+/// Below the ceiling there is nothing to wait for, so an opt-in queues nothing. A
+/// waiting job holds no running slot, so the ceiling cannot cap how many of them one
+/// caller accumulates: `depth` does, and a start that would make the queue deeper is
+/// refused in the ceiling's own words (see [`MAX_QUEUED_TRANSCRIPTION_JOBS`]).
+pub fn admit_start<R: JobLifecycle>(
+    jobs: &mut RegionalStore<R>,
+    region: &str,
+    now: SystemTime,
+    ceiling: usize,
+    queue: Option<usize>,
+) -> StartAdmission {
+    if jobs_in_flight(jobs, region, now) < ceiling {
+        return StartAdmission::Process;
+    }
+    match queue {
+        Some(depth) if jobs_waiting_in_queue(jobs, region, now) < depth => StartAdmission::Queue,
+        _ => StartAdmission::Refuse,
+    }
+}
+
+/// The lifecycle facts a job record starts life with, as [`start_lifecycle`] decides
+/// them.
+#[derive(Debug, Clone)]
+pub struct StartLifecycle {
+    /// The `*JobStatus` the job is in when the start answers.
+    pub status: String,
+    /// When the job began processing; `None` while it is still waiting.
+    pub start_time: Option<SystemTime>,
+    /// When `QUEUED` -> `IN_PROGRESS` falls due; `None` for a job that is processing
+    /// already.
+    pub queued_until: Option<SystemTime>,
+    /// When `IN_PROGRESS` -> `COMPLETED` falls due.
+    pub completion_due: SystemTime,
+}
+
+/// The status and the clock-owed instants a job accepted at `now` starts life with.
+///
+/// A job that went into its family's queue ([`StartAdmission::Queue`]) is not
+/// processing yet: it has no start time, and the clock owes it `QUEUED` ->
+/// `IN_PROGRESS` before the completion every job gets. One spelling for both families
+/// whose start documents a queue, since what differs between them is what a job IS and
+/// not how long it waits ([`JOB_TRANSITION_DELAY`]).
+pub fn start_lifecycle(now: SystemTime, queued: bool) -> StartLifecycle {
+    if queued {
+        let starts_at = now + JOB_TRANSITION_DELAY;
+        StartLifecycle {
+            status: STATUS_QUEUED.to_string(),
+            start_time: None,
+            queued_until: Some(starts_at),
+            completion_due: starts_at + JOB_TRANSITION_DELAY,
+        }
+    } else {
+        StartLifecycle {
+            status: STATUS_IN_PROGRESS.to_string(),
+            start_time: Some(now),
+            queued_until: None,
+            completion_due: now + JOB_TRANSITION_DELAY,
+        }
+    }
 }
 
 /// The most job records of one family this emulator KEEPS for one Region.
@@ -437,6 +527,22 @@ pub const MAX_CONCURRENT_TRANSCRIPTION_JOBS: usize = 100;
 /// The family [`concurrency_limit_message`] names in a transcription start's refusal.
 pub const FAMILY_TRANSCRIPTION_JOBS: &str = "transcription jobs";
 
+/// The most transcription jobs this emulator keeps WAITING in the queue a start that
+/// deferred its execution enters at the ceiling above, for one Region.
+///
+/// Not a published quota: `JobExecutionSettings$AllowDeferredExecution` describes the
+/// queue without a depth ("transcription job requests are placed in a queue until the
+/// number of jobs falls below the concurrent request limit"). It is the bound on this
+/// process's memory, needed because a queued job is NOT terminal: the ceiling does not
+/// count it against a running slot and [`evict_oldest_finished_jobs`] cannot drop it.
+/// A CHOSEN figure, this family's own ceiling, exactly as the sibling family whose
+/// start documents a queue is bounded ([`MAX_QUEUED_CALL_ANALYTICS_JOBS`]); a start
+/// made while that many are already waiting is refused the `LimitExceededException`
+/// the ceiling itself answers, in the same words ([`concurrency_limit_message`]),
+/// whose documented remedy — waiting for a running job to finish — is exactly what
+/// empties the queue.
+pub const MAX_QUEUED_TRANSCRIPTION_JOBS: usize = MAX_CONCURRENT_TRANSCRIPTION_JOBS;
+
 /// The most MEDICAL transcription jobs this emulator runs AT ONCE for an account.
 ///
 /// Amazon Transcribe Medical answers the same `LimitExceededException` for an
@@ -521,8 +627,9 @@ pub const MEDICAL_LANGUAGE_CODE: &str = "en-US";
 /// `MAX_REGIONS` buckets, and so at most `MAX_REGIONS` times its own per-Region
 /// ceiling ([`MAX_VOCABULARIES`], [`MAX_LANGUAGE_MODELS`],
 /// [`MAX_CALL_ANALYTICS_CATEGORIES`], [`MAX_RETAINED_JOB_RECORDS`] plus that family's
-/// concurrency quota, and for the family whose start queues the overflow the depth of
-/// that queue too, [`MAX_QUEUED_CALL_ANALYTICS_JOBS`]) in total. AWS operates on the
+/// concurrency quota, and for a family whose start queues the overflow the depth of
+/// that queue too, [`MAX_QUEUED_TRANSCRIPTION_JOBS`] and
+/// [`MAX_QUEUED_CALL_ANALYTICS_JOBS`]) in total. AWS operates on the
 /// order of 36 commercial Regions, so
 /// this figure is this emulator's own and comfortably above the real surface; a create
 /// or start past it answers the same modelled `LimitExceededException` AWS answers when
@@ -2661,6 +2768,22 @@ pub fn vocabulary_download_uri(resource_type: &str, name: &str, region: &str) ->
 
 /// One stored transcription job: exactly what the request asked for, plus the
 /// lifecycle facts the service itself owns (status, timestamps, transcript location).
+///
+/// This family has job QUEUEING, and the model names the request member that opts into
+/// it: "Makes it possible to enable job queuing when your concurrent request limit is
+/// exceeded. When AllowDeferredExecution is set to true, transcription job requests are
+/// placed in a queue until the number of jobs falls below the concurrent request limit.
+/// If AllowDeferredExecution is set to false and the number of transcription job
+/// requests exceed the concurrent request limit, you get a LimitExceededException
+/// error" (`smithy_query(query="shape", shape="JobExecutionSettings")`). So a start
+/// that sets that member while the family's concurrency ceiling is already reached
+/// ([`MAX_CONCURRENT_TRANSCRIPTION_JOBS`]) is ACCEPTED in [`STATUS_QUEUED`] with no
+/// start time and has two clock-owed transitions, `QUEUED` -> `IN_PROGRESS` ->
+/// `COMPLETED`, exactly as a queued Call Analytics job does ([`CallAnalyticsJobRecord`]);
+/// a start at that ceiling that deferred nothing is refused, as is one that would make
+/// the queue deeper than this emulator keeps it
+/// ([`MAX_QUEUED_TRANSCRIPTION_JOBS`]), and every accepted job below the ceiling is
+/// processing from the moment it is started ([`admit_start`]).
 #[derive(Debug, Clone)]
 pub struct TranscriptionJobRecord {
     /// `TranscriptionJobName`, with the Region, this record's key in the store.

@@ -414,12 +414,35 @@ async fn a_paused_create_is_reported_by_every_reader_and_refuses_an_update() {
             "case {}: deleting a paused environment must succeed, got {status} {json}",
             case.name
         );
+        // The delete only STARTS the teardown, so the environment is still readable in
+        // the status the model documents for a teardown in progress.
+        let (status, json) = harness
+            .send("GET", &format!("/environments/{}", case.name), None)
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {}: an environment being torn down is still readable, got {status} {json}",
+            case.name
+        );
+        assert_eq!(
+            json.get("Environment")
+                .and_then(|environment| environment.get("Status"))
+                .and_then(Value::as_str),
+            Some(state::STATUS_DELETING),
+            "case {}: a deleted paused environment reports the teardown, got {json}",
+            case.name
+        );
+    }
+    // Once the teardown has come due the record is gone from every reader.
+    tokio::time::sleep(PAST_TRANSITION).await;
+    for case in cases().iter().filter(|case| case.is_customer_managed()) {
         let (status, _) = harness
             .send("GET", &format!("/environments/{}", case.name), None)
             .await;
         assert_eq!(
             status, 404,
-            "case {}: a deleted environment is gone from GetEnvironment",
+            "case {}: a deleted environment is gone from GetEnvironment once its teardown \
+             finished",
             case.name
         );
     }

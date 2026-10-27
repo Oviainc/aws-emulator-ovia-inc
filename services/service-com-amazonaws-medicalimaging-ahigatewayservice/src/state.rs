@@ -285,10 +285,37 @@ pub const IMAGE_SET_NOT_DELETABLE_MESSAGE: &str =
 pub const IMAGE_SET_NOT_UPDATABLE_MESSAGE: &str =
     "The image set is not in the ACTIVE state, so its metadata cannot be updated.";
 
+/// The text this service refuses a copy into an image set whose patient, study or series
+/// level DICOM metadata disagrees with the copied content's, where the request did not ask
+/// for the copy to be completed anyway.
+///
+/// `CopyImageSet`'s `force` is documented as the flag that forces completion "even if there
+/// are inconsistent Patient, Study, and/or Series level metadata elements between the
+/// sourceImageSet and destinationImageSet", so without it such a copy is not completed: the
+/// destination would end up describing two different studies, which is the inconsistent
+/// state `ConflictException` (HTTP 409) reports. Constant, and stated by rule rather than
+/// by which element disagreed, like [`IMAGE_SET_NOT_ACTIVE_MESSAGE`] beside it.
+pub const IMAGE_SET_COPY_INCONSISTENT_METADATA_MESSAGE: &str =
+    "The source and destination image sets have inconsistent Patient, Study and/or Series \
+     level metadata elements, so the copy cannot be completed without the force flag.";
+
 /// The text this service answers a request naming an image frame an image set does not
 /// hold with — the resource KIND, by the same rule as [`IMAGE_SET_NOT_FOUND_MESSAGE`],
 /// with no identifier from the request in it.
 pub const IMAGE_FRAME_NOT_FOUND_MESSAGE: &str = "ImageFrame resource is not found.";
+
+/// The `Study` level of the aggregated DICOM metadata document — the document
+/// `GetImageSetMetadata` serves, `UpdateImageSetMetadata` writes and `CopyImageSet`'s
+/// subset selector is written in. Held here because more than one operation reads a
+/// document by these level names, so they are spelled once.
+pub const METADATA_STUDY_KEY: &str = "Study";
+
+/// The map of series inside the study level of that document, keyed by Series Instance
+/// UID.
+pub const METADATA_SERIES_KEY: &str = "Series";
+
+/// The map of SOP instances inside one series of that document, keyed by SOP Instance UID.
+pub const METADATA_INSTANCES_KEY: &str = "Instances";
 
 /// The text this service refuses a call that would act on a data store, or on the
 /// contents of one, that has not settled into `ACTIVE` with — one still `CREATING` or

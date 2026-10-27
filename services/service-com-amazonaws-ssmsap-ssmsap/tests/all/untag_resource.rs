@@ -78,7 +78,9 @@ fn untag_path(resource_arn: &str, tag_keys: &[String]) -> String {
 
 /// `UntagResource` for `resource_arn` at `region`'s endpoint. The operation binds every
 /// member to the URI, so the request carries no body at all.
-async fn untag_in_region(
+///
+/// `pub(crate)` for the same reason [`untag`] is.
+pub(crate) async fn untag_in_region(
     emulator: &Emulator,
     region: &str,
     resource_arn: &str,
@@ -90,7 +92,11 @@ async fn untag_in_region(
 }
 
 /// `UntagResource` for `resource_arn` at [`REGION`]'s endpoint.
-async fn untag(emulator: &Emulator, resource_arn: &str, tag_keys: &[String]) -> Reply {
+///
+/// `pub(crate)` because the suites of this target share one harness: the suite that
+/// pins which ARNs this service resolves (`tests/all/component_arn_resolution.rs`)
+/// deletes through this same route rather than spelling it a second time.
+pub(crate) async fn untag(emulator: &Emulator, resource_arn: &str, tag_keys: &[String]) -> Reply {
     untag_in_region(emulator, REGION, resource_arn, tag_keys).await
 }
 

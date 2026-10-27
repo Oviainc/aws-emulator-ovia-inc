@@ -22,15 +22,15 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
-    image_not_found_message, invalid_arn_format_message, managed_base_image_arn, service_state,
-    version_order, MANAGED_BASE_IMAGE_IDS, MAX_LIST_PAGE,
+    image_not_found_message, invalid_arn_format_message, service_state, version_order,
+    MAX_LIST_PAGE,
 };
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::microvm_image_and_instance_paths::{delete_image, get_image};
 use crate::microvm_lifecycle::{
-    as_uri_value, call, expected_image_arn, image_body, ACCOUNT, PAST_THE_SPAN, REGION,
+    as_uri_value, call, expected_image_arn, image_body, ACCOUNT, PAST_THE_SPAN,
 };
 
 /// Every member a listed version shares with the `CreateMicrovmImage` response: the
@@ -395,10 +395,11 @@ async fn each_entry_is_the_stored_version_record_and_tracks_the_build_clock() {
 }
 
 /// RULE: the identifier is resolved against the images THIS ACCOUNT holds, by either form
-/// `MicrovmImageIdentifier` accepts; a well-formed identifier naming no image of this
-/// account — an AWS-owned managed base image and an image the clock has already removed
-/// included — is HTTP 404 `ResourceNotFoundException`, and a value that is no identifier
-/// of this API at all is HTTP 400 `ValidationException`.
+/// `MicrovmImageIdentifier` accepts; a well-formed identifier of this account's own
+/// namespace naming no image of it — an image the clock has already removed included — is
+/// HTTP 404 `ResourceNotFoundException`, and a value that is no identifier of this API at
+/// all is HTTP 400 `ValidationException`. (An identifier of the AWS-OWNED namespace is
+/// refused 403 before any lookup; `managed_namespace_authorization` owns that verdict.)
 #[tokio::test]
 async fn an_identifier_naming_no_held_image_is_refused() {
     let (router, _) = emulator_with_store();
@@ -422,10 +423,9 @@ async fn an_identifier_naming_no_held_image_is_refused() {
     }
 
     // Rows differ in HOW the identifier fails to name an image this account holds: the
-    // right ARN form for a name never created, an AWS-owned managed base image, another
-    // region's ARN for a held name, and values that are no identifier of this API at all.
+    // right ARN form for a name never created, another region's ARN for a held name, and
+    // values that are no identifier of this API at all.
     let never_created = expected_image_arn("never-created");
-    let managed = managed_base_image_arn(REGION, MANAGED_BASE_IMAGE_IDS[0]);
     let other_region = format!("arn:aws:lambda:eu-central-1:{ACCOUNT}:microvm-image:held");
     let rows: Vec<(&str, String, u16, String)> = vec![
         (
@@ -433,12 +433,6 @@ async fn an_identifier_naming_no_held_image_is_refused() {
             never_created.clone(),
             404,
             image_not_found_message(&never_created),
-        ),
-        (
-            "an AWS-owned managed base image",
-            managed.clone(),
-            404,
-            image_not_found_message(&managed),
         ),
         (
             "another region's ARN for a held name",

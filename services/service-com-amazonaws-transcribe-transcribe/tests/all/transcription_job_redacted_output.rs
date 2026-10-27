@@ -122,8 +122,9 @@ fn rows() -> Vec<Row> {
         }
     }
 
-    // A job whose execution the request deferred reaches `COMPLETED` through an extra
-    // transition, and must report the same locations when it gets there.
+    // A job whose execution the request deferred reports the same locations when it
+    // gets to `COMPLETED`: the member opts into a queue the ceiling feeds, so below the
+    // ceiling it changes nothing about the output a finished job names.
     for (redaction_index, (redaction_case, redaction, unredacted, redacted)) in
         redaction_cases().iter().enumerate()
     {

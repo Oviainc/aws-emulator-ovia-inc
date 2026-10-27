@@ -34,6 +34,12 @@
 //!    `sortOrder` directions, `nameContains` and the two submit-time bounds, pages that
 //!    partition the listing through `nextToken`, a `nextToken` from nowhere refused, and no
 //!    job of another region listed.
+//! 8. **`StopModelInvocationJob` winds a job down that has not finished**: whichever
+//!    unfinished status the job holds when the stop arrives, it moves to `Stopping`, the
+//!    clock owes it the terminal `Stopped`, and it is owed neither its start nor its
+//!    completion any more — while a stop of a job that has already left those statuses
+//!    changes nothing and is answered the same way, and an identifier no stored job answers
+//!    to is refused.
 //!
 //! Every expectation is derived from the model, cited per row
 //! (`smithy_query(query="operation",operation="CreateModelInvocationJob,GetModelInvocationJob,ListModelInvocationJobs")`
@@ -45,7 +51,8 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::support::{
-    date_time_seconds, emulator, foundation_model_arn, label, Emulator, Reply, ACCOUNT, REGION,
+    date_time_seconds, emulator, foundation_model_arn, label, wall_clock_seconds, Emulator, Reply,
+    ACCOUNT, REGION,
 };
 
 type State = service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice::state::ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState;
@@ -64,6 +71,10 @@ const BEGINS_AFTER: Duration =
 const COMPLETE_AFTER: Duration =
     service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice::state::MODEL_INVOCATION_JOB_COMPLETE_AFTER;
 
+/// How long after a stop was accepted the job is owed its move to `Stopped`.
+const STOPPED_AFTER: Duration =
+    service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice::state::MODEL_INVOCATION_JOB_STOPPED_AFTER;
+
 /// A margin on top of a settle span, so a read lands after the instant the move was owed
 /// rather than exactly on it.
 const MARGIN: Duration = Duration::from_millis(150);
@@ -72,6 +83,8 @@ const MARGIN: Duration = Duration::from_millis(150);
 const SUBMITTED: &str = "Submitted";
 const IN_PROGRESS: &str = "InProgress";
 const COMPLETED: &str = "Completed";
+const STOPPING: &str = "Stopping";
+const STOPPED: &str = "Stopped";
 
 /// The `modelId` of the `index`-th model the published catalog carries.
 fn catalog_model(index: usize) -> &'static str {
@@ -147,6 +160,23 @@ async fn list_in_region(emu: &Emulator, region: &str, query: &str) -> Reply {
 
 async fn list(emu: &Emulator, query: &str) -> Reply {
     list_in_region(emu, REGION, query).await
+}
+
+/// `StopModelInvocationJob` is bound to `POST /model-invocation-job/{jobIdentifier}/stop`
+/// and carries no request body
+/// (`smithy_query(query="operation",operation="StopModelInvocationJob")`).
+async fn stop_in_region(emu: &Emulator, region: &str, identifier: &str) -> Reply {
+    emu.call_in_region(
+        region,
+        "POST",
+        &format!("/model-invocation-job/{}/stop", label(identifier)),
+        None,
+    )
+    .await
+}
+
+async fn stop(emu: &Emulator, identifier: &str) -> Reply {
+    stop_in_region(emu, REGION, identifier).await
 }
 
 /// Submit one job and hand back its ARN, failing the case by name when the create is
@@ -1082,5 +1112,367 @@ fn the_state_holds_one_batch_inference_job_store() {
         state.minted_model_invocation_jobs, 0,
         "a fresh store has minted no job id, got {}",
         state.minted_model_invocation_jobs
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// 8. StopModelInvocationJob winds down a job that has not finished.
+// ---------------------------------------------------------------------------------------
+
+/// Whether `body` carries no members: `StopModelInvocationJobResponse` is modelled with
+/// none (`smithy_query(query="operation",operation="StopModelInvocationJob")`), so the
+/// answer is either an empty document or an empty object.
+fn carries_no_members(body: &Value) -> bool {
+    body.is_null() || body.as_object().is_some_and(serde_json::Map::is_empty)
+}
+
+/// One row of the stop table: how long after the submission the stop is asked for, the
+/// status the job therefore holds when it arrives, and which `ModelInvocationJobIdentifier`
+/// spelling it is addressed by.
+struct StopRow {
+    case: &'static str,
+    /// How long after the submission the stop is asked for.
+    after: Duration,
+    /// The status the job holds when the stop arrives.
+    status_at_stop: &'static str,
+    /// Whether the stop addresses the job by its ARN or by the bare minted id.
+    by_arn: bool,
+}
+
+/// The rows differ along what the rule generalises over: WHICH unfinished status the job
+/// holds when the stop arrives — this emulator's lifecycle reaches `Submitted` and
+/// `InProgress`, two of the statuses a job that has not finished carries
+/// (`state::MODEL_INVOCATION_JOB_STOPPABLE_STATUSES`, read off the `status` doc of
+/// `smithy_query(query="doc",shape="ModelInvocationJobSummary",member="status")`) — and
+/// which of the two spellings a `ModelInvocationJobIdentifier` admits addresses the job.
+fn stop_rows() -> Vec<StopRow> {
+    vec![
+        StopRow {
+            case: "stopped while queued, by its ARN",
+            after: Duration::ZERO,
+            status_at_stop: SUBMITTED,
+            by_arn: true,
+        },
+        StopRow {
+            case: "stopped while queued, by its minted id",
+            after: Duration::ZERO,
+            status_at_stop: SUBMITTED,
+            by_arn: false,
+        },
+        StopRow {
+            case: "stopped once it had begun, by its ARN",
+            after: BEGINS_AFTER + MARGIN,
+            status_at_stop: IN_PROGRESS,
+            by_arn: true,
+        },
+        StopRow {
+            case: "stopped once it had begun, by its minted id",
+            after: BEGINS_AFTER + MARGIN,
+            status_at_stop: IN_PROGRESS,
+            by_arn: false,
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_stop_winds_down_a_job_that_has_not_finished() {
+    let emu = emulator();
+
+    for (index, row) in stop_rows().into_iter().enumerate() {
+        let case = row.case;
+        let body = create_body(&format!("batch-stop-{index}"), catalog_model(index % CATALOG.len()));
+        let arn = submit(&emu, case, body).await;
+        if !row.after.is_zero() {
+            tokio::time::sleep(row.after).await;
+        }
+
+        // The row's premise: the job holds the unfinished status this row stops it from.
+        let before = get(&emu, &arn).await;
+        assert_eq!(
+            text(case, &before.body, "status"),
+            row.status_at_stop,
+            "case {case}: the job must hold the status this row stops it from, got {:?}",
+            before.body.get("status")
+        );
+        let submitted = instant(case, &before.body, "submitTime");
+
+        let identifier = if row.by_arn {
+            arn.clone()
+        } else {
+            job_id_of(&arn).to_string()
+        };
+        let asked_at = wall_clock_seconds();
+        let stopped = stop(&emu, &identifier).await;
+        assert_eq!(
+            stopped.status, 200,
+            "case {case}: StopModelInvocationJob is bound to @http(code: 200), got {} {:?}",
+            stopped.status, stopped.body
+        );
+        assert_eq!(
+            stopped.error, None,
+            "case {case}: a stop of an unfinished job is not a failure, got {:?} {:?}",
+            stopped.error, stopped.body
+        );
+        assert!(
+            carries_no_members(&stopped.body),
+            "case {case}: StopModelInvocationJobResponse is modelled with no members, got {:?}",
+            stopped.body
+        );
+
+        // The stop is what moves the job, and the move is PERSISTED: stopping is
+        // asynchronous, so the caller observes the transient status first.
+        let stopping = get(&emu, &arn).await;
+        assert_eq!(
+            text(case, &stopping.body, "status"),
+            STOPPING,
+            "case {case}: a stop moves an unfinished job to {STOPPING}, got {:?}",
+            stopping.body.get("status")
+        );
+        assert_eq!(
+            stopping.body.get("endTime"),
+            None,
+            "case {case}: a job that has not reached a terminal status has no endTime, got {:?}",
+            stopping.body.get("endTime")
+        );
+        let asked = instant(case, &stopping.body, "lastModifiedTime");
+        assert!(
+            asked >= asked_at - 0.001,
+            "case {case}: the stop is the job's last change, so it is stamped no earlier than \
+             the call at {asked_at}, got {asked}"
+        );
+        assert_eq!(
+            instant(case, &stopping.body, "submitTime"),
+            submitted,
+            "case {case}: a stop leaves the submission instant alone"
+        );
+        assert!(
+            listed_arns(case, &list(&emu, &format!("statusEquals={STOPPING}")).await)
+                .contains(&arn),
+            "case {case}: the listing must report the status the read does, so {STOPPING} must \
+             carry {arn}"
+        );
+
+        // The terminal status is owed by the CLOCK, at the instant it was owed.
+        tokio::time::sleep(STOPPED_AFTER + MARGIN).await;
+        let done = get(&emu, &arn).await;
+        assert_eq!(
+            text(case, &done.body, "status"),
+            STOPPED,
+            "case {case}: the stop settles on {STOPPED} once its span has passed, got {:?}",
+            done.body.get("status")
+        );
+        let ended = instant(case, &done.body, "endTime");
+        assert!(
+            ended >= asked + STOPPED_AFTER.as_secs_f64() - 0.001,
+            "case {case}: the stop must be stamped at the instant it was owed ({}), got {ended} \
+             against a stop at {asked}",
+            STOPPED_AFTER.as_secs_f64()
+        );
+        assert_eq!(
+            instant(case, &done.body, "lastModifiedTime"),
+            ended,
+            "case {case}: reaching the terminal status is the job's last change"
+        );
+        let again = get(&emu, &arn).await;
+        for stamped in ["submitTime", "lastModifiedTime", "endTime"] {
+            assert_eq!(
+                instant(case, &again.body, stamped),
+                instant(case, &done.body, stamped),
+                "case {case}: a second read must report the same {stamped}"
+            );
+        }
+
+        // A stopped job is owed neither its start nor its completion any more: the spans
+        // that would have carried an unstopped job to `Completed` pass and it is still the
+        // job the stop ended, at the instant the stop ended it.
+        tokio::time::sleep(COMPLETE_AFTER + MARGIN).await;
+        let later = get(&emu, &arn).await;
+        assert_eq!(
+            text(case, &later.body, "status"),
+            STOPPED,
+            "case {case}: a stopped job is owed no completion, got {:?}",
+            later.body.get("status")
+        );
+        assert_eq!(
+            instant(case, &later.body, "endTime"),
+            ended,
+            "case {case}: a stopped job keeps the end the stop gave it"
+        );
+        assert!(
+            !listed_arns(case, &list(&emu, &format!("statusEquals={COMPLETED}")).await)
+                .contains(&arn),
+            "case {case}: a stopped job never reports {COMPLETED}"
+        );
+        assert!(
+            listed_arns(case, &list(&emu, &format!("statusEquals={STOPPED}")).await).contains(&arn),
+            "case {case}: {STOPPED} must carry {arn}"
+        );
+    }
+}
+
+/// How a row of the table below drives its job to a status a stop can no longer affect.
+enum Reach {
+    /// Ask for a stop, so the job is winding down.
+    Stopping,
+    /// Ask for a stop and let the clock carry it to its end.
+    Stopped,
+    /// Let the clock carry the job to the end of its own run.
+    Completed,
+}
+
+#[tokio::test]
+async fn a_stop_of_a_job_that_cannot_be_stopped_changes_nothing() {
+    let emu = emulator();
+
+    // The rows span the statuses a stop can no longer affect: the two a stop itself
+    // produces, and the terminal status a job reaches on its own.
+    let rows = [
+        (
+            "a job a stop has already taken over",
+            Reach::Stopping,
+            STOPPING,
+        ),
+        (
+            "a job a stop has already carried to its end",
+            Reach::Stopped,
+            STOPPED,
+        ),
+        (
+            "a job that ran to the end of its own input",
+            Reach::Completed,
+            COMPLETED,
+        ),
+    ];
+
+    for (index, (case, reach, expected)) in rows.into_iter().enumerate() {
+        let body = create_body(
+            &format!("batch-no-op-{index}"),
+            catalog_model(index % CATALOG.len()),
+        );
+        let arn = submit(&emu, case, body).await;
+        match reach {
+            Reach::Stopping => {
+                stop(&emu, &arn).await;
+            }
+            Reach::Stopped => {
+                stop(&emu, &arn).await;
+                tokio::time::sleep(STOPPED_AFTER + MARGIN).await;
+            }
+            Reach::Completed => {
+                tokio::time::sleep(BEGINS_AFTER + COMPLETE_AFTER + MARGIN).await;
+            }
+        }
+
+        let before = get(&emu, &arn).await;
+        assert_eq!(
+            text(case, &before.body, "status"),
+            expected,
+            "case {case}: the job must hold the status this row asks a further stop of, got {:?}",
+            before.body.get("status")
+        );
+
+        let further = stop(&emu, &arn).await;
+        assert_eq!(
+            further.status, 200,
+            "case {case}: a stop of a job with nothing left to wind down is answered as the \
+             first stop was, got {} {:?}",
+            further.status, further.body
+        );
+        assert_eq!(
+            further.error, None,
+            "case {case}: a further stop is not a failure, got {:?} {:?}",
+            further.error, further.body
+        );
+        assert!(
+            carries_no_members(&further.body),
+            "case {case}: StopModelInvocationJobResponse is modelled with no members, got {:?}",
+            further.body
+        );
+
+        let after = get(&emu, &arn).await;
+        assert_eq!(
+            after.body, before.body,
+            "case {case}: a stop with nothing left to wind down must change nothing"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_stop_of_an_identifier_no_stored_job_answers_to_is_refused() {
+    let emu = emulator();
+
+    // A job of ANOTHER region, so its id names nothing in the signing one.
+    let elsewhere = "eu-central-1";
+    let other_region = create_in_region(
+        &emu,
+        elsewhere,
+        create_body("batch-stop-elsewhere", catalog_model(0)),
+    )
+    .await;
+    assert_eq!(
+        other_region.status, 200,
+        "the create in {elsewhere} must answer 200, got {} {:?}",
+        other_region.status, other_region.body
+    );
+    let other_arn = other_region.text("jobArn");
+
+    // Every row is a value `ModelInvocationJobIdentifier` admits — its ARN spelling or the
+    // bare `[a-z0-9]{12}` id — so each reaches the handler rather than the modelled
+    // constraint ahead of it.
+    let rows = [
+        ("a never-minted id", "cccccccccccc".to_string()),
+        (
+            "a well-formed ARN that was never minted",
+            format!("arn:aws:bedrock:{REGION}:{ACCOUNT}:model-invocation-job/dddddddddddd"),
+        ),
+        (
+            "the id of another region's job",
+            job_id_of(&other_arn).to_string(),
+        ),
+    ];
+    for (case, identifier) in rows {
+        let reply = stop(&emu, &identifier).await;
+        assert_eq!(
+            reply.status, 404,
+            "case {case}: {identifier} names no job here, so the stop must answer 404, got {} \
+             {:?}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error.as_deref(),
+            Some("ResourceNotFoundException"),
+            "case {case}: the stop must answer ResourceNotFoundException, got {:?}",
+            reply.error
+        );
+    }
+
+    // A `model-invocation-job` ARN of ANOTHER region never reaches the lookup: this service
+    // reads such an ARN itself and refuses it ahead of every handler
+    // (`state::SELF_VALIDATED_RESOURCE_TYPES`), so the answer is its own refusal rather than
+    // "no such job".
+    let foreign = stop(&emu, &other_arn).await;
+    assert_eq!(
+        foreign.status, 400,
+        "an ARN of another region is refused before the lookup, got {} {:?}",
+        foreign.status, foreign.body
+    );
+    assert_eq!(
+        foreign.error.as_deref(),
+        Some("ValidationException"),
+        "an ARN of another region must answer ValidationException, got {:?}",
+        foreign.error
+    );
+
+    // A refused stop wound nothing down: the job of the other region is where it was.
+    let read = get_in_region(&emu, elsewhere, &other_arn).await;
+    assert_eq!(
+        read.status, 200,
+        "the job must still read back in {elsewhere}, got {} {:?}",
+        read.status, read.body
+    );
+    let status = text("the job of the other region", &read.body, "status");
+    assert!(
+        status != STOPPING && status != STOPPED,
+        "a refused stop must wind no job down, got {status:?}"
     );
 }

@@ -23,6 +23,8 @@ mod provider_credential_validation;
 mod provider_status_transition;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/shared_tag_merge.rs"]
+mod shared_tag_merge;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/subscription_provider_registration.rs"]

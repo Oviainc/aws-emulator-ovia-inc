@@ -39,10 +39,28 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! ## Credentials the account has deactivated
+//!
+//! An access key this account holds authenticates a request only while its stored
+//! `Status` is `Active`: `UpdateAccessKey$Status` documents that "Active means that the
+//! key can be used for programmatic calls to Amazon Web Services, while Inactive means
+//! that the key cannot be used", so deactivating a key must cut the credential off
+//! while leaving it listed. That is an AUTHENTICATION outcome — no principal is
+//! resolved at all — so it is refused BEFORE any operation runs, and with the code an
+//! authentication failure carries ([`UNUSABLE_CREDENTIAL_CODE`]) rather than with an
+//! authorization denial or one of the modelled resource errors.
+//!
+//! The decision reads the records `iam:CreateAccessKey` and `iam:UpdateAccessKey` wrote
+//! ([`crate::state::ComAmazonawsIamAwsidentitymanagementv20100508State::access_key_is_usable`]);
+//! this file only reaches it ahead of dispatch, through [`Service::override_operation`]
+//! — the one seam that sees a whole request before the modelled walk deserializes,
+//! validates and dispatches it.
 
-use aws_smithy_schema_server::{envelope, Violation, ViolationKind};
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
+use aws_smithy_schema_server::{envelope, ProtocolError, Violation, ViolationKind};
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, BoxFuture, ErasedOperation, OperationContext, Refusal, Refused, Service,
 };
 use std::sync::Arc;
 
@@ -166,6 +184,67 @@ fn without_bound_value_echo(violations: &[Violation]) -> Option<Refused> {
     })
 }
 
+/// The error code AWS answers a signed request whose credential it will not accept
+/// with: a key id that was never issued, one that has been deleted, and one whose
+/// `Status` the account has moved off `Active`. It is an AUTHENTICATION failure — no
+/// principal was resolved — rather than an authorization denial, so it is the code an
+/// SDK's credential-refresh path keys on, the same code this emulator's STS front door
+/// answers an unresolvable credential with.
+const UNUSABLE_CREDENTIAL_CODE: &str = "InvalidClientTokenId";
+
+/// How AWS words that refusal: a fixed sentence carrying nothing from the request, so a
+/// caller presenting a credential the service will not accept learns nothing about the
+/// credential or about this account.
+const UNUSABLE_CREDENTIAL_MESSAGE: &str = "The security token included in the request is invalid.";
+
+/// Answers a request that presented a credential this account will not accept, as a
+/// pre-dispatch operation.
+///
+/// Rendered through the service's own refusal channel — the same path the framework's
+/// authentication refusal takes — so the envelope, the status (403) and the `<Code>` a
+/// client branches on are the ones every other refusal from this service carries.
+struct UnusableCredential;
+
+impl ErasedOperation for UnusableCredential {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        // The refusal is reached from the credential alone: nothing of the request's
+        // body or metadata is read, and nothing is written.
+        let _ = (req, ctx);
+        Box::pin(async move {
+            svc.definition().refusal_response(
+                ProtocolError::Unauthenticated {
+                    code: UNUSABLE_CREDENTIAL_CODE,
+                    message: UNUSABLE_CREDENTIAL_MESSAGE,
+                },
+                None,
+            )
+        })
+    }
+}
+
+/// The access key id `req` presented, or `None` for a request carrying no SigV4
+/// `Authorization` header at all.
+///
+/// Read through the framework's ONE parser of that header
+/// (`emulator_server::extract_akid`, which every handler in this crate resolves a
+/// nameless caller through). That parser takes an `http::HeaderMap`, which this
+/// pre-dispatch seam is not handed — it sees the runtime-API request — so the one
+/// header it reads is lifted into a map rather than the parse being written again here.
+fn presented_access_key_id(req: &RtRequest) -> Option<String> {
+    let authorization = req.headers().get(http::header::AUTHORIZATION.as_str())?;
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::AUTHORIZATION,
+        http::HeaderValue::from_str(authorization).ok()?,
+    );
+    Some(::engine::extract_akid(&headers))
+}
+
 /// The `com-amazonaws-iam-awsidentitymanagementv20100508` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -173,6 +252,13 @@ fn without_bound_value_echo(violations: &[Violation]) -> Option<Refused> {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The SAME shared engine the generated entry threaded into every operation, kept
+    /// here too because the pre-dispatch credential check below has to read the access
+    /// keys this service's own operations wrote. Never a store of its own: it is the
+    /// `Arc` the router handed to `new`.
+    engine: Arc<Eng>,
+    /// Answers a request presenting a credential this account will not accept.
+    unusable_credential: UnusableCredential,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -181,8 +267,31 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            engine,
+            unusable_credential: UnusableCredential,
         }
+    }
+
+    /// Whether `req` presented an access key this account holds and will not accept —
+    /// one whose stored `Status` is not `Active` (see the module docs).
+    ///
+    /// A request that names no modelled operation is left alone: there is nothing to
+    /// serve it with, and the routing failure is the answer it gets. A store this
+    /// process cannot reach holds no key status either, so such a request is admitted
+    /// and the handler reports the unreachable store as the modelled server error.
+    ///
+    /// A READ: it takes the store's lock to look one key up and writes nothing, so a
+    /// refused request changes nothing a later caller sees.
+    fn presents_an_unusable_credential(&self, req: &RtRequest) -> bool {
+        if self.definition().protocol().routing_key(req).is_err() {
+            return false;
+        }
+        let Some(access_key_id) = presented_access_key_id(req) else {
+            return false;
+        };
+        crate::state::service_state(&*self.engine)
+            .is_some_and(|state| !state.lock().access_key_is_usable(&access_key_id))
     }
 }
 
@@ -224,8 +333,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // correctly; `None` (the default) lets the generated routing table resolve
         // it. `req` is the whole request, so a decision that depends on the body —
         // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        //
+        // A credential the account has deactivated is refused HERE, before the
+        // operation it named runs (see the module docs): the modelled walk
+        // deserializes, validates and dispatches before any handler could answer, so
+        // this pre-dispatch seam is the only place an authentication outcome is
+        // reachable from.
+        //
+        // The request's auth schemes are unaffected: the router reads them off the
+        // MODELLED operation the routing key names, so this changes nothing about which
+        // requests must be signed.
+        self.presents_an_unusable_credential(req)
+            .then_some(&self.unusable_credential as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

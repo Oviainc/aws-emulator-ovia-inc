@@ -43,6 +43,8 @@ mod detector_data_sources_projection;
 mod detector_lifecycle;
 #[path = "all/detector_sub_resource_creates.rs"]
 mod detector_sub_resource_creates;
+#[path = "all/detector_sub_resource_deletes.rs"]
+mod detector_sub_resource_deletes;
 #[path = "all/filter_delete.rs"]
 mod filter_delete;
 #[path = "all/filter_detector_timestamp.rs"]

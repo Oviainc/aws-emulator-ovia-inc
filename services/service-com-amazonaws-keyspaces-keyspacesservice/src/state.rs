@@ -619,13 +619,11 @@ impl TagRejection {
 /// request repeats. The resulting size is therefore computed before anything is stored,
 /// which is also what makes a refused call leave the tag set exactly as it was.
 pub fn merge_tags(existing: &mut TagSet, incoming: &[Tag]) -> Result<(), TagRejection> {
+    // The request-only refusal first, so merging decides it exactly as the handlers that
+    // decide it before they resolve a resource do.
+    reject_reserved_tag_keys(incoming)?;
     let mut added: BTreeSet<&str> = BTreeSet::new();
     for tag in incoming {
-        if tag.key.starts_with(RESERVED_TAG_KEY_PREFIX) {
-            return Err(TagRejection::ReservedKeyPrefix {
-                key: tag.key.clone(),
-            });
-        }
         if !existing.contains_key(&tag.key) {
             added.insert(tag.key.as_str());
         }
@@ -638,6 +636,30 @@ pub fn merge_tags(existing: &mut TagSet, incoming: &[Tag]) -> Result<(), TagReje
         existing.insert(tag.key.clone(), tag.value.clone());
     }
     Ok(())
+}
+
+/// The first key in `supplied` the caller may not name, as the refusal it is.
+///
+/// Whether a key carries [`RESERVED_TAG_KEY_PREFIX`] is a property of the REQUEST ALONE:
+/// it does not depend on which tags a resource already holds, nor on whether the resource
+/// the request names exists at all. So every operation taking tags decides it BEFORE any
+/// refusal that depends on stored state — the resource's existence, its status, a name
+/// already taken — which is what makes one and the same reserved key answer the same 400
+/// `ValidationException` whichever of them was called and whatever the store holds.
+///
+/// The quota ([`MAX_TAGS_PER_RESOURCE`]) is the other refusal [`merge_tags`] raises and is
+/// NOT request-only — it counts the tags the resource already holds — so it stays where
+/// the resource is known.
+pub fn reject_reserved_tag_keys(supplied: &[Tag]) -> Result<(), TagRejection> {
+    match supplied
+        .iter()
+        .find(|tag| tag.key.starts_with(RESERVED_TAG_KEY_PREFIX))
+    {
+        Some(reserved) => Err(TagRejection::ReservedKeyPrefix {
+            key: reserved.key.clone(),
+        }),
+        None => Ok(()),
+    }
 }
 
 /// The tag set a create operation stores for the `tags` it was given: the same rules as
