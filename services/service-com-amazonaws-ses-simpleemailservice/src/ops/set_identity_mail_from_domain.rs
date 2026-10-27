@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SetIdentityMailFromDomain
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SetIdentityMailFromDomain`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SetIdentityMailFromDomain::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records — or clears — one verified identity's custom MAIL FROM setup.
+//!
+//! The setup is stored on the identity's own record
+//! ([`crate::state::MailFromSettings`]) and reported by
+//! `GetIdentityMailFromDomainAttributes`. A recorded setup starts `Pending`,
+//! because SES reports it `Pending` until it has read the domain's MX record, and
+//! the clock owes its move to `Success`
+//! ([`crate::state::MAIL_FROM_SETUP_SPAN`]). Omitting `MailFromDomain` disables
+//! the custom MAIL FROM setting, and a domain that is not a subdomain of the
+//! identity is refused with HTTP 400 `InvalidParameterValue`, leaving the stored
+//! setup as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +146,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SetIdentityMailFromDomain` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SetIdentityMailFromDomainErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SetIdentityMailFromDomain"))
+        // `ctx` carries the request's Region, which is the Region an identity ARN
+        // this request names has to be in; nothing else here needs it.
+        let region = crate::state::region_from_request(ctx.parts());
+
+        // The stored behaviour, from the wire value. The boundary validator has
+        // already refused a value outside the model's own enum, so what reaches
+        // here is one of them; an unrecognised value is refused rather than
+        // silently taking a behaviour the caller did not ask for. An ABSENT member
+        // takes the behaviour that still delivers the message, which is what the
+        // attributes report.
+        let behavior_on_mx_failure = match input.behavior_on_mx_failure.as_deref() {
+            None => crate::state::BehaviorOnMxFailure::default(),
+            Some(given) => match crate::state::BehaviorOnMxFailure::from_wire(given.trim()) {
+                Some(behavior) => behavior,
+                None => {
+                    return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                        format!(
+                            "BehaviorOnMXFailure must be one of {}, got {given:?}",
+                            super::types::BEHAVIOR_ON_M_X_FAILURE_VALUES.join(", ")
+                        ),
+                    ));
+                }
+            },
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // See `verify_email_identity.rs`: an engine with no store for this
+            // service cannot serve the operation at all, and it models no server
+            // error of its own.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "SetIdentityMailFromDomain",
+            ));
+        };
+        let mut state = state.lock();
+
+        // The identity has to be one this account holds, keyed the way the writers
+        // key it (the ARN form the member documents resolved to the identity it
+        // names, in this account and this Region).
+        let identity = crate::state::resolve_identity(&input.identity, &region)
+            .map_err(crate::scaffolded::Scaffolded::invalid_parameter_value)?
+            .to_string();
+        let Some(record) = state.identities.get_mut(&identity) else {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                format!("Identity {identity} is not verified"),
+            ));
+        };
+
+        // "A value of null disables the custom MAIL FROM setting for the identity"
+        // (`MailFromDomain`), so a request that names no domain — or names a blank
+        // one, which is how the query protocol carries an omitted string — clears
+        // the setup rather than storing a domain no mail could come from.
+        let requested = input
+            .mail_from_domain
+            .as_deref()
+            .map(str::trim)
+            .filter(|given| !given.is_empty());
+        // Validated against the identity BEFORE anything is written, so a refused
+        // request leaves the stored setup exactly as it was.
+        let settings = match requested {
+            Some(given) => {
+                let domain = crate::state::mail_from_domain_for(&identity, given)
+                    .map_err(crate::scaffolded::Scaffolded::invalid_parameter_value)?;
+                Some(crate::state::MailFromSettings::pending(
+                    domain,
+                    behavior_on_mx_failure,
+                    std::time::SystemTime::now(),
+                ))
+            }
+            None => None,
+        };
+
+        match (settings, record.mail_from.as_mut()) {
+            // Re-setting the SAME domain changes only the behaviour the setup
+            // carries: the MX record SES is reading is the same one, so the status
+            // it has reached — and any move the clock still owes it — stand.
+            (Some(settings), Some(stored)) if stored.domain == settings.domain => {
+                stored.behavior_on_mx_failure = settings.behavior_on_mx_failure;
+            }
+            // A different domain is a new setup to read an MX record for, and no
+            // custom domain at all disables the setting.
+            (settings, _) => record.mail_from = settings,
+        }
+
+        // `SetIdentityMailFromDomainResponse` has no members: what the call
+        // produced is the state it wrote, which
+        // `GetIdentityMailFromDomainAttributes` reports.
+        Ok(SetIdentityMailFromDomainOutput {})
     }
 }

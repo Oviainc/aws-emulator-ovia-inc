@@ -206,7 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Where this request's `NextToken` continues the listing, under the one cursor
         // rule every paged listing of this service shares.
-        let start = sqs::count_cursor("NextToken", input.next_token.as_deref(), sources.len())
+        let start = sqs::count_cursor(input.next_token.as_deref(), sources.len())
             .map_err(crate::scaffolded::Scaffolded::invalid_parameter_value)?;
         // "If you do not set MaxResults, the response includes a maximum of 1,000
         // results": the upper end of the range the parameter itself publishes.

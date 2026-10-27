@@ -17,7 +17,7 @@ use crate::ops::types::{
     AccountRecoverySettingType, AccountTakeoverRiskConfigurationType, AcrLevelConfigType,
     AdminCreateUserConfigType,
     AnalyticsConfigurationType, AttributeType, AuthenticationResultType,
-    ClientAuthenticationResultType,
+    ClientAuthenticationResultType, ClientSecretDescriptorType,
     CodeDeliveryDetailsType, CompromisedCredentialsRiskConfigurationType, CustomDomainConfigType,
     DeviceConfigurationType, DeviceSecretVerifierConfigType, DeviceType, DomainDescriptionType,
     EmailConfigurationType, EmailMfaConfigType, GroupType, IdentityProviderType,
@@ -2771,11 +2771,76 @@ impl UserPoolReplica {
     }
 }
 
+/// How many client secrets one app client holds at a time:
+/// `AddUserPoolClientSecret` "supports up to 2 active secrets per app client for
+/// zero-downtime credential rotation workflows" (that operation in this
+/// service's model), so the cap is the API's rather than this emulator's.
+pub const MAX_CLIENT_SECRETS_PER_CLIENT: usize = 2;
+
+/// One active client secret of an app client: the credential a confidential app
+/// client authenticates itself with, beside the id and creation time a listing
+/// reports it by.
+#[derive(Debug, Clone)]
+pub struct ClientSecret {
+    /// The secret's unique id. "This identifier follows the format
+    /// <client-id>--<epoch-create-time>"
+    /// (`ClientSecretDescriptorType.ClientSecretId`), minted by
+    /// [`ClientSecret::new`].
+    pub id: String,
+    /// The secret value itself: either the one the request supplied or one this
+    /// emulator generated.
+    pub value: String,
+    /// When this secret was created.
+    pub create_date: SystemTime,
+}
+
+impl ClientSecret {
+    /// A secret of the app client `client_id` holding `value`, created at `now`.
+    ///
+    /// The id is "`<client-id>--<epoch-create-time>`"
+    /// (`ClientSecretDescriptorType.ClientSecretId`), with the creation time
+    /// counted in milliseconds since the epoch so two secrets rotated within one
+    /// second still carry different ids.
+    pub fn new(client_id: &str, value: String, now: SystemTime) -> Self {
+        let created_millis = now
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        Self {
+            id: format!("{client_id}--{created_millis}"),
+            value,
+            create_date: now,
+        }
+    }
+
+    /// The modelled view of this secret, rendered from what is stored.
+    ///
+    /// `ClientSecretValue` is left out: "this is only returned when creating a new
+    /// secret and only if Amazon Cognito generated the secret"
+    /// (`ClientSecretDescriptorType.ClientSecretValue`), so the call that
+    /// generates a value is the only one that carries it and every later read
+    /// renders the descriptor without it.
+    pub fn to_client_secret_descriptor_type(&self) -> ClientSecretDescriptorType {
+        ClientSecretDescriptorType {
+            client_secret_id: Some(self.id.clone()),
+            client_secret_value: None,
+            client_secret_create_date: Some(to_date_time(self.create_date)),
+        }
+    }
+}
+
 /// One stored app client of a user pool.
 #[derive(Debug, Clone)]
 pub struct UserPoolClient {
     pub client_id: String,
-    pub client_secret: Option<String>,
+    /// This app client's active client secrets, oldest first. A confidential app
+    /// client is created holding one, and `AddUserPoolClientSecret` "supports up
+    /// to 2 active secrets per app client for zero-downtime credential rotation
+    /// workflows" (that operation in this service's model), so a client holds a
+    /// LIST of them and each one it holds authenticates a request. A public app
+    /// client — one created with neither `GenerateSecret` nor a `ClientSecret` —
+    /// holds none.
+    pub client_secrets: Vec<ClientSecret>,
     pub user_pool_id: String,
     pub client_name: String,
     pub creation_date: SystemTime,
@@ -2873,23 +2938,24 @@ impl UserPoolClient {
     ///
     /// The check is `ring`'s own tag verification, so a rejected hash tells a
     /// caller nothing about how much of the expected one it got right.
+    /// A client that holds SEVERAL secrets accepts the tag ANY of them produces:
+    /// each one is an active credential of the app client, which is what lets a
+    /// caller move from one to the next without an outage.
     pub fn accepts_secret_hash(&self, username: &str, presented: Option<&str>) -> bool {
-        let Some(secret) = self.client_secret.as_deref() else {
+        if self.client_secrets.is_empty() {
             return true;
-        };
+        }
         let Some(presented) = presented else {
             return false;
         };
         let Ok(tag) = ::aws_smithy_types::base64::decode(presented) else {
             return false;
         };
-        let key = ::ring::hmac::Key::new(::ring::hmac::HMAC_SHA256, secret.as_bytes());
-        ::ring::hmac::verify(
-            &key,
-            secret_hash_message(username, &self.client_id).as_bytes(),
-            &tag,
-        )
-        .is_ok()
+        let message = secret_hash_message(username, &self.client_id);
+        self.client_secrets.iter().any(|secret| {
+            let key = ::ring::hmac::Key::new(::ring::hmac::HMAC_SHA256, secret.value.as_bytes());
+            ::ring::hmac::verify(&key, message.as_bytes(), &tag).is_ok()
+        })
     }
 
     /// Whether `presented` is the `ClientSecret` this app client requires a request
@@ -2901,17 +2967,59 @@ impl UserPoolClient {
     /// accepted, while one that holds a secret accepts only that value — a request
     /// that carries none, or another client's secret, proves nothing about holding
     /// it. The comparison is a constant-time one, so a rejected secret tells a
-    /// caller nothing about how much of it was right.
+    /// caller nothing about how much of it was right. A client that holds SEVERAL
+    /// secrets accepts any one of them: each is an active credential of the app
+    /// client.
     pub fn accepts_client_secret(&self, presented: Option<&str>) -> bool {
-        let Some(secret) = self.client_secret.as_deref() else {
+        if self.client_secrets.is_empty() {
             return true;
-        };
+        }
         presented.is_some_and(|presented| {
-            bool::from(::subtle::ConstantTimeEq::ct_eq(
-                presented.as_bytes(),
-                secret.as_bytes(),
-            ))
+            self.client_secrets.iter().any(|secret| {
+                bool::from(::subtle::ConstantTimeEq::ct_eq(
+                    presented.as_bytes(),
+                    secret.value.as_bytes(),
+                ))
+            })
         })
+    }
+
+    /// The app client secret a read of this client renders: its oldest active
+    /// secret, which is the one the create minted or accepted, or `None` for a
+    /// public app client that holds none.
+    ///
+    /// `UserPoolClientType.ClientSecret` is "the app client secret" (this
+    /// service's model) — one value, while an app client under rotation holds up
+    /// to [`MAX_CLIENT_SECRETS_PER_CLIENT`], so the member renders the secret the
+    /// client already had and a later read of the SAME client still renders it.
+    pub fn client_secret(&self) -> Option<&str> {
+        self.client_secrets
+            .first()
+            .map(|secret| secret.value.as_str())
+    }
+
+    /// Whether this app client already holds every secret it may hold at once,
+    /// which is what makes one more [`MAX_CLIENT_SECRETS_PER_CLIENT`] exceeded.
+    pub fn client_secrets_at_limit(&self) -> bool {
+        self.client_secrets.len() >= MAX_CLIENT_SECRETS_PER_CLIENT
+    }
+
+    /// Store `value` as one more active secret of this app client, created at
+    /// `now`, and answer the record as stored.
+    ///
+    /// Secrets are appended, so the order they were created in is the order a
+    /// read reports them in and [`Self::client_secret`] keeps naming the same
+    /// one. The minted id names this app client and this instant, and the instant
+    /// is carried forward until no secret of this client already holds that id,
+    /// so one id never names two secrets.
+    pub fn add_client_secret(&mut self, value: String, now: SystemTime) -> ClientSecret {
+        let mut secret = ClientSecret::new(&self.client_id, value, now);
+        while self.client_secrets.iter().any(|held| held.id == secret.id) {
+            let created = secret.create_date + Duration::from_millis(1);
+            secret = ClientSecret::new(&self.client_id, secret.value, created);
+        }
+        self.client_secrets.push(secret.clone());
+        secret
     }
 
     /// How long a refresh token this client rotates out stays valid for retries, or
@@ -2996,7 +3104,7 @@ impl UserPoolClient {
             user_pool_id: Some(self.user_pool_id.clone()),
             client_name: Some(self.client_name.clone()),
             client_id: Some(self.client_id.clone()),
-            client_secret: self.client_secret.clone(),
+            client_secret: self.client_secret().map(ToString::to_string),
             last_modified_date: Some(to_date_time(self.last_modified_date)),
             creation_date: Some(to_date_time(self.creation_date)),
             refresh_token_validity: self.refresh_token_validity,

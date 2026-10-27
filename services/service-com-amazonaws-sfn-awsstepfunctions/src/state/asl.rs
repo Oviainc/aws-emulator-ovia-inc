@@ -529,6 +529,12 @@ pub struct Step {
     pub after: Duration,
     /// Whether this is the event the execution ends on.
     pub terminal: bool,
+    /// What the walk knew about this event, which is what the history reports as that
+    /// event type's own detail member: the work a `Task` state named and the document
+    /// it was handed, the error and cause its work failed with, the item one `Map`
+    /// iteration was handed and how many a `Map` state is iterating. A step whose
+    /// event type carries no detail of its own leaves every member unset.
+    pub details: super::EventDetails,
 }
 
 /// One item of a `Map` state's iteration, as the walk ran it.
@@ -847,6 +853,42 @@ struct Branch {
     end: Duration,
 }
 
+/// One unit of a state's CONCURRENT work — a `Parallel` branch, or one iteration of a
+/// `Map` state — as the walk ran it, for [`Interpreter::abort_units`].
+struct Unit {
+    /// Where this unit's own history events begin in the walk's list.
+    from: usize,
+    /// The event this unit records when the state's failure stopped it, for a kind of
+    /// unit the language records one for: a `Map` iteration is aborted in its own
+    /// right, while a `Parallel` branch is reported through the states it was in.
+    aborted: Option<Step>,
+}
+
+/// The suffix of the event type every state records when it is ENTERED, and the one it
+/// records when it is LEFT: the prefix is the state's own type, which is what says
+/// which aborted event an in-flight state records
+/// ([`aborted_event`]).
+const STATE_ENTERED: &str = "StateEntered";
+const STATE_EXITED: &str = "StateExited";
+
+/// The event a state of a given type records when the work around it was aborted,
+/// where the service models one.
+///
+/// Only a state that can still be RUNNING when the abort reaches it has one:
+/// `HistoryEventType` models `WaitStateAborted`, `TaskStateAborted`, `MapStateAborted`
+/// and `ParallelStateAborted` and no others
+/// (`smithy_query(query="shape",shape="HistoryEventType")`), because a `Pass`, a
+/// `Choice`, a `Succeed` and a `Fail` leave in the same instant they are entered.
+fn aborted_event(state_type: &str) -> Option<&'static str> {
+    match state_type {
+        "Wait" => Some("WaitStateAborted"),
+        "Task" => Some("TaskStateAborted"),
+        "Map" => Some("MapStateAborted"),
+        "Parallel" => Some("ParallelStateAborted"),
+        _ => None,
+    }
+}
+
 /// The `$$.Map.Item` of the enclosing `Map` iteration, if the walk is inside one.
 #[derive(Debug, Clone, Default)]
 struct Scope {
@@ -856,6 +898,9 @@ struct Scope {
 /// A `Map` state's plan: everything resolved from its members before its items run.
 struct MapPlan<'a> {
     items: &'a [Value],
+    /// The state's own name: "the name of the iteration's parent Map state", which
+    /// every one of its iterations' events reports.
+    name: &'a str,
     /// The state's `Label`, else its own name: the field the Map Run's ARN and its
     /// children's own ARNs carry.
     label: &'a str,
@@ -2597,6 +2642,7 @@ fn terminal(
         state_name: None,
         after: elapsed,
         terminal: true,
+        details: super::EventDetails::default(),
     });
     Run {
         status,
@@ -3214,12 +3260,71 @@ impl Interpreter<'_> {
     }
 
     fn push(&mut self, event_type: &'static str, state_name: &str, after: Duration) {
+        self.push_detailed(
+            event_type,
+            state_name,
+            after,
+            super::EventDetails::default(),
+        );
+    }
+
+    /// One history event carrying what the walk knew about it.
+    fn push_detailed(
+        &mut self,
+        event_type: &'static str,
+        state_name: &str,
+        after: Duration,
+        details: super::EventDetails,
+    ) {
         self.steps.push(Step {
             event_type,
             state_name: Some(state_name.to_string()),
             after,
             terminal: false,
+            details,
         });
+    }
+
+    /// The event one attempt of a `Task` state's work failed with: the language's own
+    /// timeout event where the work ran out of the time the state allowed it, and the
+    /// task's own failure event otherwise, both carrying the work that failed and the
+    /// error and cause it failed with.
+    fn push_task_failure(
+        &mut self,
+        state_name: &str,
+        resource_type: &str,
+        action: &str,
+        failure: &Failure,
+        after: Duration,
+    ) {
+        let event_type = if failure.name() == TIMEOUT_ERROR {
+            super::EVENT_TASK_TIMED_OUT
+        } else {
+            super::EVENT_TASK_FAILED
+        };
+        let mut details = task_work_details(resource_type, action);
+        details.error = failure.error.clone();
+        details.cause = failure.cause.clone();
+        self.push_detailed(event_type, state_name, after, details);
+    }
+
+    /// A `Task` state's failure, recorded on the state that produced it and then
+    /// reported to the walk.
+    ///
+    /// The failure of a task is the TASK's, so the history attributes it to the work
+    /// that failed — the error name and the cause, on the state that named it —
+    /// whatever the walk then does with it: a caller reads what went wrong off the
+    /// task rather than only off the execution the task ended.
+    fn task_fault(
+        &mut self,
+        state_name: &str,
+        resource_type: &str,
+        action: &str,
+        failure: Failure,
+        after: Duration,
+    ) -> Fault {
+        self.push_task_failure(state_name, resource_type, action, &failure, after);
+        failure.at(after)
     }
 
     /// Where the walk goes after a state that carries `Next` or `"End": true`.
@@ -3496,8 +3601,19 @@ impl Interpreter<'_> {
             ))
             .at(at)
         })?;
-        let call = super::integration::read(resource)
-            .map_err(|why| runtime(format!("state '{name}': {why}")).at(at))?;
+        // "The service name of the resource in a task state" and "the action of the
+        // resource called by a task state": what every one of this state's own events
+        // names the work by, read once from the `Resource` they all describe.
+        let (resource_type, action) = super::integration::named_work(resource);
+        let call = super::integration::read(resource).map_err(|why| {
+            self.task_fault(
+                name,
+                &resource_type,
+                &action,
+                runtime(format!("state '{name}': {why}")),
+                at,
+            )
+        })?;
         // "TimeoutSeconds […] If the task runs longer than the specified seconds,
         // this state fails with a States.Timeout error name": the span it bounds is
         // the call's own, so the member is what the WAIT for the answer is bounded
@@ -3512,9 +3628,11 @@ impl Interpreter<'_> {
         // a `Duration` total for every value a caller can write.
         let within = self
             .task_seconds(state, "TimeoutSeconds", &effective, context)
-            .map_err(|failure| failure.at(at))?
+            .map_err(|failure| self.task_fault(name, &resource_type, &action, failure, at))?
             .map(Duration::from_secs);
-
+        let heartbeat = self
+            .task_seconds(state, "HeartbeatSeconds", &effective, context)
+            .map_err(|failure| self.task_fault(name, &resource_type, &action, failure, at))?;
         let (outcome, end) = self.with_retries(state, at, &mut |me, at| {
             // This attempt's own request reads `$$.State.RetryCount`, so the payload
             // template is rendered with the context of the attempt it is on.
@@ -3522,36 +3640,68 @@ impl Interpreter<'_> {
             let request = match state.get("Parameters") {
                 Some(template) => match payload_template(template, &effective, &attempt_context) {
                     Ok(request) => request,
-                    Err(failure) => return (Err(failure), at),
+                    Err(failure) => {
+                        me.push_task_failure(name, &resource_type, &action, &failure, at);
+                        return (Err(failure), at);
+                    }
                 },
                 None => effective.clone(),
             };
+            // Each attempt hands the work over and starts it again, so each writes
+            // its own pair of events, carrying the document THAT attempt built and
+            // the bounds the state declared for it.
+            me.push_detailed(
+                super::EVENT_TASK_SCHEDULED,
+                name,
+                at,
+                super::EventDetails {
+                    resource_type: Some(resource_type.clone()),
+                    resource: Some(action.clone()),
+                    input: Some(request.to_string()),
+                    timeout_seconds: within.map(|within| within.as_secs()),
+                    heartbeat_seconds: heartbeat,
+                    ..super::EventDetails::default()
+                },
+            );
+            me.push_detailed(
+                super::EVENT_TASK_STARTED,
+                name,
+                at,
+                task_work_details(&resource_type, &action),
+            );
             // The interpretation's own deadline is consulted HERE as well as at each
             // transition: the walk blocks inside a call rather than transitioning, so
             // a run already past its deadline makes no further call (and a `Retry`
             // cannot keep making them).
             if let Some(failure) = me.out_of_time() {
+                me.push_task_failure(name, &resource_type, &action, &failure, at);
                 return (Err(failure), at);
             }
             let answered = me.tasks.perform(&call, &request, within);
-            match answered {
+            let attempt = match answered {
                 // The result is a document a state carries, so it is measured
                 // against the same ceiling every state's document is measured
                 // against.
                 Ok(result) => {
                     match measure_payload(&result, &format!("the 'Task' state '{name}'")) {
-                        Ok(_bytes) => (Ok(result), at),
-                        Err(failure) => (Err(failure), at),
+                        Ok(_bytes) => Ok(result),
+                        Err(failure) => Err(failure),
                     }
                 }
-                Err(Failed { error, cause }) => (
-                    Err(Failure {
-                        error: Some(error),
-                        cause: Some(cause),
-                    }),
-                    at,
-                ),
+                Err(Failed { error, cause }) => Err(Failure {
+                    error: Some(error),
+                    cause: Some(cause),
+                }),
+            };
+            match &attempt {
+                Ok(result) => {
+                    let mut details = task_work_details(&resource_type, &action);
+                    details.output = Some(result.to_string());
+                    me.push_detailed(super::EVENT_TASK_SUCCEEDED, name, at, details);
+                }
+                Err(failure) => me.push_task_failure(name, &resource_type, &action, failure, at),
             }
+            (attempt, at)
         });
         match outcome {
             Ok(result) => {
@@ -3613,6 +3763,7 @@ impl Interpreter<'_> {
             .to_string();
         let plan = MapPlan {
             items: &items,
+            name,
             label: &label,
             states: processor_states,
             start_at: processor_start,
@@ -3637,10 +3788,30 @@ impl Interpreter<'_> {
         // what is reported is what the attempt the state ended on did.
         let mut tally = MapTally::default();
         let (outcome, end) = self.with_retries(state, at, &mut |me, at| {
+            // Every attempt at this state iterates the items again, so every attempt
+            // writes its own `MapStateStarted` — carrying "the size of the array for
+            // Map state iterations" — and the event of the outcome those iterations
+            // reached.
+            me.push_detailed(
+                super::EVENT_MAP_STATE_STARTED,
+                name,
+                at,
+                super::EventDetails {
+                    length: Some(i32::try_from(plan.items.len()).unwrap_or(i32::MAX)),
+                    ..super::EventDetails::default()
+                },
+            );
             // This attempt's own members read `$$.State.RetryCount`, so they are
             // evaluated with the context of the attempt they are on.
             let context = with_retry_count(context, me.retry_count);
-            me.run_map_items(&plan, &effective, &context, at, &mut tally)
+            let (outcome, end) = me.run_map_items(&plan, &effective, &context, at, &mut tally);
+            let event = if outcome.is_ok() {
+                super::EVENT_MAP_STATE_SUCCEEDED
+            } else {
+                super::EVENT_MAP_STATE_FAILED
+            };
+            me.push(event, name, end);
+            (outcome, end)
         });
         // A Distributed Map "starts a Map Run", a resource of its own; an INLINE Map
         // starts none, so only the distributed mode records one.
@@ -3759,7 +3930,17 @@ impl Interpreter<'_> {
         let mut results: Vec<Value> = Vec::new();
         let mut results_bytes = 0usize;
         let mut failures: u64 = 0;
-        let mut first_failure: Option<Failure> = None;
+        // The iteration that failed FIRST, with the offset it failed at: the failure
+        // an intolerant state reports, and the instant its other iterations stopped.
+        let mut first_failure: Option<(Failure, Duration)> = None;
+        // Where each iteration's own events begin in this walk's list, so an iteration
+        // the state's failure aborted can be cut back to the instant it failed.
+        let mut units: Vec<Unit> = Vec::new();
+        // "ToleratedFailureCount" and "ToleratedFailurePercentage" are what lets a
+        // state go on iterating past a failed item; a state that declares neither
+        // tolerates none, so the first failure is the state's own and the iterations
+        // that had not finished stop there.
+        let tolerant = plan.distributed || plan.tolerance_declared;
         let mut at = at;
         let mut index = 0usize;
         for chunk in plan.items.chunks(batch) {
@@ -3821,6 +4002,26 @@ impl Interpreter<'_> {
                 // kept before the walk takes it: "the string that contains the JSON
                 // input data" of that execution.
                 let child_input = child.as_ref().map(|_| item_input.to_string());
+                // One iteration per item: it is STARTED here, carrying the index of
+                // the item it was handed, and records its own outcome below — which is
+                // how a caller observes the fan-out, and how many items ran at once.
+                let from = self.steps.len();
+                self.push_detailed(
+                    super::EVENT_MAP_ITERATION_STARTED,
+                    plan.name,
+                    batch_start,
+                    iteration_details(index),
+                );
+                units.push(Unit {
+                    from,
+                    aborted: Some(Step {
+                        event_type: super::EVENT_MAP_ITERATION_ABORTED,
+                        state_name: Some(plan.name.to_string()),
+                        after: Duration::ZERO,
+                        terminal: false,
+                        details: iteration_details(index),
+                    }),
+                });
                 let branch = self.nested_walk(
                     plan.states,
                     plan.start_at,
@@ -3865,6 +4066,16 @@ impl Interpreter<'_> {
                         item_count: 1,
                     });
                 }
+                let outcome_event = match &branch.outcome {
+                    Ok(_) => super::EVENT_MAP_ITERATION_SUCCEEDED,
+                    Err(_) => super::EVENT_MAP_ITERATION_FAILED,
+                };
+                self.push_detailed(
+                    outcome_event,
+                    plan.name,
+                    branch.end,
+                    iteration_details(index),
+                );
                 match branch.outcome {
                     Ok(value) => {
                         // The array the iterations are building is a document this
@@ -3899,14 +4110,22 @@ impl Interpreter<'_> {
                             finished_at: branch.end,
                             failed: true,
                         });
-                        if first_failure.is_none() {
-                            first_failure = Some(failure);
+                        if first_failure
+                            .as_ref()
+                            .is_none_or(|(_, when)| branch.end < *when)
+                        {
+                            first_failure = Some((failure, branch.end));
                         }
                     }
                 }
                 index += 1;
             }
             at = batch_end;
+            // A state that tolerates no failure has already failed, so the items it
+            // had not started yet are never started.
+            if failures > 0 && !tolerant {
+                break;
+            }
         }
 
         if failures == 0 {
@@ -3922,18 +4141,23 @@ impl Interpreter<'_> {
         }
         // A Distributed Map reports its own tolerated-failure error; an inline Map
         // has no threshold to exceed, so the iteration's own failure is the state's.
-        let failure = if plan.distributed || plan.tolerance_declared {
-            named(
-                TOLERATED_FAILURE_ERROR,
-                format!(
-                    "{failures} of {} items failed, more than this 'Map' state tolerates",
-                    plan.items.len()
-                ),
-            )
-        } else {
-            first_failure.unwrap_or_else(|| runtime("a 'Map' iteration failed".to_string()))
+        if tolerant {
+            return (
+                Err(named(
+                    TOLERATED_FAILURE_ERROR,
+                    format!(
+                        "{failures} of {} items failed, more than this 'Map' state tolerates",
+                        plan.items.len()
+                    ),
+                )),
+                at,
+            );
+        }
+        let Some((failure, when)) = first_failure else {
+            return (Err(runtime("a 'Map' iteration failed".to_string())), at);
         };
-        (Err(failure), at)
+        self.abort_units(when, &units);
+        (Err(failure), when)
     }
 
     // -----------------------------------------------------------------------
@@ -3979,6 +4203,10 @@ impl Interpreter<'_> {
                 .push(states_of(branch, &label).map_err(|failure| failure.at(at))?);
         }
         let (outcome, end) = self.with_retries(state, at, &mut |me, at| {
+            // Every attempt at this state starts its branches, so every attempt
+            // writes its own `ParallelStateStarted` and the event of the outcome
+            // those branches reached.
+            me.push(super::EVENT_PARALLEL_STATE_STARTED, name, at);
             // "Parameters ... The effective input each branch receives." It is
             // re-evaluated per attempt, because this attempt's own members read
             // `$$.State.RetryCount`.
@@ -3986,11 +4214,21 @@ impl Interpreter<'_> {
             let branch_input = match state.get("Parameters") {
                 Some(template) => match payload_template(template, &effective, &context) {
                     Ok(value) => value,
-                    Err(failure) => return (Err(failure), at),
+                    Err(failure) => {
+                        me.push(super::EVENT_PARALLEL_STATE_FAILED, name, at);
+                        return (Err(failure), at);
+                    }
                 },
                 None => effective.clone(),
             };
-            me.run_branches(&plan, &branch_input, at)
+            let (outcome, end) = me.run_branches(&plan, &branch_input, at);
+            let event = if outcome.is_ok() {
+                super::EVENT_PARALLEL_STATE_SUCCEEDED
+            } else {
+                super::EVENT_PARALLEL_STATE_FAILED
+            };
+            me.push(event, name, end);
+            (outcome, end)
         });
         match outcome {
             Ok(results) => {
@@ -4025,23 +4263,28 @@ impl Interpreter<'_> {
     /// it is bounded as it GROWS rather than only once it is whole: a definition that
     /// declares many branches cannot hold more than a state's output may carry while
     /// it runs.
-    fn run_branches(
-        &mut self,
-        plan: &ParallelPlan<'_>,
-        input: &Value,
-        at: Duration,
-    ) -> Attempt {
+    ///
+    /// "If any branch fails ... the entire Parallel state is considered to have
+    /// failed", and it failed at the instant that branch did: the branches that were
+    /// still running are STOPPED there ([`Interpreter::abort_units`]), so no state of
+    /// a surviving branch is entered after the state the Parallel failed with.
+    fn run_branches(&mut self, plan: &ParallelPlan<'_>, input: &Value, at: Duration) -> Attempt {
         let mut results = Vec::with_capacity(plan.branches.len());
         let mut results_bytes = 0usize;
         let mut end = at;
+        // Where each branch's own events begin in this walk's list, so a branch the
+        // state's failure aborted can be cut back to the instant it failed.
+        let mut units: Vec<Unit> = Vec::with_capacity(plan.branches.len());
+        let mut failed: Option<(Failure, Duration)> = None;
         for (states, start_at) in &plan.branches {
+            let from = self.steps.len();
             let branch = self.nested_walk(states, start_at, input.clone(), at, &Scope::default());
-            end = end.max(branch.end);
+            units.push(Unit { from, aborted: None });
             match branch.outcome {
                 Ok(value) => {
                     match measure_payload(&value, "a 'Parallel' branch") {
                         Ok(bytes) => results_bytes = results_bytes.saturating_add(bytes),
-                        Err(failure) => return (Err(failure), end),
+                        Err(failure) => return (Err(failure), end.max(branch.end)),
                     }
                     if results_bytes > MAX_PAYLOAD_BYTES {
                         return (
@@ -4053,17 +4296,88 @@ impl Interpreter<'_> {
                                      state's output may carry"
                                 ),
                             )),
-                            end,
+                            end.max(branch.end),
                         );
                     }
+                    end = end.max(branch.end);
                     results.push(value);
                 }
-                // "If any branch fails ... the entire Parallel state is considered to
-                // have failed", with that branch's error.
-                Err(failure) => return (Err(failure), end),
+                // The state failed with the error of the branch that failed FIRST,
+                // which is the one whose failure stopped the others.
+                Err(failure) => {
+                    if failed.as_ref().is_none_or(|(_, when)| branch.end < *when) {
+                        failed = Some((failure, branch.end));
+                    }
+                }
             }
         }
-        (Ok(Value::Array(results)), end)
+        let Some((failure, when)) = failed else {
+            return (Ok(Value::Array(results)), end);
+        };
+        self.abort_units(when, &units);
+        (Err(failure), when)
+    }
+
+    /// Stop the branches or iterations of a state that has FAILED, at the instant
+    /// `when` it failed.
+    ///
+    /// A state whose concurrent work has already failed does not go on running the
+    /// rest of it: each unit is cut back to the events that were due at or before that
+    /// instant, the state it was in when the failure reached it records that type's own
+    /// aborted event, and the unit itself records the one its kind has. `units` is
+    /// where each unit's events begin in this walk's list, in the order they were run,
+    /// so they are cut from the last one back and no earlier unit's position moves.
+    fn abort_units(&mut self, when: Duration, units: &[Unit]) {
+        for (position, unit) in units.iter().enumerate().rev() {
+            // Every bound is clamped to the list as it stands: a later unit has
+            // already been cut back by the time this one is, so the span this reads
+            // is the one the list still holds.
+            let until = units
+                .get(position + 1)
+                .map_or(self.steps.len(), |next| next.from)
+                .min(self.steps.len());
+            let from = unit.from.min(until);
+            let Some(cut) = (from..until).find(|index| {
+                self.steps
+                    .get(*index)
+                    .is_some_and(|step| step.after > when)
+            }) else {
+                continue;
+            };
+            // The states this unit was still inside when the failure reached it: each
+            // one entered and not yet left, innermost last.
+            let mut open: Vec<(&'static str, Option<String>)> = Vec::new();
+            for step in self.steps.get(from..cut).unwrap_or_default() {
+                if let Some(entered) = step.event_type.strip_suffix(STATE_ENTERED) {
+                    open.push((entered, step.state_name.clone()));
+                } else if let Some(left) = step.event_type.strip_suffix(STATE_EXITED) {
+                    if let Some(index) = open.iter().rposition(|(name, _)| *name == left) {
+                        open.remove(index);
+                    }
+                }
+            }
+            let mut stopped: Vec<Step> = Vec::new();
+            for (entered, state_name) in open.iter().rev() {
+                if let Some(event_type) = aborted_event(entered) {
+                    stopped.push(Step {
+                        event_type,
+                        state_name: state_name.clone(),
+                        after: when,
+                        terminal: false,
+                        details: super::EventDetails::default(),
+                    });
+                }
+            }
+            if let Some(aborted) = &unit.aborted {
+                let mut aborted = aborted.clone();
+                aborted.after = when;
+                stopped.push(aborted);
+            }
+            self.steps.splice(cut..until, stopped);
+        }
+        // A Map Run a branch only started after the state had already failed never
+        // started: the state it belongs to was not entered.
+        self.map_runs.retain(|map_run| map_run.started_at <= when);
     }
 
     // -----------------------------------------------------------------------
@@ -4222,6 +4536,26 @@ impl Interpreter<'_> {
                 "'{member}' must be a non-negative number, not {value}"
             ))
         })
+    }
+}
+
+/// The members every event of a `Task` state's own work reports: "the service name of
+/// the resource in a task state" and "the action of the resource called by a task
+/// state", as [`super::integration::named_work`] read them off the `Resource`.
+fn task_work_details(resource_type: &str, action: &str) -> super::EventDetails {
+    super::EventDetails {
+        resource_type: Some(resource_type.to_string()),
+        resource: Some(action.to_string()),
+        ..super::EventDetails::default()
+    }
+}
+
+/// The member one `Map` iteration's own events report beside the state's name: "the
+/// index of the array belonging to the Map state iteration".
+fn iteration_details(index: usize) -> super::EventDetails {
+    super::EventDetails {
+        index: Some(i32::try_from(index).unwrap_or(i32::MAX)),
+        ..super::EventDetails::default()
     }
 }
 
