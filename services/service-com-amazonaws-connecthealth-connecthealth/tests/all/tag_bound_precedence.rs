@@ -60,6 +60,7 @@ use crate::domain_subscription_lifecycle::{error_code, string_at, tag_map, Emula
 use crate::resource_tag_removal::untag_path;
 use crate::resource_tagging::{domain_tags, entries, tags_path};
 use crate::tag_count_cap::held_domains;
+use crate::tag_entry_refusal_completeness::{at_least, at_most, clause, envelope};
 use crate::tag_map_bounds::detail;
 
 /// Which refusal — or none — the rule gives a map.
@@ -583,8 +584,9 @@ async fn the_entry_rule_is_decided_before_the_arn_is_resolved_and_the_count_afte
 #[test]
 fn the_shared_entry_check_reports_one_map_one_way_however_the_request_ordered_it() {
     // The entries of a map arrive in no particular order, so the check orders them by key
-    // before walking them: the entry a map of several unacceptable ones is refused for is
-    // the lexicographically first, whatever order the request listed them in.
+    // before walking them and names every entry it refuses: one map earns one refusal,
+    // stating every clause its entries earn in key order, whatever order the request
+    // listed them in.
     let unacceptable = unacceptable_entries();
     let forwards: Vec<(String, String)> = unacceptable
         .iter()
@@ -598,22 +600,56 @@ fn the_shared_entry_check_reports_one_map_one_way_however_the_request_ordered_it
         .min_by(|left, right| left.0.cmp(&right.0))
         .cloned()
         .expect("the catalog is not empty");
-    let expected_refusal = accepted_entries([first_by_key.clone()])
+    let one_entry_refusal = accepted_entries([first_by_key.clone()])
         .expect_err("the catalog's entries are unacceptable");
     // And that sentence itself, written out here rather than only compared to the check's
     // own output: the framework's envelope over the clause naming the value, the member
     // the map is bound to and the bound that was violated. The catalog's first key by
-    // order is the one below the modelled minimum, so this is the sentence a map of all
-    // five earns.
+    // order is the one below the modelled minimum, so this is the sentence a map of that
+    // entry alone earns.
     let worded = format!(
         "1 validation error detected: Value '' at 'tags' failed to satisfy constraint: \
          Member must have length greater than or equal to {MIN_TAG_KEY_LEN}"
     );
     assert_eq!(
-        expected_refusal, worded,
+        one_entry_refusal, worded,
         "the refusal must state the violated bound the way a boundary refusal does, \
-         got {expected_refusal:?}"
+         got {one_entry_refusal:?}"
     );
+
+    // The refusal a map of ALL of them earns, worded here from the bounds themselves
+    // rather than taken from the check's own output: one clause per entry outside a
+    // modelled length, in key order, under a count that agrees with how many are stated.
+    // The reserved-namespace entry contributes none — its sentence is the service's own
+    // rather than one of AWS's envelope clauses, so it is not mixed into an envelope the
+    // map already earns.
+    let mut key_ordered = forwards.clone();
+    key_ordered.sort_by(|left, right| left.0.cmp(&right.0));
+    let clauses: Vec<String> = key_ordered
+        .iter()
+        .filter_map(|(key, value)| {
+            if key.chars().count() < MIN_TAG_KEY_LEN {
+                Some(clause(key, "tags", &at_least(MIN_TAG_KEY_LEN)))
+            } else if key.chars().count() > MAX_TAG_KEY_LEN {
+                Some(clause(key, "tags", &at_most(MAX_TAG_KEY_LEN)))
+            } else if value.chars().count() > MAX_TAG_VALUE_LEN {
+                Some(clause(
+                    value,
+                    &format!("tags.{key}.member"),
+                    &at_most(MAX_TAG_VALUE_LEN),
+                ))
+            } else {
+                // The reserved namespace: refused, but by no modelled constraint.
+                None
+            }
+        })
+        .collect();
+    assert!(
+        clauses.len() > 1,
+        "the catalog must carry several entries outside a modelled length, so the \
+         composed refusal is a multi-clause one, got {clauses:?}"
+    );
+    let expected_refusal = envelope(&clauses);
 
     for (case, pairs) in [
         ("the catalog in order", forwards.clone()),
@@ -622,8 +658,8 @@ fn the_shared_entry_check_reports_one_map_one_way_however_the_request_ordered_it
         let reported = accepted_entries(pairs).expect_err("an unacceptable entry");
         assert_eq!(
             reported, expected_refusal,
-            "case {case:?}: the refusal must name the key-ordered first unacceptable \
-             entry ({:?}), got {reported:?}",
+            "case {case:?}: the refusal must name every unacceptable entry in key order, \
+             starting with {:?}, got {reported:?}",
             first_by_key.0
         );
     }
