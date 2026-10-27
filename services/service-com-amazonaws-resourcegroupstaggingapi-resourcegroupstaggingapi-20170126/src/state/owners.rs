@@ -271,7 +271,10 @@ pub fn tagged_resources<Eng: Send + Sync + 'static>(
         }
     }
     if let Some(state) = owner_events::state::service_state(engine) {
-        for bus in state.lock().buses.values() {
+        // An event bus is a REGIONAL resource of that service, so the buses this
+        // projection reports are the ones of the serving Region — which is also
+        // the Region their ARNs carry.
+        for bus in state.lock().buses_in(region) {
             record(
                 owner_events::state::event_bus_arn(region, &bus.name),
                 plain_tag_pairs(&bus.tags),
@@ -500,7 +503,7 @@ fn events<Eng: Send + Sync + 'static>(
     // parameter wording under the `ValidationException` code, which is still
     // "any valid error code returned by the ... service that hosts the
     // resource".
-    let resource = match owner_events::state::parse_tagged_resource(&arn.arn) {
+    let resource = match owner_events::state::parse_tagged_resource(&arn.arn, &arn.region) {
         Ok(resource) => resource,
         Err(reason) => return absent("ValidationException", reason),
     };

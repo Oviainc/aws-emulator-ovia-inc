@@ -131,7 +131,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListRuleNamesByTargetErrorModeled::InternalException(
@@ -155,9 +155,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         };
 
+        let region = crate::state::request_region(ctx.parts());
         let bus_name = crate::state::effective_bus_name(input.event_bus_name.as_deref());
         let store = state.lock();
-        let Some(bus) = store.bus(&bus_name) else {
+        let Some(bus) = store.bus(&region, &bus_name) else {
             return Err(ListRuleNamesByTargetErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::no_such_event_bus(&bus_name)),

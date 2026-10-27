@@ -172,10 +172,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A submitted `LogConfig` has to name the `Level` it configures, and
         // `LogConfig`'s members are modelled enums, which the boundary validator
-        // does not narrow to their values — so a value neither enum admits is
-        // refused here rather than stored and reported back as if EventBridge had
-        // accepted it.
+        // does not narrow to their values — so a configuration that configures no
+        // logging, or carries a value neither enum admits, is refused here rather
+        // than stored and reported back as if EventBridge had accepted it.
         if let Some(reason) = input
             .log_config
             .as_ref()
@@ -239,11 +240,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // The name is the bus's identity, so a name already stored is a resource
-        // that already exists — never a silent overwrite of the stored bus, and
-        // never of the account's `default` bus, which is stored under its name
-        // ("You can't use the name default for a custom event bus").
-        if store.bus(&input.name).is_some() {
+        // The name is the bus's identity WITHIN the Region the call was signed
+        // for, so a name that Region already holds is a resource that already
+        // exists — never a silent overwrite of the stored bus, and never of the
+        // account's `default` bus, which is stored under its name ("You can't
+        // use the name default for a custom event bus"). The SAME name in
+        // another Region is another bus and is not refused: "you define a
+        // primary and secondary Region with event buses in each Region" whose
+        // names "must be identical in each Region"
+        // ([`crate::state::endpoint_event_bus_violation`]), which is the
+        // required setup for a global endpoint.
+        if store.bus(&region, &input.name).is_some() {
             return Err(CreateEventBusErrorModeled::ResourceAlreadyExistsException(
                 ResourceAlreadyExistsException {
                     message: Some(format!("Event bus {} already exists.", input.name)),
@@ -252,12 +259,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        if store.buses.len() >= crate::state::MAX_EVENT_BUSES {
+        if store.bus_count_in(&region) >= crate::state::MAX_EVENT_BUSES {
             return Err(CreateEventBusErrorModeled::LimitExceededException(
                 LimitExceededException {
                     message: Some(format!(
                         "The account already holds the maximum of {} event buses.",
                         crate::state::MAX_EVENT_BUSES
+                    )),
+                },
+            )
+            .into());
+        }
+        // The Region a bus lives in comes from the caller's own credential
+        // scope, so the per-Region quota above does not bound the store on its
+        // own: a create in a Region this store holds no bus in is also charged
+        // against how many Regions it may hold buses in at all.
+        if !store.may_hold_bus_in(&region) {
+            return Err(CreateEventBusErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The account already holds event buses in the maximum of {} regions.",
+                        crate::state::MAX_BUS_REGIONS
                     )),
                 },
             )
@@ -286,7 +308,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(crate::scaffolded::Scaffolded::validation(reason));
         }
-        store.buses.insert(input.name.clone(), bus);
+        store.insert_bus(&region, bus);
 
         // Matching the source with a bus is what starts its ingestion: "an
         // Amazon Web Services account that creates a partner event bus that
@@ -305,7 +327,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Reported from the STORED record rather than from the request, so this
         // response and `DescribeEventBus`'s cannot disagree; the ARN is derived
         // from that record's name and the region the request was signed for.
-        let Some(stored) = store.bus(&input.name) else {
+        let Some(stored) = store.bus(&region, &input.name) else {
             return Err(CreateEventBusErrorModeled::InternalException(InternalException {
                 message: Some(crate::state::STORE_UNAVAILABLE.to_string()),
             })
