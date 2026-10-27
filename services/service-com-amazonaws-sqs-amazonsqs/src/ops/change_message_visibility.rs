@@ -278,11 +278,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A handle this queue holds no message under is a `ReceiptHandle` VALUE this
             // call cannot act on: the message whose visibility there is to change is gone.
             // A handle another queue minted is a handle all the same, so it is refused as
-            // the one it is rather than as a message that went away.
+            // the one it is rather than as a message that went away — and one minted by an
+            // incarnation that is gone names a queue that no longer exists.
             Err(sqs::VisibilityRefusal::NoSuchMessage) => match origin {
                 sqs::ReceiptHandleOrigin::AnotherQueue(_) => {
                     Err(ChangeMessageVisibilityErrorModeled::ReceiptHandleIsInvalid(
                         sqs::receipt_handle_is_invalid(origin),
+                    )
+                    .into())
+                }
+                sqs::ReceiptHandleOrigin::PreviousIncarnation => {
+                    Err(ChangeMessageVisibilityErrorModeled::QueueDoesNotExist(
+                        sqs::queue_does_not_exist(),
                     )
                     .into())
                 }

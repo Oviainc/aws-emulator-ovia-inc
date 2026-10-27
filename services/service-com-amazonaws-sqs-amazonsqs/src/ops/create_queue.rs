@@ -21,9 +21,14 @@
 //!   attributes it leaves out of it are
 //!   [`crate::state::ATTRIBUTES_NOT_COMPARED_ON_RECREATE`].
 //! - "If you delete a queue, you must wait at least 60 seconds before creating a queue
-//!   with the same name" — a name deleted inside
-//!   [`crate::state::QUEUE_DELETED_RECENTLY_INTERVAL`] is answered with the modelled
-//!   `QueueDeletedRecently`.
+//!   with the same name" — a name whose deletion has not propagated yet (it is still in
+//!   the ledger [`crate::state::QUEUE_DELETED_RECENTLY_INTERVAL`] bounds) is answered
+//!   with the modelled `QueueDeletedRecently`, carrying the wait the sentence above
+//!   quotes.
+//! - A create makes a new INCARNATION of the name, with an identity of its own: the
+//!   receipt handles the queue it replaces minted name that one, so a later call
+//!   presenting one is answered for a queue that no longer exists
+//!   ([`crate::state::Queue::mint_receipt_handle`]).
 //! - "If you don't specify the FifoQueue attribute, Amazon SQS creates a standard
 //!   queue", and "A FIFO queue name must end with the .fifo suffix."
 //! - The two server-side encryption options are mutually exclusive, and a queue whose
@@ -317,17 +322,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
         }
 
-        // "If you delete a queue, you must wait at least 60 seconds before creating a
-        // queue with the same name." A name whose queue was deleted inside that interval
-        // is not available yet, whoever asks for it.
+        // A name whose queue was deleted is not available again until the deletion has
+        // propagated, whoever asks for it; the refusal states the wait Amazon SQS
+        // documents.
         store.forget_lapsed_deletions(now);
         if store.deleted_recently(&input.queue_name, now).is_some() {
             return Err(CreateQueueErrorModeled::QueueDeletedRecently(
                 QueueDeletedRecently {
-                    message: Some(format!(
-                        "You must wait {} seconds after deleting a queue before you can create another with the same name.",
-                        state::QUEUE_DELETED_RECENTLY_INTERVAL.as_secs(),
-                    )),
+                    message: Some(state::queue_deleted_recently_message()),
                 },
             )
             .into());
@@ -352,6 +354,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let url = state::queue_url(ctx.parts(), &region, &input.queue_name);
         let queue = state::Queue {
             name: input.queue_name.clone(),
+            // A create makes a NEW incarnation of the name, whether or not a queue has
+            // carried it before: the handles the previous one minted name that one, so
+            // presenting one to this queue is presenting a handle of a queue that is gone.
+            incarnation: state::new_identifier(),
             url: url.clone(),
             arn: state::queue_arn(&region, &input.queue_name),
             attributes,

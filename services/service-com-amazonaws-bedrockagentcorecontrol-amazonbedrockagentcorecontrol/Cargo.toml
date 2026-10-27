@@ -30,11 +30,19 @@ sha2 = { workspace = true }
 # Resolves a gateway target's Lambda function against the emulator's own Lambda,
 # through the in-process callback (src/state.rs).
 aws-sdk-lambda = { version = "1", default-features = false }
+# Resolves an agent runtime's code artifact against the emulator's own object
+# storage, through the in-process callback (src/state.rs).
+aws-sdk-s3 = { version = "1", default-features = false }
 # Encodes the opaque `nextToken` ListAgentRuntimes pages with.
 hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
+
+[dev-dependencies]
+# Mounted beside this service in the code-artifact suite, so the object a create
+# resolves is one the emulator's object storage really holds.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [lints]
 workspace = true

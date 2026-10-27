@@ -5,6 +5,12 @@
 //! queue in [`crate::state`], permanently. It is the ONLY file to touch for
 //! `DeleteMessage`.
 //!
+//! A handle names the queue incarnation that minted it
+//! ([`crate::state::ComAmazonawsSqsAmazonsqsState::receipt_handle_origin`]), so a handle
+//! this queue cannot resolve is refused for what it NAMES: a handle of an incarnation
+//! that is gone names a queue that does not exist, while a handle of a queue that still
+//! exists, and a value nothing minted, are invalid receipt handles.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -214,8 +220,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A handle this queue currently holds names the message to delete. A handle whose
         // message a delete has ALREADY removed names a deletion this queue has performed,
         // so repeating it changes nothing and succeeds: "the request succeeds, but the
-        // message might not be deleted". Anything else — a superseded handle, or a value
-        // no queue ever minted — is invalid.
+        // message might not be deleted". Anything else — a superseded handle, a handle of
+        // another queue or of an incarnation that is gone, or a value no receive ever
+        // minted — is refused as what the handle NAMES.
         match queue.handles.get(&input.receipt_handle).cloned() {
             Some(message_id) => {
                 // The message goes for good, so the lapsing visibility timeout cannot
@@ -224,9 +231,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             None if queue.deleted_handle(&input.receipt_handle) => {}
             None => {
-                return Err(DeleteMessageErrorModeled::ReceiptHandleIsInvalid(
-                    sqs::receipt_handle_is_invalid(origin),
-                )
+                return Err(match sqs::unresolvable_receipt_handle(origin) {
+                    // The handle names a queue incarnation this store no longer holds, so
+                    // the queue it addresses does not exist — whatever queue now carries
+                    // that name.
+                    sqs::UnresolvableReceiptHandle::QueueIsGone(error) => {
+                        DeleteMessageErrorModeled::QueueDoesNotExist(error)
+                    }
+                    sqs::UnresolvableReceiptHandle::HandleIsInvalid(error) => {
+                        DeleteMessageErrorModeled::ReceiptHandleIsInvalid(error)
+                    }
+                }
                 .into())
             }
         }
