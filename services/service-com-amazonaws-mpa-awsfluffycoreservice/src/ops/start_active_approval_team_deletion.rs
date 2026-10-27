@@ -314,12 +314,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             other => {
                 return Err(StartActiveApprovalTeamDeletionErrorModeled::ConflictException(
                     ConflictException {
-                        message: format!(
+                        message: crate::state::bounded_message(format!(
                             "Approval team '{}' is {} and not ACTIVE, so its deletion cannot be \
                              started.",
                             input.arn,
                             other.as_wire()
-                        ),
+                        )),
                     },
                 )
                 .into());

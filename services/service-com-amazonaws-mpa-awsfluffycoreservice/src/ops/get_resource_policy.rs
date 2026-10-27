@@ -233,10 +233,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(policy_type) = crate::state::PolicyType::from_wire(&input.policy_type) else {
             return Err(GetResourcePolicyErrorModeled::InvalidParameterException(
                 InvalidParameterException {
-                    message: format!(
+                    message: crate::state::bounded_message(format!(
                         "PolicyType '{}' is not a policy type this service supports.",
                         input.policy_type
-                    ),
+                    )),
                 },
             )
             .into());
