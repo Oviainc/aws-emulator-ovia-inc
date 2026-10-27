@@ -175,6 +175,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
 
         let arn = input.arn;
+
+        // The modelled `@pattern` of every text member this request submits is applied
+        // first, for the reason `CreateDashboard` applies it first: the boundary validator
+        // cannot (each expression opens with a negative lookahead its regex engine does
+        // not compile, see `crate::state::ConstrainedText`), and a request carrying a
+        // value outside one changes nothing — not even the members it got right, and not
+        // the widget-id counter.
+        if let Some(message) = crate::state::text_pattern_refusal(
+            crate::state::dashboard_text_members(
+                Some(&input.name),
+                input.description.as_deref(),
+                input.widgets.as_deref().unwrap_or_default(),
+            ),
+        ) {
+            crate::state::record_state_change(ctx, Self::NAME, &arn, "ValidationException");
+            return Err(UpdateDashboardErrorModeled::ValidationException(
+                ValidationException { message },
+            )
+            .into());
+        }
+
         let not_found = || {
             // The request-derived template the recorded service words THIS operation's
             // refusal with (each operation has its own); the ARN is the request's.

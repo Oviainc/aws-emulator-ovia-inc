@@ -362,42 +362,129 @@ pub async fn vpc_cidrs(
     Some(cidrs)
 }
 
-/// The VPC each security group a request named belongs to, keyed by group id, or `None`
-/// when EC2 could not be asked (including a group id that names no security group of the
-/// account, which refuses the whole read).
-pub async fn security_group_vpcs(
+/// One security group of the account, reduced to what Elastic Load Balancing reads off it:
+/// which VPC it governs traffic in, and the name and owner a load balancer reports it
+/// under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecurityGroupFacts {
+    pub group_id: String,
+    pub group_name: Option<String>,
+    /// The account that owns the group, which is the alias a load balancer reports its
+    /// source security group under.
+    pub owner_id: Option<String>,
+    pub vpc_id: Option<String>,
+}
+
+/// What EC2 says about the security groups a request named.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecurityGroupLookup {
+    /// EC2 reported every group the request named, in the order it answered.
+    Resolved(Vec<SecurityGroupFacts>),
+    /// EC2 reports that the account holds no security group for one of the ids the request
+    /// named, carrying the error CODE it answered — which is what a caller states when it
+    /// refuses the request, because Elastic Load Balancing reports the EC2 refusal it ran
+    /// into rather than restating it.
+    Absent(String),
+    /// Nothing is known: there is no EC2 to ask, or it answered something else.
+    Unknown,
+}
+
+/// The two EC2 error codes that say a value names no security group of the account:
+/// `InvalidGroup.NotFound` for an id no group of the account carries, and
+/// `InvalidGroupId.Malformed` for a value that is not a group id at all. Both say the same
+/// thing about an association, and no OTHER `InvalidGroup…` code does — a group that
+/// exists but cannot be used says something else — so the two are matched exactly rather
+/// than by prefix.
+const GROUP_REFUSAL_CODES: &[&str] = &[GROUP_NOT_FOUND, "InvalidGroupId.Malformed"];
+
+/// The EC2 code for an id the account holds no security group for, which is what a read
+/// that resolved without reporting one of the ids ran into.
+const GROUP_NOT_FOUND: &str = "InvalidGroup.NotFound";
+
+/// What EC2 says about the security groups `group_ids` names.
+///
+/// EC2 refuses a read naming an id the account holds no group for, so one bad id says
+/// nothing about the others — which is why the refusal is reported for the request as a
+/// whole. Any other failure is this emulator failing to ask rather than EC2 reporting a bad
+/// group, so it says nothing ([`SecurityGroupLookup::Unknown`]), which is also the answer
+/// for a request that names no group at all: there was nothing to ask about, so nothing is
+/// known and nothing is refused on it.
+pub async fn resolve_security_groups(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     group_ids: &[String],
-) -> Option<Vec<(String, Option<String>)>> {
+) -> SecurityGroupLookup {
+    use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
+
     if group_ids.is_empty() {
-        return None;
+        return SecurityGroupLookup::Unknown;
     }
     let answer = ec2(ctx, region)
         .describe_security_groups()
         .set_group_ids(Some(group_ids.to_vec()))
         .send()
         .await;
-    match answer {
-        Ok(output) => Some(
-            output
+    let error = match answer {
+        Ok(output) => {
+            let reported: Vec<SecurityGroupFacts> = output
                 .security_groups()
                 .iter()
-                .map(|group| {
-                    (
-                        group.group_id().unwrap_or_default().to_string(),
-                        group.vpc_id().map(str::to_string),
-                    )
+                .map(|group| SecurityGroupFacts {
+                    group_id: group.group_id().unwrap_or_default().to_string(),
+                    group_name: group.group_name().map(str::to_string),
+                    owner_id: group.owner_id().map(str::to_string),
+                    vpc_id: group.vpc_id().map(str::to_string),
                 })
+                .collect();
+            // A read that resolved but reports no group for an id the request named says
+            // the same thing the refusal below does. The reported ids are indexed FIRST, so
+            // this costs O(n log n) in the number of ids the request carried rather than
+            // the product of the two caller-sized lists.
+            let index: std::collections::BTreeSet<&str> = reported
+                .iter()
+                .map(|group| group.group_id.as_str())
+                .collect();
+            if group_ids.iter().any(|id| !index.contains(id.as_str())) {
+                return SecurityGroupLookup::Absent(GROUP_NOT_FOUND.to_string());
+            }
+            return SecurityGroupLookup::Resolved(reported);
+        }
+        Err(error) => error,
+    };
+    let code = error
+        .as_service_error()
+        .and_then(ProvideErrorMetadata::code)
+        .unwrap_or_default()
+        .to_string();
+    if GROUP_REFUSAL_CODES.contains(&code.as_str()) {
+        return SecurityGroupLookup::Absent(code);
+    }
+    ::tracing::debug!(
+        error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+        "the security groups a request named could not be resolved against EC2"
+    );
+    SecurityGroupLookup::Unknown
+}
+
+/// The VPC each security group a request named belongs to, keyed by group id, or `None`
+/// when EC2 could not be asked (including a group id that names no security group of the
+/// account, which refuses the whole read).
+///
+/// The VPC half of [`resolve_security_groups`], for a caller whose only question is which
+/// VPC the groups govern traffic in.
+pub async fn security_group_vpcs(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    group_ids: &[String],
+) -> Option<Vec<(String, Option<String>)>> {
+    match resolve_security_groups(ctx, region, group_ids).await {
+        SecurityGroupLookup::Resolved(groups) => Some(
+            groups
+                .into_iter()
+                .map(|group| (group.group_id, group.vpc_id))
                 .collect(),
         ),
-        Err(error) => {
-            ::tracing::debug!(
-                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
-                "the security groups a request named could not be resolved against EC2"
-            );
-            None
-        }
+        SecurityGroupLookup::Absent(_) | SecurityGroupLookup::Unknown => None,
     }
 }
 

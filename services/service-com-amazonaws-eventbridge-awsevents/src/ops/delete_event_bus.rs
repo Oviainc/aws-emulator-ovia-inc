@@ -139,7 +139,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
 
         // `Name` is `EventBusName` here, not `EventBusNameOrArn`: its modelled
         // pattern (`^[/\.\-_A-Za-z0-9]+$`) admits no `:`, so an ARN cannot reach
@@ -162,7 +162,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the bus is — the same shape of precondition `DeleteRule` enforces for a
         // rule that still carries targets, and refused the same way, so a delete
         // never silently discards rules a caller can still describe.
-        if let Some(bus) = store.bus(&name) {
+        if let Some(bus) = store.bus(&region, &name) {
             if !bus.rules.is_empty() {
                 return Err(crate::scaffolded::Scaffolded::validation(format!(
                     "Event bus {name} cannot be deleted since it still has {} rule(s). \
@@ -193,7 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and `InternalException`, neither of which reports a missing resource, so
         // a name no bus carries — including one an earlier call already deleted —
         // is a success that removes nothing.
-        store.buses.remove(&name);
+        store.remove_bus(&region, &name);
 
         Ok(DeleteEventBusOutput)
     }

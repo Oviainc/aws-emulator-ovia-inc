@@ -616,6 +616,14 @@ pub const MARKER_SCOPE_ENTITY_TAGS: &str = "entity-tags";
 /// entity types it is filtered by select within that order rather than changing it.
 pub const MARKER_SCOPE_ACCOUNT_AUTHORIZATION_DETAILS: &str = "account-authorization-details";
 
+/// The marker scope of the account's delegation request collection, which
+/// `ListDelegationRequests` pages over. It is its OWN scope, for the same reason the
+/// user and role collections are: a marker issued while paging another collection
+/// names no position in this one. The key it carries is a `DelegationRequestId`, the
+/// key [`ComAmazonawsIamAwsidentitymanagementv20100508State::delegation_requests`]
+/// holds a request under.
+pub const MARKER_SCOPE_DELEGATION_REQUESTS: &str = "delegation-requests";
+
 /// The alphabet the suffix is drawn from: RFC 4648 base32, every character of
 /// which is an uppercase alphanumeric and so inside `idType`'s `^[\w]+$`.
 const BASE32_ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";

@@ -179,6 +179,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut state = state.lock();
 
+        // The modelled `@pattern` of every text member this request submits — the
+        // dashboard's name and description and each widget's title and description — is
+        // applied before anything else, because the boundary validator could not: each of
+        // those expressions opens with a negative lookahead its regex engine does not
+        // compile (`crate::state::ConstrainedText`). A request carrying a value outside
+        // one is refused with this operation's modelled `ValidationException` (400) and
+        // creates NOTHING: no ARN is minted and no widget id consumed.
+        if let Some(message) = crate::state::text_pattern_refusal(
+            crate::state::dashboard_text_members(
+                Some(&input.name),
+                input.description.as_deref(),
+                &input.widgets,
+            ),
+        ) {
+            crate::state::record_state_change(ctx, Self::NAME, "-", "ValidationException");
+            return Err(CreateDashboardErrorModeled::ValidationException(
+                ValidationException { message },
+            )
+            .into());
+        }
+
         // Tag-on-create takes caller-supplied tag keys, so the reserved `aws:` namespace
         // is refused here exactly as `TagResource` refuses it: a request naming such a key
         // creates NO dashboard at all — no ARN is minted and no widget id consumed — rather

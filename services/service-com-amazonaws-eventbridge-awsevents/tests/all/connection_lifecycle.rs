@@ -104,6 +104,10 @@ fn error_code(body: &Value) -> String {
 struct AuthCase {
     kind: &'static str,
     parameters: Value,
+    /// The `ConnectionState` a create of this type is answered in.
+    created_state: &'static str,
+    /// The `ConnectionState` the clock then owes it.
+    settled_state: &'static str,
     /// (the path into `AuthParameters`, the value the read must report)
     reported: Vec<(Vec<&'static str>, Value)>,
     /// Text a read must not contain anywhere: the credentials themselves.
@@ -115,6 +119,13 @@ struct AuthCase {
 /// — `AuthorizationType` is one of `API_KEY | BASIC |
 /// OAUTH_CLIENT_CREDENTIALS`, and `CreateConnectionAuthRequestParameters` carries
 /// exactly one member per type.
+///
+/// The states differ with the type: credentials that ARE the authorization leave
+/// the connection `CREATING` and then `AUTHORIZED`, while OAuth client
+/// credentials have to be exchanged for a token at the connection's
+/// authorization endpoint first, so the connection is `AUTHORIZING` and settles
+/// by what that exchange came to — `DEAUTHORIZED` here, because nothing answers
+/// at the endpoint the row names.
 fn auth_cases() -> Vec<AuthCase> {
     vec![
         AuthCase {
@@ -125,6 +136,8 @@ fn auth_cases() -> Vec<AuthCase> {
                     "ApiKeyValue": "sekrit-api-key-value",
                 },
             }),
+            created_state: state::CONNECTION_STATE_CREATING,
+            settled_state: state::CONNECTION_STATE_AUTHORIZED,
             reported: vec![(
                 vec!["ApiKeyAuthParameters", "ApiKeyName"],
                 json!("x-api-key"),
@@ -136,6 +149,8 @@ fn auth_cases() -> Vec<AuthCase> {
             parameters: json!({
                 "BasicAuthParameters": { "Username": "deep-user", "Password": "sekrit-password" },
             }),
+            created_state: state::CONNECTION_STATE_CREATING,
+            settled_state: state::CONNECTION_STATE_AUTHORIZED,
             reported: vec![(vec!["BasicAuthParameters", "Username"], json!("deep-user"))],
             secrets: vec!["sekrit-password"],
         },
@@ -151,6 +166,8 @@ fn auth_cases() -> Vec<AuthCase> {
                     "HttpMethod": "POST",
                 },
             }),
+            created_state: state::CONNECTION_STATE_AUTHORIZING,
+            settled_state: state::CONNECTION_STATE_DEAUTHORIZED,
             reported: vec![
                 (
                     vec!["OAuthParameters", "ClientParameters", "ClientID"],
@@ -225,10 +242,10 @@ async fn a_created_connection_is_read_back_and_settles_into_authorized() {
         );
         assert_eq!(
             created["ConnectionState"],
-            json!(state::CONNECTION_STATE_CREATING),
+            json!(case.created_state),
             "case {}: a created connection is answered in {}, got {created}",
             case.kind,
-            state::CONNECTION_STATE_CREATING
+            case.created_state
         );
         for member in ["CreationTime", "LastModifiedTime"] {
             assert!(
@@ -249,10 +266,10 @@ async fn a_created_connection_is_read_back_and_settles_into_authorized() {
         );
         assert_eq!(
             transient["ConnectionState"],
-            json!(state::CONNECTION_STATE_CREATING),
+            json!(case.created_state),
             "case {}: a read taken at once still reports {}, got {transient}",
             case.kind,
-            state::CONNECTION_STATE_CREATING
+            case.created_state
         );
 
         tokio::time::sleep(past_the_transition()).await;
@@ -265,10 +282,10 @@ async fn a_created_connection_is_read_back_and_settles_into_authorized() {
         );
         assert_eq!(
             settled["ConnectionState"],
-            json!(state::CONNECTION_STATE_AUTHORIZED),
+            json!(case.settled_state),
             "case {}: the clock owes the connection {}, got {settled}",
             case.kind,
-            state::CONNECTION_STATE_AUTHORIZED
+            case.settled_state
         );
         assert_eq!(
             settled["ConnectionArn"],
@@ -294,9 +311,11 @@ async fn a_created_connection_is_read_back_and_settles_into_authorized() {
             "case {}: a read reports the stored authorization type, got {settled}",
             case.kind
         );
-        assert!(
+        assert_eq!(
             settled["LastAuthorizedTime"].as_f64().is_some(),
-            "case {}: an authorized connection reports when it was authorized, got {settled}",
+            case.settled_state == state::CONNECTION_STATE_AUTHORIZED,
+            "case {}: only an authorized connection reports when it was authorized, \
+             got {settled}",
             case.kind
         );
         // `SecretArn` is "the ARN of the secret created from the authorization

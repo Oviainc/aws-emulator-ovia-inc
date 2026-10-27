@@ -177,11 +177,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let include_description = input.include_description.unwrap_or(false);
         let descriptions = if include_description {
+            // One instant for the whole page: part of a group's `profilingStatus` is a fact
+            // the clock makes true, so every description in one listing answers for the same
+            // moment rather than each group reading the clock again.
+            let at = crate::state::now();
             Some(
                 page.items
                     .iter()
                     .filter_map(|name| guard.groups.get(name))
-                    .map(crate::state::ProfilingGroup::description)
+                    .map(|group| group.description(at))
                     .collect(),
             )
         } else {

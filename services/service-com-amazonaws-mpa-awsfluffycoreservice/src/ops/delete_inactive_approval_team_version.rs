@@ -209,7 +209,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             DeleteInactiveApprovalTeamVersionError::Modeled(
                 DeleteInactiveApprovalTeamVersionErrorModeled::ConflictException(
                     ConflictException {
-                        message: format!(
+                        message: crate::state::bounded_message(format!(
                             "Approval team '{}' version '{}' is {version_status} and not {} or \
                              {}, so it cannot be deleted by {}; {remedy}.",
                             input.arn,
@@ -217,7 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             crate::state::TeamStatus::Inactive.as_wire(),
                             crate::state::TeamStatus::Pending.as_wire(),
                             Self::NAME,
-                        ),
+                        )),
                     },
                 ),
             )

@@ -112,7 +112,9 @@ fn stored_rules(engine: &Arc<engine::InMemoryEngine>) -> (Vec<String>, Vec<Strin
         .state::<service_com_amazonaws_eventbridge_awsevents::state::ComAmazonawsEventbridgeAwseventsState>();
     let current_names: Vec<String> = current
         .lock()
-        .bus(DEFAULT_BUS)
+        // An event bus of this model is a REGIONAL resource, so it is addressed
+        // in the Region the calls above were signed for.
+        .bus(REGION, DEFAULT_BUS)
         .map(|bus| bus.rules.keys().cloned().collect())
         .unwrap_or_default();
     let legacy = engine
@@ -252,7 +254,7 @@ async fn an_operation_only_the_superset_model_serves_lands_in_its_store() {
     let current = engine
         .state::<service_com_amazonaws_eventbridge_awsevents::state::ComAmazonawsEventbridgeAwseventsState>();
     assert!(
-        current.lock().bus("superset-only-bus").is_some(),
+        current.lock().bus(REGION, "superset-only-bus").is_some(),
         "the model that answered must hold the bus it created"
     );
 

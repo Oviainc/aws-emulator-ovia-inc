@@ -168,11 +168,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(entry) = store.asset_type_by_reference(&input.identifier) else {
             return Err(GetAssetTypeErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    // Wording for this slice is pinned by no recording or doc, so the
-                    // refusal is derived from the request: it names the member that
-                    // resolved to nothing. What is pinned is the behaviour — 400 with
+                    // The one wording the catalog's asset type surface refuses an
+                    // identifier it holds no asset type under with
+                    // (`crate::state::asset_type_not_found_message`): it names the member
+                    // that resolved to nothing. What is pinned is the behaviour — 400 with
                     // `EntityNotFoundException`.
-                    message: Some(format!("Asset type {} not found", input.identifier)),
+                    message: Some(crate::state::asset_type_not_found_message(
+                        &input.identifier,
+                    )),
                     from_federation_source: None,
                 },
             )

@@ -45,7 +45,9 @@ use crate::distribution_tenant_lifecycle::{
     create_distribution_tenant, domains_of, encode_label, escape, longest_domain,
     managed_certificate_request, multi_tenant_distribution,
 };
-use crate::managed_certificate_domain_ownership::{distribution_domain_name, resolvable_domains};
+use crate::managed_certificate_domain_ownership::{
+    await_certificate_issuance, distribution_domain_name, resolvable_domains,
+};
 use crate::response_headers_policy_lifecycle::text;
 
 // ---------------------------------------------------------------------------
@@ -348,6 +350,12 @@ async fn a_tenant_is_bound_only_to_a_domain_the_account_has_proven() {
                 claimed, row.domains,
                 "case {case}: expected the domains the create claimed, got {claimed:?}"
             );
+            // A domain whose validation the create asked CloudFront for is served only once
+            // the managed certificate it waits on has been issued — one wait for the one
+            // transition, whatever the number of domains.
+            if row.certificate_request {
+                await_certificate_issuance().await;
+            }
             for domain in &row.domains {
                 let by_domain = get_distribution_tenant_by_domain(&router, domain).await;
                 assert_eq!(
@@ -423,6 +431,9 @@ async fn a_tenant_is_bound_only_to_a_domain_the_account_has_proven() {
              got {} with {}",
             accepted.status, accepted.raw
         );
+        // The re-submit asked CloudFront to validate the domains, so the by-domain read
+        // answers once the clock has made the certificate's issuance due.
+        await_certificate_issuance().await;
         for domain in &row.domains {
             let by_domain = get_distribution_tenant_by_domain(&router, domain).await;
             assert_eq!(

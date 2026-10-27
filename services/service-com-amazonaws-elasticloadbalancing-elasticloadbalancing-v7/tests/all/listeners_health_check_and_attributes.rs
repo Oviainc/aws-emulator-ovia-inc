@@ -455,8 +455,9 @@ async fn listener_requests_the_rules_rule_out_are_refused() {
             Some("LoadBalancerNotFound"),
         ),
         (
-            // `Protocol` is documented as "HTTP, HTTPS, TCP, or SSL"; anything else is
-            // the protocol error the operation declares.
+            // `Protocol` is documented as "HTTP, HTTPS, TCP, or SSL"; anything else is a
+            // VALUE the service cannot accept, under the code every such value answers
+            // under.
             "a protocol outside the documented set",
             "CreateLoadBalancerListeners",
             {
@@ -471,7 +472,7 @@ async fn listener_requests_the_rules_rule_out_are_refused() {
                 params
             },
             400,
-            Some("UnsupportedProtocol"),
+            Some("ValidationError"),
         ),
         (
             // "If the front-end protocol is HTTP or HTTPS, the back-end protocol must be
@@ -1305,13 +1306,16 @@ async fn attribute_values_the_rules_rule_out_are_refused() {
             None,
         ),
         (
+            // A value outside a bound is a VALUE this service cannot accept, so it answers
+            // under the same code as every other out-of-bounds value rather than as a
+            // configuration change it cannot apply.
             "a connection-draining timeout one below the published minimum",
             vec![
                 param("LoadBalancerAttributes.ConnectionDraining.Enabled", "true"),
                 param("LoadBalancerAttributes.ConnectionDraining.Timeout", "0"),
             ],
-            409,
-            Some("InvalidConfigurationRequest"),
+            400,
+            Some("ValidationError"),
         ),
         (
             "a connection-draining timeout one above the published maximum",
@@ -1319,8 +1323,8 @@ async fn attribute_values_the_rules_rule_out_are_refused() {
                 param("LoadBalancerAttributes.ConnectionDraining.Enabled", "true"),
                 param("LoadBalancerAttributes.ConnectionDraining.Timeout", "3601"),
             ],
-            409,
-            Some("InvalidConfigurationRequest"),
+            400,
+            Some("ValidationError"),
         ),
         (
             "an access-log interval that is neither published value",

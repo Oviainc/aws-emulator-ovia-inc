@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCapacityManagerAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCapacityManagerAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCapacityManagerAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! REPORTING ONLY: this operation "retrieves the current configuration and status of EC2
+//! Capacity Manager for your account", so it reads the account's settings out of
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::capacity_manager_at`] and writes nothing
+//! at all: two calls in a row report the same thing, and an account that never enabled
+//! Capacity Manager is told it is `disabled`. `EnableCapacityManager` is what turns it on.
+//!
+//! The `IngestionStatus` it reports is DERIVED from the instant the enable recorded for the
+//! ingestion it started, so this read materialises nothing either.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +151,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCapacityManagerAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCapacityManagerAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCapacityManagerAttributes"))
+        use crate::state;
+        use std::time::Instant;
+
+        // `ctx` carries request metadata only, and this operation reads none of it: the
+        // settings it reports are "for your account", which names no Region.
+        let _ = ctx;
+
+        // A `DryRun` request that would have succeeded stops before the read: "If you have
+        // the required permissions, the error response is DryRunOperation"
+        // (`GetCapacityManagerAttributesRequest$DryRun`).
+        if input.dry_run == Some(true) {
+            return Err(state::dry_run_operation());
+        }
+
+        let store = state::require_service_state(&*self.engine)?;
+        let store = store.lock();
+        // REPORTING ONLY: the settings as of this instant, derived rather than written, so
+        // two reads in a row report the same thing and an account that never enabled
+        // Capacity Manager is told it is `disabled`.
+        let settings = store.capacity_manager_at(Instant::now());
+        Ok(GetCapacityManagerAttributesOutput {
+            capacity_manager_status: Some(settings.status.to_string()),
+            organizations_access: Some(settings.organizations_access),
+            // "The number of active data export configurations for this account": the
+            // account holds the data exports `CreateCapacityManagerDataExport` made, and
+            // that operation is still a scaffold in this emulator, so there is nothing for
+            // it to have made and the count is zero.
+            data_export_count: Some(0),
+            // "Initial ingestion may take several hours after enabling Capacity Manager"
+            // (`GetCapacityManagerAttributesResult$IngestionStatus`): the status is the one
+            // the enable's clock-owed move has reached, and is absent until an enable
+            // starts an ingestion at all.
+            ingestion_status: settings.ingestion_status.map(str::to_string),
+            // "A descriptive message providing additional details about the current
+            // ingestion status. This may include error information if ingestion has
+            // failed": no ingestion here fails and none reports progress of its own, so
+            // there is no detail to add and the member is left off rather than filled with
+            // a guess.
+            ingestion_status_message: None,
+            // "The timestamp of the earliest data point available in Capacity Manager" /
+            // "the most recent data point ingested": these bound the DATAPOINTS Capacity
+            // Manager holds, and nothing in this emulator ingests one yet
+            // (`GetCapacityManagerMetricData` is still a scaffold), so there is no earliest
+            // or latest datapoint to report.
+            earliest_datapoint_timestamp: None,
+            latest_datapoint_timestamp: None,
+        })
     }
 }

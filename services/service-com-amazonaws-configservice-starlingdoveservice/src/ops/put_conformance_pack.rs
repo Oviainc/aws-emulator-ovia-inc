@@ -25,7 +25,10 @@
 //!   in progress. Try your request again later." (`ResourceInUseException`): the
 //!   deployment this call starts is still in flight when it answers, so a further call
 //!   for a pack whose deployment has not settled is refused rather than restarting work
-//!   in progress — the idempotency above is what a call for a SETTLED pack gets;
+//!   in progress — the idempotency above is what a call for a SETTLED pack gets, and the
+//!   refusal NAMES the pack whose workflow holds it
+//!   ([`crate::state::conformance_pack_workflow_in_progress_message`]), rather than
+//!   repeating the error shape's documentation sentence;
 //! * a NEW pack has to fit under this Region's conformance pack quota
 //!   ([`crate::state::CONFORMANCE_PACKS_QUOTA`]), else
 //!   `MaxNumberOfConformancePacksExceededException`;
@@ -922,7 +925,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`ResourceInUseException`): the deployment this operation starts is still
         // running when the call answers, so a further call for a pack whose deployment is
         // in flight is refused rather than restarting work in progress. A pack whose
-        // deployment has finished — complete, or failed — is redeployed as usual.
+        // deployment has finished — complete, or failed — is redeployed as usual. The
+        // refusal NAMES the pack whose workflow holds it, built from the request, so a
+        // caller deploying several packs can tell which one is busy
+        // ([`crate::state::conformance_pack_workflow_in_progress_message`]).
         if store
             .conformance_packs
             .get(&name)
@@ -932,11 +938,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(PutConformancePackErrorModeled::ResourceInUseException(
                 ResourceInUseException {
-                    message: Some(
-                        "A conformance pack creation, update, and deletion is in progress. Try \
-                         your request again later."
-                            .to_string(),
-                    ),
+                    message: Some(crate::state::conformance_pack_workflow_in_progress_message(
+                        &name,
+                    )),
                 },
             )
             .into());

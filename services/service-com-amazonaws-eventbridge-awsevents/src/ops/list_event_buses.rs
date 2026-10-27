@@ -173,23 +173,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
-        // Filtered in the name order the ordered map keeps; the page token is a
-        // position in that same order, so resuming means "every name strictly
-        // after it".
+        // "Lists all the event buses in your account" — in the Region the call
+        // was signed for, which is where the buses it can address live, the
+        // Region's `default` bus included. Filtered in the name order
+        // `buses_in` reports; the page token is a position in that same order,
+        // so resuming means "every name strictly after it".
         let matched: Vec<&crate::state::EventBus> = store
-            .buses
-            .iter()
-            .filter(|(name, _)| {
+            .buses_in(&region)
+            .into_iter()
+            .filter(|bus| {
                 let filtered_out = input
                     .name_prefix
                     .as_deref()
-                    .is_some_and(|prefix| !name.starts_with(prefix));
+                    .is_some_and(|prefix| !bus.name.starts_with(prefix));
                 let already_returned = resume_after
                     .as_deref()
-                    .is_some_and(|after| name.as_str() <= after);
+                    .is_some_and(|after| bus.name.as_str() <= after);
                 !filtered_out && !already_returned
             })
-            .map(|(_, bus)| bus)
             .collect();
 
         let limit = input.limit.map_or(crate::state::MAX_LIST_PAGE, |limit| {

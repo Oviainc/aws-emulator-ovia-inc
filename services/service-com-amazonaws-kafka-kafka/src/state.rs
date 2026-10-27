@@ -43,6 +43,16 @@
 //! only: each refuses a serverless one on its kind, in the same words, through
 //! [`serverless_topic_apis_unsupported`].
 //!
+//! A cluster reports the topics a running replicator REPLICATES onto it as well as
+//! the ones it holds itself, and the topic readers answer from the one derivation
+//! that puts the two together:
+//! [`ComAmazonawsKafkaKafkaState::observable_topics_in`] for a listing and
+//! [`ComAmazonawsKafkaKafkaState::observable_topic_in`] for one name. A replicated
+//! topic is DERIVED from the source cluster's own topic rather than stored a second
+//! time, so a listing and a describe of one cluster cannot disagree, and the
+//! deletion of the source topic or of the replicator withdraws it without anything
+//! having to remember to.
+//!
 //! A cluster's configuration also changes after creation: an update operation
 //! (`UpdateConnectivity`, `UpdateStorage`, `UpdateBrokerStorage`) records a
 //! [`PendingUpdate`] on the cluster, and [`Cluster::settle`] folds it into the
@@ -95,6 +105,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
 use std::time::{Duration, SystemTime};
 
+use regex::RegexSet;
+
 use crate::ops::types::{
     BrokerEBSVolumeInfo, BrokerNodeGroupInfo, BrokerNodeInfo, BrokerSoftwareInfo,
     ChannelLoggingInfo, ClientAuthentication, ClusterInfo, ClusterOperationInfo, ClusterOperationV2,
@@ -110,7 +122,8 @@ use crate::ops::types::{
     ProvisionedThroughput, Rebalancing, ReplicationInfo, ReplicationInfoDescription,
     ReplicationInfoSummary, ReplicatorSummary, S3DestinationConfiguration, Serverless,
     ServerlessClientAuthentication, ServerlessConnectivityInfo, ServerlessRequest, StorageInfo,
-    TopicConfiguration, TopicInfo, TopicReplicationUpdate, VpcConfig, ZookeeperAccess,
+    TopicConfiguration, TopicInfo, TopicReplication, TopicReplicationUpdate, VpcConfig,
+    ZookeeperAccess,
 };
 
 /// How long after a cluster create a new cluster becomes `ACTIVE`.
@@ -403,6 +416,78 @@ pub const MAX_CLUSTERS_PER_REPLICATOR: usize = 16;
 /// [`MAX_CLUSTERS_PER_REPLICATOR`]: a replicator cannot hold more distinct
 /// ordered cluster pairs than this anyway.
 pub const MAX_FLOWS_PER_REPLICATOR: usize = 32;
+
+/// How long after a replication flow and a source topic it covers are both in
+/// place the clock owes that topic's appearance on the flow's target cluster.
+///
+/// CHOSEN, not documented: AWS documents that a matching source topic becomes
+/// visible on the target cluster but no propagation latency. The project fixes an
+/// emulated clock-owed transition at 250–750 ms, so a caller that lists the target
+/// cluster's topics immediately still sees the topic absent while one that waits
+/// sees it — the same span, and the same reasoning, as
+/// [`TOPIC_ACTIVATION_DELAY`].
+pub const TOPIC_REPLICATION_DELAY: Duration = Duration::from_millis(500);
+
+/// The most `TopicsToReplicate` / `TopicsToExclude` patterns one replication flow
+/// may carry.
+///
+/// CHOSEN as a process-safety backstop, not an AWS quota (the model declares both
+/// members as `__listOf__stringMax249`, with no `length` trait): the patterns are
+/// caller-supplied and every listing of a target cluster matches that cluster's
+/// replicated topics against them, so without a ceiling one create would size the
+/// work of every later read. Sized far above the handful of patterns a real
+/// replication configuration names.
+pub const MAX_TOPIC_PATTERNS_PER_FLOW: usize = 100;
+
+/// The longest one topic-selection pattern may be: the `length` the model puts on
+/// the member of `TopicsToReplicate` / `TopicsToExclude`
+/// (`__listOf__stringMax249`, whose member is `__stringMax249`, 0..249).
+///
+/// The framework's boundary validator refuses a longer value off the wire, with
+/// the service's own constraint wording; this module checks it as well, so no
+/// caller of it can hand a pattern of unbounded length to the regex compiler.
+pub const MAX_TOPIC_PATTERN_LENGTH: usize = 249;
+
+/// The most memory the matcher compiled from ONE of a flow's pattern lists may
+/// take.
+///
+/// CHOSEN as a process-safety bound, not an AWS quota: the patterns come from a
+/// request and the matcher compiled from them is kept on the stored flow, so this
+/// is what bounds the memory one create can leave behind. A list is at most
+/// [`MAX_TOPIC_PATTERNS_PER_FLOW`] patterns of [`MAX_TOPIC_PATTERN_LENGTH`]
+/// characters — about 25 KiB of pattern text — and a matcher that would not fit
+/// here makes the request a `BadRequestException` instead of a large allocation.
+/// A tenth of the regex crate's own default, and far above what a real
+/// replication configuration's handful of patterns compiles to.
+pub const TOPIC_MATCHER_SIZE_LIMIT: usize = 1024 * 1024;
+
+/// The most replication flows INTO one cluster a single reader of that cluster's
+/// topics derives from.
+///
+/// CHOSEN as a process-safety backstop, not an AWS quota: a caller can register
+/// [`MAX_REPLICATORS_IN_REGISTRY`] replicators of
+/// [`MAX_FLOWS_PER_REPLICATOR`] flows each pointing at one cluster, so without a
+/// cap on the PRODUCT one small listing would walk every one of them. Sized at the
+/// flows a single replicator may carry, which is already far above the one or two
+/// a real target cluster is fed by.
+pub const MAX_REPLICATION_FLOWS_PER_TARGET: usize = MAX_FLOWS_PER_REPLICATOR;
+
+/// The `ReplicationTopicNameConfigurationType` members, spelled as the model's
+/// enum declares them. `PREFIXED_WITH_SOURCE_CLUSTER_ALIAS` names a replicated
+/// topic after its source topic prefixed with the source cluster's alias, which is
+/// what `KafkaClusterDescription$KafkaClusterAlias` ("Used to prefix names of
+/// replicated topics") describes.
+pub const TOPIC_NAME_PREFIXED_WITH_SOURCE_CLUSTER_ALIAS: &str =
+    "PREFIXED_WITH_SOURCE_CLUSTER_ALIAS";
+/// The other member: a replicated topic carries the same name as its source
+/// topic, so a flow that asks for it mints no prefix.
+pub const TOPIC_NAME_IDENTICAL: &str = "IDENTICAL";
+
+/// What separates the source cluster's alias from the source topic's name in a
+/// replicated topic's name, when the flow prefixes names with the alias:
+/// `<source-cluster-alias>.<source-topic>`, the form Amazon MSK's replicated
+/// topics carry.
+pub const REPLICATED_TOPIC_SEPARATOR: char = '.';
 
 /// The most tags one replicator may carry: the general per-resource limit, which
 /// [`MAX_TAGS_PER_RESOURCE`] states and every tag write is admitted against. Kept
@@ -1474,6 +1559,182 @@ impl ReplicatorCluster {
     }
 }
 
+/// Which of a source cluster's topics one replication flow replicates: the
+/// compiled form of that flow's `TopicsToReplicate` and `TopicsToExclude`.
+///
+/// Both members are documented as a "List of regular expression patterns", and a
+/// pattern describes a WHOLE topic name rather than a part of one, so each is
+/// anchored before it is compiled. A topic is replicated when some
+/// `TopicsToReplicate` pattern describes it and no `TopicsToExclude` pattern does
+/// — one rule, so the flow that decides a listing and the flow that decides a
+/// single read cannot disagree.
+///
+/// Compiled ONCE, when the configuration it comes from is stored, and kept on the
+/// replicator record beside that configuration: the patterns come from a request,
+/// so compiling them per read would let one create size the work of every later
+/// listing of the target cluster.
+#[derive(Debug, Clone, Default)]
+pub struct TopicFilter {
+    replicate: RegexSet,
+    exclude: RegexSet,
+}
+
+impl TopicFilter {
+    /// The filter a stored `TopicReplication` describes.
+    pub fn of(topic_replication: &TopicReplication) -> Self {
+        Self {
+            replicate: compile_topic_patterns(&topic_replication.topics_to_replicate),
+            exclude: compile_topic_patterns(
+                topic_replication.topics_to_exclude.as_deref().unwrap_or(&[]),
+            ),
+        }
+    }
+
+    /// Whether the flow replicates the topic `name`.
+    pub fn covers(&self, name: &str) -> bool {
+        self.replicate.is_match(name) && !self.exclude.is_match(name)
+    }
+}
+
+/// `pattern` as the anchored expression a topic-selection pattern means: the
+/// pattern describes a topic's whole name, and the group keeps an alternation
+/// inside it from reaching past the anchors.
+fn anchored_topic_pattern(pattern: &str) -> String {
+    format!("^(?:{pattern})$")
+}
+
+/// Why `pattern` cannot be used to select topics, or `None` when it compiles.
+///
+/// The one rule a flow's patterns are admitted by, so `CreateReplicator` and
+/// `UpdateReplicationInfo` refuse the same values — and a stored configuration
+/// holds only patterns the readers can actually match topics against, rather than
+/// quietly replicating nothing. A pattern longer than
+/// [`MAX_TOPIC_PATTERN_LENGTH`] is refused before it is compiled, so no
+/// caller-sized string reaches the regex compiler — a backstop behind the
+/// boundary validator, which refuses that length off the wire.
+pub fn topic_pattern_error(pattern: &str) -> Option<String> {
+    let length = pattern.chars().count();
+    if length > MAX_TOPIC_PATTERN_LENGTH {
+        return Some(format!(
+            "A topic pattern is at most {MAX_TOPIC_PATTERN_LENGTH} characters long, but this one \
+             is {length}."
+        ));
+    }
+    ::regex::Regex::new(&anchored_topic_pattern(pattern))
+        .err()
+        .map(|_| format!("'{pattern}' is not a valid regular expression."))
+}
+
+/// Why a replication flow's topic-selection pattern lists cannot be stored:
+/// WHICH `TopicReplication` member is at fault and why.
+///
+/// Named so `CreateReplicator` and `UpdateReplicationInfo` admit the same values
+/// and name the same member, each under its own request path — a create reports
+/// the member inside the `ReplicationInfoList` entry it came in, an update
+/// reports it under the update shape.
+#[derive(Debug, Clone)]
+pub struct TopicPatternsViolation {
+    /// The member at fault, spelled as the model names it.
+    pub member: &'static str,
+    /// What is wrong with it.
+    pub message: String,
+}
+
+/// Check both pattern lists of one replication flow: no more patterns than
+/// [`MAX_TOPIC_PATTERNS_PER_FLOW`], none longer than
+/// [`MAX_TOPIC_PATTERN_LENGTH`], every one of them a regular expression topics
+/// can be selected by, and the list usable — within
+/// [`TOPIC_MATCHER_SIZE_LIMIT`] — as the matcher a reader will build from it.
+/// `None` when the lists are admissible.
+///
+/// Together those bound the work and the memory a stored flow can cost: the
+/// patterns of one list are at most `MAX_TOPIC_PATTERNS_PER_FLOW` strings of
+/// `MAX_TOPIC_PATTERN_LENGTH` characters, and the matcher compiled from them at
+/// most `TOPIC_MATCHER_SIZE_LIMIT` bytes, whatever the request asked for.
+pub fn topic_patterns_violation(
+    topics_to_replicate: &[String],
+    topics_to_exclude: &[String],
+) -> Option<TopicPatternsViolation> {
+    for (member, patterns) in [
+        ("TopicsToReplicate", topics_to_replicate),
+        ("TopicsToExclude", topics_to_exclude),
+    ] {
+        if patterns.len() > MAX_TOPIC_PATTERNS_PER_FLOW {
+            return Some(TopicPatternsViolation {
+                member,
+                message: format!(
+                    "{member} may hold at most {MAX_TOPIC_PATTERNS_PER_FLOW} patterns, not {}.",
+                    patterns.len()
+                ),
+            });
+        }
+        if let Some(message) = patterns.iter().find_map(|pattern| topic_pattern_error(pattern)) {
+            return Some(TopicPatternsViolation { member, message });
+        }
+        // Admitted through the SAME construction the readers match topics with, so
+        // a list this service could not turn into a matcher — including one whose
+        // compiled program would pass `TOPIC_MATCHER_SIZE_LIMIT` — is refused here
+        // rather than stored and selecting nothing.
+        if topic_matcher(patterns).is_none() {
+            return Some(TopicPatternsViolation {
+                member,
+                message: format!(
+                    "{member} holds patterns too large to be used together as a topic filter."
+                ),
+            });
+        }
+    }
+    None
+}
+
+/// The matcher the patterns `patterns` describe, or `None` when they cannot be
+/// compiled into one together.
+///
+/// The ONE construction a flow's patterns go through: the admission check builds
+/// it to decide whether to accept them, and the store builds it to keep, so a
+/// stored configuration can never hold patterns the readers would match nothing
+/// with. Bounded by [`MAX_TOPIC_PATTERNS_PER_FLOW`] for the reason that constant
+/// gives, and every pattern anchored because it describes a whole topic name.
+fn topic_matcher(patterns: &[String]) -> Option<RegexSet> {
+    ::regex::RegexSetBuilder::new(
+        patterns
+            .iter()
+            .take(MAX_TOPIC_PATTERNS_PER_FLOW)
+            .map(|pattern| anchored_topic_pattern(pattern)),
+    )
+    // The compiled program's own ceiling, set here rather than left to the regex
+    // crate's default: the patterns come from a request, and a stored flow keeps
+    // the matcher compiled from them, so the memory one create can leave behind
+    // is bounded by this rather than by what the caller wrote.
+    .size_limit(TOPIC_MATCHER_SIZE_LIMIT)
+    .build()
+    .ok()
+}
+
+/// The patterns `patterns` holds, compiled into the matcher a reader selects
+/// topics with.
+///
+/// Called where a flow's configuration is STORED, never on a read path. An
+/// unbuildable list cannot reach here — `CreateReplicator` and
+/// `UpdateReplicationInfo` refuse one through [`topic_patterns_violation`], which
+/// builds the same matcher — so the empty fallback is an unreachable backstop
+/// rather than a filter anybody can be given.
+fn compile_topic_patterns(patterns: &[String]) -> RegexSet {
+    topic_matcher(patterns).unwrap_or_else(RegexSet::empty)
+}
+
+/// The name a replication flow gives the source topic `source_topic` on its
+/// target cluster: the source cluster's alias and the topic's own name when the
+/// flow prefixes replicated names, and the source topic's name itself when it
+/// asks for identical ones.
+pub fn replicated_topic_name(source_alias: &str, source_topic: &str, prefixed: bool) -> String {
+    if prefixed {
+        format!("{source_alias}{REPLICATED_TOPIC_SEPARATOR}{source_topic}")
+    } else {
+        source_topic.to_string()
+    }
+}
+
 /// A replicator, holding the whole replication setup so every reader is computed
 /// from it rather than echoed from a request.
 #[derive(Debug, Clone)]
@@ -1515,6 +1776,13 @@ pub struct Replicator {
     pub kafka_clusters: Vec<ReplicatorCluster>,
     /// The replications configured between those clusters, in submission order.
     pub replication_info: Vec<ReplicationInfo>,
+    /// The compiled topic filter of each of those replications, at the same
+    /// index: the one DERIVED thing on this record, built from
+    /// [`Self::replication_info`] whenever that is set so no reader has to compile
+    /// a caller's patterns. Set by [`Self::provisioned`] and refreshed by
+    /// [`Self::apply_replication_update`], the only two places the configuration
+    /// changes.
+    pub topic_filters: Vec<TopicFilter>,
     /// Where the replicator's own logs are delivered, as submitted.
     pub log_delivery: Option<LogDelivery>,
     /// Ordered so a reader renders a stable map.
@@ -1564,6 +1832,12 @@ impl Replicator {
                 cluster,
             })
             .collect();
+        // Capped for the same reason as the cluster list above.
+        let replication_info: Vec<ReplicationInfo> = input
+            .replication_info_list
+            .into_iter()
+            .take(MAX_FLOWS_PER_REPLICATOR)
+            .collect();
         Self {
             current_version: current_version_token(&arn, 1),
             revision: 1,
@@ -1581,12 +1855,13 @@ impl Replicator {
             // cross-region setup.
             is_replicator_reference: false,
             kafka_clusters,
-            // Capped for the same reason as the cluster list above.
-            replication_info: input
-                .replication_info_list
-                .into_iter()
-                .take(MAX_FLOWS_PER_REPLICATOR)
+            // Each flow's patterns are compiled HERE, once, so no later read of
+            // this record compiles a pattern a request supplied.
+            topic_filters: replication_info
+                .iter()
+                .map(|info| TopicFilter::of(&info.topic_replication))
                 .collect(),
+            replication_info,
             log_delivery: input.log_delivery,
             // The handler already refuses an over-tagged request, so this cap is
             // an unreachable backstop — and it takes the surviving tags in KEY
@@ -1616,6 +1891,39 @@ impl Replicator {
         if settling && now >= self.running_due {
             self.state = REPLICATOR_STATE_RUNNING.to_string();
         }
+    }
+
+    /// The instant this replicator's flows start replicating: the instant the
+    /// clock first owes the replicator `RUNNING`.
+    ///
+    /// Read off the creation instant rather than [`Self::running_due`], which a
+    /// later accepted update moves forward: an update rolls out while the flows
+    /// the replicator already runs keep running, so a configuration change does
+    /// not withdraw what has already been replicated.
+    pub fn replication_start(&self) -> SystemTime {
+        self.creation_time + REPLICATOR_ACTIVATION_DELAY
+    }
+
+    /// Whether this replicator is replicating at `now`: from
+    /// [`Self::replication_start`] on, which is exactly when a reader reports it
+    /// `RUNNING`. A deleted replicator leaves the registry, so no caller can ask
+    /// this about one.
+    pub fn replicates_at(&self, now: SystemTime) -> bool {
+        now >= self.replication_start()
+    }
+
+    /// The Amazon MSK cluster ARNs this replicator replicates INTO, once each:
+    /// what the per-target index maps to this replicator, so a reader of one
+    /// cluster's topics finds the replicators that feed it.
+    ///
+    /// A flow whose target is a self-managed Apache Kafka cluster names no ARN
+    /// here: that cluster's topics live on the cluster itself, which this
+    /// emulator does not hold.
+    pub fn target_cluster_arns(&self) -> BTreeSet<String> {
+        self.replication_info
+            .iter()
+            .filter_map(|info| info.target_kafka_cluster_arn.clone())
+            .collect()
     }
 
     /// The position in [`Self::replication_info`] of the replication running
@@ -1690,10 +1998,32 @@ impl Replicator {
         if log_delivery.is_some() {
             self.log_delivery = log_delivery;
         }
+        // The filter is DERIVED from the configuration just written, so it is
+        // rebuilt here rather than left reporting the patterns the update
+        // replaced — and rebuilt for the one replication that changed.
+        if let Some(info) = self.replication_info.get(index) {
+            let filter = TopicFilter::of(&info.topic_replication);
+            match self.topic_filters.get_mut(index) {
+                Some(stored) => *stored = filter,
+                // Unreachable: the filter list is built from the replication list
+                // and the two are only ever set together. Grown rather than
+                // dropped, so the replication at `index` keeps a filter.
+                None => {
+                    self.topic_filters.resize_with(index, TopicFilter::default);
+                    self.topic_filters.push(filter);
+                }
+            }
+        }
         self.revision += 1;
         self.current_version = current_version_token(&self.arn, self.revision);
         self.state = REPLICATOR_STATE_UPDATING.to_string();
         self.running_due = now + REPLICATOR_ACTIVATION_DELAY;
+    }
+
+    /// The compiled topic filter of the replication at `index`, or `None` when
+    /// the record holds no such replication.
+    pub fn topic_filter(&self, index: usize) -> Option<&TopicFilter> {
+        self.topic_filters.get(index)
     }
 
     /// The alias of the stored cluster an endpoint of a `ReplicationInfo` names,
@@ -1883,6 +2213,11 @@ pub struct Topic {
     pub configs: Option<String>,
     /// A `TopicState` value.
     pub state: String,
+    /// The instant this topic was created on its cluster. Not reported by any
+    /// topic shape; it is what decides whether a replication flow that does not
+    /// detect new topics covers this one, since such a flow replicates the topics
+    /// its source cluster already held when the replicator was created.
+    pub created_at: SystemTime,
     /// The instant the clock owes this topic its `CREATING` -> `ACTIVE`
     /// transition. Stored, never slept on.
     pub active_due: SystemTime,
@@ -1911,9 +2246,56 @@ impl Topic {
             replication_factor,
             configs,
             state: TOPIC_STATE_CREATING.to_string(),
+            created_at: now,
             active_due: now + TOPIC_ACTIVATION_DELAY,
             removal_due: None,
         }
+    }
+
+    /// The topic a replication flow carries onto its TARGET cluster, as that
+    /// cluster's readers report it: `target` is the cluster the flow replicates
+    /// INTO, `name` the name the flow gives the topic there, `source` the source
+    /// cluster's topic it is carried from, `configs` the topic-level
+    /// configuration the flow copies over (if any), and `visible_at` the instant
+    /// the clock owed its appearance on the target.
+    ///
+    /// Every member is DERIVED from that source topic and that target cluster: a
+    /// replicated topic carries the source topic's partitions, and its replication
+    /// factor is the source topic's bounded by the brokers the TARGET cluster has
+    /// to place replicas on — the same bound `CreateTopic` enforces for a topic of
+    /// that cluster, since Apache Kafka cannot place more replicas of a partition
+    /// than there are brokers.
+    pub fn replicated(
+        target: &Cluster,
+        name: String,
+        source: &Topic,
+        configs: Option<String>,
+        visible_at: SystemTime,
+    ) -> Self {
+        Self {
+            arn: target.topic_arn(&name),
+            name,
+            cluster_arn: target.arn.clone(),
+            partition_count: source.partition_count,
+            replication_factor: source
+                .replication_factor
+                .clamp(1, target.number_of_broker_nodes.max(1)),
+            configs,
+            // The flow has finished carrying the topic over by the instant the
+            // target reports it at all, so the target reports the created topic it
+            // is: before that instant the target holds no such topic.
+            state: TOPIC_STATE_ACTIVE.to_string(),
+            created_at: visible_at,
+            active_due: visible_at,
+            removal_due: None,
+        }
+    }
+
+    /// Whether a reader at `now` still sees this topic in its cluster: a topic
+    /// whose removal the clock already owes is gone, whether or not anything has
+    /// pruned the record yet.
+    pub fn is_present(&self, now: SystemTime) -> bool {
+        self.removal_due.is_none_or(|due| now < due)
     }
 
     /// Apply the `CREATING` -> `ACTIVE` transition once `now` has reached
@@ -2003,6 +2385,15 @@ pub struct ComAmazonawsKafkaKafkaState {
     /// account and region, which is what makes a repeated `CreateReplicator`
     /// under one name a conflict.
     pub replicator_arn_by_name: HashMap<(String, String), String>,
+    /// Target Amazon MSK cluster ARN -> the ARNs of the replicators that run a
+    /// replication flow INTO that cluster. Maintained on insert and remove by
+    /// [`Self::register_replicator`] / [`Self::unregister_replicator`], so
+    /// deriving one cluster's replicated topics costs a lookup rather than a walk
+    /// of the whole replicator registry. The endpoints of a stored flow never
+    /// change — `UpdateReplicationInfo` changes a replication's topic and
+    /// consumer-group settings, not which clusters it runs between — so the index
+    /// cannot drift from the records it points at.
+    pub replicator_arns_by_target_cluster: HashMap<String, BTreeSet<String>>,
     /// Monotonic counter feeding replicator ARNs, so each replicator gets a
     /// distinct identity.
     pub next_replicator_suffix: u64,
@@ -2642,7 +3033,7 @@ impl ComAmazonawsKafkaKafkaState {
     /// one cluster's topics are a contiguous range.
     pub fn topic_count_in(&self, cluster_arn: &str, now: SystemTime) -> usize {
         self.topics_in(cluster_arn)
-            .filter(|topic| topic.removal_due.is_none_or(|due| now < due))
+            .filter(|topic| topic.is_present(now))
             .count()
     }
 
@@ -2695,7 +3086,7 @@ impl ComAmazonawsKafkaKafkaState {
     fn prune_removed_topics(&mut self, cluster_arn: &str, now: SystemTime) {
         let removed: Vec<(String, String)> = self
             .topics_in(cluster_arn)
-            .filter(|topic| topic.removal_due.is_some_and(|due| now >= due))
+            .filter(|topic| !topic.is_present(now))
             .map(|topic| (topic.cluster_arn.clone(), topic.name.clone()))
             .collect();
         for key in removed {
@@ -2782,6 +3173,16 @@ impl ComAmazonawsKafkaKafkaState {
             (replicator.region.clone(), replicator.name.clone()),
             replicator.arn.clone(),
         );
+        // One entry per Amazon MSK cluster this replicator replicates INTO, which
+        // is what a reader of that cluster's topics looks the replicator up by. A
+        // flow whose target is a self-managed Apache Kafka cluster is indexed
+        // under nothing: that cluster's topics are not this service's to report.
+        for target in replicator.target_cluster_arns() {
+            self.replicator_arns_by_target_cluster
+                .entry(target)
+                .or_default()
+                .insert(replicator.arn.clone());
+        }
         self.replicators.insert(replicator.arn.clone(), replicator);
         Ok(())
     }
@@ -2792,7 +3193,182 @@ impl ComAmazonawsKafkaKafkaState {
         let replicator = self.replicators.remove(arn)?;
         self.replicator_arn_by_name
             .remove(&(replicator.region.clone(), replicator.name.clone()));
+        for target in replicator.target_cluster_arns() {
+            if let Some(arns) = self.replicator_arns_by_target_cluster.get_mut(&target) {
+                arns.remove(arn);
+                if arns.is_empty() {
+                    self.replicator_arns_by_target_cluster.remove(&target);
+                }
+            }
+        }
         Some(replicator)
+    }
+
+    /// Every topic the cluster `cluster_arn` names reports to a reader at `now`:
+    /// the topics it holds itself, plus the topics a running replicator
+    /// replicates onto it. Keyed, and so ordered, by the name the cluster reports
+    /// each topic under — the order `ListTopics` pages through.
+    ///
+    /// The ONE derivation the topic readers answer from, so a listing and a
+    /// describe of the same cluster cannot disagree about which topics are on it.
+    /// A name the cluster holds a topic of its own under is that topic: a
+    /// replicated name never shadows a stored record.
+    pub fn observable_topics_in(
+        &self,
+        cluster_arn: &str,
+        now: SystemTime,
+    ) -> BTreeMap<String, Topic> {
+        let mut topics = self.replicated_topics_into(cluster_arn, None, now);
+        for topic in self
+            .topics_in(cluster_arn)
+            .filter(|topic| topic.is_present(now))
+        {
+            topics.insert(topic.name.clone(), topic.clone());
+        }
+        topics
+    }
+
+    /// The same derivation for the ONE name a reader addresses: the cluster's own
+    /// topic of that name, with the transitions the clock already owed it
+    /// materialised, or else the topic a running replicator replicates onto this
+    /// cluster under it.
+    pub fn observable_topic_in(
+        &mut self,
+        cluster_arn: &str,
+        name: &str,
+        now: SystemTime,
+    ) -> Option<Topic> {
+        if let Some(topic) = self.settled_topic_in(cluster_arn, name, now) {
+            return Some(topic.clone());
+        }
+        self.replicated_topics_into(cluster_arn, Some(name), now)
+            .remove(name)
+    }
+
+    /// The topics the registry's replicators replicate onto the cluster
+    /// `target_cluster_arn` names, as a reader at `now` sees them, keyed by the
+    /// name the target reports each one under; `wanted` narrows the derivation to
+    /// one such name.
+    ///
+    /// A replicated topic is DERIVED, never a second stored record: it is
+    /// reported exactly while a replicator that is replicating has a flow into
+    /// this cluster whose filter covers a topic its source cluster still holds,
+    /// so deleting that topic — or the replicator — withdraws it with nothing
+    /// having to remember to. A flow's own source topics are reported from the
+    /// moment the clock owes the propagation ([`TOPIC_REPLICATION_DELAY`] after
+    /// the flow and the topic are both in place), and a flow that does not detect
+    /// new topics carries only the ones its source cluster already held when the
+    /// replicator was created.
+    ///
+    /// The work is bounded for every reader: the per-target index narrows it to
+    /// the flows INTO this cluster, [`MAX_REPLICATION_FLOWS_PER_TARGET`] bounds how
+    /// many of those one reader derives from, [`MAX_TOPICS_PER_CLUSTER`] bounds
+    /// what it reports — the same ceiling the cluster's own topics obey — and the
+    /// patterns were compiled when they were stored, so nothing here compiles a
+    /// caller's pattern.
+    fn replicated_topics_into(
+        &self,
+        target_cluster_arn: &str,
+        wanted: Option<&str>,
+        now: SystemTime,
+    ) -> BTreeMap<String, Topic> {
+        let mut replicated = BTreeMap::new();
+        // A cluster this endpoint does not hold reports nothing at all, and a
+        // replicated topic's identity is derived from the target cluster's own.
+        let Some(target) = self.clusters.get(target_cluster_arn) else {
+            return replicated;
+        };
+        let mut flows_derived = 0usize;
+        for replicator in self
+            .replicator_arns_by_target_cluster
+            .get(target_cluster_arn)
+            .into_iter()
+            .flatten()
+            .filter_map(|arn| self.replicators.get(arn))
+            .filter(|replicator| replicator.replicates_at(now))
+        {
+            for (index, info) in replicator.replication_info.iter().enumerate().filter(|(_, info)| {
+                info.target_kafka_cluster_arn.as_deref() == Some(target_cluster_arn)
+            }) {
+                // The two bounds this derivation is capped by, checked before each
+                // flow is walked: the flows one reader derives from, and the topics
+                // one cluster reports.
+                if flows_derived >= MAX_REPLICATION_FLOWS_PER_TARGET
+                    || replicated.len() >= MAX_TOPICS_PER_CLUSTER
+                {
+                    return replicated;
+                }
+                flows_derived += 1;
+                // Only an Amazon MSK source cluster's topics are this service's to
+                // read: a self-managed Apache Kafka cluster's topics live on that
+                // cluster, which this emulator does not hold.
+                let Some(source_arn) = info.source_kafka_cluster_arn.as_deref() else {
+                    continue;
+                };
+                // Compiled when the flow was stored, so a listing matches topics
+                // rather than compiling what a request supplied.
+                let Some(filter) = replicator.topic_filter(index) else {
+                    continue;
+                };
+                let settings = &info.topic_replication;
+                // Replicated names are prefixed with the source cluster's alias
+                // unless the flow asks for names identical to the source's, which
+                // is the one thing `ReplicationTopicNameConfiguration` configures.
+                let prefixed = settings
+                    .topic_name_configuration
+                    .as_ref()
+                    .and_then(|configuration| configuration.r#type.as_deref())
+                    .is_none_or(|kind| kind != TOPIC_NAME_IDENTICAL);
+                let alias = replicator
+                    .alias_of(Some(source_arn), None)
+                    .unwrap_or_default();
+                // A flow that does not say periodically detects new topics and
+                // copies the source topics' configurations: those are the
+                // replicator's own defaults, so only an explicit `false` turns
+                // either off.
+                let detects_new_topics = settings.detect_and_copy_new_topics != Some(false);
+                let copies_configurations = settings.copy_topic_configurations != Some(false);
+                let flow_start = replicator.replication_start();
+                for source in self
+                    .topics_in(source_arn)
+                    .filter(|topic| topic.is_present(now))
+                    .filter(|topic| filter.covers(&topic.name))
+                    .filter(|topic| {
+                        detects_new_topics || topic.created_at <= replicator.creation_time
+                    })
+                {
+                    if replicated.len() >= MAX_TOPICS_PER_CLUSTER {
+                        return replicated;
+                    }
+                    let name = replicated_topic_name(&alias, &source.name, prefixed);
+                    // An Apache Kafka topic name is at most
+                    // `MAX_TOPIC_NAME_LENGTH` characters, so a prefixed name past
+                    // that length is one no cluster could hold.
+                    if name.chars().count() > MAX_TOPIC_NAME_LENGTH {
+                        continue;
+                    }
+                    if wanted.is_some_and(|wanted| wanted != name) {
+                        continue;
+                    }
+                    let visible_at = source.active_due.max(flow_start) + TOPIC_REPLICATION_DELAY;
+                    if now < visible_at {
+                        continue;
+                    }
+                    let configs = if copies_configurations {
+                        source.configs.clone()
+                    } else {
+                        None
+                    };
+                    // The first flow to replicate a name keeps it: two flows that
+                    // carry one name onto a cluster are carrying the same topic
+                    // there, and the cluster holds one topic per name.
+                    replicated.entry(name.clone()).or_insert_with(|| {
+                        Topic::replicated(target, name, source, configs, visible_at)
+                    });
+                }
+            }
+        }
+        replicated
     }
 
     /// The replicator `arn` names, as an endpoint for `region` sees it.

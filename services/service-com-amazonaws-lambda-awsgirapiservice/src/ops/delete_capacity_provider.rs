@@ -169,13 +169,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "You cannot delete a capacity provider that is currently being used by Lambda
         // functions": a function version configured to run on it is such a use, and the
-        // provider's ARN is how a function names it. The users are collected before the
-        // provider is borrowed mutably below.
-        let users = match crate::state::parse_capacity_provider_name(
+        // provider's ARN is how a function names it. The associations are collected before
+        // the provider is borrowed mutably below — one per function that holds one, which
+        // is what the refusal below counts.
+        let associations = match crate::state::parse_capacity_provider_name(
             &input.capacity_provider_name,
         ) {
-            Some(name) => store
-                .capacity_provider_users(&crate::state::capacity_provider_arn(&region, &name)),
+            Some(name) => store.capacity_provider_user_associations(
+                &crate::state::capacity_provider_arn(&region, &name),
+            ),
             None => Vec::new(),
         };
 
@@ -206,17 +208,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         })?;
 
-        if let Some(user) = users.first() {
+        // The refusal states the use that blocks the delete: how many functions hold an
+        // association with the provider, and the association the caller has to remove —
+        // each read out of this store's own association state, never out of the request.
+        if let Some(association) = associations.first() {
             return Err(
                 DeleteCapacityProviderErrorModeled::ResourceConflictException(
                     ResourceConflictException {
                         r#type: None,
                         message: Some(format!(
-                            "The capacity provider {} cannot be deleted while it is in use \
-                             by {} function version(s), including {}",
-                            record.arn,
-                            users.len(),
-                            user.function_arn
+                            "The capacity provider is currently in use by {} function. To \
+                             delete this capacity provider, first remove its association \
+                             with {association}.",
+                            associations.len()
                         )),
                     },
                 )

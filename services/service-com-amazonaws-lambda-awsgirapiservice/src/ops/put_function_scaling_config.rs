@@ -234,10 +234,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .request(requested, now);
 
         // "The current state of the function after applying the scaling configuration":
-        // read off the record, which resolution already brought up to date, so this call
-        // reports the function's state rather than asserting one of its own.
+        // the state a read of the FUNCTION reports — its unpublished configuration's, the
+        // one this operation's `UnqualifiedFunctionName` addresses — so this call states
+        // the same thing `GetFunctionConfiguration` does rather than a state of its own,
+        // including the `ActiveNonInvocable` a function that runs on a capacity provider
+        // settles into.
+        let function_state = record.reported_state(crate::state::VERSION_LATEST);
         Ok(PutFunctionScalingConfigOutput {
-            function_state: Some(record.state.clone()),
+            function_state: Some(function_state),
         })
     }
 }

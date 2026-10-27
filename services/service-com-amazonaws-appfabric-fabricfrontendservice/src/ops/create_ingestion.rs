@@ -292,9 +292,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // none at all or one still `PendingConnect` — cannot be ingested, and
         // the refusal is the modelled `ValidationException` (HTTP 400): the
         // request names a dependency that is not satisfied, so nothing is
-        // written. Only that refusal needs the status the bundle DOES hold for
-        // the pair, which is what tells the caller whether it still has to
-        // create the authorization or only to connect it.
+        // written. What the bundle DOES hold for the pair only decides which
+        // call the caller still owes — create the authorization, or connect the
+        // one that exists — which is what the refusal states; no value of the
+        // request or of the stored record reaches the message.
         //
         // This is a STATE-DEPENDENT precondition, so it is checked AFTER the
         // idempotent replay above, exactly like the quota guard below: the
@@ -307,11 +308,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|bundle| bundle.connected_authorization(&input.app, &input.tenant_id))
             .is_none()
         {
-            let held_status = parent
+            let owed = if parent
                 .and_then(|bundle| bundle.authorization_for(&input.app, &input.tenant_id))
-                .map(|authorization| authorization.status.clone());
+                .is_some()
+            {
+                crate::state::OwedAuthorizationStep::ConnectAuthorization
+            } else {
+                crate::state::OwedAuthorizationStep::CreateAuthorization
+            };
             return Err(CreateIngestionErrorModeled::ValidationException(
-                crate::state::app_authorization_not_connected(&input.app, held_status.as_deref()),
+                crate::state::app_authorization_not_connected(owed),
             )
             .into());
         }

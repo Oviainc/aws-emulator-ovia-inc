@@ -17,15 +17,17 @@
 //! * the write is confined to the organization recommendation the identifier
 //!   names: no other organization recommendation and no account-level
 //!   recommendation moves;
-//! * **an organization recommendation whose `type` is not `priority` conflicts
-//!   (409) and nothing is written**, because the operation's own doc says it
-//!   "only supports prioritized recommendations";
+//! * **an organization recommendation exists only for a prioritized
+//!   recommendation, so the identifier of a non-prioritized check's would-be
+//!   organization recommendation resolves to nothing** — pinned, for every
+//!   organization operation at once, in
+//!   `tests/all/organization_prioritized_only.rs`;
 //! * a well-formed identifier that resolves to nothing is 404 and one outside
 //!   the modelled pattern is 400, for both the update and the read;
 //! * `resourcesAggregates` is COUNTED on every read from the resources of the
 //!   member accounts' recommendations the organization recommendation
-//!   aggregates — never stored — so an exclusion made through
-//!   `BatchUpdateRecommendationResourceExclusion` shows up in it.
+//!   aggregates — never stored — so a change in one of those resources shows up
+//!   in it.
 //!
 //! The statuses and error codes come from the model:
 //! `smithy_query(query="operation",operation="UpdateOrganizationRecommendationLifecycle,GetOrganizationRecommendation",
@@ -50,17 +52,22 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::recommendation_loop::{
     call, check_arn, emulator_on_plan, error_code, field_of_each, label, recommendation_arn,
-    resource_arn, timestamp_secs,
+    timestamp_secs,
 };
 
-/// One seeded check and the organization recommendation its findings aggregate
-/// into. Written out by hand; its source is the `SEED` table in `src/state.rs`,
-/// and the rows are in organization-recommendation ARN order (check id order),
-/// which is the store's key order.
+/// One seeded check with an organization recommendation, and the organization
+/// recommendation its findings aggregate into. Written out by hand; its source
+/// is the `SEED` table in `src/state.rs`, and the rows are in
+/// organization-recommendation ARN order (check id order), which is the store's
+/// key order.
+///
+/// Only a check whose recommendation is `priority` has one: every organization
+/// operation supports only prioritized recommendations, a rule pinned in
+/// `tests/all/organization_prioritized_only.rs`.
 struct Seeded {
     check_id: &'static str,
-    /// `RecommendationType` — only `priority` recommendations can have their
-    /// lifecycle moved.
+    /// `RecommendationType` — only `priority` recommendations reach the
+    /// organization surface at all.
     kind: &'static str,
     status: &'static str,
     /// The stage the seed left, before any caller moved it.
@@ -69,20 +76,6 @@ struct Seeded {
 }
 
 const SEEDED: &[Seeded] = &[
-    Seeded {
-        check_id: "amazon-ebs-snapshots",
-        kind: "standard",
-        status: "error",
-        lifecycle_stage: None,
-        pillars: &["fault_tolerance"],
-    },
-    Seeded {
-        check_id: "iam-access-key-rotation",
-        kind: "standard",
-        status: "ok",
-        lifecycle_stage: None,
-        pillars: &["security"],
-    },
     Seeded {
         check_id: "low-utilization-ec2-instances",
         kind: "priority",
@@ -287,38 +280,67 @@ async fn every_seeded_organization_recommendation_reports_members_computed_from_
 /// `resourcesAggregates` is counted from the member recommendations' resources
 /// on every read, so a change made to one of those resources is visible without
 /// a second write: the rows exclude a resource, exclude another, then include
-/// the first again.
+/// the first again, and move one resource's status.
+///
+/// The exclusion and status changes are written in process, the way the part of
+/// Trusted Advisor that produces check results would: an organization
+/// recommendation aggregates PRIORITIZED recommendations, and
+/// `BatchUpdateRecommendationResourceExclusion` "currently doesn't support
+/// prioritized recommendation resources", so no request moves these members.
 #[tokio::test]
 async fn organization_resources_aggregates_are_counted_on_every_read() {
-    let router = emulator();
-    let check_id = "amazon-ebs-snapshots";
-    let first = resource_arn(check_id, "res-ebs-0001");
-    let second = resource_arn(check_id, "res-ebs-0002");
+    let (router, engine) = emulator_on_plan(SupportPlan::Business);
+    let check_id = "rds-idle-db-instances";
     let resources_path = format!(
         "/v1/recommendations/{}/resources",
         label(&recommendation_arn(check_id))
     );
 
-    let rows: &[(&str, &str, bool)] = &[
-        ("exclude the first resource", &first, true),
-        ("exclude the second resource too", &second, true),
-        ("include the first resource again", &first, false),
+    /// What one row writes on a member resource: its exclusion state, or its
+    /// `ResourceStatus`.
+    enum Change {
+        Exclusion(&'static str),
+        Status(&'static str),
+    }
+    let rows: &[(&str, &str, Change)] = &[
+        (
+            "exclude the first resource",
+            "res-rds-0001",
+            Change::Exclusion("excluded"),
+        ),
+        (
+            "exclude the second resource too",
+            "res-rds-0002",
+            Change::Exclusion("excluded"),
+        ),
+        (
+            "include the first resource again",
+            "res-rds-0001",
+            Change::Exclusion("included"),
+        ),
+        (
+            "move the second resource to error",
+            "res-rds-0002",
+            Change::Status("error"),
+        ),
     ];
 
-    for (case, arn, is_excluded) in rows {
-        let (status, body) = call(
-            &router,
-            "PUT",
-            "/v1/batch-update-recommendation-resource-exclusion",
-            Some(json!({
-                "recommendationResourceExclusions": [{ "arn": arn, "isExcluded": is_excluded }],
-            })),
-        )
-        .await;
-        assert_eq!(
-            status, 200,
-            "case {case}: expected 200 from the exclusion batch, got {status} with {body}"
-        );
+    for (case, resource_id, change) in rows {
+        {
+            let state = service_state(&*engine).expect("this service's state");
+            let mut state = state.lock();
+            let resource = state
+                .recommendation_resources
+                .values_mut()
+                .find(|resource| resource.id == *resource_id)
+                .unwrap_or_else(|| panic!("case {case}: no seeded resource {resource_id}"));
+            match change {
+                Change::Exclusion(exclusion_status) => {
+                    resource.exclusion_status = (*exclusion_status).to_string();
+                }
+                Change::Status(status) => resource.status = (*status).to_string(),
+            }
+        }
 
         // What the resources themselves now report, which is what the
         // organization recommendation's `excludedCount` must count.
@@ -334,6 +356,19 @@ async fn organization_resources_aggregates_are_counted_on_every_read() {
             Some(excluded as u64),
             "case {case}: expected excludedCount {excluded}, got {:?}",
             got["resourcesAggregates"]["excludedCount"]
+        );
+
+        // And the per-status counters are the member's own, counted the same
+        // way on every read.
+        let errors = field_of_each(&listed, "recommendationResourceSummaries", "status")
+            .into_iter()
+            .filter(|status| status == "error")
+            .count();
+        assert_eq!(
+            got["resourcesAggregates"]["errorCount"].as_u64(),
+            Some(errors as u64),
+            "case {case}: expected errorCount {errors}, got {:?}",
+            got["resourcesAggregates"]["errorCount"]
         );
     }
 }
@@ -472,8 +507,9 @@ async fn a_lifecycle_update_persists_and_the_next_read_reports_it() {
         );
     }
 
-    // Every seeded organization recommendation whose `type` is `priority`.
-    for target in SEEDED.iter().filter(|row| row.kind == "priority") {
+    // Every seeded organization recommendation — each one prioritized, since no
+    // other kind reaches the organization surface.
+    for target in SEEDED {
         let router = emulator();
         let seeded_last_updated =
             timestamp_secs(&read(&router, target.check_id, target.check_id).await["lastUpdatedAt"]);
@@ -568,50 +604,6 @@ async fn a_lifecycle_update_persists_and_the_next_read_reports_it() {
                 target.lifecycle_stage,
                 "case {case}: the update must not move the account-level recommendation, got {}",
                 account["recommendation"]
-            );
-        }
-    }
-}
-
-#[tokio::test]
-async fn a_lifecycle_update_of_a_non_priority_organization_recommendation_conflicts() {
-    let router = emulator();
-
-    // Every seeded organization recommendation whose `type` is not `priority`:
-    // the operation's own doc says it "only supports prioritized
-    // recommendations".
-    for row in SEEDED.iter().filter(|row| row.kind != "priority") {
-        let case = row.check_id;
-        // Rows differ along the requested stage, so the refusal is about the
-        // recommendation's type and not about one stage.
-        for stage in UPDATE_RECOMMENDATION_LIFECYCLE_STAGE_VALUES {
-            let (status, body) = call(
-                &router,
-                "PUT",
-                &lifecycle_path(row.check_id),
-                Some(json!({
-                    "lifecycleStage": stage,
-                    "updateReason": "not applicable to this organization",
-                    "updateReasonCode": "not_applicable",
-                })),
-            )
-            .await;
-            assert_eq!(
-                status, 409,
-                "case {case}/{stage}: expected 409, got {status} with {body}"
-            );
-            assert_eq!(
-                error_code(&body),
-                "ConflictException",
-                "case {case}/{stage}: expected ConflictException, got {body}"
-            );
-
-            // And nothing was written: the lifecycle is still the seeded one.
-            let got = read(&router, &format!("{case}/{stage}"), row.check_id).await;
-            assert_eq!(
-                lifecycle_of(&got),
-                (row.lifecycle_stage, None, None),
-                "case {case}/{stage}: expected the seeded lifecycle, got {got}"
             );
         }
     }

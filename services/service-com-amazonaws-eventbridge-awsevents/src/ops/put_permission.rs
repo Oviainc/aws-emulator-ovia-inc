@@ -188,8 +188,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // StatementId, Action, Principal, or Condition parameters" — so a request
         // either supplies the whole policy document or names one grant, and the
         // model cannot express that either-or over five optional members. What
-        // this call would install is assembled BEFORE the store is reached, so a
-        // request that is not a grant at all is refused without touching it.
+        // this call would install is assembled once the BUS has been resolved, so
+        // a caller naming a bus that does not exist reads that rather than a
+        // verdict on its request body.
         let document = input.policy.filter(|text| !text.trim().is_empty());
         let region = crate::state::request_region(ctx.parts());
         // "The name of the event bus associated with the rule. If you omit this,
@@ -203,6 +204,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Document(crate::state::BusPolicy),
             /// One grant, added to or replaced within what the bus holds.
             Statement(crate::state::PolicyStatement),
+        }
+
+        let mut store = state.lock();
+
+        // A grant is installed on a bus that exists; it never creates one. The
+        // bus is resolved BEFORE the request's own members are judged, so a call
+        // naming a bus this Region does not hold is answered with the missing
+        // resource whatever else the request carries.
+        if store.bus(&region, &bus_name).is_none() {
+            return Err(PutPermissionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::no_such_event_bus(&bus_name)),
+                },
+            )
+            .into());
         }
 
         let install = match (document, input.statement_id, input.action, input.principal) {
@@ -257,10 +273,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        let mut store = state.lock();
-
-        // A grant is installed on a bus that exists; it never creates one.
-        let Some(bus) = store.bus_mut(&bus_name) else {
+        let Some(bus) = store.bus_mut(&region, &bus_name) else {
             return Err(PutPermissionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::no_such_event_bus(&bus_name)),

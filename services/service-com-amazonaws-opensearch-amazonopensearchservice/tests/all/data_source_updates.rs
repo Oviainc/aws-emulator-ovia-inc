@@ -22,7 +22,11 @@
 //! The assertions span a SET of inputs rather than one call: every `DataSourceStatus`
 //! the model declares, a description supplied and withheld, and a `DataSourceType`
 //! whose catalog role changes — each read back through `GetDataSource` AND the
-//! listing.
+//! listing. The scope of ONE update is asserted the same way: over every (domain,
+//! data source) pair of a store holding the same names on several domains, the
+//! addressed record changes and every other one keeps what it was last left at.
+
+use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_opensearch_amazonopensearchservice::ops::types::DATA_SOURCE_STATUS_VALUES;
@@ -173,6 +177,128 @@ async fn an_update_replaces_exactly_the_members_the_request_carries() {
             expected,
             "case ListDataSources({case}): expected {expected:?}, got {entry:?}"
         );
+    }
+}
+
+#[tokio::test]
+async fn an_update_reaches_only_the_record_it_addresses() {
+    let emulator = Emulator::new();
+
+    // Several domains, each holding data sources under the SAME names: a data source
+    // belongs to one domain and is keyed within it by name, so an update that reached
+    // another domain's record, or a sibling of the one it names, is observable here.
+    let domains = ["scope-alpha", "scope-beta", "scope-gamma"];
+    let names = ["first_catalog", "second_catalog", "third_catalog"];
+
+    // The whole record expected of each (domain, name): the role suffix its
+    // `DataSourceType` carries, its description and its status.
+    let mut expected: BTreeMap<(&str, &str), (String, String, String)> = BTreeMap::new();
+    for domain in domains {
+        created_domain(&emulator, domain).await;
+        for name in names {
+            let role_suffix = format!("{domain}-{name}-created");
+            let description = format!("{name} of {domain} as created");
+            let answer = add(
+                &emulator,
+                domain,
+                json!({
+                    "Name": name,
+                    "DataSourceType": data_source_type(&role(&role_suffix)),
+                    "Description": description,
+                }),
+            )
+            .await;
+            assert_eq!(
+                answer.status, 200,
+                "case AddDataSource({domain}/{name}): expected 200, got {} with {:?}",
+                answer.status, answer.body
+            );
+            expected.insert(
+                (domain, name),
+                (
+                    role_suffix,
+                    description,
+                    DATA_SOURCE_STATUS_ACTIVE.to_string(),
+                ),
+            );
+        }
+    }
+
+    // One row per (domain, name) pair: that pair is the target of ONE update, whose
+    // status cycles through every value the model declares. After each row the WHOLE
+    // store is re-read, so a row only passes when the addressed record carries the
+    // update and every other record still carries what the row before it left.
+    let targets = domains
+        .iter()
+        .flat_map(|domain| names.iter().map(move |name| (*domain, *name)));
+    for (index, (domain, name)) in targets.enumerate() {
+        let case = format!("{domain}/{name}");
+        let role_suffix = format!("{domain}-{name}-updated");
+        let description = format!("{name} of {domain} after update {index}");
+        let status = DATA_SOURCE_STATUS_VALUES[index % DATA_SOURCE_STATUS_VALUES.len()];
+        let answer = update(
+            &emulator,
+            domain,
+            name,
+            json!({
+                "DataSourceType": data_source_type(&role(&role_suffix)),
+                "Description": description,
+                "Status": status,
+            }),
+        )
+        .await;
+        assert_eq!(
+            answer.status, 200,
+            "case UpdateDataSource({case}): expected 200, got {} with {:?}",
+            answer.status, answer.body
+        );
+        expected.insert((domain, name), (role_suffix, description, status.to_string()));
+
+        for other_domain in domains {
+            let listing = super::data_source_registry::list(&emulator, other_domain).await;
+            let listed = data_sources(&listing, &case);
+            assert_eq!(
+                listed.len(),
+                names.len(),
+                "case ListDataSources({other_domain} after {case}): expected {} records, got \
+                 {listed:?}",
+                names.len()
+            );
+            for other_name in names {
+                let (role_suffix, description, status) = expected
+                    .get(&(other_domain, other_name))
+                    .expect("every created data source has an expected record");
+                let expected_type = data_source_type(&role(role_suffix));
+                let want = (
+                    Some(other_name),
+                    &expected_type,
+                    Some(description.as_str()),
+                    Some(status.as_str()),
+                );
+                let read = read_back(&emulator, other_domain, other_name, &case).await;
+                assert_eq!(
+                    summary(&read),
+                    want,
+                    "case GetDataSource({other_domain}/{other_name} after {case}): expected \
+                     {want:?}, got {read:?}"
+                );
+                let entry = listed
+                    .iter()
+                    .find(|entry| entry["Name"].as_str() == Some(other_name))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "case ListDataSources({other_domain} after {case}): the listing must \
+                             report {other_name}, got {listed:?}"
+                        )
+                    });
+                assert_eq!(
+                    summary(entry),
+                    want,
+                    "case ListDataSources({other_domain}/{other_name} after {case}): expected \
+                     {want:?}, got {entry:?}"
+                );
+            }
+        }
     }
 }
 

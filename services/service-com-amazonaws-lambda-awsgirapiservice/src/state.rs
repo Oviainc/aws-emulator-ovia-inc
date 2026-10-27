@@ -206,6 +206,16 @@ pub const STATE_PENDING: &str = "Pending";
 /// See [`STATE_PENDING`].
 pub const STATE_ACTIVE: &str = "Active";
 
+/// The `State` a settled function reports while its unpublished configuration cannot be
+/// invoked directly, from the same `State` enum (`Pending | Active | Inactive | Failed |
+/// Deactivating | Deactivated | ActiveNonInvocable | Deleting`).
+///
+/// A function that names a capacity provider is such a function: the compute it runs on
+/// belongs to the provider, and what the provider runs is a published version registered
+/// with it, so the function is provisioned and healthy without `$LATEST` being invocable.
+/// See [`FunctionRecord::reported_state`].
+pub const STATE_ACTIVE_NON_INVOCABLE: &str = "ActiveNonInvocable";
+
 /// The `StateReasonCode` a function carries while it is being provisioned, from the
 /// model's `StateReasonCode` enum, whose documentation reads: "When the code is
 /// Creating, you can't invoke or modify the function."
@@ -1761,6 +1771,16 @@ pub struct DurableExecutionRecord {
     pub status: String,
     /// When the execution started, which the model's `StartTimestamp` reports.
     pub started: SystemTime,
+    /// The payload the call that started the execution carried, which the model's
+    /// `InputPayload` reports and which a later start of the SAME name is compared
+    /// against: `Invoke$DurableExecutionName` documents that a repeat "with the same
+    /// payload" answers the execution already started and a repeat whose "payload differs"
+    /// is refused, so the payload is part of the execution's identity.
+    ///
+    /// What it can hold is bounded on both sides: one payload by the invocation payload
+    /// ceiling `Invoke` checks BEFORE a start is attempted, and the number of them by
+    /// [`MAX_DURABLE_EXECUTIONS`] per function.
+    pub input_payload: Vec<u8>,
     /// When the execution ended, once it reached a terminal status; the model's
     /// `EndTimestamp`, which is absent while it is still running.
     pub ended: Option<SystemTime>,
@@ -1816,6 +1836,35 @@ impl DurableExecutionRecord {
 #[must_use]
 pub fn mint_durable_execution_id() -> String {
     ::uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// A fresh durable execution NAME, for a start that named none.
+///
+/// `Invoke$DurableExecutionName` is optional and documents the default: "If not
+/// specified, Lambda generates a unique identifier automatically." The generated name is
+/// a fresh UUID's hexadecimal, which is unique and satisfies that member's own
+/// `@length(1, 64)` and `^[a-zA-Z0-9-_]+$`.
+#[must_use]
+pub fn mint_durable_execution_name() -> String {
+    ::uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// What became of a [`FunctionRecord::start_durable_execution`] call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DurableExecutionStart {
+    /// A new execution was stored; the ARN it is addressed by.
+    Started(String),
+    /// The function already held an execution of that name carrying the same payload, so
+    /// nothing was stored and that execution answers the start: "Lambda returns the
+    /// existing execution instead of creating a duplicate."
+    AlreadyStarted(String),
+    /// The function already held an execution of that name carrying a DIFFERENT payload,
+    /// which is the state the modelled `DurableExecutionAlreadyStartedException`
+    /// describes. Nothing was stored.
+    NameAlreadyStarted,
+    /// The function already holds [`MAX_DURABLE_EXECUTIONS`], so the start was refused
+    /// and nothing was stored.
+    LimitExceeded,
 }
 
 /// The most aliases this emulator keeps for one function.
@@ -2179,17 +2228,51 @@ impl FunctionRecord {
         }
     }
 
-    /// Start a durable execution named `name` against `version` at `now`, answering the
-    /// ARN it is addressed by, or `None` when it cannot be started.
+    /// The model's `State` reported for the configuration of `version`, which is this
+    /// function's lifecycle state narrowed by whether that configuration can be invoked
+    /// directly.
     ///
-    /// It is not started, and nothing is stored, in either of two cases, which a caller
-    /// tells apart by reading [`FunctionRecord::durable_executions`] itself: this
-    /// function already holds an execution of that name — the state `Invoke`'s
+    /// The UNPUBLISHED configuration of a function that names a capacity provider cannot
+    /// be: the compute it runs on is the provider's, and what the provider runs is a
+    /// published version registered with it, so a settled function is provisioned and
+    /// healthy without `$LATEST` being invocable. The `State` enum's own
+    /// [`STATE_ACTIVE_NON_INVOCABLE`] is the value for exactly that. Every other
+    /// configuration reports the lifecycle state as it stands, and so does one that has
+    /// not settled yet: a function still being provisioned is [`STATE_PENDING`] whatever
+    /// it will be invocable as.
+    ///
+    /// `version` is read through [`Self::resolved_version`], so an alias reports the state
+    /// of the version it invokes.
+    ///
+    /// Read it only after [`Self::materialize`], so the state reported is the one the
+    /// clock has already made due.
+    #[must_use]
+    pub fn reported_state(&self, version: &str) -> String {
+        if self.state == STATE_ACTIVE
+            && self.resolved_version(version).as_deref() == Some(VERSION_LATEST)
+            && configured_capacity_provider(&self.config).is_some()
+        {
+            return STATE_ACTIVE_NON_INVOCABLE.to_string();
+        }
+        self.state.clone()
+    }
+
+    /// Start a durable execution named `name` against `version` at `now`, carrying
+    /// `payload` as its input, and report what became of the start.
+    ///
+    /// `Invoke$DurableExecutionName` states the whole rule: "If you invoke a durable
+    /// function using a name that already exists with the same payload, Lambda returns the
+    /// existing execution instead of creating a duplicate. If the payload differs, Lambda
+    /// returns a DurableExecutionAlreadyStartedException error." So a name this function
+    /// already holds never starts a second execution and never replaces the one held —
+    /// [`DurableExecutionStart::AlreadyStarted`] answers the stored execution's ARN for the
+    /// repeat that carries the same payload, and
+    /// [`DurableExecutionStart::NameAlreadyStarted`] is the state the modelled
     /// `DurableExecutionAlreadyStartedException` describes ("Each durable execution name
-    /// must be unique within the function"), so a start never replaces an execution
-    /// already held — or it already holds [`MAX_DURABLE_EXECUTIONS`] of them, the
-    /// ceiling that keeps the map (and the per-read walk over it in
-    /// [`FunctionRecord::materialize`]) bounded.
+    /// must be unique within the function") for the one that does not. A function already
+    /// holding [`MAX_DURABLE_EXECUTIONS`] of them answers
+    /// [`DurableExecutionStart::LimitExceeded`], the ceiling that keeps the map (and the
+    /// per-read walk over it in [`FunctionRecord::materialize`]) bounded.
     ///
     /// The execution's settings come from the function's own `DurableConfig`: the key it
     /// encrypts payload data under, and the `ExecutionTimeout` whose due instant is
@@ -2198,13 +2281,17 @@ impl FunctionRecord {
         &mut self,
         name: &str,
         version: &str,
+        payload: &[u8],
         now: SystemTime,
-    ) -> Option<String> {
-        if self.durable_executions.contains_key(name) {
-            return None;
+    ) -> DurableExecutionStart {
+        if let Some(held) = self.durable_executions.get(name) {
+            if held.input_payload == payload {
+                return DurableExecutionStart::AlreadyStarted(self.durable_execution_arn(held));
+            }
+            return DurableExecutionStart::NameAlreadyStarted;
         }
         if self.durable_executions.len() >= MAX_DURABLE_EXECUTIONS {
-            return None;
+            return DurableExecutionStart::LimitExceeded;
         }
         let durable_config = self
             .config_of(version)
@@ -2215,6 +2302,7 @@ impl FunctionRecord {
             version: version.to_string(),
             status: EXECUTION_STATUS_RUNNING.to_string(),
             started: now,
+            input_payload: payload.to_vec(),
             ended: None,
             kms_key_arn: durable_config
                 .as_ref()
@@ -2230,7 +2318,7 @@ impl FunctionRecord {
         };
         let arn = self.durable_execution_arn(&execution);
         self.durable_executions.insert(name.to_string(), execution);
-        Some(arn)
+        DurableExecutionStart::Started(arn)
     }
 
     /// The ARN `execution` is addressed by, in the one form the model's
@@ -2267,6 +2355,11 @@ impl FunctionRecord {
     /// belongs to, and the lifecycle `State` of the function the version is part of
     /// (which is a property of the function rather than of one version, see
     /// [`FunctionRecord::state`]).
+    ///
+    /// That is the LIFECYCLE state, not the narrowed [`FunctionRecord::reported_state`]
+    /// the unpublished configuration reports: a version registered with a capacity
+    /// provider is the one thing that provider runs, so this listing reports it as the
+    /// live resource it is.
     #[must_use]
     pub fn capacity_provider_version(&self, version: &str) -> CapacityProviderVersion {
         CapacityProviderVersion {
@@ -2473,7 +2566,11 @@ impl FunctionRecord {
                     })
                     .collect()
             }),
-            state: Some(self.state.clone()),
+            // `State` is the state of the configuration being reported: the unpublished
+            // configuration of a function that runs on a capacity provider is not
+            // directly invocable, so it settles into `ActiveNonInvocable` rather than
+            // `Active` (see [`FunctionRecord::reported_state`]).
+            state: Some(self.reported_state(version)),
             state_reason: self.state_reason.clone(),
             state_reason_code: self.state_reason_code.clone(),
             last_update_status: if version == VERSION_LATEST {
@@ -3926,6 +4023,48 @@ impl ComAmazonawsLambdaAwsgirapiserviceState {
         users
     }
 
+    /// One entry per FUNCTION associated with the capacity provider `provider_arn`
+    /// names, in the same stable order as [`Self::capacity_provider_users`], each the ARN
+    /// of the association a caller has to remove to free the provider for deletion.
+    ///
+    /// A function may name one provider from several of its configurations — its
+    /// unpublished one and each published version that froze it — and those are ONE
+    /// association of ONE function, so a function appears here once however many of its
+    /// configurations name the provider. The ARN is the association's own: the qualified
+    /// ARN of the first published version that names the provider, and the unqualified
+    /// one when only the function's unpublished configuration does.
+    ///
+    /// It reads the relationship through [`Self::capacity_provider_users`], so the two
+    /// cannot disagree about what counts as a use of a provider.
+    #[must_use]
+    pub fn capacity_provider_user_associations(&self, provider_arn: &str) -> Vec<String> {
+        /// One function's association: the function's name, the ARN that names the
+        /// association, and whether that ARN is a published version's.
+        type Association = (String, String, bool);
+        let mut associations: Vec<Association> = Vec::new();
+        for user in self.capacity_provider_users(provider_arn) {
+            let published = user.version != VERSION_LATEST;
+            match associations
+                .iter_mut()
+                .find(|(function, _, _)| *function == user.function_name)
+            {
+                // A published version that runs on the provider is what names the
+                // association; the unqualified ARN of the unpublished configuration names
+                // it only while the function has published no such version.
+                Some(held) if published && !held.2 => {
+                    held.1 = user.function_arn;
+                    held.2 = true;
+                }
+                Some(_) => {}
+                None => associations.push((user.function_name, user.function_arn, published)),
+            }
+        }
+        associations
+            .into_iter()
+            .map(|(_, arn, _)| arn)
+            .collect()
+    }
+
     /// The ARNs of every function associated with the code-signing configuration
     /// `config_arn` names, in a stable order.
     ///
@@ -5086,6 +5225,58 @@ pub fn resolve_resource_tags<'a>(
 /// carries [`resolve_function`]'s refusal through unchanged.
 fn no_such_taggable_resource() -> TagResolveFailure {
     TagResolveFailure::NotFound(RESOURCE_NOT_FOUND_MESSAGE.to_string())
+}
+
+/// The refusal a `DurableExecutionArn` that names no execution this emulator holds gets:
+/// the canonical sentence every Lambda resource-shaped refusal follows, naming the
+/// resource the request asked about so the caller recovers the ARN it sent by stripping
+/// the fixed prefix (compare the `Function not found: <arn>` [`resolve_function`] builds).
+#[must_use]
+pub fn durable_execution_not_found_message(arn: &str) -> String {
+    format!("Durable execution not found: {arn}")
+}
+
+/// Resolve a `DurableExecutionArn` to the function record that holds the execution and
+/// the name the execution is keyed by.
+///
+/// The ARN is the one form the model's `DurableExecutionArn` pattern admits —
+/// `<function-arn>:<version>/durable-execution/<execution-name>/<execution-id>` — so it
+/// is read as the function ARN it carries (resolved exactly the way every other operation
+/// resolves a `FunctionName`, which is also what brings the record up to whatever the
+/// clock made due) plus the execution's name and id. The id is CHECKED against the stored
+/// execution, because an ARN that names the right name under a different id names an
+/// execution this emulator never started.
+///
+/// The value is UNTRUSTED request text: it is only ever split and compared, so no input
+/// can make this panic.
+pub fn resolve_durable_execution<'a>(
+    store: &'a mut ComAmazonawsLambdaAwsgirapiserviceState,
+    execution_arn: &str,
+    region: &str,
+    now: SystemTime,
+) -> Result<(&'a mut FunctionRecord, String), ResolveFailure> {
+    let not_found =
+        || ResolveFailure::NotFound(durable_execution_not_found_message(execution_arn));
+    let infix = format!("/{DURABLE_EXECUTION_ARN_INFIX}/");
+    let Some((function_reference, execution)) = execution_arn.split_once(infix.as_str()) else {
+        return Err(not_found());
+    };
+    let Some((name, execution_id)) = execution.split_once('/') else {
+        return Err(not_found());
+    };
+    let (record, version) = resolve_function(store, function_reference, None, region, now)
+        // A function this emulator does not hold holds no execution either, and the
+        // refusal names the execution the request asked about rather than the function it
+        // was derived from.
+        .map_err(|_| not_found())?;
+    let held = record
+        .durable_executions
+        .get(name)
+        .filter(|held| held.execution_id == execution_id && held.version == version);
+    match held {
+        Some(_) => Ok((record, name.to_string())),
+        None => Err(not_found()),
+    }
 }
 
 /// Why a `FunctionName`/`Qualifier` pair names no record.

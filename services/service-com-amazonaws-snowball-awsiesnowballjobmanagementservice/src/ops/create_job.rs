@@ -318,6 +318,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The create holds the store's lock; the notifications the job states it starts owe
+        // are published once that lock is released, because a publish is an in-process call
+        // into Amazon SNS and must not run under it.
+        let (output, notifications) = self.place_order(input)?;
+
+        // Every job record created has entered its first state, which its own notification
+        // settings may select, and a subscriber of the topic they name is told about it.
+        crate::state::job_notifications::publish(ctx, &notifications).await;
+
+        Ok(output)
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateJob<Eng> {
+    /// The order itself: what it answers, and the job-state notifications it owes.
+    ///
+    /// Everything that touches the store lives here, so the lock is held for the write
+    /// ALONE and nothing is awaited while it is.
+    fn place_order(
+        &self,
+        input: CreateJobInput,
+    ) -> Result<
+        (
+            CreateJobOutput,
+            Vec<crate::state::job_notifications::JobStateNotification>,
+        ),
+        CreateJobError,
+    > {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::validation(
                 crate::state::STATE_UNAVAILABLE,
@@ -514,13 +542,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             node.device_configuration = input.device_configuration;
             node.impact_level = input.impact_level;
             node.pickup_details = input.pickup_details;
+            // A created job has ENTERED its first `JobState`, which is a state change like
+            // any other this API makes, so the notification settings the node carries — the
+            // cluster's, or this request's where it supplied its own — decide whether that
+            // is published onto their topic. Decided here, under the lock, and published by
+            // the caller once the lock is released.
+            let notifications = crate::state::job_notifications::owed_for_records(
+                [&node],
+                ::std::time::SystemTime::now(),
+            );
             if !store.add_cluster_node_jobs(&cluster_id, vec![node]) {
                 return Err(crate::scaffolded::Scaffolded::validation(format!(
                     "this emulator stores at most {} jobs, and that limit has been reached",
                     crate::state::MAX_STORED_JOBS
                 )));
             }
-            return Ok(CreateJobOutput { job_id: Some(job_id) });
+            return Ok((CreateJobOutput { job_id: Some(job_id) }, notifications));
         }
 
         let Some(address_id) = input.address_id.clone() else {
@@ -698,6 +735,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             order.push(main_job);
         }
 
+        // Every record of this order has entered its first `JobState`, so each one's own
+        // notification settings decide whether that is published: an export order's job
+        // parts inherit the order's settings and are jobs in their own right, each with its
+        // own id, so each is reported on its own. Decided here, under the lock, and
+        // published by the caller once the lock is released.
+        let notifications = crate::state::job_notifications::owed_for_records(
+            order.iter(),
+            ::std::time::SystemTime::now(),
+        );
+
         // This emulator holds a bounded number of jobs, and `CancelJob` does not remove
         // one, so a store that cannot hold the whole order refuses the create rather than
         // growing the process further. The model declares no quota error on this
@@ -710,10 +757,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        Ok(CreateJobOutput {
-            // The id a caller keeps: the main job's for an export order — the job parts
-            // hang off it and `DescribeJob` on it reports them — the job's own otherwise.
-            job_id: Some(job_id),
-        })
+        Ok((
+            CreateJobOutput {
+                // The id a caller keeps: the main job's for an export order — the job parts
+                // hang off it and `DescribeJob` on it reports them — the job's own otherwise.
+                job_id: Some(job_id),
+            },
+            notifications,
+        ))
     }
 }

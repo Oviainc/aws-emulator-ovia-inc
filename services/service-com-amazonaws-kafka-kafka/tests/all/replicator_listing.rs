@@ -232,6 +232,10 @@ fn replicator(region: &str, name: &str, ordinal: u32) -> Replicator {
         is_replicator_reference: false,
         kafka_clusters: Vec::new(),
         replication_info: Vec::new(),
+        // Derived from `replication_info`, so a record with no replications
+        // carries no filter either; this suite drives `ListReplicators`, whose
+        // summary reports no topic filter.
+        topic_filters: Vec::new(),
         // Only reported by `DescribeReplicator`, which this suite does not drive:
         // a `ReplicatorSummary` carries none of them.
         description: None,

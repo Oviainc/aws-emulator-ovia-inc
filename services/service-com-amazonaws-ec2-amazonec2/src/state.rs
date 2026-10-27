@@ -1264,6 +1264,26 @@
 //! `CopyVolumes`), which raise a new volume's encryption state to it ("the EBS volumes
 //! that you create are always encrypted", `EnableEbsEncryptionByDefault`).
 //!
+//! ## Capacity Manager: an account-level setting, and the ingestion an enable starts
+//!
+//! EC2 Capacity Manager has no resource and no id either: it is one status "for your
+//! account" (`EnableCapacityManager`) beside the cross-account aggregation flag
+//! `OrganizationsAccess` carries. So it is stored as one private
+//! [`CapacityManagerSettings`] of [`ComAmazonawsEc2Amazonec2State`] — not keyed by Region,
+//! because nothing in its documentation scopes it to one — written through
+//! [`ComAmazonawsEc2Amazonec2State::enable_capacity_manager`] and read through
+//! [`ComAmazonawsEc2Amazonec2State::capacity_manager_at`], so the operation that reports
+//! the settings and the operations that change them cannot disagree.
+//!
+//! The INGESTION an enable starts is a clock-owed move rather than a stored word: "this
+//! starts data ingestion for your EC2 capacity usage" and "initial data processing may
+//! take several hours to complete" (`EnableCapacityManager`), so the enable records when
+//! the initial ingestion falls complete and [`CapacityManagerSettings::view_at`] derives
+//! `initial-ingestion-in-progress` or `ingestion-complete` from that instant — on the same
+//! monotonic clock and the same [`TRANSITION_DELAY`] as an instance's
+//! [`PendingTransition`] — so a reader never writes and a caller asking straight after the
+//! enable still sees the transient status.
+//!
 //! ## Scheduled event notification tag keys are a fact of a REGION
 //!
 //! [`ComAmazonawsEc2Amazonec2State::instance_event_tag_registrations`] holds, per Region, the tag
@@ -3588,6 +3608,15 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// disagree about one Region. PRIVATE, like the single-word setting above, so those
     /// accessors are the only way in.
     ebs_encryption_by_default_regions: BTreeSet<String>,
+    /// The account's EC2 Capacity Manager settings — see the module docs.
+    ///
+    /// ONE value rather than a map because the setting is an account-level singleton with
+    /// no id: "Enables EC2 Capacity Manager for your account" (`EnableCapacityManager`).
+    /// Read it through [`Self::capacity_manager_at`] and write it through
+    /// [`Self::enable_capacity_manager`], so the operation that reports the settings and
+    /// the operations that change them cannot disagree. PRIVATE, like the other
+    /// account-level settings above, so those accessors are the only way in.
+    capacity_manager: CapacityManagerSettings,
     /// The longer-ID (17-character ID) preference each principal has EXPLICITLY set, by
     /// principal ARN and then by resource type — see the module docs.
     ///
@@ -3842,6 +3871,10 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             // No Region has EBS encryption by default turned on until something enables
             // it there, so a fresh account holds the empty set.
             ebs_encryption_by_default_regions: BTreeSet::new(),
+            // An account that has never called `EnableCapacityManager` has Capacity
+            // Manager `disabled`, no Organizations access and no ingestion at all, which
+            // is what `CapacityManagerSettings::default()` is.
+            capacity_manager: CapacityManagerSettings::default(),
             // No principal has overridden its ID format settings yet, so every one of
             // them follows the root user, which follows `DEFAULT_USE_LONG_IDS`.
             id_format_overrides: BTreeMap::new(),
@@ -29733,6 +29766,144 @@ impl ComAmazonawsEc2Amazonec2State {
     pub fn would_exceed_encryption_by_default_regions(&self, region: &str) -> bool {
         !self.ebs_encryption_by_default_regions.contains(region)
             && self.ebs_encryption_by_default_regions.len() >= MAX_ENCRYPTION_BY_DEFAULT_REGIONS
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EC2 Capacity Manager (an account-level setting, and the ingestion it starts)
+// ---------------------------------------------------------------------------
+
+/// Capacity Manager turned ON for the account: the `CapacityManagerStatus` enum's
+/// `enabled` member — "the current status of Capacity Manager after the enable operation"
+/// (`EnableCapacityManagerResult$CapacityManagerStatus`). The whole catalog is the
+/// generated [`crate::ops::types::CAPACITY_MANAGER_STATUS_VALUES`].
+pub const CAPACITY_MANAGER_ENABLED: &str = "enabled";
+
+/// Capacity Manager turned OFF: the `CapacityManagerStatus` enum's `disabled` member,
+/// which is also where an account that has never enabled it sits.
+pub const CAPACITY_MANAGER_DISABLED: &str = "disabled";
+
+/// The ingestion an enable starts, while it is still catching up: the `IngestionStatus`
+/// enum's `initial-ingestion-in-progress` member. The whole catalog is the generated
+/// [`crate::ops::types::INGESTION_STATUS_VALUES`].
+pub const INGESTION_STATUS_INITIAL_IN_PROGRESS: &str = "initial-ingestion-in-progress";
+
+/// The ingestion an enable started, once it has caught up: the `IngestionStatus` enum's
+/// `ingestion-complete` member.
+///
+/// Its third member, `ingestion-failed`, names an ingestion that broke; nothing in this
+/// emulator can fail one, so no record is ever put into it.
+pub const INGESTION_STATUS_COMPLETE: &str = "ingestion-complete";
+
+/// The account's EC2 Capacity Manager settings: whether it is on, whether its data may be
+/// aggregated across the organization, and when the ingestion an enable started falls
+/// complete.
+///
+/// The status is a `&'static str` so only a member of the modelled `CapacityManagerStatus`
+/// catalog can ever be stored here: the word comes from this module's own constants, never
+/// from a request.
+#[derive(Debug, Clone)]
+pub struct CapacityManagerSettings {
+    /// [`CAPACITY_MANAGER_ENABLED`] or [`CAPACITY_MANAGER_DISABLED`].
+    status: &'static str,
+    /// Whether "Capacity Manager can aggregate data from all accounts in your
+    /// organization" (`EnableCapacityManagerRequest$OrganizationsAccess`). "Default is
+    /// false", which is where an account that has never asked for it sits.
+    organizations_access: bool,
+    /// When the initial ingestion an enable started falls complete, and `None` while no
+    /// enable has started one.
+    ///
+    /// The INSTANT rather than a word, because the move is owed to the clock: the status a
+    /// reader sees is derived from it ([`Self::view_at`]), so reporting the settings never
+    /// writes.
+    ingestion_complete_at: Option<Instant>,
+}
+
+impl Default for CapacityManagerSettings {
+    /// Where an account that has never called `EnableCapacityManager` sits: Capacity
+    /// Manager `disabled`, no Organizations access, and no ingestion at all.
+    fn default() -> Self {
+        Self {
+            status: CAPACITY_MANAGER_DISABLED,
+            organizations_access: false,
+            ingestion_complete_at: None,
+        }
+    }
+}
+
+/// The account's Capacity Manager settings as of ONE instant: what every operation that
+/// reports them answers from.
+///
+/// A view rather than the stored record, because the ingestion status is a fact of elapsed
+/// time that no store holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapacityManagerView {
+    /// The account's `CapacityManagerStatus`.
+    pub status: &'static str,
+    /// The account's `OrganizationsAccess`.
+    pub organizations_access: bool,
+    /// The `IngestionStatus` of the ingestion an enable started, and `None` when no enable
+    /// has started one — there is then no ingestion to report a status for.
+    pub ingestion_status: Option<&'static str>,
+}
+
+impl CapacityManagerSettings {
+    /// These settings as of `now`.
+    ///
+    /// The ingestion status is DERIVED from the instant the enable recorded, so two reads
+    /// at the same instant report the same word and a read writes nothing: an ingestion
+    /// whose instant has not yet fallen due is still
+    /// [`INGESTION_STATUS_INITIAL_IN_PROGRESS`], and one that has is
+    /// [`INGESTION_STATUS_COMPLETE`].
+    pub fn view_at(&self, now: Instant) -> CapacityManagerView {
+        CapacityManagerView {
+            status: self.status,
+            organizations_access: self.organizations_access,
+            ingestion_status: self.ingestion_complete_at.map(|due| {
+                if now >= due {
+                    INGESTION_STATUS_COMPLETE
+                } else {
+                    INGESTION_STATUS_INITIAL_IN_PROGRESS
+                }
+            }),
+        }
+    }
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// The account's Capacity Manager settings as of `now`.
+    ///
+    /// Reporting only: the one read every operation that answers these settings goes
+    /// through, so none of them can report the account two ways.
+    pub fn capacity_manager_at(&self, now: Instant) -> CapacityManagerView {
+        self.capacity_manager.view_at(now)
+    }
+
+    /// Turn Capacity Manager ON for the account with `organizations_access`, and answer the
+    /// settings as they now stand as of `now`.
+    ///
+    /// The one writer of the enable, so what a later report answers is always what this
+    /// left here. `organizations_access` is the request's own choice — "specifies whether
+    /// to enable cross-account access for Amazon Web Services Organizations"
+    /// (`EnableCapacityManagerRequest$OrganizationsAccess`) — so it is applied on every
+    /// enable.
+    ///
+    /// The ingestion is started only by the enable that turns the setting ON: an account
+    /// already enabled keeps the instant its first enable recorded, so re-enabling it does
+    /// not send a caught-up ingestion back to [`INGESTION_STATUS_INITIAL_IN_PROGRESS`].
+    /// That instant is one [`TRANSITION_DELAY`] out, the span every clock-owed move of this
+    /// store falls due after.
+    pub fn enable_capacity_manager(
+        &mut self,
+        organizations_access: bool,
+        now: Instant,
+    ) -> CapacityManagerView {
+        if self.capacity_manager.status != CAPACITY_MANAGER_ENABLED {
+            self.capacity_manager.status = CAPACITY_MANAGER_ENABLED;
+            self.capacity_manager.ingestion_complete_at = Some(now + TRANSITION_DELAY);
+        }
+        self.capacity_manager.organizations_access = organizations_access;
+        self.capacity_manager.view_at(now)
     }
 }
 

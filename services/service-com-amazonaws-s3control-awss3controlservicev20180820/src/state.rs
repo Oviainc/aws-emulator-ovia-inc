@@ -1001,6 +1001,34 @@ pub struct AccessGrantsInstanceRecord {
     /// with their own gap issues, and will read this field rather than a second
     /// copy.
     pub tags: Vec<Tag>,
+    /// The resource policy the last `PutAccessGrantsInstanceResourcePolicy`
+    /// stored; `None` until one is put, and `None` again once
+    /// `DeleteAccessGrantsInstanceResourcePolicy` removes it, which is what
+    /// `GetAccessGrantsInstanceResourcePolicy` refuses as a missing policy.
+    ///
+    /// On the instance record rather than in a map of its own: the policy is a
+    /// subresource of ONE instance, so it is read and written through the
+    /// instance it belongs to and cannot outlive it.
+    pub resource_policy: Option<AccessGrantsResourcePolicyRecord>,
+}
+
+/// The resource policy of one S3 Access Grants instance: the document
+/// `PutAccessGrantsInstanceResourcePolicy` stored, the organization it named,
+/// and when it was stored — everything that call and
+/// `GetAccessGrantsInstanceResourcePolicy` report.
+#[derive(Debug, Clone)]
+pub struct AccessGrantsResourcePolicyRecord {
+    /// The document the put call sent, byte for byte: the read answers what the
+    /// caller stored, not a re-serialized form of it.
+    pub policy: String,
+    /// "The Organization of the resource policy of the S3 Access Grants
+    /// instance" (`PutAccessGrantsInstanceResourcePolicyRequest$Organization`) —
+    /// `None` when the put named none, which is what the reads report as an
+    /// absent `Organization`.
+    pub organization: Option<String>,
+    /// When the policy was stored. A further put replaces the policy, so this
+    /// is the instant of the put the read reports.
+    pub created_at: ::aws_smithy_types::DateTime,
 }
 
 /// How a stored S3 Access Grants instance is keyed: the owning account id and
@@ -1480,6 +1508,42 @@ impl ComAmazonawsS3controlAwss3controlservicev20180820State {
             region.to_string(),
             grant_id.to_string(),
         ))
+    }
+
+    /// Remove the grant `grant_id` names from `account_id`'s instance in
+    /// `region` and answer it, or `None` when that instance has no such grant —
+    /// what `DeleteAccessGrant` releases, keyed exactly as [`Self::access_grant`]
+    /// reads it.
+    pub fn remove_access_grant(
+        &mut self,
+        account_id: &str,
+        region: &str,
+        grant_id: &str,
+    ) -> Option<AccessGrantRecord> {
+        self.access_grants.remove(&(
+            account_id.to_string(),
+            region.to_string(),
+            grant_id.to_string(),
+        ))
+    }
+
+    /// Whether any grant of `account_id`'s instance in `region` references the
+    /// location `location_id` names.
+    ///
+    /// A registered location is referenced by every grant whose scope was
+    /// computed from it, which is what makes deregistering it a refusal while
+    /// one of them is still there.
+    pub fn access_grants_location_is_referenced(
+        &self,
+        account_id: &str,
+        region: &str,
+        location_id: &str,
+    ) -> bool {
+        self.access_grants.values().any(|grant| {
+            grant.account_id == account_id
+                && grant.region == region
+                && grant.access_grants_location_id == location_id
+        })
     }
 
     /// The grant in `account_id`'s instance in `region` whose scope covers
@@ -2369,19 +2433,39 @@ pub fn access_grants_instance_store_full<E>() -> crate::scaffolded::Scaffolded<E
     )
 }
 
-/// `AccessGrantsLocationNotExistsError` (HTTP 404): the S3 Access Grants
-/// instance of the account the request names, in the Region it was signed for,
-/// has no location registered under that id.
+/// `NoSuchAccessGrantsLocationError` (HTTP 404): the S3 Access Grants instance
+/// of the account the request names, in the Region it was signed for, has no
+/// location registered under that id — because none was ever registered under
+/// it, or because the registration was deleted.
 ///
-/// The code and status follow the instance refusal one resource up
-/// ([`no_such_access_grants_instance`]): the Access Grants surface answers a
-/// missing resource with a `<Resource>NotExistsError` code and a 404, carried in
-/// the S3-style XML envelope because the model declares no error here.
-pub fn no_such_access_grants_location<E>(location_id: &str) -> crate::scaffolded::Scaffolded<E> {
+/// The message is the fixed sentence S3 Access Grants answers for a location id
+/// it holds no registration for, whichever id was asked about: it names no id,
+/// so every caller asking about a location that is not there is told the same
+/// thing. Carried in the S3-style XML envelope because the model declares no
+/// error here.
+pub fn no_such_access_grants_location<E>() -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::service_failure(
-        "AccessGrantsLocationNotExistsError",
+        "NoSuchAccessGrantsLocationError",
         404,
-        format!("Access Grants Location does not exist: {location_id}"),
+        "The specified access grants location does not exist",
+    )
+}
+
+/// `AccessGrantsLocationNotEmptyError` (HTTP 409): grants of this instance still
+/// reference the location, and `DeleteAccessGrantsLocation` documents the rule —
+/// "You can only delete a location registration from an S3 Access Grants
+/// instance if there are no grants associated with this location."
+///
+/// A conflict with the state the instance is in rather than a missing resource,
+/// so the status is the one [`access_grants_location_already_exists`] answers
+/// for the other conflict this resource has. The message is fixed text, as the
+/// missing-location refusal's is: what the caller must do about it — delete the
+/// grants first — is the same whichever location and however many grants.
+pub fn access_grants_location_not_empty<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        "AccessGrantsLocationNotEmptyError",
+        409,
+        "Please delete access grants before deleting access grants location",
     )
 }
 
@@ -2415,14 +2499,31 @@ pub fn access_grants_location_store_full<E>() -> crate::scaffolded::Scaffolded<E
     )
 }
 
-/// `AccessGrantNotExistsError` (HTTP 404): the instance has no grant under that
-/// id. The code and status follow the Access Grants surface's missing-resource
-/// refusal; see [`no_such_access_grants_location`].
-pub fn no_such_access_grant<E>(grant_id: &str) -> crate::scaffolded::Scaffolded<E> {
+/// `NoSuchAccessGrantError` (HTTP 404): the instance has no grant under that id,
+/// because none was created under it or the grant was deleted. The code, status
+/// and fixed message follow the Access Grants surface's missing-resource refusal
+/// one resource up; see [`no_such_access_grants_location`].
+pub fn no_such_access_grant<E>() -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::service_failure(
-        "AccessGrantNotExistsError",
+        "NoSuchAccessGrantError",
         404,
-        format!("Access Grant does not exist: {grant_id}"),
+        "The specified access grant does not exist",
+    )
+}
+
+/// `AccessGrantsInstanceResourcePolicyNotExists` (HTTP 404): the instance of the
+/// account the request names, in the Region it was signed for, carries no
+/// resource policy — none was put, or the one that was put has been deleted.
+///
+/// The policy is a subresource of one instance and has no id of its own, so the
+/// message is the fixed sentence the service answers for its absence; the status
+/// is the missing-resource 404 the rest of this surface answers (see
+/// [`no_such_access_grants_location`]).
+pub fn no_access_grants_instance_resource_policy<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        "AccessGrantsInstanceResourcePolicyNotExists",
+        404,
+        "Access Grants Instance Resource Policy does not exist",
     )
 }
 

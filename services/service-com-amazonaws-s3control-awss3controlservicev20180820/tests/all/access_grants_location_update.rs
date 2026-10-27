@@ -187,7 +187,7 @@ async fn get_location(
 }
 
 /// Update the IAM role of the registered location `location_id` names.
-async fn update_location(
+pub(crate) async fn update_location(
     emulator: &Emulator,
     account_id: &str,
     region: &str,
@@ -465,13 +465,17 @@ async fn an_id_the_instance_holds_no_location_of_is_refused_and_changes_nothing(
         );
         assert_eq!(
             refused.code(),
-            "AccessGrantsLocationNotExistsError",
+            "NoSuchAccessGrantsLocationError",
             "case {label:?}: expected the not-exists error code, got body {}",
             refused.body
         );
+        // The refusal is the same sentence whichever id was asked about: it
+        // says the location does not exist, and nothing about the request.
         assert!(
-            refused.body.contains(&location_id),
-            "case {label:?}: expected the refusal to name the location id asked about, got body {}",
+            refused
+                .body
+                .contains("The specified access grants location does not exist"),
+            "case {label:?}: expected the not-exists message, got body {}",
             refused.body
         );
     }

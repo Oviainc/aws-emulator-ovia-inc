@@ -199,7 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             if let Some(group) = guard.groups.get(&input.profiling_group_name) {
                 return Ok(CreateProfilingGroupOutput {
-                    profiling_group: group.created_description(),
+                    profiling_group: group.created_description(crate::state::now()),
                 });
             }
         }
@@ -273,7 +273,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // coming into existence: `SubmitFeedback` is what files the first one.
             anomaly_feedback: ::std::collections::VecDeque::new(),
         };
-        let description = group.created_description();
+        let description = group.created_description(created_at);
         guard
             .groups
             .insert(input.profiling_group_name.clone(), group);

@@ -27,6 +27,9 @@ use service_com_amazonaws_appfabric_fabricfrontendservice::state::{
 };
 
 use crate::app_bundle_ingestion_lifecycle::{arn_of, encode, is_v4_uuid, Answer, Emulator};
+use crate::ingestion_authorization_refusal_wording::{
+    NOT_CONNECTED_MESSAGE, NO_AUTHORIZATION_MESSAGE,
+};
 
 /// The email address every start call below searches for.
 const EMAIL: &str = "grace.hopper@example.com";
@@ -239,9 +242,9 @@ fn member(value: &Value, name: &str) -> String {
 /// that state, `CreateIngestion` creates an ingestion (readable back through
 /// `GetIngestion`) and `StartUserAccessTasks` mints a task for it; for every
 /// other state — including none at all — `CreateIngestion` is refused with the
-/// modelled `ValidationException` (HTTP 400) naming the held status, and the
-/// start call reports that authorization with the modelled `error` and no
-/// `taskId`.
+/// modelled `ValidationException` (HTTP 400) carrying the service's fixed
+/// sentence for the step the caller still owes, and the start call reports that
+/// authorization with the modelled `error` and no `taskId`.
 ///
 /// The table spans every set-up that reaches each state (never created, created
 /// and not connected, connected, connected then invalidated by an applied
@@ -323,18 +326,23 @@ async fn one_connect_handshake_rule_decides_both_dependent_operations() {
                 ingestion.body
             );
             let message = member(&ingestion.body, "message");
-            match setup.expected_status() {
-                // The held status is what tells a caller whether it still has to
-                // create the authorization or only to connect it.
-                Some(held) => assert!(
-                    message.contains(app) && message.contains(held),
-                    "case {case:?}: the refusal must name the app and the held status {held:?}, got {message:?}"
-                ),
-                None => assert!(
-                    message.contains(app) && !message.contains(APP_AUTHORIZATION_STATUS_PENDING_CONNECT),
-                    "case {case:?}: the refusal must name the app and no held status, got {message:?}"
-                ),
-            }
+            // The refusal carries the service's FIXED sentence for the step the
+            // caller still owes — the create step while the pair holds no
+            // authorization, the connect step once it holds one — and no value
+            // of the request or of the store. See
+            // `ingestion_authorization_refusal_wording` for the whole class.
+            let expected = match setup.expected_status() {
+                Some(_) => NOT_CONNECTED_MESSAGE,
+                None => NO_AUTHORIZATION_MESSAGE,
+            };
+            assert_eq!(
+                message, expected,
+                "case {case:?}: expected the service's fixed sentence, got {message:?}"
+            );
+            assert!(
+                !message.contains(app) && !message.contains(tenant),
+                "case {case:?}: the sentence must carry neither the app nor the tenant, got {message:?}"
+            );
         }
 
         // The second operation that asks it: the user-access fan-out over the

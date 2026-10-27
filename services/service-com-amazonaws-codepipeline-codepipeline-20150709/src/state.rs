@@ -50,7 +50,8 @@ pub mod rules;
 pub use driver::advance;
 pub use execution::{
     artifact_store, declared_action, declared_stage, is_terminal_status, plan_stage, plan_stages,
-    stage_states, ActionRun, ArtifactRef, StageRun, StopRequest, MAX_ARCHIVE_ENTRIES,
+    s3_source_pin, stage_states, ActionRun, ArtifactRef, S3SourcePin, StageRun, StopRequest,
+    MAX_ARCHIVE_ENTRIES,
     MAX_CONCURRENT_EXECUTIONS_PER_PIPELINE, MAX_EXTRACTED_BYTES, STATUS_FAILED, STATUS_STOPPED,
     STATUS_SUCCEEDED, STATUS_SUPERSEDED, TRANSITION_INBOUND, TRANSITION_OUTBOUND,
 };
@@ -3261,6 +3262,15 @@ pub struct PipelineExecutionRecord {
     /// The source revisions this execution was started with, plus the ones its source
     /// actions resolved as they ran.
     pub source_revisions: Vec<SourceRevision>,
+    /// The source-revision OVERRIDES this execution runs with, as the start that
+    /// created it stated them.
+    ///
+    /// What each one pins is decided by its `revisionType`, so this is what an action's
+    /// run consults ([`execution::s3_source_pin`]) rather than
+    /// [`Self::source_revisions`]: a revision REPORTED for an action, or recorded by
+    /// the source action that resolved it, says which revision the pipeline is running,
+    /// not which object or version to read.
+    pub source_overrides: Vec<crate::ops::types::SourceRevisionOverride>,
     /// The stages and actions this execution runs, pinned from the declaration at the
     /// instant it started.
     pub stages: Vec<StageRun>,

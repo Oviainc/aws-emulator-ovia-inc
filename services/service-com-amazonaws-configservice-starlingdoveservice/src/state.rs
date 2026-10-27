@@ -654,6 +654,21 @@ pub fn no_such_conformance_pack_message(missing: &[String]) -> String {
     )
 }
 
+/// How Config words `ResourceInUseException` for a conformance pack whose deployment
+/// workflow — a creation, an update or a deletion — has not settled yet, so the call
+/// cannot start another one for it.
+///
+/// The message is BUILT FROM THE REQUEST: the fixed sentence states that a workflow
+/// holds the pack, and its one variable part is the conformance pack name the caller
+/// named, so a client that fans several deployments out can tell WHICH pack is busy
+/// from the refusal alone. ONE template for every operation that refuses a pack whose
+/// workflow is in flight, so they cannot word the one refusal two ways.
+pub fn conformance_pack_workflow_in_progress_message(name: &str) -> String {
+    format!(
+        "A workflow is currently in progress for the Conformance Pack: {name}. Please try later."
+    )
+}
+
 /// How Config words `NoSuchConfigRuleInConformancePackException` ("Config rule that you
 /// passed in the filter does not exist") for a filter that named a rule the pack holds
 /// none of.

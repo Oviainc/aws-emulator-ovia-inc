@@ -214,7 +214,7 @@ fn refusal_for(violation: &Violation) -> Option<Refused> {
         // wording for this code lives in one place.
         (_, _) if missing && (member == "repositoryName" || leaf == "repositoryName") => (
             "RepositoryNameRequiredException",
-            "A repository name is required, but was not specified.",
+            crate::state::REPOSITORY_NAME_REQUIRED_MESSAGE,
         ),
         (_, _) if member == "repositoryName" || leaf == "repositoryName" => (
             "InvalidRepositoryNameException",

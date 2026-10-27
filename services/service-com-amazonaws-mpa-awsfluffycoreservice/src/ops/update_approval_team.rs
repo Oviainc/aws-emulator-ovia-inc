@@ -242,10 +242,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if status == crate::state::TeamStatus::Deleting {
             return Err(UpdateApprovalTeamErrorModeled::ConflictException(ConflictException {
-                message: format!(
+                message: crate::state::bounded_message(format!(
                     "Approval team '{}' is being deleted and cannot be updated.",
                     input.arn
-                ),
+                )),
             })
             .into());
         }
@@ -254,11 +254,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is moving to, and a second request would ask them to approve two.
         if let Some(version_id) = outstanding_update {
             return Err(UpdateApprovalTeamErrorModeled::ConflictException(ConflictException {
-                message: format!(
+                message: crate::state::bounded_message(format!(
                     "Approval team '{}' already has version '{version_id}' awaiting the team's \
                      approval, so it cannot be updated again.",
                     input.arn
-                ),
+                )),
             })
             .into());
         }
@@ -270,15 +270,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     a.primary_identity_source_arn.as_str(),
                 )
             })) {
-                return Err(UpdateApprovalTeamErrorModeled::ValidationException(
-                    ValidationException {
-                        message: format!(
-                            "Approvers names the same identity more than once ({repeated}); each \
-                             approver must be a distinct identity."
-                        ),
-                    },
-                )
-                .into());
+                return Err(
+                    UpdateApprovalTeamErrorModeled::ValidationException(repeated).into()
+                );
             }
         }
 

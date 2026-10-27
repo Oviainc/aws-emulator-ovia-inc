@@ -20,6 +20,7 @@ use service_com_amazonaws_appfabric_fabricfrontendservice::state::{
 };
 
 use crate::app_bundle_ingestion_lifecycle::{arn_of, encode, Emulator};
+use crate::ingestion_authorization_refusal_wording::NOT_CONNECTED_MESSAGE;
 
 /// A client token in the form the model's `UUID` pattern requires
 /// (`^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$`), built
@@ -282,11 +283,13 @@ async fn a_spent_token_replays_its_ingestion_after_the_dependency_stops_holding(
             refused.body
         );
         let refusal_message = member(&refused.body, "message");
-        assert!(
-            refusal_message.contains(app)
-                && refusal_message.contains(APP_AUTHORIZATION_STATUS_PENDING_CONNECT),
-            "case {case:?}: the refusal must name the app and the status the pair's authorization \
-             now holds, got {refusal_message:?}"
+        // The refusal carries the service's fixed sentence for the connect step
+        // the pair now owes again, with no value of the request or of the store
+        // in it — see `ingestion_authorization_refusal_wording`.
+        assert_eq!(
+            refusal_message, NOT_CONNECTED_MESSAGE,
+            "case {case:?}: expected the service's fixed sentence for an unconnected pair, got \
+             {refusal_message:?}"
         );
 
         // The retry, however often it comes, replays the ingestion the first

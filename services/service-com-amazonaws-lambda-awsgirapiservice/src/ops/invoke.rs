@@ -11,6 +11,16 @@
 //! includes a status code" — so the event is queued against the resolved version
 //! exactly as `InvokeAsync` queues one, and the accepted status is answered.
 //!
+//! An accepted `Event` invocation of a DURABLE function — one whose resolved
+//! configuration carries a `DurableConfig` — or one that names a `DurableExecutionName`
+//! also STARTS a durable execution in the function's own durable-execution state, and
+//! answers the ARN that execution is addressed by: "The ARN of the durable execution that
+//! was started. This is returned when invoking a durable function and provides a unique
+//! identifier for tracking the execution." `ListDurableExecutionsByFunction` reports the
+//! execution from that moment on, a repeat of a live name carrying the same payload
+//! answers the execution already started rather than a duplicate, and one carrying a
+//! different payload is the modelled `DurableExecutionAlreadyStartedException`.
+//!
 //! Running the deployment package is NOT implemented: this emulator has no in-process
 //! runtime for a Lambda zip archive or container image, so `RequestResponse` answers
 //! HTTP 501 rather than a payload no function produced, and a queued asynchronous
@@ -505,10 +515,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The payload is the EMPTY one rather than no payload at all, for the reason
             // the dry run's is (`Payload` is this operation's `@httpPayload`, so it IS
             // the body the accepted status carries).
-            record.queue_async_invocation(&version, payload, now);
+            //
+            // An accepted invocation of a DURABLE function also STARTS a durable
+            // execution, which is the handle every durable-execution operation addresses:
+            // `DurableExecutionName` is "A unique name for the durable execution […] If
+            // not specified, Lambda generates a unique identifier automatically", and
+            // `DurableExecutionArn` is "The ARN of the durable execution that was started.
+            // This is returned when invoking a durable function". So the execution is
+            // registered before the event is queued — a start that is refused queues
+            // nothing — and its ARN is answered.
+            let started = start_durable_execution(
+                record,
+                input.durable_execution_name.as_deref(),
+                &version,
+                &payload,
+                now,
+            )?;
+            // A repeat that named an execution already started is the SAME invocation,
+            // not a second one — "Lambda returns the existing execution instead of
+            // creating a duplicate" — so it queues no second event either.
+            if !started.deduplicated {
+                record.queue_async_invocation(&version, payload, now);
+            }
             return Ok(InvokeOutput {
                 status_code: ACCEPTED_STATUS,
                 payload: Some(Vec::new()),
+                durable_execution_arn: started.durable_execution_arn,
                 ..InvokeOutput::default()
             });
         }
@@ -530,6 +562,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         ))
     }
+}
+
+/// Start the durable execution an accepted invocation of `record` starts, reporting the
+/// ARN to answer for it and whether the invocation was de-duplicated onto one already
+/// started.
+///
+/// An invocation starts one when it is an invocation of a DURABLE function (one whose
+/// resolved configuration carries a `DurableConfig`, which is "Configuration settings for
+/// durable functions"), or when the caller named a `DurableExecutionName`, which is the
+/// name a durable execution is addressed by. Every other invocation starts none, so no
+/// execution is registered for a function that has none.
+///
+/// The name is the one the request named, or a generated one: "If not specified, Lambda
+/// generates a unique identifier automatically." A name the function already holds never
+/// starts a second execution — the one already started answers the repeat that carries the
+/// same payload, and the repeat whose payload differs is the modelled
+/// `DurableExecutionAlreadyStartedException`.
+fn start_durable_execution(
+    record: &mut crate::state::FunctionRecord,
+    requested_name: Option<&str>,
+    version: &str,
+    payload: &[u8],
+    now: ::std::time::SystemTime,
+) -> Result<StartedDurableExecution, InvokeError> {
+    let durable = record
+        .config_of(version)
+        .is_some_and(|config| config.durable_config.is_some());
+    if !durable && requested_name.is_none() {
+        return Ok(StartedDurableExecution::default());
+    }
+    let name = requested_name
+        .map(str::to_string)
+        .unwrap_or_else(crate::state::mint_durable_execution_name);
+    // The execution runs under the VERSION the call resolved, not under the qualifier it
+    // named: the modelled `DurableExecutionArn` pattern admits `$LATEST` or a version
+    // number there and no alias name, and an alias names the version it invokes.
+    let resolved = record
+        .resolved_version(version)
+        .unwrap_or_else(|| version.to_string());
+    match record.start_durable_execution(&name, &resolved, payload, now) {
+        crate::state::DurableExecutionStart::Started(arn) => Ok(StartedDurableExecution {
+            durable_execution_arn: Some(arn),
+            deduplicated: false,
+        }),
+        // "If you invoke a durable function using a name that already exists with the
+        // same payload, Lambda returns the existing execution instead of creating a
+        // duplicate."
+        crate::state::DurableExecutionStart::AlreadyStarted(arn) => {
+            Ok(StartedDurableExecution {
+                durable_execution_arn: Some(arn),
+                deduplicated: true,
+            })
+        }
+        crate::state::DurableExecutionStart::NameAlreadyStarted => Err(
+            InvokeErrorModeled::DurableExecutionAlreadyStartedException(
+                DurableExecutionAlreadyStartedException {
+                    r#type: None,
+                    message: Some(format!(
+                        "The durable execution {name} has already been started. Each durable \
+                         execution name must be unique within the function. Use a different \
+                         name or check the status of the existing execution."
+                    )),
+                },
+            )
+            .into(),
+        ),
+        crate::state::DurableExecutionStart::LimitExceeded => {
+            Err(InvokeErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    r#type: None,
+                    message: Some(format!(
+                        "Durable execution limit exceeded: this function already holds the \
+                         maximum of {} durable executions.",
+                        crate::state::MAX_DURABLE_EXECUTIONS
+                    )),
+                },
+            )
+            .into())
+        }
+    }
+}
+
+/// What an accepted invocation's durable execution came to: the ARN to report for it, if
+/// the invocation started one at all, and whether the invocation was DE-DUPLICATED onto an
+/// execution already started rather than starting one.
+#[derive(Default)]
+struct StartedDurableExecution {
+    /// The `DurableExecutionArn` to answer, absent when the invocation starts no durable
+    /// execution.
+    durable_execution_arn: Option<String>,
+    /// Whether this invocation named an execution the function already held, carrying the
+    /// same payload — the repeat the model answers with "the existing execution instead of
+    /// creating a duplicate", which therefore performs nothing a second time.
+    deduplicated: bool,
 }
 
 /// `InvocationType` values, from the model's `InvocationType` enum

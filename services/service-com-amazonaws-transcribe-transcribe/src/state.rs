@@ -15,8 +15,8 @@
 //! and input type it was created with and its projection onto `CategoryProperties` —
 //! the custom LANGUAGE models ([`LanguageModelRecord`]), each a record of the
 //! base model, language and training data a create named, with its
-//! `IN_PROGRESS` -> `FAILED` transition and its projection onto the modelled
-//! `LanguageModel` shape — the Call Analytics jobs ([`CallAnalyticsJobRecord`]), each
+//! `IN_PROGRESS` -> `COMPLETED` (or `FAILED`) transition and its projection onto the
+//! modelled `LanguageModel` shape — the Call Analytics jobs ([`CallAnalyticsJobRecord`]), each
 //! a record of the media, output location and settings a start named, with its own
 //! `IN_PROGRESS` -> `COMPLETED` transition and its projections onto `CallAnalyticsJob`
 //! and `CallAnalyticsJobSummary` — and the Medical Scribe (AWS HealthScribe) jobs, each a
@@ -99,11 +99,13 @@
 //! ([`identified_language`]), the format the media URI it was given names
 //! ([`media_format_of`]) and this family's own sample rate
 //! ([`CALL_AUDIO_SAMPLE_RATE_HERTZ`]). A custom
-//! language model is the MEDICAL vocabulary's case again: its
-//! training and tuning data can only be read from the Amazon S3 location a create
-//! names ([`LanguageModelRecord`]), so the record is real and the training it cannot
-//! run ends in the service's own modelled `FAILED` state — nothing here reports a
-//! `COMPLETED` model, because nothing trained one. A Medical Scribe job is the job
+//! language model is NOT that case: its training and tuning data come from the Amazon
+//! S3 locations a create names, this emulator's own Amazon S3 answers for them in
+//! process ([`resolve_training_data`]), and no operation of that family reports
+//! anything derived from the data itself — so a model whose data the object store
+//! answers for finishes `COMPLETED` and is usable, and only a location that store says
+//! cannot be read ends a model `FAILED`, with the reason its answer grounds (see
+//! [`LanguageModelRecord`] and [`TrainingDataVerdict`]). A Medical Scribe job is the job
 //! RECORD too, and the strongest case of the same limit: no conversation is
 //! transcribed, no speaker role is identified and no clinical note is generated, so
 //! the `MedicalScribeOutput.TranscriptFileUri` / `ClinicalDocumentUri` a completed
@@ -737,11 +739,13 @@ pub const MAX_CALL_ANALYTICS_CATEGORIES: usize = 100;
 /// (`smithy_query(query="shape", shape="ModelStatus")`): a custom language model is
 /// being trained, has finished training, or failed.
 pub const MODEL_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
-/// See [`MODEL_STATUS_IN_PROGRESS`]. No model this emulator records reaches it:
-/// training would have to READ the training data at `InputDataConfig$S3Uri`, which
-/// this emulator does not do (see [`LanguageModelRecord`]).
+/// See [`MODEL_STATUS_IN_PROGRESS`]: the status a model whose training data the object
+/// store answered for settles in, and the one that makes it usable ("When the status
+/// displays as COMPLETED, your model is ready to use").
 pub const MODEL_STATUS_COMPLETED: &str = "COMPLETED";
-/// See [`MODEL_STATUS_IN_PROGRESS`].
+/// See [`MODEL_STATUS_IN_PROGRESS`]: the status a model settles in when the object
+/// store says a location its create named cannot be read (see
+/// [`TrainingDataVerdict`]).
 pub const MODEL_STATUS_FAILED: &str = "FAILED";
 
 /// Whether a custom language model in `status` has finished training, so the service
@@ -757,8 +761,8 @@ pub fn is_terminal_model_status(status: &str) -> bool {
 }
 
 /// How long after the call that starts it a custom language model's next status
-/// transition is owed (`IN_PROGRESS` -> `FAILED` for one whose training data this
-/// emulator cannot read).
+/// transition is owed (`IN_PROGRESS` -> the status its training data settles on,
+/// `COMPLETED` or `FAILED` — see [`TrainingDataVerdict`]).
 ///
 /// A chosen span, not a documented one: Amazon Transcribe gives no training-time
 /// guarantee for a custom language model. It is deliberately non-zero, so a caller
@@ -1810,12 +1814,16 @@ impl ComAmazonawsTranscribeTranscribeState {
     ///
     /// * a custom vocabulary FILTER models no processing state anywhere (see
     ///   [`VocabularyFilterRecord`]), so a held filter is always applicable;
-    /// * a custom MEDICAL vocabulary ([`MedicalVocabularyRecord`]) and a custom
-    ///   LANGUAGE model ([`LanguageModelRecord`]) are built only from a location this
-    ///   emulator reads nothing from, so no record of either family ever reaches a
-    ///   usable state. Refusing every job that names one would refuse a request the real
-    ///   service serves — a limitation of this emulator's build, not an error in the
-    ///   caller's request — so a held resource of those families is applied as named;
+    /// * a custom LANGUAGE model ([`LanguageModelRecord`]) is checked for existence
+    ///   only: whether a job may name a model still training, or one whose training
+    ///   failed, is a rule about what a job START admits, which each start operation's
+    ///   own validation owns rather than this lookup;
+    /// * a custom MEDICAL vocabulary ([`MedicalVocabularyRecord`]) is built only from a
+    ///   location this emulator reads nothing from, so no record of that family ever
+    ///   reaches a usable state. Refusing every job that names one would refuse a
+    ///   request the real service serves — a limitation of this emulator's build, not
+    ///   an error in the caller's request — so a held medical vocabulary is applied as
+    ///   named;
     /// * the job families are never the target of a settings reference.
     fn unusable_reference_state(
         &mut self,
@@ -2285,19 +2293,24 @@ pub fn file_not_read_failure_reason(kind: &str, file_uri: &str) -> String {
 /// location a create named, plus the lifecycle facts the service itself owns (its
 /// training status and its timestamps).
 ///
-/// WHAT IS REAL HERE: the record. A custom language model's training and tuning data
-/// can only come from the Amazon S3 location at `InputDataConfig$S3Uri`, which
-/// `CreateLanguageModel` models `@required` and for which it publishes no inline
-/// alternative ("The location of your training and tuning files (this must be an
-/// Amazon S3 URI)" — the operation's own doc). Reading that location is work this
-/// emulator cannot perform, so the resource is recorded — its name, language, base
-/// model, input data config, status, timestamps and tag set are the control plane
-/// every operation of this family reports — and the training it cannot run ends in
-/// the service's own modelled failure state: [`MODEL_STATUS_IN_PROGRESS`] at the
-/// create, then [`MODEL_STATUS_FAILED`] with a `FailureReason` that says the data was
-/// not read ([`language_model_failure_reason`]) once the clock makes that transition
-/// due. Nothing here reports a `COMPLETED` model, because nothing trained one; this
-/// is the custom MEDICAL vocabulary's case again ([`MedicalVocabularyRecord`]).
+/// WHAT IS REAL HERE: the record, and the one thing the training run has to establish
+/// about the data it is given — whether that data is THERE. A custom language model's
+/// training and tuning data come from the Amazon S3 locations at
+/// `InputDataConfig$S3Uri` and `InputDataConfig$TuningDataS3Uri`, and this emulator's
+/// own Amazon S3 answers for them in process ([`resolve_training_data`]), so a create
+/// resolves them exactly as the service's training run would. Nothing of a model's
+/// content is reported anywhere — the `LanguageModel` shape carries the name, the
+/// timestamps, the language, the base model, the status, the upgrade availability, the
+/// failure reason, the input data config and the encryption configuration, and no
+/// member of any operation of this family reports a trained artifact — so a model
+/// whose training data the object store answers for finishes:
+/// [`MODEL_STATUS_IN_PROGRESS`] at the create, then [`MODEL_STATUS_COMPLETED`] once
+/// the clock makes the transition due, which is the status that makes the model usable
+/// ("When the status displays as COMPLETED, your model is ready to use" — the model's
+/// own doc for `ModelStatus`). A model settles in [`MODEL_STATUS_FAILED`], with the
+/// `FailureReason` the store's answer grounds, only where that answer says a location
+/// cannot be read: nothing is failed on an assumption, so a location no object store
+/// answered for at all fails nothing ([`TrainingDataVerdict`]).
 #[derive(Debug, Clone)]
 pub struct LanguageModelRecord {
     /// `ModelName`, with the Region, this record's key in the store.
@@ -2309,19 +2322,23 @@ pub struct LanguageModelRecord {
     pub language_code: String,
     /// `BaseModelName`: the standard Amazon Transcribe model this one was built on.
     pub base_model_name: String,
-    /// `InputDataConfig`: where the training (and optionally tuning) data would be
-    /// read from, and the role that would read it. Held so the failure reason can
-    /// name it and every reader can report it; never fetched.
+    /// `InputDataConfig`: where the training (and optionally tuning) data is read
+    /// from, and the role that would read it. Held so every reader can report it and
+    /// so a failure reason can name the location that could not be read.
     pub input_data_config: InputDataConfig,
     /// `EncryptionConfiguration`, as the create named it, or `None`.
     pub encryption_configuration: Option<EncryptionConfiguration>,
     /// `ModelStatus`: [`MODEL_STATUS_IN_PROGRESS`] until the clock makes the training
-    /// due, then [`MODEL_STATUS_FAILED`].
+    /// due, then the status [`Self::training_data`] settles on.
     pub status: String,
     /// `FailureReason`, set only on a `FAILED` model.
     pub failure_reason: Option<String>,
-    /// When `IN_PROGRESS` -> `FAILED` falls due; `None` once it has been materialised.
-    pub failed_due: Option<SystemTime>,
+    /// What the object store answered about this model's training and tuning data when
+    /// the create resolved them — which is what the clock-owed transition settles on.
+    pub training_data: TrainingDataVerdict,
+    /// When the `IN_PROGRESS` -> terminal transition falls due; `None` once it has
+    /// been materialised.
+    pub settles_due: Option<SystemTime>,
     /// `CreateTime`: when the create that stored this record was served.
     pub create_time: SystemTime,
     /// `LastModifiedTime`: when the record last changed.
@@ -2331,7 +2348,9 @@ pub struct LanguageModelRecord {
 
 impl LanguageModelRecord {
     /// The record a create of `name` stores: `IN_PROGRESS`, with its one clock-owed
-    /// transition already due at a fixed span from `now`.
+    /// transition already due at a fixed span from `now` and the verdict that
+    /// transition settles on — what the object store answered about the training data
+    /// the request named ([`resolve_training_data`]).
     ///
     /// Single-homed so the create and any later update cannot disagree about the
     /// invariant that an `IN_PROGRESS` record always carries the instant its
@@ -2345,6 +2364,7 @@ impl LanguageModelRecord {
         input_data_config: InputDataConfig,
         encryption_configuration: Option<EncryptionConfiguration>,
         tags: Vec<Tag>,
+        training_data: TrainingDataVerdict,
         now: SystemTime,
     ) -> Self {
         Self {
@@ -2356,7 +2376,8 @@ impl LanguageModelRecord {
             encryption_configuration,
             status: MODEL_STATUS_IN_PROGRESS.to_string(),
             failure_reason: None,
-            failed_due: Some(now + MODEL_TRANSITION_DELAY),
+            training_data,
+            settles_due: Some(now + MODEL_TRANSITION_DELAY),
             create_time: now,
             last_modified_time: now,
             tags,
@@ -2367,19 +2388,22 @@ impl LanguageModelRecord {
     /// at its stored instant whether or not anybody called. A reporting operation
     /// (`DescribeLanguageModel`, a listing) runs this before projecting the record,
     /// and that is the only write it performs.
+    ///
+    /// WHICH status it moves to was decided when the create resolved the training data
+    /// ([`TrainingDataVerdict::settles`]), so a read neither resolves anything nor
+    /// changes what the next read sees.
     pub fn advance_clock(&mut self, now: SystemTime) {
         if self.status != MODEL_STATUS_IN_PROGRESS {
             return;
         }
-        if let Some(due) = self.failed_due.filter(|due| now >= *due) {
-            self.status = MODEL_STATUS_FAILED.to_string();
-            self.failure_reason = Some(language_model_failure_reason(
-                &self.input_data_config.s3_uri,
-            ));
+        if let Some(due) = self.settles_due.filter(|due| now >= *due) {
+            let (status, failure_reason) = self.training_data.settles();
+            self.status = status.to_string();
+            self.failure_reason = failure_reason;
             // The resource changed when the training ended, so the modification
             // instant is that of the transition, not of the request that started it.
             self.last_modified_time = due;
-            self.failed_due = None;
+            self.settles_due = None;
         }
     }
 
@@ -2406,18 +2430,242 @@ impl LanguageModelRecord {
     }
 }
 
-/// Why a custom language model this emulator recorded ends `FAILED`: the Amazon S3
-/// location its training data would have come from is one this emulator does not read
-/// (see [`LanguageModelRecord`]).
+/// What the object store answered about the data a custom language model's training
+/// run reads (see [`LanguageModelRecord`]).
+///
+/// The verdict is read from Amazon S3's own answer and nothing else: a refusal has to
+/// be GROUNDED in what the store said, so a location no store answered for at all is
+/// [`Self::Unknown`] rather than a failure, and nothing is failed on an assumption.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrainingDataVerdict {
+    /// Every location the create named holds objects to train from.
+    Readable,
+    /// The store answered that a location cannot be read — nothing is stored under it,
+    /// the bucket is not there, or the read is not permitted. The text is the
+    /// `FailureReason` the model carries once its training ends
+    /// ([`training_data_unreadable_reason`]).
+    Unreadable(String),
+    /// Nothing is known about the data: there was no object store to ask, or the
+    /// location is not one an object store can be asked about.
+    Unknown,
+}
+
+impl TrainingDataVerdict {
+    /// The `ModelStatus` a model whose training data this verdict is about settles in,
+    /// with the `FailureReason` a failed one carries ("If `ModelStatus` is `FAILED`,
+    /// `FailureReason` contains information about why the custom language model request
+    /// failed" — the model's doc for `LanguageModel$FailureReason`).
+    ///
+    /// Nothing of a model's content is reported by any operation of this family, so a
+    /// training run that was given data has nothing left to establish and the model is
+    /// ready to use; only a location the store refused ends the run in the modelled
+    /// failure state. [`Self::Unknown`] settles the same way as [`Self::Readable`] —
+    /// deliberately, because it is the absence of an answer and not evidence that the
+    /// data is missing: a failure this emulator could not ground would refuse a caller
+    /// the real service serves.
+    pub fn settles(&self) -> (&'static str, Option<String>) {
+        match self {
+            Self::Readable | Self::Unknown => (MODEL_STATUS_COMPLETED, None),
+            Self::Unreadable(reason) => (MODEL_STATUS_FAILED, Some(reason.clone())),
+        }
+    }
+}
+
+/// The member of `InputDataConfig` that names a model's training data.
+pub const TRAINING_DATA_MEMBER: &str = "InputDataConfig.S3Uri";
+/// The member of `InputDataConfig` that names a model's tuning data.
+pub const TUNING_DATA_MEMBER: &str = "InputDataConfig.TuningDataS3Uri";
+
+/// Resolve the data a custom language model would be trained and tuned from against
+/// this emulator's own Amazon S3, and report what that read established.
+///
+/// The locations are resolved when the model is CREATED, which is when the service's
+/// training run reads them, and the verdict is stored on the record so the clock-owed
+/// transition settles on it without any read having to resolve anything
+/// ([`LanguageModelRecord::advance_clock`]). S3 is reached the way any emulated
+/// service reaches another: through the in-process callback
+/// ([`smithy_server_runtime::OperationContext::callback`], which dispatches inside
+/// this process — see [`s3_client`]: no socket, no outbound request, no host
+/// resolution).
+///
+/// Both locations are resolved, in the order the operation documents them: training
+/// data is `@required` and tuning data optional, and a run cannot tune from data that
+/// is not there either, so the FIRST location the store refuses is the one the failure
+/// reason names. A location the store refuses nothing about contributes no failure.
+pub async fn resolve_training_data(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    input_data_config: &InputDataConfig,
+) -> TrainingDataVerdict {
+    let client = s3_client(ctx, region);
+    let mut verdict = TrainingDataVerdict::Readable;
+    for (member, uri) in [
+        (TRAINING_DATA_MEMBER, Some(input_data_config.s3_uri.as_str())),
+        (
+            TUNING_DATA_MEMBER,
+            input_data_config.tuning_data_s3_uri.as_deref(),
+        ),
+    ] {
+        let Some(uri) = uri else { continue };
+        match read_training_location(&client, member, uri).await {
+            TrainingDataVerdict::Readable => {}
+            // The first refusal decides: it is the one the model reports.
+            unreadable @ TrainingDataVerdict::Unreadable(_) => return unreadable,
+            TrainingDataVerdict::Unknown => verdict = TrainingDataVerdict::Unknown,
+        }
+    }
+    verdict
+}
+
+/// What Amazon S3 answers about the objects under ONE location of a create's input
+/// data config.
+///
+/// The read is a LISTING, not a fetch: a training location is a prefix holding the
+/// text files a model is trained from ("Here's an example URI path:
+/// `s3://DOC-EXAMPLE-BUCKET/my-model-training-data/`" — the model's doc for
+/// `InputDataConfig$S3Uri`), so what the run has to establish is that the prefix holds
+/// files at all, and no byte of them is read or stored: no member of this family
+/// reports anything derived from a model's training data.
+///
+/// A key ending in the delimiter is a folder marker rather than a file, so a location
+/// holding only markers holds no training data. The walk therefore stops at the FIRST
+/// file it sees, and pages on only while every key so far has been a marker and the
+/// listing says more keys follow — so the answer does not depend on how many markers a
+/// caller staged ahead of its files, while the number of pages a create reads is
+/// bounded by [`MAX_TRAINING_DATA_PAGES`] whatever is under the prefix.
+async fn read_training_location(
+    client: &::aws_sdk_s3::Client,
+    member: &str,
+    uri: &str,
+) -> TrainingDataVerdict {
+    use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
+
+    // `Uri`'s own `@pattern` admits an `http(s)://` location too, which is not an
+    // address this emulator asks an object store about: nothing is known about it.
+    let Some((bucket, prefix)) = s3_bucket_and_path(uri) else {
+        return TrainingDataVerdict::Unknown;
+    };
+    let mut continuation: Option<String> = None;
+    for _ in 0..MAX_TRAINING_DATA_PAGES {
+        match client
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix(prefix)
+            .set_continuation_token(continuation.take())
+            .send()
+            .await
+        {
+            Ok(page) => {
+                let holds_data = page
+                    .contents()
+                    .iter()
+                    .any(|object| object.key().is_some_and(|key| !key.ends_with('/')));
+                if holds_data {
+                    return TrainingDataVerdict::Readable;
+                }
+                match page.next_continuation_token() {
+                    // Only markers so far, and the store says there are more keys:
+                    // the files may be behind them.
+                    Some(token) => continuation = Some(token.to_string()),
+                    // The store has shown every key under the location and not one of
+                    // them is a file.
+                    None => {
+                        return TrainingDataVerdict::Unreadable(training_data_absent_reason(
+                            member, uri,
+                        ))
+                    }
+                }
+            }
+            Err(error) => {
+                let code = error.code().unwrap_or_default();
+                if location_is_unreadable(code) {
+                    // The store says the location is not there, or not readable by this
+                    // account: the failure is grounded in its answer.
+                    return TrainingDataVerdict::Unreadable(training_data_unreadable_reason(
+                        member, uri, code,
+                    ));
+                }
+                // Any other answer is this emulator failing to ask its own object store,
+                // not the store reporting an unreadable location, so it fails nothing —
+                // and it is worth a warning, because a deployment with no S3 mounted to
+                // ask is one where this resolution does not run. The caller's own value
+                // is rendered with its escaped `Debug` form, so a URI carrying a newline
+                // cannot forge a log line.
+                ::tracing::warn!(
+                    member = member,
+                    uri = ?uri,
+                    code = ?error.code(),
+                    error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                    "a custom language model's data could not be resolved against the \
+                     emulator's Amazon S3"
+                );
+                return TrainingDataVerdict::Unknown;
+            }
+        }
+    }
+    // Every key the walk was allowed to look at is a folder marker and more follow:
+    // whether a file sits behind them is not something this read established, so it
+    // grounds no failure.
+    ::tracing::warn!(
+        member = member,
+        uri = ?uri,
+        "a custom language model's data holds more than the folder markers this \
+         emulator walks, so whether it holds files was not established"
+    );
+    TrainingDataVerdict::Unknown
+}
+
+/// How many listing pages one location of a create's input data config is walked for
+/// before the read gives up (see [`read_training_location`]).
+///
+/// The walk only pages while every key it has seen is a folder marker, so this bounds
+/// the pathological case — a location staged with nothing but markers — rather than the
+/// ordinary one, which the first page answers. Each page is one in-process listing of
+/// at most the object store's own page size, so a create reads a bounded number of them
+/// however much a caller staged.
+const MAX_TRAINING_DATA_PAGES: usize = 8;
+
+/// Whether `code` is Amazon S3 saying a location a create named cannot be READ:
+/// either one of the codes in which it reports that an address holds nothing
+/// ([`ABSENT_OBJECT_CODES`], the same list the media resolution refuses on — a listing
+/// addresses no object version, so the version code among them cannot arise here) or
+/// one of the codes in which it reports that the read is not permitted
+/// ([`FORBIDDEN_READ_CODES`]). Every other answer is this emulator failing to ask,
+/// which grounds no failure (see [`read_training_location`]).
+fn location_is_unreadable(code: &str) -> bool {
+    ABSENT_OBJECT_CODES.contains(&code) || FORBIDDEN_READ_CODES.contains(&code)
+}
+
+/// The Amazon S3 error codes in which S3 reports that a read is NOT PERMITTED, as
+/// opposed to that the address holds nothing ([`ABSENT_OBJECT_CODES`]). A custom
+/// language model's training data is read with the role the request named, so "you may
+/// not read this" is as much a grounded reason for the training to fail as "there is
+/// nothing there".
+const FORBIDDEN_READ_CODES: &[&str] = &["AccessDenied", "AllAccessDisabled"];
+
+/// Why a custom language model ends `FAILED` when the object store holds nothing under
+/// a location the create named: there is no data to train (or tune) from.
 ///
 /// The wording is this emulator's own — AWS publishes no text for a custom language
-/// model's `FailureReason` — and it names the URI the request gave, so a caller can
-/// see which location was not read.
-pub fn language_model_failure_reason(s3_uri: &str) -> String {
+/// model's `FailureReason` — and it names the member and the location the store
+/// answered for, so a caller can see which of the two locations was empty.
+pub fn training_data_absent_reason(member: &str, uri: &str) -> String {
     format!(
-        "The InputDataConfig S3Uri {s3_uri} was not read: this emulator reads no object \
-         store and makes no outbound request, so it cannot train a custom language \
-         model from data held there. No model was trained."
+        "The {member} {uri} holds no files: Amazon S3 reports no object under that \
+         location, so there was nothing to train this custom language model from. \
+         Upload your data and create the model again."
+    )
+}
+
+/// Why a custom language model ends `FAILED` when the object store refuses a location
+/// the create named: `code` is the answer S3 gave, so the reason says which location
+/// could not be read and what the store said about it. See
+/// [`training_data_absent_reason`].
+pub fn training_data_unreadable_reason(member: &str, uri: &str, code: &str) -> String {
+    format!(
+        "The {member} {uri} could not be read: Amazon S3 answered {code}. Check that \
+         the location exists and that the DataAccessRoleArn you specified has \
+         permission to read it, then create the model again."
     )
 }
 
@@ -2933,6 +3181,13 @@ const BUCKET_EXISTS_STATUS: u16 = 409;
 const UNCONSTRAINED_BUCKET_REGION: &str = "us-east-1";
 
 /// An Amazon S3 client over the in-process callback into this same emulator.
+///
+/// The ONE client this service reaches object storage with: a job start resolving the
+/// media location it was given, the listings that resolve a custom language model's
+/// training and tuning data ([`resolve_training_data`]) and the writes that store a
+/// custom vocabulary's or filter's built text file ([`store_vocabulary_content`]) all
+/// go through it, so none of them can reach the object store in a way the others
+/// would not.
 ///
 /// The callback is the framework's documented seam for calling another emulated
 /// service: it routes in process, so no network client is configured here and this
@@ -3719,17 +3974,34 @@ pub fn media_format_of(media: &Media) -> Option<String> {
         .map(|format| (*format).to_string())
 }
 
+/// The Amazon S3 bucket an `s3://` URI addresses, together with everything after it —
+/// the key, or the key PREFIX, which is empty for a URI that names the bucket alone.
+///
+/// The ONE `s3://` parse this service makes: the training and tuning locations of a
+/// custom language model ([`read_training_location`]) are prefixes, so they may name a
+/// bucket with nothing after it, while a media URI names an object and layers the
+/// non-empty-key requirement on top of this ([`media_object_address`]) — so the two
+/// cannot disagree about what a URI addresses.
+///
+/// `None` for a value that addresses no bucket, including the `http(s)://` form the
+/// `Uri` pattern also admits, which addresses a HOST, and this emulator resolves no
+/// hosts, so such a URI names nothing it can ask an object store about.
+fn s3_bucket_and_path(uri: &str) -> Option<(&str, &str)> {
+    let rest = uri.trim().strip_prefix("s3://")?;
+    let (bucket, path) = rest.split_once('/').unwrap_or((rest, ""));
+    (!bucket.is_empty()).then_some((bucket, path))
+}
+
 /// The Amazon S3 object a media URI addresses: its bucket and its key.
 ///
 /// `Media$MediaFileUri` is "The Amazon S3 location of the media file you want to
 /// transcribe", spelled `s3://DOC-EXAMPLE-BUCKET/media-files/my-media-file.flac` in the
 /// member's own examples: the first path segment is the bucket and everything after it
-/// is the key. `None` for a URI that addresses no such pair — including the
-/// `http(s)://` form the member's pattern also admits, which addresses a HOST, and this
-/// emulator resolves no hosts, so such a URI names no object it can ask about.
+/// is the key. [`s3_bucket_and_path`] with the requirement this member adds — a media
+/// URI names an OBJECT, so a URI naming only a bucket addresses none.
 fn media_object_address(uri: &str) -> Option<(&str, &str)> {
-    let (bucket, key) = uri.trim().strip_prefix("s3://")?.split_once('/')?;
-    (!bucket.is_empty() && !key.is_empty()).then_some((bucket, key))
+    let (bucket, key) = s3_bucket_and_path(uri)?;
+    (!key.is_empty()).then_some((bucket, key))
 }
 
 /// Whether `uri` is of the Amazon S3 scheme and yet addresses NO object of it

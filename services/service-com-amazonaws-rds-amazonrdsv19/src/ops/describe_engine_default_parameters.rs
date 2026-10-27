@@ -430,6 +430,17 @@ pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "Stores each InnoDB table and its indexes in a tablespace file of its own.",
     ),
     parameter(
+        "innodb_flush_log_at_trx_commit",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "0,1,2",
+        "1",
+        true,
+        "",
+        "Controls the balance between strict ACID compliance for commit operations and the \
+         higher performance of flushing the log less often.",
+    ),
+    parameter(
         "innodb_lock_wait_timeout",
         crate::state::APPLY_TYPE_DYNAMIC,
         "integer",
@@ -471,6 +482,17 @@ pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "Whether table names are stored on disk and compared case-insensitively.",
     ),
     parameter(
+        "max_allowed_packet",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "1024-1073741824",
+        "67108864",
+        true,
+        "",
+        "The maximum size in bytes of one packet, of any generated string, and of any \
+         intermediate string.",
+    ),
+    parameter(
         "max_connections",
         crate::state::APPLY_TYPE_DYNAMIC,
         "integer",
@@ -490,6 +512,17 @@ pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "",
         "The maximum number of simultaneous connections permitted to any one database \
          account; 0 means no limit.",
+    ),
+    parameter(
+        "net_read_timeout",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "1-31536000",
+        "30",
+        true,
+        "",
+        "The time in seconds the server waits for more data from a connection before \
+         aborting the read.",
     ),
     parameter(
         "slow_query_log",
@@ -528,6 +561,17 @@ pub(crate) const POSTGRES_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "Starts the autovacuum subprocess.",
     ),
     parameter(
+        "cursor_tuple_fraction",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "float",
+        "0-1",
+        "0.1",
+        true,
+        "",
+        "Sets the planner's estimate of the fraction of a cursor's rows that will be \
+         retrieved.",
+    ),
+    parameter(
         "deadlock_timeout",
         crate::state::APPLY_TYPE_DYNAMIC,
         "integer",
@@ -536,6 +580,27 @@ pub(crate) const POSTGRES_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         true,
         "",
         "The time in milliseconds to wait on a lock before checking for a deadlock.",
+    ),
+    parameter(
+        "default_statistics_target",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "1-10000",
+        "100",
+        true,
+        "",
+        "Sets the default statistics target for table columns without a target set by \
+         ALTER TABLE SET STATISTICS.",
+    ),
+    parameter(
+        "from_collapse_limit",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "1-2147483647",
+        "8",
+        true,
+        "",
+        "Sets the FROM-list size beyond which subqueries are not collapsed.",
     ),
     parameter(
         "idle_in_transaction_session_timeout",
@@ -547,6 +612,27 @@ pub(crate) const POSTGRES_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "",
         "The time in milliseconds after which a session idle in a transaction is \
          terminated; 0 disables the timeout.",
+    ),
+    parameter(
+        "join_collapse_limit",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "1-2147483647",
+        "8",
+        true,
+        "",
+        "Sets the FROM-list size beyond which JOIN constructs are not flattened.",
+    ),
+    parameter(
+        "lock_timeout",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "0-2147483647",
+        "0",
+        true,
+        "",
+        "The time in milliseconds to wait on a lock before the statement is cancelled; 0 \
+         disables the timeout.",
     ),
     parameter(
         "log_connections",
@@ -600,6 +686,16 @@ pub(crate) const POSTGRES_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "The maximum number of concurrent connections to the database server.",
     ),
     parameter(
+        "max_parallel_workers_per_gather",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "0-1024",
+        "2",
+        true,
+        "",
+        "Sets the maximum number of parallel processes per executor node.",
+    ),
+    parameter(
         "shared_buffers",
         crate::state::APPLY_TYPE_STATIC,
         "integer",
@@ -619,6 +715,17 @@ pub(crate) const POSTGRES_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "",
         "The time in milliseconds after which a statement is aborted; 0 disables the \
          timeout.",
+    ),
+    parameter(
+        "temp_buffers",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "100-1073741823",
+        "1024",
+        true,
+        "",
+        "Sets the maximum number of temporary buffers, in 8 kB pages, used by each \
+         session.",
     ),
     parameter(
         "work_mem",

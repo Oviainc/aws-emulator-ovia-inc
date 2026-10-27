@@ -202,6 +202,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let requested = input.scheduled_report;
         let resource_tags = input.resource_tags.unwrap_or_default();
 
+        // The modelled `@pattern` of the submitted report's name and description is
+        // applied first, because the boundary validator could not: both expressions open
+        // with a negative lookahead its regex engine does not compile
+        // (`crate::state::ConstrainedText`). A request carrying a value outside one
+        // creates NO report — no ARN is minted and its `clientToken` stays free.
+        if let Some(message) = crate::state::text_pattern_refusal(
+            crate::state::report_text_members(
+                Some("scheduledReport"),
+                Some(&requested.name),
+                requested.description.as_deref(),
+            ),
+        ) {
+            crate::state::record_state_change(ctx, Self::NAME, "-", "ValidationException");
+            return Err(CreateScheduledReportErrorModeled::ValidationException(
+                ValidationException { message },
+            )
+            .into());
+        }
+
         // Tag-on-create takes caller-supplied tag keys, so the reserved `aws:` namespace
         // is refused here exactly as `TagResource` refuses it: a request naming such a key
         // creates NO report — no ARN is minted and the request's `clientToken` stays free —

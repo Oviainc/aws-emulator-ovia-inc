@@ -8,11 +8,17 @@
 //! CloudFront resource type ([`RESOURCE_POLICY_RESOURCE_TYPE`]) and addresses that policy
 //! only by the ARN of the resource it is attached to, so
 //!
-//! * a `ResourceArn` naming anything else — a string that is no ARN, an ARN of another
-//!   service, an ARN of another CloudFront resource type, an ARN carrying no resource id —
-//!   is a bad PARAMETER: HTTP 400 `InvalidArgument`, with the fixed sentence
-//!   [`INVALID_RESOURCE_POLICY_RESOURCE_TYPE_MESSAGE`], decided before anything is written
-//!   or looked up and whether or not a resource of that type exists;
+//! * a `ResourceArn` that is no ARN at all — a value that does not open with `arn:` — is
+//!   refused on its FORM: HTTP 400 `InvalidArgument` with the fixed sentence
+//!   [`MALFORMED_ARN_MESSAGE`], since the value cannot be read as an ARN in the first
+//!   place;
+//! * a `ResourceArn` that IS an ARN but names anything else — an ARN of another service, an
+//!   ARN of another CloudFront resource type, an ARN carrying no resource id — is refused on
+//!   the resource TYPE it names: HTTP 400 `InvalidArgument`, decided before anything is
+//!   written or looked up and whether or not a resource of that type exists. The CONDITION
+//!   is one for both operations; the SENTENCE is the one each puts on the wire — the write
+//!   names the resource type it wants ([`INVALID_RESOURCE_POLICY_RESOURCE_TYPE_MESSAGE`]),
+//!   the read demands a usable ARN ([`INVALID_RESOURCE_POLICY_ARN_MESSAGE`]);
 //! * an ARN the surface does accept round-trips: a read answers with the document the last
 //!   write persisted under that ARN, byte for byte, and with that ARN;
 //! * an accepted ARN carrying no policy is `EntityNotFound` (404) — the EXISTENCE answer,
@@ -29,7 +35,8 @@
 //! [`crate::distribution_lifecycle`] already builds.
 
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
-    vpc_origin_arn, INVALID_RESOURCE_POLICY_RESOURCE_TYPE_MESSAGE,
+    vpc_origin_arn, INVALID_RESOURCE_POLICY_ARN_MESSAGE,
+    INVALID_RESOURCE_POLICY_RESOURCE_TYPE_MESSAGE, MALFORMED_ARN_MESSAGE,
     RESOURCE_POLICY_NOT_FOUND_MESSAGE, RESOURCE_POLICY_RESOURCE_TYPE, TAGGABLE_RESOURCE_TYPES,
 };
 use smithy_server_runtime::MultiServiceRouter;
@@ -182,10 +189,6 @@ async fn an_arn_naming_no_vpc_origin_is_an_invalid_argument() {
             distribution_arn.clone(),
         ),
         (
-            "a string that is no ARN at all".to_string(),
-            format!("{RESOURCE_POLICY_RESOURCE_TYPE}/vo-1"),
-        ),
-        (
             "a bare ARN prefix".to_string(),
             "arn:".to_string(),
         ),
@@ -216,11 +219,22 @@ async fn an_arn_naming_no_vpc_origin_is_an_invalid_argument() {
     ]);
 
     for (case, arn) in &rows {
+        // The CONDITION is one for both operations; the SENTENCE each answers it with is the
+        // one that operation puts on the wire — the write names the resource type it wants,
+        // the read demands a usable ARN.
         let answers = [
-            ("PutResourcePolicy", put_resource_policy(&router, arn, &policy("gate")).await),
-            ("GetResourcePolicy", get_resource_policy(&router, arn).await),
+            (
+                "PutResourcePolicy",
+                put_resource_policy(&router, arn, &policy("gate")).await,
+                INVALID_RESOURCE_POLICY_RESOURCE_TYPE_MESSAGE,
+            ),
+            (
+                "GetResourcePolicy",
+                get_resource_policy(&router, arn).await,
+                INVALID_RESOURCE_POLICY_ARN_MESSAGE,
+            ),
         ];
-        for (operation, answer) in answers {
+        for (operation, answer, expected) in answers {
             assert_eq!(
                 answer.status, 400,
                 "case {case}/{operation}: expected HTTP 400, got {} ({})",
@@ -235,9 +249,8 @@ async fn an_arn_naming_no_vpc_origin_is_an_invalid_argument() {
             );
             assert_eq!(
                 message(&answer),
-                INVALID_RESOURCE_POLICY_RESOURCE_TYPE_MESSAGE,
-                "case {case}/{operation}: expected message {INVALID_RESOURCE_POLICY_RESOURCE_TYPE_MESSAGE:?}, \
-                 got {:?}",
+                expected,
+                "case {case}/{operation}: expected message {expected:?}, got {:?}",
                 message(&answer)
             );
         }
@@ -250,6 +263,98 @@ async fn an_arn_naming_no_vpc_origin_is_an_invalid_argument() {
     assert_eq!(
         read.status, 404,
         "case after the refusals: expected HTTP 404, got {} ({})",
+        read.status, read.raw
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A value that is no ARN at all
+// ---------------------------------------------------------------------------
+
+/// A `ResourceArn` that does not open with `arn:` cannot be READ as an ARN, so both
+/// operations of the surface refuse it on its FORM: HTTP 400 `InvalidArgument` with
+/// [`MALFORMED_ARN_MESSAGE`], which states what the parameter has to be rather than the
+/// resource type it names. Nothing is written by the refusal.
+///
+/// The rows span the forms a value that is no ARN takes: empty, a bare word, the resource
+/// part alone, the accepted ARN with its prefix missing or misspelled (including the one
+/// case difference, since the prefix is case-sensitive), a URL, and a value that merely
+/// CONTAINS an ARN.
+#[tokio::test]
+async fn a_resource_arn_that_is_no_arn_is_refused_on_its_form() {
+    let router = emulator();
+    let accepted = vpc_origin_arn("vo-form");
+
+    let rows: [(&str, String); 8] = [
+        ("the empty string", String::new()),
+        ("a bare word", "not-an-arn".to_string()),
+        (
+            "the resource part alone",
+            format!("{RESOURCE_POLICY_RESOURCE_TYPE}/vo-1"),
+        ),
+        (
+            "the accepted ARN with the prefix stripped",
+            accepted
+                .strip_prefix("arn:")
+                .unwrap_or_default()
+                .to_string(),
+        ),
+        (
+            "the accepted ARN with the prefix in upper case",
+            format!("ARN:{}", accepted.strip_prefix("arn:").unwrap_or_default()),
+        ),
+        (
+            "the accepted ARN with the prefix misspelled",
+            format!("arn{}", accepted.strip_prefix("arn:").unwrap_or_default()),
+        ),
+        (
+            "a URL rather than an ARN",
+            format!("https://cloudfront.amazonaws.com/{RESOURCE_POLICY_RESOURCE_TYPE}/vo-1"),
+        ),
+        (
+            "a value that merely contains an ARN",
+            format!("resource={accepted}"),
+        ),
+    ];
+
+    for (case, value) in &rows {
+        let answers = [
+            (
+                "PutResourcePolicy",
+                put_resource_policy(&router, value, &policy("form")).await,
+            ),
+            (
+                "GetResourcePolicy",
+                get_resource_policy(&router, value).await,
+            ),
+        ];
+        for (operation, answer) in answers {
+            assert_eq!(
+                answer.status, 400,
+                "case {case}/{operation}: expected HTTP 400 for {value:?}, got {} ({})",
+                answer.status, answer.raw
+            );
+            assert_eq!(
+                answer.error_code(),
+                "InvalidArgument",
+                "case {case}/{operation}: expected InvalidArgument for {value:?}, got {:?} ({})",
+                answer.error_code(),
+                answer.raw
+            );
+            assert_eq!(
+                message(&answer),
+                MALFORMED_ARN_MESSAGE,
+                "case {case}/{operation}: expected message {MALFORMED_ARN_MESSAGE:?}, got {:?}",
+                message(&answer)
+            );
+        }
+    }
+
+    // The refusals wrote nothing under any key the surface does address.
+    let read = get_resource_policy(&router, &accepted).await;
+    assert_eq!(
+        read.status, 404,
+        "case after the form refusals: expected HTTP 404, got {} ({})",
         read.status, read.raw
     );
 }

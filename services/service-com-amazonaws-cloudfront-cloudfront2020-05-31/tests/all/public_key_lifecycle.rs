@@ -71,7 +71,10 @@ pub(crate) async fn create_key(router: &MultiServiceRouter, body: &str) -> Answe
 }
 
 /// `GET /2020-05-31/public-key/{Id}`.
-async fn get_key(router: &MultiServiceRouter, id: &str) -> Answer {
+///
+/// `pub(crate)` so a sibling suite that reads a public key back goes over the same wire path
+/// rather than growing a copy of this.
+pub(crate) async fn get_key(router: &MultiServiceRouter, id: &str) -> Answer {
     call(
         router,
         "GET",
@@ -100,21 +103,24 @@ async fn list_keys(router: &MultiServiceRouter, query: &str) -> Answer {
 // ---------------------------------------------------------------------------
 
 /// One `PublicKeyConfig`, as a client submits it.
+///
+/// `pub(crate)` for the reason [`create_key`] is: a sibling suite that submits a public key
+/// configuration writes it with this one writer rather than a copy of it.
 #[derive(Debug, Clone)]
-struct Key {
+pub(crate) struct Key {
     /// What this row is a case of, named in every assertion it drives.
-    case: String,
-    caller_reference: String,
-    name: String,
-    encoded_key: String,
+    pub(crate) case: String,
+    pub(crate) caller_reference: String,
+    pub(crate) name: String,
+    pub(crate) encoded_key: String,
     /// `Comment`, or `None` to leave the optional member out entirely.
-    comment: Option<String>,
+    pub(crate) comment: Option<String>,
 }
 
 impl Key {
     /// The `PublicKeyConfig` XML a client sends for this configuration, in the model's
     /// member declaration order (`CallerReference`, `Name`, `EncodedKey`, `Comment`).
-    fn xml(&self) -> String {
+    pub(crate) fn xml(&self) -> String {
         let mut out = format!(
             "<PublicKeyConfig xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">"
         );
@@ -136,7 +142,7 @@ impl Key {
 
     /// Assert that `config` — a `PublicKeyConfig` element the emulator serialised —
     /// reports exactly this configuration.
-    fn assert_matches(&self, config: &Node, context: &str, raw: &str) {
+    pub(crate) fn assert_matches(&self, config: &Node, context: &str, raw: &str) {
         for (member, expected) in [
             ("CallerReference", self.caller_reference.clone()),
             ("Name", self.name.clone()),
