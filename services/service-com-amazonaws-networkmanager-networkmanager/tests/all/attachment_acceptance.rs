@@ -97,8 +97,9 @@ pub(crate) async fn accept(emulator: &Emulator, attachment_id: &str) -> (u16, Va
         .await
 }
 
-/// `GetVpcAttachment`.
-async fn read_vpc(emulator: &Emulator, attachment_id: &str) -> (u16, Value) {
+/// `GetVpcAttachment`. Shared with the suites that read a VPC attachment back, so the URI
+/// shape lives in one place.
+pub(crate) async fn read_vpc(emulator: &Emulator, attachment_id: &str) -> (u16, Value) {
     emulator
         .get(&format!("/vpc-attachments/{attachment_id}"))
         .await

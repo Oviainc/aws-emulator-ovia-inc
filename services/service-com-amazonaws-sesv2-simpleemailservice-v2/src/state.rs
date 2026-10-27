@@ -160,6 +160,39 @@ pub const MAX_MULTI_REGION_ENDPOINTS: usize = 1_000;
 /// From the model's `Tag` documentation: "A resource can have as many as 50 tags."
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
+/// The resource TYPE the ARN `resource_arn` names and the id it addresses within that
+/// type, or `None` when the value is not a resource ARN of this service naming a
+/// resource at all.
+///
+/// SES writes a resource in the resource field of its ARN as `<type>/<id>`, so a value
+/// of another vendor, or one carrying no id (a bare type names no resource), addresses
+/// nothing this service can resolve — which is a bad REQUEST, refused on the input,
+/// rather than a resource that happens to be missing. The ARN's six fields come from
+/// the shared caller-supplied-ARN parse, which is where what an ARN of this vendor is —
+/// fields, partition, the resource field's own colons — is decided.
+pub fn ses_resource_of(resource_arn: &str) -> Option<(&str, &str)> {
+    let resource_type = ::service_common::arn::parse_of(resource_arn, ARN_NAMESPACE)?.resource_type();
+    let resource_id = ::service_common::arn::resource_id_of_type(resource_arn, resource_type)
+        .filter(|resource_id| !resource_id.is_empty())?;
+    Some((resource_type, resource_id))
+}
+
+/// How the tagging surface words `NotFoundException` for a `ResourceArn` that names
+/// no resource the account holds in this Region.
+///
+/// One wording for every operation that resolves a `ResourceArn` to a tag set, so a
+/// client sees the same sentence whichever of them first tells it the resource is
+/// gone. The ARN is the only variable part, taken from the request.
+///
+/// Neither the model nor a recording of this surface states the sentence, so it is
+/// this service's own sentence for a named resource it does not hold — the form
+/// [`tenant_not_found`] and [`reputation_entity_not_found`] state for the resources
+/// they name — with the resource written as the ARN the request addressed it by,
+/// which is the only name this operation is given.
+pub fn tagged_resource_not_found(resource_arn: &str) -> String {
+    format!("Resource {resource_arn} does not exist.")
+}
+
 /// Tenants the account may hold.
 ///
 /// CHOSEN for the same reason as [`MAX_CONTACT_LISTS`]: one record per accepted
@@ -470,29 +503,30 @@ pub const TENANT_RESOURCE_TYPES: [(&str, &str); 3] = [
 /// `CreateTenantResourceAssociation` documents that "resources can be email
 /// identities, configuration sets, or email templates", so a value naming anything
 /// else — another vendor's resource, an SES resource of another kind, or no ARN at
-/// all — addresses nothing this surface can associate. The ARN's six fields come
-/// from the shared caller-supplied-ARN parse, and the id must be present: a bare
-/// type names no resource.
+/// all — addresses nothing this surface can associate. Which values name a resource
+/// of this service at all is read by [`ses_resource_of`], so this surface and the
+/// tagging surface cannot disagree about it; the kinds a tenant may hold are the
+/// narrowing this surface adds.
 pub fn tenant_resource_type(resource_arn: &str) -> Option<&'static str> {
-    let arn = ::service_common::arn::parse_of(resource_arn, ARN_NAMESPACE)?;
+    let (resource_type, _) = ses_resource_of(resource_arn)?;
     TENANT_RESOURCE_TYPES
         .iter()
-        .find(|(token, _)| {
-            arn.resource_type() == *token
-                && ::service_common::arn::resource_id_of_type(resource_arn, token)
-                    .is_some_and(|id| !id.is_empty())
-        })
-        .map(|(_, resource_type)| *resource_type)
+        .find(|(token, _)| resource_type == *token)
+        .map(|(_, modelled)| *modelled)
 }
 
-/// How the tenant-resource association surface words `BadRequestException` for a
-/// `ResourceArn` naming no resource kind a tenant may hold.
+/// How this service words `BadRequestException` for a caller-supplied `ResourceArn`
+/// in none of the resource-ARN forms the surface reading it addresses: the
+/// tenant-resource surface for an ARN naming no resource kind a tenant may hold, the
+/// tagging surface for a value that is no SES resource ARN, or one whose resource
+/// field names no resource at all.
 ///
 /// The sentence is fixed text with no variable part: the refusal is about the FORM of
 /// the value — SES reads the ARN against the resource-ARN forms it addresses, and a
 /// value matching none of them (another vendor's resource, an SES resource of a kind
-/// a tenant cannot hold, or no ARN at all) names nothing it can associate.
-pub const UNSUPPORTED_TENANT_RESOURCE: &str = "Provided ARN is not in SES resource ARN format";
+/// the surface cannot address, or no ARN at all) names nothing it can act on. Stated
+/// once, so two surfaces cannot word the one condition differently.
+pub const UNSUPPORTED_RESOURCE_ARN: &str = "Provided ARN is not in SES resource ARN format";
 
 /// The keys `ListTenantResourcesFilterKey` names: "currently, the only supported
 /// filter key is RESOURCE_TYPE". The filter arrives as a map of plain strings, so
@@ -670,6 +704,62 @@ impl ComAmazonawsSesv2SimpleemailserviceV2State {
         self.tenants
             .values_mut()
             .find(|tenant| tenant.arn == reference)
+    }
+
+    /// The tags stored on the resource `resource_arn` names, as the modelled `TagList`
+    /// the tagging surface reports them; `None` when the call `scope` describes holds
+    /// no such resource.
+    ///
+    /// SES writes each of its resources in the resource field of its ARN as the
+    /// resource TYPE and then the id the resource is held under — an email identity as
+    /// `identity/<identity>` (the form [`identity_arn`] mints), a contact list as
+    /// `contact-list/<name>`, a configuration set as `configuration-set/<name>` and a
+    /// tenant as `tenant/<name>/<id>` (the form [`tenant_arn`] mints) — so the type
+    /// picks the table and the id picks the record within it. An identity resolves
+    /// through [`identity_key`], so an ARN spelling the domain part in another case
+    /// names the same identity the rest of the API does. A tenant's id is part of its
+    /// ARN, so the whole value is compared against the ARN the tenant was minted with,
+    /// which keeps a recreated tenant of the same name from answering for its
+    /// predecessor.
+    ///
+    /// An ARN naming a resource kind this account holds no record of — a kind nothing
+    /// creates here yet, or an id never created — resolves to nothing, exactly as a
+    /// name that was never created: the two are indistinguishable to the caller.
+    ///
+    /// The scope is applied first, so an ARN of another account or another Region
+    /// reaches nothing whatever it names elsewhere; see
+    /// [`CallerScope::covers_resource`]. Reporting only: the resolution reads the
+    /// tables and writes nothing, so a read leaves every later caller seeing exactly
+    /// what it saw.
+    pub fn resource_tags(
+        &self,
+        resource_arn: &str,
+        scope: &CallerScope,
+    ) -> Option<Vec<crate::ops::types::Tag>> {
+        if !scope.covers_resource(resource_arn) {
+            return None;
+        }
+        let (resource_type, resource_id) = ses_resource_of(resource_arn)?;
+        match resource_type {
+            "identity" => self
+                .identities
+                .get(&identity_key(resource_id))
+                .map(EmailIdentityRecord::tag_list),
+            "contact-list" => self
+                .contact_lists
+                .get(resource_id)
+                .map(ContactListRecord::tag_list),
+            "configuration-set" => self
+                .configuration_sets
+                .get(resource_id)
+                .map(ConfigurationSetRecord::tag_list),
+            "tenant" => self
+                .tenants
+                .values()
+                .find(|tenant| tenant.arn == resource_arn)
+                .map(TenantRecord::tag_list),
+            _ => None,
+        }
     }
 
     /// Put `record` on the suppression list `key` names, refusing a NEW entry once

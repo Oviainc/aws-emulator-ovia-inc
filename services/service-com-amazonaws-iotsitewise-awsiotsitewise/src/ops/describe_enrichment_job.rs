@@ -244,14 +244,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             job_configuration: record.configuration.clone(),
             created_at: crate::state::to_date_time(record.created_at),
             // "Timestamp when the job status was last updated", absent until a
-            // transition has fallen due, and the completion instant only once the
-            // job has reached its terminal status.
+            // transition has fallen due or a cancellation was recorded, and the
+            // completion instant only once the job has reached that status.
             updated_at: record.updated_at(now).map(crate::state::to_date_time),
             completed_at: record.completed_at(now).map(crate::state::to_date_time),
-            // "Only present if status is CANCELLED" and "only present if status is
-            // FAILED": no job of this emulator is cancelled or fails, so neither
-            // member is reported — see `crate::state::EnrichmentJobRecord::status`.
-            cancelled_at: None,
+            // "Only present if status is CANCELLED": the instant a cancel was
+            // recorded on the job, which is the one `CancelEnrichmentJob` wrote.
+            cancelled_at: record.cancelled_at.map(crate::state::to_date_time),
+            // "Only present if status is FAILED": no job of this emulator fails,
+            // so no failure message is reported — see
+            // `crate::state::EnrichmentJobRecord::status`.
             failure_message: None,
         })
     }

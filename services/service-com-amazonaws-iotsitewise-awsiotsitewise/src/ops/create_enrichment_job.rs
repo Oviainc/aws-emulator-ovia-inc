@@ -303,6 +303,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The job's whole lifecycle is owed from here; the status is derived from
             // this instant rather than stored, and nothing is slept on.
             created_at: now,
+            // Nothing has cancelled the job this create starts;
+            // `CancelEnrichmentJob` is what records a cancellation on it.
+            cancelled_at: None,
         };
 
         let output = created(&record, now);

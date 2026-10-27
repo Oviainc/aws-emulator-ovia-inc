@@ -177,7 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if crate::state::tenant_resource_type(&resource_arn).is_none() {
             return Err(CreateTenantResourceAssociationErrorModeled::BadRequestException(
                 BadRequestException {
-                    message: Some(crate::state::UNSUPPORTED_TENANT_RESOURCE.to_string()),
+                    message: Some(crate::state::UNSUPPORTED_RESOURCE_ARN.to_string()),
                 },
             )
             .into());

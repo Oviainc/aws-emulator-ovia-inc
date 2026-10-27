@@ -532,7 +532,9 @@ mod list_projects;
 
 // Declared last, for the same reason the suites above it are: both stretches
 // higher up are where every concurrent iotsitewise change inserts a declaration
-// of its own. Fold it into the sorted list once the churn settles.
+// of its own. Fold them into the sorted list once the churn settles.
+#[path = "all/enrichment_job_cancellation.rs"]
+mod enrichment_job_cancellation;
 #[path = "all/update_gateway.rs"]
 mod update_gateway;
 

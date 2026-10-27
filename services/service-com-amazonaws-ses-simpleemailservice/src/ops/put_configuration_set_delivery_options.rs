@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutConfigurationSetDeliveryOptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutConfigurationSetDeliveryOptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutConfigurationSetDeliveryOptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -101,6 +92,17 @@ impl From<PutConfigurationSetDeliveryOptionsErrorModeled> for PutConfigurationSe
     }
 }
 
+/// Refuse the request as `InvalidDeliveryOptions` (HTTP 400), the error this
+/// operation reports for delivery options Amazon SES cannot act on.
+fn invalid_delivery_options(message: String) -> PutConfigurationSetDeliveryOptionsError {
+    PutConfigurationSetDeliveryOptionsErrorModeled::InvalidDeliveryOptionsException(
+        InvalidDeliveryOptionsException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
 /// The `PutConfigurationSetDeliveryOptions` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -137,18 +139,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutConfigurationSetDeliveryOptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutConfigurationSetDeliveryOptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutConfigurationSetDeliveryOptions"))
+        // `ctx` carries only request metadata; this operation needs none of it.
+        let _ = ctx;
+        let name = input.configuration_set_name;
+
+        // The delivery options the request SUPPLIES are judged first, the way the
+        // tracking-options writers judge the domain they were given: options
+        // Amazon SES cannot act on are what `InvalidDeliveryOptions` is about, and
+        // they are refused before anything is looked up for them. `TlsPolicy` is a
+        // modeled enum, so the boundary validator refuses a value outside its
+        // value set before this handler runs; the check stands for the rule that
+        // only the policies the model names are ever stored, because a set
+        // carrying any other value would carry a delivery rule no send could
+        // apply.
+        let tls_policy = match input.delivery_options.and_then(|options| options.tls_policy) {
+            Some(policy) if !TLS_POLICY_VALUES.contains(&policy.as_str()) => {
+                return Err(invalid_delivery_options(format!(
+                    "Invalid TLS policy: {policy}"
+                )));
+            }
+            supplied => supplied,
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // See `verify_email_identity.rs`: an engine with no store for this
+            // service cannot serve the operation at all, and every error this
+            // operation models is a client error, so none of them fits.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutConfigurationSetDeliveryOptions",
+            ));
+        };
+        let mut state = state.lock();
+
+        let Some(configuration_set) = state.configuration_sets.get_mut(&name) else {
+            // "Indicates that the configuration set does not exist", in the
+            // wording every operation of this service uses for a set that is not
+            // there.
+            return Err(
+                PutConfigurationSetDeliveryOptionsErrorModeled::ConfigurationSetDoesNotExistException(
+                    ConfigurationSetDoesNotExistException {
+                        configuration_set_name: Some(name.clone()),
+                        message: Some(format!("Configuration set <{name}> does not exist.")),
+                    },
+                )
+                .into(),
+            );
+        };
+        // A PUT: the set's delivery options become exactly what this request
+        // carries, so a request supplying a policy replaces whatever the set held
+        // and one supplying none leaves it carrying none.
+        configuration_set.tls_policy = tls_policy;
+        Ok(PutConfigurationSetDeliveryOptionsOutput {})
     }
 }
