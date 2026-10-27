@@ -31,20 +31,26 @@
 //!   evaluation altogether, and `ignore` leaves it out too but, when NO datapoint at all
 //!   could be evaluated, keeps the alarm in the state it has ("the current alarm state is
 //!   maintained");
-//! * the alarm is in `ALARM` once at least `DatapointsToAlarm` of the evaluated datapoints
-//!   breach ("The number of data points that must be breaching to trigger the alarm",
-//!   defaulting to `EvaluationPeriods`) — or, where the missing-data treatment left the
-//!   evaluation with FEWER datapoints than that, once every one of the datapoints it does
-//!   have breaches, because an alarm evaluated on the datapoints that are present cannot be
-//!   asked for more of them than it has; it is in `OK` when fewer breach, and in
-//!   `INSUFFICIENT_DATA` when no datapoint was evaluated at all;
+//! * the predicate an "M out of N" alarm is decided by has TWO directions, each with a minimum
+//!   of its own built from the alarm's configuration alone: the alarm is in `ALARM` once at
+//!   least `DatapointsToAlarm` of the evaluated datapoints breach ("The number of data points
+//!   that must be breaching to trigger the alarm" — the M, defaulting to `EvaluationPeriods`,
+//!   which is the N), and in `OK` once at least `EvaluationPeriods - DatapointsToAlarm + 1` of
+//!   them do not — the count that makes M breaching datapoints unreachable inside the same
+//!   window, which is the minimum CloudWatch's own explanation of an `OK` state reports;
+//! * a window neither direction's minimum is reached over is one the evaluation cannot decide
+//!   — only a treatment that substitutes NO datapoint (`missing`, `ignore`) can leave it that
+//!   short of datapoints — so the alarm is in `INSUFFICIENT_DATA`, or keeps the state it has
+//!   where the treatment is `ignore` ("the current alarm state is maintained");
 //! * the `StateReason` ("An explanation for the alarm state, in text format.") explains how
 //!   the state was decided: it NAMES the datapoints the evaluation graded — the value the
 //!   statistic took over each window and the instant that window ends — beside the counts it
 //!   made over them, and a window that held NO datapoint of the metric is reported as the hole
 //!   it was, naming the missing-data arm that was applied to it, rather than being counted as a
 //!   datapoint the evaluation graded — a client can tell an alarm that saw clean data from one
-//!   that saw none.
+//!   that saw none. The count it reports is of the datapoints that satisfied the DIRECTION the
+//!   state stands for, and its closing clause names that direction and the minimum it needed,
+//!   so both integers of the alarm's configuration are recoverable from the sentence.
 //!
 //! The evaluation is a pure function of the stored datapoints and the clock, and it writes
 //! only when the state it computes differs from the state the alarm already reports — so
@@ -133,14 +139,15 @@ const MISSING_BREACHING: &str = "breaching";
 /// The `TreatMissingData` value that counts a missing datapoint as not breaching.
 const MISSING_NOT_BREACHING: &str = "notBreaching";
 
-/// The `TreatMissingData` value under which an evaluation with no datapoint at all leaves the
-/// alarm in the state it has: "the current alarm state is maintained". A datapoint that IS
-/// present still decides the state.
+/// The `TreatMissingData` value under which an evaluation that cannot decide the alarm leaves
+/// it in the state it has: "the current alarm state is maintained". A window the datapoints
+/// present DO decide still decides it.
 const MISSING_IGNORE: &str = "ignore";
 
 /// The `TreatMissingData` default: "If `TreatMissingData` is omitted, the default behavior of
 /// `missing` is used" (`PutMetricAlarmInput$TreatMissingData`) — a missing datapoint is
-/// neither breaching nor not breaching, so the alarm is evaluated on the datapoints it has.
+/// neither breaching nor not breaching, so the alarm is evaluated on the datapoints it has and
+/// reports insufficient data where they are too few to reach either direction's minimum.
 const MISSING_MISSING: &str = "missing";
 
 /// The most alarms ONE request may evaluate.
@@ -265,8 +272,22 @@ struct Evaluated {
     window: Option<usize>,
     /// The statistic over that window, for a real datapoint.
     value: Option<f64>,
+    /// How many observations that window aggregated, for a real datapoint.
+    sample_count: Option<f64>,
     /// How it stands against the threshold.
     datapoint: Datapoint,
+}
+
+/// What the datapoints a verdict RESTS ON are: how a datapoint that satisfied the direction the
+/// state was decided in reads against the threshold, and how many of them that direction needed.
+#[derive(Debug, Clone, Copy)]
+struct Verdict {
+    /// The classification of a datapoint that satisfied the reported direction: breaching for
+    /// `ALARM`, non-breaching for `OK`.
+    satisfying: Datapoint,
+    /// How many of them the direction needed — the alarm's M for `ALARM`, and `N - M + 1` for
+    /// `OK`.
+    minimum: usize,
 }
 
 /// The state one evaluation computed for one alarm, with the explanation it reports.
@@ -468,6 +489,9 @@ impl State {
             evaluated.push(Evaluated {
                 window: Some(index),
                 value: Some(value),
+                // How many observations the window stood for, which is what a decision record
+                // reports beside the value the statistic took over them.
+                sample_count: Some(window.iter().map(|datum| datum.sample_count).sum()),
                 datapoint: if (comparison.breaches)(value, threshold) {
                     Datapoint::Breaching
                 } else {
@@ -487,6 +511,7 @@ impl State {
             evaluated.push(Evaluated {
                 window: None,
                 value: None,
+                sample_count: None,
                 datapoint: substituted,
             });
         }
@@ -494,6 +519,10 @@ impl State {
         let breaching = evaluated
             .iter()
             .filter(|slot| slot.datapoint == Datapoint::Breaching)
+            .count();
+        let not_breaching = evaluated
+            .iter()
+            .filter(|slot| slot.datapoint == Datapoint::NotBreaching)
             .count();
         let present = evaluated
             .iter()
@@ -515,59 +544,77 @@ impl State {
             .filter(|count| *count >= 1)
             .unwrap_or(evaluation_periods)
             .min(evaluation_periods);
-        // An evaluation left with fewer datapoints than M — which only the treatments that
-        // substitute NOTHING can leave it with — is decided by the datapoints it has: asking
-        // for more breaching datapoints than the evaluation holds could never be satisfied,
-        // and CloudWatch uses a missing datapoint "only as few times as possible".
-        let required = to_alarm.min(present);
+        // The complement of M over the same N: the number of NON-breaching datapoints that
+        // makes M breaching ones unreachable inside the window, which is the minimum an
+        // evaluation needs to put the alarm in `OK`. Both minima are built from the alarm's
+        // configuration, so neither depends on how many datapoints this one evaluation found.
+        let to_ok = evaluation_periods
+            .saturating_sub(to_alarm)
+            .saturating_add(1);
 
-        let state = if present > 0 && breaching >= required {
+        let state = if breaching >= to_alarm {
             ALARM_STATE_ALARM
-        } else if present == 0 {
-            // Nothing was evaluated: the whole range was missing. "ignore — the current alarm
-            // state is maintained", so under that setting this evaluation produces no state
-            // at all and the alarm keeps the one it has; under every other setting it reports
-            // that it had no data to decide on. A datapoint that IS present still decides,
-            // whichever setting is in force — only missing data is what `TreatMissingData`
-            // speaks about.
-            if treat_missing == MISSING_IGNORE {
-                return None;
-            }
-            ALARM_STATE_INSUFFICIENT_DATA
-        } else {
+        } else if not_breaching >= to_ok {
             ALARM_STATE_OK
+        } else if treat_missing == MISSING_IGNORE {
+            // Neither direction's minimum was reached, and the datapoints the treatment left
+            // out are why: "ignore — the current alarm state is maintained", so this
+            // evaluation produces no state at all and the alarm keeps the one it has.
+            return None;
+        } else {
+            // The window the evaluation graded is short of the datapoints EITHER direction
+            // needs — the treatments that substitute nothing are the only ones that can leave
+            // it so — so there is no verdict to report: the alarm had insufficient data.
+            ALARM_STATE_INSUFFICIENT_DATA
         };
         // An evaluation that computes the state the alarm already reports changes nothing, so
         // there is no transition to explain: the alarm keeps the reason it has rather than
         // being given one that names a state as the state it moved from and to.
-        let old_state = alarm
-            .state_value
-            .as_deref()
-            .unwrap_or(ALARM_STATE_INSUFFICIENT_DATA);
         if alarm.state_value.as_deref() == Some(state) {
             return None;
         }
+        // Which datapoints the verdict RESTS ON: the direction the state was decided in, and
+        // how many datapoints of it that direction needed. A state no datapoint decided —
+        // insufficient data — rests on none, and its sentence names no minimum either.
+        let verdict = if state == ALARM_STATE_ALARM {
+            Some(Verdict {
+                satisfying: Datapoint::Breaching,
+                minimum: to_alarm,
+            })
+        } else if state == ALARM_STATE_OK {
+            Some(Verdict {
+                satisfying: Datapoint::NotBreaching,
+                minimum: to_ok,
+            })
+        } else {
+            None
+        };
         let counts = EvaluationCounts {
             breaching,
+            not_breaching,
             present,
             substituted,
             periods: evaluated.len(),
-            required,
+            minimum: verdict.map_or(0, |verdict| verdict.minimum),
         };
         Some(Evaluation {
             state,
             reason: state_reason(
                 state,
-                // The state the alarm reports now is the state this evaluation moves it FROM,
-                // which the sentence names beside the state it moves to.
-                old_state,
                 counts,
                 missing_data_arm(treat_missing),
                 comparison.phrase,
                 threshold,
                 &cited_datapoints(&evaluated, now_secs, period),
             ),
-            reason_data: state_reason_data(&statistic, period, threshold, now_secs, &evaluated),
+            reason_data: state_reason_data(
+                &statistic,
+                period,
+                threshold,
+                now_secs,
+                &evaluated,
+                verdict,
+            ),
         })
     }
 
@@ -703,6 +750,9 @@ impl AlarmStatistic<'_> {
 struct EvaluationCounts {
     /// Datapoints whose comparison against the threshold held.
     breaching: usize,
+    /// Datapoints the comparison did not hold for: the ones that satisfy the `OK` direction of
+    /// the alarm's predicate.
+    not_breaching: usize,
     /// Datapoints the evaluation really had to decide on: the real ones plus the ones the
     /// missing-data treatment substituted.
     present: usize,
@@ -710,8 +760,10 @@ struct EvaluationCounts {
     substituted: usize,
     /// How many windows the look-back covered — the alarm's `EvaluationPeriods`.
     periods: usize,
-    /// How many breaching datapoints this evaluation needed to put the alarm in `ALARM`.
-    required: usize,
+    /// How many datapoints the DIRECTION this state was decided in needs: the alarm's M for
+    /// `ALARM`, and its complement `N - M + 1` for `OK`. Zero for a state no direction decided,
+    /// whose sentence names no minimum.
+    minimum: usize,
 }
 
 /// The name the missing-data treatment is reported under in a `StateReason`, or `None` for a
@@ -747,9 +799,10 @@ fn plural(count: usize) -> (&'static str, &'static str) {
 /// `Threshold Crossed: <n> out of the last <m> datapoints [<value> (<instant>), …] was|were
 /// [not] <comparison> the threshold (<threshold>) (minimum <k> datapoint(s) for <from> -> <to>
 /// transition).` for a graded state, and `Insufficient Data: <m> datapoint(s) was|were unknown.`
-/// for a state decided with nothing to grade. The state the alarm moved to decides whether the
-/// comparison is stated as it holds or negated, and the count is of the datapoints that read
-/// that way.
+/// for a state decided with too few datapoints to grade. The state the alarm moved to decides
+/// whether the comparison is stated as it holds or negated, the count is of the datapoints that
+/// read that way, and the closing clause names that direction and the minimum it needed
+/// ([`transition_minimum`]).
 ///
 /// The datapoints are NAMED, not just counted ([`cited_datapoints`]): the explanation of a
 /// state says which values decided it and when each was measured, so a reader can tell the
@@ -768,7 +821,6 @@ fn plural(count: usize) -> (&'static str, &'static str) {
 /// a datapoint list bounded by [`MAX_CITED_DATAPOINT_CHARS`].
 fn state_reason(
     state: &str,
-    old_state: &str,
     counts: EvaluationCounts,
     arm: Option<&str>,
     comparison: &str,
@@ -777,17 +829,20 @@ fn state_reason(
 ) -> String {
     let EvaluationCounts {
         breaching,
+        not_breaching,
         present,
         substituted,
         periods,
-        required,
+        minimum,
     } = counts;
     let threshold = decimal_text(threshold);
     if state == ALARM_STATE_INSUFFICIENT_DATA {
-        // No datapoint was evaluated and the treatment substituted none: the evaluation had
-        // nothing to decide on.
-        let (plural_suffix, verb) = plural(periods);
-        return format!("Insufficient Data: {periods} datapoint{plural_suffix} {verb} unknown.");
+        // The window was short of the datapoints either direction of the predicate needs, so
+        // the evaluation reports the ones it did not have: the windows of its look-back that
+        // no datapoint, real or substituted, stood for.
+        let unknown = periods.saturating_sub(present);
+        let (plural_suffix, verb) = plural(unknown);
+        return format!("Insufficient Data: {unknown} datapoint{plural_suffix} {verb} unknown.");
     }
     if let Some(arm) = arm.filter(|_| substituted > 0 && substituted == present) {
         // EVERY slot was substituted: the state was decided by the missing-data arm alone, so
@@ -820,25 +875,37 @@ fn state_reason(
             "Threshold Crossed: {breaching} out of the last {present} datapoints{cited} \
              {} {comparison} the threshold ({threshold}) ({}).{substituted_clause}",
             plural(breaching).1,
-            transition_minimum(required, old_state, state)
+            transition_minimum(minimum, state)
         );
     }
     // The alarm is in OK, so the comparison did not hold: the sentence states its NEGATION and
-    // counts the datapoints that read that way.
-    let cleared = present.saturating_sub(breaching);
+    // counts the datapoints that read that way — the ones that satisfied the direction being
+    // reported, not the ones that breached.
     format!(
-        "Threshold Crossed: {cleared} out of the last {present} datapoints{cited} {} not \
+        "Threshold Crossed: {not_breaching} out of the last {present} datapoints{cited} {} not \
          {comparison} the threshold ({threshold}) ({}).{substituted_clause}",
-        plural(cleared).1,
-        transition_minimum(required, old_state, state)
+        plural(not_breaching).1,
+        transition_minimum(minimum, state)
     )
 }
 
-/// The clause a graded reason closes with: how many breaching datapoints the transition needed
-/// and which transition it was — `minimum 1 datapoint for OK -> ALARM transition`.
-fn transition_minimum(required: usize, old_state: &str, state: &str) -> String {
-    let (datapoints_suffix, _) = plural(required);
-    format!("minimum {required} datapoint{datapoints_suffix} for {old_state} -> {state} transition")
+/// The clause a graded reason closes with: how many datapoints the direction the state was
+/// decided in needs, and that direction — `minimum 1 datapoint for OK -> ALARM transition` for a
+/// state the breaching datapoints decided, and `minimum <N - M + 1> datapoints for ALARM -> OK
+/// transition` for one the non-breaching ones decided.
+///
+/// The clause names the DIRECTION of the predicate the state stands for, not the state the alarm
+/// happened to report before: the minimum belongs to the transition into the state being
+/// explained, so both integers of an "M out of N" configuration are recoverable from the
+/// sentence whichever state the evaluation moved out of.
+fn transition_minimum(minimum: usize, state: &str) -> String {
+    let (datapoints_suffix, _) = plural(minimum);
+    let transition = if state == ALARM_STATE_ALARM {
+        format!("{ALARM_STATE_OK} -> {ALARM_STATE_ALARM}")
+    } else {
+        format!("{ALARM_STATE_ALARM} -> {ALARM_STATE_OK}")
+    };
+    format!("minimum {minimum} datapoint{datapoints_suffix} for {transition} transition")
 }
 
 /// The most characters the datapoint list a `StateReason` cites may take.
@@ -929,9 +996,13 @@ fn decimal_text(value: f64) -> String {
     format!("{value}")
 }
 
-/// The `StateReasonData` an evaluated state reports: the query the evaluation made and the
-/// datapoints it evaluated, newest first, each with the start of the period it came from — and
-/// no period at all for a slot the missing-data treatment filled.
+/// The `StateReasonData` an evaluated state reports: the query the evaluation made, the values
+/// of the window it graded, and the datapoints the verdict RESTS ON — the ones that satisfied
+/// the direction the state was decided in, as many as that direction needed, each with the
+/// instant of the period it was aggregated out of and how many observations that period held.
+///
+/// A period the missing-data treatment substituted a datapoint for carries no instant and no
+/// value: nothing was measured over it, and the arm that decided it is what the entry names.
 ///
 /// "An explanation for the alarm state, in JSON format." (`MetricAlarm$StateReasonData`),
 /// bounded by [`MAX_STATE_REASON_DATA_LEN`] — a document is JSON, so it can never be
@@ -943,10 +1014,25 @@ fn state_reason_data(
     threshold: f64,
     now_secs: f64,
     evaluated: &[Evaluated],
+    verdict: Option<Verdict>,
 ) -> String {
     let mut document = Map::new();
     document.insert("version".to_string(), Value::from(HISTORY_DATA_VERSION));
-    document.insert("queryDateSeconds".to_string(), Value::from(now_secs));
+    // The instant the evaluation queried the series at, and the start of the OLDEST period it
+    // graded: together they say which span of the series the state was decided over. Both are
+    // the modelled timestamp type's own rendering ([`super::rfc3339`]), the one this crate
+    // writes every instant with.
+    if let Some(at) = super::rfc3339(now_secs) {
+        document.insert("queryDate".to_string(), Value::from(at));
+    }
+    if let Some(at) = evaluated
+        .iter()
+        .filter_map(|slot| slot.window)
+        .max()
+        .and_then(|index| super::rfc3339(window_start(now_secs, index, period)))
+    {
+        document.insert("startDate".to_string(), Value::from(at));
+    }
     let member = if statistic.is_percentile() {
         "extendedStatistic"
     } else {
@@ -958,7 +1044,8 @@ fn state_reason_data(
     // The values the evaluation really had, oldest first — the order they were observed in.
     // `evaluated` is newest first and holds a slot for every period the alarm evaluates, so
     // the slots a missing-data treatment filled contribute no value here: this list reports
-    // the datapoints, and `evaluatedDatapoints` below reports the periods.
+    // the window the state was decided over, and `evaluatedDatapoints` below reports the
+    // datapoints the verdict rests on.
     let recent: Vec<Value> = evaluated
         .iter()
         .rev()
@@ -966,20 +1053,27 @@ fn state_reason_data(
         .collect();
     document.insert("recentDatapoints".to_string(), Value::Array(recent));
 
-    let datapoints: Vec<Value> = evaluated
-        .iter()
-        .map(|slot| {
-            let mut window = Map::new();
-            if let Some(index) = slot.window {
-                window.insert(
-                    "windowStartSeconds".to_string(),
-                    Value::from(window_start(now_secs, index, period)),
-                );
+    let mut datapoints: Vec<Value> = Vec::new();
+    if let Some(verdict) = verdict {
+        for slot in evaluated
+            .iter()
+            .filter(|slot| slot.datapoint == verdict.satisfying)
+            .take(verdict.minimum)
+        {
+            let mut entry = Map::new();
+            if let Some(at) = slot
+                .window
+                .and_then(|index| super::rfc3339(window_start(now_secs, index, period)))
+            {
+                entry.insert("timestamp".to_string(), Value::from(at));
+            }
+            if let Some(count) = slot.sample_count {
+                entry.insert("sampleCount".to_string(), Value::from(count));
             }
             if let Some(value) = slot.value {
-                window.insert("value".to_string(), Value::from(value));
+                entry.insert("value".to_string(), Value::from(value));
             }
-            window.insert(
+            entry.insert(
                 "datapoint".to_string(),
                 Value::from(match slot.datapoint {
                     Datapoint::Breaching => "breaching",
@@ -987,9 +1081,9 @@ fn state_reason_data(
                     Datapoint::Missing => "missing",
                 }),
             );
-            Value::Object(window)
-        })
-        .collect();
+            datapoints.push(Value::Object(entry));
+        }
+    }
     let mut full = document.clone();
     full.insert("evaluatedDatapoints".to_string(), Value::Array(datapoints));
     let rendered = Value::Object(full).to_string();

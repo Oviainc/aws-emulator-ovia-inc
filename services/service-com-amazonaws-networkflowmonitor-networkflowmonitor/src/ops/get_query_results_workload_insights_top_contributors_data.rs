@@ -233,7 +233,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) else {
             return Err(
                 GetQueryResultsWorkloadInsightsTopContributorsDataErrorModeled::ResourceNotFoundException(
-                    crate::state::not_found(crate::state::QUERY_RESOURCE, &input.query_id),
+                    crate::state::query_not_found(&input.query_id),
                 )
                 .into(),
             );

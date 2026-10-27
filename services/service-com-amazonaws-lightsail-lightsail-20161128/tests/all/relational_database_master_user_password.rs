@@ -272,7 +272,10 @@ fn read_body(name: &str, version: Option<&str>) -> Value {
 }
 
 /// The version `version` of `name`'s master user password, required to succeed.
-async fn read_password(emulator: &Emulator, name: &str, version: Option<&str>) -> Value {
+///
+/// `pub(crate)` so a sibling suite reads a database's master credentials through
+/// this one call rather than through a second copy of it.
+pub(crate) async fn read_password(emulator: &Emulator, name: &str, version: Option<&str>) -> Value {
     emulator
         .ok(
             "GetRelationalDatabaseMasterUserPassword",

@@ -23,6 +23,7 @@
 //! in [`ComAmazonawsDevopsguruCapstonecontrolplaneserviceState::anomalies`], which
 //! `DescribeAnomaly` reads under the same rule: an `AnomalyId` the map does not hold
 //! names no anomaly and is refused with `ResourceNotFoundException`.
+//! `ListAnomaliesForInsight` reports the page of that map that belongs to one insight.
 //!
 //! The LOG anomalies that analysis found in the covered resources' CloudWatch logs
 //! have the same provenance again, and live in
@@ -48,8 +49,9 @@ use crate::ops::types::{
     CloudFormationHealth, CloudWatchMetricsDetail, Event, EventResource, InsightHealth,
     InsightTimeRange, ListEventsFilters, ListInsightsStatusFilter, LogAnomalyShowcase,
     MonitoredResourceIdentifier, PerformanceInsightsMetricsDetail, PredictionTimeRange,
-    ProactiveAnomaly, ProactiveInsight, ProactiveInsightSummary,
-    ProactiveOrganizationInsightSummary, ReactiveAnomaly, ReactiveInsight, ReactiveInsightSummary,
+    ProactiveAnomaly, ProactiveAnomalySummary, ProactiveInsight, ProactiveInsightSummary,
+    ProactiveOrganizationInsightSummary, ReactiveAnomaly, ReactiveAnomalySummary, ReactiveInsight,
+    ReactiveInsightSummary,
     ReactiveOrganizationInsightSummary, Recommendation, RecommendationRelatedAnomaly,
     RecommendationRelatedEvent, ResourceCollection, ServiceCollection, ServiceHealth,
     ServiceInsightHealth, StartTimeRange, TagCollection, TagHealth, ValidationException,
@@ -837,6 +839,17 @@ pub struct AnomalyRecord {
     /// cascade follows; see
     /// [`ComAmazonawsDevopsguruCapstonecontrolplaneserviceState::remove_insight`].
     pub associated_insight_id: Option<String>,
+    /// The Amazon Web Services services whose resources this anomalous behaviour was
+    /// found in, each one of `SERVICE_NAME_VALUES`; empty when the analysis attributed
+    /// it to none.
+    ///
+    /// Not a modelled member of either anomaly shape, the way
+    /// [`EventRecord::associated_insight_id`] is none of `Event`: it is the attribution
+    /// `ListAnomaliesForInsight`'s `ListAnomaliesForInsightFilters` — which "specifies
+    /// one or more service names that are used to list anomalies" — selects on, in the
+    /// same `ServiceCollection` form [`InsightRecord::service_names`] keeps for the
+    /// insight searches.
+    pub service_names: Vec<String>,
     /// `ResourceCollection` — the resources this anomaly is about, in the same
     /// stack-name / tag-collection shape as the account's coverage and an insight's
     /// own collection, so it reuses [`ResourceCoverage`]; absent when the anomaly
@@ -944,6 +957,85 @@ impl AnomalyRecord {
         self.resource_collection
             .as_ref()
             .map(ResourceCoverage::wire_collection)
+    }
+
+    /// This record as the modelled `ProactiveAnomalySummary`, the shape the anomaly
+    /// LISTINGS report a proactive anomaly on.
+    ///
+    /// `ProactiveAnomalySummary` models exactly the members `ProactiveAnomaly` does, so
+    /// the summary is that one rendering moved member by member onto the summary shape:
+    /// a detail read and a listing of one store cannot then disagree about an anomaly,
+    /// and a model that stops matching breaks this destructuring instead of quietly
+    /// dropping a member.
+    pub fn to_proactive_anomaly_summary(&self) -> ProactiveAnomalySummary {
+        let ProactiveAnomaly {
+            id,
+            severity,
+            status,
+            update_time,
+            anomaly_time_range,
+            anomaly_reported_time_range,
+            prediction_time_range,
+            source_details,
+            associated_insight_id,
+            resource_collection,
+            limit,
+            source_metadata,
+            anomaly_resources,
+            description,
+        } = self.to_proactive_anomaly();
+        ProactiveAnomalySummary {
+            id,
+            severity,
+            status,
+            update_time,
+            anomaly_time_range,
+            anomaly_reported_time_range,
+            prediction_time_range,
+            source_details,
+            associated_insight_id,
+            resource_collection,
+            limit,
+            source_metadata,
+            anomaly_resources,
+            description,
+        }
+    }
+
+    /// This record as the modelled `ReactiveAnomalySummary`, the shape the anomaly
+    /// listings report a reactive anomaly on — the reactive half of the rule
+    /// [`AnomalyRecord::to_proactive_anomaly_summary`] states.
+    pub fn to_reactive_anomaly_summary(&self) -> ReactiveAnomalySummary {
+        let ReactiveAnomaly {
+            id,
+            severity,
+            status,
+            anomaly_time_range,
+            anomaly_reported_time_range,
+            source_details,
+            associated_insight_id,
+            resource_collection,
+            r#type,
+            name,
+            description,
+            causal_anomaly_id,
+            anomaly_resources,
+        } = self.to_reactive_anomaly();
+        ReactiveAnomalySummary {
+            id,
+            severity,
+            status,
+            anomaly_time_range,
+            anomaly_reported_time_range,
+            source_details,
+            associated_insight_id,
+            resource_collection,
+            r#type,
+            name,
+            description,
+            causal_anomaly_id,
+            anomaly_resources,
+        }
     }
 
     fn wire_anomaly_resources(&self) -> Option<Vec<AnomalyResource>> {
@@ -1606,6 +1698,96 @@ impl<'a> EventSelector<'a> {
 /// from the modelled range of `ListEventsMaxResults` (1..200): a request cannot ask
 /// for a larger page, so neither does the walk serve one.
 pub const LIST_EVENTS_MAX_RESULTS: i32 = 200;
+
+/// What a `ListAnomaliesForInsight` request selects out of ONE insight's anomalies.
+///
+/// The read "returns a list of the anomalies that belong to an insight that you specify
+/// using its ID", so the insight decides WHICH anomalies there are and this selector
+/// decides which of them the request asks for: `StartTimeRange` is "a time range used to
+/// specify when the requested anomalies started. All returned anomalies started during
+/// this time range", and the filters "specif[y] one or more service names that are used
+/// to list anomalies". Both are optional, so an anomaly of the insight is reported
+/// exactly while every one the request carries admits it, a filter is satisfied by ANY
+/// ONE of the values it names, and one the request omits restricts nothing.
+#[derive(Debug, Clone)]
+pub struct AnomalySelector<'a> {
+    /// `StartTimeRange`, matched against the anomaly's `AnomalyTimeRange.StartTime`:
+    /// when its anomalous behaviour started.
+    started: Option<MillisRange>,
+    /// `Filters.ServiceCollection.ServiceNames`, or `None` when the request names none.
+    service_names: Option<&'a Vec<String>>,
+}
+
+impl<'a> AnomalySelector<'a> {
+    /// The selection a request's `StartTimeRange` and `Filters` name, or the
+    /// [`FilterRejection`] that refuses it — a service name outside its modelled enum,
+    /// or a time bound this service cannot represent, rather than a silently empty page.
+    pub fn of(
+        start_time_range: Option<&StartTimeRange>,
+        service_collection: Option<&'a ServiceCollection>,
+    ) -> Result<Self, FilterRejection> {
+        let service_names =
+            named(service_collection.and_then(|collection| collection.service_names.as_ref()));
+        enum_values(
+            service_names,
+            SERVICE_NAME_VALUES,
+            "Filters.ServiceCollection.ServiceNames",
+        )?;
+        let started = match start_time_range {
+            None => None,
+            Some(range) => Some(millis_range(
+                range.from_time.as_ref(),
+                range.to_time.as_ref(),
+                "StartTimeRange",
+            )?),
+        };
+        Ok(Self {
+            started,
+            service_names,
+        })
+    }
+
+    /// Whether this selection holds `anomaly`: every filter the request carries admits
+    /// it.
+    ///
+    /// A service-name filter names a SET OF SERVICES, so it admits an anomaly found in
+    /// any one of them; an anomaly the analysis attributed to no service is in no such
+    /// set.
+    pub fn matches(&self, anomaly: &AnomalyRecord) -> bool {
+        self.started
+            .is_none_or(|started| started.holds(anomaly.start_time_millis))
+            && self.service_names.is_none_or(|wanted| {
+                wanted
+                    .iter()
+                    .any(|service_name| anomaly.service_names.contains(service_name))
+            })
+    }
+
+    /// The scope a page token over this selection is bound to, so a cursor issued for
+    /// one request's window and services does not seek into another's selection. A
+    /// caller prefixes its operation and the insight, as
+    /// [`InsightSearchSelector::page_scope`]'s callers prefix theirs.
+    pub fn page_scope(&self) -> String {
+        let service_names: BTreeSet<&str> = self
+            .service_names
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+            .collect();
+        format!(
+            "started/{}/services/{}",
+            self.started
+                .as_ref()
+                .map_or_else(|| "-".to_string(), MillisRange::page_scope),
+            scope_values(service_names),
+        )
+    }
+}
+
+/// The most anomalies one `ListAnomaliesForInsight` response carries when the request
+/// asks for more, from the modelled range of `ListAnomaliesForInsightMaxResults`
+/// (1..500): a request cannot ask for a larger page, so neither does the walk serve one.
+pub const LIST_ANOMALIES_FOR_INSIGHT_MAX_RESULTS: i32 = 500;
 
 /// Accepts a single enum filter member whose value is one `allowed` holds, or the
 /// rejection naming `member`.

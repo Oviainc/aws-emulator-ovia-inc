@@ -4,9 +4,17 @@
 //! IMPLEMENTED: reports the stored table, with `ItemCount` and `TableSizeBytes`
 //! derived from the items actually written and `TableStatus` derived from the
 //! lifecycle instants [`crate::ops::create_table`] and [`crate::ops::delete_table`]
-//! stored — so this is how a client polls a table from `CREATING` to `ACTIVE`, and
-//! how it sees `DELETING` before the table is gone. An unknown table is
+//! stored — so this is how a client polls a table to `ACTIVE`, and how it sees
+//! `DELETING` before the table is gone. An unknown table is
 //! `ResourceNotFoundException`.
+//!
+//! This is the operation an SDK waiter polls, at an interval far longer than the span
+//! this emulator compresses a table's creation into, so a poll that lands while the
+//! clock still owes the table that creation is answered once it has fallen due — never
+//! later than one [`crate::state::STATUS_TRANSITION`] — and reports the status the clock
+//! holds at the instant it answers. Nothing else about the transient span changes: the
+//! creating call's own response reports `CREATING`, and every operation the state refuses
+//! while a table is not `ACTIVE` still refuses it.
 //!
 //! ## Shape of an operation
 //!
@@ -144,14 +152,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let region = crate::state::request_region(ctx.parts());
-        let now = ::std::time::SystemTime::now();
+        let mut now = ::std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         let name = crate::state::resolve_table_name(&input.table_name).map_err(lift)?;
 
+        // How much of the table's creation the clock still owes when this poll lands
+        // ([`crate::state::Table::creation_settles_in`]). The store guard is dropped with
+        // the block, so nothing else is held while this request waits below.
+        let still_creating = {
+            let mut store = state.lock();
+            // Finish any transition the clock already made due before reporting: a table
+            // whose DeleteTable span has elapsed is gone, and this is a read, so that is
+            // the only write it makes.
+            store.apply_due_transitions(now);
+            store
+                .table(&region, &name)
+                .map_err(lift)?
+                .creation_settles_in(now)
+        };
+        // A client confirms a new table is usable by polling THIS operation, at an
+        // interval orders of magnitude longer than the span the emulator compresses the
+        // creation into: answering "still creating" to a poll that lands inside that span
+        // leaves the caller waiting out its whole interval for a transition already a
+        // fraction of a second away. So the poll is answered once the creation has fallen
+        // due — never later than one span — and the status reported is still the one the
+        // clock holds at the instant this answers.
+        if let Some(left) = still_creating {
+            ::tokio::time::sleep(left.min(crate::state::STATUS_TRANSITION)).await;
+            now = ::std::time::SystemTime::now();
+        }
+
         let mut store = state.lock();
-        // Finish any transition the clock already made due before reporting: a table
-        // whose DeleteTable span has elapsed is gone, and this is a read, so that is
-        // the only write it makes.
         store.apply_due_transitions(now);
         let table = store.table(&region, &name).map_err(lift)?;
 

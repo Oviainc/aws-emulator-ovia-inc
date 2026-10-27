@@ -53,6 +53,8 @@ mod queue_policy_authorization;
 mod queue_tags;
 #[path = "all/receive_message_attribute_names.rs"]
 mod receive_message_attribute_names;
+#[path = "all/refusal_message_reasons.rs"]
+mod refusal_message_reasons;
 #[path = "all/refusal_taxonomy.rs"]
 mod refusal_taxonomy;
 #[path = "all/request_size_transport_bound.rs"]

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeVpcEndpointAssociations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeVpcEndpointAssociations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the VPC endpoint associations [`crate::state`] holds, narrowed by
+//! `VpcEndpointIds` and the documented filters and paged by `MaxResults`/`NextToken`. This
+//! is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeVpcEndpointAssociations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An association exists only for an endpoint that points at a resource configuration or a
+//! service network, which is what
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::vpc_endpoint_associations`] holds — so an
+//! account whose endpoints are all gateway or interface endpoints is reported the empty set,
+//! which is one case of reporting the store rather than a special answer.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +146,332 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeVpcEndpointAssociations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeVpcEndpointAssociationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeVpcEndpointAssociations"))
+        // `ctx` carries request metadata only; this operation reads none of it — an
+        // association is named by id and carries the ARNs of what it associates itself. The
+        // store is reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // Matching cost is filters x values x held values x stored associations, and the
+        // model bounds none of them, so the request-controlled factors are capped here,
+        // before any work proportional to them is done — and their PRODUCT is charged to one
+        // [`crate::state::MatchBudget`] below, which is the bound the per-factor caps cannot
+        // give. The same walk `DescribeVpcEndpoints` does over the endpoint store.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > state::MAX_FILTERS {
+            return Err(state::invalid_parameter_value(format!(
+                "The request carries {supplied} filters, above the maximum of {maximum}",
+                supplied = filters.len(),
+                maximum = state::MAX_FILTERS,
+            )));
+        }
+        let mut selectors: Vec<(&str, &[String])> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            let documented = documented_filter_name(name).ok_or_else(|| {
+                state::invalid_parameter_value(format!("The filter '{name}' is invalid"))
+            })?;
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > state::MAX_FILTER_VALUES {
+                return Err(state::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {supplied} values, above the maximum of \
+                     {maximum}",
+                    supplied = values.len(),
+                    maximum = state::MAX_FILTER_VALUES,
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > state::MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(state::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {supplied} bytes, above the \
+                     maximum of {maximum}",
+                    supplied = oversize.len(),
+                    maximum = state::MAX_FILTER_VALUE_BYTES,
+                )));
+            }
+            selectors.push((documented, values));
+        }
+
+        // "The pagination token" (`NextToken`) — one this service issued, so anything else
+        // is refused rather than read as an id, by the message EC2 answers for it (which
+        // names the token the request sent), and before any other member is looked at, so
+        // whether a bogus token is caught never depends on the rest of the request.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                state::decode_page_token(token)
+                    .ok_or_else(|| state::invalid_pagination_token_for(token))?,
+            ),
+        };
+
+        // "The IDs of the VPC endpoints" (`VpcEndpointIds`): the model publishes no bound on
+        // the list, so the number of ids one request may name is capped here, before any
+        // per-id work. An id that is not a VPC endpoint id at all is refused as malformed —
+        // the same reading of the same member `DescribeVpcEndpoints` applies — so "not an
+        // endpoint id" never reads as "no such endpoint" and is never answered by the DryRun
+        // arm below either.
+        let requested: &[String] = input.vpc_endpoint_ids.as_deref().unwrap_or_default();
+        if requested.len() > state::MAX_RESOURCE_IDS {
+            return Err(state::invalid_parameter_value(format!(
+                "VpcEndpointIds carries {supplied} ids, above the maximum of {maximum}",
+                supplied = requested.len(),
+                maximum = state::MAX_RESOURCE_IDS,
+            )));
+        }
+        if let Some(malformed) = requested
+            .iter()
+            .find(|endpoint_id| !state::vpc_endpoint_id_is_well_formed(endpoint_id))
+        {
+            return Err(crate::scaffolded::Scaffolded::service_error(
+                state::INVALID_VPC_ENDPOINT_ID_MALFORMED,
+                400,
+                format!("Invalid id: '{malformed}'"),
+            ));
+        }
+
+        // "Checks whether you have the required permissions for the action, WITHOUT
+        // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`DryRun`): the flag asks about PERMISSION, not about the
+        // named resources, so it is answered once the request's own form has been checked
+        // and before anything is resolved; every caller of this emulator is permitted.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // A `Pending` endpoint reaches `Available` at an instant the clock owes it, whether
+        // or not anybody called — so the moves already due are applied before this report
+        // resolves the endpoint ids it was given, and two reports either side of that
+        // instant differ because the CLOCK passed it and not because this call changed
+        // anything
+        // ([`crate::state::ComAmazonawsEc2Amazonec2State::materialize_due_transitions`]).
+        store.materialize_due_transitions();
+
+        // An endpoint id that names no endpoint of the account is an error and not an empty
+        // report — which is what lets a client tell a dangling endpoint reference from an
+        // endpoint that simply has no association. The ids are held as an ordered SET, so
+        // the per-association selection below costs O(log R) rather than a walk of the whole
+        // list per candidate.
+        let named_ids: ::std::collections::BTreeSet<&str> =
+            requested.iter().map(String::as_str).collect();
+        if let Some(unknown) = named_ids
+            .iter()
+            .find(|endpoint_id| !store.vpc_endpoints.contains_key(**endpoint_id))
+        {
+            return Err(state::id_not_found(
+                state::INVALID_VPC_ENDPOINT_ID_NOT_FOUND,
+                "VPC endpoint ID",
+                unknown,
+            ));
+        }
+
+        // Every association of the account by default; `VpcEndpointIds` narrows the store to
+        // the associations of the endpoints named, and every filter must then hold ("If you
+        // specify multiple filters, the filters are joined with an AND" — `Filter`). Every
+        // comparison is charged to ONE budget — one step per candidate even when no filter
+        // was given, so an unfiltered scan is counted too — which bounds the PRODUCT of
+        // stored associations, filters, values, held values and value length however the
+        // caller combines them.
+        let mut budget = state::MatchBudget::new(state::MAX_FILTER_MATCH_STEPS);
+        let compiled = compiled(&selectors);
+        let mut selected: Vec<&VpcEndpointAssociation> = Vec::new();
+        for association in store.vpc_endpoint_associations.values() {
+            if budget.exhausted() {
+                break;
+            }
+            let named = named_ids.is_empty()
+                || association
+                    .vpc_endpoint_id
+                    .as_deref()
+                    .is_some_and(|id| named_ids.contains(id));
+            if named
+                && state::matches_every_filter(&compiled, &mut budget, &|name| {
+                    filter_values(association, name)
+                })
+            {
+                selected.push(association);
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report
+        // as a result: the request asked for more filtering than one call will do, and is
+        // told so rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(
+                format!(
+                    "The request's filters would take more than {steps} comparisons to \
+                     evaluate; narrow them or page with MaxResults",
+                    steps = state::MAX_FILTER_MATCH_STEPS,
+                ),
+            ));
+        }
+
+        // Page in association-id order, which the cursor below names a position in. The
+        // store is an ordered map keyed by that id, so its iteration order already satisfies
+        // this sort; doing it here establishes the invariant the cursor depends on at the
+        // point of use.
+        selected.sort_by(|left, right| left.id.cmp(&right.id));
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected.partition_point(|association| {
+                association.id.as_deref().unwrap_or_default() < cursor
+            }),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // "The maximum page size" (`MaxResults`, modelled `range 1..100`, so the boundary
+        // validator has already refused every size outside it). A request naming no size is
+        // answered with everything the store holds, up to the page this crate will build at
+        // all, so the `NextToken` path below behaves the same whether or not a size was
+        // asked for.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(state::MAX_PAGE_SIZE)
+            .clamp(1, state::MAX_PAGE_SIZE);
+
+        // "The pagination token" (`DescribeVpcEndpointAssociationsResult$NextToken`): a
+        // token only when an association follows this page.
+        let next_token = page
+            .get(limit)
+            .and_then(|association| association.id.as_deref())
+            .map(state::encode_page_token);
+
+        Ok(DescribeVpcEndpointAssociationsOutput {
+            vpc_endpoint_associations: Some(
+                page.iter()
+                    .take(limit)
+                    .map(|association| (*association).clone())
+                    .collect(),
+            ),
+            next_token,
+        })
     }
+}
+
+/// The selectors as [`crate::state::matches_every_filter`] takes them: one compiled filter
+/// per entry, EC2's `*`/`?` wildcards and all.
+fn compiled(selectors: &[(&str, &[String])]) -> Vec<crate::state::CompiledFilter> {
+    selectors
+        .iter()
+        .map(|(name, values)| {
+            crate::state::CompiledFilter::new((*name).to_string(), values.to_vec())
+        })
+        .collect()
+}
+
+/// The filter names this operation documents, from
+/// `DescribeVpcEndpointAssociationsRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeVpcEndpointAssociationsRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// The member documents no `tag:`/`tag-key` filter for this operation, so — unlike
+/// `DescribeVpcEndpoints` — a tag filter name is as undocumented here as any other
+/// misspelling. Every entry must be answered by [`filter_values`].
+const VPC_ENDPOINT_ASSOCIATION_FILTERS: [&str; 6] = [
+    "associated-resource-accessibility",
+    "associated-resource-id",
+    "association-id",
+    "resource-configuration-group-arn",
+    "service-network-arn",
+    "vpc-endpoint-id",
+];
+
+/// The name [`filter_values`] answers for the filter the request called `name`, or `None`
+/// when this operation documents no such filter.
+///
+/// "Filter names are case-sensitive" (`Filter$Name`), so every comparison is exact.
+fn documented_filter_name(name: &str) -> Option<&str> {
+    VPC_ENDPOINT_ASSOCIATION_FILTERS
+        .contains(&name)
+        .then_some(name)
+}
+
+/// The values the EC2 filter `name` compares against this association.
+///
+/// A filter naming an attribute this association does not carry compares against NO values,
+/// so it selects nothing — which is the answer for `service-network-arn` on an association
+/// of an endpoint that points at a resource configuration instead ("Only VPC endpoints of
+/// type service network will be returned"). `name` is a name [`documented_filter_name`]
+/// resolved.
+///
+/// `associated-resource-accessibility` compares against BOTH spellings of the association's
+/// accessibility: the stored value is the one the response reports, while the filter
+/// documents its own spelling of the same state — see
+/// [`crate::state::ASSOCIATED_RESOURCE_ACCESSIBILITY_FILTER_VALUES`].
+fn filter_values<'a>(
+    association: &'a VpcEndpointAssociation,
+    name: &str,
+) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        "associated-resource-accessibility" => {
+            let accessibility = association.associated_resource_accessibility.as_deref();
+            let mut values = text(accessibility);
+            if let Some(documented) = accessibility.and_then(documented_accessibility_value) {
+                values.push(Cow::Borrowed(documented));
+            }
+            values
+        }
+        // "The ID of the associated resource configuration": the id of the resource this
+        // association's `AssociatedResourceArn` names, which is that ARN's resource part
+        // rather than a second copy of it on the record.
+        "associated-resource-id" => text(
+            association
+                .associated_resource_arn
+                .as_deref()
+                .and_then(arn_resource_id),
+        ),
+        "association-id" => text(association.id.as_deref()),
+        "resource-configuration-group-arn" => {
+            text(association.resource_configuration_group_arn.as_deref())
+        }
+        "service-network-arn" => text(association.service_network_arn.as_deref()),
+        "vpc-endpoint-id" => text(association.vpc_endpoint_id.as_deref()),
+        // Unreachable: `documented_filter_name` has already refused every other name. An
+        // undefined name compares against nothing, so it could never widen a result even if
+        // that check were bypassed.
+        _ => Vec::new(),
+    }
+}
+
+/// How the `associated-resource-accessibility` filter spells the reported accessibility
+/// `accessibility`, when that spelling differs from the reported one; `None` for a value the
+/// filter documents no spelling of.
+fn documented_accessibility_value(accessibility: &str) -> Option<&'static str> {
+    crate::state::ASSOCIATED_RESOURCE_ACCESSIBILITY_FILTER_VALUES
+        .iter()
+        .find(|(documented, reported)| *reported == accessibility && *documented != accessibility)
+        .map(|(documented, _)| *documented)
+}
+
+/// The resource id an ARN names: the part after the last `/` of its resource part, or after
+/// the last `:` for a resource part that carries no `/`.
+///
+/// An ARN is `arn:<partition>:<service>:<region>:<account>:<resource>`, and the resource part
+/// is either `<type>/<id>` or `<type>:<id>` (AWS General Reference, "Amazon Resource Names"),
+/// so the id is the last segment under either separator. `None` for a value that is no ARN at
+/// all, which therefore names no resource id to compare against.
+fn arn_resource_id(arn: &str) -> Option<&str> {
+    if !arn.starts_with("arn:") {
+        return None;
+    }
+    let resource = arn.splitn(6, ':').nth(5)?;
+    let id = match resource.rsplit_once('/') {
+        Some((_, id)) => id,
+        None => resource.rsplit_once(':').map_or(resource, |(_, id)| id),
+    };
+    (!id.is_empty()).then_some(id)
 }

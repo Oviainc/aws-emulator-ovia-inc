@@ -37,6 +37,15 @@
 //! Those copies are to be MIGRATED onto this module; they are left in place only
 //! because this change does not own those services' issues, and each is covered by its
 //! own suite. Nothing new should inline the rule again — call this module.
+//!
+//! # Two wordings
+//!
+//! Most front doors answer the one fixed sentence above. Some report, in brackets, the
+//! CLAUSE their body-schema validator states for each constraint class it found — the
+//! regex a value does not match, the length bound a string broke. That is the only thing
+//! a service chooses here: [`FrontDoor::worded`] takes a [`BodyWording`] built from the
+//! sentences in [`crate::validation_message`], so the sentences themselves still cannot
+//! drift per crate.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema::Schema;
@@ -46,6 +55,8 @@ use smithy_server_runtime::{
     BoxFuture, ErasedOperation, Operation, OperationContext, Refused, ServerHttpProtocol, Service,
     Violation,
 };
+
+use crate::validation::SubmittedEcho;
 
 /// The error code a front door names for a request body that breaks a modelled
 /// constraint. NOT a shape in the serving service's model: the rejection happens ahead
@@ -60,6 +71,15 @@ pub const BAD_REQUEST_EXCEPTION: &str = "BadRequestException";
 /// member-by-member clause the framework writes is what the service's own modelled
 /// validation error carries, for the refusals the application layer owns.)
 pub const INVALID_REQUEST_BODY: &str = "Invalid request body";
+
+/// How a front door words a body it refused, for a service whose recordings show the
+/// body-schema validator's CLAUSES rather than the fixed sentence alone.
+///
+/// It is handed every violation the request's BODY broke, each with the value the caller
+/// submitted ([`SubmittedEcho`]) — the framework's own echo of a long value is elided, so
+/// a clause that quotes one needs this — and answers the code and the message together,
+/// or `None` to leave the request to the layers behind the door.
+pub type BodyWording = fn(&[(Violation, SubmittedEcho)]) -> Option<Refused>;
 
 /// One modelled operation, served behind its service's front door.
 ///
@@ -83,12 +103,28 @@ pub const INVALID_REQUEST_BODY: &str = "Invalid request body";
 /// already enforces, buy the per-operation placement no other seam can make.
 pub struct FrontDoor<O> {
     operation: O,
+    /// How this service's front door words a refused body, or `None` for the fixed
+    /// sentence [`INVALID_REQUEST_BODY`].
+    wording: Option<BodyWording>,
 }
 
 impl<O> FrontDoor<O> {
-    /// Wrap one operation, already constructed from the shared engine.
+    /// Wrap one operation, already constructed from the shared engine. Its front door
+    /// answers the fixed sentence.
     pub fn new(operation: O) -> Self {
-        Self { operation }
+        Self {
+            operation,
+            wording: None,
+        }
+    }
+
+    /// Wrap one operation whose front door states `wording`'s clauses instead of the
+    /// fixed sentence.
+    pub fn worded(operation: O, wording: BodyWording) -> Self {
+        Self {
+            operation,
+            wording: Some(wording),
+        }
     }
 }
 
@@ -103,12 +139,12 @@ where
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
-            // The protocol is read, used and dropped inside this one statement:
-            // `&dyn ErasedServiceDefinition` is not `Sync`, so holding it across the
-            // await below would make this future non-`Send`.
-            let refused = body_violations::<O>(svc.definition().protocol(), req);
-            if !refused.is_empty() {
-                return rejection(svc, refused);
+            // The door's own answer is computed in one call that reads, uses and drops
+            // the protocol: `&dyn ErasedServiceDefinition` is not `Sync`, so holding it
+            // across the await below would make this future non-`Send`.
+            let refused = self.refusal(svc, req);
+            if let Some(response) = refused {
+                return response;
             }
             self.operation.run(svc, req, ctx).await
         })
@@ -118,6 +154,29 @@ where
     /// change which schemes sign it.
     fn auth_schemes(&self) -> Option<&'static [&'static str]> {
         self.operation.auth_schemes()
+    }
+}
+
+impl<O: Operation> FrontDoor<O> {
+    /// This door's answer to `req`, or `None` when its body breaks nothing the door
+    /// refuses — in which case the operation behind it is served.
+    ///
+    /// The protocol is read, used and dropped inside this one function, so nothing
+    /// borrowed from the service definition is held across the caller's await.
+    fn refusal(&self, svc: &dyn Service, req: &RtRequest) -> Option<RtResponse> {
+        let protocol = svc.definition().protocol();
+        match self.wording {
+            None => {
+                let refused = body_violations::<O>(protocol, req);
+                (!refused.is_empty()).then(|| rejection(svc, refused))
+            }
+            Some(wording) => {
+                let refused = body_violations_with_echoes::<O>(protocol, req);
+                let chosen = wording(&refused)?;
+                let violations = refused.into_iter().map(|(violation, _)| violation).collect();
+                Some(worded_rejection(svc, violations, chosen))
+            }
+        }
     }
 }
 
@@ -152,6 +211,23 @@ pub fn body_violations<O: Operation>(
         .collect()
 }
 
+/// As [`body_violations`], with each violation paired with how a clause can state the
+/// value it is about ([`SubmittedEcho`]).
+///
+/// For a front door that QUOTES the submitted value: the framework's own echo elides a
+/// long one, so a clause built from it would state text the caller never sent. The
+/// violation set is the same one [`body_violations`] finds — the same collecting walk,
+/// narrowed by the same binding rule.
+pub fn body_violations_with_echoes<O: Operation>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+) -> Vec<(Violation, SubmittedEcho)> {
+    crate::validation::refusing_violations_with_echoes::<O>(protocol, req)
+        .into_iter()
+        .filter(|(violation, _)| binds_to_body(O::INPUT_SCHEMA, &violation.path))
+        .collect()
+}
+
 /// Whether `violation_path` names a member `input_schema` carries in the request BODY.
 ///
 /// Read off the member's own HTTP binding traits, so the model decides: a member with
@@ -182,13 +258,85 @@ pub fn binds_to_body(input_schema: &Schema, violation_path: &str) -> bool {
 /// message together — a client branches on the code, so one without the other is worse
 /// than neither.
 pub fn rejection(svc: &dyn Service, refused: Vec<Violation>) -> RtResponse {
-    svc.definition().refusal_response(
-        ProtocolError::Invalid(refused),
-        Some(Refused {
+    worded_rejection(
+        svc,
+        refused,
+        Refused {
             code: BAD_REQUEST_EXCEPTION.to_string(),
             message: INVALID_REQUEST_BODY.to_string(),
-        }),
+        },
     )
+}
+
+/// As [`rejection`], with the code and message a service's own [`BodyWording`] chose.
+///
+/// The envelope and the status stay the framework's — a constraint failure is a 400 in
+/// every protocol — so a service's wording decides the words and nothing else.
+pub fn worded_rejection(
+    svc: &dyn Service,
+    refused: Vec<Violation>,
+    chosen: Refused,
+) -> RtResponse {
+    svc.definition()
+        .refusal_response(ProtocolError::Invalid(refused), Some(chosen))
+}
+
+/// The routing table a service serves its operations behind its front door through:
+/// every operation wrapped in [`FrontDoor`], keyed by the routing key the protocol
+/// resolves.
+///
+/// A service builds one in its `EmulatedService::new` and returns it from
+/// `override_operation`, which is the whole wiring: [`serve`](Self::serve) takes one
+/// already-constructed operation, wraps it and keys it by the operation's own
+/// [`Operation::NAME`] — the model-derived shape name the generated table is keyed by, so
+/// a wrapped operation cannot be filed under a key the protocol never resolves. Every
+/// service that had this wiring wrote the same wrapping loop by hand; this is that loop,
+/// once.
+pub struct FrontDoorTable {
+    table: smithy_server_runtime::OperationRoutingTable,
+    wording: Option<BodyWording>,
+}
+
+impl FrontDoorTable {
+    /// An empty table whose doors answer the fixed sentence [`INVALID_REQUEST_BODY`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            table: smithy_server_runtime::OperationRoutingTable::new(),
+            wording: None,
+        }
+    }
+
+    /// An empty table whose doors state `wording`'s clauses instead.
+    #[must_use]
+    pub fn worded(wording: BodyWording) -> Self {
+        Self {
+            table: smithy_server_runtime::OperationRoutingTable::new(),
+            wording: Some(wording),
+        }
+    }
+
+    /// Serve `operation` behind this table's front door, under its modelled name.
+    pub fn serve<O: Operation + ErasedOperation + 'static>(&mut self, operation: O) -> &mut Self {
+        let door = match self.wording {
+            Some(wording) => FrontDoor::worded(operation, wording),
+            None => FrontDoor::new(operation),
+        };
+        self.table.add_operation(O::NAME, Box::new(door));
+        self
+    }
+
+    /// The table, for the service to hold and answer `override_operation` from.
+    #[must_use]
+    pub fn finish(self) -> smithy_server_runtime::OperationRoutingTable {
+        self.table
+    }
+}
+
+impl Default for FrontDoorTable {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]

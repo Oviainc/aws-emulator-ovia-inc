@@ -95,6 +95,8 @@ mod managed_login_branding;
 mod managed_login_branding_updates;
 #[path = "all/log_delivery_configuration.rs"]
 mod log_delivery_configuration;
+#[path = "all/message_delivery_and_live_codes.rs"]
+mod message_delivery_and_live_codes;
 #[path = "all/provisioned_limits.rs"]
 mod provisioned_limits;
 #[path = "all/public_user_not_found_message.rs"]

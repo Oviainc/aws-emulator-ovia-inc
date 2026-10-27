@@ -290,6 +290,37 @@ fn bare_id(arn: &str) -> String {
     arn.rsplit('/').next().unwrap_or(arn).to_string()
 }
 
+/// The `BillingPeriod` `months` after the CURRENT billing period (negative for
+/// earlier), in the zero-padded spelling the modelled `BillingPeriod` pattern
+/// `^\d{4}-(0?[1-9]|1[012])$` allows.
+///
+/// A custom line item may be created only into the current or the previous billing
+/// period, which the wall clock decides, so every span an item here is created with is
+/// named relative to the service's own current billing period rather than by a fixed
+/// month.
+fn period(months: i64) -> String {
+    let current =
+        service_com_amazonaws_billingconductor_awsbillingconductor::state::current_billing_period();
+    let (year, month) = current
+        .split_once('-')
+        .expect("the current billing period is spelled YYYY-MM");
+    let total = year.parse::<i64>().expect("a four-digit year") * 12
+        + month.parse::<i64>().expect("a month")
+        - 1
+        + months;
+    format!("{:04}-{:02}", total.div_euclid(12), total.rem_euclid(12) + 1)
+}
+
+/// The same billing period with its month spelled without a leading zero — the other
+/// spelling the modelled `BillingPeriod` pattern allows. A month from October on has
+/// only the one spelling, so for those this is the value it was given.
+fn one_digit_month(billing_period: &str) -> String {
+    let (year, month) = billing_period
+        .split_once('-')
+        .expect("a billing period is spelled YYYY-MM");
+    format!("{year}-{}", month.trim_start_matches('0'))
+}
+
 /// RULE: the pro forma cost of a billing group is the SIGNED sum of the charges of the
 /// custom line items in effect for it, the actual cost is the metered usage this emulator
 /// records (none), and the margin and its percentage follow from the two.
@@ -558,8 +589,8 @@ async fn the_proforma_cost_is_the_signed_sum_of_the_custom_line_items_in_effect(
         0.0,
     ));
 
-    // An item whose own billing period range ended long ago is in effect in no period the
-    // report covers, so none of its charge is reported.
+    // An item whose own billing period range ended before the period the report covers is
+    // in effect in none of them, so none of its charge is reported.
     let expired = em.billing_group("expired").await;
     em.custom_line_item(
         &expired,
@@ -567,8 +598,8 @@ async fn the_proforma_cost_is_the_signed_sum_of_the_custom_line_items_in_effect(
         json!({
             "ChargeDetails": { "Type": "FEE", "Flat": { "ChargeValue": 500.0 } },
             "BillingPeriodRange": {
-                "InclusiveStartBillingPeriod": "2020-01",
-                "ExclusiveEndBillingPeriod": "2020-02",
+                "InclusiveStartBillingPeriod": period(-1),
+                "ExclusiveEndBillingPeriod": period(0),
             },
         }),
     )
@@ -610,22 +641,22 @@ async fn a_report_grouped_by_billing_period_reports_each_period_of_the_range() {
     .await;
     em.custom_line_item(
         &group,
-        "januaryonly",
+        "previousonly",
         json!({
             "ChargeDetails": { "Type": "FEE", "Flat": { "ChargeValue": 10.0 } },
             "BillingPeriodRange": {
-                "InclusiveStartBillingPeriod": "2026-01",
-                "ExclusiveEndBillingPeriod": "2026-02",
+                "InclusiveStartBillingPeriod": period(-1),
+                "ExclusiveEndBillingPeriod": period(0),
             },
         }),
     )
     .await;
     em.custom_line_item(
         &group,
-        "februaryonwards",
+        "fromcurrent",
         json!({
             "ChargeDetails": { "Type": "FEE", "Flat": { "ChargeValue": 5.0 } },
-            "BillingPeriodRange": { "InclusiveStartBillingPeriod": "2026-02" },
+            "BillingPeriodRange": { "InclusiveStartBillingPeriod": period(0) },
         }),
     )
     .await;
@@ -638,8 +669,8 @@ async fn a_report_grouped_by_billing_period_reports_each_period_of_the_range() {
             json!({
                 "Arn": group.clone(),
                 "BillingPeriodRange": {
-                    "InclusiveStartBillingPeriod": "2026-1",
-                    "ExclusiveEndBillingPeriod": "2026-04",
+                    "InclusiveStartBillingPeriod": one_digit_month(&period(-1)),
+                    "ExclusiveEndBillingPeriod": period(2),
                 },
                 "GroupBy": ["BILLING_PERIOD"],
             }),
@@ -647,7 +678,11 @@ async fn a_report_grouped_by_billing_period_reports_each_period_of_the_range() {
         .await;
 
     // (the period the row is for, its pro forma cost)
-    let expected = [("2026-01", 11.0), ("2026-02", 6.0), ("2026-03", 6.0)];
+    let expected = [
+        (period(-1), 11.0),
+        (period(0), 6.0),
+        (period(1), 6.0),
+    ];
     assert_eq!(
         rows.len(),
         expected.len(),
@@ -670,8 +705,8 @@ async fn a_report_grouped_by_billing_period_reports_each_period_of_the_range() {
             json!({
                 "Arn": group.clone(),
                 "BillingPeriodRange": {
-                    "InclusiveStartBillingPeriod": "2026-01",
-                    "ExclusiveEndBillingPeriod": "2026-04",
+                    "InclusiveStartBillingPeriod": period(-1),
+                    "ExclusiveEndBillingPeriod": period(2),
                 },
             }),
         )
@@ -710,8 +745,8 @@ async fn a_report_grouped_by_product_name_reports_each_presented_product() {
             "ChargeDetails": { "Type": "FEE", "Flat": { "ChargeValue": 2.0 } },
             "PresentationDetails": { "Service": "S3" },
             "BillingPeriodRange": {
-                "InclusiveStartBillingPeriod": "2026-02",
-                "ExclusiveEndBillingPeriod": "2026-03",
+                "InclusiveStartBillingPeriod": period(0),
+                "ExclusiveEndBillingPeriod": period(1),
             },
         }),
     )
@@ -733,8 +768,8 @@ async fn a_report_grouped_by_product_name_reports_each_presented_product() {
     .await;
 
     let two_months = json!({
-        "InclusiveStartBillingPeriod": "2026-01",
-        "ExclusiveEndBillingPeriod": "2026-03",
+        "InclusiveStartBillingPeriod": period(-1),
+        "ExclusiveEndBillingPeriod": period(1),
     });
 
     // By product over both periods: each product's charges summed across the range.
@@ -788,12 +823,12 @@ async fn a_report_grouped_by_product_name_reports_each_presented_product() {
         .await;
     // (period, product, pro forma cost), in the order the rows run.
     let expected = [
-        ("2026-01", OWN_PRODUCT_NAME, 7.0),
-        ("2026-01", "EC2", -3.0),
-        ("2026-01", "S3", 10.0),
-        ("2026-02", OWN_PRODUCT_NAME, 7.0),
-        ("2026-02", "EC2", -3.0),
-        ("2026-02", "S3", 12.0),
+        (period(-1), OWN_PRODUCT_NAME, 7.0),
+        (period(-1), "EC2", -3.0),
+        (period(-1), "S3", 10.0),
+        (period(0), OWN_PRODUCT_NAME, 7.0),
+        (period(0), "EC2", -3.0),
+        (period(0), "S3", 12.0),
     ];
     assert_eq!(
         rows.len(),

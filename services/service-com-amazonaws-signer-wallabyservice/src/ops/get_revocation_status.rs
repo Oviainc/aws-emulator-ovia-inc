@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRevocationStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRevocationStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRevocationStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports which of the entities a signature depends on — the
+//! signing-profile version, the signing job and the certificates — this
+//! endpoint holds a revocation for that leaves a signature made at the
+//! request's `signatureTimestamp` untrusted. Every answer is read out of the
+//! records `RevokeSigningProfile` and `RevokeSignature` wrote (see
+//! [`crate::state`]), and each revoked entity is reported by the identifier the
+//! REQUEST carried for it.
+//!
+//! A profile's revocation names the instant it becomes effective, so it covers
+//! the signatures its versions produced at or after that instant; a signature's
+//! own revocation names no such instant, so a revoked signing job's signature is
+//! untrusted whenever it was made. Nothing in AWS Signer revokes a CERTIFICATE —
+//! the service models revocation of a signing profile and of a signing job's
+//! signature, and of nothing else — so no stored record can make one of the
+//! request's certificate hashes revoked, and none is reported.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +165,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRevocationStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRevocationStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRevocationStatus"))
+        // Signer is regional: the profile version and the signing job a request
+        // names are the ones held by the region whose endpoint it was signed for,
+        // and no other region's.
+        let region = crate::state::request_region(ctx.parts());
+
+        // `platformId` names the signing platform the signature was produced on,
+        // and this service publishes the WHOLE set of platforms a signature can
+        // be produced on, so an id outside that catalog names no platform at all.
+        if crate::state::signing_platform(&input.platform_id).is_none() {
+            return Err(validation(crate::state::platform_not_found_message(
+                &input.platform_id,
+            )));
+        }
+
+        // Both ARNs name a resource of THIS service, so a value that is not an AWS
+        // Signer ARN at all is refused for the value it carried. A well-formed
+        // Signer ARN is not: the operation models no not-found, so an ARN naming a
+        // resource this endpoint holds none of — another account's, another
+        // region's, an id nothing was created under, a resource of another kind —
+        // is answered as a resource that is simply not revoked.
+        if !crate::state::is_signer_arn(&input.profile_version_arn) {
+            return Err(validation(format!(
+                "{} is not a valid signing profile version ARN",
+                input.profile_version_arn
+            )));
+        }
+        if !crate::state::is_signer_arn(&input.job_arn) {
+            return Err(validation(format!(
+                "{} is not a valid signing job ARN",
+                input.job_arn
+            )));
+        }
+        // The profile version and the job id the ARNs name, when they name one at
+        // all; `None` is a resource no record can cover.
+        let profile_version_named = crate::state::profile_version_in_arn(&input.profile_version_arn);
+        let job_named = crate::state::job_region_and_id_in_arn(&input.job_arn);
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetRevocationStatusErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some("the signer revocation store is unavailable".to_string()),
+                        code: Some(crate::state::ERROR_CODE_INTERNAL_SERVICE_ERROR.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        // A REPORT of what the store holds: the guard is taken for reading only
+        // and nothing is written, so repeating the call answers the same list and
+        // a later caller sees exactly what this one saw.
+        let store = state.lock();
+
+        // "A list of revoked entities … supplied as input to the API": each one is
+        // reported by the identifier the REQUEST carried for it, in the order the
+        // input names them — the profile version, then the job, then the
+        // certificate hashes.
+        let mut revoked_entities: Vec<String> = Vec::new();
+
+        // The ARN has to be the one the stored profile's version carries, so a
+        // version ARN naming another account's or another partition's profile of
+        // the same name names no version this endpoint can report on.
+        if profile_version_named.is_some_and(|(_, profile_name, profile_version)| {
+            store.profile(&region, profile_name).is_some_and(|profile| {
+                profile.version_arn(profile_version) == input.profile_version_arn
+                    && profile.version_revoked_at(profile_version, &input.signature_timestamp)
+            })
+        }) {
+            revoked_entities.push(input.profile_version_arn.clone());
+        }
+
+        // A revoked signature is revoked outright: `SigningJobRevocationRecord`
+        // carries when the signature was revoked and by whom, and no instant from
+        // which the revocation takes effect, so the one signature that job
+        // produced is untrusted whenever it was made.
+        if job_named.is_some_and(|(_, job_id)| {
+            store
+                .job(&region, job_id)
+                .is_some_and(|job| job.arn() == input.job_arn && job.is_revoked())
+        }) {
+            revoked_entities.push(input.job_arn.clone());
+        }
+
+        // No certificate hash is ever reported: this service revokes signing
+        // profiles and signing jobs' signatures and models no revocation of a
+        // certificate, so there is no record one of these hashes could resolve
+        // to. A request carrying them is answered on the entities that do have
+        // records rather than refused for asking (see this module's header).
+
+        // Always present, and empty when nothing the request named is revoked:
+        // the member reports "zero or more" of the input entities, so a caller
+        // reads the answer off the list itself.
+        Ok(GetRevocationStatusOutput {
+            revoked_entities: Some(revoked_entities),
+        })
     }
+}
+
+/// The modelled 400 for a request this operation cannot act on: a `platformId`
+/// naming no published signing platform, or a member that is not an ARN of the
+/// resource it names.
+///
+/// `code` is the modelled shape's own name — a refusal of the request's own
+/// values, which is what that shape already says (see
+/// [`crate::state::ERROR_CODE_VALIDATION`]).
+fn validation(message: String) -> GetRevocationStatusError {
+    GetRevocationStatusErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+        code: Some(crate::state::ERROR_CODE_VALIDATION.to_string()),
+    })
+    .into()
 }
