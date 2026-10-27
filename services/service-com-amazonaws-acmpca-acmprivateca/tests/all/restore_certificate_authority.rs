@@ -15,10 +15,9 @@
 //!   cannot be restored; a CA whose restoration period has run out is permanently deleted
 //!   and so is found by nobody.
 //!
-//! `UpdateCertificateAuthority` is still a scaffold stub, so the statuses no implemented
-//! operation can reach (DISABLED, EXPIRED, FAILED, and a CREATING CA that has not settled
-//! yet) are seeded straight into the store the handlers share; every assertion then goes
-//! over the wire.
+//! The statuses no implemented operation moves a CA into (EXPIRED, FAILED, and a CREATING
+//! CA that has not settled yet) are seeded straight into the store the handlers share;
+//! every assertion then goes over the wire.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 

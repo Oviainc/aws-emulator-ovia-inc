@@ -983,6 +983,21 @@
 //! ([`PREFIX_LIST_REFERENCE_STATE_PENDING`]) and the clock owes it `available`
 //! [`TRANSITION_DELAY`] later, on the same clock as every other move above.
 //!
+//! ## Transit gateway metering policies
+//!
+//! [`ComAmazonawsEc2Amazonec2State::transit_gateway_metering_policies`] holds the account's
+//! transit gateway metering policies as the modelled [`TransitGatewayMeteringPolicy`] shape
+//! itself rather than a parallel record — the arrangement
+//! [`ComAmazonawsEc2Amazonec2State::vpcs`] uses, and for the same reason: every member a
+//! writer sets round-trips through `DescribeTransitGatewayMeteringPolicies` without a
+//! field-by-field copy that can silently drop one, and a member nothing recorded is reported
+//! absent rather than invented by the reader. Keyed by `TransitGatewayMeteringPolicyId` in a
+//! [`BTreeMap`], which gives the describe path one stable order and lets a pagination token
+//! name the id the next page starts at.
+//! [`ComAmazonawsEc2Amazonec2State::insert_transit_gateway_metering_policy`] is the one way
+//! one is stored, so the id mint and the bytes a stored policy is charged
+//! ([`transit_gateway_metering_policy_payload_bytes`]) cannot differ between writers.
+//!
 //! ## Transit gateway Connect peers
 //!
 //! [`ComAmazonawsEc2Amazonec2State::transit_gateway_connect_peers`] holds the Connect peers
@@ -1342,6 +1357,7 @@ use crate::ops::types::{
     TagSpecification,
     TransitGateway, TransitGatewayClientVpnAttachment, TransitGatewayConnect,
     TransitGatewayConnectPeer,
+    TransitGatewayMeteringPolicy,
     TransitGatewayMulticastDomainAssociation, TransitGatewayOptions,
     TransitGatewayPeeringAttachment, TransitGatewayPolicyTable,
     TransitGatewayPolicyTableAssociation, TransitGatewayPrefixListAttachment,
@@ -3216,6 +3232,18 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// answers `InvalidTransitGatewayPolicyTableId.NotFound` for every id until one of them
     /// is written, exactly as the real service does for a table that does not exist.
     pub transit_gateway_policy_tables: BTreeMap<String, TransitGatewayPolicyTableRecord>,
+    /// Every transit gateway metering policy the account holds, by
+    /// `TransitGatewayMeteringPolicyId`, as the modelled [`TransitGatewayMeteringPolicy`]
+    /// shape itself — see the module docs. Ordered by id, the stable order every reader of
+    /// them reports and pages over.
+    ///
+    /// `CreateTransitGatewayMeteringPolicy` is the operation that adds one and
+    /// `DeleteTransitGatewayMeteringPolicy` the one that removes it; both are still
+    /// scaffolds, so a fresh account holds none — which is why
+    /// `DescribeTransitGatewayMeteringPolicies` answers
+    /// `InvalidTransitGatewayMeteringPolicyId.NotFound` for every well-formed id until one of
+    /// them is written, exactly as the real service does for a policy that does not exist.
+    pub transit_gateway_metering_policies: BTreeMap<String, TransitGatewayMeteringPolicy>,
     /// Every IPAM pool the account holds, by `IpamPoolId`, as the modelled [`IpamPool`]
     /// shape itself.
     pub ipam_pools: BTreeMap<String, IpamPool>,
@@ -3642,6 +3670,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             transit_gateway_route_table_announcements: BTreeMap::new(),
             transit_gateway_connect_peers: BTreeMap::new(),
             transit_gateway_policy_tables: BTreeMap::new(),
+            transit_gateway_metering_policies: BTreeMap::new(),
             ipam_pools: BTreeMap::new(),
             // A fresh account has brought no ASN of its own to IPAM, so nothing is
             // associated with any of its address ranges either.
@@ -7765,6 +7794,7 @@ impl ComAmazonawsEc2Amazonec2State {
             traffic_mirror_filters,
             traffic_mirror_sessions,
             transit_gateway_connect_peers => view,
+            transit_gateway_metering_policies,
             transit_gateway_policy_tables => view,
             transit_gateway_route_tables,
             transit_gateways,
@@ -26052,6 +26082,93 @@ impl ComAmazonawsEc2Amazonec2State {
             }
         }
         None
+    }
+}
+
+// =============================================================================
+// Transit gateway metering policies
+// =============================================================================
+
+/// The id prefix a transit gateway metering policy is minted with.
+///
+/// The model publishes no `@pattern` for `TransitGatewayMeteringPolicyId`
+/// (`smithy_query(query="shape",shape="TransitGatewayMeteringPolicyId")` is a plain
+/// `String`), so the prefix follows the transit gateway family's own abbreviation style, the
+/// way [`TRANSIT_GATEWAY_POLICY_TABLE_ID_PREFIX`] abbreviates a policy table's. Every reader
+/// and writer of the kind takes it from HERE, so the form an id is minted in and the form one
+/// is checked against cannot drift apart.
+pub const TRANSIT_GATEWAY_METERING_POLICY_ID_PREFIX: &str = "tgw-mp";
+
+/// `InvalidTransitGatewayMeteringPolicyId.NotFound` (HTTP 400): the request named a transit
+/// gateway metering policy id this account holds no policy for.
+pub const INVALID_TRANSIT_GATEWAY_METERING_POLICY_ID_NOT_FOUND: &str =
+    "InvalidTransitGatewayMeteringPolicyId.NotFound";
+
+/// `InvalidTransitGatewayMeteringPolicyId.Malformed` (HTTP 400): the request named something
+/// that is not a transit gateway metering policy id at all.
+pub const INVALID_TRANSIT_GATEWAY_METERING_POLICY_ID_MALFORMED: &str =
+    "InvalidTransitGatewayMeteringPolicyId.Malformed";
+
+/// Refuse a request that named a transit gateway metering policy id no policy of the account
+/// has: HTTP 400 `InvalidTransitGatewayMeteringPolicyId.NotFound`, worded the way
+/// [`invalid_transit_gateway_id_not_found`] words the transit gateway's own.
+pub fn invalid_transit_gateway_metering_policy_id_not_found<E>(
+    transit_gateway_metering_policy_id: &str,
+) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_TRANSIT_GATEWAY_METERING_POLICY_ID_NOT_FOUND,
+        400,
+        format!(
+            "Transit Gateway Metering Policy {transit_gateway_metering_policy_id} was deleted or \
+             does not exist."
+        ),
+    )
+}
+
+/// The caller-chosen bytes one stored metering policy holds: its tags and the middlebox
+/// attachment ids the request named.
+///
+/// The ONE definition of that charge, the way [`transit_gateway_payload_bytes`] is a transit
+/// gateway's, so a writer cannot store one uncharged and
+/// [`ComAmazonawsEc2Amazonec2State::insert_transit_gateway_metering_policy`] charges exactly
+/// this.
+pub fn transit_gateway_metering_policy_payload_bytes(policy: &TransitGatewayMeteringPolicy) -> usize {
+    let tags = tag_list_bytes(policy.tags.as_deref().unwrap_or_default());
+    let middlebox_attachments: usize = policy
+        .middlebox_attachment_ids
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(String::len)
+        .sum();
+    tags.saturating_add(middlebox_attachments)
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Store a transit gateway metering policy and answer the
+    /// `TransitGatewayMeteringPolicyId` it was given — or `None` when the store is at
+    /// [`MAX_STORED_RECORDS_PER_STORE`] and nothing was stored.
+    ///
+    /// The id is minted here rather than taken from `view`, exactly as
+    /// [`Self::insert_transit_gateway_policy_table`] mints a policy table's, and the
+    /// caller-chosen bytes the policy holds are charged on top of the fixed
+    /// [`STORED_RECORD_OVERHEAD_BYTES`] every stored record costs, so no path can store one
+    /// uncharged.
+    pub fn insert_transit_gateway_metering_policy(
+        &mut self,
+        mut view: TransitGatewayMeteringPolicy,
+    ) -> Option<String> {
+        if self.transit_gateway_metering_policies.len() >= MAX_STORED_RECORDS_PER_STORE {
+            return None;
+        }
+        let metering_policy_id = self.next_id(TRANSIT_GATEWAY_METERING_POLICY_ID_PREFIX);
+        view.transit_gateway_metering_policy_id = Some(metering_policy_id.clone());
+        self.add_stored_bytes(
+            STORED_RECORD_OVERHEAD_BYTES + transit_gateway_metering_policy_payload_bytes(&view),
+        );
+        self.transit_gateway_metering_policies
+            .insert(metering_policy_id.clone(), view);
+        Some(metering_policy_id)
     }
 }
 

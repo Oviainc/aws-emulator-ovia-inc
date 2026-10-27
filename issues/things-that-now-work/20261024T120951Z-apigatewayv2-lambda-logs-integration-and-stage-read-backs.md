@@ -49,3 +49,22 @@ Cause 3: expected HTTP 101 Switching Protocols; actual `the WebSocket upgrade to
 3. Cause 2: CreateStage(ApiId=..., StageName='prod', DeploymentId=...) with no DefaultRouteSettings, then GetStage — DefaultRouteSettings is absent.
 4. Cause 3: send an HTTP/1.1 websocket upgrade to the announced prod stage URL — it answers 404 with x-amzn-errortype: UnknownService.
 5. Replay the three check ids in trace_ids.
+
+## Resolution
+
+Causes 1 and 2 are fixed: `CreateIntegration` resolves the members the service supplies
+(`PassthroughBehavior`, `PayloadFormatVersion`, and the Lambda proxy integration's
+`IntegrationMethod`) and `CreateStage` resolves `DefaultRouteSettings` member by member for
+the members its api's protocol supports, so every read-back reports them; quick create's
+managed integration and `$default` stage and an imported integration go through the same
+resolution.
+
+Cause 3 is NOT fixed and is blocked outside this emulator's reach: completing the RFC 6455
+upgrade needs the connection itself, and the read-only framework hands a service only a
+buffered request and a buffered response
+(`vendor/smithy-server-runtime/src/service.rs`, the `Service` trait's
+`override_operation` / `override_routing_error` seams), with no upgrade or hijack path and
+no way for a service to open a listener of its own. A `101` would promise a socket nothing
+can carry, so the WebSocket data plane (`src/service/websocket.rs`) answers the handshake
+from the api's and the stage's stored records and refuses the upgrade, naming the absent
+transport. Reaching `101` requires that core change first.

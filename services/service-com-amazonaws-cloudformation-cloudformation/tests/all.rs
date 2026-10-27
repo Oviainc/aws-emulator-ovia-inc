@@ -93,6 +93,8 @@ mod list_generated_templates;
 mod list_stack_instances;
 #[path = "all/list_stack_resources.rs"]
 mod list_stack_resources;
+#[path = "all/list_stack_set_auto_deployment_targets.rs"]
+mod list_stack_set_auto_deployment_targets;
 #[path = "all/list_stack_set_operations.rs"]
 mod list_stack_set_operations;
 #[path = "all/list_types.rs"]

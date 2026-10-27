@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCertificateAuthority
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCertificateAuthority`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCertificateAuthority::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -187,18 +178,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCertificateAuthority` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateCertificateAuthorityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let arn = input.certificate_authority_arn;
+        if crate::state::parse_certificate_authority_arn(&arn).is_none() {
+            return Err(UpdateCertificateAuthorityErrorModeled::InvalidArnException(
+                InvalidArnException {
+                    message: Some(crate::state::INVALID_ARN_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // What the request ASKS FOR is judged before any CA is read, so a request this
+        // operation cannot carry out writes nothing whichever CA it named.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCertificateAuthority"))
+        // "You can disable a private CA that is in the ACTIVE state or make a CA that is
+        // in the DISABLED state active again": those two transitions are the whole of
+        // what this call performs, so the statuses it puts a CA into are exactly
+        // `UPDATABLE_STATUSES`. Every other member of the enum is a status the service
+        // itself moves a CA into (a creation settling, a certificate expiring, a deletion,
+        // a failed create), never one a caller assigns.
+        if let Some(requested) = input.status.as_deref() {
+            if !crate::state::UPDATABLE_STATUSES.contains(&requested) {
+                return Err(invalid_args(format!(
+                    "Status {requested} cannot be requested for a private CA. Valid statuses \
+                     are: {}.",
+                    crate::state::UPDATABLE_STATUSES.join(", ")
+                )));
+            }
+        }
+        if let Some(reason) =
+            crate::state::invalid_revocation_configuration_reason(input.revocation_configuration.as_ref())
+        {
+            return Err(invalid_args(reason));
+        }
+        // This call "updates the status or configuration of a private certificate
+        // authority", and both members are optional: a request naming neither asks for no
+        // update at all, which is not a request this operation can carry out.
+        if input.status.is_none() && input.revocation_configuration.is_none() {
+            return Err(invalid_args(
+                "Either Status or RevocationConfiguration must be specified.",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(not_found(
+                "the private CA store is unavailable, so no certificate authority can be \
+                 updated",
+            ));
+        };
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+
+        // `certificate_authority_mut` materialises the CREATING -> PENDING_CERTIFICATE
+        // change the clock already owed and drops a CA whose restoration window has
+        // closed: that CA was permanently deleted at the instant the window ended, so it
+        // names no resource at all.
+        let Some(record) = state.certificate_authority_mut(&arn, now) else {
+            return Err(not_found(crate::state::CA_NOT_FOUND_MESSAGE.to_string()));
+        };
+
+        // "Your private CA must be in the ACTIVE or DISABLED state before you can update
+        // it." — the gate covers the whole call, so a revocation configuration cannot be
+        // written to a CA that is still waiting for its certificate, has expired, failed
+        // or been deleted either.
+        if !record.is_updatable() {
+            return Err(UpdateCertificateAuthorityErrorModeled::InvalidStateException(
+                InvalidStateException {
+                    message: Some(crate::state::UPDATE_INVALID_STATE_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The requested status takes effect at once — there is no transient status
+        // between ACTIVE and DISABLED, and the CA is reported in the requested one by the
+        // next read. A request for the status the CA already holds changes nothing, so the
+        // instant it last changed status stands still.
+        if let Some(requested) = input.status {
+            if record.status != requested {
+                record.status = requested;
+                record.last_state_change_at = now;
+            }
+        }
+
+        // "If you don't supply this parameter, existing capibilites remain unchanged": a
+        // supplied configuration states which mechanisms the CA supports from now on
+        // ("OCSP, CRL, both protocols, or neither"), so it REPLACES the one the CA held
+        // rather than being merged into it.
+        if let Some(revocation) = input.revocation_configuration {
+            record.revocation_configuration = Some(revocation);
+        }
+
+        Ok(UpdateCertificateAuthorityOutput)
     }
+}
+
+/// "One or more of the specified arguments was not valid.", naming the member and the rule
+/// it broke so the caller can fix the request from the message alone.
+fn invalid_args(message: impl Into<String>) -> UpdateCertificateAuthorityError {
+    UpdateCertificateAuthorityErrorModeled::InvalidArgsException(InvalidArgsException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// "A resource such as a private CA, S3 bucket, certificate, audit report, or policy
+/// cannot be found."
+///
+/// This operation models no server-fault error, so a store that cannot be reached is
+/// reported the way a CA that was never created is: the named CA cannot be read.
+fn not_found(message: impl Into<String>) -> UpdateCertificateAuthorityError {
+    UpdateCertificateAuthorityErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message.into()),
+    })
+    .into()
 }

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteHealthCheck
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteHealthCheck`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteHealthCheck::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -74,6 +65,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::{health_check_status, no_such_health_check};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -143,20 +136,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteHealthCheck` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteHealthCheckErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteHealthCheck"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable under the router, which always mounts this service on
+            // the shared `InMemoryEngine`.
+            DeleteHealthCheckErrorModeled::InvalidInput(InvalidInput {
+                message: Some("the Route 53 emulator's state store is unavailable".to_string()),
+            })
+        })?;
+
+        let mut store = state.lock();
+
+        // A health check is addressed by the bare id `CreateHealthCheck`
+        // assigned it, which is the id the store is keyed by. Taking the record
+        // out IS the delete: "Amazon Route 53 does not prevent you from deleting
+        // a health check even if the health check is associated with one or more
+        // resource record sets", and `HealthCheckInUse`'s own documentation says
+        // that error "is not in use", so nothing this store holds can refuse the
+        // call — a record set keeps the id it referenced, dangling.
+        let deleted = store
+            .health_checks
+            .remove(&input.health_check_id)
+            .ok_or_else(|| {
+                DeleteHealthCheckErrorModeled::NoSuchHealthCheck(no_such_health_check(
+                    &input.health_check_id,
+                ))
+            })?;
+
+        // The health check's `CallerReference` outlives it, so the index
+        // `CreateHealthCheck` recognises a reference by keeps the entry: "the
+        // same value for CallerReference as a health check that you created and
+        // later deleted, regardless of the other settings in the request" is one
+        // of the conditions that create refuses.
+        store.retain_deleted_health_check_reference(deleted.caller_reference);
+
+        // The store guard goes before the assessment runs: the deleted health
+        // check is no longer assessed, and publishing the remaining checks'
+        // probes reaches the CloudWatch metric store, which is never locked at
+        // the same time as this one.
+        drop(store);
+        health_check_status::drive_health_check_metrics(&self.engine);
+        Ok(DeleteHealthCheckOutput {})
     }
 }

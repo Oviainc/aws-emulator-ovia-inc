@@ -222,10 +222,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         destination.destination_configuration = input.destination_configuration;
         destination.updated_at = ::std::time::SystemTime::now();
         // A destination this emulator accepted is usable, so an accepted update
-        // leaves it in the terminal `Active` state with no status reason; the
-        // `Failed` state is for a configuration the service could not accept.
-        destination.status = "Active".to_string();
-        destination.status_reason = None;
+        // leaves it in the same terminal accepted state a create call leaves it
+        // in; the other state of that enum is for a configuration the service
+        // could not accept.
+        destination.mark_accepted();
 
         // Read the response back out of the store, so what the caller sees is
         // exactly what a later Get or List will see.

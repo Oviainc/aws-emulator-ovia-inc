@@ -347,6 +347,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let is_http = api.protocol_type == crate::state::HTTP_PROTOCOL_TYPE;
+        // The protocol decides which members the service itself supplies, so it is read
+        // out of the api record before the record below borrows it.
+        let protocol_type = api.protocol_type.clone();
 
         // Each of these members, and three of the five `IntegrationType` values, is
         // documented as supported only for APIs of ONE protocol, so an integration of an
@@ -465,11 +468,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let integration_id = api.mint_integration_id();
+        // An integration whose endpoint is a Lambda function is invoked through Lambda's
+        // own Invoke action, which is served for one method only, so the service supplies
+        // the method the caller did not have to name (see
+        // `crate::state::default_integration_method`).
+        let integration_method = input.integration_method.or_else(|| {
+            crate::state::default_integration_method(
+                &input.integration_type,
+                input.integration_subtype.as_deref(),
+            )
+            .map(str::to_string)
+        });
         let record = crate::state::Integration {
             integration_id: integration_id.clone(),
             integration_type: input.integration_type,
             integration_uri: input.integration_uri,
-            integration_method: input.integration_method,
+            integration_method,
             integration_subtype: input.integration_subtype,
             // "The default value is INTERNET" (`Integration$ConnectionType`).
             connection_type: input
@@ -479,8 +493,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             content_handling_strategy: input.content_handling_strategy,
             credentials_arn: input.credentials_arn,
             description: input.description,
-            passthrough_behavior: input.passthrough_behavior,
-            payload_format_version: input.payload_format_version,
+            // "WHEN_NO_MATCH passes the request body for unmapped content types through
+            // to the integration backend without transformation"
+            // (`Integration$PassthroughBehavior`) is what an integration that mapped no
+            // content type does, so the service applies it; the member is supported only
+            // for WebSocket APIs, so only such an api's integration carries one (see
+            // `crate::state::default_passthrough_behavior`).
+            passthrough_behavior: input.passthrough_behavior.or_else(|| {
+                crate::state::default_passthrough_behavior(&protocol_type).map(str::to_string)
+            }),
+            // "For all other integrations, 1.0 is the only supported value"
+            // (`Integration$PayloadFormatVersion`): where the request named no version,
+            // the one the integration is served under is the one every type supports, so
+            // the record carries it rather than nothing. An HTTP api's integration always
+            // named one (the create above requires it), so this resolves a WebSocket
+            // api's.
+            payload_format_version: Some(input.payload_format_version.unwrap_or_else(|| {
+                crate::state::ONLY_PAYLOAD_FORMAT_VERSION.to_string()
+            })),
             request_parameters: input.request_parameters.unwrap_or_default().into_iter().collect(),
             request_templates: input.request_templates.unwrap_or_default().into_iter().collect(),
             response_parameters: input

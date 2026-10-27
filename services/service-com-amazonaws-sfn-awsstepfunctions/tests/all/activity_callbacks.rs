@@ -124,9 +124,9 @@ async fn settled(emulator: &Emulator, execution_arn: &str) -> (String, Option<Va
 
 /// The event types one execution's stored history holds, in order.
 ///
-/// Read from the STORE because `GetExecutionHistory` is still a scaffold of its own:
-/// the rule under test is that a reply APPENDS its events to the ones the states before
-/// the task left, which is what the record holds either way.
+/// Read from the STORE rather than through `GetExecutionHistory`: the rule under test
+/// is that a reply APPENDS its events to the ones the states before the task left,
+/// which is what the record holds either way.
 pub(crate) fn history(emulator: &Emulator, execution_arn: &str) -> Vec<String> {
     let state = emulator.store();
     let store = state.lock();

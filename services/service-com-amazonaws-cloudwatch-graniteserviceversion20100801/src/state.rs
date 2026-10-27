@@ -504,9 +504,11 @@ const TRIMMED_FAMILIES: &[&str] = &["tm", "tc", "ts", "wm"];
 const FOLDED_STATISTICS: &[&str] = &["SampleCount", "Average", "Sum", "Minimum", "Maximum"];
 
 /// Whether `statistic` is one CloudWatch supports at all: a basic statistic, a percentile, or
-/// a member of a bounded family. Shared by every operation that takes a statistic NAME —
-/// `MetricStat$Stat` is an unconstrained string in the model, so the grammar is the only thing
-/// that tells a statistic from a typo.
+/// a member of a bounded family. Shared by every operation that takes a statistic NAME and
+/// admits the basic five among them — `MetricStat$Stat` is an unconstrained string in the
+/// model, so the grammar is the only thing that tells a statistic from a typo. An operation
+/// that admits only the statistics computed over the distribution asks
+/// [`is_extended_statistic`] instead.
 pub fn is_cloudwatch_statistic(statistic: &str) -> bool {
     CLOUDWATCH_BASIC_STATISTICS
         .iter()

@@ -111,14 +111,14 @@ fn dashboard_not_found() -> DeleteDashboardError {
 /// [`crate::scaffolded::Scaffolded::validation`], the channel for a refusal the model
 /// does not express.
 ///
-/// The text names the dashboard the request addressed and the way out, so a caller
-/// can act on it; AWS publishes no wording for this refusal, so the status and the
-/// code are what is contract here.
-fn termination_protected(dashboard_arn: &str) -> DeleteDashboardError {
-    crate::scaffolded::Scaffolded::validation(format!(
-        "The dashboard {dashboard_arn} cannot be deleted while termination protection is \
-         enabled for it: disable termination protection and try again."
-    ))
+/// The text is the ONE fixed sentence CloudTrail answers this refusal with
+/// ([`crate::state::DASHBOARD_TERMINATION_PROTECTED_MESSAGE`]): the dashboard the
+/// request addressed is reported nowhere in it, so no name, ARN, account or Region is
+/// interpolated — a client matching on the refusal text sees the same bytes AWS sends.
+fn termination_protected() -> DeleteDashboardError {
+    crate::scaffolded::Scaffolded::validation(
+        crate::state::DASHBOARD_TERMINATION_PROTECTED_MESSAGE.to_string(),
+    )
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -219,7 +219,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "You cannot delete a dashboard that has termination protection enabled." The
         // dashboard stays exactly as it was: the refusal releases nothing.
         if record.termination_protection_enabled {
-            return Err(termination_protected(&record.dashboard_arn));
+            return Err(termination_protected());
         }
 
         // The record carries the registry key it is stored under (its name and the Region

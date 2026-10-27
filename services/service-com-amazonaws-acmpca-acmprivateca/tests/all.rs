@@ -35,3 +35,5 @@ mod restore_certificate_authority;
 mod state_roundtrip;
 #[path = "all/tag_listing.rs"]
 mod tag_listing;
+#[path = "all/update_certificate_authority.rs"]
+mod update_certificate_authority;

@@ -29,6 +29,8 @@ mod monitor_lifecycle_and_front_door;
 mod monitor_state_follows_probe_activation;
 #[path = "all/probe_teardown.rs"]
 mod probe_teardown;
+#[path = "all/probes_per_monitor_limit.rs"]
+mod probes_per_monitor_limit;
 #[path = "all/probes_per_subnet_limit.rs"]
 mod probes_per_subnet_limit;
 #[path = "all/region_isolation.rs"]

@@ -289,14 +289,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        let probe_count = store
-            .monitor(&region, &input.monitor_name)
-            .map_or(0, |monitor| monitor.probes.len());
-        if probe_count >= crate::state::MAX_PROBES_PER_MONITOR {
-            return Err(validation(
-                crate::state::PROBES_PER_MONITOR_MESSAGE.to_string(),
-            ));
-        }
+        // A probe occupies a slot in its monitor, and a monitor holds only so
+        // many probes. Counted off the probes the monitor already holds, by the
+        // one rule both create paths apply.
+        crate::state::check_probes_per_monitor(store.monitor(&region, &input.monitor_name), 1)
+            .map_err(validation)?;
         // The probe has to satisfy the probe rules on its own before the request
         // is judged on how many probes its subnet already holds, so a malformed
         // probe is refused for what it says.

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetModel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetModel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetModel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports a stored `Model` of a `RestApi`: the record `CreateModel` wrote, rendered
+//! through the one `Model` body this crate has. `flatten` resolves the model references
+//! the schema carries from stored state; nothing is written here.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +151,178 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetModel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetModelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetModel"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let store = state.lock();
+        // Every identifier the request carries is resolved against stored state, each
+        // naming its own record so the refusal says which one was not found. A model
+        // belongs to ONE API, so the name is resolved inside the API that holds it and
+        // never account-wide.
+        let api = store.rest_apis.get(&input.rest_api_id).ok_or_else(|| {
+            GetModelErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
+            })
+        })?;
+        let model = api.models.get(&input.model_name).ok_or_else(|| {
+            GetModelErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::NO_SUCH_MODEL.to_string()),
+            })
+        })?;
+        // Rendered through the one `Model` body this crate has, so a read reports the
+        // record exactly as the create that stored it did.
+        let mut body = super::create_model::model_body(model);
+        // "A query parameter of a Boolean value to resolve (true) all external model
+        // references and returns a flattened model schema or not (false)"
+        // (`GetModelRequest$flatten`): the references a schema of this API can carry name
+        // the API's OTHER models, so flattening inlines each referenced model's schema
+        // from stored state. A schema that references nothing is reported as stored.
+        if input.flatten {
+            body.schema = body
+                .schema
+                .map(|schema| flattened_schema(api, &input.rest_api_id, &schema));
+        }
+        Ok(body.into())
+    }
+}
+
+/// The same `Model` the create reports, as THIS operation's output shape.
+///
+/// Both shapes are the model's `Model` (`smithy_query(query="operation",
+/// operation="CreateModel,GetModel")`: one output shape, generated once per operation),
+/// so the conversion is member for member and lives in ONE place — a member added to the
+/// modelled shape fails to compile here instead of being quietly dropped from the read.
+impl From<CreateModelOutput> for GetModelOutput {
+    fn from(body: CreateModelOutput) -> Self {
+        let CreateModelOutput {
+            id,
+            name,
+            description,
+            schema,
+            content_type,
+        } = body;
+        Self {
+            id,
+            name,
+            description,
+            schema,
+            content_type,
+        }
+    }
+}
+
+/// How many model references one flatten inlines, so a read does the work of a bounded
+/// number of substitutions however the API's models reference each other, and the answer
+/// is at most that many model schemas larger than the one stored. A reference past the
+/// budget is left as it stands rather than followed further.
+///
+/// A schema is bounded at the published 400 KB maximum
+/// (`super::create_model::MAX_MODEL_SCHEMA_CHARS`), so this budget is what bounds the
+/// FLATTENED document: a read answers at most that maximum times this many characters,
+/// whatever the API's models reference.
+const MAX_FLATTEN_REFERENCES: usize = 16;
+
+/// The model of `api` a `$ref` names, when the reference names one.
+///
+/// API Gateway references another model of the same API by the model's own URL,
+/// `.../restapis/{restApiId}/models/{modelName}`, so a reference is read as that tail and
+/// is a model reference only when it names THIS API. Anything else — a JSON Pointer into
+/// the document itself, a reference to another API, a URL of something else — names no
+/// model of this API and is left alone.
+fn referenced_model<'a>(reference: &'a str, rest_api_id: &str) -> Option<&'a str> {
+    let (_, addressed) = reference.rsplit_once("/restapis/")?;
+    let (api, model) = addressed.split_once("/models/")?;
+    (api == rest_api_id && !model.is_empty() && !model.contains('/')).then_some(model)
+}
+
+/// `schema` with every model reference it carries replaced by the referenced model's
+/// schema, from stored state.
+///
+/// A schema that is not a JSON document, or that resolves no reference at all, is
+/// answered unchanged — so a read reports the caller's own text whenever flattening has
+/// nothing to do.
+fn flattened_schema(
+    api: &crate::state::RestApiEntry,
+    rest_api_id: &str,
+    schema: &str,
+) -> String {
+    let Ok(document) = ::serde_json::from_str::<::serde_json::Value>(schema) else {
+        return schema.to_string();
+    };
+    let mut budget = MAX_FLATTEN_REFERENCES;
+    let mut expanding: Vec<String> = Vec::new();
+    let flattened = resolve_references(
+        api,
+        rest_api_id,
+        document,
+        &mut expanding,
+        &mut budget,
+    );
+    if budget == MAX_FLATTEN_REFERENCES {
+        return schema.to_string();
+    }
+    ::serde_json::to_string(&flattened).unwrap_or_else(|_| schema.to_string())
+}
+
+/// One step of [`flattened_schema`]: `value` with the model references under it resolved.
+///
+/// `expanding` carries the models being inlined on the way down, so a schema that
+/// references itself — directly or round a cycle — is expanded once and then left as it
+/// stands instead of being followed forever. `budget` is how many references this read
+/// may still inline ([`MAX_FLATTEN_REFERENCES`]), spent across the whole document, so the
+/// work and the answer are bounded by a constant rather than by how the API's models
+/// reference each other. The document's own nesting is bounded by the JSON reader that
+/// parsed it.
+fn resolve_references(
+    api: &crate::state::RestApiEntry,
+    rest_api_id: &str,
+    value: ::serde_json::Value,
+    expanding: &mut Vec<String>,
+    budget: &mut usize,
+) -> ::serde_json::Value {
+    match value {
+        ::serde_json::Value::Object(members) => {
+            if let Some(name) = members
+                .get("$ref")
+                .and_then(::serde_json::Value::as_str)
+                .and_then(|reference| referenced_model(reference, rest_api_id))
+            {
+                if *budget > 0 && !expanding.iter().any(|busy| busy == name) {
+                    if let Some(referenced) = api
+                        .models
+                        .get(name)
+                        .and_then(|model| model.schema.as_deref())
+                        .and_then(|schema| {
+                            ::serde_json::from_str::<::serde_json::Value>(schema).ok()
+                        })
+                    {
+                        *budget -= 1;
+                        expanding.push(name.to_string());
+                        let inlined =
+                            resolve_references(api, rest_api_id, referenced, expanding, budget);
+                        expanding.pop();
+                        return inlined;
+                    }
+                }
+            }
+            ::serde_json::Value::Object(
+                members
+                    .into_iter()
+                    .map(|(key, member)| {
+                        (
+                            key,
+                            resolve_references(api, rest_api_id, member, expanding, budget),
+                        )
+                    })
+                    .collect(),
+            )
+        }
+        ::serde_json::Value::Array(entries) => ::serde_json::Value::Array(
+            entries
+                .into_iter()
+                .map(|entry| resolve_references(api, rest_api_id, entry, expanding, budget))
+                .collect(),
+        ),
+        other => other,
     }
 }

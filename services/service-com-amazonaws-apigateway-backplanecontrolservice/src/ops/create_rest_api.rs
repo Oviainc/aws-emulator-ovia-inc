@@ -538,6 +538,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Nor with any request validator: `CreateRequestValidator` is what adds one,
             // and a clone copies the source's resource tree only.
             request_validators: BTreeMap::new(),
+            // Nor with any model: `CreateModel` is what adds one, and a clone copies the
+            // source's resource tree only.
+            models: BTreeMap::new(),
             sequence,
         };
 
