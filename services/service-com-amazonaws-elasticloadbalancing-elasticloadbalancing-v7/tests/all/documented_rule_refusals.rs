@@ -26,7 +26,9 @@
 //! Every refusal is asserted on what a LATER read reports too, so a refusal that changed
 //! the record would fail here.
 
-use super::wire::{call, emulator, find, kid_text, member_texts, param, parse, Element, Wire};
+use super::wire::{
+    call, emulator, error_message, find, kid_text, member_texts, param, parse, Element, Wire,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every request below is signed for.
@@ -34,6 +36,11 @@ const REGION: &str = "us-west-2";
 
 /// The error code this service answers a request whose values it cannot accept with.
 const VALIDATION_ERROR: &str = "ValidationError";
+
+/// The sentence a health check whose timeout is not below its interval is refused with:
+/// the RELATION the two members have to each other, which is the rule the caller has to
+/// satisfy whichever pair of values broke it.
+const TIMEOUT_RELATION_REFUSAL: &str = "HealthCheck timeout must be less than interval.";
 
 /// One row of a refusal table that spans several operations: the case, the action, and the
 /// form fields the request carries beside it.
@@ -46,15 +53,6 @@ type ListenerConflictRow = (&'static str, Vec<(String, String)>, Option<i32>);
 /// One row of the duplicate-name table: the case, the load balancer name, and the form
 /// fields the SECOND create carries.
 type DuplicateNameRow = (&'static str, &'static str, Vec<(String, String)>);
-
-/// The `<Message>` of an answer's `<Error>`, or an empty string.
-fn message(answer: &Wire) -> String {
-    let doc = parse(&answer.body);
-    find(doc.root_element(), "Message")
-        .and_then(Element::text)
-        .unwrap_or_default()
-        .to_string()
-}
 
 /// Create `name` with one HTTP 80 -> `instance_port` listener in one Availability Zone.
 async fn create(
@@ -221,14 +219,12 @@ async fn a_health_check_timeout_is_accepted_only_below_the_interval() {
                 answered.status,
                 answered.body
             );
-            let stated = message(&answered);
-            for named in ["Timeout", "Interval"] {
-                assert!(
-                    stated.contains(named),
-                    "case {case:?}: the refusal must name the {named} the rule is stated \
-                     over, got {stated:?}"
-                );
-            }
+            let stated = error_message(&answered);
+            assert_eq!(
+                stated, TIMEOUT_RELATION_REFUSAL,
+                "case {case:?}: expected the message {TIMEOUT_RELATION_REFUSAL:?}, got \
+                 {stated:?}"
+            );
         }
 
         // A refused check leaves the stored one as the last accepted call wrote it.
@@ -361,7 +357,7 @@ async fn every_documented_rule_the_model_declares_no_error_for_answers_one_code(
             answered.body
         );
         assert!(
-            !message(&answered).is_empty(),
+            !error_message(&answered).is_empty(),
             "case {case:?}: the refusal must say what was wrong, got {}",
             answered.body
         );
@@ -491,7 +487,7 @@ async fn the_duplicate_listener_refusal_states_which_members_may_differ() {
                     "A listener already exists for {name} with LoadBalancerPort {port}, \
                      but with a different InstancePort, Protocol, or SSLCertificateId"
                 );
-                let stated = message(&answered);
+                let stated = error_message(&answered);
                 assert_eq!(
                     stated, expected,
                     "case {case:?}: expected the message {expected:?}, got {stated:?}"
@@ -627,7 +623,7 @@ async fn the_duplicate_name_refusal_states_the_differing_parameters_rule() {
             "Load Balancer named {name} already exists and it is configured with \
              different parameters."
         );
-        let stated = message(&refused);
+        let stated = error_message(&refused);
         assert_eq!(
             stated, expected,
             "case {case:?}: expected the message {expected:?}, got {stated:?}"
