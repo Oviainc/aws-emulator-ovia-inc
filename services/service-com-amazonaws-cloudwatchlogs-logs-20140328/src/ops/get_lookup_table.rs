@@ -184,7 +184,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(table) = table else {
             return Err(
                 GetLookupTableErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: Some(crate::state::resource_not_found_message("lookup table")),
+                    message: Some(crate::state::lookup_table_not_found_message_for_arn(
+                        &input.lookup_table_arn,
+                    )),
                 })
                 .into(),
             );

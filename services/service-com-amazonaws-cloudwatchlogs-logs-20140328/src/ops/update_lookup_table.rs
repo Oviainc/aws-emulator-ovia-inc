@@ -225,7 +225,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // cannot be read from replaces nothing.
         let (table_body, shape) = match source {
             crate::state::LookupTableSource::TableBody(table_body) => {
-                let shape = crate::state::parse_table_body(&table_body).map_err(invalid)?;
+                // A header row declaring one column name twice names no column set, which is
+                // a validation failure of the body as a whole rather than a member value
+                // this operation could not read — so each rejection is answered with the
+                // modelled error its own kind calls for.
+                let shape = crate::state::parse_table_body(&table_body).map_err(|rejection| {
+                    match rejection {
+                        crate::state::TableBodyRejection::Unreadable(message) => invalid(message),
+                        crate::state::TableBodyRejection::DuplicateFields => {
+                            validation(crate::state::DUPLICATE_TABLE_FIELDS_MESSAGE.to_string())
+                        }
+                    }
+                })?;
                 (table_body, shape)
             }
             // `queryId` names "a completed or cancelled CloudWatch Logs query whose results
@@ -289,7 +300,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(table) = table else {
             return Err(
                 UpdateLookupTableErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: Some(crate::state::resource_not_found_message("lookup table")),
+                    message: Some(crate::state::lookup_table_not_found_message_for_arn(
+                        &input.lookup_table_arn,
+                    )),
                 })
                 .into(),
             );
