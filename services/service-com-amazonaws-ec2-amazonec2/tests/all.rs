@@ -17,6 +17,12 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// The `domain-name` attribute of an Elastic IP address: what `ResetAddressAttribute` starts
+// on one address's reverse DNS record, what it refuses, and what the report reads back.
+// Declared beside `prefix_lists` for the reason the note above gives: the sorted
+// neighbourhood and the tail of this file are where every new ec2 suite inserts its lines.
+#[path = "all/address_attribute_reset.rs"]
+mod address_attribute_reset;
 // What a delete does to the state behind it: the dependency refusals and the reads of a
 // resource that is gone. Declared here rather than in sorted position, for the reason the
 // note above gives — the sorted neighbourhood is the contended region of this file.

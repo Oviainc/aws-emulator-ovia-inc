@@ -480,6 +480,21 @@
 //! [`ComAmazonawsEc2Amazonec2State::allocation_id_associated_with_instance`] answers which
 //! address an instance holds.
 //!
+//! The address's `domain-name` attribute — its reverse DNS (PTR) record — is NOT on that
+//! record, because the [`Address`] shape carries no member for it: it lives in
+//! [`ComAmazonawsEc2Amazonec2State::address_ptr_records`] as an [`AddressPtrRecord`], the
+//! record in effect beside the update a caller started and the instant that update falls
+//! due. Unlike the allocation itself, such an update is NOT immediate — the modelled
+//! `AddressAttribute$PtrRecordUpdate` is what reports one that has not been applied yet —
+//! so the move is recorded ([`ComAmazonawsEc2Amazonec2State::start_address_ptr_record_update`])
+//! and applied at its instant by
+//! [`ComAmazonawsEc2Amazonec2State::apply_due_ptr_record_updates`] rather than slept for,
+//! and while one is owed a second request on the same record is refused
+//! ([`pending_request_already_exists`]).
+//! [`ComAmazonawsEc2Amazonec2State::address_attribute_view`] is the ONE projection of that
+//! state into the modelled `AddressAttribute` shape, so the operations that set, reset and
+//! report the attribute cannot describe one address differently.
+//!
 //! ## Elastic IP address transfers
 //!
 //! [`ComAmazonawsEc2Amazonec2State::address_transfers`] holds the Elastic IP address
@@ -1237,7 +1252,8 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    Address, AddressTransfer, ApplicationStatus, ApplicationStatusDetail, AsnAssociation,
+    Address, AddressAttribute, AddressTransfer, ApplicationStatus, ApplicationStatusDetail,
+    AsnAssociation,
     AttachVolumeOutput,
     AttributeValue,
     AvailabilityZone, AvailabilityZoneMessage, BlockDeviceMapping, BlockPublicAccessStates,
@@ -1267,7 +1283,7 @@ use crate::ops::types::{
     NetworkInsightsAccessScopeAnalysis, NetworkInterface, NetworkInterfacePermission,
     NetworkInterfacePermissionState, NetworkInterfacePrivateIpAddress,
     OperatorResponse, PeeringAttachmentStatus, Placement,
-    PlacementGroup, PrefixListId,
+    PlacementGroup, PrefixListId, PtrUpdateStatus,
     PrivateDnsNameOptionsOnLaunch, ReferencedSecurityGroup, SecurityGroupRule,
     DnsEntry, PayerResponsibilityEntry, ProductCode,
     Region, ReplaceRootVolumeTask, RequestLaunchTemplateData, RevokedSecurityGroupRule,
@@ -2862,6 +2878,13 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// Monotonic source of the Elastic IP addresses [`Self::mint_elastic_ip`] hands out,
     /// so one allocation can never be given an address another still holds.
     next_elastic_ip: u64,
+    /// The `domain-name` attribute of the account's Elastic IP addresses, by
+    /// `AllocationId` — see the module docs. Ordered by that id, which is the order the
+    /// attribute is reported and paged over in.
+    ///
+    /// Starts EMPTY, and holds an entry only for an address that has a PTR record or an
+    /// update owed on one: an address nothing has asked about has no reverse DNS record.
+    pub address_ptr_records: BTreeMap<String, AddressPtrRecord>,
     /// Every route server the account holds, by `RouteServerId` — see the module docs.
     /// Ordered by id, which is the order `DescribeRouteServers` reports and pages over.
     pub route_servers: BTreeMap<String, RouteServerRecord>,
@@ -3473,6 +3496,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             store_image_tasks: BTreeMap::new(),
             addresses: BTreeMap::new(),
             next_elastic_ip: 0,
+            address_ptr_records: BTreeMap::new(),
             route_servers: BTreeMap::new(),
             route_server_client_tokens: HashMap::new(),
             address_transfers: BTreeMap::new(),
@@ -6057,7 +6081,9 @@ impl ComAmazonawsEc2Amazonec2State {
     /// route table / VPC association reaching `associated`, an `associating` local gateway
     /// route table / virtual interface group association reaching it too, and a Client VPN
     /// target network association moving `associating` -> `associated`. So is a `pending`
-    /// permission over a network interface reaching `granted`.
+    /// permission over a network interface reaching `granted`, and a PTR record update owed
+    /// on an Elastic IP address's `domain-name` attribute reaching that record
+    /// ([`Self::apply_due_ptr_record_updates`]).
     pub fn materialize_due_transitions(&mut self) {
         let now = Instant::now();
         // The one clock-owed REMOVAL: a recycled AMI whose retention period has run out was
@@ -6942,6 +6968,10 @@ impl ComAmazonawsEc2Amazonec2State {
         // at their instant whether or not anybody called, and both are spans AWS
         // documents, so they are read off the wall clock rather than `now`.
         self.expire_due_address_transfers(SystemTime::now());
+        // A PTR record update an address carries reaches the record once its instant has
+        // passed, whether or not anybody called again — the reverse DNS counterpart of the
+        // moves above.
+        self.apply_due_ptr_record_updates(now);
         self.complete_due_import_image_tasks(now);
         self.materialize_due_capacity_reservation_fleet_moves(now);
         self.materialize_due_spot_instance_requests(now);
@@ -20952,6 +20982,10 @@ impl ComAmazonawsEc2Amazonec2State {
         self.detach_elastic_ip(allocation_id);
         let address = self.addresses.remove(allocation_id)?;
         self.address_transfers.remove(allocation_id);
+        // The reverse DNS record of an address the account no longer holds is the record of
+        // nothing, and an update owed on it can no longer come due, so both go with the
+        // allocation rather than outliving it.
+        self.address_ptr_records.remove(allocation_id);
         self.release_stored_bytes(address_payload_bytes(&address));
         Some(address)
     }
@@ -21132,6 +21166,171 @@ pub fn invalid_address_not_found<E>(public_ip: &str) -> Scaffolded<E> {
         INVALID_ADDRESS_NOT_FOUND,
         400,
         format!("Address '{public_ip}' not found"),
+    )
+}
+
+// =============================================================================
+// The `domain-name` attribute of an Elastic IP address
+// =============================================================================
+
+/// The one attribute of an Elastic IP address a caller can set and reset: the single
+/// member of the modelled `AddressAttributeName` enum
+/// (`smithy_query(query="shape",shape="AddressAttributeName")`), which names the address's
+/// reverse DNS (PTR) record.
+pub const ADDRESS_ATTRIBUTE_DOMAIN_NAME: &str = "domain-name";
+
+/// The `PtrUpdateStatus$Status` of a PTR record update that has been accepted and not
+/// applied yet.
+///
+/// "The updated PTR record for the IP address" (`AddressAttribute$PtrRecordUpdate`) is
+/// reported only while an update is outstanding, so this is the status every such report
+/// carries.
+pub const PTR_UPDATE_STATUS_PENDING: &str = "PENDING";
+
+/// `PendingRequestAlreadyExists` (HTTP 400): the address's PTR record already carries an
+/// update that has not been applied, so a second one cannot be started on it.
+pub const PENDING_REQUEST_ALREADY_EXISTS: &str = "PendingRequestAlreadyExists";
+
+/// What the `domain-name` attribute of one Elastic IP address is, and what the clock still
+/// owes it.
+///
+/// The modelled [`Address`] shape carries no member for the reverse DNS record, so this
+/// record holds it beside the account's address rather than on it; it is projected into the
+/// modelled `AddressAttribute` shape by
+/// [`ComAmazonawsEc2Amazonec2State::address_attribute_view`].
+#[derive(Debug, Clone, Default)]
+pub struct AddressPtrRecord {
+    /// The PTR record in effect for the address, which is what
+    /// `AddressAttribute$PtrRecord` reports. `None` until an update that names one has been
+    /// applied, and again once one that takes it away has been.
+    pub ptr_record: Option<String>,
+    /// The update started on that record and not applied yet, which is what
+    /// `AddressAttribute$PtrRecordUpdate` reports.
+    pub pending_update: Option<PendingPtrRecordUpdate>,
+}
+
+/// A PTR record update the clock has not applied yet: what it will leave in effect, and
+/// when it falls due.
+#[derive(Debug, Clone)]
+pub struct PendingPtrRecordUpdate {
+    /// The PTR record this update leaves in effect. `None` is a RESET, which takes the
+    /// record away instead of naming a new one — "Resets the attribute of the specified IP
+    /// address" (`ResetAddressAttribute`) — so the value a report carries for it is absent
+    /// too.
+    pub value: Option<String>,
+    /// When the update falls due, on the same monotonic clock and the same
+    /// [`TRANSITION_DELAY`] as every other move this store records rather than sleeps for.
+    pub due_at: Instant,
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether `allocation_id`'s PTR record already carries an update the clock has not
+    /// applied.
+    ///
+    /// The one question both writers of the attribute ask before starting one, because the
+    /// real service admits a single outstanding request per record and refuses a second
+    /// with [`pending_request_already_exists`].
+    pub fn address_ptr_update_is_pending(&self, allocation_id: &str) -> bool {
+        self.address_ptr_records
+            .get(allocation_id)
+            .is_some_and(|record| record.pending_update.is_some())
+    }
+
+    /// Start an update of `allocation_id`'s PTR record to `value` — `None` to take the
+    /// record away, which is what a reset asks for — and answer the attribute as it now
+    /// reads.
+    ///
+    /// The record in effect is left ALONE: an update is reported as outstanding
+    /// (`AddressAttribute$PtrRecordUpdate`) beside the record it has not replaced yet, and
+    /// reaches that record [`TRANSITION_DELAY`] later through
+    /// [`Self::apply_due_ptr_record_updates`] — recorded rather than slept for, like every
+    /// other clock-owed move of this store. The caller has already resolved
+    /// `allocation_id` to an address of the account and asked
+    /// [`Self::address_ptr_update_is_pending`].
+    ///
+    /// No byte charge is made for the entry: it is keyed by an id of [`Self::addresses`],
+    /// so there can be no more of them than there are stored addresses, and a reset — the
+    /// one caller that reaches this today — names no value at all. A writer that DOES name
+    /// one has to bound it before it gets here, the way every other caller-supplied value
+    /// of this store is bounded.
+    pub fn start_address_ptr_record_update(
+        &mut self,
+        allocation_id: &str,
+        value: Option<String>,
+    ) -> Option<AddressAttribute> {
+        let entry = self
+            .address_ptr_records
+            .entry(allocation_id.to_string())
+            .or_default();
+        entry.pending_update = Some(PendingPtrRecordUpdate {
+            value,
+            due_at: Instant::now() + TRANSITION_DELAY,
+        });
+        self.address_attribute_view(allocation_id)
+    }
+
+    /// Apply every PTR record update the clock has taken past its due instant.
+    ///
+    /// Reached through [`Self::materialize_due_transitions`], so a reporting operation may
+    /// apply it: each update was already owed at `now` whether or not anybody called, and
+    /// applying it is what makes the record the caller asked for the record in effect. An
+    /// entry left with neither a record nor an owed update is dropped, an address with no
+    /// reverse DNS record being one this store holds nothing about.
+    pub fn apply_due_ptr_record_updates(&mut self, now: Instant) {
+        self.address_ptr_records.retain(|_allocation_id, record| {
+            let due = record
+                .pending_update
+                .as_ref()
+                .is_some_and(|pending| now >= pending.due_at);
+            if due {
+                record.ptr_record = record
+                    .pending_update
+                    .take()
+                    .and_then(|pending| pending.value);
+            }
+            record.ptr_record.is_some() || record.pending_update.is_some()
+        });
+    }
+
+    /// The `domain-name` attribute of `allocation_id` as the modelled `AddressAttribute`
+    /// shape, or `None` when the account holds no address under that id.
+    ///
+    /// The ONE projection of an address and its [`AddressPtrRecord`] into that shape, so
+    /// the operations that set, reset and report the attribute cannot describe one address
+    /// differently. An address with no PTR record and no update owed on it reports neither
+    /// member — the shape's own answer for an address nothing has given a reverse DNS
+    /// record.
+    pub fn address_attribute_view(&self, allocation_id: &str) -> Option<AddressAttribute> {
+        let address = self.addresses.get(allocation_id)?;
+        let record = self.address_ptr_records.get(allocation_id);
+        Some(AddressAttribute {
+            public_ip: address.public_ip.clone(),
+            allocation_id: address.allocation_id.clone(),
+            ptr_record: record.and_then(|record| record.ptr_record.clone()),
+            ptr_record_update: record
+                .and_then(|record| record.pending_update.as_ref())
+                .map(|pending| PtrUpdateStatus {
+                    value: pending.value.clone(),
+                    status: Some(PTR_UPDATE_STATUS_PENDING.to_string()),
+                    // "The reason for the PTR record update"
+                    // (`PtrUpdateStatus$Reason`): an accepted update has none to give.
+                    reason: None,
+                }),
+        })
+    }
+}
+
+/// Refuse a request to change a PTR record that already has an outstanding update: HTTP
+/// 400 `PendingRequestAlreadyExists`.
+///
+/// The message is the sentence the real service answers there, which carries no variable
+/// part: the request named the record, and the refusal is about the one update already
+/// outstanding on it.
+pub fn pending_request_already_exists<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        PENDING_REQUEST_ALREADY_EXISTS,
+        400,
+        "A pending request for this record already exists.",
     )
 }
 

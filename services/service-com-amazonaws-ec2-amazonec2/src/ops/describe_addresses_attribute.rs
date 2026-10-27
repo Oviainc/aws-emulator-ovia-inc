@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAddressesAttribute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAddressesAttribute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the `domain-name` attribute — the reverse DNS (PTR) record — of the account's
+//! Elastic IP addresses, narrowed by the allocation ids the request names and paged over
+//! those ids.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAddressesAttribute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A REPORT: it writes nothing of its own. The one thing it applies is a PTR record update
+//! the clock had already taken past its instant, which was owed whether or not anybody
+//! called.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +140,129 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAddressesAttribute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAddressesAttributeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            decode_page_token, invalid_pagination_token_for, page_from_cursor,
+            require_known_address, require_service_state, PageTokenRule, MAX_PAGE_SIZE,
+            MAX_RESOURCE_IDS,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it. The store
+        // is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "[EC2-VPC] The allocation IDs"
+        // (`DescribeAddressesAttributeRequest$AllocationIds`): the one way a request narrows
+        // which addresses it asks about, and the model bounds neither the list nor its
+        // entries, so it is bounded here before any work proportional to it is done.
+        let requested_ids = input.allocation_ids.clone().unwrap_or_default();
+        if requested_ids.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "AllocationIds carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                requested_ids.len()
+            )));
+        }
+
+        // "The token for the next page of results"
+        // (`DescribeAddressesAttributeRequest$NextToken`) — anything else is refused rather
+        // than read as an allocation id.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                Some(decode_page_token(token).ok_or_else(|| invalid_pagination_token_for(token))?)
+            }
+        };
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // The only write a REPORT may do: a PTR record update whose instant has passed
+        // reached the record then, whether or not anybody called — so applying it here is
+        // what makes two calls in a row answer the same thing, and no later caller can tell
+        // this one was made.
+        store.materialize_due_transitions();
+
+        // "Describes the attributes of the specified Elastic IP addresses": an allocation id
+        // that names no address of the account is an error, not an absent row — a malformed
+        // id before an unknown one, the way the service orders the two.
+        for allocation_id in &requested_ids {
+            require_known_address(&store, allocation_id)?;
+        }
+
+        // DryRun sits AFTER every parameter has been validated and every named address
+        // resolved: the flag asks whether the request WOULD have succeeded, so one that would
+        // have been refused is refused with that reason instead. The model's own `@range` on
+        // `MaxResults` (1..1000) was already applied at the boundary, before this handler
+        // ran.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // "The attribute of the IP address"
+        // (`DescribeAddressesAttributeRequest$Attribute`) selects WHICH attribute is
+        // reported, and `AddressAttributeName` has exactly one member — the reverse DNS
+        // record this view carries — so a request that names it and one that leaves it out
+        // ask for the same thing. Every other spelling is refused by the request walk before
+        // this handler runs.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAddressesAttribute"))
+        // With no `AllocationIds` every address of the account is reported, and with the list
+        // given an address is reported when the list names it — asked of a set built once, so
+        // the narrowing costs one lookup per stored address however many ids the request
+        // carries. Each row is the ONE projection of the stored address and its PTR record
+        // ([`crate::state::ComAmazonawsEc2Amazonec2State::address_attribute_view`]), so this
+        // report and the operation that resets the attribute cannot describe one address
+        // differently. The row carries the store's own KEY beside the attribute, and the page
+        // cursor is defined over that key rather than over `AddressAttribute$AllocationId`:
+        // the key is not optional, so a page can never end without a token because a
+        // record's member was absent.
+        let narrowed_to: ::std::collections::BTreeSet<&str> =
+            requested_ids.iter().map(String::as_str).collect();
+        let mut selected: Vec<(&String, AddressAttribute)> = store
+            .addresses
+            .keys()
+            .filter(|allocation_id| {
+                narrowed_to.is_empty() || narrowed_to.contains(allocation_id.as_str())
+            })
+            .filter_map(|allocation_id| {
+                store
+                    .address_attribute_view(allocation_id)
+                    .map(|attribute| (allocation_id, attribute))
+            })
+            .collect();
+        // Paged in `AllocationId` order, which the cursor names a position in. The store is an
+        // ordered map keyed by that id, so its iteration order already satisfies this sort;
+        // doing it here establishes the invariant the shared pager depends on at the point of
+        // use.
+        selected.sort_by(|left, right| left.0.cmp(right.0));
+
+        // A request that names no page size gets the largest page this service serves, so
+        // the `NextToken` path behaves the same whether or not a page size was asked for.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+
+        // The crate's one pager: a token only when an address follows this page, which is
+        // what "This value is null when there are no more results to return"
+        // (`DescribeAddressesAttributeResult$NextToken`) reads as, so a caller stops when it
+        // is absent.
+        let (page, next_token) = page_from_cursor(
+            &selected,
+            start_at.as_deref(),
+            Some(limit),
+            PageTokenRule::WhenAnotherItemFollows,
+            |(allocation_id, _)| allocation_id.as_str(),
+        );
+
+        Ok(DescribeAddressesAttributeOutput {
+            // Present even when it holds nothing: an account with no Elastic IP address is an
+            // answer, and `addressSet` is the member that carries it.
+            addresses: Some(
+                page.iter()
+                    .map(|(_, attribute)| attribute.clone())
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }
