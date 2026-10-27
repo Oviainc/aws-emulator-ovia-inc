@@ -47,6 +47,8 @@ mod scaling_plan_lifecycle;
 mod scaling_plan_resource_policies;
 #[path = "all/scheduled_action_buffer_time.rs"]
 mod scheduled_action_buffer_time;
+#[path = "all/scheduled_action_capacity_band.rs"]
+mod scheduled_action_capacity_band;
 #[path = "all/stack_arn_predicate_consistency.rs"]
 mod stack_arn_predicate_consistency;
 #[path = "all/state_roundtrip.rs"]

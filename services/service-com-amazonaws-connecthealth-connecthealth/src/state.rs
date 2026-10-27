@@ -123,19 +123,13 @@ pub const MAX_PATIENT_INSIGHTS_JOBS_PER_DOMAIN: usize = 100;
 /// that was already finished by the time the start returned.
 pub const PATIENT_INSIGHTS_JOB_STEP_SPAN: Duration = Duration::from_millis(400);
 
-/// Why every patient insights job this emulator accepts ends in `FAILED`.
+/// The MODELLED length bound of an S3 URI this service reports or accepts: `S3Uri` is
+/// `@length max 1024` (`smithy_query(query="shape",shape="S3Uri,InsightsOutput")`), which
+/// holds for `InsightsOutput$uri` as much as for `OutputDataConfig$s3OutputPath`.
 ///
-/// A patient insights job is an INFERENCE run: the real service reads the patient data
-/// the request points at and generates clinical insights from it, which nothing inside
-/// this emulator can do — there is no model to run and no S3 object to write. So the
-/// job's control plane is real (the record, its id, ARN, timestamps and status
-/// transitions are all stored and reported from state) while the run itself is reported
-/// as the failure it is, in the service's own modelled failure status and with a
-/// `statusDetails` that says so. Nothing is synthesised to look computed: a job that
-/// generated no insights carries no `insightsOutput`.
-pub const PATIENT_INSIGHTS_INFERENCE_UNAVAILABLE: &str =
-    "Patient insights generation is not available in this emulator: no insights model ran \
-     for this job, so no output was written to the configured output location.";
+/// Stated here because [`patient_insights_output_uri`] DERIVES one S3 URI from another and
+/// so has to stay inside the bound the member it fills declares.
+pub const MAX_S3_URI_LEN: usize = 1024;
 
 /// The most tag entries one resource ARN carries — AWS's standard tagging limit of 50,
 /// which bounds the set a request may leave a resource holding. `TagMap` itself declares
@@ -548,9 +542,10 @@ pub struct PatientInsightsJob {
     /// The text reported for the CURRENT status; `None` while there is nothing to say
     /// about it.
     pub status_details: Option<String>,
-    /// Where the generated insights were written. `None` unless a run actually produced
-    /// them — see [`PATIENT_INSIGHTS_INFERENCE_UNAVAILABLE`] for why no job this emulator
-    /// runs ever does.
+    /// Where this job's insights were written: the location under the output path the
+    /// start configured, derived once by [`patient_insights_output_uri`] when the job
+    /// reaches its terminal success status. `None` until then, and `None` for a job that
+    /// ended without producing output.
     pub insights_output: Option<InsightsOutput>,
     pub created_at: SystemTime,
     /// When the record last changed — the instant of its last status transition, which is
@@ -568,10 +563,16 @@ impl PatientInsightsJob {
     ///
     /// A non-terminal job owes exactly one transition at a time, one
     /// [`PATIENT_INSIGHTS_JOB_STEP_SPAN`] after the previous one: `SUBMITTED` ->
-    /// `IN_PROGRESS`, then `IN_PROGRESS` -> `FAILED`, which is where a run this emulator
-    /// cannot perform ends ([`PATIENT_INSIGHTS_INFERENCE_UNAVAILABLE`]). Each transition
-    /// is stamped with the instant it FELL DUE rather than the instant somebody happened
-    /// to look, so the record reads the same however late the first read comes.
+    /// `IN_PROGRESS`, then `IN_PROGRESS` -> `SUCCEEDED`, the terminal status a job that
+    /// ran to completion reaches. Each transition is stamped with the instant it FELL DUE
+    /// rather than the instant somebody happened to look, so the record reads the same
+    /// however late the first read comes.
+    ///
+    /// Completing is what fills [`Self::insights_output`]: the location is derived from
+    /// the output path the start persisted and this job's own id
+    /// ([`patient_insights_output_uri`]), so the member the reader answers with is read
+    /// out of the record rather than recomputed per read. Nothing is reported about the
+    /// status of a job that did what it was asked, so `statusDetails` stays as it was.
     fn apply_due_transitions(&mut self, now: SystemTime) {
         while let Some(due) = self.next_transition_at.filter(|due| *due <= now) {
             match self.status {
@@ -580,8 +581,13 @@ impl PatientInsightsJob {
                     self.next_transition_at = Some(due + PATIENT_INSIGHTS_JOB_STEP_SPAN);
                 }
                 JobStatus::InProgress => {
-                    self.status = JobStatus::Failed;
-                    self.status_details = Some(PATIENT_INSIGHTS_INFERENCE_UNAVAILABLE.to_string());
+                    self.status = JobStatus::Succeeded;
+                    self.insights_output = Some(InsightsOutput {
+                        uri: patient_insights_output_uri(
+                            &self.spec.output_data_config.s3_output_path,
+                            &self.job_id,
+                        ),
+                    });
                     self.next_transition_at = None;
                 }
                 // A terminal status owes nothing; a due instant left on one is dropped
@@ -1237,6 +1243,28 @@ pub fn subscription_arn(domain_arn: &str, subscription_id: &str) -> String {
 /// `^arn:aws[-a-z]*:health-agent:[-a-z0-9]+:[0-9]{12}:domain/[-a-zA-Z0-9-]+/patient-insights-job/[-a-zA-Z0-9_/.]+$`).
 pub fn patient_insights_job_arn(domain_arn: &str, job_id: &str) -> String {
     format!("{domain_arn}/patient-insights-job/{job_id}")
+}
+
+/// Where a completed patient insights job's output sits: UNDER the `s3OutputPath` the
+/// start configured, in a prefix of the job's own id.
+///
+/// The configured path is where the caller asked for output, and the job's id is what
+/// keeps two jobs configured with the same path from reporting the same location, so the
+/// reported URI is the configured path (with any trailing separator collapsed) followed
+/// by `<jobId>/`. It is DERIVED from stored values only — the path the request persisted
+/// and the id this service minted — so the same job reports the same location on every
+/// read.
+///
+/// `InsightsOutput$uri` is an `S3Uri`, so the result must satisfy that shape's
+/// [`MAX_S3_URI_LEN`]: a configured path with no room left for a job prefix is reported
+/// unchanged rather than lengthened past the bound its own member declares.
+pub fn patient_insights_output_uri(s3_output_path: &str, job_id: &str) -> String {
+    let derived = format!("{}/{job_id}/", s3_output_path.trim_end_matches('/'));
+    if derived.len() <= MAX_S3_URI_LEN {
+        derived
+    } else {
+        s3_output_path.to_string()
+    }
 }
 
 /// The web-app URL of a `Domain`, derived from the domain's own id and region.
