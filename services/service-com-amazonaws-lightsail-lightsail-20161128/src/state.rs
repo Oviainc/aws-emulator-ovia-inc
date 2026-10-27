@@ -5530,6 +5530,29 @@ impl StoredDisk {
             auto_mount_status: None,
         }
     }
+
+    /// Record this disk as attached to the instance `instance_name` and exposed
+    /// at the device `path`: the attachment and the path are what the modelled
+    /// `Disk$attachedTo` and `$path` report, and the disk is [`DISK_STATE_IN_USE`]
+    /// for as long as the attachment stands.
+    ///
+    /// A settle to [`DISK_STATE_AVAILABLE`] the clock still owed this disk is
+    /// dropped here: settling there is what RELEASES an attachment (see
+    /// [`ComAmazonawsLightsailLightsail20161128State::advance_clock`]), so
+    /// leaving it in place would un-attach the disk this very call attached. A
+    /// settle to any OTHER state is left alone — it is not this attachment's.
+    /// Every operation that attaches an EXISTING disk goes through here, so the
+    /// invariant lives next to the members it protects rather than in each
+    /// handler. (A disk a restore CREATES already attached is stored attached,
+    /// owed nothing, by the insert that creates it.)
+    pub fn attach_to(&mut self, instance_name: String, path: String) {
+        self.attached_to = Some(instance_name);
+        self.path = Some(path);
+        self.state = DISK_STATE_IN_USE;
+        if self.due.is_some_and(|due| due.state == DISK_STATE_AVAILABLE) {
+            self.due = None;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

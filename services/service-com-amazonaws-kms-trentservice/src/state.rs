@@ -4508,6 +4508,95 @@ fn rsa_signing_encoding(
     }
 }
 
+/// Whether `signature` is a signature of `message` under `key`'s key pair with
+/// `signing_algorithm`.
+///
+/// "The signature is verified by using the public key in the same asymmetric KMS key"
+/// (`smithy_query(query="doc",shape="Verify")`): the check is performed by the library
+/// that implements the algorithm, against the public half DERIVED from the private half
+/// this store holds ([`public_key_spki`]) — the same bytes `GetPublicKey` publishes — so
+/// a signature verifies here exactly when it verifies outside KMS, and a signature of
+/// another message, under another key or with another algorithm does not verify.
+///
+/// `message_type` says what `message` is, as it does for [`sign_message`]: a message of
+/// [`MESSAGE_TYPE_RAW`] is hashed by the scheme itself, and one of
+/// [`MESSAGE_TYPE_DIGEST`] is the hash already computed, so the signature is checked
+/// over that digest with the hashing step skipped — "a message and its hash digest are
+/// considered to be the same message"
+/// (`smithy_query(query="doc",shape="VerifyRequest",member="Message")`).
+///
+/// The errors mean what they mean for [`sign_message`]: `Unsupported` when no library
+/// reachable from here verifies this key pair under this algorithm, and `Failed` when a
+/// library refused a step it should have performed.
+pub fn signature_matches(
+    key: &Cmk,
+    signing_algorithm: &str,
+    message_type: &str,
+    message: &[u8],
+    signature: &[u8],
+) -> Result<bool, SignatureRefusal> {
+    let (Some(private_key), Some(algorithm)) = (
+        key.material.private_key_pkcs8(),
+        verification_algorithm(&key.key_spec, signing_algorithm),
+    ) else {
+        return Err(SignatureRefusal::Unsupported);
+    };
+
+    let public_key =
+        public_key_spki(&key.key_spec, private_key).ok_or(SignatureRefusal::Failed)?;
+    let parsed = ::aws_lc_rs::signature::ParsedPublicKey::new(algorithm, &public_key)
+        .map_err(|_| SignatureRefusal::Failed)?;
+    if message_type == MESSAGE_TYPE_DIGEST {
+        let digest = signed_digest(signing_algorithm, message_type, message)?;
+        return Ok(parsed.verify_digest_sig(&digest, signature).is_ok());
+    }
+    Ok(parsed.verify_sig(message, signature).is_ok())
+}
+
+/// How a signature produced with `signing_algorithm` under a key pair of `key_spec` is
+/// VERIFIED: the same scheme, hash and curve, named from the verifying side.
+///
+/// The RSA schemes are verified for any modulus the specs allow, and each curve spec
+/// names its own curve, so the parameters a signature is checked with are the key's own
+/// rather than the ones a request asked for. `None` for a pairing no library reachable
+/// from here verifies — the prehashed Ed25519 scheme and SM2DSA, which [`sign_message`]
+/// likewise produces no signature with, and ML-DSA, whose key pair this service does not
+/// hold.
+fn verification_algorithm(
+    key_spec: &str,
+    signing_algorithm: &str,
+) -> Option<&'static dyn ::aws_lc_rs::signature::VerificationAlgorithm> {
+    use ::aws_lc_rs::signature::{
+        ECDSA_P256K1_SHA256_ASN1, ECDSA_P256_SHA256_ASN1, ECDSA_P384_SHA384_ASN1,
+        ECDSA_P521_SHA512_ASN1, ED25519, RSA_PKCS1_2048_8192_SHA256, RSA_PKCS1_2048_8192_SHA384,
+        RSA_PKCS1_2048_8192_SHA512, RSA_PSS_2048_8192_SHA256, RSA_PSS_2048_8192_SHA384,
+        RSA_PSS_2048_8192_SHA512,
+    };
+
+    match key_pair_kind(key_spec)? {
+        KeyPairKind::Rsa(_) => match signing_algorithm {
+            "RSASSA_PKCS1_V1_5_SHA_256" => Some(&RSA_PKCS1_2048_8192_SHA256),
+            "RSASSA_PKCS1_V1_5_SHA_384" => Some(&RSA_PKCS1_2048_8192_SHA384),
+            "RSASSA_PKCS1_V1_5_SHA_512" => Some(&RSA_PKCS1_2048_8192_SHA512),
+            "RSASSA_PSS_SHA_256" => Some(&RSA_PSS_2048_8192_SHA256),
+            "RSASSA_PSS_SHA_384" => Some(&RSA_PSS_2048_8192_SHA384),
+            "RSASSA_PSS_SHA_512" => Some(&RSA_PSS_2048_8192_SHA512),
+            _ => None,
+        },
+        KeyPairKind::Ecdsa(_) => match (key_spec, signing_algorithm) {
+            ("ECC_NIST_P256", "ECDSA_SHA_256") => Some(&ECDSA_P256_SHA256_ASN1),
+            ("ECC_NIST_P384", "ECDSA_SHA_384") => Some(&ECDSA_P384_SHA384_ASN1),
+            ("ECC_NIST_P521", "ECDSA_SHA_512") => Some(&ECDSA_P521_SHA512_ASN1),
+            ("ECC_SECG_P256K1", "ECDSA_SHA_256") => Some(&ECDSA_P256K1_SHA256_ASN1),
+            _ => None,
+        },
+        KeyPairKind::Ed25519 if signing_algorithm == SIGNING_ALGORITHM_ED25519_SHA_512 => {
+            Some(&ED25519)
+        }
+        KeyPairKind::Ed25519 | KeyPairKind::Sm2 => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Message authentication codes
 // ---------------------------------------------------------------------------
