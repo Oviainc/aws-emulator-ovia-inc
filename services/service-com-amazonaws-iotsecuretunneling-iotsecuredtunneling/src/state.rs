@@ -31,26 +31,65 @@ pub const DEFAULT_MAX_LIFETIME_TIMEOUT_MINUTES: i32 = 720;
 /// 100 summaries and anything beyond it is reported through `nextToken`.
 pub const MAX_LIST_PAGE_SIZE: i32 = 100;
 
-/// The number of tunnel records this service stores.
+/// The tunnels one account may hold OPEN at the same time in one Region.
 ///
-/// AWS quotas tunnels per account — the modelled `LimitExceededException`
-/// (HTTP 403) documents itself as "Thrown when a tunnel limit is exceeded" — so
-/// an `OpenTunnel` past the limit is refused with that error rather than stored.
-/// Enforcing it is also what keeps this store from growing without bound in a
+/// The quota the modelled `LimitExceededException` (HTTP 403, "Thrown when a
+/// tunnel limit is exceeded") reports is a quota on CONCURRENCY: a tunnel
+/// occupies one of these slots only while its status is `TunnelStatus::Open`,
+/// so a tunnel that has been closed — by `CloseTunnel` or by its
+/// `maxLifetimeTimeoutMinutes` running out — releases its slot immediately,
+/// even though `CloseTunnel$delete` ("When set to true, IoT Secure Tunneling
+/// deletes the tunnel data immediately") means its record is still describable.
+/// A slot is a resource of the Region that holds the tunnel, since the quota and
+/// the tunnel alike belong to one Region's endpoint.
+///
+/// The model publishes no number, so the number itself is this emulator's
+/// bound, kept to the order of the quota AWS publishes for concurrently open
+/// tunnels rather than to the size of the store (see [`MAX_RETAINED_TUNNELS`]).
+pub const MAX_CONCURRENT_TUNNELS: usize = 50;
+
+/// The refusal message for an `OpenTunnel` past [`MAX_CONCURRENT_TUNNELS`],
+/// beside the constant it reports exactly as [`tag_limit_message`] sits beside
+/// its own: the text names the quota and the number of tunnels the account
+/// already holds open, and what releases a slot.
+///
+/// `open` is read from the store, so the text describes the account's own state
+/// and nothing else.
+pub fn tunnel_limit_message(open: usize) -> String {
+    format!(
+        "Tunnel limit of {MAX_CONCURRENT_TUNNELS} concurrently open tunnels exceeded; this \
+         account holds {open} open tunnels in this Region, so close one before opening another"
+    )
+}
+
+/// The number of tunnel RECORDS this service keeps, closed history included.
+///
+/// This is not the quota AWS enforces on a caller — that is
+/// [`MAX_CONCURRENT_TUNNELS`], and a record past its close consumes none of it —
+/// but the bound that keeps the store from growing without bound in a
 /// long-lived emulator: each record's size is bounded by the modelled `@length`
 /// and `@pattern` constraints on its members, and the record COUNT is bounded
-/// here. A record leaves the store only through `CloseTunnel` with `delete`
-/// set, which is the one call AWS documents as deleting a tunnel's data; the
-/// number itself is this emulator's bound, since the model publishes none.
-pub const MAX_TUNNELS: usize = 500;
+/// here, across every Region, since the Region a record belongs to comes from
+/// the request. Records a caller deletes leave through `CloseTunnel` with
+/// `delete` set, the one call AWS documents as deleting a tunnel's data; beyond
+/// that, the longest-closed records are evicted to make room for a new tunnel,
+/// and an `OpenTunnel` the store has no room for at all is refused (see
+/// [`ComAmazonawsIotsecuretunnelingIotsecuredtunnelingState::make_room_for_tunnel`]).
+/// An OPEN tunnel is never evicted, and the number itself is this emulator's
+/// bound, since the model publishes none.
+pub const MAX_RETAINED_TUNNELS: usize = 500;
 
-/// The refusal message for an `OpenTunnel` the store has no room for, beside
-/// the constant it reports exactly as [`tag_limit_message`] sits beside its
-/// own: the text names the limit and what releases a record.
-pub fn tunnel_limit_message() -> String {
+/// The refusal message for an `OpenTunnel` the store has no room for: it holds
+/// [`MAX_RETAINED_TUNNELS`] records and none of them is closed, so nothing can
+/// be evicted to make room.
+///
+/// Reported with the same modelled `LimitExceededException` (HTTP 403) as
+/// [`tunnel_limit_message`], the one error this service models for an exhausted
+/// limit; the text names the limit and what releases a record.
+pub fn tunnel_record_limit_message() -> String {
     format!(
-        "Tunnel limit of {MAX_TUNNELS} exceeded; close a tunnel with delete set before opening \
-         another"
+        "Tunnel limit of {MAX_RETAINED_TUNNELS} tunnel records exceeded; close a tunnel before \
+         opening another"
     )
 }
 
@@ -66,7 +105,7 @@ pub fn tunnel_limit_message() -> String {
 /// is also what keeps the tag store from growing without bound in a long-lived
 /// emulator — each key and value is bounded by the modelled `@length`
 /// constraints on `Tag`, the keys per tunnel by this constant, and the tunnels
-/// by [`MAX_TUNNELS`].
+/// by [`MAX_RETAINED_TUNNELS`].
 pub const MAX_TAGS_PER_TUNNEL: usize = 50;
 
 /// The refusal message for a request that would take one tunnel past
@@ -367,10 +406,49 @@ impl ComAmazonawsIotsecuretunnelingIotsecuredtunnelingState {
         seq
     }
 
-    /// Whether the store is full, i.e. whether another `OpenTunnel` must be
-    /// refused with the modelled `LimitExceededException`. See [`MAX_TUNNELS`].
-    pub fn is_at_tunnel_limit(&self) -> bool {
-        self.tunnels.len() >= MAX_TUNNELS
+    /// How many tunnels `region`'s endpoint currently holds OPEN — the count the
+    /// concurrency quota is enforced against. A record whose status is `CLOSED`
+    /// is not counted, however it got there, so closing a tunnel frees a slot
+    /// while leaving the record readable. See [`MAX_CONCURRENT_TUNNELS`].
+    ///
+    /// Call [`Self::materialize_expired_tunnels`] first, so a tunnel whose
+    /// lifetime has already run out is not counted as open.
+    pub fn open_tunnel_count(&self, region: &str) -> usize {
+        self.tunnels_in_region(region)
+            .filter(|tunnel| tunnel.status == TunnelStatus::Open)
+            .count()
+    }
+
+    /// Make room in the store for one more record, and report whether there is
+    /// room: `true` when the store holds fewer than [`MAX_RETAINED_TUNNELS`]
+    /// records once the longest-closed ones have been dropped, `false` when it
+    /// is still full and so cannot take another record.
+    ///
+    /// Only a CLOSED record is ever evicted — an open tunnel is live state a
+    /// caller is still using — and the one closed longest ago goes first, so
+    /// what a caller loses is the oldest history. The eviction walks every
+    /// Region, because the bound is on this store and not on one Region's share
+    /// of it: the Region a record belongs to comes from the request, so a bound
+    /// held per Region would be no bound on the store at all.
+    ///
+    /// Called by the one operation that grows the store, which refuses the
+    /// request when this answers `false` rather than inserting anyway.
+    pub fn make_room_for_tunnel(&mut self) -> bool {
+        while self.tunnels.len() >= MAX_RETAINED_TUNNELS {
+            let Some((region, tunnel_id)) = self
+                .tunnels
+                .iter()
+                .filter(|(_, tunnel)| tunnel.status != TunnelStatus::Open)
+                .min_by_key(|(_, tunnel)| (tunnel.last_updated_at, tunnel.creation_seq))
+                .map(|((region, tunnel_id), _)| (region.clone(), tunnel_id.clone()))
+            else {
+                // Every record is open, so there is nothing retention may
+                // reclaim and the store has no room for another tunnel.
+                return false;
+            };
+            self.remove_tunnel(&region, &tunnel_id);
+        }
+        true
     }
 
     /// Record a newly opened tunnel's expiry, so the sweep knows when to run.
