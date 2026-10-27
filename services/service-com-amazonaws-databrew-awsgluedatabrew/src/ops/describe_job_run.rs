@@ -187,13 +187,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        // A run is addressed by its job's name AND the minted run id, so which half of
+        // that pair the store does not hold is what the message names: a job nobody
+        // created, or a run id this job never minted.
+        if !store.jobs.contains_key(&input.name) {
+            return Err(DescribeJobRunErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::not_found_message("Job", &input.name)),
+                },
+            )
+            .into());
+        }
         let Some(run) = store
             .job_runs
             .get_mut(&(input.name.clone(), input.run_id.clone()))
         else {
             return Err(DescribeJobRunErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                    message: Some(crate::state::not_found_message("Job run", &input.run_id)),
                 },
             )
             .into());

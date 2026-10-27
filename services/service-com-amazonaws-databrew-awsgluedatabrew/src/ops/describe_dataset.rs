@@ -166,7 +166,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = store.datasets.get(&input.name) else {
             return Err(DescribeDatasetErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                    message: Some(crate::state::not_found_message("Dataset", &input.name)),
                 },
             )
             .into());
