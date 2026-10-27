@@ -592,6 +592,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
+            // A container's `cpu`, `memory` and `memoryReservation` are COUNTS of a
+            // resource — CPU units reserved, MiB presented and MiB reserved — so each has
+            // to name a number its unit admits. The same range, and the same wording for
+            // crossing it, as the daemon registration's container definitions; this
+            // operation reports its container-definition refusals as a client error, so
+            // this one keeps that class.
+            if let Some(message) = crate::state::container_reservation_violation(
+                &name,
+                definition.cpu,
+                definition.memory,
+                definition.memory_reservation,
+            ) {
+                return Err(RegisterTaskDefinitionErrorModeled::ClientException(
+                    ClientException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
             if input.memory.is_none()
                 && definition.memory.is_none()
                 && definition.memory_reservation.is_none()

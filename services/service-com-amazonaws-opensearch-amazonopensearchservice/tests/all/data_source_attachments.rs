@@ -27,6 +27,9 @@
 //! * an attachment the clock owes a move settles without any call asking for it: PENDING
 //!   while either the application or the data source is still being provisioned, then
 //!   ATTACHED — or FAILED, where the data source is gone before it could complete;
+//! * an attach is asynchronous, so an ARN that resolves to no data source of this
+//!   account is accepted and recorded as PENDING and the clock settles it as FAILED,
+//!   over a table of ARNs differing in why they resolve to nothing;
 //! * a detached data source leaves the set, and a detach of a PENDING attachment or of a
 //!   data source the application holds no record for is the modelled refusal;
 //! * an attach is idempotent by data source and by a client token naming the same
@@ -657,6 +660,128 @@ async fn an_attachment_whose_data_source_is_gone_fails_rather_than_completing() 
 }
 
 #[tokio::test]
+async fn an_attach_of_a_data_source_this_account_does_not_hold_is_accepted_then_fails() {
+    let emulator = Emulator::new();
+    let id = application(&emulator, "absent-src-ui").await;
+    let held = domain(&emulator, "absent-src-held").await;
+    tokio::time::sleep(SETTLE_WAIT).await;
+
+    // Every row has ARN syntax and satisfies `ARN`'s `@length(20..2048)`, and resolves
+    // to no data source this account holds. They differ in WHY it resolves to nothing —
+    // the resource name, the Region, the account, the service — and one sits at the
+    // published upper length bound, so the acceptance is not a property of one value.
+    let stem = "arn:aws:es:us-east-1:123456789012:domain/";
+    let absent: Vec<(&str, String)> = vec![
+        (
+            "a resource name this account holds no domain under",
+            format!("{stem}no-domain-of-this-name"),
+        ),
+        (
+            "a domain of this name in another Region",
+            "arn:aws:es:ap-southeast-2:123456789012:domain/absent-src-held".to_string(),
+        ),
+        (
+            "a domain of this name in another account",
+            "arn:aws:es:us-east-1:210987654321:domain/absent-src-held".to_string(),
+        ),
+        (
+            "another service's resource",
+            "arn:aws:s3:::a-bucket-that-is-no-domain".to_string(),
+        ),
+        (
+            "the longest value the length constraint allows",
+            format!("{stem}{}", "d".repeat(2048 - stem.len())),
+        ),
+    ];
+
+    let mut recorded = Vec::new();
+    for (case, data_source_arn) in &absent {
+        let answer = attach(&emulator, &id, json!({ "dataSourceArn": data_source_arn })).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case}: an attach is asynchronous, so expected 200, got {} with {:?}",
+            answer.status, answer.body
+        );
+        let record = reported(&answer.body, case);
+        assert_eq!(
+            record.status, ATTACHMENT_STATUS_PENDING,
+            "case {case}: expected {ATTACHMENT_STATUS_PENDING} while the data source is not \
+             active, got {record:?}"
+        );
+        assert_eq!(
+            &record.data_source_arn, data_source_arn,
+            "case {case}: the attachment records the data source it was asked for, got {record:?}"
+        );
+        // The record is the store's, not the answer's: the single-attachment read
+        // reports the same one straight away.
+        let read = describe_attachment(&emulator, &id, data_source_arn).await;
+        assert_eq!(
+            reported(&read.body, case),
+            record,
+            "case {case}: the read reports the record the attach stored, got {:?}",
+            read.body
+        );
+        recorded.push(record);
+    }
+
+    // An attach of a data source this account DOES hold, and which is active, completes
+    // at once: what the rule turns on is the data source's state, not the call.
+    let answer = attach(&emulator, &id, json!({ "dataSourceArn": held })).await;
+    assert_eq!(
+        reported(&answer.body, "a held, active data source").status,
+        ATTACHMENT_STATUS_ATTACHED,
+        "case a held, active data source: the attachment completes at once, got {:?}",
+        answer.body
+    );
+
+    // Nothing asks for the move: the span the clock owed each attachment passes, and
+    // every attachment whose data source this account does not hold has failed —
+    // "attachment timed out or encountered a non-retryable error" — while the one that
+    // resolved stays attached.
+    tokio::time::sleep(SETTLE_WAIT).await;
+    let settled = whole_set(&emulator, &id, "an attach that resolves to nothing").await;
+    assert_eq!(
+        settled.len(),
+        absent.len() + 1,
+        "case an attach that resolves to nothing: every accepted attach is recorded, got \
+         {settled:?}"
+    );
+    for ((case, data_source_arn), record) in absent.iter().zip(&recorded) {
+        let found = settled
+            .iter()
+            .find(|entry| &entry.data_source_arn == data_source_arn)
+            .unwrap_or_else(|| {
+                panic!("case {case}: expected the listing to report {record:?}, got {settled:?}")
+            });
+        assert_eq!(
+            found,
+            &Reported {
+                status: ATTACHMENT_STATUS_FAILED.to_string(),
+                ..record.clone()
+            },
+            "case {case}: expected the attachment to fail rather than land, got {found:?}"
+        );
+        let read = describe_attachment(&emulator, &id, data_source_arn).await;
+        assert_eq!(
+            &reported(&read.body, case),
+            found,
+            "case {case}: the read and the listing report one record, got {:?}",
+            read.body
+        );
+    }
+    let resolved = settled
+        .iter()
+        .find(|entry| entry.data_source_arn == held)
+        .unwrap_or_else(|| {
+            panic!("case a held, active data source: expected its attachment, got {settled:?}")
+        });
+    assert_eq!(
+        resolved.status, ATTACHMENT_STATUS_ATTACHED,
+        "case a held, active data source: expected {ATTACHMENT_STATUS_ATTACHED}, got {resolved:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_detached_data_source_leaves_the_set() {
     let emulator = Emulator::new();
     let id = application(&emulator, "detach-ui").await;
@@ -869,26 +994,22 @@ async fn an_attach_the_store_cannot_serve_is_refused() {
     let arn = domain(&emulator, "refusal-src").await;
     tokio::time::sleep(SETTLE_WAIT).await;
 
-    // An ARN naming no data source of this account names nothing that can be attached,
-    // and a value that is no ARN at all is the malformed input it is. Each row is long
-    // enough to satisfy `ARN`'s own `@length(min: 20)`, so the refusal comes from the
-    // rule under test rather than from the request boundary.
+    // A value that is no ARN at all is the malformed input it is — the syntax of the
+    // member is this call's to check, while resolving an ARN to a data source is the
+    // attach's own asynchronous work (see
+    // [`an_attach_of_a_data_source_this_account_does_not_hold_is_accepted_then_fails`]).
+    // Each row is long enough to satisfy `ARN`'s own `@length(min: 20)`, so the refusal
+    // comes from the rule under test rather than from the request boundary.
     for (case, data_source_arn, status, code) in [
-        (
-            "an ARN naming no domain of this account",
-            "arn:aws:es:us-east-1:123456789012:domain/not-a-domain-here",
-            409,
-            "ResourceNotFoundException",
-        ),
-        (
-            "an ARN naming another service's resource",
-            "arn:aws:s3:::a-bucket-that-is-not-a-domain",
-            409,
-            "ResourceNotFoundException",
-        ),
         (
             "a value that is not an ARN at all",
             "not-an-arn-but-long-enough",
+            400,
+            "ValidationException",
+        ),
+        (
+            "a value whose resource field is empty",
+            "arn:aws:es:us-east-1:123456789012:",
             400,
             "ValidationException",
         ),

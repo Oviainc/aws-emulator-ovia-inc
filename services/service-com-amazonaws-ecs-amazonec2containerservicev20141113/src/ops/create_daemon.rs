@@ -347,6 +347,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // daemon": the revision is resolved ONCE, here, so a registration made later in
         // the same family does not move the daemon onto it.
         let reference = input.daemon_task_definition_arn.as_str();
+        // Every form of the reference carries a FAMILY, and a family is a name of the
+        // documented character set, so a value whose family part is not one is refused as
+        // invalid input stating the pattern a family has to match.
+        if let Some(message) = crate::state::daemon_task_definition_family_violation(reference) {
+            return Err(CreateDaemonErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
+        }
         let Some((family, revision)) =
             crate::state::parse_daemon_task_definition_reference(reference)
         else {

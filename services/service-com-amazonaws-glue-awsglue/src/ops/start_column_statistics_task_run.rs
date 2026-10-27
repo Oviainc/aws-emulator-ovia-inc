@@ -225,6 +225,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .tables
                 .get(&crate::state::fold_name(&input.table_name))
             else {
+                // The catalog's own per-resource template, naming the table the request
+                // addressed. NOT the settings create's fixed sentence for its table miss:
+                // this surface's refusals are worded per operation (its in-flight sentence
+                // and the create's differ in one letter's case), so each answers the
+                // wording recorded for it and nothing records this one's.
                 return Err(not_found(crate::state::messages::table_not_found(
                     &input.table_name,
                 )));

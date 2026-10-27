@@ -9,6 +9,10 @@
 //! naming no resource this account holds is refused with `InvalidRequestException`, and
 //! so is a tag Amazon EMR would not have held (see [`crate::state::validate_tags`]).
 //!
+//! Which resource the request names is resolved by
+//! [`crate::state::ComAmazonawsEmrElasticmapreduceState::tag_target_mut`], shared with
+//! `RemoveTags`: the `ClusterId`/`ResourceId` pair means the same thing on both.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -140,7 +144,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        use crate::state::{merge_tags, validate_tags, STUDIO_ID_PREFIX};
+        use crate::state::{merge_tags, validate_tags};
 
         let _ = ctx;
         let now = ::std::time::SystemTime::now();
@@ -159,64 +163,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut store = state.lock();
 
-        // "The ID of the cluster that scopes the tag operation. Required when the
-        // resource being tagged is a session-scoped resource." (`AddTags$ClusterId`
-        // doc.) A request carrying one is tagging that cluster or something that lives
-        // on it and nothing outside it, so the `ResourceId` is resolved against the
-        // named cluster alone. `ClusterId` is `len 0..256`, so the empty string reaches
-        // this handler, and it scopes nothing.
-        if let Some(cluster_id) = input.cluster_id.as_deref().filter(|id| !id.is_empty()) {
-            // `cluster_mut` materialises the transitions the clock already made due,
-            // which were owed at this instant whether or not anybody added a tag.
-            let Some(cluster) = store.cluster_mut(cluster_id, now) else {
-                return Err(refuse(crate::state::unknown_cluster_message(cluster_id)));
-            };
-            if cluster.id == input.resource_id {
-                merge_tags(&mut cluster.tags, &input.tags).map_err(refuse)?;
-                return Ok(AddTagsOutput {});
-            }
-            let Some(session) = cluster.session_mut(&input.resource_id) else {
-                return Err(refuse(crate::state::unknown_session_message(
-                    &input.resource_id,
-                    cluster_id,
-                )));
-            };
-            let mut held = session.tags.clone().unwrap_or_default();
-            merge_tags(&mut held, &input.tags).map_err(refuse)?;
-            session.tags = Some(held);
-            return Ok(AddTagsOutput {});
-        }
-
-        // "The Amazon EMR resource identifier to which tags will be added. For example,
-        // a cluster identifier or an Amazon EMR Studio ID." (`AddTags$ResourceId` doc.)
-        // The id alone says which resource it names, so it is resolved against the
-        // resources this service holds a tag set for.
-        if let Some(cluster) = store.cluster_mut(&input.resource_id, now) {
-            merge_tags(&mut cluster.tags, &input.tags).map_err(refuse)?;
-            return Ok(AddTagsOutput {});
-        }
-        if let Some(studio) = store.studios.get_mut(&input.resource_id) {
-            // A Studio reports `Tags` only when it carries some (`CreateStudio`), which
-            // a merge leaves true either way: it never takes a tag off.
-            let mut held = studio.tags.clone().unwrap_or_default();
-            merge_tags(&mut held, &input.tags).map_err(refuse)?;
-            studio.tags = (!held.is_empty()).then_some(held);
-            return Ok(AddTagsOutput {});
-        }
-
-        // Nothing resolved: the refusal is the one the surface that owns an id of this
-        // form answers, so a caller reads here the same sentence a read of the resource
-        // it asked to tag answers.
-        if input.resource_id.starts_with(STUDIO_ID_PREFIX) {
-            return Err(AddTagsErrorModeled::InvalidRequestException(
-                crate::state::resource_not_found(crate::state::unknown_studio_message()),
-            )
-            .into());
-        }
-        Err(refuse(crate::state::unknown_cluster_message(
-            &input.resource_id,
-        )))
+        // Which resource the `ClusterId`/`ResourceId` pair names is the same question
+        // for every tag operation, so it is answered in one place
+        // ([`crate::state::ComAmazonawsEmrElasticmapreduceState::tag_target_mut`]) and
+        // this handler only merges into the set it hands back.
+        let mut target = store
+            .tag_target_mut(input.cluster_id.as_deref(), &input.resource_id, now)
+            .map_err(unresolved)?;
+        let mut held = target.held();
+        merge_tags(&mut held, &input.tags).map_err(refuse)?;
+        target.store(held);
+        Ok(AddTagsOutput {})
     }
+}
+
+/// Lift a refusal to resolve the resource into the client error this operation models.
+fn unresolved(refusal: crate::state::TagTargetRefusal) -> AddTagsError {
+    AddTagsErrorModeled::InvalidRequestException(refusal.into_invalid_request()).into()
 }
 
 /// Refuse the request with the client error this operation models: HTTP 400

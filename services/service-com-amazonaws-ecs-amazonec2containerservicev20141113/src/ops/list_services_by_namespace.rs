@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListServicesByNamespace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListServicesByNamespace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListServicesByNamespace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the services associated with ONE Cloud Map namespace, across every cluster: the
+//! stored services whose Service Connect configuration puts them in the namespace the
+//! request names, in one total order, cut into pages of `maxResults` ARNs whose `nextToken`
+//! resumes the walk where the page stopped.
 //!
 //! ## Shape of an operation
 //!
@@ -173,20 +168,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListServicesByNamespace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListServicesByNamespaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListServicesByNamespace"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListServicesByNamespaceErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        // "The namespace name or full Amazon Resource Name (ARN) of the Cloud Map
+        // namespace to list the services in": a value outside the form a namespace
+        // reference takes names no namespace, so it is refused for its FORM — with the
+        // pattern it has to match — before anything is resolved.
+        if !crate::state::is_namespace_reference(&input.namespace) {
+            return Err(
+                ListServicesByNamespaceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(crate::state::namespace_pattern_message(&input.namespace)),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "This value can be between 1 and 100."
+        if let Some(message) = input.max_results.and_then(|max_results| {
+            crate::state::page_size_violation(
+                max_results,
+                crate::state::MIN_LIST_PAGE_SIZE,
+                crate::state::MAX_LIST_PAGE_SIZE,
+            )
+        }) {
+            return Err(
+                ListServicesByNamespaceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut guard = state.lock();
+        guard.advance_clock(::std::time::SystemTime::now());
+
+        // A namespace nothing in this account is in is not a namespace this listing can
+        // walk, and this operation models that condition as its own error.
+        if !guard.knows_namespace(&input.namespace) {
+            return Err(
+                ListServicesByNamespaceErrorModeled::NamespaceNotFoundException(
+                    NamespaceNotFoundException {
+                        message: Some(crate::state::NAMESPACE_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "This list might include services in different clusters": the namespace, not the
+        // cluster, is what selects here — every ACTIVE service whose Service Connect
+        // namespace is the one named, whichever cluster it was created in.
+        let wanted = crate::state::namespace_key(&input.namespace);
+        let mut matching: Vec<String> = guard
+            .services
+            .values()
+            // A service the caller deleted is no longer one of the namespace's services,
+            // the same rule `ListServices` lists a cluster's services under.
+            .filter(|service| service.is_active())
+            .filter(|service| {
+                guard
+                    .service_namespace(service)
+                    .is_some_and(|namespace| crate::state::namespace_key(&namespace) == wanted)
+            })
+            .map(|service| service.arn.clone())
+            .collect();
+        // A service ARN is `service/<cluster>/<name>`, so sorting the ARNs totally orders
+        // services across clusters and gives paging a stable sequence to walk.
+        matching.sort();
+
+        // "If this parameter isn't used, then ListServicesByNamespace returns up to 10
+        // results and a nextToken value if applicable."
+        let page_size = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(crate::state::DEFAULT_LIST_SERVICES_PAGE_SIZE);
+        // The token is the ARN the next page starts at — "an opaque identifier that is
+        // only used to retrieve the next items in a list" — so a page is unaffected by
+        // services created or deleted before it.
+        let start = match input.next_token.as_deref() {
+            Some(token) => matching.partition_point(|arn| arn.as_str() < token),
+            None => 0,
+        };
+        let end = start.saturating_add(page_size).min(matching.len());
+        let service_arns = matching[start.min(matching.len())..end].to_vec();
+        // "When there are no more results to return, this value is null."
+        let next_token = matching.get(end).cloned();
+
+        Ok(ListServicesByNamespaceOutput {
+            service_arns: Some(service_arns),
+            next_token,
+        })
     }
 }

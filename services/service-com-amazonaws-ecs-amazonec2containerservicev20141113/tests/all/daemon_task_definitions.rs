@@ -626,28 +626,38 @@ async fn a_reference_that_names_no_stored_daemon_revision_is_refused() {
     )
     .await;
 
-    // The rows span the ways a reference can fail to name one stored daemon revision.
+    // The rows span the ways a reference can fail to name one stored daemon revision. A
+    // value whose FAMILY part is outside the documented character set is invalid input;
+    // the rest are well-formed references that name no stored revision.
     let rows = [
         (
             "a family nothing was registered under",
             "neverregistered".to_string(),
+            "ClientException",
         ),
         (
             "a revision the family never minted",
             format!("{FAMILY}:9"),
+            "ClientException",
         ),
-        ("revision zero", format!("{FAMILY}:0")),
-        ("not a reference at all", "not a reference".to_string()),
+        ("revision zero", format!("{FAMILY}:0"), "ClientException"),
+        (
+            "not a reference at all",
+            "not a reference".to_string(),
+            "InvalidParameterException",
+        ),
         (
             "the daemon ARN of another family",
             daemon_arn("neverregistered", 1),
+            "ClientException",
         ),
         (
             "the ARN of the plain revision of the same family",
             plain_arn(FAMILY, 1),
+            "ClientException",
         ),
     ];
-    for (case, reference) in rows {
+    for (case, reference, expected_code) in rows {
         let (code, message) = refusal(
             &router,
             "DescribeDaemonTaskDefinition",
@@ -656,8 +666,8 @@ async fn a_reference_that_names_no_stored_daemon_revision_is_refused() {
         )
         .await;
         assert_eq!(
-            code, "ClientException",
-            "case {case:?}: expected a ClientException for {reference:?}, got {code} \
+            code, expected_code,
+            "case {case:?}: expected a {expected_code} for {reference:?}, got {code} \
              with {message:?}"
         );
         assert!(

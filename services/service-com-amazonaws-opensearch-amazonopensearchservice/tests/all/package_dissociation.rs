@@ -75,7 +75,7 @@ pub(crate) async fn dissociate_many(emulator: &Emulator, body: Value) -> Answer 
 }
 
 /// `DissociatePackage`: `POST /2021-01-01/packages/dissociate/{PackageID}/{DomainName}`.
-async fn dissociate_one(emulator: &Emulator, domain: &str, package_id: &str) -> Answer {
+pub(crate) async fn dissociate_one(emulator: &Emulator, domain: &str, package_id: &str) -> Answer {
     emulator
         .call(
             "POST",

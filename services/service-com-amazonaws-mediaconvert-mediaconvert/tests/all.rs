@@ -91,6 +91,8 @@ mod resource_projection_defaults;
 mod resource_share;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
+#[path = "all/shared_next_token_refusal.rs"]
+mod shared_next_token_refusal;
 #[path = "all/shared_paging.rs"]
 mod shared_paging;
 #[path = "all/shared_set_selection.rs"]

@@ -16,6 +16,12 @@
 //! `ResourceNotFoundException`, exactly as `TagResource` refuses it.
 //! `ListTagsForResource` reports what is left.
 //!
+//! An instance whose own creation has not finished serves only its describe and its delete
+//! (`DescribeInstance`: "While the instance is in the CREATE_IN_PROGRESS state, you can
+//! call only DescribeInstance and DeleteInstance operations"), so a tag write on such an
+//! instance — or on any resource held under it — is refused with the modelled
+//! `ConflictException` and removes nothing.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -199,6 +205,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Never created, already deleted, gone with its instance, or held under another
         // instance than the one the request named — the same answer either way: there is
         // no such resource to untag.
+        //
+        // The instance that HOLDS it decides whether this write is available at all: an
+        // instance still being created serves only its own describe and delete ("While the
+        // instance is in the CREATE_IN_PROGRESS state, you can call only DescribeInstance
+        // and DeleteInstance operations"), so a tag write on it, or on anything under it,
+        // is the conflict with the `CreateInstance` still in flight.
+        let holder = store
+            .taggable_resource_instance(&input.resource_arn)
+            .map(str::to_string);
+        if let Some(holder) = holder.filter(|arn| store.instance_creation_in_progress(arn)) {
+            return Err(
+                UntagResourceErrorModeled::ConflictException(ConflictException {
+                    message: Some(crate::state::instance_creation_in_progress_message(&holder)),
+                })
+                .into(),
+            );
+        }
+
         let stored = store
             .taggable_resource_tags_mut(input.instance_arn.as_deref(), &input.resource_arn)
             .ok_or_else(|| {

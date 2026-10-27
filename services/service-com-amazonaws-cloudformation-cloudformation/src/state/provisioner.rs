@@ -305,6 +305,26 @@
 //!   the delete carries the declaration the create was made from. Its identity is
 //!   CloudFormation's ("Ref returns the record name"), so the create answers none of its own.
 //!
+//! * the three `AWS::Backup::*` types' properties are their creates' own members, with two
+//!   differences and no others: a plan's rule list is published as `BackupPlanRule` where
+//!   `CreateBackupPlan` takes `Rules`, and a rule's destination vault as
+//!   `TargetBackupVault` where it takes `TargetBackupVaultName`
+//!   ([`BACKUP_PLAN_MEMBERS`], [`BACKUP_RULE_MEMBERS`]) — so a declared plan body and a
+//!   declared selection body reach AWS Backup as the bodies those calls take, and a member
+//!   the declaration leaves out is absent from the request, leaving the plan with the
+//!   service's own default for it. Each taggable type publishes its tags as a MAP of its
+//!   own (`BackupVaultTags`, `BackupPlanTags`), which is the member its create takes them
+//!   as ([`backup_declared_tags`]); a selection publishes none. A vault's
+//!   `LockConfiguration` is no member of its create at all: it is the
+//!   `PutBackupVaultLockConfiguration` a client makes next on the vault just created, and
+//!   a lock AWS Backup refuses leaves no unlocked vault behind. A vault is keyed by the
+//!   name the template states ("Ref returns the backup vault name"), while a plan's and a
+//!   selection's identifiers are AWS Backup's OWN — neither create takes one, and each
+//!   answers the id it minted — so what the stack reports for one is that id, which is
+//!   what `GetBackupPlan`, `ListBackupSelections` and `GetBackupSelection` resolve; a
+//!   selection is addressed by the PAIR of its plan and that id
+//!   ([`backup_selection_uri`]), so its delete and its drift read carry both.
+//!
 //! ## The tags every created resource carries
 //!
 //! Beside what its declaration asks for, a resource CloudFormation creates carries the tags
@@ -347,7 +367,7 @@ use super::template::{
     ACM_ACME_ENDPOINT, ACM_CERTIFICATE, AOSS_COLLECTION, AOSS_SECURITY_POLICY, APIGATEWAYV2_API,
     APIGATEWAYV2_API_MAPPING, APIGATEWAYV2_AUTHORIZER, APIGATEWAYV2_DEPLOYMENT,
     APIGATEWAYV2_DOMAIN_NAME, APIGATEWAYV2_INTEGRATION, APIGATEWAYV2_ROUTE,
-    APIGATEWAYV2_STAGE, BATCH_COMPUTE_ENVIRONMENT,
+    APIGATEWAYV2_STAGE, BACKUP_PLAN, BACKUP_SELECTION, BACKUP_VAULT, BATCH_COMPUTE_ENVIRONMENT,
     BATCH_JOB_QUEUE, BATCH_SERVICE_ENVIRONMENT, CLOUDWATCH_DASHBOARD,
     CLOUDWATCH_METRIC_STREAM, CODECOMMIT_REPOSITORY, CODEDEPLOY_APPLICATION,
     CODEDEPLOY_DEPLOYMENT_CONFIG, CODEDEPLOY_DEPLOYMENT_GROUP,
@@ -488,6 +508,9 @@ pub(super) enum Provisioner {
     ApiGatewayV2Authorizer,
     CodeCommitRepository,
     SesConfigurationSet,
+    BackupVault,
+    BackupPlan,
+    BackupSelection,
 }
 
 /// The provisioner that owns a template resource type, or `None` for a type this emulator
@@ -565,6 +588,9 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         APIGATEWAYV2_AUTHORIZER => Some(Provisioner::ApiGatewayV2Authorizer),
         CODECOMMIT_REPOSITORY => Some(Provisioner::CodeCommitRepository),
         SES_CONFIGURATION_SET => Some(Provisioner::SesConfigurationSet),
+        BACKUP_VAULT => Some(Provisioner::BackupVault),
+        BACKUP_PLAN => Some(Provisioner::BackupPlan),
+        BACKUP_SELECTION => Some(Provisioner::BackupSelection),
         _ => None,
     }
 }
@@ -849,6 +875,14 @@ impl Provisioner {
             Self::SesConfigurationSet => {
                 create_ses_configuration_set(ctx, region, resource).await
             }
+            Self::BackupVault => {
+                create_backup_vault(ctx, region, resource, propagated).await
+            }
+            Self::BackupPlan => create_backup_plan(ctx, region, resource, propagated).await,
+            // `AWS::Backup::BackupSelection` publishes `BackupPlanId` and
+            // `BackupSelection` and no tags: AWS Backup tags a plan and a vault, not a
+            // selection, so no tags are propagated to one.
+            Self::BackupSelection => create_backup_selection(ctx, region, resource).await,
         }
     }
 
@@ -1342,6 +1376,13 @@ impl Provisioner {
             Self::SesConfigurationSet => {
                 delete_ses_configuration_set(ctx, region, physical_resource_id).await
             }
+            Self::BackupVault => {
+                delete_backup_vault(ctx, region, physical_resource_id).await
+            }
+            Self::BackupPlan => delete_backup_plan(ctx, region, physical_resource_id).await,
+            // The delete addresses the selection by the PAIR AWS Backup keys one by, and
+            // the plan half of that pair is on the resource's own declaration.
+            Self::BackupSelection => delete_backup_selection(ctx, region, resource).await,
         }
     }
 
@@ -1583,6 +1624,12 @@ impl Provisioner {
             Self::SesConfigurationSet => {
                 describe_ses_configuration_set(ctx, region, physical_resource_id).await
             }
+            Self::BackupVault => {
+                describe_backup_vault(ctx, region, physical_resource_id).await
+            }
+            Self::BackupPlan => describe_backup_plan(ctx, region, physical_resource_id).await,
+            // Read back by the same plan-and-selection pair the delete uses.
+            Self::BackupSelection => describe_backup_selection(ctx, region, resource).await,
         }
     }
 }
@@ -16107,6 +16154,518 @@ async fn describe_record_set(
             ("HealthCheckId", "HealthCheckId"),
         ],
     )))
+}
+
+// ---------------------------------------------------------------------------
+// AWS Backup: AWS::Backup::BackupVault, ::BackupPlan, ::BackupSelection
+// ---------------------------------------------------------------------------
+
+/// AWS Backup's signing name, from its model (`sigv4Name: backup`), which speaks
+/// `restJson1`: every operation binds to a method and a URI of its own rather than to an
+/// `X-Amz-Target` header.
+const BACKUP_SIGNING_NAME: &str = "backup";
+
+/// The error code AWS Backup answers for a resource it does not hold
+/// (`ResourceNotFoundException`: "a resource that is required for the action doesn't
+/// exist", the modelled refusal of `GetBackupPlan`, `DescribeBackupVault`,
+/// `GetBackupSelection` and each of their deletes).
+const BACKUP_RESOURCE_NOT_FOUND: &str = "ResourceNotFoundException";
+
+/// The URI prefixes AWS Backup binds its vault and plan operations to
+/// (`PUT /backup-vaults/{BackupVaultName}`, `PUT /backup/plans`).
+const BACKUP_VAULTS_URI: &str = "/backup-vaults";
+const BACKUP_PLANS_URI: &str = "/backup/plans";
+
+/// Every property `AWS::Backup::BackupVault` publishes that this arm carries to AWS
+/// Backup: the name the vault is created under, the tags the create takes, the KMS key it
+/// encrypts the vault with, and the vault lock a second call applies
+/// ([`BACKUP_VAULT_LOCK_PROPERTY`]). A declaration naming anything else — `AccessPolicy`
+/// and `Notifications`, whose `PutBackupVaultAccessPolicy` and
+/// `PutBackupVaultNotifications` this emulator does not serve yet — is REFUSED rather than
+/// deployed with the property dropped.
+const BACKUP_VAULT_PROPERTIES: &[&str] = &[
+    "BackupVaultName",
+    "BackupVaultTags",
+    "EncryptionKeyArn",
+    BACKUP_VAULT_LOCK_PROPERTY,
+];
+
+/// The property carrying the vault's lock. It is no member of `CreateBackupVault` at all:
+/// it is the `PutBackupVaultLockConfiguration` a client makes next on the vault just
+/// created, whose three members this property's own
+/// (`MinRetentionDays`, `MaxRetentionDays`, `ChangeableForDays`) are named identically to.
+const BACKUP_VAULT_LOCK_PROPERTY: &str = "LockConfiguration";
+
+/// The members of that lock call, as (property, member) pairs — identical on both sides.
+const BACKUP_VAULT_LOCK_MEMBERS: &[(&str, &str)] = &[
+    ("MinRetentionDays", "MinRetentionDays"),
+    ("MaxRetentionDays", "MaxRetentionDays"),
+    ("ChangeableForDays", "ChangeableForDays"),
+];
+
+/// The property of `AWS::Backup::BackupVault` and of `AWS::Backup::BackupPlan` that
+/// carries the resource's tags: each type publishes its own tag MAP rather than the `Tags`
+/// list most types do, and each create takes that map under the same name.
+const BACKUP_VAULT_TAGS_PROPERTY: &str = "BackupVaultTags";
+const BACKUP_PLAN_TAGS_PROPERTY: &str = "BackupPlanTags";
+
+/// Every property `AWS::Backup::BackupPlan` publishes: the plan body and the tag map,
+/// both of which are members of `CreateBackupPlan` under the same names.
+const BACKUP_PLAN_PROPERTIES: &[&str] = &["BackupPlan", BACKUP_PLAN_TAGS_PROPERTY];
+
+/// Every property `AWS::Backup::BackupSelection` publishes: the plan the selection is
+/// assigned to, which `CreateBackupSelection` binds to its URI, and the selection body,
+/// which is that call's own member of the same name.
+const BACKUP_SELECTION_PROPERTIES: &[&str] = &["BackupPlanId", "BackupSelection"];
+
+/// The members of the plan body `AWS::Backup::BackupPlan` declares, as the
+/// `BackupPlanInput` `CreateBackupPlan` takes spells them.
+///
+/// Source: AWS's CloudFormation resource reference for `BackupPlanResourceType` against
+/// `smithy_query(shape="BackupPlanInput")`. The plan NAME and the advanced settings are
+/// named identically on both sides; the rule list is the one member CloudFormation spells
+/// differently (`BackupPlanRule` against the API's `Rules`).
+const BACKUP_PLAN_MEMBERS: &[(&str, &str)] = &[
+    ("BackupPlanName", "BackupPlanName"),
+    ("AdvancedBackupSettings", "AdvancedBackupSettings"),
+];
+
+/// The property carrying the plan's rules, and the member of the plan body that takes them.
+const BACKUP_PLAN_RULES_PROPERTY: &str = "BackupPlanRule";
+const BACKUP_PLAN_RULES_MEMBER: &str = "Rules";
+
+/// The members of ONE declared rule, as the `BackupRuleInput` a plan body carries spells
+/// them.
+///
+/// Source: AWS's `BackupRuleResourceType` against `smithy_query(shape="BackupRuleInput")`.
+/// Every member is named identically on both sides except the destination vault, which the
+/// type publishes as `TargetBackupVault` and the API takes as `TargetBackupVaultName`; the
+/// nested `Lifecycle`, `CopyActions` and `IndexActions` structures spell their own members
+/// identically too, so their values are carried through as the template wrote them.
+const BACKUP_RULE_MEMBERS: &[(&str, &str)] = &[
+    ("RuleName", "RuleName"),
+    ("TargetBackupVault", "TargetBackupVaultName"),
+    ("ScheduleExpression", "ScheduleExpression"),
+    ("ScheduleExpressionTimezone", "ScheduleExpressionTimezone"),
+    ("StartWindowMinutes", "StartWindowMinutes"),
+    ("CompletionWindowMinutes", "CompletionWindowMinutes"),
+    ("EnableContinuousBackup", "EnableContinuousBackup"),
+    ("Lifecycle", "Lifecycle"),
+    ("RecoveryPointTags", "RecoveryPointTags"),
+    ("CopyActions", "CopyActions"),
+    ("IndexActions", "IndexActions"),
+];
+
+/// Create the backup vault an `AWS::Backup::BackupVault` declares, in AWS Backup itself.
+///
+/// "Ref returns the backup vault name", which is the name the declaration states (or the
+/// one CloudFormation generated for it) and the `@httpLabel` `CreateBackupVault` creates
+/// the vault under — so the create carries no identity of its own and the vault a client
+/// then calls `DescribeBackupVault` with is the one the stack reports.
+///
+/// The vault carries the tags CloudFormation gives it beside the declared ones
+/// ([`tags_of`]), as the tag MAP that create takes under this type's own
+/// `BackupVaultTags`. A declared `LockConfiguration` is no member of the create: it is the
+/// `PutBackupVaultLockConfiguration` a client makes next on the vault just created, so a
+/// vault declared with one is locked rather than created unlocked.
+///
+/// The ARN AWS Backup minted is reported back as the `BackupVaultArn` attribute the type
+/// publishes, beside the `BackupVaultName` it answered with.
+async fn create_backup_vault(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    refuse_unmapped_properties(resource, BACKUP_VAULT_PROPERTIES)?;
+    let name = resource.physical_resource_id.clone();
+    let mut request = Map::new();
+    if let Some(key) = property(resource, "EncryptionKeyArn") {
+        request.insert("EncryptionKeyArn".to_string(), Value::String(key));
+    }
+    let tags = tags_as_map(&tags_of(
+        &backup_declared_tags(resource, BACKUP_VAULT_TAGS_PROPERTY),
+        propagated,
+    ));
+    if !tags.is_empty() {
+        request.insert(
+            BACKUP_VAULT_TAGS_PROPERTY.to_string(),
+            Value::Object(tags),
+        );
+    }
+    let answered = call_rest_json(
+        ctx,
+        BACKUP_SIGNING_NAME,
+        region,
+        "PUT",
+        &backup_vault_uri(&name),
+        Some(&Value::Object(request)),
+    )
+    .await?;
+    if let Some(declared) = resource.properties.get(BACKUP_VAULT_LOCK_PROPERTY) {
+        let locked = call_rest_json(
+            ctx,
+            BACKUP_SIGNING_NAME,
+            region,
+            "PUT",
+            &format!("{}/vault-lock", backup_vault_uri(&name)),
+            Some(&mapped_members(declared, BACKUP_VAULT_LOCK_MEMBERS)),
+        )
+        .await;
+        if let Err(refusal) = locked {
+            // The vault exists but not with the lock it was declared with, and the stack
+            // will record no resource for it, so it is removed before the failure is
+            // reported — a refused delete changes nothing about the refusal that caused it.
+            let _ = delete_backup_vault(ctx, region, &name).await;
+            return Err(refusal);
+        }
+    }
+    let mut attributes = BTreeMap::new();
+    attributes.insert(
+        "BackupVaultName".to_string(),
+        reported_text(&answered, "BackupVaultName").unwrap_or(name),
+    );
+    if let Some(arn) = reported_text(&answered, "BackupVaultArn") {
+        attributes.insert("BackupVaultArn".to_string(), arn);
+    }
+    Ok(Created::attributes(attributes))
+}
+
+/// Delete the backup vault a stack created, addressed by its name — this resource's
+/// physical id, which is what `Ref` returns for the type.
+///
+/// A vault AWS Backup no longer holds is already in the state the delete asks for, judged
+/// on the CODE and never on a message.
+async fn delete_backup_vault(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let uri = backup_vault_uri(physical_resource_id);
+    match call_rest_json(ctx, BACKUP_SIGNING_NAME, region, "DELETE", &uri, None).await {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == BACKUP_RESOURCE_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The vault's configuration as AWS Backup reports it, for drift detection:
+/// `DescribeBackupVault`'s own record, read by the name the delete uses. A vault that
+/// service no longer holds was deleted.
+///
+/// Only the two published properties that read answers under the same names are reported —
+/// the vault's name and the key it is encrypted with — and a property the read does not
+/// report is not evidence of anything ([`super::drift::differs`]).
+async fn describe_backup_vault(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let uri = backup_vault_uri(physical_resource_id);
+    match call_rest_json(ctx, BACKUP_SIGNING_NAME, region, "GET", &uri, None).await {
+        Ok(answered) => Ok(Some(reported_as_properties(
+            &answered,
+            &[
+                ("BackupVaultName", "BackupVaultName"),
+                ("EncryptionKeyArn", "EncryptionKeyArn"),
+            ],
+        ))),
+        Err(refusal) if refusal.code == BACKUP_RESOURCE_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The URI that addresses ONE backup vault: the `@httpLabel` every vault operation binds
+/// the name to, percent-encoded as a non-greedy label is sent.
+fn backup_vault_uri(name: &str) -> String {
+    format!("{BACKUP_VAULTS_URI}/{}", percent_encoded(name))
+}
+
+/// Create the backup plan an `AWS::Backup::BackupPlan` declares, in AWS Backup itself — so
+/// a client that deployed the stack and then calls `backup get-backup-plan` with the id the
+/// stack published reads the plan back, rather than a `ResourceNotFoundException` for a
+/// plan nothing created.
+///
+/// The declared plan body IS `CreateBackupPlan`'s own `BackupPlan` member, with the rule
+/// list spelled differently on the two sides ([`BACKUP_PLAN_MEMBERS`],
+/// [`BACKUP_RULE_MEMBERS`]) and a rule's destination vault published as
+/// `TargetBackupVault` where the API takes `TargetBackupVaultName`. A member the
+/// declaration leaves out is absent from the request, so the plan AWS Backup creates
+/// carries the service's own defaults for it exactly as a client's own create would.
+///
+/// The plan's IDENTITY is that service's to mint: `CreateBackupPlan` takes no identifier
+/// and answers the `BackupPlanId` it assigned, the `BackupPlanArn` it built around it and
+/// the `VersionId` of the version it created. The id is reported back as the resource's
+/// physical id — which is what `Ref` resolves to and what a stack output carrying it
+/// publishes — and all three as the attributes the type publishes.
+async fn create_backup_plan(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    refuse_unmapped_properties(resource, BACKUP_PLAN_PROPERTIES)?;
+    let declared = resource.properties.get("BackupPlan").ok_or_else(|| Refusal {
+        code: MISSING_PROPERTY_CODE.to_string(),
+        message: format!(
+            "Property BackupPlan cannot be empty for resource of type {}",
+            resource.resource_type
+        ),
+    })?;
+    let mut plan = Map::new();
+    if let Some(members) = declared.as_object() {
+        copy_members(members, BACKUP_PLAN_MEMBERS, &mut plan);
+    }
+    let rules: Vec<Value> = declared
+        .get(BACKUP_PLAN_RULES_PROPERTY)
+        .and_then(Value::as_array)
+        .map(|rules| {
+            rules
+                .iter()
+                .map(|rule| mapped_members(rule, BACKUP_RULE_MEMBERS))
+                .collect()
+        })
+        .unwrap_or_default();
+    plan.insert(BACKUP_PLAN_RULES_MEMBER.to_string(), Value::Array(rules));
+    let mut request = Map::new();
+    request.insert("BackupPlan".to_string(), Value::Object(plan));
+    let tags = tags_as_map(&tags_of(
+        &backup_declared_tags(resource, BACKUP_PLAN_TAGS_PROPERTY),
+        propagated,
+    ));
+    if !tags.is_empty() {
+        request.insert(BACKUP_PLAN_TAGS_PROPERTY.to_string(), Value::Object(tags));
+    }
+    let answered = call_rest_json(
+        ctx,
+        BACKUP_SIGNING_NAME,
+        region,
+        "PUT",
+        BACKUP_PLANS_URI,
+        Some(&Value::Object(request)),
+    )
+    .await?;
+    let Some(plan_id) = reported_text(&answered, "BackupPlanId") else {
+        // The create answered 2xx without the id its output models. Nothing addresses a
+        // plan without one, so this is reported as a failure rather than recorded as a
+        // resource with a physical id nothing minted.
+        return Err(Refusal {
+            code: UNIDENTIFIED_FAILURE.to_string(),
+            message: "CreateBackupPlan answered no BackupPlanId".to_string(),
+        });
+    };
+    let mut attributes = BTreeMap::new();
+    attributes.insert("BackupPlanId".to_string(), plan_id.clone());
+    for (attribute, member) in [
+        ("BackupPlanArn", "BackupPlanArn"),
+        ("VersionId", "VersionId"),
+    ] {
+        if let Some(value) = reported_text(&answered, member) {
+            attributes.insert(attribute.to_string(), value);
+        }
+    }
+    Ok(Created {
+        physical_resource_id: Some(plan_id),
+        attributes,
+    })
+}
+
+/// Delete the backup plan a stack created, addressed by the id AWS Backup minted for it —
+/// this resource's physical id.
+///
+/// A plan that service no longer holds is already in the state the delete asks for, judged
+/// on the CODE and never on a message. The selections assigned to the plan are resources of
+/// their own: a stack that declared them deletes each of them in its own right, which the
+/// deletion pass does before this (it deletes a stack's resources in the reverse of the
+/// order they were created in), and AWS Backup refuses to delete a plan that still holds
+/// one.
+async fn delete_backup_plan(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let uri = backup_plan_uri(physical_resource_id);
+    match call_rest_json(ctx, BACKUP_SIGNING_NAME, region, "DELETE", &uri, None).await {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == BACKUP_RESOURCE_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// Whether AWS Backup still holds the plan a stack created, for drift detection:
+/// `GetBackupPlan`'s own record, read by the id the delete uses. A plan that service no
+/// longer holds — or one it reports a `DeletionDate` for, a plan whose deletion it has
+/// recorded — was deleted.
+///
+/// No property is reported for a plan it still holds. Every member that read answers for
+/// one carries what the SERVICE decided about the plan — a `RuleId` per rule, and the
+/// backup windows it filled in where the declaration stated none — so the body it reports
+/// is not the body a template declares, and a property the actual document does not carry
+/// is not evidence of anything ([`super::drift::differs`]).
+async fn describe_backup_plan(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let uri = backup_plan_uri(physical_resource_id);
+    match call_rest_json(ctx, BACKUP_SIGNING_NAME, region, "GET", &uri, None).await {
+        Ok(answered) if answered.get("DeletionDate").is_some() => Ok(None),
+        Ok(_) => Ok(Some(Value::Object(Map::new()))),
+        Err(refusal) if refusal.code == BACKUP_RESOURCE_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The URI that addresses ONE backup plan: the `@httpLabel` every plan operation binds the
+/// id to, percent-encoded as a non-greedy label is sent.
+fn backup_plan_uri(plan_id: &str) -> String {
+    format!("{BACKUP_PLANS_URI}/{}", percent_encoded(plan_id))
+}
+
+/// Create the resource selection an `AWS::Backup::BackupSelection` declares, in the plan
+/// its declaration names — so `backup list-backup-selections` and
+/// `backup get-backup-selection` on the id the stack published answer with the selection
+/// the template declared.
+///
+/// The type's two properties are `CreateBackupSelection`'s own: the plan, which that call
+/// binds to its URI, and the selection body, whose members (`SelectionName`, `IamRoleArn`,
+/// `Resources`, `NotResources`, `ListOfTags`, `Conditions`) are named identically on both
+/// sides all the way down, so the evaluated document is carried through verbatim. The type
+/// publishes no `Tags` property — AWS Backup tags a plan and a vault, not a selection — so
+/// no tags are propagated to one.
+///
+/// The selection's IDENTITY is AWS Backup's to mint: that create takes no identifier and
+/// answers the `SelectionId` it assigned, which is reported back as the resource's physical
+/// id and as the attribute of that name beside the plan the selection belongs to.
+async fn create_backup_selection(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    refuse_unmapped_properties(resource, BACKUP_SELECTION_PROPERTIES)?;
+    let plan_id = required_property(resource, "BackupPlanId")?;
+    let declared = resource
+        .properties
+        .get("BackupSelection")
+        .cloned()
+        .ok_or_else(|| Refusal {
+            code: MISSING_PROPERTY_CODE.to_string(),
+            message: format!(
+                "Property BackupSelection cannot be empty for resource of type {}",
+                resource.resource_type
+            ),
+        })?;
+    let mut request = Map::new();
+    request.insert("BackupSelection".to_string(), declared);
+    let answered = call_rest_json(
+        ctx,
+        BACKUP_SIGNING_NAME,
+        region,
+        "PUT",
+        &format!("{}/selections", backup_plan_uri(&plan_id)),
+        Some(&Value::Object(request)),
+    )
+    .await?;
+    let Some(selection_id) = reported_text(&answered, "SelectionId") else {
+        // The create answered 2xx without the id its output models, so there is no
+        // identifier to address the selection by: not something this stack can report as a
+        // created resource.
+        return Err(Refusal {
+            code: UNIDENTIFIED_FAILURE.to_string(),
+            message: "CreateBackupSelection answered no SelectionId".to_string(),
+        });
+    };
+    let mut attributes = BTreeMap::new();
+    attributes.insert("SelectionId".to_string(), selection_id.clone());
+    attributes.insert("BackupPlanId".to_string(), plan_id);
+    Ok(Created {
+        physical_resource_id: Some(selection_id),
+        attributes,
+    })
+}
+
+/// Delete the resource selection a stack created, addressed by the PAIR AWS Backup keys one
+/// by: the plan its declaration names and the `SelectionId` that service minted, which is
+/// this resource's physical id.
+///
+/// A selection that service no longer holds — including one whose PLAN it no longer holds,
+/// which took the selection with it — is already in the state the delete asks for, judged
+/// on the CODE and never on a message.
+async fn delete_backup_selection(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<(), Refusal> {
+    let uri = backup_selection_uri(resource)?;
+    match call_rest_json(ctx, BACKUP_SIGNING_NAME, region, "DELETE", &uri, None).await {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == BACKUP_RESOURCE_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The selection's configuration as AWS Backup reports it, for drift detection:
+/// `GetBackupSelection`'s own record, read by the same pair the delete uses. A selection
+/// that service no longer holds was deleted.
+///
+/// Both published properties are reported: that read answers the plan the selection belongs
+/// to and the selection body it was created with, verbatim — a selection has no member the
+/// service fills — so the two sides of the comparison are the same document.
+async fn describe_backup_selection(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Option<Value>, Refusal> {
+    let uri = backup_selection_uri(resource)?;
+    match call_rest_json(ctx, BACKUP_SIGNING_NAME, region, "GET", &uri, None).await {
+        Ok(answered) => Ok(Some(reported_as_properties(
+            &answered,
+            &[
+                ("BackupPlanId", "BackupPlanId"),
+                ("BackupSelection", "BackupSelection"),
+            ],
+        ))),
+        Err(refusal) if refusal.code == BACKUP_RESOURCE_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The URI that addresses ONE resource selection: the two `@httpLabel`s of every operation
+/// on one, each percent-encoded. The plan half comes from the resource's own declaration —
+/// the only place it is recorded — and a declaration naming no plan addresses no selection
+/// at all, so it is refused here rather than with a request AWS Backup would reject.
+fn backup_selection_uri(resource: &StoredResource) -> Result<String, Refusal> {
+    let plan_id = required_property(resource, "BackupPlanId")?;
+    Ok(format!(
+        "{}/selections/{}",
+        backup_plan_uri(&plan_id),
+        percent_encoded(&resource.physical_resource_id)
+    ))
+}
+
+/// The tag MAP an AWS Backup resource's declaration asks for, under the `Tags` property
+/// name [`tags_of`] merges the propagated tags into.
+///
+/// Both taggable types here publish their tags as a MAP under a name of their own
+/// (`BackupVaultTags`, `BackupPlanTags`) rather than as the `Tags` list most types publish,
+/// and [`declared_tags`] already reads either SHAPE — so the declared map is handed to it
+/// under the one property name it looks for, and the merge rule a resource's declared tags
+/// and the stack's follow is the same one every other type here applies.
+fn backup_declared_tags(resource: &StoredResource, property: &str) -> Value {
+    let mut tags = Map::new();
+    if let Some(declared) = resource.properties.get(property) {
+        tags.insert("Tags".to_string(), declared.clone());
+    }
+    Value::Object(tags)
+}
+
+/// One scalar member of an answered document as its text, or `None` where the answer does
+/// not carry it (or carries it empty, which identifies nothing).
+fn reported_text(answered: &Value, member: &str) -> Option<String> {
+    answered
+        .get(member)
+        .and_then(scalar_text)
+        .filter(|text| !text.is_empty())
 }
 
 #[cfg(test)]

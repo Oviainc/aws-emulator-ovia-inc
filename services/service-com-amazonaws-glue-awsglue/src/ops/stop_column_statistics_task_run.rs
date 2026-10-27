@@ -183,6 +183,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .tables
                 .contains_key(&crate::state::fold_name(&input.table_name))
             {
+                // The catalog's own per-resource template, as the start answers it: the
+                // settings create's fixed sentence is the wording recorded for THAT
+                // operation, and this surface words its refusals per operation.
                 return Err(not_found(crate::state::messages::table_not_found(
                     &input.table_name,
                 )));

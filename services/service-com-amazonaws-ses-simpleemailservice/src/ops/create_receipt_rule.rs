@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateReceiptRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateReceiptRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateReceiptRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds one receipt rule to a rule set the account holds, at the position the
+//! request places it: straight after the rule `After` names, and at the beginning
+//! of the set's rule list when the request names none. The rule set must exist,
+//! the rule's own name must be free within it and in the form a rule name
+//! documents, and every action the rule carries must be one SES could take.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +159,139 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateReceiptRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateReceiptRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateReceiptRule"))
+        // `ctx` carries only request metadata; this operation needs none of it.
+        let _ = ctx;
+        let rule_set_name = input.rule_set_name;
+        let after = input.after;
+        let rule = input.rule;
+
+        // `ReceiptRuleName` is only a string in the model, so a name outside the
+        // form `ReceiptRule$Name` documents reaches here; this operation models
+        // no error for one, so it is refused through the service's 400 channel
+        // rather than recording a rule under a name SES would never accept.
+        if !crate::state::is_receipt_rule_name(&rule.name) {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                format!(
+                    "Rule name must contain only ASCII letters, numbers, underscores, dashes \
+                     or periods, start and end with a letter or number, and contain {} \
+                     characters or fewer, got {:?}",
+                    crate::state::MAX_RECEIPT_RULE_NAME,
+                    rule.name
+                ),
+            ));
+        }
+        // An action naming a resource of another service that the member cannot
+        // name is an action SES could never take, so the rule is refused instead
+        // of being stored as one that can never fire; each defect is reported as
+        // the refusal that action's member carries.
+        if let Some(defect) =
+            crate::state::receipt_actions_defect(rule.actions.as_deref().unwrap_or_default())
+        {
+            return Err(match defect {
+                crate::state::ReceiptActionDefect::NotOneAction { message } => {
+                    crate::scaffolded::Scaffolded::invalid_parameter_value(message)
+                }
+                crate::state::ReceiptActionDefect::SnsTopic { topic, message } => {
+                    CreateReceiptRuleErrorModeled::InvalidSnsTopicException(
+                        InvalidSnsTopicException {
+                            topic: Some(topic),
+                            message: Some(message),
+                        },
+                    )
+                    .into()
+                }
+                crate::state::ReceiptActionDefect::S3Configuration { bucket, message } => {
+                    CreateReceiptRuleErrorModeled::InvalidS3ConfigurationException(
+                        InvalidS3ConfigurationException {
+                            bucket: Some(bucket),
+                            message: Some(message),
+                        },
+                    )
+                    .into()
+                }
+                crate::state::ReceiptActionDefect::LambdaFunction {
+                    function_arn,
+                    message,
+                } => CreateReceiptRuleErrorModeled::InvalidLambdaFunctionException(
+                    InvalidLambdaFunctionException {
+                        function_arn: Some(function_arn),
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            });
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // See `create_receipt_rule_set.rs`: an engine with no store for this
+            // service cannot serve the operation at all, and every error this
+            // operation models is a client error, so none of them fits.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateReceiptRule",
+            ));
+        };
+        let mut state = state.lock();
+
+        // `RuleSetName` IDENTIFIES a set the account already holds, so a name
+        // outside the documented form needs no refusal of its own: a name SES
+        // cannot hold is a name the store does not hold, which is the refusal
+        // below. The set is resolved FIRST — a rule of a set that does not exist
+        // is not a rule this account can add.
+        let Some(rule_set) = state.receipt_rule_sets.get_mut(&rule_set_name) else {
+            return Err(
+                CreateReceiptRuleErrorModeled::RuleSetDoesNotExistException(
+                    RuleSetDoesNotExistException {
+                        name: Some(rule_set_name.clone()),
+                        message: Some(format!("Rule set does not exist: {rule_set_name}")),
+                    },
+                )
+                .into(),
+            );
+        };
+        // "Creates a receipt rule": a name the set already holds is a naming
+        // conflict rather than a rule to replace (`UpdateReceiptRule` is what
+        // replaces one), so nothing is stored for it.
+        if rule_set.rule_position(&rule.name).is_some() {
+            return Err(CreateReceiptRuleErrorModeled::AlreadyExistsException(
+                AlreadyExistsException {
+                    name: Some(rule.name.clone()),
+                    message: Some(format!("Rule already exists: {}", rule.name)),
+                },
+            )
+            .into());
+        }
+        // `After` is "the name of an existing rule after which the new rule is
+        // placed. If this parameter is null, the new rule is inserted at the
+        // beginning of the rule list." A value naming no rule of this set names
+        // no existing rule, so there is no position to place the new rule at and
+        // nothing is stored.
+        let position = match &after {
+            Some(after) => match rule_set.rule_position(after) {
+                Some(at) => at + 1,
+                None => {
+                    return Err(CreateReceiptRuleErrorModeled::RuleDoesNotExistException(
+                        RuleDoesNotExistException {
+                            name: Some(after.clone()),
+                            message: Some(format!("Rule does not exist: {after}")),
+                        },
+                    )
+                    .into())
+                }
+            },
+            None => 0,
+        };
+        if !rule_set.insert_rule(rule, position) {
+            return Err(CreateReceiptRuleErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Rule limit exceeded: a receipt rule set may hold {} receipt rules.",
+                        crate::state::MAX_RECEIPT_RULES_PER_RULE_SET
+                    )),
+                },
+            )
+            .into());
+        }
+
+        Ok(CreateReceiptRuleOutput {})
     }
 }

@@ -25,6 +25,10 @@
 //!   each half of that pairing is refused (`ValidationException`) when it is missed;
 //! * an `InstanceArn` this account holds no instance for is a missing resource:
 //!   `ResourceNotFoundException` (404), which this operation's model declares;
+//! * an instance whose CREATION has not finished serves only its own describe and delete —
+//!   "While the instance is in the CREATE_IN_PROGRESS state, you can call only
+//!   DescribeInstance and DeleteInstance operations" — so an update made inside that
+//!   window is refused with the modelled `ConflictException` and writes nothing;
 //! * `Name` "Updates the instance name", independently of the other two members (the
 //!   one-of rule above names only `EncryptionConfiguration` and
 //!   `PermissionSetsEnabled`).
@@ -158,6 +162,22 @@ impl From<UpdateInstanceErrorModeled> for UpdateInstanceError {
     }
 }
 
+/// The modelled refusal for an update of an instance whose creation has not finished.
+///
+/// The request itself is well formed and the instance exists — what is not available yet
+/// is the operation, until the `CreateInstance` still in flight has finished — which is
+/// what this operation's `ConflictException` reports: "a conflict with a previous
+/// successful write … A retry (with appropriate backoff logic) is the recommended
+/// response to this exception."
+fn creation_in_progress(instance_arn: &str) -> UpdateInstanceError {
+    UpdateInstanceErrorModeled::ConflictException(ConflictException {
+        message: Some(crate::state::instance_creation_in_progress_message(
+            instance_arn,
+        )),
+    })
+    .into()
+}
+
 /// The modelled refusal for a request this operation's documented rules reject.
 ///
 /// This operation's model declares its own `ValidationException` ("The request failed
@@ -287,6 +307,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 reason: None,
             })
         })?;
+
+        // An instance that is still being CREATED is not one this operation is available
+        // on: only its own describe and delete are, until the creation finishes.
+        if instance.creation_in_progress() {
+            return Err(creation_in_progress(&input.instance_arn));
+        }
 
         // Only the members the request CARRIES are written: an absent member leaves the
         // stored value alone, so a caller updating the name cannot silently reset the

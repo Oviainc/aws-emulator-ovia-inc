@@ -4,7 +4,8 @@
 //!
 //! Replaces one receipt rule of a rule set the account holds with the rule the
 //! request carries, in the position the stored rule already occupies. The rule
-//! set must exist, and so must the rule the request names.
+//! set must exist, so must the rule the request names, and every action the rule
+//! carries must be one SES could take.
 //!
 //! ## Shape of an operation
 //!
@@ -155,6 +156,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let rule_set_name = input.rule_set_name;
         let rule = input.rule;
+
+        // The rule this request carries is stored whole, so its actions are held
+        // to the same requirements a created rule's are (`create_receipt_rule.rs`
+        // reads them through the same one reading): an action naming a resource
+        // of another service that the member cannot name is an action SES could
+        // never take, so the update is refused instead of replacing a working
+        // rule with one that can never fire.
+        if let Some(defect) =
+            crate::state::receipt_actions_defect(rule.actions.as_deref().unwrap_or_default())
+        {
+            return Err(match defect {
+                crate::state::ReceiptActionDefect::NotOneAction { message } => {
+                    crate::scaffolded::Scaffolded::invalid_parameter_value(message)
+                }
+                crate::state::ReceiptActionDefect::SnsTopic { topic, message } => {
+                    UpdateReceiptRuleErrorModeled::InvalidSnsTopicException(
+                        InvalidSnsTopicException {
+                            topic: Some(topic),
+                            message: Some(message),
+                        },
+                    )
+                    .into()
+                }
+                crate::state::ReceiptActionDefect::S3Configuration { bucket, message } => {
+                    UpdateReceiptRuleErrorModeled::InvalidS3ConfigurationException(
+                        InvalidS3ConfigurationException {
+                            bucket: Some(bucket),
+                            message: Some(message),
+                        },
+                    )
+                    .into()
+                }
+                crate::state::ReceiptActionDefect::LambdaFunction {
+                    function_arn,
+                    message,
+                } => UpdateReceiptRuleErrorModeled::InvalidLambdaFunctionException(
+                    InvalidLambdaFunctionException {
+                        function_arn: Some(function_arn),
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            });
+        }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // See `verify_email_identity.rs`: an engine with no store for this

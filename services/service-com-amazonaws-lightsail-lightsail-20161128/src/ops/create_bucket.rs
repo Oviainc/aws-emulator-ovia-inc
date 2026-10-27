@@ -289,7 +289,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 object_versioning: object_versioning.to_string(),
                 // Nothing has moved this bucket between bundles yet, so its one
                 // monthly bundle change is still available.
-                able_to_update_bundle: true,
+                bundle_updated_at_ms: None,
                 // A new bucket and its objects are private until `UpdateBucket`
                 // widens them.
                 access_rules: AccessRules {

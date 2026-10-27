@@ -190,9 +190,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .tables
             .get(&crate::state::fold_name(&input.table_name))
         else {
-            return Err(not_found(crate::state::messages::table_not_found(
-                &input.table_name,
-            )));
+            // The entry this read addresses hangs on a table, so a database holding no
+            // table under that name holds no entry either: the read is the same miss as a
+            // stored table carrying no settings, in the same fixed wording.
+            return Err(not_found(
+                crate::state::messages::COLUMN_STATISTICS_TASK_SETTINGS_NOT_FOUND.to_string(),
+            ));
         };
         let Some(settings) = table.column_statistics_task_settings.as_ref() else {
             return Err(not_found(

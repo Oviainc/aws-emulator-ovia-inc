@@ -32,9 +32,8 @@ use std::time::SystemTime;
 
 /// A router holding only this service, beside the engine it was built over — the
 /// same construction `crate::harness::emulator` performs, handing back the
-/// engine as well so a test can seed a resource no implemented operation can
-/// create yet (a receipt rule set holding RULES: `CreateReceiptRule` is still a
-/// scaffold stub).
+/// engine as well so a test can seed a rule set holding RULES directly, keeping
+/// each case about the update under test rather than about `CreateReceiptRule`.
 fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();

@@ -177,6 +177,70 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The `message` member of the synthetic `InternalServerErrorException` error shape.
+static INTERNAL_SERVER_ERROR_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#InternalServerErrorException$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for the synthetic `InternalServerErrorException` error shape.
+///
+/// In the `smithy.framework` namespace for the same reason as [`NotImplemented`]: the
+/// shape is in no service's model — this service's model names its server fault
+/// `InternalServerException` — so it must not collide with a modeled one. The wire
+/// `__type` and the `x-amzn-errortype` header come from [`OperationError::shape_name`]
+/// below, not from this schema.
+pub static INTERNAL_SERVER_ERROR_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#InternalServerErrorException",
+        "smithy.framework",
+        "InternalServerErrorException",
+    ),
+    ShapeType::Structure,
+    &[&INTERNAL_SERVER_ERROR_MESSAGE],
+);
+
+/// The payload of an `InternalServerErrorException`: a server fault, described only as
+/// far as a client can act on it.
+#[derive(Debug, Clone)]
+pub struct InternalServerError {
+    pub message: String,
+}
+
+impl InternalServerError {
+    /// An `InternalServerErrorException` carrying `message`.
+    ///
+    /// A server fault reports nothing about the request: the caller cannot fix it, so the
+    /// text says only that the service failed. Nothing of the request is interpolated.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for InternalServerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "InternalServerErrorException: {}", self.message)
+    }
+}
+
+impl std::error::Error for InternalServerError {}
+
+impl SerializableStruct for InternalServerError {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&INTERNAL_SERVER_ERROR_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -185,6 +249,16 @@ pub enum Scaffolded<E> {
     NotImplemented(NotImplemented),
     /// A modeled error the operation declares. Renders with the model's own status.
     Modeled(E),
+    /// The service failed to carry the request out. Renders as HTTP 500 with the error
+    /// code `InternalServerErrorException`.
+    ///
+    /// That code is not a shape this service's model declares (the model names its
+    /// server fault `InternalServerException`), and this wrapper is the only place a
+    /// handler can answer an error its own model does not declare — which is why the
+    /// synthetic shape lives here beside [`NotImplemented`] rather than in
+    /// `src/ops/types/`. [`crate::state::scan_arn_lookup_fault`] is the one composition
+    /// that raises it.
+    InternalServerError(InternalServerError),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
     ///
@@ -221,6 +295,16 @@ impl<E> Scaffolded<E> {
     pub fn validation(message: impl Into<String>) -> Self {
         Self::ValidationException(ValidationException::new(message))
     }
+
+    /// Fail the request as a server fault, with HTTP 500 `InternalServerErrorException`.
+    ///
+    /// Reach for this only where CodeGuru Security itself answers that code rather than a
+    /// client error — see [`crate::state::scan_arn_lookup_fault`], the one composition
+    /// that raises it. A refusal the caller can act on is a client error and keeps its
+    /// modelled 4xx.
+    pub fn internal_server_error(message: impl Into<String>) -> Self {
+        Self::InternalServerError(InternalServerError::new(message))
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -228,6 +312,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
+            Self::InternalServerError(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
         }
     }
@@ -240,6 +325,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
+            Self::InternalServerError(e) => e.source(),
             Self::ValidationException(e) => e.source(),
         }
     }
@@ -254,6 +340,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
+            Self::InternalServerError(e) => e,
             Self::ValidationException(e) => e,
         }
     }
@@ -262,6 +349,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
+            Self::InternalServerError(_) => &INTERNAL_SERVER_ERROR_SCHEMA,
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
         }
     }
@@ -274,6 +362,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
+            Self::InternalServerError(_) => "InternalServerErrorException",
             Self::ValidationException(_) => "ValidationException",
         }
     }
@@ -286,6 +375,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
+            // A server fault, so a 5xx an SDK's standard retry policy retries.
+            Self::InternalServerError(_) => 500,
             Self::ValidationException(_) => 400,
         }
     }
@@ -297,7 +388,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // envelope carries the signal on the query protocols too.
             Self::NotImplemented(_) => None,
             Self::Modeled(e) => e.query_error_code(),
-            // Same reason: the synthetic shape carries no `awsQueryError` trait.
+            // Same reason: neither synthetic shape carries an `awsQueryError` trait, and
+            // this service speaks restJson1 in any case.
+            Self::InternalServerError(_) => None,
             Self::ValidationException(_) => None,
         }
     }

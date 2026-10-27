@@ -228,23 +228,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The cursor is this service's own opaque token: "Use this string to request the
         // next batch of jobs matched by a jobs query." One this service never issued is
-        // refused here, rather than starting a query that could not be computed.
-        let resume_from = match input.next_token.as_deref() {
-            None => None,
-            Some(token) => {
-                let Some(anchor) = crate::state::decode_cursor(token) else {
-                    return Err(StartJobsQueryErrorModeled::BadRequestException(
-                        BadRequestException {
-                            message: Some(
-                                "nextToken is not a token this service issued.".to_string(),
-                            ),
-                        },
-                    )
-                    .into());
-                };
-                Some(anchor)
-            }
-        };
+        // refused here, rather than starting a query that could not be computed — by the
+        // state module's decode-or-refuse rule, the same one every paged reader applies,
+        // mapped onto this operation's modelled error.
+        let resume_from = crate::state::resume_from_token(input.next_token.as_deref()).map_err(
+            |message| {
+                StartJobsQueryErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(message),
+                })
+            },
+        )?;
 
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();

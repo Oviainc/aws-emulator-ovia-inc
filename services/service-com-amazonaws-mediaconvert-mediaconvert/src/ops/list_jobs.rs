@@ -181,20 +181,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(str::to_string);
         let status = input.status.clone();
 
-        // The ordering, the cursor and the page size are the state module's, shared with
-        // every other paged reader of the job set.
-        let resume_from = match input.next_token.as_deref() {
-            None => None,
-            Some(token) => {
-                let Some(anchor) = crate::state::decode_cursor(token) else {
-                    return Err(ListJobsErrorModeled::BadRequestException(BadRequestException {
-                        message: Some("nextToken is not a token this service issued.".to_string()),
-                    })
-                    .into());
-                };
-                Some(anchor)
-            }
-        };
+        // The ordering, the cursor, the page size and the decode-or-refuse rule for a
+        // `nextToken` are the state module's, shared with every other paged reader of the
+        // job set; only the modelled error the one refusal is answered as is this
+        // operation's.
+        let resume_from = crate::state::resume_from_token(input.next_token.as_deref()).map_err(
+            |message| {
+                ListJobsErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(message),
+                })
+            },
+        )?;
 
         let page = crate::state::page_of_jobs(
             state
