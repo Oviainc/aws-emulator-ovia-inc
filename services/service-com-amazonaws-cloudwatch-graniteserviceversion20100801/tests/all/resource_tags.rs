@@ -204,7 +204,9 @@ async fn write_resource(
                 "PutCompositeAlarm",
                 &json!({
                     "AlarmName": name,
-                    "AlarmRule": "ALARM(\"a-child-alarm\")",
+                    // A literal rule: this row is about the TAGS a composite alarm carries,
+                    // and a rule naming an alarm is refused unless that alarm exists.
+                    "AlarmRule": "TRUE",
                     "Tags": tags,
                 }),
             )
