@@ -552,6 +552,35 @@ pub fn metric_alarm_request(name: &str) -> Value {
     })
 }
 
+/// `request` with `patch` merged in: every member the patch names replaces the one the request
+/// carried, and a member the patch names `null` is REMOVED — an alarm carries `Statistic` or
+/// `ExtendedStatistic`, never both, so a case that names one has to drop the other.
+///
+/// Every table-driven suite that varies one request across rows merges its rows this way, so the
+/// merge lives here once rather than beside each base request.
+pub fn merged(mut request: Value, patch: &Value) -> Value {
+    let members = request
+        .as_object_mut()
+        .expect("the request being patched is a JSON object");
+    for (member, value) in patch.as_object().cloned().unwrap_or_default() {
+        if value.is_null() {
+            members.remove(&member);
+        } else {
+            members.insert(member, value);
+        }
+    }
+    request
+}
+
+/// Whether two JSON values are the same value, comparing numbers numerically so an integral
+/// double and an integer are not reported as a difference.
+pub fn same_json_value(asked: &Value, reported: &Value) -> bool {
+    match (asked.as_f64(), reported.as_f64()) {
+        (Some(asked), Some(reported)) => (asked - reported).abs() <= f64::EPSILON,
+        _ => asked == reported,
+    }
+}
+
 /// A log alarm request for `name`: every member `PutLogAlarm` requires and nothing else.
 pub fn log_alarm_request(name: &str) -> Value {
     ::serde_json::json!({
