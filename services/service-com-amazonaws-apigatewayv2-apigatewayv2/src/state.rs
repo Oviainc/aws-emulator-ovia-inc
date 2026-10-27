@@ -365,12 +365,18 @@ pub const INVALID_STAGE_IDENTIFIER: &str = "Invalid stage identifier specified";
 /// request — the domain name the caller asked for is already the resource it addressed.
 pub const INVALID_DOMAIN_NAME_IDENTIFIER: &str = "Invalid domain name identifier specified";
 
-/// The refusal an operation addressing an api mapping its domain name does not hold
-/// takes: the message of the modelled `NotFoundException`. Fixed text in the same form as
-/// [`INVALID_DOMAIN_NAME_IDENTIFIER`], the other `@httpLabel` resource of the same path —
-/// the mapping the caller asked for is already the resource it addressed, so the message
-/// names the kind of identifier that was not found rather than echoing it back.
-pub const INVALID_API_MAPPING_IDENTIFIER: &str = "Invalid API mapping identifier specified";
+/// The sentence an operation addressing an api mapping its domain name does not hold
+/// refuses with: the message of the modelled `NotFoundException`.
+///
+/// API Gateway reports an api mapping that resolves to nothing by naming the resource
+/// TYPE and the `ApiMappingId` the request addressed it by — the form
+/// [`ROUTING_RULE_NOT_FOUND`] also takes, rather than the `Invalid {resource} identifier
+/// specified` sentence the api-level resources use. The id in the sentence is the one the
+/// request sent. Shared by every reader and writer of a single mapping, so the same
+/// identifier is never reported two ways.
+pub fn api_mapping_not_found_message(api_mapping_id: &str) -> String {
+    format!("Unable to find ApiMapping with ID {api_mapping_id}")
+}
 
 /// The most API mappings one custom domain name may hold, after which
 /// `CreateApiMapping` is refused.
@@ -381,6 +387,16 @@ pub const INVALID_API_MAPPING_IDENTIFIER: &str = "Invalid API mapping identifier
 /// this store without end. `TooManyRequestsException` ("A limit has been exceeded") is
 /// the modelled error the operation refuses with.
 pub const MAX_API_MAPPINGS_PER_DOMAIN: usize = 200;
+
+/// The sentence a writer of an api mapping refuses a base path the named domain name
+/// already maps with: the message of the modelled `ConflictException` ("The requested
+/// operation would cause a conflict with the current state of a service resource
+/// associated with the request").
+///
+/// Fixed text for the whole class, interpolating nothing from the request: the domain name
+/// and the base path the caller asked for are already the values it sent. Held here once,
+/// so the mint and the patch of a mapping cannot report the same conflict two ways.
+pub const API_MAPPING_KEY_CONFLICT: &str = "ApiMapping key already exists for this domain name";
 
 /// Refuse an `ApiMappingKey` that is not a base path API Gateway can route on.
 ///
@@ -3664,10 +3680,16 @@ impl DomainName {
     /// one. An absent and an empty `ApiMappingKey` are the SAME base path — the root of
     /// the domain — which is why the comparison goes through
     /// [`ApiMapping::base_path`].
-    pub fn api_mapping_for_key(&self, key: &str) -> Option<&ApiMapping> {
-        self.api_mappings
-            .values()
-            .find(|mapping| mapping.base_path() == key)
+    ///
+    /// `other_than` is the mapping the request ADDRESSES, when it addresses one: a patch
+    /// that leaves a mapping on the base path it already occupies conflicts with nothing,
+    /// because a mapping is never a second claim on its own base path. A writer that
+    /// mints a new mapping addresses none and passes `None`.
+    pub fn api_mapping_for_key(&self, key: &str, other_than: Option<&str>) -> Option<&ApiMapping> {
+        self.api_mappings.values().find(|mapping| {
+            other_than.is_none_or(|addressed| mapping.api_mapping_id != addressed)
+                && mapping.base_path() == key
+        })
     }
 }
 

@@ -176,10 +176,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is stored: a mapping is never kept against an api or a stage that does not
         // exist.
         let Some(api) = store.apis.get(&input.api_id) else {
-            return Err(not_found(&format!(
-                "Invalid API identifier specified {}:{}",
-                ::engine::emulator_account_id(),
-                input.api_id
+            return Err(not_found(&crate::state::invalid_api_identifier_message(
+                &input.api_id,
             )));
         };
         // `Stage` names a stage of that api by its `StageName`. A value that names none
@@ -195,14 +193,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // routing on it ambiguous: that is a conflict "with the current state of a
         // service resource associated with the request".
         let base_path = requested_key.as_deref().unwrap_or("");
-        if domain.api_mapping_for_key(base_path).is_some() {
+        if domain.api_mapping_for_key(base_path, None).is_some() {
             return Err(CreateApiMappingErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(format!(
-                        "An API mapping already exists for the domain name {} with the \
-                         specified API mapping key.",
-                        domain.domain_name
-                    )),
+                    message: Some(crate::state::API_MAPPING_KEY_CONFLICT.to_string()),
                 },
             )
             .into());

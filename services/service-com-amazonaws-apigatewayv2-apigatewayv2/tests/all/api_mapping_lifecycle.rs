@@ -42,8 +42,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_apigatewayv2_apigatewayv2::state::{
-    API_MAPPING_KEY_ILLEGAL_CHARACTER, API_MAPPING_KEY_MALFORMED_PATH,
-    API_MAPPING_KEY_PUNCTUATION, INVALID_API_MAPPING_IDENTIFIER, INVALID_DOMAIN_NAME_IDENTIFIER,
+    api_mapping_not_found_message, API_MAPPING_KEY_ILLEGAL_CHARACTER,
+    API_MAPPING_KEY_MALFORMED_PATH, API_MAPPING_KEY_PUNCTUATION, INVALID_DOMAIN_NAME_IDENTIFIER,
     INVALID_NEXT_TOKEN_MESSAGE, INVALID_STAGE_IDENTIFIER, MAX_API_MAPPINGS_PER_DOMAIN,
 };
 
@@ -53,20 +53,20 @@ use crate::api_lifecycle::{
 
 /// The region every request in this suite is signed for. Deliberately NOT the
 /// emulator's `us-east-1` default, so nothing region-derived can be hardcoded.
-const REGION: &str = "ap-southeast-2";
+pub(crate) const REGION: &str = "ap-southeast-2";
 
 /// The custom domain name every test seeds unless the row is about an absent one.
-const DOMAIN: &str = "mapped.example.com";
+pub(crate) const DOMAIN: &str = "mapped.example.com";
 
 /// The stage every test seeds on its api. `$default` is the stage a base path mapping
 /// most often points at, and its `$` proves the stage reference is compared verbatim.
-const STAGE: &str = "$default";
+pub(crate) const STAGE: &str = "$default";
 
 /// A second seeded stage, so a row can move the mapping's target without inventing one.
-const OTHER_STAGE: &str = "prod";
+pub(crate) const OTHER_STAGE: &str = "prod";
 
 /// Send one request signed for [`REGION`] and answer `(status, body)`.
-async fn call(
+pub(crate) async fn call(
     emulator: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -75,7 +75,7 @@ async fn call(
     call_in_region(emulator, REGION, method, uri, body).await
 }
 
-async fn create_api_mapping(
+pub(crate) async fn create_api_mapping(
     emulator: &MultiServiceRouter,
     domain: &str,
     request: &Value,
@@ -103,7 +103,7 @@ async fn get_api_mappings(
     .await
 }
 
-async fn get_api_mapping(
+pub(crate) async fn get_api_mapping(
     emulator: &MultiServiceRouter,
     domain: &str,
     api_mapping_id: &str,
@@ -119,7 +119,7 @@ async fn get_api_mapping(
 
 /// Create one custom domain name, asserting the 201 the model binds to
 /// `CreateDomainName`.
-async fn seed_domain_name(emulator: &MultiServiceRouter, domain: &str) {
+pub(crate) async fn seed_domain_name(emulator: &MultiServiceRouter, domain: &str) {
     let (status, body) = call(
         emulator,
         "POST",
@@ -144,7 +144,11 @@ async fn seed_domain_name(emulator: &MultiServiceRouter, domain: &str) {
 }
 
 /// Create one HTTP api with the stages `stage_names` names, and answer its `ApiId`.
-async fn seed_api(emulator: &MultiServiceRouter, name: &str, stage_names: &[&str]) -> String {
+pub(crate) async fn seed_api(
+    emulator: &MultiServiceRouter,
+    name: &str,
+    stage_names: &[&str],
+) -> String {
     let (status, body) = call(
         emulator,
         "POST",
@@ -178,7 +182,7 @@ async fn seed_api(emulator: &MultiServiceRouter, name: &str, stage_names: &[&str
 
 /// A fresh emulator holding one custom domain name ([`DOMAIN`]) and one api with the
 /// stages [`STAGE`] and [`OTHER_STAGE`]. Answers `(emulator, api_id)`.
-async fn seeded() -> (MultiServiceRouter, String) {
+pub(crate) async fn seeded() -> (MultiServiceRouter, String) {
     let emulator = emulator();
     seed_domain_name(&emulator, DOMAIN).await;
     let api_id = seed_api(&emulator, "mapped-api", &[STAGE, OTHER_STAGE]).await;
@@ -743,7 +747,7 @@ async fn an_api_mapping_id_the_domain_name_does_not_hold_is_not_found() {
         );
         assert_eq!(
             as_str(&body, "message"),
-            INVALID_API_MAPPING_IDENTIFIER,
+            api_mapping_not_found_message(&api_mapping_id),
             "case {label:?}: expected the api-mapping refusal message, got {body}"
         );
     }
