@@ -154,9 +154,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        // `ctx` carries request metadata only; this read is driven entirely by its
-        // input and the store.
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        // The signing key id this read is authorized on is carried by `ctx`; everything
+        // else comes from the input and the store.
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListUserPoliciesErrorModeled::ServiceFailureException(
@@ -203,7 +203,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A read: it reports the names the account holds and writes nothing.
         let store = state.lock();
-        if !store.users.contains_key(&user_key) {
+        // IAM authorizes its own API: the signing principal's identity-based policies,
+        // within the boundary that caps them, are evaluated before any name is reported.
+        // The LOOKUP of the addressed user comes first but its answer is withheld until
+        // the call has been authorized, because a caller that may not list a user's
+        // embedded policies learns that it may not, never whether that user exists. The
+        // decision is made on the ARN of the user the request addresses — the held user's
+        // own, or, for a name the account holds no user under, the ARN that name would
+        // carry at the default path, since there is no other path to attribute it to —
+        // while the refusal names that user as the request named it (`user Bob`).
+        let held = store.users.get(&user_key);
+        let resource = held.map_or_else(
+            || crate::state::user_arn(crate::state::DEFAULT_PATH, &input.user_name),
+            |user| user.arn.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::LIST_USER_POLICIES,
+            &resource,
+            &format!("user {}", input.user_name),
+        )?;
+        if held.is_none() {
             return Err(ListUserPoliciesErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
                     message: Some(format!(

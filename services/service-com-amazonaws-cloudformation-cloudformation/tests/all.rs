@@ -231,6 +231,8 @@ mod unrecognized_resource_types;
 mod update_after_a_refused_delete;
 #[path = "all/update_rollback_recovery.rs"]
 mod update_rollback_recovery;
+#[path = "all/update_stack_instances.rs"]
+mod update_stack_instances;
 #[path = "all/validate_template.rs"]
 mod validate_template;
 #[path = "all/waf_regional_ip_set_resources.rs"]

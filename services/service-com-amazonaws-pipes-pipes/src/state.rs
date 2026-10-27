@@ -6,8 +6,16 @@
 //! its lifecycle states and its timestamps) is real and persisted in this module, and
 //! what a RUNNING pipe DOES with no client action — poll the source, hand the batch to
 //! the enrichment, deliver each event to the target — is [`data_plane`].
+//!
+//! Two modules serve the stages that data plane runs: [`execution_role`], the decision of
+//! whether the pipe's own `RoleArn` lets a stage make the call it is about to make, and
+//! [`metrics`], the CloudWatch series the running pipe publishes about its executions —
+//! the only signal that distinguishes a pipe whose stage was refused from a pipe that
+//! never ran.
 
 pub mod data_plane;
+pub mod execution_role;
+pub mod metrics;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant, SystemTime};

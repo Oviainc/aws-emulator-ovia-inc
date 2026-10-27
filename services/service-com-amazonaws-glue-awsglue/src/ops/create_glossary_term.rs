@@ -205,11 +205,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.glossary(&input.glossary_identifier).is_none() {
             return Err(CreateGlossaryTermErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    // Wording for this slice is pinned by no recording or doc, so the
-                    // refusal is derived from the request: it names the member that
-                    // resolved to nothing, exactly as `GetGlossary`'s does. What is
-                    // pinned is the behaviour — 400 with `EntityNotFoundException`.
-                    message: Some(format!("Glossary {} not found", input.glossary_identifier)),
+                    // The ONE wording this surface words a glossary miss with, shared with
+                    // the glossary's own reader: a JSON document naming the resource and
+                    // the identifier that resolved to nothing.
+                    message: Some(crate::state::glossary_not_found_message(
+                        &input.glossary_identifier,
+                    )),
                     from_federation_source: None,
                 },
             )

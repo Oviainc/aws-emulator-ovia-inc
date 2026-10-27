@@ -171,16 +171,30 @@ async fn create_bucket(router: &MultiServiceRouter, bucket: &str) -> String {
     format!("arn:aws:s3:::{bucket}")
 }
 
+/// The service principal a Snow order's role is assumed under, which is what its trust
+/// policy has to name.
+const SNOWBALL_PRINCIPAL: &str = "importexport.amazonaws.com";
+
+/// The service principal a Lambda function's execution role is assumed under. A role is
+/// only assumable by the service its trust policy names, so the function below needs its
+/// OWN role rather than the order's.
+const LAMBDA_PRINCIPAL: &str = "lambda.amazonaws.com";
+
 /// `CreateRole` on the mounted IAM service, answering the role ARN IAM minted.
-async fn create_role(router: &MultiServiceRouter, role_name: &str) -> String {
+///
+/// `service_principal` is the service the role is created FOR: its trust policy names that
+/// principal and no other, exactly as a role an account creates for one service does.
+async fn create_role(
+    router: &MultiServiceRouter,
+    role_name: &str,
+    service_principal: &str,
+) -> String {
     let case = format!("create the role {role_name}");
-    // The trust policy a Snow order's role carries: the service principal Snowball
-    // transfers under can assume it.
     let trust = json!({
         "Version": "2012-10-17",
         "Statement": [{
             "Effect": "Allow",
-            "Principal": { "Service": "importexport.amazonaws.com" },
+            "Principal": { "Service": service_principal },
             "Action": "sts:AssumeRole"
         }]
     })
@@ -344,13 +358,21 @@ impl Held {
         .await;
         let bucket_arn = create_bucket(router, "snowball-order-source").await;
         let other_bucket_arn = create_bucket(router, "snowball-order-second-source").await;
-        let role_arn = create_role(router, "snowball-order-role").await;
+        let role_arn = create_role(router, "snowball-order-role", SNOWBALL_PRINCIPAL).await;
         let key_arn = create_kms_key(router).await;
         let topic_arn = create_topic(router, "snowball-order-events").await;
         let pickup_topic_arn = create_topic(router, "snowball-order-pickup").await;
-        let function_arn =
-            create_function(router, "snowball-order-function", &role_arn, "snowball-order-source")
-                .await;
+        // The function RUNS AS its own execution role, which Lambda assumes, so that role
+        // trusts the Lambda service principal rather than the one the order's role names.
+        let function_role_arn =
+            create_role(router, "snowball-order-function-role", LAMBDA_PRINCIPAL).await;
+        let function_arn = create_function(
+            router,
+            "snowball-order-function",
+            &function_role_arn,
+            "snowball-order-source",
+        )
+        .await;
         let ami_id = visible_ami(router).await;
 
         let mut held = Self {

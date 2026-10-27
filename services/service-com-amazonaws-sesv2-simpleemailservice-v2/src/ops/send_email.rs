@@ -3,7 +3,9 @@
 //! @op SendEmail
 //! Accepts an outbound message from a verified identity while the account's
 //! sending switch is on, appends it to this service's outbound-message log with a
-//! fresh unique `MessageId`, and bumps the account's send counters. This is the
+//! fresh unique `MessageId`, and bumps the account's send counters. A message that
+//! carries list-management options is resolved against the contact lists first, and
+//! its recipients become contacts of the list it belongs to. This is the
 //! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -222,10 +224,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Members that select a resource this slice does not own: the sending
-        // authorization policies, tenants, multi-region endpoints and contact lists
-        // they name are kept by operations nobody has written yet. A request that
-        // names one is answered as unwritten, rather than accepted as if the member
-        // had not been sent.
+        // authorization policies, tenants and multi-region endpoints they name are
+        // kept by operations nobody has written yet. A request that names one is
+        // answered as unwritten, rather than accepted as if the member had not been
+        // sent.
         for (present, member) in [
             (
                 input.from_email_address_identity_arn.is_some(),
@@ -239,10 +241,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
             (input.endpoint_id.is_some(), "EndpointId"),
             (input.tenant_name.is_some(), "TenantName"),
-            (
-                input.list_management_options.is_some(),
-                "ListManagementOptions",
-            ),
             (
                 input.configuration_overrides.is_some(),
                 "ConfigurationOverrides",
@@ -295,6 +293,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle(now);
 
+        // "An object used to specify a list or topic to which an email belongs, which
+        // will be used when a contact chooses to unsubscribe": the list and the topic
+        // the message belongs to name a contact list this account holds and a topic
+        // that list publishes, so they are resolved against the contact-list table —
+        // ahead of the sending identity, since a message that names a list which is
+        // not there is refused for that and for nothing else.
+        let list_management = match input.list_management_options.as_ref() {
+            None => None,
+            Some(options) => {
+                let Some(list) = store.contact_lists.get(&options.contact_list_name) else {
+                    return Err(SendEmailErrorModeled::NotFoundException(NotFoundException {
+                        message: Some(crate::state::contact_list_not_found(
+                            &options.contact_list_name,
+                        )),
+                    })
+                    .into());
+                };
+                if let Some(topic_name) = options.topic_name.as_deref() {
+                    if !list.publishes_topic(topic_name) {
+                        return Err(bad_request(crate::state::contact_list_topic_not_found(
+                            &options.contact_list_name,
+                            topic_name,
+                        )));
+                    }
+                }
+                Some(options.contact_list_name.clone())
+            }
+        };
+
         // The account-level sending switch (`GetAccount`'s `SendingEnabled`, which
         // `PutAccountSendingAttributes` sets) gates every message this account
         // sends, so it is read before anything about this particular message: while
@@ -328,7 +355,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The account's 24-hour sending quota, measured over the window rather
         // than over all time: `settle` above recomputed the counter from the log, so
         // this reads the one view of it rather than scanning the log again.
-        let recipients = (to.len() + cc.len() + bcc.len()) as f64;
+        let addressed: Vec<String> = to.iter().chain(&cc).chain(&bcc).cloned().collect();
+        let recipients = addressed.len() as f64;
         let charged = store.send_counters.sent_last_24h;
         let quota = store.send_counters.max_24h;
         if charged + recipients > quota {
@@ -374,6 +402,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let message_id = message.message_id.clone();
         // The log keeps its newest `MAX_SENT_MESSAGES` entries.
         store.record_sent(message);
+        // A message that belongs to a contact list makes its recipients contacts of
+        // that list: the unsubscribe link list management stamps into the message
+        // unsubscribes a CONTACT of the list, so a recipient the list did not hold
+        // becomes one, with no preference of its own stated. One that is already on
+        // the list is left exactly as it is — the send states nothing about its
+        // preferences. The list's own ceiling still applies, so a send cannot grow a
+        // list past what `CreateContact` would admit.
+        if let Some(list_name) = list_management {
+            if let Some(list) = store.contact_lists.get_mut(&list_name) {
+                for address in &addressed {
+                    let key = crate::state::identity_key(address);
+                    if list.contacts.contains_key(&key)
+                        || list.contacts.len() >= crate::state::MAX_CONTACTS_PER_LIST
+                    {
+                        continue;
+                    }
+                    list.contacts
+                        .insert(key, crate::state::ContactRecord::new(address, now));
+                    // The list now holds one more contact, which is a change to the
+                    // list itself.
+                    list.last_updated_at = now;
+                }
+            }
+        }
         // Each recipient counts as one message against the account's sending quota.
         // The counter is a view of the log the send just extended, so settling again
         // recomputes it from the log rather than tallying: a tally would outlive the

@@ -383,6 +383,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx);
+
+        // A request that REPLACES the function's execution role resolves the new role
+        // exactly as creation resolves the first one: the function would run as it. The
+        // function has to exist for its configuration to be updated at all, so that is
+        // settled first, under a guard scoped to the read so none is held across the
+        // in-process hop to IAM.
+        if let Some(role) = input.role.as_deref() {
+            let held = {
+                let store = state.lock();
+                store.functions.contains_key(&reference.name)
+            };
+            if !held {
+                return Err(not_found(&region, &reference.name));
+            }
+            if crate::state::execution_role_is_unassumable(ctx, &region, role).await {
+                return Err(invalid_parameter(
+                    crate::state::ROLE_NOT_ASSUMABLE_MESSAGE.to_string(),
+                ));
+            }
+        }
+
         let mut store = state.lock();
 
         // A request naming no stored function is refused for THAT before any of its

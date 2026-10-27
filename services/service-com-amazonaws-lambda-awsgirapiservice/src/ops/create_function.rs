@@ -422,6 +422,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx);
+
+        // "To create a function, you need a deployment package and an execution role."
+        // The function RUNS AS the role the request names, so that role is resolved
+        // against this account's IAM before anything is written: a role IAM does not hold,
+        // or one whose trust policy does not let this service assume it, is the modelled
+        // 400 and no function is stored. This is awaited with no store guard held.
+        if crate::state::execution_role_is_unassumable(ctx, &region, &input.role).await {
+            return Err(invalid_parameter(
+                crate::state::ROLE_NOT_ASSUMABLE_MESSAGE.to_string(),
+            ));
+        }
+
         let mut store = state.lock();
 
         if store.functions.contains_key(&reference.name) {

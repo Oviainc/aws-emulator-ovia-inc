@@ -101,6 +101,8 @@ mod get_plan;
 mod get_table_entity_not_found;
 #[path = "all/glossaries.rs"]
 mod glossaries;
+#[path = "all/glossary_deletion.rs"]
+mod glossary_deletion;
 #[path = "all/glossary_term_listing.rs"]
 mod glossary_term_listing;
 #[path = "all/glossary_terms.rs"]
