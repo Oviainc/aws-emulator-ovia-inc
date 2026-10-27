@@ -66,7 +66,12 @@ const DRAFT_VERSION: i64 = 0;
 ///
 /// `CreateDataTransformationProfile` answers the 201 its model gives it, so the
 /// call is dispatched rather than taken through the harness's 200-only helper.
-async fn profile(service: &HealthLake, name: &str) -> (String, String) {
+///
+/// `pub(crate)` so the sibling suites of this test target get a profile the same
+/// way rather than each growing its own copy:
+/// `tests/all/idempotency_replay_precedes_state_gates.rs` starts a job against
+/// one and then deletes it.
+pub(crate) async fn profile(service: &HealthLake, name: &str) -> (String, String) {
     let (status, created) = service
         .call(
             "CreateDataTransformationProfile",
