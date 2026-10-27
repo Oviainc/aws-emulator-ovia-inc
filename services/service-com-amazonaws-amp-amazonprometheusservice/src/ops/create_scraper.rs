@@ -204,6 +204,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
 
+        // A map's KEYS carry the key shape's own modelled constraints, which nothing in
+        // the request walk applies (see the map-keys section of `crate::state`). Checked
+        // BEFORE the rule this handler adds, so a key that misses both is refused by the
+        // modelled constraint the request boundary stands for.
+        crate::state::check_map_keys(
+            "tags",
+            input.tags.iter().flat_map(|tags| tags.keys()),
+            &crate::state::TAG_KEY,
+        )
+        .map_err(CreateScraperErrorModeled::ValidationException)?;
+
         // "Keys must not begin with aws:" (`TagResource$tags`) — the service's rule for
         // its own tag keys, so it holds for the tags a scraper is created with too.
         // Stated in the one form every aps refusal takes, which names the member and the
@@ -218,15 +229,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-
-        // A map's KEYS carry the key shape's own modelled constraints, which nothing in
-        // the request walk applies (see the map-keys section of `crate::state`).
-        crate::state::check_map_keys(
-            "tags",
-            input.tags.iter().flat_map(|tags| tags.keys()),
-            &crate::state::TAG_KEY,
-        )
-        .map_err(CreateScraperErrorModeled::ValidationException)?;
 
         let mut store = state.lock();
         store.materialize_due(now);
