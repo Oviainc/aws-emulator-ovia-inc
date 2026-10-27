@@ -185,12 +185,13 @@ async fn create_manager(
         tag_map.insert(key.clone(), Value::String(value.clone()));
     }
     // `Type` must name a configuration type this service publishes; the catalog's first
-    // entry is the one every case here deploys, since no case is about the type.
+    // entry is the one every case here deploys, since no case is about the type. Its
+    // parameters name somewhere to deploy to, which every accepted definition must.
     let body = json!({
         "Name": "tagged-manager",
         "ConfigurationDefinitions": [{
             "Type": QUICK_SETUP_TYPE_CATALOG[0].type_,
-            "Parameters": {},
+            "Parameters": { "TargetOrganizationalUnits": "ou-1" },
         }],
         "Tags": Value::Object(tag_map),
     });

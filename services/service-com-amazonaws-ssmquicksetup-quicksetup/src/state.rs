@@ -418,6 +418,23 @@ pub const PARAMETER_TARGET_REGIONS: &str = "TargetRegions";
 /// configuration to.
 pub const PARAMETER_TARGET_ACCOUNTS: &str = "TargetAccounts";
 
+/// The `Parameters` key naming the organizational units a configuration definition is
+/// deployed to, documented on the same member as a comma separated list of the
+/// organizational units to deploy the configuration to.
+pub const PARAMETER_TARGET_ORGANIZATIONAL_UNITS: &str = "TargetOrganizationalUnits";
+
+/// Why a configuration definition whose parameters name no deployment target is
+/// refused.
+///
+/// Documented on `ConfigurationDefinitionInput$Parameters` for every configuration type
+/// that leaves both target keys optional: a value must be provided for either
+/// [`PARAMETER_TARGET_ACCOUNTS`] or [`PARAMETER_TARGET_ORGANIZATIONAL_UNITS`]
+/// (`smithy_query(query="doc", shape="ConfigurationDefinitionInput",
+/// member="Parameters")`). The sentence carries no value of the request, so it names no
+/// member: one definition either names somewhere to deploy to or it does not.
+pub const NO_DEPLOYMENT_TARGET_MESSAGE: &str =
+    "Either TargetAccounts or TargetOrganizationalUnits must be defined in parameters.";
+
 /// How many account-and-Region deployments ONE configuration definition may fan out
 /// to.
 ///
@@ -477,20 +494,30 @@ impl ConfigurationParameters for BTreeMap<String, String> {
     }
 }
 
-/// The deployment-target parameters `parameters` names: the [`PARAMETER_TARGET_REGIONS`]
-/// value and the [`PARAMETER_TARGET_ACCOUNTS`] value, each `None` when the definition
-/// carries no such parameter.
+/// The deployment-target parameters one configuration definition names, each `None`
+/// when the definition carries no such parameter.
+struct DeploymentTargetParameters<'a> {
+    /// The [`PARAMETER_TARGET_REGIONS`] value.
+    regions: Option<&'a str>,
+    /// The [`PARAMETER_TARGET_ACCOUNTS`] value.
+    accounts: Option<&'a str>,
+    /// The [`PARAMETER_TARGET_ORGANIZATIONAL_UNITS`] value.
+    organizational_units: Option<&'a str>,
+}
+
+/// The deployment-target parameters `parameters` names.
 ///
 /// The one place the extraction lives, so the refusal and the fan-out below take a
 /// definition's targets from the same parameter keys: which keys name a target is a
 /// change here, not in each handler that writes a definition.
 fn deployment_target_parameters<P: ConfigurationParameters + ?Sized>(
     parameters: &P,
-) -> (Option<&str>, Option<&str>) {
-    (
-        parameters.parameter(PARAMETER_TARGET_REGIONS),
-        parameters.parameter(PARAMETER_TARGET_ACCOUNTS),
-    )
+) -> DeploymentTargetParameters<'_> {
+    DeploymentTargetParameters {
+        regions: parameters.parameter(PARAMETER_TARGET_REGIONS),
+        accounts: parameters.parameter(PARAMETER_TARGET_ACCOUNTS),
+        organizational_units: parameters.parameter(PARAMETER_TARGET_ORGANIZATIONAL_UNITS),
+    }
 }
 
 /// Where a configuration definition carrying `parameters` is deployed: ONE target per
@@ -508,12 +535,12 @@ pub fn deployment_targets<P: ConfigurationParameters + ?Sized>(
     local_account: &str,
     local_region: &str,
 ) -> Vec<DeploymentTarget> {
-    let (target_regions, target_accounts) = deployment_target_parameters(parameters);
-    let mut regions = comma_separated(target_regions);
+    let targets = deployment_target_parameters(parameters);
+    let mut regions = comma_separated(targets.regions);
     if regions.is_empty() {
         regions.push(local_region.to_string());
     }
-    let mut accounts = comma_separated(target_accounts);
+    let mut accounts = comma_separated(targets.accounts);
     if accounts.is_empty() {
         accounts.push(local_account.to_string());
     }
@@ -532,19 +559,28 @@ pub fn deployment_targets<P: ConfigurationParameters + ?Sized>(
 /// served, or `None` when they can.
 ///
 /// `ConfigurationParametersMap` bounds each key and value but says nothing about what
-/// a value means, so both rules live here: a targeted account is named by its account
-/// id, and the number of account-and-Region deployments one definition fans out to is
-/// bounded by [`MAX_DEPLOYMENT_TARGETS`]. The one place the rule lives, so a create
-/// and an update refuse the same target sets — and, reading the same parameters
+/// a value means, so these rules live here: a parameter set must name somewhere to
+/// deploy to ([`NO_DEPLOYMENT_TARGET_MESSAGE`]), a targeted account is named by its
+/// account id, and the number of account-and-Region deployments one definition fans out
+/// to is bounded by [`MAX_DEPLOYMENT_TARGETS`]. The one place the rule lives, so a
+/// create and an update refuse the same target sets — and, reading the same parameters
 /// [`deployment_targets`] deploys from, refuse exactly the sets that cannot be
-/// deployed. `member` labels the request member the parameters arrived on, so the
-/// refusal names what the caller sent.
+/// deployed. `member` labels the request member the parameters arrived on, so a refusal
+/// stating one of this service's own bounds names what the caller sent.
 pub fn deployment_targets_rejection<P: ConfigurationParameters + ?Sized>(
     member: &str,
     parameters: &P,
 ) -> Option<String> {
-    let (target_regions, target_accounts) = deployment_target_parameters(parameters);
-    let accounts = comma_separated(target_accounts);
+    let target_parameters = deployment_target_parameters(parameters);
+    let accounts = comma_separated(target_parameters.accounts);
+    // A definition is deployed where its parameters say, so a parameter set that names
+    // neither the accounts nor the organizational units to deploy to names nowhere: a
+    // value for one of the two is required, and a key written with no entries provides
+    // none.
+    let organizational_units = comma_separated(target_parameters.organizational_units);
+    if accounts.is_empty() && organizational_units.is_empty() {
+        return Some(NO_DEPLOYMENT_TARGET_MESSAGE.to_string());
+    }
     if let Some(malformed) = accounts.iter().find(|account| {
         account.len() != ACCOUNT_ID_DIGITS || !account.bytes().all(|b| b.is_ascii_digit())
     }) {
@@ -554,7 +590,7 @@ pub fn deployment_targets_rejection<P: ConfigurationParameters + ?Sized>(
             echoed_value(malformed)
         ));
     }
-    let targets = comma_separated(target_regions).len().max(1) * accounts.len().max(1);
+    let targets = comma_separated(target_parameters.regions).len().max(1) * accounts.len().max(1);
     (targets > MAX_DEPLOYMENT_TARGETS).then(|| {
         format!(
             "{member} names {targets} account and Region deployments, more than the \
