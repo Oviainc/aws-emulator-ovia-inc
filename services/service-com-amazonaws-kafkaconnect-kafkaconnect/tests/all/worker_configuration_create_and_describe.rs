@@ -499,9 +499,11 @@ async fn describing_a_worker_configuration_arn_the_service_never_minted_is_a_not
     assert_eq!(status, 200, "the create must succeed, got {status} {body}");
     let stored = text(&body, "workerConfigurationArn");
 
-    // Every row is an ARN this store does not hold: a well-formed one for a
-    // name that was never created, one of the right shape in another region,
-    // the stored ARN with its uuid altered, and a string that is no ARN at all.
+    // Every row is a WELL-FORMED kafkaconnect ARN this store does not hold: one
+    // for a name that was never created, one of the right shape in another
+    // region, the stored ARN with its uuid altered, and one naming another of
+    // this service's resource kinds. A value that is not an ARN at all is
+    // incorrect input instead, which `arn_label_refusals` pins.
     let unknown: Vec<(&str, String)> = vec![
         (
             "a name that was never created",
@@ -522,7 +524,12 @@ async fn describing_a_worker_configuration_arn_the_service_never_minted_is_a_not
                 format!("{head}{other}")
             },
         ),
-        ("not an ARN at all", "worker-configuration".to_string()),
+        (
+            "a well-formed ARN naming another of this service's resource kinds",
+            format!(
+                "arn:aws:kafkaconnect:{REGION}:{ACCOUNT}:connector/ghost/00000000-0000-4000-8000-000000000000"
+            ),
+        ),
     ];
 
     for (case, arn) in unknown {

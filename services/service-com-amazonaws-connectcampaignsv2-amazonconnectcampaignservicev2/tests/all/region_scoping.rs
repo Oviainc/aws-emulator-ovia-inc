@@ -25,7 +25,7 @@ use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::sta
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::common::{call, error_code, router};
+use super::common::{call, error_code, router, Harness};
 
 /// The region pairs every case runs over: `(case, home, other)`, where `home` is the
 /// region a resource is created in and `other` the region whose endpoint must not see
@@ -56,8 +56,12 @@ fn telephony_config() -> Value {
 /// the clock owes those jobs once, so every instance is a campaign target in its region
 /// by the time this returns. Nothing in the emulator sleeps for that span — only a
 /// caller that wants the settled state does.
-async fn onboard(router: &MultiServiceRouter, regions: &[&str], instance: &str) {
+async fn onboard(router: &Harness, regions: &[&str], instance: &str) {
     for region in regions {
+        // Onboarding resolves the `connectInstanceId` against the account's Connect
+        // instance registry, which is the account's and not one region's, so one
+        // registration serves every region's onboarding call.
+        router.register_connect_instance(region, instance);
         let (status, body) = call(
             router,
             region,
@@ -569,6 +573,7 @@ async fn a_write_past_the_region_ceiling_is_refused_and_stores_nothing() {
     // store holds, not which.
     for index in 0..MAX_REGIONS {
         let region = format!("zz-test-{index}");
+        router.register_connect_instance(&region, instance);
         let (status, body) = call(
             &router,
             &region,

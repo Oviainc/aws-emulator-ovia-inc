@@ -33,6 +33,8 @@ mod managed_base_image_catalogue;
 mod managed_base_image_versions;
 #[path = "all/managed_namespace_authorization.rs"]
 mod managed_namespace_authorization;
+#[path = "all/microvm_endpoint_data_plane.rs"]
+mod microvm_endpoint_data_plane;
 #[path = "all/microvm_image_and_instance_paths.rs"]
 mod microvm_image_and_instance_paths;
 #[path = "all/microvm_lifecycle.rs"]

@@ -406,10 +406,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status_message: None,
             creation_time: now,
             last_update_time: None,
-            deletion_start_time: None,
-            deletion_completion_time: None,
             // A freshly created team has asked its approvers for nothing beyond their
-            // invitations: no change is waiting on their approval.
+            // invitations: no change and no deletion is waiting on their approval.
+            pending_deletion: None,
             pending_update: None,
             tags: input
                 .tags

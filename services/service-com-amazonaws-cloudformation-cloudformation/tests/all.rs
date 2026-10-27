@@ -101,6 +101,8 @@ mod list_stack_resources;
 mod list_stack_set_auto_deployment_targets;
 #[path = "all/list_stack_set_operations.rs"]
 mod list_stack_set_operations;
+#[path = "all/list_stack_sets.rs"]
+mod list_stack_sets;
 #[path = "all/list_types.rs"]
 mod list_types;
 #[path = "all/nested_resource_outputs.rs"]

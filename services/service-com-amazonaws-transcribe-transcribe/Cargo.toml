@@ -21,10 +21,11 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-# Amazon S3 client the custom-vocabulary and vocabulary-filter creates and updates
-# store the text file their reported `DownloadUri` serves through, over the in-process
-# callback into this same emulator (no network client feature is enabled: the
-# transport is the emulator's own).
+# The Amazon S3 client this service reaches its companion object store with, over
+# the in-process callback into this same emulator (no network client feature is
+# enabled: the transport is the emulator's own): a job start resolves its `Media`
+# location through it, and the custom-vocabulary and vocabulary-filter creates and
+# updates store the text file their reported `DownloadUri` serves.
 aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 
 [build-dependencies]
@@ -33,9 +34,11 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
-# The download-content suite mounts the S3 service beside Transcribe on one engine,
-# because a vocabulary's and a filter's content is stored in object storage by calling
-# S3 in process, and the suite fetches the reported location back.
+# The media-resolution and download-content suites mount the Amazon S3 service beside
+# transcribe on one engine: a job start resolves the media location it is given against
+# Amazon S3 before it stores anything, and a vocabulary's and a filter's content is
+# stored in object storage by calling S3 in process and fetched back by its reported
+# location.
 service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [lints]

@@ -158,6 +158,9 @@ mod input_device_listing;
 #[path = "all/input_device_maintenance_window.rs"]
 mod input_device_maintenance_window;
 
+#[path = "all/input_device_reboot.rs"]
+mod input_device_reboot;
+
 #[path = "all/input_device_run_state_independence.rs"]
 mod input_device_run_state_independence;
 

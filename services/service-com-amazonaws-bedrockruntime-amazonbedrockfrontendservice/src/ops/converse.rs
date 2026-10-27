@@ -13,10 +13,12 @@
 //!
 //! A mandatory `toolConfig.toolChoice` (`any` or `tool`) obliges the turn to
 //! request a tool instead of generating text: the assistant message is then one
-//! `toolUse` block whose `toolUseId` is minted here, and the turn stops on
-//! `tool_use`. A later turn's `toolResult` has to address an id this service
-//! issued, which is why the conversation's tool results are validated against
-//! the tool requests it carries.
+//! `toolUse` block whose `toolUseId` is minted here, whose `input` is the
+//! argument object the requested tool's own `inputSchema` describes (see
+//! [`crate::state::tool_input_arguments`]), and the turn stops on `tool_use`. A
+//! later turn's `toolResult` has to address an id this service issued, which is
+//! why the conversation's tool results are validated against the tool requests
+//! it carries.
 //!
 //! ## Shape of an operation
 //!

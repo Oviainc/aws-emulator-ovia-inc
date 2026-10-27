@@ -46,6 +46,7 @@ use ::std::sync::atomic::{AtomicU64, Ordering};
 
 use ::service_common::iam_authorization::{self as iam, Decision};
 
+use crate::ops::types::DelegationRequest;
 use crate::scaffolded::AccessDenied;
 
 use super::{ComAmazonawsIamAwsidentitymanagementv20100508State as IamState, PrincipalPolicies};
@@ -153,6 +154,9 @@ pub const SET_DEFAULT_POLICY_VERSION: &str = "iam:SetDefaultPolicyVersion";
 /// `iam:GetAccountAuthorizationDetails`.
 pub const GET_ACCOUNT_AUTHORIZATION_DETAILS: &str = "iam:GetAccountAuthorizationDetails";
 
+/// `iam:GetDelegationRequest`.
+pub const GET_DELEGATION_REQUEST: &str = "iam:GetDelegationRequest";
+
 /// The resource an account-WIDE call is decided against.
 ///
 /// An action that reports the account's whole configuration is not taken on one
@@ -171,6 +175,23 @@ pub const DECISION_EXPLICIT_DENY: &str = "explicitDeny";
 
 /// The decision value for a request nothing allows and nothing explicitly denies.
 pub const DECISION_IMPLICIT_DENY: &str = "implicitDeny";
+
+/// The permission-check result for a caller that covers every ask of a delegation
+/// request: "ALLOWED: The caller has sufficient permissions cover all the requested
+/// permissions" (`GetDelegationRequestResponse$PermissionCheckResult`). One of the three
+/// values `permissionCheckResultType` declares, which
+/// `crate::ops::types::PERMISSION_CHECK_RESULT_TYPE_VALUES` records.
+pub const PERMISSION_CHECK_ALLOWED: &str = "ALLOWED";
+
+/// The permission-check result for a caller that does not: "DENIED: The caller does not
+/// have sufficient permissions to cover all the requested permissions". See
+/// [`PERMISSION_CHECK_ALLOWED`].
+pub const PERMISSION_CHECK_DENIED: &str = "DENIED";
+
+/// The permission-check result for a check that reaches neither answer: "UNSURE: It is
+/// not possible to determine whether the caller has all the permissions needed". See
+/// [`PERMISSION_CHECK_ALLOWED`].
+pub const PERMISSION_CHECK_UNSURE: &str = "UNSURE";
 
 /// The modelled name of the decision the two sets of documents come to, as
 /// `EvaluationResult$EvalDecision` reports it.
@@ -277,6 +298,84 @@ pub fn authorize_named(
          {reason}{}",
         authorization_details_sentence(&request_region(ctx), &authorization_id)
     )))
+}
+
+/// Whether the caller has sufficient permissions to cover the asks of the delegation
+/// request `delegated` — the permission check `GetDelegationRequest` performs when its
+/// request asks for one — as one of the three values `permissionCheckResultType`
+/// declares (`super::super::ops::types::PERMISSION_CHECK_RESULT_TYPE_VALUES`).
+///
+/// The asks are the `(action, resource)` pairs the request's permission policy names
+/// ([`super::delegated_asks`]), and the question asked about each of them is the one
+/// [`authorize_named`] asks about the call itself, decided against the SAME documents by
+/// the same evaluation: the caller covers an ask when its identity-based policies allow
+/// that action on that resource.
+///
+/// * [`PERMISSION_CHECK_DENIED`] as soon as a statement explicitly denies an ask, since
+///   no grant overturns an explicit deny, and for a caller whose documents simply do not
+///   cover every ask.
+/// * [`PERMISSION_CHECK_ALLOWED`] when every ask is covered.
+/// * [`PERMISSION_CHECK_UNSURE`] — "it is not possible to determine whether the caller
+///   has all the permissions needed" — where the evidence is incomplete rather than
+///   short: asks that cannot be enumerated from the request, a caller holding a grant
+///   whose document the account does not hold (see the module docs), and a caller whose
+///   grants are conditioned, which the documented case for this value ("most likely for
+///   cases when the caller has permissions with conditions") names.
+///
+/// A READ, like every other decision here: the answer comes from the documents in force
+/// at the instant of the call and nothing is written, so asking twice answers twice the
+/// same.
+pub fn delegation_permission_check(
+    store: &IamState,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    delegated: &DelegationRequest,
+) -> &'static str {
+    let Some(asks) = delegated
+        .permission_policy
+        .as_deref()
+        .and_then(super::delegated_asks)
+    else {
+        return PERMISSION_CHECK_UNSURE;
+    };
+
+    let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
+    // A credential this account holds no IAM user for carries no identity-based policies
+    // at all — the position account root credentials are in (see the module docs) — so
+    // there is nothing its permissions can fall short of.
+    let Some((principal, policies)) = signing_principal(store, &access_key_id) else {
+        return PERMISSION_CHECK_ALLOWED;
+    };
+
+    let principals = [principal];
+    let documents = iam::prepare_documents(&policies.documents);
+    let mut short_of_an_ask = false;
+    for (action, resource) in &asks {
+        let request = iam::Request::new(action, resource, &principals);
+        let decided = iam::identity_decision_prepared(&documents, &request);
+        if decided == Decision::Denied {
+            return PERMISSION_CHECK_DENIED;
+        }
+        if !iam::is_allowed(decided, Decision::NotStated) {
+            short_of_an_ask = true;
+        }
+    }
+    if !short_of_an_ask {
+        return PERMISSION_CHECK_ALLOWED;
+    }
+
+    // The caller is short of an ask on the evidence that could be read. Where part of
+    // that evidence could NOT be — a document the account does not hold, or a grant
+    // whose condition is not decided here — what is known is that the answer is not
+    // known, which is the third value rather than a refusal.
+    let conditioned = !super::context_keys_in_policies(
+        policies.documents.iter().map(::std::string::String::as_str),
+    )
+    .is_empty();
+    if conditioned || !policies.uncarried.is_empty() {
+        PERMISSION_CHECK_UNSURE
+    } else {
+        PERMISSION_CHECK_DENIED
+    }
 }
 
 /// A fresh authorization id for one denied request: the handle the denial hands the

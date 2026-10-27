@@ -24,7 +24,11 @@ pub struct StartCodeInterpreterSessionInput {
     pub client_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentcore#StartCodeInterpreterSessionResponse")]
+/// `StartCodeInterpreterSessionResponse`. Its schema and serializer come from
+/// [`super::date_time_wire`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `createdAt` targets `DateTimestamp`, which carries
+/// `@timestampFormat("date-time")`, and the derive does not put that trait on a member
+/// schema — see `types/date_time_wire.rs`.
 #[derive(Debug, Clone)]
 pub struct StartCodeInterpreterSessionOutput {
     pub code_interpreter_identifier: String,

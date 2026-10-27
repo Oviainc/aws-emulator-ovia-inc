@@ -43,7 +43,10 @@ const CONFLICT: (u16, &str) = (409, "ConflictException");
 const LIMIT_EXCEEDED: (u16, &str) = (429, "LimitExceededException");
 
 /// `CreateBasePathMapping` under `domain_name` with `body` sent as given.
-async fn create_mapping(gateway: &Gateway, domain_name: &str, body: Value) -> Answer {
+///
+/// `pub(crate)` so a sibling suite creates a mapping the one way rather than keeping its
+/// own copy (the `update_base_path_mapping` suite does).
+pub(crate) async fn create_mapping(gateway: &Gateway, domain_name: &str, body: Value) -> Answer {
     gateway
         .call(
             "POST",
@@ -54,7 +57,10 @@ async fn create_mapping(gateway: &Gateway, domain_name: &str, body: Value) -> An
 }
 
 /// `GetBasePathMapping` for `base_path` of `domain_name`.
-async fn get_mapping(gateway: &Gateway, domain_name: &str, base_path: &str) -> Answer {
+///
+/// `pub(crate)` for the reason [`create_mapping`] is: the sibling suite that patches a
+/// mapping reads it back through this one reader.
+pub(crate) async fn get_mapping(gateway: &Gateway, domain_name: &str, base_path: &str) -> Answer {
     gateway
         .call(
             "GET",
@@ -65,7 +71,9 @@ async fn get_mapping(gateway: &Gateway, domain_name: &str, base_path: &str) -> A
 }
 
 /// Assert `answer` is the modelled failure `(status, code)` carrying exactly `message`.
-fn assert_refusal(answer: &Answer, expected: (u16, &str), message: &str, case: &str) {
+///
+/// `pub(crate)` for the reason [`create_mapping`] is.
+pub(crate) fn assert_refusal(answer: &Answer, expected: (u16, &str), message: &str, case: &str) {
     assert_failure(answer, expected.0, expected.1, case);
     assert_eq!(
         answer.body["message"].as_str(),
@@ -77,7 +85,10 @@ fn assert_refusal(answer: &Answer, expected: (u16, &str), message: &str, case: &
 
 /// The `basePath`, `restApiId` and `stage` a body reports, with an absent member as
 /// `None`, which is what a mapping that names no stage must report.
-fn mapping_of(body: &Value, case: &str) -> (String, String, Option<String>) {
+///
+/// `pub(crate)` for the reason [`create_mapping`] is: the whole modelled record in one
+/// comparable value, spelled once for every suite that asserts a mapping.
+pub(crate) fn mapping_of(body: &Value, case: &str) -> (String, String, Option<String>) {
     (
         string_member(body, "basePath", case),
         string_member(body, "restApiId", case),
@@ -87,7 +98,9 @@ fn mapping_of(body: &Value, case: &str) -> (String, String, Option<String>) {
 
 /// An API with one deployed stage, answering `(restApiId, stageName)` — what a mapping
 /// points at.
-async fn deployed_api(gateway: &Gateway, name: &str, stage: &str) -> (String, String) {
+///
+/// `pub(crate)` for the reason [`create_mapping`] is.
+pub(crate) async fn deployed_api(gateway: &Gateway, name: &str, stage: &str) -> (String, String) {
     let (api, _root) = create_api(gateway, name).await;
     create_deployed_stage(gateway, &api, stage).await;
     (api, stage.to_string())

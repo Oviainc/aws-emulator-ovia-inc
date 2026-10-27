@@ -655,12 +655,13 @@ async fn an_arn_naming_no_stored_resource_is_the_modelled_not_found() {
     let doomed_operation = text(&restarted, "connectorOperationArn");
 
     // Every form of a `connectorArn` this emulator holds no connector of: one of the
-    // right shape that was never created, one of another service, and a value that is no
-    // ARN at all.
+    // right shape that was never created, and one naming another of this service's
+    // resource kinds. Both are WELL-FORMED kafkaconnect ARNs, so each names a resource
+    // that is absent; a value that is not an ARN at all is incorrect input instead, and
+    // `arn_label_refusals` pins that.
     let absent_connectors = [
         format!("arn:aws:kafkaconnect:{REGION}:{ACCOUNT}:connector/never-made/{}", "0".repeat(8)),
-        format!("arn:aws:iam::{ACCOUNT}:role/not-a-connector"),
-        "not-an-arn".to_string(),
+        format!("arn:aws:kafkaconnect:{REGION}:{ACCOUNT}:custom-plugin/not-a-connector/{}", "0".repeat(8)),
     ];
     for connector_arn in &absent_connectors {
         let (status, answered) = list_operations(&emulator, connector_arn, "").await;
@@ -686,7 +687,10 @@ async fn an_arn_naming_no_stored_resource_is_the_modelled_not_found() {
             "0".repeat(8),
             "1".repeat(8)
         ),
-        "not-an-arn".to_string(),
+        format!(
+            "arn:aws:kafkaconnect:{REGION}:{ACCOUNT}:connector/not-an-operation/{}",
+            "0".repeat(8)
+        ),
     ];
     for operation_arn in &absent_operations {
         let (status, answered) = describe_operation(&emulator, operation_arn).await;

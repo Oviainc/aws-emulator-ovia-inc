@@ -116,7 +116,7 @@ const ERROR_CASES: &[ErrorCase] = &[
     },
     ErrorCase {
         case: "scaffolded operation, which answers the 501 channel",
-        action: "ListStackSets",
+        action: "DescribeOrganizationsAccess",
         members: &[],
         status: 501,
         code: "NotImplemented",
