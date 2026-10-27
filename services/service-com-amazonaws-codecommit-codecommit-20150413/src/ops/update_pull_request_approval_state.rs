@@ -309,12 +309,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // "You cannot approve a pull request that you created": the author's own
-        // approval would be its own review, so it is refused rather than recorded.
-        // Revoking is not approving, and an author holds no approval to revoke, so
-        // it is only an approval that is refused here.
-        if requested == crate::state::APPROVAL_STATE_APPROVE && pull_request.author_arn == reviewer
-        {
+        // "You cannot approve a pull request that you created": the author holds no
+        // say over its own review, so the author is refused this operation
+        // ALTOGETHER — the identity is compared before the requested state is
+        // considered, because the state asked for is not what makes the caller the
+        // author, and either value of the enum would otherwise let the author move
+        // (or confirm) an approval state of its own pull request.
+        if pull_request.author_arn == reviewer {
             return Err(
                 UpdatePullRequestApprovalStateErrorModeled::PullRequestCannotBeApprovedByAuthorException(
                     PullRequestCannotBeApprovedByAuthorException {

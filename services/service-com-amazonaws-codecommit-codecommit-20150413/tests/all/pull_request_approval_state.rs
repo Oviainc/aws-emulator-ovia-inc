@@ -34,6 +34,7 @@ use crate::wire::{caller_arn, ok_as, refusal_as};
 /// through.
 const OPERATION: &str = "UpdatePullRequestApprovalState";
 const SQUASH_OPERATION: &str = "MergePullRequestBySquash";
+const APPROVAL_STATES_OPERATION: &str = "GetPullRequestApprovalStates";
 
 /// The status every error asserted here models (`errorKind: client`, `httpError:
 /// 400` on each of these error shapes).
@@ -285,6 +286,16 @@ impl Fixture {
     /// and the same destination, and report ITS current revision id — a well-formed
     /// revision id that names no revision of the fixture's pull request.
     async fn second_pull_request_revision(&self) -> String {
+        self.pull_request_opened_by(AUTHOR, SECOND_SOURCE).await.1
+    }
+
+    /// Open another pull request in this repository AS `caller`, between a new
+    /// branch `source` off the destination tip and the same destination, and report
+    /// its `pullRequestId` and the `revisionId` of its current revision.
+    ///
+    /// Who opened a pull request is what makes them its author, so this is how a
+    /// case gets a pull request whose author is a chosen identity.
+    async fn pull_request_opened_by(&self, caller: &str, source: &str) -> (String, String) {
         let branch = ok(
             &self.router,
             "GetBranch",
@@ -294,23 +305,23 @@ impl Fixture {
         let tip = string_at(&branch, "/branch/commitId");
         ok_as(
             &self.router,
-            AUTHOR,
+            caller,
             "CreateBranch",
             &json!({
                 "repositoryName": REPOSITORY,
-                "branchName": SECOND_SOURCE,
+                "branchName": source,
                 "commitId": tip,
             }),
         )
         .await;
         ok_as(
             &self.router,
-            AUTHOR,
+            caller,
             "PutFile",
             &json!({
                 "repositoryName": REPOSITORY,
-                "branchName": SECOND_SOURCE,
-                "filePath": "second.txt",
+                "branchName": source,
+                "filePath": format!("{source}.txt"),
                 "fileContent": base64(b"gamma\n"),
                 "parentCommitId": tip,
                 "commitMessage": "another change",
@@ -319,20 +330,48 @@ impl Fixture {
         .await;
         let created = ok_as(
             &self.router,
-            AUTHOR,
+            caller,
             "CreatePullRequest",
             &json!({
                 "title": "another change to review",
                 "targets": [{
                     "repositoryName": REPOSITORY,
-                    "sourceReference": SECOND_SOURCE,
+                    "sourceReference": source,
                     "destinationReference": DESTINATION,
                 }],
             }),
         )
         .await;
-        string_at(&created, "/pullRequest/revisionId")
+        (
+            string_at(&created, "/pullRequest/pullRequestId"),
+            string_at(&created, "/pullRequest/revisionId"),
+        )
     }
+}
+
+/// The ARNs of the reviewers `GetPullRequestApprovalStates` reports an approval of
+/// this revision for, in the order it reports them.
+async fn approver_arns(
+    router: &MultiServiceRouter,
+    pull_request_id: &str,
+    revision_id: &str,
+) -> Vec<String> {
+    let read = ok(
+        router,
+        APPROVAL_STATES_OPERATION,
+        &json!({
+            "pullRequestId": pull_request_id,
+            "revisionId": revision_id,
+        }),
+    )
+    .await;
+    read.get("approvals")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_else(|| panic!("no approvals member in {read}"))
+        .iter()
+        .map(|approval| string_at(approval, "/userArn"))
+        .collect()
 }
 
 /// One row of the recorded-state table: the rule the pull request carries, the calls
@@ -382,13 +421,6 @@ async fn an_approval_state_is_recorded_for_the_calling_identity_and_logged() {
             case: "a revoke by a reviewer holding no approval",
             rule: Some(document(1, &[])),
             calls: vec![(REVIEWER, REVOKE)],
-            logged: vec![],
-            merges: false,
-        },
-        ApprovalRow {
-            case: "the author revoking an approval they never held",
-            rule: Some(document(1, &[])),
-            calls: vec![(AUTHOR, REVOKE)],
             logged: vec![],
             merges: false,
         },
@@ -727,6 +759,15 @@ async fn a_request_naming_no_pull_request_revision_or_state_records_nothing() {
             code: "PullRequestCannotBeApprovedByAuthorException",
             message: CANNOT_BE_APPROVED_BY_AUTHOR.to_string(),
         },
+        Refusal {
+            case: "the author of the pull request revoking on it",
+            caller: AUTHOR,
+            pull_request_id: Some("{id}"),
+            revision_id: Some("{revision}"),
+            approval_state: Some(REVOKE),
+            code: "PullRequestCannotBeApprovedByAuthorException",
+            message: CANNOT_BE_APPROVED_BY_AUTHOR.to_string(),
+        },
     ];
 
     for refusal in refusals {
@@ -917,4 +958,181 @@ async fn a_pull_request_that_is_no_longer_open_records_no_approval_state() {
         logged.is_empty(),
         "a closed pull request records no approval state change, got {logged:?}"
     );
+}
+
+/// One row of the author table: who calls and with which state, and what the pull
+/// request holds afterwards.
+struct AuthorRow {
+    case: &'static str,
+    caller: &'static str,
+    approval_state: &'static str,
+    /// Whether the call is refused as one made by the pull request's own author.
+    refused: bool,
+    /// The access key ids of the reviewers the pull request holds an approval for
+    /// once the call has been answered.
+    approvers: Vec<&'static str>,
+    /// How many approval state changes its event log holds by then.
+    logged: usize,
+}
+
+#[tokio::test]
+async fn the_author_of_a_pull_request_may_set_no_approval_state_on_it() {
+    // Rows differ along the state asked for and whether the caller is the author of
+    // the pull request: the author is refused for EITHER state, and either state
+    // from a reviewer is answered.
+    let rows = vec![
+        AuthorRow {
+            case: "the author approving",
+            caller: AUTHOR,
+            approval_state: APPROVE,
+            refused: true,
+            approvers: vec![OTHER_REVIEWER],
+            logged: 1,
+        },
+        AuthorRow {
+            case: "the author revoking",
+            caller: AUTHOR,
+            approval_state: REVOKE,
+            refused: true,
+            approvers: vec![OTHER_REVIEWER],
+            logged: 1,
+        },
+        AuthorRow {
+            case: "a reviewer approving",
+            caller: REVIEWER,
+            approval_state: APPROVE,
+            refused: false,
+            approvers: vec![OTHER_REVIEWER, REVIEWER],
+            logged: 2,
+        },
+        AuthorRow {
+            case: "a reviewer revoking an approval they never held",
+            caller: REVIEWER,
+            approval_state: REVOKE,
+            refused: false,
+            approvers: vec![OTHER_REVIEWER],
+            logged: 1,
+        },
+        AuthorRow {
+            case: "the reviewer whose approval is on record revoking it",
+            caller: OTHER_REVIEWER,
+            approval_state: REVOKE,
+            refused: false,
+            approvers: vec![],
+            logged: 2,
+        },
+    ];
+
+    for row in rows {
+        let case = row.case;
+        // The rule asks for more approvals than any row records, so no row can be
+        // told apart by a merge going through instead.
+        let fixture = fixture(Some(&document(3, &[]))).await;
+        let revision = fixture.revision_id().await;
+        // One approval already on record, so a refused call is seen to leave the
+        // approvals the pull request holds exactly as they were.
+        ok_as(
+            &fixture.router,
+            OTHER_REVIEWER,
+            OPERATION,
+            &fixture.body(&revision, APPROVE),
+        )
+        .await;
+
+        let body = fixture.body(&revision, row.approval_state);
+        if row.refused {
+            let (code, message) = refusal_as(
+                &fixture.router,
+                row.caller,
+                OPERATION,
+                &body,
+                CLIENT_ERROR_STATUS,
+            )
+            .await;
+            assert_eq!(
+                code, "PullRequestCannotBeApprovedByAuthorException",
+                "case {case:?}: expected PullRequestCannotBeApprovedByAuthorException, \
+                 got {code:?}"
+            );
+            assert_eq!(
+                message, CANNOT_BE_APPROVED_BY_AUTHOR,
+                "case {case:?}: expected {CANNOT_BE_APPROVED_BY_AUTHOR:?}, got {message:?}"
+            );
+        } else {
+            let answered = ok_as(&fixture.router, row.caller, OPERATION, &body).await;
+            let members = answered.as_object().map_or(0, serde_json::Map::len);
+            assert_eq!(
+                members, 0,
+                "case {case:?}: {OPERATION} answers no output members, got {answered}"
+            );
+        }
+
+        // What the pull request holds afterwards: a refused call records nothing, so
+        // neither the approvals nor the event log moved for it.
+        let mut expected: Vec<String> = row.approvers.iter().copied().map(caller_arn).collect();
+        expected.sort();
+        let reported = approver_arns(&fixture.router, &fixture.pull_request_id, &revision).await;
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: expected the approvals {expected:?}, got {reported:?}"
+        );
+        let logged = fixture.approval_events().await;
+        assert_eq!(
+            logged.len(),
+            row.logged,
+            "case {case:?}: expected {} logged change(s), got {logged:?}",
+            row.logged
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_identity_may_set_an_approval_state_on_a_pull_request_it_did_not_open() {
+    let fixture = fixture(Some(&document(1, &[]))).await;
+    // A SECOND pull request in the same repository, opened by the REVIEWER: whose
+    // approval is refused is decided per pull request, against the identity that
+    // opened THAT one, so the author of the first is a reviewer of the second and
+    // the other way round.
+    let (other_id, other_revision) = fixture
+        .pull_request_opened_by(REVIEWER, SECOND_SOURCE)
+        .await;
+
+    for state in [APPROVE, REVOKE] {
+        let body = json!({
+            "pullRequestId": other_id,
+            "revisionId": other_revision,
+            "approvalState": state,
+        });
+        let answered = ok_as(&fixture.router, AUTHOR, OPERATION, &body).await;
+        let members = answered.as_object().map_or(0, serde_json::Map::len);
+        assert_eq!(
+            members, 0,
+            "case {state:?}: {OPERATION} answers no output members, got {answered}"
+        );
+        // The state the author of the OTHER pull request just set is what this one
+        // holds: an approval while it stands, none once taken back.
+        let expected: Vec<String> = if state == APPROVE {
+            vec![caller_arn(AUTHOR)]
+        } else {
+            vec![]
+        };
+        let reported = approver_arns(&fixture.router, &other_id, &other_revision).await;
+        assert_eq!(
+            reported, expected,
+            "case {state:?}: expected the approvals {expected:?}, got {reported:?}"
+        );
+
+        // The SAME call by the identity that opened it is refused, whichever state
+        // it asks for.
+        let (code, message) =
+            refusal_as(&fixture.router, REVIEWER, OPERATION, &body, CLIENT_ERROR_STATUS).await;
+        assert_eq!(
+            code, "PullRequestCannotBeApprovedByAuthorException",
+            "case {state:?}: expected PullRequestCannotBeApprovedByAuthorException, got {code:?}"
+        );
+        assert_eq!(
+            message, CANNOT_BE_APPROVED_BY_AUTHOR,
+            "case {state:?}: expected {CANNOT_BE_APPROVED_BY_AUTHOR:?}, got {message:?}"
+        );
+    }
 }
