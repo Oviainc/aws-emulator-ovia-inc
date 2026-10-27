@@ -24,6 +24,9 @@
 //!   a schema one character past the published 400 KB maximum;
 //! * a model is identified by its NAME under the API that holds it, so a second create
 //!   under one name is the modelled 409 and two APIs may each hold a model of one name;
+//! * that 409 carries the ONE fixed sentence for the condition, which varies neither with
+//!   the name that collides, nor with what the second request says about the payload, nor
+//!   with the API the name is held under;
 //! * `flatten` resolves the model references a schema carries from stored state.
 
 use serde_json::{json, Value};
@@ -458,6 +461,81 @@ async fn a_model_is_identified_by_its_name_under_the_api_that_holds_it() {
         NOT_FOUND,
         "CreateModel on an unknown API",
     );
+}
+
+/// The one sentence API Gateway refuses a second model under one name with: the resource
+/// class and the scope a model name is unique within, and no value from the request.
+///
+/// `pub(crate)` so a sibling suite asserts the one sentence rather than keeping a second
+/// copy of it.
+pub(crate) const NAME_ALREADY_EXISTS: &str = "Model name already exists for this REST API";
+
+#[tokio::test]
+async fn a_duplicate_model_name_is_refused_with_one_fixed_sentence() {
+    let gateway = Gateway::new();
+    let (api, _root) = create_api(&gateway, "models-conflict-sentence").await;
+    let (other, _other_root) = create_api(&gateway, "models-conflict-sentence-other").await;
+
+    // Rows differ along what the sentence must NOT vary with: the form of the name that
+    // collides (letters, digits, mixed case, one character, a long name), what the second
+    // request says about the payload (its content type, its schema, its description), and
+    // which API holds the model.
+    let rows: Vec<(&str, &str, Value)> = vec![
+        (
+            "a name of letters, repeated verbatim",
+            "Pet",
+            json!({ "name": "Pet", "contentType": "application/json" }),
+        ),
+        (
+            "a name of digits, with another content type",
+            "12345",
+            json!({ "name": "12345", "contentType": "application/xml" }),
+        ),
+        (
+            "a mixed-case name, with a schema the first create did not carry",
+            "PetOrder2",
+            json!({
+                "name": "PetOrder2",
+                "contentType": "application/json",
+                "schema": json_schema("PetOrder2", 3),
+            }),
+        ),
+        (
+            "a one-character name, with a description",
+            "A",
+            json!({ "name": "A", "contentType": "text/plain", "description": "second" }),
+        ),
+        (
+            "a long name, under a +json content type",
+            "M0123456789012345678901234567890123456789",
+            json!({
+                "name": "M0123456789012345678901234567890123456789",
+                "contentType": "application/vnd.pet+json",
+            }),
+        ),
+    ];
+
+    for (case, name, second) in rows {
+        // Both APIs hold a model of the name, so each refusal is decided inside the API
+        // the request names and the sentence is the same in either scope.
+        for scope in [api.as_str(), other.as_str()] {
+            created_model(
+                &gateway,
+                scope,
+                case,
+                json!({ "name": name, "contentType": "application/json" }),
+            )
+            .await;
+            let answer = create_model(&gateway, scope, second.clone()).await;
+            assert_failure(&answer, 409, CONFLICT, case);
+            assert_eq!(
+                answer.body["message"].as_str(),
+                Some(NAME_ALREADY_EXISTS),
+                "case {case}: expected the message {NAME_ALREADY_EXISTS:?}, got {:?}",
+                answer.body["message"]
+            );
+        }
+    }
 }
 
 #[tokio::test]

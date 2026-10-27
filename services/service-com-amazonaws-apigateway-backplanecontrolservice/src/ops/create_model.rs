@@ -316,7 +316,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // replacing the model the first one stored.
             if api.models.contains_key(&input.name) {
                 return Err(CreateModelErrorModeled::ConflictException(ConflictException {
-                    message: Some(crate::state::model_already_exists(&input.name)),
+                    message: Some(crate::state::MODEL_NAME_ALREADY_EXISTS.to_string()),
                 })
                 .into());
             }
