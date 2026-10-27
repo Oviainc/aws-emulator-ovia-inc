@@ -171,6 +171,18 @@ impl<Eng: Send + Sync + 'static> ConverseStream<Eng> {
             .forced_tool_use(input.tool_config.as_ref(), crate::state::now_millis())
             .map_err(validation)?;
 
+        // The prompt-cache stage both Converse operations share: a `cachePoint`
+        // marker delimits a cacheable prefix, which this call writes to the
+        // cache or reads back from it, and which is then no longer charged as
+        // ordinary input tokens.
+        let cache = crate::state::serve_prompt_cache(
+            &state,
+            &model.model_id,
+            input.system.as_ref(),
+            input.messages.as_ref(),
+            input.tool_config.as_ref(),
+        );
+
         let turn = crate::state::converse_turn(
             &model,
             input.system.as_ref(),
@@ -181,6 +193,7 @@ impl<Eng: Send + Sync + 'static> ConverseStream<Eng> {
                 .as_ref()
                 .and_then(|config| config.max_tokens),
             tool_use,
+            cache,
         );
 
         let logged = crate::state::InvocationLogEntry {
