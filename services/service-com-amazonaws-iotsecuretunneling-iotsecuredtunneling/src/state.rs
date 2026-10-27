@@ -255,6 +255,30 @@ pub struct StoredTunnel {
     pub creation_seq: u64,
 }
 
+impl StoredTunnel {
+    /// Apply the close transition at `at`: the tunnel becomes `CLOSED` and
+    /// neither end is connected to it any more ("we close the WebSocket
+    /// connections between the client and proxy server", `CloseTunnel`'s own
+    /// documentation).
+    ///
+    /// The single writer of the transition, so whoever closes a tunnel — the
+    /// explicit call or the clock-owed expiry sweep — writes the same fields and
+    /// stamps them with the instant the close happened. IDEMPOTENT: a tunnel
+    /// that is already `CLOSED` is left exactly as it is, stamps included,
+    /// because a close that changes nothing about the resource has nothing to
+    /// report; `true` means this call was the one that closed it.
+    pub fn close(&mut self, at: SystemTime) -> bool {
+        if self.status != TunnelStatus::Open {
+            return false;
+        }
+        self.status = TunnelStatus::Closed;
+        self.last_updated_at = at;
+        self.source_connection_state = StoredConnectionState::disconnected(at);
+        self.destination_connection_state = StoredConnectionState::disconnected(at);
+        true
+    }
+}
+
 /// Per-service state for com-amazonaws-iotsecuretunneling-iotsecuredtunneling. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsIotsecuretunnelingIotsecuredtunnelingState {
@@ -405,6 +429,10 @@ impl ComAmazonawsIotsecuretunnelingIotsecuredtunnelingState {
     /// idempotent, and it stamps `lastUpdatedAt` with the instant the transition
     /// came due rather than with the time of the call that noticed it.
     ///
+    /// The transition itself is [`StoredTunnel::close`], shared with the explicit
+    /// `CloseTunnel`, so both writers close a tunnel in exactly one way and
+    /// neither touches a record that is already `CLOSED`.
+    ///
     /// The store is scanned only when something is actually due: the soonest
     /// expiry of any open tunnel is tracked on the state, so the usual call pays
     /// one comparison rather than a walk of every record while holding the lock.
@@ -422,12 +450,9 @@ impl ComAmazonawsIotsecuretunnelingIotsecuredtunnelingState {
                 continue;
             }
             if now >= tunnel.expires_at {
-                tunnel.status = TunnelStatus::Closed;
-                tunnel.last_updated_at = tunnel.expires_at;
-                tunnel.source_connection_state =
-                    StoredConnectionState::disconnected(tunnel.expires_at);
-                tunnel.destination_connection_state =
-                    StoredConnectionState::disconnected(tunnel.expires_at);
+                // The stamp is the instant the transition came DUE, not the
+                // instant of the call that noticed it.
+                tunnel.close(tunnel.expires_at);
             } else if earliest.is_none_or(|soonest| tunnel.expires_at < soonest) {
                 earliest = Some(tunnel.expires_at);
             }

@@ -1344,8 +1344,9 @@ pub fn one_of(member: &str, value: &str, allowed: &[&str]) -> Result<(), String>
     ))
 }
 
-/// Validate a `ScalingPlanVersion` a caller wrote, on an operation that identifies ONE
-/// plan by it and models no not-found error.
+/// Validate a `ScalingPlanVersion` a caller wrote, on a REPORTING operation that carries
+/// the member and models no not-found error — whether it identifies one plan by it or
+/// filters a collection with it.
 ///
 /// The member documents exactly one valid value ([`ONLY_VERSION`]) — "The version number
 /// of the scaling plan. Currently, the only valid value is 1", on every request shape that
