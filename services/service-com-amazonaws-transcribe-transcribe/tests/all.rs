@@ -97,6 +97,8 @@ mod tagging_arn_qualifiers;
 mod tagging_resource_families;
 #[path = "all/transcription_job_language_identification.rs"]
 mod transcription_job_language_identification;
+#[path = "all/transcription_job_queueing.rs"]
+mod transcription_job_queueing;
 #[path = "all/transcription_job_redacted_output.rs"]
 mod transcription_job_redacted_output;
 #[path = "all/transcription_job_request_rules.rs"]
