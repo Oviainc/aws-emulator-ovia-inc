@@ -24,7 +24,7 @@ use crate::resource_tagging::{
 
 /// `GET /2017-03-31/tags/{Resource}` — the tag-listing URI this model binds, with the
 /// resource ARN as the path label and no body.
-async fn list_tags(router: &MultiServiceRouter, resource: &str) -> (u16, Value) {
+pub(crate) async fn list_tags(router: &MultiServiceRouter, resource: &str) -> (u16, Value) {
     call(
         router,
         "GET",
