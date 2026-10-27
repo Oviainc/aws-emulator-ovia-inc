@@ -1606,12 +1606,11 @@ impl DatasetRecord {
 /// source's [`CaptureSegment`] span is read, so two adjacent segments cover a
 /// continuous stream and the instant between them belongs to the later one alone.
 ///
-/// The PRODUCER side (`BatchAssociateDataSegmentsToDataset`, and the bulk import
-/// of time series data into a session dataset) is not implemented in this
-/// emulator yet, so today the only writer of a dataset's segments is
+/// The one writer of a dataset's segments is
 /// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::put_dataset_data_segment`] — the
-/// one entry point a producer path (or a test seeding a dataset) calls — and the
-/// only remover is
+/// entry point every producer path (`BatchAssociateDataSegmentsToDataset`, the
+/// bulk import of time series data into a session dataset, or a test seeding a
+/// dataset) calls — and the only remover is
 /// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::delete_dataset_data_segment`].
 #[derive(Debug, Clone)]
 pub struct DataSegmentRecord {
@@ -4349,10 +4348,11 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// [`MAX_DATA_SEGMENTS_PER_DATASET`] segments.
     ///
     /// This is the PRODUCER-side entry point — the one writer of a dataset's
-    /// segments, which `BatchDeleteDatasetDataSegments` then removes from. The
-    /// producer operations themselves are not implemented in this emulator yet
-    /// (see [`DataSegmentRecord`]), so a test seeding a dataset is today's only
-    /// caller; everything a deletion can find was written here and nowhere else.
+    /// segments, which `BatchDeleteDatasetDataSegments` then removes from:
+    /// `BatchAssociateDataSegmentsToDataset` stores every segment it accepts
+    /// here, and a test seeding a dataset directly reaches the same writer, so
+    /// everything a read or a deletion can find was written here and nowhere
+    /// else.
     ///
     /// The log stays sorted by [`data_segment_key`] and single-valued on it:
     /// storing the same series' same span again REPLACES the entry held for it
@@ -4387,6 +4387,48 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             }
         }
         true
+    }
+
+    /// The ASSOCIATION of `time_series_id` whose span shares an instant with
+    /// the half-open span `[start, end)`: the dataset that holds it, paired with
+    /// the segment itself, or `None` when no dataset holds one.
+    ///
+    /// "Data segments that belong to the same time series can't overlap in
+    /// time, regardless of which dataset they belong to" (the
+    /// `BatchAssociateDataSegmentsToDataset` model doc), so the search spans
+    /// EVERY dataset's segments rather than the one a request names, and
+    /// answers the first in dataset-then-span order so one store answers one
+    /// way whatever order its map iterates in.
+    ///
+    /// A segment whose data came from the dataset that HOLDS it is a source
+    /// dataset's own data — what an association selects a slice of (see
+    /// [`DataSegmentRecord::source_dataset_id`]) — rather than an association
+    /// of it, so it is not one of the segments this rule compares.
+    pub fn overlapping_data_segment_association(
+        &self,
+        time_series_id: &str,
+        start: &TimeInNanos,
+        end: &TimeInNanos,
+    ) -> Option<(&str, &DataSegmentRecord)> {
+        let (start, end) = (timestamp_key(start), timestamp_key(end));
+        self.dataset_data_segments
+            .iter()
+            .flat_map(|(dataset_id, held)| {
+                held.iter()
+                    .map(move |segment| (dataset_id.as_str(), segment))
+            })
+            .filter(|(dataset_id, segment)| {
+                segment.time_series_id == time_series_id
+                    && segment.source_dataset_id != *dataset_id
+                    // Two half-open spans overlap exactly when each starts
+                    // before the other ends, so spans that merely touch at one
+                    // instant — the end of one, the start of the next — do not.
+                    && timestamp_key(&segment.start_timestamp) < end
+                    && timestamp_key(&segment.end_timestamp) > start
+            })
+            .min_by(|(left_id, left), (right_id, right)| {
+                (*left_id, data_segment_key(left)).cmp(&(*right_id, data_segment_key(right)))
+            })
     }
 
     /// Forget the segment of `dataset_id` that `time_series_id` and the span
@@ -5519,6 +5561,17 @@ pub const RESOURCE_ACTION_DEFINITION: &str = "Action Definition";
 /// handler resolved.
 pub fn not_found_message(resource: &str, requested: &str) -> String {
     format!("{resource} with ID {requested} not found")
+}
+
+/// The message a half-open span covering no time is refused with: a span's
+/// start must be strictly before its end, so the refusal names the two members
+/// the request stated it with.
+///
+/// One wording for every operation that takes a span as a pair of modelled
+/// members, so the two batch data-segment operations cannot each state the same
+/// refusal differently.
+pub fn empty_span_message() -> String {
+    "endTimestamp must be later than startTimestamp.".to_string()
 }
 
 /// The message a uniqueness refusal carries: AWS names the DIMENSION of the

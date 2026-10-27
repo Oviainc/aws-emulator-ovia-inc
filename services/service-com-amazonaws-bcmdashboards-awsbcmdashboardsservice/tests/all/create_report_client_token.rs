@@ -331,8 +331,8 @@ async fn a_retried_client_token_replays_the_create_it_already_served() {
                 );
                 let message = body["message"].as_str().unwrap_or_default();
                 assert!(
-                    message.contains(TOKEN) && message.contains(&served.arn),
-                    "case {label}: the refusal names the token and the report it already created, got {body}"
+                    message.contains(&served.arn) && !message.contains(TOKEN),
+                    "case {label}: the refusal names the report the token already created and never the token itself, got {body}"
                 );
             }
         }
@@ -376,8 +376,8 @@ async fn a_duplicate_racing_the_create_is_refused_and_the_later_retry_is_replaye
     );
     let message = body["message"].as_str().unwrap_or_default();
     assert!(
-        message.contains(TOKEN) && message.contains("in progress"),
-        "case racing duplicate: the refusal says a creation is already in progress for the token, got {body}"
+        message.contains("in progress") && !message.contains(TOKEN),
+        "case racing duplicate: the refusal says a creation is already in progress and never echoes the token, got {body}"
     );
     assert_eq!(
         stored_arns(&served.router).await,

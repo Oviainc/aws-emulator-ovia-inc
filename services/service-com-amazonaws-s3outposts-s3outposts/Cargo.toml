@@ -21,6 +21,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The AWS Outposts control plane this service reports the Outposts OF: an Outpost is
+# that service's resource, so the inventory is read from its store in-process rather
+# than copied here.
+service-com-amazonaws-outposts-outpostsolafservice = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

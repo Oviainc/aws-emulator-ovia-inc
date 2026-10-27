@@ -17,6 +17,8 @@ mod arn_minting;
 mod audit_records;
 #[path = "all/create_report_client_token.rs"]
 mod create_report_client_token;
+#[path = "all/create_report_conflict_message.rs"]
+mod create_report_conflict_message;
 #[path = "all/create_time_tag_merge.rs"]
 mod create_time_tag_merge;
 #[path = "all/dashboard_lifecycle.rs"]

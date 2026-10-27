@@ -18,17 +18,19 @@
 //!   that was submitted, byte for byte, and omits a name the identity does not
 //!   carry;
 //! * a document that is not an IAM resource-based policy, or one past the
-//!   documented 4 KB ceiling, is refused with the modeled `InvalidPolicy` error
-//!   and nothing is stored;
+//!   service's size ceiling, is refused with the modeled `InvalidPolicy` error
+//!   and nothing is stored, and a size refusal reports the size submitted;
 //! * an identity this account has not verified is refused by every one of these
 //!   operations ("this operation is for the identity owner only").
 
 use crate::harness::{call, element, elements, emulator, field, map_entries, xml_text, Field};
 use smithy_server_runtime::MultiServiceRouter;
 
-/// The documented ceiling on one policy document: `PutIdentityPolicyRequest$Policy`
-/// is "the text of the policy in JSON format. The policy cannot exceed 4 KB."
-const MAX_POLICY_BYTES: usize = 4 * 1024;
+/// The ceiling on one policy document: `PutIdentityPolicyRequest$Policy` is "the
+/// text of the policy in JSON format. The policy cannot exceed 4 KB", and the
+/// service enforces that 4 KB as a round 4,000 bytes — the number its own
+/// refusal names. Mirrors `crate::state::MAX_POLICY_BYTES`.
+const MAX_POLICY_BYTES: usize = 4_000;
 
 /// The documented size of an identity's policy collection:
 /// `GetIdentityPoliciesRequest$PolicyNames` is "a list of the names of policies
@@ -168,6 +170,13 @@ fn policy() -> String {
     policy_with_sid("AuthorizeOneSender")
 }
 
+/// The sentence the service answers for a document past the size ceiling: the
+/// submitted document's size in bytes, then the ceiling it passed, with the
+/// trailing space the service's text carries.
+fn size_refusal(size: usize) -> String {
+    format!("The policy size, {size}, is larger than the max policy size, {MAX_POLICY_BYTES}. ")
+}
+
 #[tokio::test]
 async fn list_reports_exactly_the_names_put_on_the_identity_in_one_stable_order() {
     // The rows differ along what the rule generalises over: how many policies the
@@ -282,7 +291,7 @@ async fn a_policy_document_is_stored_verbatim_and_read_back_by_name() {
             ),
         ),
         (
-            "a document at the 4 KB ceiling",
+            "a document at the size ceiling",
             policy_of_size(MAX_POLICY_BYTES),
         ),
     ];
@@ -349,7 +358,7 @@ async fn a_document_that_is_not_a_policy_is_refused_and_nothing_is_stored() {
     // the text is not JSON or is JSON that is not a policy document; the size
     // ceiling is a different rule and says so.
     let not_a_policy = "Unable to parse policy.";
-    let too_large = format!("Policy exceeds the maximum size of {MAX_POLICY_BYTES} bytes.");
+    let too_large = size_refusal(MAX_POLICY_BYTES + 1);
     let rows: [(&str, String, &str); 10] = [
         (
             "text that is not JSON at all",
@@ -389,7 +398,7 @@ async fn a_document_that_is_not_a_policy_is_refused_and_nothing_is_stored() {
             not_a_policy,
         ),
         (
-            "one byte past the 4 KB ceiling",
+            "one byte past the size ceiling",
             policy_of_size(MAX_POLICY_BYTES + 1),
             &too_large,
         ),
@@ -415,6 +424,61 @@ async fn a_document_that_is_not_a_policy_is_refused_and_nothing_is_stored() {
         assert!(
             listed.is_empty(),
             "case {case:?}: a refused put must store nothing, got {listed:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_size_ceiling_holds_at_the_byte_and_a_refusal_reports_the_size_submitted() {
+    // The rows differ ONLY in the size of an otherwise identical, valid policy
+    // document: each side of the ceiling, the byte on either side of it, and
+    // documents far past it. Every refusal names the size that was submitted, so
+    // no two of them carry the same sentence.
+    let rows: [(&str, usize); 6] = [
+        ("well under the ceiling", MAX_POLICY_BYTES / 2),
+        ("one byte under the ceiling", MAX_POLICY_BYTES - 1),
+        ("exactly at the ceiling", MAX_POLICY_BYTES),
+        ("one byte past the ceiling", MAX_POLICY_BYTES + 1),
+        ("a few hundred bytes past the ceiling", MAX_POLICY_BYTES + 562),
+        ("far past the ceiling", MAX_POLICY_BYTES * 4),
+    ];
+
+    for (case, size) in rows {
+        let router = emulator();
+        verify_email(&router, "sender@example.com").await;
+        let document = policy_of_size(size);
+        let (status, body) =
+            put_policy(&router, "sender@example.com", "Authorize", &document).await;
+
+        let accepted = size <= MAX_POLICY_BYTES;
+        let expected_status = if accepted { 200 } else { 400 };
+        assert_eq!(
+            status, expected_status,
+            "case {case:?} ({size} bytes): expected {expected_status}, got {status} with {body}"
+        );
+
+        let listed = policy_names(&router, "sender@example.com").await;
+        if accepted {
+            assert_eq!(
+                listed,
+                vec!["Authorize".to_string()],
+                "case {case:?} ({size} bytes): an accepted document is stored, got {listed:?}"
+            );
+            continue;
+        }
+
+        assert!(
+            body.contains("<Code>InvalidPolicy</Code>"),
+            "case {case:?} ({size} bytes): expected the modeled InvalidPolicy code, got {body}"
+        );
+        let expected_message = size_refusal(size);
+        assert!(
+            body.contains(&expected_message),
+            "case {case:?} ({size} bytes): expected the message {expected_message:?}, got {body}"
+        );
+        assert!(
+            listed.is_empty(),
+            "case {case:?} ({size} bytes): an oversized document is not stored, got {listed:?}"
         );
     }
 }
