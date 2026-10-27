@@ -45,6 +45,8 @@ mod bucket_location;
 mod bucket_logging;
 #[path = "all/bucket_metadata_configuration.rs"]
 mod bucket_metadata_configuration;
+#[path = "all/bucket_metadata_inventory_table_update.rs"]
+mod bucket_metadata_inventory_table_update;
 #[path = "all/bucket_metrics_configuration.rs"]
 mod bucket_metrics_configuration;
 #[path = "all/bucket_metrics_configuration_listing.rs"]

@@ -47,6 +47,8 @@ mod job_templates;
 mod jobs_query;
 #[path = "all/optional_free_text.rs"]
 mod optional_free_text;
+#[path = "all/output_preset_reference.rs"]
+mod output_preset_reference;
 #[path = "all/policy_enforcement.rs"]
 mod policy_enforcement;
 #[path = "all/policy_lifecycle.rs"]

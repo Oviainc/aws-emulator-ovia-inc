@@ -222,3 +222,11 @@ mod update_usage_plan;
 mod base_path_mapping_private_domain;
 #[path = "all/test_invoke_method_no_integration.rs"]
 mod test_invoke_method_no_integration;
+#[path = "all/models.rs"]
+mod models;
+#[path = "all/authorizer_in_use.rs"]
+mod authorizer_in_use;
+#[path = "all/gateway_response_parameter_mappings.rs"]
+mod gateway_response_parameter_mappings;
+#[path = "all/documentation_part_import_atomicity.rs"]
+mod documentation_part_import_atomicity;

@@ -290,20 +290,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .and_then(|table| table.encryption_configuration.as_ref()),
             ),
         ] {
-            let Some(encryption) = encryption else {
-                continue;
-            };
-            if encryption.sse_algorithm == crate::state::METADATA_TABLE_SSE_KMS_ALGORITHM
-                && encryption.kms_key_arn.is_none()
+            if let Some(message) =
+                crate::state::metadata_table_encryption_refusal(member, encryption)
             {
                 return Err(crate::scaffolded::Scaffolded::unmodeled(
                     crate::state::INVALID_ARGUMENT_CODE,
                     crate::state::INVALID_ARGUMENT_STATUS,
-                    format!(
-                        "{member}.EncryptionConfiguration names SseAlgorithm {:?} without a \
-                         KmsKeyArn; a KMS key ARN is required with that algorithm",
-                        encryption.sse_algorithm
-                    ),
+                    message,
                 ));
             }
         }

@@ -563,11 +563,35 @@ async fn the_deployed_configuration_reports_what_the_update_wrote() {
     );
     assert_eq!(
         target_after.get("FirstClassParameters"),
+        Some(&json!({ "TargetOrganizationalUnits": TARGET_OU })),
+        "case {case}: the deployed configuration must carry the common parameters the update \
+         wrote, got {target_after:?}"
+    );
+    // The listing reports only a definition's common parameters, so the whole map the
+    // update wrote — the type-specific option included — is read back through
+    // `GetConfiguration`.
+    let target_id = target_after["Id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case}: expected an Id, got {target_after:?}"));
+    let (status, deployed) = call(
+        &router,
+        "GET",
+        &format!("/getConfiguration/{target_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case}: GetConfiguration must succeed, got {status} / {deployed:?}"
+    );
+    assert_eq!(
+        deployed.get("Parameters"),
         Some(&json!({
             "TargetOrganizationalUnits": TARGET_OU,
             "TargetType": "instance",
         })),
-        "case {case}: the deployed configuration must carry the updated parameters, got {target_after:?}"
+        "case {case}: the deployed configuration must carry every updated parameter, got \
+         {deployed:?}"
     );
     assert_eq!(
         target_after.get("Type"),

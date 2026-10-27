@@ -26,10 +26,25 @@ use service_com_amazonaws_ssmquicksetup_quicksetup::ops::types::{
     STATUS_TYPE_VALUES, STATUS_VALUES,
 };
 use service_com_amazonaws_ssmquicksetup_quicksetup::state::{
-    MAX_FILTERS, MAX_FILTER_VALUES, MAX_ITEMS_LIMIT, QUICK_SETUP_TYPE_CATALOG, STATUS_INITIALIZING,
-    STATUS_SUCCEEDED, STATUS_TYPE_DEPLOYMENT, TRANSITION_SPAN,
+    COMMON_PARAMETER_KEYS, MAX_FILTERS, MAX_FILTER_VALUES, MAX_ITEMS_LIMIT,
+    QUICK_SETUP_TYPE_CATALOG, STATUS_INITIALIZING, STATUS_SUCCEEDED, STATUS_TYPE_DEPLOYMENT,
+    TRANSITION_SPAN,
 };
 use smithy_server_runtime::MultiServiceRouter;
+
+/// The common parameters of a stored parameter map: the entries a summary reports as
+/// its `FirstClassParameters`, taken from the set the crate publishes so this file
+/// writes no second copy of it. The subset rule itself is covered by
+/// `tests/all/first_class_parameters.rs`.
+fn common_parameters(parameters: &Value) -> Value {
+    let mut common = Map::new();
+    for key in COMMON_PARAMETER_KEYS {
+        if let Some(value) = parameters.get(*key) {
+            common.insert((*key).to_string(), value.clone());
+        }
+    }
+    Value::Object(common)
+}
 
 /// The region every request below signs for; every ARN must carry exactly this one.
 const REGION: &str = "us-west-2";
@@ -1678,18 +1693,21 @@ async fn a_stored_configuration_is_read_back_by_its_service_generated_id() {
                 "case {case}: the deployed configuration must report the published version it \
                  was deployed at ({version}), got {got:?}"
             );
-            // The create supplied the parameters; `GetConfiguration$Parameters` and the
-            // listing's `ConfigurationSummary$FirstClassParameters` are both that map.
+            // The create supplied the parameters; `GetConfiguration$Parameters` is that
+            // whole map, while the listing's `ConfigurationSummary$FirstClassParameters`
+            // is only its common parameters.
             let stored_parameters = got.get("Parameters").cloned().unwrap_or_else(|| json!({}));
             assert_eq!(
                 stored_parameters,
                 want.get("Parameters").cloned().unwrap_or_else(|| json!({})),
                 "case {case}: Parameters must come back as they were stored, got {got:?}"
             );
+            let common = common_parameters(&stored_parameters);
             assert_eq!(
-                Some(&stored_parameters),
                 summary.get("FirstClassParameters"),
-                "case {case}: the Get and the listing must report one stored parameter map, got {got:?}"
+                Some(&common),
+                "case {case}: the listing must report the common parameters {common:?} of the \
+                 map the Get reports, got {summary:?}"
             );
             assert_eq!(
                 got.get("Account").and_then(Value::as_str),

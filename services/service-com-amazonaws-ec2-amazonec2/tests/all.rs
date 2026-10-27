@@ -633,3 +633,8 @@ mod image_block_public_access;
 // mints and persists for the gateway it names, and what it refuses.
 #[path = "all/create_transit_gateway_route_table.rs"]
 mod create_transit_gateway_route_table;
+// Appended at the END for the same reason. What `DescribeTransitGatewayMeteringPolicies`
+// reports out of the metering policy store, and how the id list, the filters and the page
+// size narrow it.
+#[path = "all/transit_gateway_metering_policies.rs"]
+mod transit_gateway_metering_policies;

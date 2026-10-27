@@ -215,31 +215,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
-        // `ClientToken` idempotency, for as long as the token's validity window is open
-        // (`crate::state::CLIENT_TOKEN_VALIDITY`): the same token with the same body
-        // answers with the job the first call minted and creates nothing; with a
-        // different body it is a conflict, because that token already names another job.
-        // Past that window the token names nothing, so the call below falls through and
-        // mints a new job — which is what the model says a request carrying an expired
-        // token is.
-        if let Some(token) = input.client_token.as_deref() {
-            if let Some(job) = state.job_by_client_token(token, now) {
-                if job.request_fingerprint != fingerprint {
-                    return Err(StartSearchJobErrorModeled::ConflictException(ConflictException {
-                        message: format!(
-                            "ClientToken '{token}' was already used for a different StartSearchJob request"
-                        ),
-                        resource_id: job.identifier.clone(),
-                        resource_type: SEARCH_JOB_RESOURCE.to_string(),
-                    })
-                    .into());
-                }
-                return Ok(StartSearchJobOutput {
-                    search_job_arn: Some(job.arn.clone()),
-                    creation_time: Some(job.creation_time),
-                    search_job_identifier: Some(job.identifier.clone()),
-                });
-            }
+        // `ClientToken` idempotency, decided by the one replay rule both `Start`
+        // operations of this service follow (`crate::state::client_token_replay`): inside
+        // the token's validity window the same body answers with the job the first call
+        // minted and creates nothing, while a different body is a conflict, because that
+        // token already names another job. Past that window the token names nothing, so
+        // this falls through and a new job is minted — which is what the model says a
+        // request carrying an expired token is. The refusal names THIS operation and the
+        // search-job resource type; the rule itself lives in one place.
+        if let Some(job) = state
+            .search_job_replay(
+                input.client_token.as_deref(),
+                &fingerprint,
+                now,
+                Self::NAME,
+            )
+            .map_err(StartSearchJobErrorModeled::ConflictException)?
+        {
+            return Ok(StartSearchJobOutput {
+                search_job_arn: Some(job.arn.clone()),
+                creation_time: Some(job.creation_time),
+                search_job_identifier: Some(job.identifier.clone()),
+            });
         }
 
         // The tags this job would be stored with have to pass the admission rule every

@@ -423,6 +423,51 @@ pub const PARAMETER_TARGET_ACCOUNTS: &str = "TargetAccounts";
 /// organizational units to deploy the configuration to.
 pub const PARAMETER_TARGET_ORGANIZATIONAL_UNITS: &str = "TargetOrganizationalUnits";
 
+/// The `Parameters` keys that are COMMON to a configuration definition whatever Quick
+/// Setup configuration type it deploys: the keys that say where the definition is
+/// deployed.
+///
+/// Source: the per-type parameter tables documented on
+/// `ConfigurationDefinitionInput$Parameters` (`smithy_query(query="doc",
+/// shape="ConfigurationDefinitionInput", member="Parameters")`). Every type's table
+/// names where the configuration goes with these three keys and describes them in the
+/// same words; every OTHER key in those tables belongs to one type's own
+/// service-owned template (a conformance-pack list, a recorder's delivery bucket, a
+/// schedule, an agent toggle) and so is specific to that type rather than common to
+/// definitions.
+///
+/// This is the set a SUMMARY reports ([`first_class_parameters`]), as opposed to the
+/// full parameter map a definition carries, so the one place the distinction lives is
+/// here.
+pub const COMMON_PARAMETER_KEYS: &[&str] = &[
+    PARAMETER_TARGET_ACCOUNTS,
+    PARAMETER_TARGET_ORGANIZATIONAL_UNITS,
+    PARAMETER_TARGET_REGIONS,
+];
+
+/// The common parameters and values of a definition holding `parameters`: the entries
+/// whose keys are in [`COMMON_PARAMETER_KEYS`], and no others.
+///
+/// This is what both summary shapes report as their `FirstClassParameters`
+/// (`ConfigurationSummary` and `ConfigurationDefinitionSummary`, both documented as
+/// the common parameters and values for the configuration definition) — a listing
+/// reports the common parameters of a definition, never the type-specific options its
+/// full `Parameters` map also holds, which is why the model carries the two members
+/// separately and why a value may run to 40960 characters on the full one.
+///
+/// A key matches exactly, as it does everywhere else a parameter is read
+/// ([`ConfigurationParameters::parameter`]): a definition that spells a key
+/// differently names a parameter of its own type's template, not a common one. A
+/// definition carrying none of them reports an empty map rather than nothing, because
+/// the member reports what the definition holds.
+pub fn first_class_parameters(parameters: &BTreeMap<String, String>) -> HashMap<String, String> {
+    COMMON_PARAMETER_KEYS
+        .iter()
+        .filter_map(|key| parameters.get_key_value(*key))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
 /// Why a configuration definition whose parameters name no deployment target is
 /// refused.
 ///
@@ -444,6 +489,27 @@ pub const NO_DEPLOYMENT_TARGET_MESSAGE: &str =
 /// a published AWS quota; far above the number of Regions AWS publishes.
 pub const MAX_DEPLOYMENT_TARGETS: usize = 100;
 
+/// How many entries this service reads out of ONE comma-separated parameter value.
+///
+/// `ConfigurationParametersMap` lets a value run to 40960 characters, which is tens of
+/// thousands of comma-separated entries, while the deployments one definition fans out
+/// to are bounded by [`MAX_DEPLOYMENT_TARGETS`]: a target list naming more entries than
+/// that already names more deployments than this service serves, so it is refused
+/// whatever its further entries say. Reading stops one entry past that bound, so the
+/// work one request costs is bounded by the bound rather than by the length of the
+/// value it sent. Emulator resource guard, NOT a published AWS quota.
+pub const MAX_PARAMETER_LIST_ENTRIES: usize = MAX_DEPLOYMENT_TARGETS + 1;
+
+/// How many configurations this emulator will hold at once.
+///
+/// One create deploys one configuration per targeted account and Region of EVERY
+/// definition it carries, so its fan-out is the product of
+/// [`MAX_CONFIGURATION_DEFINITIONS`] and [`MAX_DEPLOYMENT_TARGETS`]; this bounds what
+/// one request may add to the store instead of letting that product stand. Emulator
+/// resource guard, NOT a published AWS quota, and far above what a manager of a
+/// realistic size deploys.
+pub const MAX_CONFIGURATIONS: usize = 2_000;
+
 /// Digits in an Amazon Web Services account id, the form a `TargetAccounts` entry
 /// takes.
 const ACCOUNT_ID_DIGITS: usize = 12;
@@ -458,14 +524,24 @@ pub struct DeploymentTarget {
 
 /// The entries of one comma-separated parameter value: each trimmed, empty entries
 /// dropped, repeats dropped, and the order the caller wrote them kept.
+///
+/// Repeats are recognised through a set rather than by re-scanning what has been kept,
+/// so one caller-sized value costs work proportional to its entries and not to their
+/// square, and reading stops at [`MAX_PARAMETER_LIST_ENTRIES`] — one entry past what
+/// may be deployed, which is enough for [`deployment_targets_rejection`] to refuse the
+/// value.
 pub fn comma_separated(value: Option<&str>) -> Vec<String> {
     let mut entries: Vec<String> = Vec::new();
+    let mut seen: ::std::collections::HashSet<&str> = ::std::collections::HashSet::new();
     for entry in value.unwrap_or_default().split(',') {
         let entry = entry.trim();
-        if entry.is_empty() || entries.iter().any(|seen| seen == entry) {
+        if entry.is_empty() || !seen.insert(entry) {
             continue;
         }
         entries.push(entry.to_string());
+        if entries.len() == MAX_PARAMETER_LIST_ENTRIES {
+            break;
+        }
     }
     entries
 }
@@ -824,6 +900,23 @@ pub fn start_teardown(summaries: &mut Vec<StatusSummaryRecord>, now: SystemTime)
     }
 }
 
+/// A configuration definition's stored parameter map, SHARED with the configurations
+/// deployed from that definition.
+///
+/// One definition fans out to up to [`MAX_DEPLOYMENT_TARGETS`] configurations, each
+/// carrying the parameters it was deployed with, and a parameter map may hold
+/// [`MAX_PARAMETERS`] values of up to the 40960 characters
+/// `ConfigurationParametersMap` allows: sharing one map keeps what a request stores
+/// proportional to what it sent instead of multiplying it by the fan-out. The map is
+/// never edited in place — an update replaces a definition's parameters wholesale with
+/// a new one — so no record observes another's write.
+pub type SharedParameters = ::std::sync::Arc<BTreeMap<String, String>>;
+
+/// A wire parameter map as the store shares it. The one place this conversion lives.
+pub fn to_shared_parameters(map: Option<HashMap<String, String>>) -> SharedParameters {
+    ::std::sync::Arc::new(to_btree_map(map))
+}
+
 /// One configuration definition of a stored manager, with the `Id` the service
 /// assigned it.
 #[derive(Debug, Clone)]
@@ -838,7 +931,7 @@ pub struct ConfigurationDefinitionRecord {
     /// none — so a caller can read which version was deployed. The member it is
     /// reported through is modelled optional, so the record keeps it optional too.
     pub type_version: Option<String>,
-    pub parameters: BTreeMap<String, String>,
+    pub parameters: SharedParameters,
     pub local_deployment_execution_role_name: Option<String>,
     pub local_deployment_administration_role_arn: Option<String>,
 }
@@ -862,15 +955,16 @@ impl ConfigurationDefinitionRecord {
 
     /// The modelled `ConfigurationDefinitionSummary` for this record.
     ///
-    /// `FirstClassParameters` are the definition's own parameters: this emulator
-    /// stores every parameter the create supplied and distinguishes no subset of
-    /// them, so reporting them is what the record holds.
+    /// `FirstClassParameters` are this definition's COMMON parameters
+    /// ([`first_class_parameters`]), a subset of the full `Parameters` map the record
+    /// stores and `to_configuration_definition` reports: a summary reports the
+    /// parameters common to a configuration definition, not the options of its type.
     pub fn to_summary(&self) -> ConfigurationDefinitionSummary {
         ConfigurationDefinitionSummary {
             id: Some(self.id.clone()),
             r#type: Some(self.type_.clone()),
             type_version: self.type_version.clone(),
-            first_class_parameters: Some(to_hash_map(&self.parameters)),
+            first_class_parameters: Some(first_class_parameters(&self.parameters)),
         }
     }
 }
@@ -943,6 +1037,25 @@ impl ConfigurationManagerRecord {
     }
 }
 
+/// Why a store already holding `held` configurations cannot take `planned` further
+/// ones, or `None` when it can.
+///
+/// A create deploys one configuration per targeted account and Region of every
+/// definition it carries, so the fan-out of ONE request is the product of the
+/// per-definition bounds; what the store holds is bounded by [`MAX_CONFIGURATIONS`]
+/// instead, and a request that would take it past that is refused before anything is
+/// deployed. The one place the bound is read, so a create and an update refuse alike.
+/// `held` is the store as the request found it, so a request that also replaces
+/// deployments of its own is measured against no less than it adds.
+pub fn configuration_capacity_rejection(held: usize, planned: usize) -> Option<String> {
+    (held.saturating_add(planned) > MAX_CONFIGURATIONS).then(|| {
+        format!(
+            "this request deploys {planned} configurations, more than this service can hold \
+             beside the {held} it already deploys (the maximum is {MAX_CONFIGURATIONS})"
+        )
+    })
+}
+
 /// One stored configuration: the deployment of one configuration definition, created
 /// with the manager that owns it and reclaimed when that manager goes.
 #[derive(Debug, Clone)]
@@ -957,7 +1070,9 @@ pub struct ConfigurationRecord {
     pub region: String,
     pub created_at: SystemTime,
     pub last_modified_at: SystemTime,
-    pub parameters: BTreeMap<String, String>,
+    /// The parameters this configuration was deployed with: the SAME map the definition
+    /// it deploys holds ([`SharedParameters`]), not a copy of it.
+    pub parameters: SharedParameters,
     pub status_summaries: Vec<StatusSummaryRecord>,
 }
 
@@ -965,7 +1080,9 @@ impl ConfigurationRecord {
     /// The configuration ONE deployment of `definition` is: the definition's own
     /// values, in the account and Region `target` names, submitted for deployment at
     /// `now`. The one place a deployed configuration is built, so a create and an
-    /// update that changes a definition's targets deploy the same record.
+    /// update that changes a definition's targets deploy the same record. The
+    /// definition's parameter map is SHARED with the record rather than copied into it
+    /// ([`SharedParameters`]), so a definition deployed to many targets is stored once.
     pub fn deployed(
         id: String,
         manager_arn: &str,
@@ -983,7 +1100,7 @@ impl ConfigurationRecord {
             region: target.region.clone(),
             created_at: now,
             last_modified_at: now,
-            parameters: definition.parameters.clone(),
+            parameters: SharedParameters::clone(&definition.parameters),
             status_summaries: fresh_summaries(now),
         }
     }
@@ -997,6 +1114,10 @@ impl ConfigurationRecord {
     }
 
     /// The modelled `ConfigurationSummary` for this record.
+    ///
+    /// `FirstClassParameters` are this configuration's COMMON parameters
+    /// ([`first_class_parameters`]), the same subset of the same map the definition's
+    /// own summary reports; the full map is what `GetConfiguration` answers.
     pub fn to_summary(&self) -> ConfigurationSummary {
         ConfigurationSummary {
             id: Some(self.id.clone()),
@@ -1007,7 +1128,7 @@ impl ConfigurationRecord {
             region: Some(self.region.clone()),
             account: Some(self.account.clone()),
             created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
-            first_class_parameters: Some(to_hash_map(&self.parameters)),
+            first_class_parameters: Some(first_class_parameters(&self.parameters)),
             status_summaries: Some(
                 self.status_summaries
                     .iter()
@@ -1174,7 +1295,7 @@ impl ComAmazonawsSsmquicksetupQuicksetupState {
             }
             configuration.type_ = definition.type_.clone();
             configuration.type_version = definition.type_version.clone();
-            configuration.parameters = definition.parameters.clone();
+            configuration.parameters = SharedParameters::clone(&definition.parameters);
             // Monotonic: the stamp never moves backwards, whatever the host clock does.
             configuration.last_modified_at = now.max(configuration.last_modified_at);
             restart_deployment(&mut configuration.status_summaries, now);

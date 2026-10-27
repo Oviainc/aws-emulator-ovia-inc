@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateModel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateModel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateModel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds a `Model` to a stored `RestApi`: the record `GetModel` reports and a method's
+//! `requestModels` entry names. A model is keyed by its NAME under the API that holds it,
+//! so a second create under one name is the modelled conflict.
+//!
+//! The request is refused BEFORE anything is stored when it does not describe a payload:
+//! a `name` that is not alphanumeric, a `contentType` that is not a media type, and — for
+//! a model typed as JSON — a `schema` that is not a JSON Schema document.
 //!
 //! ## Shape of an operation
 //!
@@ -91,6 +90,111 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::ModelEntry;
+
+/// From `CreateModel$schema`'s own documentation: "The maximum size of the model is 400
+/// KB."
+pub const MAX_MODEL_SCHEMA_CHARS: usize = 400 * 1024;
+
+/// Whether `name` is a model name: "The name of the model. Must be alphanumeric."
+/// (`CreateModel$name`) — so a non-empty run of ASCII letters and digits and nothing
+/// else. The model types the member as a bare `String` and declares no pattern for it,
+/// which is why the documented rule is applied here.
+pub fn is_model_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|character| character.is_ascii_alphanumeric())
+}
+
+/// Whether `media_type` types a JSON payload: the `application/json` the schema sentence
+/// names, and any media type carrying the structured `+json` suffix, which is the same
+/// JSON syntax under another name.
+fn is_json_media_type(media_type: &::mime::Mime) -> bool {
+    media_type.subtype() == ::mime::JSON || media_type.suffix() == Some(::mime::JSON)
+}
+
+/// The schema as it is STORED, once it has been read as the document the member
+/// documents.
+///
+/// From `CreateModel$schema`: "The schema for the model. For application/json models,
+/// this should be JSON schema draft 4 model" — so for a model typed as JSON the schema
+/// has to be a JSON Schema document, which is a JSON object; a value that is not even
+/// parseable JSON describes nothing. The text is kept verbatim rather than re-rendered,
+/// so what a later read reports is what the caller wrote, and a model typed as something
+/// else keeps its own body, whose syntax this sentence says nothing about.
+///
+/// `Err` carries WHY the schema could not be read, for the modelled `BadRequestException`.
+fn validated_schema(schema: Option<String>, content_type: &::mime::Mime) -> Result<Option<String>, String> {
+    let Some(schema) = schema else {
+        return Ok(None);
+    };
+    crate::state::bound_chars("schema", &schema, MAX_MODEL_SCHEMA_CHARS)?;
+    // A model may be created with no schema at all (`schema` is optional), so a blank one
+    // is stored as the absent member rather than refused as an unreadable document.
+    if schema.trim().is_empty() {
+        return Ok(None);
+    }
+    if is_json_media_type(content_type) {
+        let read = ::serde_json::from_str::<::serde_json::Value>(&schema).map_err(|_| {
+            crate::state::invalid_model_schema("the schema is not a JSON document")
+        })?;
+        if !read.is_object() {
+            return Err(crate::state::invalid_model_schema(
+                "the schema is not a JSON Schema document",
+            ));
+        }
+    }
+    Ok(Some(schema))
+}
+
+/// The `Model` body for a stored model — the one place this crate renders that shape, so
+/// `CreateModel` and `GetModel` cannot report one record differently.
+///
+/// `description` and `schema` are reported exactly as the record carries them: both are
+/// optional on the request, so a model created without one reports none rather than an
+/// empty value invented per read.
+pub fn model_body(entry: &ModelEntry) -> CreateModelOutput {
+    CreateModelOutput {
+        id: Some(entry.id.clone()),
+        name: Some(entry.name.clone()),
+        description: entry.description.clone(),
+        schema: entry.schema.clone(),
+        content_type: Some(entry.content_type.clone()),
+    }
+}
+
+/// Refuse a request this service will not store: a member past a store bound, or a value
+/// that does not describe a payload.
+///
+/// Called BEFORE the store lock is taken, so a refused request never reaches the records
+/// at all. Answers the schema as it is to be stored, because reading the schema is part
+/// of checking it.
+fn validated_input(input: &mut CreateModelInput) -> Result<(), String> {
+    use crate::state::{bound_chars, MAX_STRING_CHARS};
+
+    bound_chars("name", &input.name, MAX_STRING_CHARS)?;
+    if !is_model_name(&input.name) {
+        return Err(crate::state::invalid_model_name(&input.name));
+    }
+    if let Some(description) = &input.description {
+        bound_chars("description", description, MAX_STRING_CHARS)?;
+    }
+    bound_chars("contentType", &input.content_type, MAX_STRING_CHARS)?;
+    // "The content-type for the model" is the media type of the payload the model
+    // describes, read by the maintained media-type parser rather than a hand-written
+    // split, so a value that is not a media type is refused however it is malformed. A
+    // media type names a TYPE and a SUBTYPE, so a value carrying no subtype types nothing
+    // whether the parser reads it or not — this parser does read `application/`, so the
+    // check is what refuses it.
+    let content_type: ::mime::Mime = input
+        .content_type
+        .parse()
+        .map_err(|_| crate::state::invalid_model_content_type(&input.content_type))?;
+    if content_type.subtype().as_str().is_empty() {
+        return Err(crate::state::invalid_model_content_type(&input.content_type));
+    }
+    input.schema = validated_schema(input.schema.take(), &content_type)?;
+    Ok(())
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -164,18 +268,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateModel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateModelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateModel"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // Nothing caller-sized reaches the store unchecked, and the checks run before the
+        // store lock is taken, so a refused request leaves the API's models as they were.
+        let mut input = input;
+        validated_input(&mut input).map_err(|message| {
+            CreateModelErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+        })?;
+
+        let mut store = state.lock();
+        // Every refusal is decided BEFORE an identifier is minted, so a refused create
+        // leaves the store's counters where they were as well as its records: the id and
+        // the creation rank are taken only once this request is known to store a model.
+        // Checking and writing go through ONE lookup of the API, so what was checked and
+        // what is written can never be two different records.
+        {
+            let api = store.rest_apis.get(&input.rest_api_id).ok_or_else(|| {
+                CreateModelErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
+                })
+            })?;
+            // One model per request, and at most this many per API: the store cannot grow
+            // past the bound however many requests arrive.
+            if api.models.len() >= crate::state::MAX_MODELS_PER_API {
+                return Err(CreateModelErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        retry_after_seconds: None,
+                        message: Some(crate::state::quota_reached("Models", "API")),
+                    },
+                )
+                .into());
+            }
+            // A model's NAME is its identity under the API — it is the label `GetModel`
+            // addresses it by — so a second create under one name is refused rather than
+            // replacing the model the first one stored.
+            if api.models.contains_key(&input.name) {
+                return Err(CreateModelErrorModeled::ConflictException(ConflictException {
+                    message: Some(crate::state::model_already_exists(&input.name)),
+                })
+                .into());
+            }
+        }
+        let id = store.mint_id();
+        let sequence = store.next_sequence();
+        let api = store
+            .rest_apis
+            .get_mut(&input.rest_api_id)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let stored = ModelEntry {
+            id: id.clone(),
+            name: input.name.clone(),
+            description: input.description,
+            content_type: input.content_type,
+            schema: input.schema,
+            sequence,
+        };
+        // The answer is rendered from the record that is about to be stored, by the one
+        // renderer a read uses, so what the caller is told is what the store holds.
+        let body = model_body(&stored);
+        api.models.insert(input.name.clone(), stored);
+        // Everything below is owned, so the lock covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, what, and the outcome.
+        // Metadata only — never the schema or any other request content.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            rest_api = ?input.rest_api_id,
+            model = ?id,
+            outcome = "created",
+            "model created",
+        );
+        Ok(body)
     }
 }

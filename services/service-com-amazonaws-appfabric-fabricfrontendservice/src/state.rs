@@ -45,6 +45,16 @@ pub const INGESTION_STATE_ENABLED: &str = "enabled";
 /// The other one — see [`INGESTION_STATE_ENABLED`].
 pub const INGESTION_STATE_DISABLED: &str = "disabled";
 
+/// The `IngestionDestinationStatus` an ingestion destination whose
+/// configuration was ACCEPTED carries, from the model's enum of that name
+/// (`INGESTION_DESTINATION_STATUS_VALUES` = `Active` | `Failed`), whose own
+/// documentation states it: "`Active`: The ingestion destination is active and
+/// is ready to be used." Named here, beside the other modelled states this
+/// crate writes, so the handlers that write the status and the ones that read
+/// it cannot drift apart over a bare literal. What writes it is
+/// [`IngestionDestinationRecord::mark_accepted`].
+pub const INGESTION_DESTINATION_STATUS_ACTIVE: &str = "Active";
+
 /// How long after an enabled ingestion loses a destination association the
 /// disable AppFabric documents for it falls due.
 ///
@@ -732,6 +742,18 @@ pub struct IngestionDestinationRecord {
 }
 
 impl IngestionDestinationRecord {
+    /// Leave this destination in the state an ACCEPTED configuration puts it
+    /// in: the terminal [`INGESTION_DESTINATION_STATUS_ACTIVE`] status and no
+    /// status reason, which the model reserves for the other value of the same
+    /// enum ("Only present when the `status` of ingestion destination is
+    /// `Failed`"). The ONE place this crate writes that pair, so a destination a
+    /// create call accepted and one an update call accepted cannot drift apart
+    /// over it.
+    pub fn mark_accepted(&mut self) {
+        self.status = INGESTION_DESTINATION_STATUS_ACTIVE.to_string();
+        self.status_reason = None;
+    }
+
     /// The modelled `IngestionDestination` for this record.
     pub fn to_ingestion_destination(&self) -> IngestionDestination {
         IngestionDestination {
