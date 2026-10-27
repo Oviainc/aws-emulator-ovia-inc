@@ -17,6 +17,12 @@
 //! modelled `ValidationException` carrying the `ValidationExceptionReason` the model
 //! enumerates for that fault.
 //!
+//! The item is created "for the current or previous billing period", so a
+//! `BillingPeriodRange` whose `InclusiveStartBillingPeriod` names a month outside that
+//! window is refused with the modelled 400 `ValidationException` and nothing is minted
+//! (see [`crate::state::check_billing_period_range_is_modifiable`], the same check
+//! `DeleteCustomLineItem` applies).
+//!
 //! A `Tags` key in the reserved `aws:` namespace is refused with the modelled 400
 //! `ValidationException` and nothing is minted (see
 //! [`crate::state::check_tag_keys_not_reserved`]).
@@ -285,6 +291,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                      start billing period"
                         .to_string(),
                 ));
+            }
+            // "Creates a custom line item … for the current or previous billing
+            // period": the periods this operation may put an item into are bounded to
+            // that window, so a range starting outside it — an already closed month or
+            // one that has not begun — is refused and no item is minted (the same
+            // refusal `DeleteCustomLineItem` answers such a range with).
+            if let Err((reason, field, message)) =
+                crate::state::check_billing_period_range_is_modifiable(range)
+            {
+                return Err(validation(reason, field, message));
             }
         }
 

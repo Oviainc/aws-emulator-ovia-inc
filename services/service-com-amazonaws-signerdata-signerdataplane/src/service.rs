@@ -105,25 +105,30 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing name — and
-        // also one that names its ENDPOINT PREFIX, which the model gives as
-        // `data-signer` while the SigV4 signing name is `signer`. The default predicate
-        // only knows the signing name, so an anonymous request addressed at the
-        // service's own endpoint host (`data-signer.<region>.amazonaws.com`, where the
-        // routing key is the host's first label) would otherwise reach no service at
-        // all, even though it is addressed at exactly this one. A signed request still
-        // routes on the signing name, which the credential scope carries.
+        // Claim a request whose resolved routing key names THIS service's ENDPOINT,
+        // which the model gives as `data-signer` while the SigV4 signing name is
+        // `signer`. The router resolves the key from the credential scope first and
+        // falls back to the `Host` label, so `data-signer` is the key of a request
+        // addressed at this service's own endpoint host
+        // (`data-signer.<region>.amazonaws.com`) that carries no credential scope —
+        // exactly the traffic this endpoint answers alone.
         //
-        // That signing name is SHARED with AWS Signer
+        // The signing name itself is SHARED with AWS Signer
         // (`services/service-com-amazonaws-signer-wallabyservice`, endpoint `signer`),
-        // so the key alone would make both services claim every `signer`-signed request
-        // and the router would answer `500 AmbiguousService` for ALL of it. The claim is
-        // therefore also narrowed to this service's own modeled URI path space
-        // (`/revocations`, see `claims_modeled_path`); AWS Signer serves the rest of the
-        // signing name's traffic and declines this path space, which its own model binds
-        // to this data-plane endpoint via `@endpoint(hostPrefix: "data-")`.
+        // and it is NOT claimed here: a request signed for `signer` resolves to that
+        // key whichever host it was sent to, and the control plane holds the
+        // revocation records such a request is answered from
+        // (`RevokeSigningProfile` / `RevokeSignature` write them), so it serves the
+        // signing name's traffic whole. Claiming the shared name here as well would
+        // give every `signer`-signed request two claimants and the router would answer
+        // `500 AmbiguousService` for all of it.
+        //
+        // The claim is also narrowed to this service's own modeled URI path space
+        // (`/revocations`, see `claims_modeled_path`), so a request addressed at this
+        // endpoint on a path this model does not publish reaches the router's own
+        // `404 UnknownService` rather than this service.
         match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) if key == self.entry.identity().signing_name() || key == ENDPOINT_PREFIX => {
+            Some(key) if key == ENDPOINT_PREFIX => {
                 claims_modeled_path(parts, crate::ROUTE_PATH_SEGMENTS)
             }
             _ => false,

@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateControlPanel
-//! Implemented: validates the named cluster is stored, mints a control-panel ARN under
-//! it and persists it in [`crate::state`]; `DescribeControlPanel` projects the same
-//! stored record.
+//! Implemented: validates the named cluster is stored — a `ClusterArn` holding none is
+//! `ValidationException` (400), since the request only REFERENCES it — mints a
+//! control-panel ARN under it and persists it in [`crate::state`];
+//! `DescribeControlPanel` projects the same stored record.
 //!
 //! `RoutingControlCount` is COUNTED from the routing controls stored under this panel on
 //! every projection, so it is 0 here and tracks every later create and delete.
@@ -205,12 +206,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A control panel only exists inside a cluster, so the parent must be one this
-        // service actually stored.
+        // service actually stored. The request REFERENCES that cluster rather than
+        // addressing it, so an ARN holding none makes this request's input wrong — a
+        // 400 — where a read ADDRESSING the same ARN is the 404 the read path answers.
         if !guard.clusters.contains_key(&input.cluster_arn) {
-            return Err(CreateControlPanelErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: crate::state::not_found_message(
-                        crate::state::CLUSTER_NOUN,
+            return Err(CreateControlPanelErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::does_not_exist_message(
+                        crate::state::CLUSTER_RESOURCE,
                         &input.cluster_arn,
                     ),
                 },
@@ -218,17 +221,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A control panel name identifies the panel within its cluster.
+        // A control panel name identifies the panel within its cluster. A name already
+        // taken under the same parent is a refusal of the request's INPUT, not a
+        // transient collision a retry could win.
         if guard
             .ordered_control_panels(Some(&input.cluster_arn))
             .iter()
             .any(|panel| panel.name == input.control_panel_name)
         {
-            return Err(CreateControlPanelErrorModeled::ConflictException(
-                ConflictException {
-                    message: format!(
-                        "a control panel named \"{}\" already exists in {}",
-                        input.control_panel_name, input.cluster_arn
+            return Err(CreateControlPanelErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::already_exists_message(
+                        crate::state::CONTROL_PANEL_RESOURCE,
+                        &input.control_panel_name,
+                        crate::state::CLUSTER_RESOURCE,
+                        &input.cluster_arn,
                     ),
                 },
             )

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes from the repository a `resourceArn` names exactly the tags whose keys the
+//! request lists: every other tag the repository carries is left with the value it had,
+//! and a key the repository does not carry removes nothing, so the same removal asked for
+//! twice leaves the same tag set behind.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +145,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        // This operation is served from every Region ECR Public publishes an endpoint in,
+        // so nothing here reads the Region the request was signed for — see
+        // `crate::state::unsupported_in_region` for the one call that is Region-scoped.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(server_error());
+        };
+
+        // What the request asks for is settled before any repository is resolved: a tag
+        // key no caller may delete is a bad request whether or not the resource exists.
+        // `tagKeys` is modelled `@required`, so the request always carries the member.
+        let removed = crate::state::removed_tag_keys(&input.tag_keys).map_err(tag_error)?;
+
+        let mut store = state.lock();
+        // A `resourceArn` that is not a well-formed ECR Public repository ARN is a bad
+        // parameter; a well-formed one naming a repository this registry does not hold
+        // is a missing repository. Both are modelled, so neither is a 501.
+        let repository = store
+            .repository_by_arn_mut(&input.resource_arn)
+            .map_err(arn_error)?;
+        // A key the repository does not carry takes nothing away, so what is left is the
+        // tag set minus exactly the keys the request named.
+        repository.remove_tags(&removed);
+        drop(store);
+
+        // `UntagResourceResponse` models no members: the acknowledgement is the 200
+        // itself, and `ListTagsForResource` is what reports the tag set that is left.
+        Ok(UntagResourceOutput {})
     }
+}
+
+/// The modelled refusal for a `resourceArn` no repository of this registry answers to.
+fn arn_error(problem: crate::state::ResourceArnProblem) -> UntagResourceError {
+    match problem {
+        crate::state::ResourceArnProblem::Malformed(_) => {
+            // The clause the parse carries is the tag READ's wording for this member; a
+            // tagging write states the same refusal as `UNPARSEABLE_ARN_MESSAGE`, so this
+            // path words it rather than passing the parse's text through.
+            UntagResourceErrorModeled::InvalidParameterException(InvalidParameterException {
+                message: Some(crate::state::UNPARSEABLE_ARN_MESSAGE.to_string()),
+            })
+        }
+        crate::state::ResourceArnProblem::RepositoryNotFound(message) => {
+            UntagResourceErrorModeled::RepositoryNotFoundException(RepositoryNotFoundException {
+                message: Some(message),
+            })
+        }
+    }
+    .into()
+}
+
+/// The modelled refusal for a `tagKeys` list this registry will not act on, each
+/// [`crate::state::TagProblem`] on the error this operation models for it.
+fn tag_error(problem: crate::state::TagProblem) -> UntagResourceError {
+    let message = Some(problem.message().to_string());
+    match problem {
+        crate::state::TagProblem::InvalidTagParameter(_) => {
+            UntagResourceErrorModeled::InvalidTagParameterException(InvalidTagParameterException {
+                message,
+            })
+        }
+        // Removing tags only ever shrinks the set a repository carries, so the limit
+        // cannot be passed here; the arm exists because the problem type is shared with
+        // the write that CAN pass it.
+        crate::state::TagProblem::TooManyTags(_) => {
+            UntagResourceErrorModeled::TooManyTagsException(TooManyTagsException { message })
+        }
+    }
+    .into()
+}
+
+/// The modelled server fault for a state store this service could not reach.
+fn server_error() -> UntagResourceError {
+    UntagResourceErrorModeled::ServerException(ServerException {
+        message: Some("The ECR Public emulator could not reach its state store.".to_string()),
+    })
+    .into()
 }

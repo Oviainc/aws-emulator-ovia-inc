@@ -7,6 +7,12 @@
 //! settings become the cluster's own — together with a new cluster version — when
 //! the clock makes that operation due (see [`crate::state::Cluster::settle`]).
 //!
+//! The update is started through
+//! [`crate::state::ComAmazonawsKafkaKafkaState::start_connectivity_update`], the
+//! one path every update of this service comes through, so the cluster operation
+//! this call answers with is filed in the registry and the cluster-operation
+//! readers resolve that ARN.
+//!
 //! The call is accepted only for a cluster this endpoint's region holds, that is
 //! `ACTIVE`, and whose stored version is the one the request names; every other
 //! case is refused with the modelled error for it and changes nothing.
@@ -281,11 +287,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let operation_arn =
-            cluster.begin_connectivity_update(now, input.connectivity_info, input.zookeeper_access);
+        // The registry starts the operation: it records what changes, moves the
+        // cluster to UPDATING, stores the instant the change comes due and files
+        // the cluster operation this call answers with, so the ARN below
+        // resolves for every cluster-operation reader.
+        let cluster_arn = cluster.arn.clone();
+        let Some(operation_arn) = state.start_connectivity_update(
+            &region,
+            &cluster_arn,
+            now,
+            input.connectivity_info,
+            input.zookeeper_access,
+        ) else {
+            // Unreachable: the cluster was resolved above under the lock this
+            // call still holds, so the registry path finds the same record.
+            // Reported as a server fault rather than as a success that started
+            // nothing, which is how `UpdateStorage` answers the same case.
+            return Err(
+                UpdateConnectivityErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        invalid_parameter: None,
+                        message: Some(
+                            "the cluster vanished while its update was starting".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
         Ok(UpdateConnectivityOutput {
             // Both members come from the stored cluster, not from the request.
-            cluster_arn: Some(cluster.arn.clone()),
+            cluster_arn: Some(cluster_arn),
             cluster_operation_arn: Some(operation_arn),
         })
     }

@@ -41,6 +41,13 @@ mod violation_details;
 #[path = "all/admin_disassociation_first_in_last_out.rs"]
 mod admin_disassociation_first_in_last_out;
 
+// Declared beside them, for the same reason: inserting a `mod` into the sorted
+// list below conflicts with every other fms suite landing in the same window, and
+// this suite's name sorts right into the stretch of that list the late-sorting
+// suites keep landing in. The suite itself is an ordinary `tests/all/<name>.rs`.
+#[path = "all/resource_set_mutation_admin_scope.rs"]
+mod resource_set_mutation_admin_scope;
+
 #[path = "all/admin_account_disassociation.rs"]
 mod admin_account_disassociation;
 #[path = "all/admin_account_scopes.rs"]

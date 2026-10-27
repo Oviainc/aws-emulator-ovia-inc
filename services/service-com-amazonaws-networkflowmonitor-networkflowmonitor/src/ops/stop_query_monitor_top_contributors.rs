@@ -4,13 +4,14 @@
 //! Stops one top-contributors query of a monitor.
 //!
 //! A query that has not finished is moved to the terminal `CANCELED`, which
-//! `GetQueryStatusMonitorTopContributors` reports from then on. Stopping an already
-//! canceled query succeeds without changing anything — the operation is
-//! `@idempotent`, so a retried stop must not be refused — while stopping one that
-//! already finished is refused with the modelled `ValidationException` (HTTP 400):
-//! there is nothing left to stop. A `queryId` that is not a monitor
-//! top-contributors query of THIS monitor is refused the same way, that being the
-//! only client refusal this operation models.
+//! `GetQueryStatusMonitorTopContributors` reports from then on. A query that
+//! already reached a terminal status — finished or already canceled — keeps the
+//! outcome it reached and the stop succeeds anyway: the operation is `@idempotent`
+//! with an EMPTY output shape and models no `ResourceNotFoundException`, so it is a
+//! fire-and-forget whose retry (and whose defensive use on a cleanup path) must not
+//! be refused. A `queryId` that is not a monitor top-contributors query of THIS
+//! monitor is refused with the modelled `ValidationException` (HTTP 400), that
+//! being the only client refusal this operation models for an id.
 //!
 //! ## Shape of an operation
 //!
@@ -181,23 +182,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) else {
             return Err(
                 StopQueryMonitorTopContributorsErrorModeled::ValidationException(
-                    crate::state::field_validation(
-                        "queryId",
-                        format!(
-                            "query {} was not found for monitor {}",
-                            input.query_id, input.monitor_name
-                        ),
-                    ),
+                    crate::state::unknown_query(&input.query_id),
                 )
                 .into(),
             );
         };
 
-        if let Err(refusal) = query.stop() {
-            return Err(
-                StopQueryMonitorTopContributorsErrorModeled::ValidationException(refusal).into(),
-            );
-        }
+        // The stop asks only that the query not go on running, and reports no
+        // status of its own (the output shape is EMPTY): a query still QUEUED or
+        // RUNNING is canceled, and one that already reached a terminal status keeps
+        // the outcome it reached while this call succeeds, so a retry of a stop that
+        // already landed — and the defensive stop a cleanup path makes — is the
+        // no-op an idempotent delete is modelled for.
+        query.stop();
 
         Ok(StopQueryMonitorTopContributorsOutput {})
     }

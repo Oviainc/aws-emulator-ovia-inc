@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutRoutingRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutRoutingRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutRoutingRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: rewrites the conditions, the actions and the priority of the routing
+//! rule the path addresses, under the custom domain name that owns it, and reports the
+//! stored rule; 404 `NotFoundException` when that domain name or that rule does not
+//! exist, 400 `BadRequestException` for a body that is not a rule API Gateway could
+//! evaluate (the checks the create shares).
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +152,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutRoutingRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutRoutingRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        // The rule's own form is checked before anything is looked up: what makes a set
+        // of actions and conditions a rule API Gateway could evaluate depends on neither
+        // the store nor the clock. The one implementation lives in `state`, shared with
+        // the create, so the two writers of the resource cannot drift. `Priority` needs
+        // no check here — the boundary validator already refused anything outside
+        // `RoutingRulePriority`'s modelled range.
+        if let Err(message) = crate::state::validate_routing_rule(&input.actions, &input.conditions)
+        {
+            return Err(bad_request(&message));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutRoutingRule",
+            ));
+        };
+        let mut store = state.lock();
+
+        // This operation rewrites the rule its path ADDRESSES, so both resources of that
+        // path are resolved before anything is written: the domain name — under the
+        // `DomainNameId` the request named, when it named one — and then the rule it
+        // owns. A rule the account does not hold is reported as the missing resource it
+        // is.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutRoutingRule"))
+        // The api an action INVOKES is not resolved: `RoutingRuleActionInvokeApi` is a
+        // reference the rule carries rather than a resource the rule is written under,
+        // so it is stored exactly as the request wrote it, the same way the create
+        // stores it.
+        let Some(domain) = store
+            .domain_names
+            .get_mut(&input.domain_name)
+            .filter(|domain| domain.answers_to_requested_id(input.domain_name_id.as_deref()))
+        else {
+            return Err(not_found(crate::state::INVALID_DOMAIN_NAME_IDENTIFIER));
+        };
+        let Some(record) = domain.routing_rules.get_mut(&input.routing_rule_id) else {
+            return Err(not_found(crate::state::ROUTING_RULE_NOT_FOUND));
+        };
+
+        // Every member of the body belongs to the caller, so the stored rule takes them
+        // all; the id and the ARN are the rule's identity and are left as they were
+        // minted, so a client holding either keeps reaching this rule.
+        record.priority = input.priority;
+        record.conditions = input.conditions;
+        record.actions = input.actions;
+
+        // Report the STORED record, so what the caller is told is what a later
+        // GetRoutingRule reports.
+        let stored = record.to_wire();
+        Ok(PutRoutingRuleOutput {
+            actions: stored.actions,
+            conditions: stored.conditions,
+            priority: stored.priority,
+            routing_rule_arn: stored.routing_rule_arn,
+            routing_rule_id: stored.routing_rule_id,
+        })
     }
 }
+
+/// This operation's refusal of a request it models no more specific error for: the
+/// modelled `BadRequestException` ("The request is not valid, for example, the input is
+/// incomplete or incorrect"), whose message names the constraint that was not met.
+fn bad_request(message: &str) -> PutRoutingRuleError {
+    PutRoutingRuleErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// This operation's refusal of a request naming a resource the account does not hold:
+/// the modelled `NotFoundException` ("The resource specified in the request was not
+/// found").
+fn not_found(message: &str) -> PutRoutingRuleError {
+    PutRoutingRuleErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message.to_string()),
+        resource_type: ::std::option::Option::None,
+    })
+    .into()
+}
+

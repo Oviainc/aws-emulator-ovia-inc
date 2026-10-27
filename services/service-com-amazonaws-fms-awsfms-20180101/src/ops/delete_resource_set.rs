@@ -9,6 +9,13 @@
 //! and the organisation-scoped administrator gate is decided BEFORE the lookup,
 //! like every other Firewall Manager control-plane operation here.
 //!
+//! What the administrative scope governing the resource set DECIDES is whether
+//! the set may be removed at all: one reported `OUT_OF_ADMIN_SCOPE` is a set the
+//! administrator "can view … but they can't edit or delete", so the delete is
+//! refused with the modelled `InvalidOperationException`
+//! ([`crate::state::ComAmazonawsFmsAwsfms20180101State::resource_set_mutation_refusal`])
+//! and nothing is removed — "existing protections stay in place".
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -172,6 +179,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // The authorization gate, BEFORE the identifier is looked up.
         crate::state::require_administrator(&store, &crate::state::request_region(ctx.parts()))?;
+
+        // A resource set the administrative scope governing it does not cover is
+        // view-only, so the removal is refused on the SAME shared rule its edits
+        // take, and decided before anything is removed. An identifier that names
+        // no stored resource set reaches the not-found below instead: there is no
+        // record whose scope could refuse it.
+        if let Some(refusal) = store
+            .resource_sets
+            .get(&input.identifier)
+            .and_then(|existing| store.resource_set_mutation_refusal(existing))
+        {
+            return Err(
+                DeleteResourceSetErrorModeled::InvalidOperationException(refusal).into(),
+            );
+        }
 
         // Removing the record removes the set's document, its tags and the
         // resources associated with it in one step, because the record owns all
