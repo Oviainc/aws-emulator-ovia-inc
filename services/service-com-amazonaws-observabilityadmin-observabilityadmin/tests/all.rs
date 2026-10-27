@@ -31,3 +31,6 @@ mod telemetry_rules;
 
 #[path = "all/test_telemetry_pipeline.rs"]
 mod test_telemetry_pipeline;
+
+#[path = "all/validate_telemetry_pipeline_configuration.rs"]
+mod validate_telemetry_pipeline_configuration;
