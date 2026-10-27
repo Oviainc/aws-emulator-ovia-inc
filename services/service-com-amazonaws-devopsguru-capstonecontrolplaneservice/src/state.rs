@@ -1263,13 +1263,29 @@ impl FilterRejection {
     /// shrunk names no page at all. `scoped_by` names the request members the cursor is
     /// bound to.
     pub fn stale_cursor(operation: &str, collection: &str, scoped_by: &str) -> Self {
+        Self::cursor_names_no_page(operation, collection, Some(scoped_by))
+    }
+
+    /// The same refusal for a read that binds no selecting member: there is no member
+    /// set to scope the cursor to, so it is bound to the issuing operation alone and
+    /// the field message names no members.
+    pub fn unscoped_stale_cursor(operation: &str, collection: &str) -> Self {
+        Self::cursor_names_no_page(operation, collection, None)
+    }
+
+    /// The one wording and shape of a cursor refusal, shared by both forms above so
+    /// the scoped and unscoped answers cannot drift apart.
+    fn cursor_names_no_page(operation: &str, collection: &str, scoped_by: Option<&str>) -> Self {
         Self {
             message: format!("NextToken does not name a page of {collection}"),
             reason: "FIELD_VALIDATION_FAILED",
             field: "NextToken".to_string(),
-            field_message: format!(
-                "must be a token returned by an earlier {operation} for the same {scoped_by}"
-            ),
+            field_message: match scoped_by {
+                Some(members) => format!(
+                    "must be a token returned by an earlier {operation} for the same {members}"
+                ),
+                None => format!("must be a token returned by an earlier {operation}"),
+            },
         }
     }
 

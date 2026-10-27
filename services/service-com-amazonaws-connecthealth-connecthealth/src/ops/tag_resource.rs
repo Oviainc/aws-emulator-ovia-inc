@@ -75,8 +75,9 @@
 //! as a 400 `ValidationException` (`crate::scaffolded::Scaffolded::validation`): the model
 //! bounds `TagKey` at 1..128 and `TagValue` at 0..256, states the reserved namespace
 //! nowhere, and declares no error shape for a bad input, so that is the only channel for
-//! it. The check itself is [`crate::service::tag_bounds::violation`], shared with
-//! `CreateDomain`.
+//! it. The check itself is [`crate::service::tag_bounds::accepted_entries`], shared with
+//! `CreateDomain` — and it is decided from the request alone, so it is decided BEFORE the
+//! ARN is resolved and before the count above, the same place `CreateDomain` decides it.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -193,6 +194,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::region_of(ctx);
         let now = ::std::time::SystemTime::now();
 
+        // The model bounds a tag key at 1..128 characters and a value at 0..256
+        // (`smithy_query(query="shape",shape="TagMap")`) and the service reserves a key
+        // namespace of its own; checked here as well because a constraint on a MAP's key
+        // or value is not one the boundary walk can refuse through the member it was bound
+        // to, and a rule the model does not state is not one it knows at all. The SAME
+        // check `CreateDomain` applies to the tags a create carries, in the same place:
+        // it is decided from the request alone, so it is decided before any state is read
+        // — before the ARN below is resolved and before the merge is bounded — which is
+        // where the boundary would have decided it. So neither operation enforces half
+        // the rule, and neither answers a different refusal for one map. Nothing is
+        // written: the store has not even been looked at yet.
+        let requested_tags = crate::service::tag_bounds::accepted_entries(input.tags)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
         let mut store = state.lock();
         // Every handler materialises the deletions the CLOCK already made due first, so
         // the ARN of a resource whose deletion has fallen due no longer resolves here.
@@ -214,18 +229,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The model bounds a tag key at 1..128 characters and a value at 0..256
-        // (`smithy_query(query="shape",shape="TagMap")`) and the service reserves a key
-        // namespace of its own; checked here as well because a constraint on a MAP's key
-        // or value is not one the boundary walk can refuse through the member it was bound
-        // to, and a rule the model does not state is not one it knows at all. The SAME
-        // check `CreateDomain` applies to the tags a create carries, so neither can
-        // enforce half the rule — and a refusal is raised before the merge below, so it
-        // writes nothing.
-        if let Some(violation) = crate::service::tag_bounds::violation(input.tags.iter()) {
-            return Err(crate::scaffolded::Scaffolded::validation(violation));
-        }
-
         // The limit is on the resource's tag SET, so it is the merged set that is
         // bounded: re-tagging keys the resource already carries is always accepted,
         // while new keys that would carry it past the cap are refused. The merge and the
@@ -234,7 +237,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // because the set is only computed here.
         let merged = crate::service::tag_bounds::merged_within_cap(
             store.tags_for(&input.resource_arn),
-            input.tags,
+            requested_tags,
         )
         .map_err(|count| {
             TagResourceErrorModeled::ServiceQuotaExceededException(

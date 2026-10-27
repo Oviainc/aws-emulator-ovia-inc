@@ -47,6 +47,8 @@ mod shared_pagination_policy;
 mod start_patient_insights_job_write_discipline;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_bound_precedence.rs"]
+mod tag_bound_precedence;
 #[path = "all/tag_bound_unit.rs"]
 mod tag_bound_unit;
 #[path = "all/tag_count_cap.rs"]

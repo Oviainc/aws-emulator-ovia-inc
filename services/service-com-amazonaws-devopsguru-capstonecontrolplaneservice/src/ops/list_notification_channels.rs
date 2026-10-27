@@ -173,16 +173,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.next_token.as_deref(),
         )
         .ok_or_else(|| -> ListNotificationChannelsError {
-            ListNotificationChannelsErrorModeled::ValidationException(ValidationException {
-                message: "NextToken does not name a page of this account's notification channels"
-                    .to_string(),
-                reason: Some("FIELD_VALIDATION_FAILED".to_string()),
-                fields: Some(vec![ValidationExceptionField {
-                    name: "NextToken".to_string(),
-                    message: "must be a token returned by an earlier ListNotificationChannels"
-                        .to_string(),
-                }]),
-            })
+            ListNotificationChannelsErrorModeled::ValidationException(
+                // This listing binds no selecting member, so its cursor is scoped to
+                // the operation alone.
+                crate::state::FilterRejection::unscoped_stale_cursor(
+                    "ListNotificationChannels",
+                    "this account's notification channels",
+                )
+                .validation_exception(),
+            )
             .into()
         })?;
 

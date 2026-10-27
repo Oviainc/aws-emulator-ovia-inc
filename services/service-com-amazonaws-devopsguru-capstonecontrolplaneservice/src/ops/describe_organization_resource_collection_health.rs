@@ -269,18 +269,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         let invalid_next_token = || -> DescribeOrganizationResourceCollectionHealthError {
             DescribeOrganizationResourceCollectionHealthErrorModeled::ValidationException(
-                ValidationException {
-                    message:
-                        "NextToken does not name a page of this organization resource collection's health"
-                            .to_string(),
-                    reason: Some("FIELD_VALIDATION_FAILED".to_string()),
-                    fields: Some(vec![ValidationExceptionField {
-                        name: "NextToken".to_string(),
-                        message:
-                            "must be a token returned by an earlier DescribeOrganizationResourceCollectionHealth for the same OrganizationResourceCollectionType, AccountIds and OrganizationalUnitIds"
-                                .to_string(),
-                    }]),
-                },
+                crate::state::FilterRejection::stale_cursor(
+                    "DescribeOrganizationResourceCollectionHealth",
+                    "this organization resource collection's health",
+                    "OrganizationResourceCollectionType, AccountIds and OrganizationalUnitIds",
+                )
+                .validation_exception(),
             )
             .into()
         };

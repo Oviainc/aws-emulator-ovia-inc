@@ -32,6 +32,7 @@ use service_com_amazonaws_medialive_medialive::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::support::resolved_network_ids;
 use crate::wire::{call, error_code, error_message, medialive, ACCOUNT};
 
 /// The cluster collection URI `CreateCluster` and `ListClusters` are bound to
@@ -184,6 +185,10 @@ async fn create_cluster_holds_its_strings_to_the_lengths_the_store_keeps() {
         if member == "requestId" {
             body["requestId"] = json!(value.clone());
         }
+        // The networks the mappings name are put in the account first: a mapping
+        // may only name a network this account holds, so the refusal each row is
+        // about stays the one it varies.
+        let body = resolved_network_ids(&router, body).await;
 
         let (status, answer) = create(&router, body.clone()).await;
         assert_eq!(

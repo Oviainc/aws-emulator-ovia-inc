@@ -70,7 +70,9 @@
 //!   `ListPresets` the presets through [`page_of_presets`], over at most [`MAX_PRESETS`]
 //!   records. Each of those is a thin statement of its own documented defaults over
 //!   [`page_of_records`], which is where the ordering, the cursor and the page size
-//!   actually live, for every kind of record this service lists.
+//!   actually live, for every kind of record this service lists; the SET a `listBy`
+//!   listing reports — the kind of record its `listBy` selects, narrowed to the `category`
+//!   the request names — comes from [`records_listed_by`], the one place that states it.
 //! * [`ComAmazonawsMediaconvertMediaconvertState::rearm_queue`] — the one other walk over
 //!   the job set — runs only when `UpdateQueue` sets a queue back to `ACTIVE`, and is
 //!   likewise bounded by `MAX_JOBS`, as `job_counts` is.
@@ -3360,6 +3362,56 @@ impl ListBySortKey {
     }
 }
 
+/// A record whose listing selects it with a `listBy` and a `category`.
+///
+/// Implemented by the two kinds of record whose listing takes both members — a job
+/// template and a preset — so [`records_listed_by`] owns the one selection rule they
+/// share. `is_system` comes from [`NamedRecord`], which already states which records are
+/// built in for the create and delete paths, so the set half of a listing reads the same
+/// property those do.
+pub trait ListedRecord: NamedRecord {
+    /// The `Category` the record is stored under, or `None` for one stored under no
+    /// category at all.
+    fn record_category(&self) -> Option<&str>;
+}
+
+impl ListedRecord for JobTemplateRecord {
+    fn record_category(&self) -> Option<&str> {
+        self.category.as_deref()
+    }
+}
+
+impl ListedRecord for PresetRecord {
+    fn record_category(&self) -> Option<&str> {
+        self.category.as_deref()
+    }
+}
+
+/// The records a request's `listBy` and `category` select, out of every record of that
+/// kind the account holds.
+///
+/// ONE place that owns the SET a `listBy` listing reports, as [`page_of_records`] owns its
+/// ordering, cursor and page size, so no two such listings can drift:
+///
+/// * `listBy` chooses WHICH set: its [`LIST_BY_SYSTEM`] value selects the built-in records,
+///   the ones a caller can neither modify nor delete, and every other value — including
+///   none at all, which names only an ordering key — the account's own records.
+/// * `category` keeps only the records stored under exactly that category, so a record
+///   stored under none matches no category a caller can name ("specify a ... category to
+///   limit responses to only [the records] from that category"); a request naming no
+///   category narrows nothing.
+pub fn records_listed_by<'a, R: ListedRecord + 'a>(
+    records: impl Iterator<Item = &'a R> + 'a,
+    list_by: Option<&str>,
+    category: Option<&'a str>,
+) -> impl Iterator<Item = &'a R> + 'a {
+    let wanted_built_in = list_by == Some(LIST_BY_SYSTEM);
+    records.filter(move |record| {
+        record.is_system() == wanted_built_in
+            && category.is_none_or(|want| record.record_category() == Some(want))
+    })
+}
+
 /// The page of `queues` `ListQueues` reports, ordered on the key `list_by` names in the
 /// direction `order` names, through [`page_of_records`].
 ///
@@ -3395,8 +3447,8 @@ pub fn page_of_queues<'a>(
 /// listing's default key is the NAME one, which is the only way it differs from the queue
 /// listing.
 ///
-/// `presets` is whatever set the handler selected (a `Type`, a category): choosing the set
-/// is the handler's business, ordering and paging it is [`page_of_records`]'s.
+/// `presets` is whatever set was selected (a `Type`, a category), which is
+/// [`records_listed_by`]'s business; ordering and paging it is [`page_of_records`]'s.
 ///
 /// `resume_from` is the ordering key a caller's `nextToken` decoded to.
 pub fn page_of_presets<'a>(
@@ -3423,8 +3475,8 @@ pub fn page_of_presets<'a>(
 /// chronologically by CREATION_DATE. If you don't specify, the service will list them by
 /// name" — so this listing's default key is the NAME one, as the preset listing's is.
 ///
-/// `job_templates` is whatever set the handler selected (a `Type`, a category): choosing
-/// the set is the handler's business, ordering and paging it is [`page_of_records`]'s.
+/// `job_templates` is whatever set was selected (a `Type`, a category), which is
+/// [`records_listed_by`]'s business; ordering and paging it is [`page_of_records`]'s.
 ///
 /// `resume_from` is the ordering key a caller's `nextToken` decoded to.
 pub fn page_of_job_templates<'a>(

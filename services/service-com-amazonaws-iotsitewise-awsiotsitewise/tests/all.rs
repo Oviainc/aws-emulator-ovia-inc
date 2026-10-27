@@ -564,3 +564,10 @@ mod list_dataset_data_segments;
 #[path = "all/time_series_binding_touches_the_asset.rs"]
 mod time_series_binding_touches_the_asset;
 
+// Declared at the very end, after every suite above, for the reason the notes
+// higher up give: both stretches above are where every concurrent iotsitewise
+// change inserts a declaration of its own. Fold it into the sorted list once the
+// churn settles.
+#[path = "all/list_access_policies.rs"]
+mod list_access_policies;
+

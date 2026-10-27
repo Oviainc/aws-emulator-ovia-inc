@@ -6,12 +6,14 @@
 //! back out of that store.
 //!
 //! The cluster slice owns the documented rules (`Name` "unique in the AWS
-//! account", the store's cap, the mint and the `CREATING` -> `ACTIVE`
+//! account", the bound on the mapping list, the networks those mappings name,
+//! the store's cap, the mint and the `CREATING` -> `ACTIVE`
 //! transition the clock owes a created cluster): see
 //! [`crate::state::ComAmazonawsMedialiveMedialiveState::insert_cluster`]. This
 //! handler validates the request's lengths, honours the `@idempotencyToken`
 //! retry and turns a [`crate::state::ClusterRefusal`] into this operation's own
-//! modelled error.
+//! modelled error — including the one for a mapping that names a network this
+//! account does not hold.
 //!
 //! ## Shape of an operation
 //!
@@ -207,28 +209,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::MAX_REQUEST_ID_LEN,
         )?;
 
-        // The mapping list is bounded BEFORE anything is written, so a refused
-        // request stores no cluster: the bound is what keeps the network side's
-        // per-read `AssociatedClusterIds` derivation
-        // (`clusters_using_network`, which scans each stored cluster's mappings)
-        // bounded too.
-        let mappings = input
-            .network_settings
-            .as_ref()
-            .and_then(|settings| settings.interface_mappings.as_ref())
-            .map_or(0, Vec::len);
-        if mappings > crate::state::MAX_CLUSTER_INTERFACE_MAPPINGS {
-            return Err(
-                CreateClusterErrorModeled::BadRequestException(BadRequestException {
-                    message: Some(format!(
-                        "networkSettings.interfaceMappings takes at most {} entries, but was {mappings}",
-                        crate::state::MAX_CLUSTER_INTERFACE_MAPPINGS
-                    )),
-                })
-                .into(),
-            );
-        }
-
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
 
@@ -280,6 +260,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Err(crate::state::ClusterRefusal::NameAlreadyInUse) => {
                 return Err(CreateClusterErrorModeled::ConflictException(ConflictException {
                     message: Some(crate::state::NAME_ALREADY_IN_USE_MESSAGE.to_string()),
+                })
+                .into());
+            }
+            // The mapping list this emulator stores for one cluster is bounded,
+            // which is what keeps the network side's per-read
+            // `AssociatedClusterIds` derivation (`clusters_using_network`, which
+            // scans each stored cluster's mappings) bounded too: a longer list
+            // is refused with the shared wording the update is refused with,
+            // and no cluster is stored.
+            Err(crate::state::ClusterRefusal::TooManyInterfaceMappings { count }) => {
+                return Err(CreateClusterErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(crate::state::too_many_cluster_interface_mappings_message(
+                        count,
+                    )),
+                })
+                .into());
+            }
+            // An `InterfaceMapping`'s `NetworkId` is "the ID of the network
+            // that you want to connect to the specified logicalInterfaceName",
+            // so a mapping naming a network this account does not hold is a
+            // request that cannot be carried out: it is refused with this
+            // operation's own modelled client error, worded by the shared
+            // helper every unresolvable reference of this service is refused
+            // with, and no cluster is stored.
+            Err(crate::state::ClusterRefusal::UnknownMappedNetwork { index, network_id }) => {
+                return Err(CreateClusterErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(crate::state::unknown_reference_message(
+                        &crate::state::mapped_network_member(index),
+                        "Network",
+                        &network_id,
+                    )),
                 })
                 .into());
             }
