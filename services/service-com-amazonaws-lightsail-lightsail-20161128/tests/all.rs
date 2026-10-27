@@ -175,6 +175,8 @@ mod instance_start_addresses;
 mod inverted_time_window;
 #[path = "all/key_pair_delete.rs"]
 mod key_pair_delete;
+#[path = "all/key_pair_listing.rs"]
+mod key_pair_listing;
 #[path = "all/key_pair_read.rs"]
 mod key_pair_read;
 #[path = "all/known_host_keys_delete.rs"]

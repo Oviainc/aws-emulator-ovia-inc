@@ -165,7 +165,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !store.jobs.contains_key(&input.name) {
             return Err(ListJobRunsErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                    message: Some(crate::state::not_found_message("Job", &input.name)),
                 },
             )
             .into());

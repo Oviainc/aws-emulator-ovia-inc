@@ -222,8 +222,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `Scope` and `PolicyUsageFilter` each name one value of a modelled enum, and
         // the boundary validator has already refused any value outside the declared
-        // set (400 `ValidationException`), so reaching here means both carry a value
-        // the model declares.
+        // set (400 `ValidationError`, worded by `crate::service`), so reaching here
+        // means both carry a value the model declares.
 
         // WHOSE policies the request asks about: "to list only Amazon Web Services
         // managed policies, set Scope to AWS. To list only the customer managed

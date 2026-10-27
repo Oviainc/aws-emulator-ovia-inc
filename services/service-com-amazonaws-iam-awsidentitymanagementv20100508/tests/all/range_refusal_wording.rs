@@ -10,7 +10,8 @@
 //! failed to satisfy constraint: Member must have {value,length} {greater,less} than or
 //! equal to <bound>`), while the other classes of boundary refusal — a string outside its
 //! `@pattern`, an absent required member — keep the sentence the framework states with the
-//! rejected value in it.
+//! rejected value in it. A value outside an enumerated set is stated value-free too, and
+//! is read back by `tests/all/enum_refusal_wording.rs`.
 //!
 //! Each suite is a TABLE whose rows differ along what the rule generalises over: which
 //! member carries the bound and which operation takes it, whether the bound is a `@range`
@@ -378,8 +379,10 @@ struct EchoedCase<'a> {
     value: &'a str,
 }
 
-/// RULE: only a DECLARED BOUND is stated value-free — a string outside its `@pattern` is
-/// another class and keeps the sentence the framework states, the rejected value included.
+/// RULE: a string outside its `@pattern` is another constraint class and keeps the
+/// sentence the framework states, the rejected value included — the value-free clause
+/// belongs to the classes this service states that way (a declared bound, and an
+/// enumerated set).
 #[tokio::test]
 async fn another_constraint_class_keeps_the_frameworks_own_sentence() {
     let router = router();

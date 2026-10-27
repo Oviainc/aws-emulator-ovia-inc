@@ -33,6 +33,8 @@ mod shard_listing;
 mod shard_scaling;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/stream_encryption.rs"]
+mod stream_encryption;
 #[path = "all/stream_lifecycle.rs"]
 mod stream_lifecycle;
 #[path = "all/stream_removal.rs"]

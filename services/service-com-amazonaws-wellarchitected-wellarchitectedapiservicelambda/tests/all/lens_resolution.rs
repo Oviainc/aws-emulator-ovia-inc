@@ -87,11 +87,10 @@ fn stored_templates(client: &Client) -> usize {
     store.review_templates.len()
 }
 
-/// How many workloads the store holds, the counterpart of [`stored_templates`].
+/// How many workloads the store holds, the counterpart of [`stored_templates`] — the one
+/// counter this crate's suites share (`super::workload_harness::stored_workload_count`).
 fn stored_workloads(client: &Client) -> usize {
-    let state = client.store();
-    let store = state.lock();
-    store.workloads.len()
+    super::workload_harness::stored_workload_count(client)
 }
 
 /// The `Lenses` a stored review template reports through `GetReviewTemplate`.

@@ -9,6 +9,9 @@ build = "build.rs"
 [dependencies]
 # The shared request-claim rule for a SigV4 signing name several services share.
 service-common = { path = "../common" }
+# The data-automation build-time service: it owns the projects and blueprints a
+# submission references, so this service resolves those references against its store.
+service-com-amazonaws-bedrockdataautomation-amazonbedrockkeystonebuildtimeservice = { workspace = true }
 engine = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
@@ -30,6 +33,11 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Percent-encoding for the ARN the build-time service binds in an `@httpLabel` path
+# segment, which the reference-resolution suite creates and releases its fixtures
+# through: the encoding is the crate's, as the sibling apigateway/medialive suites do it,
+# rather than another hand-written copy of RFC 3986.
+percent-encoding = "2"
 # The integration tests poll a job across a clock-owed transition with
 # `tokio::time::sleep`; the feature is enabled here so the library target does not carry
 # it.

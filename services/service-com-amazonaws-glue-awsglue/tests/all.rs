@@ -83,6 +83,8 @@ mod form_type_deletion;
 mod form_types;
 #[path = "all/get_mapping.rs"]
 mod get_mapping;
+#[path = "all/get_plan.rs"]
+mod get_plan;
 #[path = "all/get_table_entity_not_found.rs"]
 mod get_table_entity_not_found;
 #[path = "all/glossaries.rs"]

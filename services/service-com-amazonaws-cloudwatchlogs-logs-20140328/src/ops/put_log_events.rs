@@ -440,16 +440,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let accepted_any = !batch.is_empty();
         // The messages that were actually STORED, each with its own timestamp: the events an
-        // Embedded Metric Format document can be extracted from below. Taken only when this
-        // group extracts them, so a suppressed group copies nothing.
-        let stored_messages: Vec<(i64, String)> = if extract_emf_metrics {
-            batch
-                .iter()
-                .map(|event| (event.timestamp, event.message.clone()))
-                .collect()
-        } else {
-            Vec::new()
-        };
+        // Embedded Metric Format document can be extracted from below. Taken whether or not
+        // this group extracts them, because a suppressed document is still accounted for.
+        let stored_messages: Vec<(i64, String)> = batch
+            .iter()
+            .map(|event| (event.timestamp, event.message.clone()))
+            .collect();
         let added_bytes: i64 = batch
             .iter()
             .map(crate::state::StoredEvent::stored_bytes)
@@ -513,11 +509,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the metrics that document declares — "EMF metric creation is enabled for all log
         // groups" unless an account-level metric extraction policy selects this group — so
         // the datapoints are extracted from the events that were actually STORED, stamped
-        // with each event's own timestamp.
+        // with each event's own timestamp. A policy that suppresses this group publishes
+        // none of them and counts the skipped documents instead, so a client can see that
+        // extraction was disabled rather than broken.
         let extracted: Vec<crate::state::emf::ExtractedDatapoint> = stored_messages
             .iter()
             .flat_map(|(timestamp, message)| {
-                crate::state::emf::extracted_datapoints(message, *timestamp)
+                if extract_emf_metrics {
+                    crate::state::emf::extracted_datapoints(message, *timestamp)
+                } else {
+                    crate::state::emf::suppressed_datapoints(
+                        message,
+                        *timestamp,
+                        &input.log_group_name,
+                    )
+                }
             })
             .collect();
         // The metric store is written with no log-store guard held, so the two services'

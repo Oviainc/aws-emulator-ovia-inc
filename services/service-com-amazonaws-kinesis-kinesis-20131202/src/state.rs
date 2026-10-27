@@ -123,6 +123,30 @@ pub const SHARD_WRITE_MI_BPS: i32 = 1;
 /// encrypted reports `NONE`.
 pub const ENCRYPTION_TYPE_NONE: &str = "NONE";
 
+/// The server-side encryption a stream carries once it is encrypted with a KMS key, which
+/// is also the only `EncryptionType` either encryption operation accepts: "The encryption
+/// type. The only valid value is KMS" (`StopStreamEncryptionInput$EncryptionType`).
+pub const ENCRYPTION_TYPE_KMS: &str = "KMS";
+
+/// How long after an encryption change the stream's `UPDATING` -> `ACTIVE` transition falls
+/// due. A CHOSEN span, not an AWS-documented duration ("Stopping encryption normally takes a
+/// few seconds to complete, but it can take minutes" names no value): it only has to be
+/// non-zero, so a caller that reads the stream straight after the change still observes
+/// `UPDATING`. The instant it falls due is stored on the record and never slept on.
+pub const ENCRYPTION_UPDATE_DELAY: Duration = Duration::from_millis(500);
+
+/// How many times ONE kind of encryption change may be made to one stream inside
+/// [`ENCRYPTION_CHANGE_WINDOW`]: "You can successfully disable server-side encryption 25
+/// times in a rolling 24-hour period" (`StopStreamEncryption`) and "You can successfully
+/// apply a new Amazon Web Services KMS key for server-side encryption 25 times in a rolling
+/// 24-hour period" (`StartStreamEncryption`) — one ceiling per kind, so enabling and
+/// disabling are counted separately against it.
+pub const MAX_ENCRYPTION_CHANGES_PER_WINDOW: usize = 25;
+
+/// The rolling window [`MAX_ENCRYPTION_CHANGES_PER_WINDOW`] encryption changes are counted
+/// over: the "rolling 24-hour period" both encryption operations document.
+pub const ENCRYPTION_CHANGE_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// The most shards one stream of this emulator holds. `ShardCount` is modelled `range
 /// 1..` with no maximum, so a create past this one is refused rather than allocated — and
 /// the request's count is checked against it BEFORE a shard map is sized from it.
@@ -635,6 +659,16 @@ pub struct Stream {
     /// ([`MAX_RESHARDS_PER_WINDOW`]) is counted over. Pruned to [`RESHARD_WINDOW`] by the
     /// change that counts it, so it holds at most that many instants.
     pub reshards: Vec<SystemTime>,
+    /// The instants a KMS key was applied to the stream at, youngest last — what the
+    /// documented "25 times in a rolling 24-hour period" ceiling
+    /// ([`MAX_ENCRYPTION_CHANGES_PER_WINDOW`]) is counted over for enabling encryption.
+    /// Only a change that SUCCEEDED is recorded, since that is what the limit counts, and
+    /// the list is pruned to [`ENCRYPTION_CHANGE_WINDOW`] by the change that counts it.
+    pub encryption_starts: Vec<SystemTime>,
+    /// The instants server-side encryption was disabled on the stream at, counted against
+    /// the same ceiling for disabling it and kept the same way as
+    /// [`Self::encryption_starts`].
+    pub encryption_stops: Vec<SystemTime>,
     /// The tags the create carried.
     pub tags: HashMap<String, String>,
 }
@@ -777,6 +811,56 @@ impl Stream {
     /// removal is still due has no shard map to serve at all.
     pub fn serves_shards(&self, now: SystemTime) -> bool {
         matches!(self.status(now), STREAM_ACTIVE | STREAM_UPDATING)
+    }
+
+    /// Whether records written to the stream are encrypted by the service, which is what
+    /// disabling encryption needs there to be something to disable.
+    pub fn is_encrypted(&self) -> bool {
+        self.encryption_type == ENCRYPTION_TYPE_KMS
+    }
+
+    /// How many times a KMS key has been applied to the stream inside the window ending at
+    /// `now`, which is what [`MAX_ENCRYPTION_CHANGES_PER_WINDOW`] bounds for enabling
+    /// encryption.
+    pub fn encryption_starts_in_window(&self, now: SystemTime) -> usize {
+        encryption_changes_in_window(&self.encryption_starts, now)
+    }
+
+    /// How many times encryption has been disabled on the stream inside the window ending
+    /// at `now`, which is what the same ceiling bounds for disabling it.
+    pub fn encryption_stops_in_window(&self, now: SystemTime) -> usize {
+        encryption_changes_in_window(&self.encryption_stops, now)
+    }
+
+    /// Turn server-side encryption ON at `at` with `key_id`, which is also how the key an
+    /// encrypted stream already uses is UPDATED: "Enables or updates server-side encryption
+    /// using an Amazon Web Services KMS key for a specified stream"
+    /// (`StartStreamEncryption`).
+    ///
+    /// "Once the status of the stream is ACTIVE, encryption begins for records written to
+    /// the stream", and UPDATING is not terminal: the instant the stream is owed `ACTIVE`
+    /// at is stored rather than slept on. The change counts towards the rolling-window
+    /// ceiling.
+    pub fn start_encryption(&mut self, key_id: &str, at: SystemTime) {
+        self.encryption_type = ENCRYPTION_TYPE_KMS.to_string();
+        self.key_id = Some(key_id.to_string());
+        self.updating_until = Some(at + ENCRYPTION_UPDATE_DELAY);
+        record_encryption_change(&mut self.encryption_starts, at);
+    }
+
+    /// Turn server-side encryption OFF at `at`: the stream stops naming a KMS key, so
+    /// records written to it from here on are no longer encrypted by the service.
+    ///
+    /// "Upon receiving the request, Kinesis Data Streams returns immediately and sets the
+    /// status of the stream to UPDATING. After the update is complete, Kinesis Data Streams
+    /// sets the status of the stream back to ACTIVE" (`StopStreamEncryption`), so UPDATING
+    /// is not terminal: the instant the stream is owed `ACTIVE` at is stored rather than
+    /// slept on. The disable counts towards the rolling-window ceiling.
+    pub fn stop_encryption(&mut self, at: SystemTime) {
+        self.encryption_type = ENCRYPTION_TYPE_NONE.to_string();
+        self.key_id = None;
+        self.updating_until = Some(at + ENCRYPTION_UPDATE_DELAY);
+        record_encryption_change(&mut self.encryption_stops, at);
     }
 
     /// How many shard-count changes the stream has been scaled by inside the window
@@ -1373,6 +1457,57 @@ pub fn stream_not_active_message(identifier: &str, status: &str) -> String {
         "stream {identifier} is in state {status}, not {STREAM_ACTIVE}; the stream must be \
          {STREAM_ACTIVE} for this operation"
     )
+}
+
+/// How disabling server-side encryption refuses a stream that is not encrypted: there is
+/// no encryption on it to disable, which is the modelled "a specified parameter ... is not
+/// supported, or can't be used" refusal. FIXED text for this refusal — it names no stream
+/// and carries no request- or state-derived value.
+pub const UNENCRYPTED_STREAM_MESSAGE: &str = "Cannot stop encrypting an unencrypted stream.";
+
+/// How an encryption operation refuses an `EncryptionType` it does not serve: "The
+/// encryption type. The only valid value is KMS"
+/// (`StopStreamEncryptionInput$EncryptionType`), so the value at fault names the refusal.
+pub fn encryption_type_unsupported_message(encryption_type: &str) -> String {
+    format!(
+        "EncryptionType {encryption_type} is not supported; the only valid value is \
+         {ENCRYPTION_TYPE_KMS}"
+    )
+}
+
+/// How an encryption change refuses a stream that has used up the rolling window's changes
+/// of that kind: "You can successfully disable server-side encryption 25 times in a rolling
+/// 24-hour period" (`StopStreamEncryption`), and the same ceiling for applying a key
+/// (`StartStreamEncryption`). Built FROM the request and the stored record, so the stream
+/// and the count at fault name it.
+///
+/// ONE sentence for the one rule: both encryption operations are bounded by one ceiling
+/// over one window, so they refuse a stream past it identically rather than each wording it.
+pub fn encryption_change_limit_message(identifier: &str, changed: usize) -> String {
+    format!(
+        "stream {identifier} has had its server-side encryption changed {changed} times in \
+         the last 24 hours; you can successfully change server-side encryption \
+         {MAX_ENCRYPTION_CHANGES_PER_WINDOW} times in a rolling 24-hour period"
+    )
+}
+
+/// How many of `instants` fall inside the window ending at `now`, which is what
+/// [`MAX_ENCRYPTION_CHANGES_PER_WINDOW`] bounds.
+fn encryption_changes_in_window(instants: &[SystemTime], now: SystemTime) -> usize {
+    let from = now
+        .checked_sub(ENCRYPTION_CHANGE_WINDOW)
+        .unwrap_or(UNIX_EPOCH);
+    instants.iter().filter(|at| **at >= from).count()
+}
+
+/// Record an encryption change at `at`, dropping the ones the window has rolled past, so
+/// the list holds at most the changes the ceiling is counted over.
+fn record_encryption_change(instants: &mut Vec<SystemTime>, at: SystemTime) {
+    let from = at
+        .checked_sub(ENCRYPTION_CHANGE_WINDOW)
+        .unwrap_or(UNIX_EPOCH);
+    instants.retain(|instant| *instant >= from);
+    instants.push(at);
 }
 
 /// How an operation that only serves a provisioned stream refuses one whose shard count

@@ -206,6 +206,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the same name in another Region is another stack, and this call must not delete
         // it.
         let request_region = crate::state::request_region(ctx.parts());
+        // What a deletion has to delete is the configuration in force, so a rollback the
+        // failure of an update already made due is carried out first: it was owed at the
+        // instant that update failed, whether or not anybody called
+        // (`crate::state::settle_due_rollbacks`).
+        crate::state::settle_due_rollbacks(ctx, &*self.engine).await;
         // The store lock is taken for the write and RELEASED at the end of this block: the
         // calls that delete the stack's resources run after it, and each of those reaches
         // another service's own handler, which takes that service's lock.

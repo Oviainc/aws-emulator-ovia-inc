@@ -60,6 +60,9 @@
 //! deleted-stack summaries), [`MAX_EVENTS_PER_STACK`] events per stack (oldest-first),
 //! one [`timeline`] step per resource transition the operation in flight recorded, which
 //! is retired with that operation,
+//! one rollback plan per stack with an update in flight and one unreverted set per stack
+//! whose rollback failed ([`OwedRollback`], each one entry per resource that update
+//! declared, both retired with the operation that holds them),
 //! [`MAX_SIGNALS_PER_STACK`] recorded resource signals per stack (oldest-first),
 //! [`MAX_CLIENT_REQUEST_TOKENS_PER_STACK`] client request tokens remembered per stack
 //! (oldest-first),
@@ -1168,6 +1171,29 @@ pub struct PendingDeployment {
     pub dependencies: BTreeMap<String, BTreeSet<String>>,
 }
 
+/// What the ROLLBACK of the UPDATE in flight would have to put back in the services that
+/// own the stack's resources, held against the chance that the update fails with no call of
+/// its own to compute it.
+///
+/// An update held at a wait condition has already asked the owning services for everything
+/// it wanted ([`provisioning::reconcile`], driven by the handler), and the thing that can
+/// still end it is its wait running out — which falls due on the CLOCK. CloudFormation
+/// "rolls back the stack to the previous stack configuration" when an update fails,
+/// whichever way it failed, so the work that rollback owes is computed by the handler that
+/// knows what the update changed, carried here, and performed by the next operation that
+/// can reach those services ([`settle_due_rollbacks`]).
+///
+/// One record per stack with an update in flight, carrying one entry per resource that
+/// update declared ([`MAX_CONCURRENT_RESOURCES`] across the store), retired with the
+/// operation that holds it.
+#[derive(Debug, Clone)]
+pub struct OwedRollback {
+    /// The resources in force before the update — the configuration to put back.
+    pub previous: Vec<StoredResource>,
+    /// What the update left in the owning services, which the revert runs against.
+    pub applied: Vec<StoredResource>,
+}
+
 /// One client request token an operation on a stack was started under, with the operation
 /// that claimed it.
 ///
@@ -1289,6 +1315,34 @@ pub struct StoredStack {
     /// [`Self::settle`] holds the pending transition back while one of these is
     /// unsatisfied, and `SignalResource` is what satisfies one.
     pub wait_conditions: Vec<wait_conditions::WaitConditionBarrier>,
+    /// What the ROLLBACK of the UPDATE in flight would owe the services that own the
+    /// stack's resources, if that update fails ([`OwedRollback`]) — computed by the handler
+    /// that started it, because only that handler knows what it changed there.
+    ///
+    /// Held only while an update that can still fail with no call of its own is in flight,
+    /// and retired with it: [`Self::begin_transition`] replaces it, [`Self::settle`] drops
+    /// it when the operation completes, and [`Self::begin_owed_update_rollback`] is what
+    /// turns it into work now owed when the update fails.
+    pub rollback_plan: Option<OwedRollback>,
+    /// The rollback work this stack owes the owning services RIGHT NOW: the plan above,
+    /// promoted by the failure of the update that held it.
+    ///
+    /// A rollback cannot be reported as complete before it has been carried out, so
+    /// [`Self::settle`] holds the rollback's own terminal status back while this is set, and
+    /// [`settle_due_rollbacks`] — called by the operations a client drives a stack
+    /// through — is what performs it and clears it.
+    pub owed_rollback: Option<OwedRollback>,
+    /// The rollback this stack still OWES the services that own its resources, held while it
+    /// is in `UPDATE_ROLLBACK_FAILED`: what the previous configuration is, and what those
+    /// services are still holding ([`OwedRollback`]).
+    ///
+    /// `UPDATE_ROLLBACK_FAILED` means a rollback could not be carried out, and both sides of
+    /// it are still needed: `ContinueUpdateRollback` declares the previous configuration
+    /// again, against what the failed update left in those services. The stack's own records
+    /// report what they hold, so a rollback resumed from those records would ask for no
+    /// change at all. `None` for a stack with no rollback outstanding; cleared when a
+    /// rollback completes.
+    pub unreverted_rollback: Option<OwedRollback>,
     /// The most recent stack operation, as `Stack$LastOperations` reports it. Recorded by
     /// [`StoredStack::begin_transition`], so every call that opens an operation records
     /// exactly one.
@@ -1394,6 +1448,9 @@ impl StoredStack {
             resource_dependencies: BTreeMap::new(),
             resource_timeline: None,
             wait_conditions: Vec::new(),
+            rollback_plan: None,
+            owed_rollback: None,
+            unreverted_rollback: None,
             last_operation: None,
             creation_time: now,
             last_updated_time: None,
@@ -2216,6 +2273,13 @@ impl StoredStack {
             // The operation is still waiting for its signals: nothing is due.
             return;
         }
+        if self.owed_rollback.is_some() {
+            // A rollback this stack owes the services that own its resources has not been
+            // carried out yet ([`settle_due_rollbacks`] is what performs it), and a
+            // rollback is not reported as finished before it has: the clock owes nothing
+            // until then.
+            return;
+        }
         let Some(due_at) = self.pending.as_ref().map(|pending| pending.due_at) else {
             // No operation is in flight, so a walk left over belongs to nothing: whatever
             // it still owed is recorded rather than held.
@@ -2239,6 +2303,11 @@ impl StoredStack {
         // reported for the whole of it rather than disappearing between the releasing
         // signal and the completion it makes due.
         self.wait_conditions.clear();
+        // ...and so does the rollback the operation would have owed had it failed. A
+        // rollback that is COMPLETING is one the owning services carried out, so nothing is
+        // left unreverted either.
+        self.rollback_plan = None;
+        self.unreverted_rollback = None;
         let pending = self.pending.take().expect("checked just above");
         let completing_deletion = pending.status == status::DELETE_COMPLETE;
         let deployed = self.pending_deployment.take();
@@ -2364,6 +2433,11 @@ impl StoredStack {
             operation_id.clone(),
             client_request_token.clone(),
         );
+        // The rollback the operation now starting would owe is not known until that
+        // operation has asked the owning services for what it wanted
+        // ([`Self::hold_rollback_plan`]); whatever the operation before it held belongs to
+        // nothing.
+        self.rollback_plan = None;
         self.pending = Some(PendingStatus {
             status: settles_to.to_string(),
             // A completion carries no reason, and nothing has failed yet:
@@ -2495,14 +2569,21 @@ impl StoredStack {
 
     /// Materialise what the wait conditions of the operation in flight owe at `now`.
     ///
-    /// The clock owes exactly one thing here, and only to a wait condition whose
-    /// `Timeout` has run out: "if the wait condition doesn't receive the specified number
-    /// of success signals before the `Timeout` period expires, CloudFormation assumes that
-    /// the wait condition has failed", so the operation takes the failed status carrying
-    /// that reason — which was owed at that instant even if nobody had called. The
-    /// resources the failed operation had already made stay recorded on the stack, and
-    /// removing them is its DELETION: that calls the services that own them, which a read
-    /// cannot do.
+    /// The clock owes this to a wait condition whose `Timeout` has run out: "if the wait
+    /// condition doesn't receive the specified number of success signals before the
+    /// `Timeout` period expires, CloudFormation assumes that the wait condition has
+    /// failed", so the operation takes the failed status carrying that reason — which was
+    /// owed at that instant even if nobody had called.
+    ///
+    /// A failed operation does not stop there, and this failure is no different from one an
+    /// owning service answered: a failed UPDATE is rolled back to the previous stack
+    /// configuration, which is what [`crate::ops::update_stack`]'s own failure path does
+    /// ([`Self::begin_owed_update_rollback`]). The CALLS that rollback makes in the
+    /// services that own the resources cannot be made from here — this runs under the store
+    /// lock, with no request to make them on — so the work is recorded as owed
+    /// ([`Self::owed_rollback`]) and the next operation that can reach those services
+    /// performs it ([`settle_due_rollbacks`]), with the rollback's own terminal status held
+    /// back until it has.
     ///
     /// Nothing else about a barrier moves here: a SIGNAL is what satisfies one
     /// ([`Self::release_wait_conditions`]), and a barrier left behind by an operation that
@@ -2526,8 +2607,54 @@ impl StoredStack {
             return;
         };
         let failed_status = failed_status_of(&self.status);
+        let updating = self.status == status::UPDATE_IN_PROGRESS;
         self.wait_conditions.clear();
-        self.fail_transition(now, failed_status, reason);
+        self.fail_transition(now, failed_status, reason.clone());
+        if updating {
+            self.begin_owed_update_rollback(now, reason);
+        }
+    }
+
+    /// Open the ROLLBACK the UPDATE that has just failed owes, and say whether one was
+    /// opened.
+    ///
+    /// "If the stack update fails, CloudFormation rolls back the stack to the previous stack
+    /// configuration": the stack moves to `UPDATE_ROLLBACK_IN_PROGRESS` and the work that
+    /// puts the previous configuration back in the owning services becomes owed
+    /// ([`Self::owed_rollback`]) — the plan the update's own handler computed, since only it
+    /// knows what the update changed there.
+    ///
+    /// Called after [`Self::fail_transition`] has recorded the update's own failure, with
+    /// that failure's reason. Nothing is opened for an update that changed nothing in any
+    /// owning service (the previous configuration is the one in force already) or for a
+    /// caller that asked for the failed state to be kept (`DisableRollback`), which is the
+    /// same rule [`crate::ops::update_stack`]'s failure path follows.
+    pub fn begin_owed_update_rollback(&mut self, now: SystemTime, reason: String) -> bool {
+        let Some(plan) = self.rollback_plan.take().filter(|_| !self.disable_rollback) else {
+            return false;
+        };
+        self.begin_update_rollback(now, reason);
+        self.owed_rollback = Some(plan);
+        true
+    }
+
+    /// Hold what the ROLLBACK of the update in flight would owe the services that own the
+    /// stack's resources, for a failure that falls due with no call of its own to compute
+    /// it.
+    ///
+    /// Called by the handler that drove the update's own calls to those services, once it
+    /// has — only that handler knows what the update changed there. An update that changed
+    /// nothing in any owning service owes no rollback: the previous configuration is the one
+    /// in force, which is the rule [`crate::ops::update_stack`] follows for a failure a
+    /// service answered.
+    pub fn hold_rollback_plan(&mut self, plan: Option<OwedRollback>) {
+        self.rollback_plan = plan;
+    }
+
+    /// The rollback this stack owes the owning services right now, taken for the caller
+    /// that is about to perform it.
+    pub fn take_owed_rollback(&mut self) -> Option<OwedRollback> {
+        self.owed_rollback.take()
     }
 
     /// The resources a read of this stack reports RIGHT NOW.
@@ -2766,10 +2893,28 @@ impl StoredStack {
         transitions: &[provisioning::ResourceTransition],
         at: SystemTime,
     ) {
+        self.record_resource_statuses(transitions, at, |status| {
+            status == resource_status::DELETE_COMPLETE
+                || status == resource_status::DELETE_FAILED
+        });
+    }
+
+    /// Leave each of the stack's resource records in the status one walk left it in, for the
+    /// transitions `applies` selects.
+    ///
+    /// `StackResource$ResourceStatus` is the resource's "Current status", so what a walk did
+    /// to a resource is what that resource then reports — the one rule both the deletion
+    /// above and the rollback below are an application of, so the two cannot drift about what
+    /// a resource's current status is. A record no selected transition names keeps the status
+    /// it carried, because that walk did not act on it.
+    fn record_resource_statuses(
+        &mut self,
+        transitions: &[provisioning::ResourceTransition],
+        at: SystemTime,
+        applies: impl Fn(&str) -> bool,
+    ) {
         for transition in transitions {
-            if transition.status != resource_status::DELETE_COMPLETE
-                && transition.status != resource_status::DELETE_FAILED
-            {
+            if !applies(&transition.status) {
                 continue;
             }
             let Some(deployed) = self
@@ -2783,6 +2928,24 @@ impl StoredStack {
             deployed.status_reason = transition.reason.clone();
             deployed.status_timestamp = at;
         }
+    }
+
+    /// Leave each of the stack's resource records in the status a ROLLBACK left it in.
+    ///
+    /// Once a rollback has ended, a resource it put back reports the status of that revert
+    /// and a resource the owning service would NOT put back reports the failed one with that
+    /// service's own refusal — which is also the set `ContinueUpdateRollback` reads: "you can
+    /// specify only resources that are in the UPDATE_FAILED state because a rollback failed".
+    /// Only the transitions that ENDED are applied, through the one writer of a resource's
+    /// current status ([`Self::record_resource_statuses`]).
+    pub fn record_rollback_resource_statuses(
+        &mut self,
+        transitions: &[provisioning::ResourceTransition],
+        at: SystemTime,
+    ) {
+        self.record_resource_statuses(transitions, at, |status| {
+            !status.ends_with(IN_PROGRESS_SUFFIX)
+        });
     }
 
     /// Record that the operation in flight could not be carried out: the stack takes the
@@ -3568,6 +3731,30 @@ impl ComAmazonawsCloudformationCloudformationState {
         }
         self.reclaim_retired_stacks();
         self.reclaim_orphaned_change_sets();
+    }
+
+    /// The rollbacks the stacks of this store owe the services that own their resources
+    /// right now, taken for the caller that is about to perform them
+    /// ([`settle_due_rollbacks`]).
+    ///
+    /// A rollback lands here when the operation it belongs to failed ON THE CLOCK — a wait
+    /// condition whose wait ran out — because the store cannot call another service while
+    /// it holds its own lock. Taking it is what lets the caller make those calls with the
+    /// lock released, and the stack's own terminal status stays held back until the caller
+    /// has recorded what they answered.
+    pub fn take_due_rollbacks(&mut self) -> Vec<DueRollback> {
+        self.stacks
+            .iter_mut()
+            .filter_map(|stack| {
+                let rollback = stack.take_owed_rollback()?;
+                Some(DueRollback {
+                    region: stack.region.clone(),
+                    stack_id: stack.stack_id.clone(),
+                    provenance: stack.provenance(),
+                    rollback,
+                })
+            })
+            .collect()
     }
 
     /// The generated template `name_or_id` addresses in the request's Region, if this store
@@ -5620,6 +5807,90 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsCloudformationCloudformationState>)
+}
+
+/// One stack's rollback work, taken off the store for the operation that is about to
+/// perform it ([`ComAmazonawsCloudformationCloudformationState::take_due_rollbacks`]).
+#[derive(Debug, Clone)]
+pub struct DueRollback {
+    /// The Region the stack's resources live in, which is the credential scope every call
+    /// the rollback makes carries.
+    pub region: String,
+    pub stack_id: String,
+    /// The stack's identity and tags, which a resource the rollback re-declares is created
+    /// carrying ([`provisioning::StackProvenance`]).
+    pub provenance: provisioning::StackProvenance,
+    pub rollback: OwedRollback,
+}
+
+/// Perform the rollbacks the stacks of this store owe the services that own their
+/// resources, and record what those services answered.
+///
+/// An update held at a wait condition is failed by the CLOCK when its wait runs out
+/// ([`StoredStack::settle_wait_conditions`]), and CloudFormation rolls such an update back
+/// to the previous stack configuration exactly as it rolls back one an owning service
+/// refused. The rollback's own calls — putting back what the failed update changed there —
+/// reach other services' handlers, which the store cannot do under its lock and a stack's
+/// clock cannot do at all, so they are made HERE: by the next operation of this service to
+/// be called, before it reads or writes the stack.
+///
+/// This materialises what was already due at the same instant whether or not anybody
+/// called: the failure is the clock's, and the rollback is what that failure owes. It is
+/// therefore correct for a REPORTING operation to drive it — the status a later caller reads
+/// is the one the clock had already made due — and it is what keeps a stack from reporting a
+/// rollback as complete that nothing carried out: [`StoredStack::settle`] holds the
+/// rollback's terminal status back until the work recorded here is done.
+///
+/// Call it with the handler's `ctx` and `&*self.engine`, holding no store lock.
+pub async fn settle_due_rollbacks<Eng: Send + Sync + 'static>(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    engine: &Eng,
+) {
+    let Some(state) = service_state(engine) else {
+        return;
+    };
+    // The failures the clock has made due, and the rollback work each one owes — taken
+    // under the lock, performed with it RELEASED.
+    let due: Vec<DueRollback> = {
+        let mut store = state.lock();
+        store.settle(SystemTime::now());
+        store.take_due_rollbacks()
+    };
+    for owed in due {
+        let outstanding = owed.rollback.clone();
+        let reverted = provisioning::reconcile(
+            ctx,
+            &owed.region,
+            &owed.provenance,
+            outstanding.previous.clone(),
+            &outstanding.applied,
+        )
+        .await;
+        let mut store = state.lock();
+        let Some(stack) = store.resolve_mut(&owed.region, &owed.stack_id) else {
+            continue;
+        };
+        stack.schedule_resource_events(&reverted.transitions);
+        stack.record_materialised_resources(reverted.resources);
+        // What the rollback left each resource in, which is what a client reads back —
+        // and what says which resource a resumed rollback may skip.
+        stack.record_rollback_resource_statuses(&reverted.transitions, SystemTime::now());
+        if let Some(failure) = reverted.failure {
+            // "A stack goes into the UPDATE_ROLLBACK_FAILED state when CloudFormation can't
+            // roll back all changes after a failed stack update": a resource the owning
+            // service would not put back leaves the stack there — the state
+            // `ContinueUpdateRollback` resumes from — with that service's own refusal as
+            // the reason, rather than reporting a rollback that did not happen. What those
+            // services are still holding is kept, because that is what a resumed rollback
+            // has to put back.
+            stack.fail_transition(
+                SystemTime::now(),
+                status::UPDATE_ROLLBACK_FAILED,
+                failure,
+            );
+            stack.unreverted_rollback = Some(outstanding);
+        }
+    }
 }
 
 /// The IAM store a stack operation resolves its `RoleARN` against.

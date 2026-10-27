@@ -172,7 +172,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // secondary replicas": the pool's own Region holds the primary, every
         // stored replica a secondary. Ascending by Region is a stable order
         // over the whole set — the order a page token indexes into.
-        let regions = pool.replica_regions();
+        let regions = pool.replica_regions(now);
         let page = crate::state::page_of(
             Self::NAME,
             &regions,
