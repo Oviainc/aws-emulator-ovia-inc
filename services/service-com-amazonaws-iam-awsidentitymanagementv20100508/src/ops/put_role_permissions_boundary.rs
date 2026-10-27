@@ -236,19 +236,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "You cannot set the boundary for a service-linked role"
         // (`PutRolePermissionsBoundary`): such a role is a protected resource only the
-        // service that depends on it may change, and `UnmodifiableEntityException`'s
-        // documentation says the message "includes the name of the service that depends
-        // on this service-linked role".
-        if let Some(linked_service) = crate::state::service_linked_role_principal(&path) {
+        // service that depends on it may change, so the put is refused in the one
+        // sentence this service words that protection with
+        // (`crate::state::protected_role_message`).
+        if crate::state::is_service_linked_role_path(&path) {
             return Err(
                 PutRolePermissionsBoundaryErrorModeled::UnmodifiableEntityException(
                     UnmodifiableEntityException {
-                        message: Some(format!(
-                            "Service role {} cannot be modified: a permissions boundary may \
-                             not be set for a service-linked role, and only {linked_service} \
-                             can modify the role it is linked to",
-                            input.role_name
-                        )),
+                        message: Some(crate::state::protected_role_message(&input.role_name)),
                     },
                 )
                 .into(),
