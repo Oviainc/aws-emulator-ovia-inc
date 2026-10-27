@@ -13,7 +13,10 @@
 //!    `BadRequestException`. That is the modelled `@pattern` on the label, so the
 //!    refusal is stated at the request boundary, where `crate::service::validation`
 //!    words it with that code rather than the generic `ValidationException` this
-//!    operation does not even model.
+//!    operation does not even model. A `tagKeys` selection past its modelled maximum is
+//!    refused at that same boundary with that same code and the sentence stating the
+//!    limit: the limit is the size of the tag set a resource may carry, and this list
+//!    selects out of that one set exactly as a write's tag map does.
 //! 2. EXISTENCE — an ARN addressing no resource of this account is refused with HTTP 404
 //!    `NotFoundException` ([`crate::scaffolded::NOT_FOUND_CODE`] /
 //!    [`crate::scaffolded::NOT_FOUND_STATUS`]), the same status, code and text as the

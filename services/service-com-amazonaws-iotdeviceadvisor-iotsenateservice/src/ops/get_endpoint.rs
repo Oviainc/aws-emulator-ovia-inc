@@ -5,10 +5,10 @@
 //! Reports the Device Advisor host a device under test connects to: the ACCOUNT-LEVEL
 //! host for a request that names no device, and the DEVICE-LEVEL host for one that names
 //! a device by its thing, its certificate or the role it assumes. A pure read — the host
-//! is derived from the account, the request's signing region and the device named, by the
-//! single derivation in [`crate::state`] that `StartSuiteRun` already reports from, so
-//! nothing is written and the endpoint a run carries and the one this vends cannot
-//! disagree.
+//! is derived from the account, the request's signing region and the device named, by
+//! [`crate::state::endpoint_for`], the single derivation `StartSuiteRun` also reports its
+//! run's endpoint from, so nothing is written and the endpoint a run carries for its
+//! primary device and the one this vends for that device cannot disagree.
 //!
 //! ## Shape of an operation
 //!
@@ -224,12 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The region the host names is the one the request was signed for, the same region
         // this service scopes a minted ARN to.
         let region = crate::state::request_region(ctx.parts());
-        let endpoint = if device.names_no_device() {
-            crate::state::endpoint_for_region(&region)
-        } else {
-            crate::state::endpoint_for_device(&region, &device)
-        };
-
+        let endpoint = crate::state::endpoint_for(&region, &device);
         Ok(GetEndpointOutput {
             endpoint: Some(endpoint),
         })

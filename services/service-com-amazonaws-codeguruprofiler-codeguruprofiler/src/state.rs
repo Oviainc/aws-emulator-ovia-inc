@@ -1872,6 +1872,23 @@ pub fn policy_group_not_found_message(name: &str) -> String {
     )
 }
 
+/// How the NOTIFICATION surface says that the profiling group a request names does not
+/// exist: `GetNotificationConfiguration` states the LOOKUP it performed — the account the
+/// lookup was scoped to and the name it looked for — rather than the sentence every other
+/// group-scoped operation states ([`group_not_found_message`]).
+///
+/// `AddNotificationChannels` and `RemoveNotificationChannel` keep
+/// [`group_not_found_message`] for a group that is not there, for the reason
+/// [`policy_group_not_found_message`] is `GetPolicy`'s alone: their own wording for that
+/// case is not recorded anywhere, and a per-operation sentence this service has never
+/// been observed to emit would be invented rather than emulated.
+pub fn notification_group_not_found_message(name: &str) -> String {
+    format!(
+        "Profiling group not found with accountId: {}, name: {name}.",
+        ::engine::emulator_account_id()
+    )
+}
+
 /// How `UpdateProfilingGroup` says that the profiling group a request names does not
 /// exist: it states the lookup it performed — the account it was scoped to and the
 /// `profilingGroupName` member it looked the group up by — and the operation that could

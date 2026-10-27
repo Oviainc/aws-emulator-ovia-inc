@@ -27,6 +27,8 @@ mod db_cluster_create_record;
 mod db_cluster_deletion;
 #[path = "all/db_cluster_snapshots.rs"]
 mod db_cluster_snapshots;
+#[path = "all/db_cluster_subject_operations.rs"]
+mod db_cluster_subject_operations;
 #[path = "all/db_clusters.rs"]
 mod db_clusters;
 #[path = "all/db_engine_version_catalog.rs"]

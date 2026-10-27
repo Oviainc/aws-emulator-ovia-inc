@@ -200,7 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // would apply on top of one half applied, which is the inconsistent state
         // `ConflictException` reports. This operation is not `@idempotent`, so a repeat
         // is refused rather than reported as the same operation.
-        if let Some(in_flight) = store.baseline_operation_in_flight(&arn) {
+        if let Some(in_flight) = store.baseline_change_in_flight_on(&arn) {
             return Err(UpdateEnabledBaselineErrorModeled::ConflictException(
                 ConflictException {
                     message: format!(

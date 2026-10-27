@@ -150,6 +150,42 @@ pub(crate) fn place_receipts_at(harness: &Harness, name: &str, receipts: &[(i64,
         .map(|(secs, nanos)| DateTime::from_secs_and_nanos(*secs, *nanos));
 }
 
+/// Store `bytes` as a profile of the stored group `name`, posted under `content_type` and
+/// received at `at` (epoch seconds), WITHOUT submitting them.
+///
+/// `PostAgentProfile` parses the data it is handed and refuses data that is not an agent
+/// profile, so bytes that are deliberately NO profile document — or a document that is no
+/// profile, such as a bare list — cannot be put in the store over HTTP. A case whose rule
+/// is a READER's (what `GetProfile` serves for stored bytes it cannot read, what a frame
+/// metric tallies for a profile that records nothing) places them here instead, through
+/// the harness's one shared engine, writing exactly the fields `PostAgentProfile` writes.
+/// `pub(crate)` so every suite that needs such a profile places it one way.
+pub(crate) fn place_profile(
+    harness: &Harness,
+    name: &str,
+    content_type: &str,
+    bytes: Vec<u8>,
+    at: i64,
+) {
+    let state = harness
+        .engine
+        .state::<service_com_amazonaws_codeguruprofiler_codeguruprofiler::ComAmazonawsCodeguruprofilerCodeguruprofilerState>();
+    let mut guard = state.lock();
+    let group = guard
+        .groups
+        .get_mut(name)
+        .unwrap_or_else(|| panic!("no stored group named {name}"));
+    let received_at = DateTime::from_secs(at);
+    group.profiles.push_back(
+        service_com_amazonaws_codeguruprofiler_codeguruprofiler::state::AgentProfile {
+            bytes,
+            content_type: content_type.to_string(),
+            received_at,
+        },
+    );
+    group.latest_agent_profile_reported_at = Some(received_at);
+}
+
 /// A group holding one posted profile per receipt time, each with its own payload;
 /// answers the payloads, in posting order.
 async fn group_with_receipts(harness: &Harness, name: &str, receipts: &[i64]) -> Vec<Vec<u8>> {
@@ -160,7 +196,8 @@ async fn group_with_receipts(harness: &Harness, name: &str, receipts: &[i64]) ->
     );
     let mut payloads = Vec::new();
     for index in 0..receipts.len() {
-        let payload = format!("{{\"profile\":\"{name}-{index}\"}}").into_bytes();
+        let payload = format!("{{\"start\":{},\"profile\":\"{name}-{index}\"}}", 1_000 + index)
+            .into_bytes();
         assert_eq!(
             harness
                 .post_agent_profile(name, "application/json", None, payload.clone())

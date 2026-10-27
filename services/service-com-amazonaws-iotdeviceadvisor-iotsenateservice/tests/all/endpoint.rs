@@ -7,7 +7,10 @@
 //! was signed for, the label is the account's when the request names no device and a
 //! stable per-device one when it names a device, and a device identity whose ARN is not
 //! one for the member carrying it — or that the named authentication method cannot use —
-//! is refused with the modelled `ValidationException`.
+//! is refused with the modelled `ValidationException`. The host is a function of the
+//! account, the region and the device identity ALONE, so every operation that reports one —
+//! `GetEndpoint` and the suite-run start that reports the host its primary device connects
+//! to — answers the same host for one device.
 //!
 //! Every case below drives a real HTTP request through the same `MultiServiceRouter` the
 //! emulator serves on a socket. The tables span what the rule generalises over: the
@@ -135,18 +138,18 @@ impl Emulator {
         self.call("GET", &path, region, None).await
     }
 
-    /// The `endpoint` the store holds on the single suite run it has, if any.
-    fn persisted_run_endpoint(&self) -> Option<String> {
+    /// The `endpoint` the store holds on the suite run `run_id` names, if it holds that run.
+    fn persisted_run_endpoint(&self, run_id: &str) -> Option<String> {
         let state = iotdeviceadvisor::state::service_state(&*self.engine)
             .expect("the service's store is reachable from the shared engine");
         let store = state.lock();
-        store.runs.values().next().map(|run| run.endpoint.clone())
+        store.runs.get(run_id).map(|run| run.endpoint.clone())
     }
 }
 
 /// A query value as an SDK sends it: everything outside the unreserved set escaped, which
 /// for an ARN is the `:` and `/` it is built from.
-fn percent_encode(value: &str) -> String {
+pub(crate) fn percent_encode(value: &str) -> String {
     value
         .chars()
         .map(|c| {
@@ -257,62 +260,168 @@ async fn a_region_that_is_not_one_falls_back_to_the_default_region() {
     }
 }
 
-/// The host `GetEndpoint` vends is the host a suite run of that region PERSISTED: one
-/// derivation, so what a device is told to connect to cannot differ between the two.
+/// One row of the cross-operation agreement table: a suite run's primary device, and the
+/// `GetEndpoint` query that names that very device.
+struct RunDeviceRow {
+    /// What this row is called in an assertion message.
+    case: &'static str,
+    /// The region the run is started in and the endpoint is asked for.
+    region: &'static str,
+    /// `suiteRunConfiguration.primaryDevice`, as the start request carries it.
+    primary_device: Value,
+    /// The `GET /endpoint` query members naming the SAME device.
+    query: Vec<(&'static str, String)>,
+}
+
+/// The host a suite run reports and PERSISTS for its primary device is the host
+/// `GetEndpoint` vends for that same device: one derivation, so a client told a host by
+/// `StartSuiteRun` is told that host again when it asks where that device connects — and
+/// never the account-level host, which belongs to a request naming no device.
+///
+/// The rows span the ways a run's primary device can be named (its thing, its certificate,
+/// both, and a thing beside the role it assumes — `SuiteRunConfiguration$primaryDevice`
+/// "requires a thing ARN or a certificate ARN") and the signing region.
 #[tokio::test]
-async fn the_vended_host_is_the_host_a_suite_run_persisted() {
+async fn a_run_reports_the_host_get_endpoint_vends_for_its_primary_device() {
     let emulator = Emulator::new();
-    let region = "eu-west-3";
 
-    let created = emulator
-        .call(
-            "POST",
-            "/suiteDefinitions",
-            region,
-            Some(json!({
-                "suiteDefinitionConfiguration": {
-                    "suiteDefinitionName": "endpoint-suite",
-                    "rootGroup": "g",
-                    "devicePermissionRoleArn": role_arn("DeviceAdvisorRole"),
-                }
-            })),
-        )
-        .await;
-    assert_eq!(
-        created.status, 200,
-        "case \"create a definition\": expected HTTP 200, got {} {}",
-        created.status, created.body
+    let rows: Vec<RunDeviceRow> = vec![
+        RunDeviceRow {
+            case: "thing only",
+            region: "eu-west-3",
+            primary_device: json!({ "thingArn": thing_arn("endpoint-device") }),
+            query: vec![("thingArn", thing_arn("endpoint-device"))],
+        },
+        RunDeviceRow {
+            case: "certificate only",
+            region: "us-east-1",
+            primary_device: json!({ "certificateArn": certificate_arn("run-cert") }),
+            query: vec![("certificateArn", certificate_arn("run-cert"))],
+        },
+        RunDeviceRow {
+            case: "thing and certificate",
+            region: "ap-southeast-4",
+            primary_device: json!({
+                "thingArn": thing_arn("paired-device"),
+                "certificateArn": certificate_arn("paired-cert"),
+            }),
+            query: vec![
+                ("thingArn", thing_arn("paired-device")),
+                ("certificateArn", certificate_arn("paired-cert")),
+            ],
+        },
+        RunDeviceRow {
+            case: "thing and the role it assumes",
+            region: "us-gov-west-1",
+            primary_device: json!({
+                "thingArn": thing_arn("sigv4-device"),
+                "deviceRoleArn": role_arn("DeviceRoleB"),
+            }),
+            query: vec![
+                ("thingArn", thing_arn("sigv4-device")),
+                ("deviceRoleArn", role_arn("DeviceRoleB")),
+            ],
+        },
+    ];
+
+    for RunDeviceRow {
+        case,
+        region,
+        primary_device,
+        query,
+    } in rows
+    {
+        let created = emulator
+            .call(
+                "POST",
+                "/suiteDefinitions",
+                region,
+                Some(json!({
+                    "suiteDefinitionConfiguration": {
+                        "suiteDefinitionName": format!("endpoint-suite-{case}"),
+                        "rootGroup": "g",
+                        "devicePermissionRoleArn": role_arn("DeviceAdvisorRole"),
+                    }
+                })),
+            )
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: expected HTTP 200 from CreateSuiteDefinition, got {} {}",
+            created.status, created.body
+        );
+        let definition_id = created.string("suiteDefinitionId");
+
+        let started = emulator
+            .call(
+                "POST",
+                &format!("/suiteDefinitions/{definition_id}/suiteRuns"),
+                region,
+                Some(json!({
+                    "suiteRunConfiguration": { "primaryDevice": primary_device }
+                })),
+            )
+            .await;
+        assert_eq!(
+            started.status, 200,
+            "case {case:?}: expected HTTP 200 from StartSuiteRun, got {} {}",
+            started.status, started.body
+        );
+        let reported = started.string("endpoint");
+        assert_host_shape(case, &reported, region);
+
+        let query: Vec<(&str, &str)> = query
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect();
+        let vended = emulator
+            .get_endpoint(&query, region)
+            .await
+            .string("endpoint");
+        assert_eq!(
+            reported, vended,
+            "case {case:?}: StartSuiteRun must report the host GetEndpoint vends for the \
+             run's primary device, got {reported:?} and {vended:?}"
+        );
+
+        let account_level = emulator.get_endpoint(&[], region).await.string("endpoint");
+        assert_ne!(
+            reported, account_level,
+            "case {case:?}: a run naming a device reports that device's host, not the \
+             account-level one, got {reported:?}"
+        );
+
+        let run_id = started.string("suiteRunId");
+        assert_eq!(
+            emulator.persisted_run_endpoint(&run_id).as_deref(),
+            Some(reported.as_str()),
+            "case {case:?}: the persisted run endpoint must be the host the start call \
+             reported, got {:?}",
+            emulator.persisted_run_endpoint(&run_id)
+        );
+    }
+}
+
+/// A suite run whose configuration names no device at all is reported the ACCOUNT-LEVEL
+/// host, the same one `GetEndpoint` vends for a request naming no device: the two sides of
+/// the one derivation, taken on the other branch.
+#[tokio::test]
+async fn a_run_with_no_primary_device_carries_the_account_level_host() {
+    let emulator = Emulator::new();
+    let region = "us-west-2";
+
+    // A run with an empty primary device cannot be STARTED over the wire — the member
+    // "requires a thing ARN or a certificate ARN" — so the no-device identity is taken
+    // straight from the derivation every reporting operation shares.
+    let derived = iotdeviceadvisor::state::endpoint_for(
+        region,
+        &iotdeviceadvisor::state::DeviceIdentity::default(),
     );
-    let definition_id = created.string("suiteDefinitionId");
-
-    let started = emulator
-        .call(
-            "POST",
-            &format!("/suiteDefinitions/{definition_id}/suiteRuns"),
-            region,
-            Some(json!({
-                "suiteRunConfiguration": {
-                    "primaryDevice": { "thingArn": thing_arn("endpoint-device") }
-                }
-            })),
-        )
-        .await;
-    assert_eq!(
-        started.status, 200,
-        "case \"start a run\": expected HTTP 200, got {} {}",
-        started.status, started.body
-    );
-
     let vended = emulator.get_endpoint(&[], region).await.string("endpoint");
     assert_eq!(
-        started.string("endpoint"),
-        vended,
-        "case \"a started run\": StartSuiteRun must report the host GetEndpoint vends"
-    );
-    assert_eq!(
-        emulator.persisted_run_endpoint().as_deref(),
-        Some(vended.as_str()),
-        "case \"the stored run\": the persisted run endpoint must be the host GetEndpoint vends"
+        derived, vended,
+        "case \"no device\": the host derived for a run naming no device must be the host \
+         GetEndpoint vends for a request naming none, got {derived:?} and {vended:?}"
     );
 }
 

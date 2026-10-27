@@ -243,6 +243,18 @@ pub const SNAPSHOT_STATUS_COPYING: &str = "copying";
 /// The status of a snapshot the clock has finished.
 pub const SNAPSHOT_STATUS_AVAILABLE: &str = "available";
 
+/// The status a snapshot carries while it is still being TAKEN of its source, the
+/// counterpart of [`SNAPSHOT_STATUS_COPYING`] for a snapshot that is not a copy of another
+/// one: `DBClusterSnapshot$Status` ("specifies the status of this DB cluster snapshot")
+/// carries it, and `CreateDBClusterSnapshot` answers with it, since the snapshot is not
+/// restorable the instant the call returns.
+pub const SNAPSHOT_STATUS_CREATING: &str = "creating";
+
+/// The `SnapshotType` of every snapshot a CALLER asked for, from the values
+/// [`SNAPSHOT_TYPES`] lists: AWS classes one the caller took as `manual`, reserving
+/// `automated` for the backups it schedules itself — and this service schedules none.
+pub const SNAPSHOT_TYPE_MANUAL: &str = "manual";
+
 /// How many cluster parameter groups one region may hold.
 ///
 /// Emulator resource guard, NOT an AWS quota: AWS publishes none for cluster parameter
@@ -444,6 +456,30 @@ pub const DB_CLUSTER_STATUS_MODIFYING: &str = "modifying";
 /// nothing and every read of it is the modelled `DBClusterNotFoundFault`, the signal the
 /// AWS waiters poll for.
 pub const DB_CLUSTER_STATUS_DELETING: &str = "deleting";
+
+/// The status a DB cluster reports while a stop is running, as the published cluster-status
+/// list carries it (Amazon Aurora User Guide, "Viewing Amazon Aurora DB cluster status").
+///
+/// Transient: `StopDBCluster` answers with the cluster in this status and the clock owes it
+/// [`DB_CLUSTER_STATUS_STOPPED`] [`STATUS_TRANSITION_DELAY`] later, so a caller that reads
+/// the cluster straight back sees the stop in progress, exactly as it would against the
+/// real service.
+pub const DB_CLUSTER_STATUS_STOPPING: &str = "stopping";
+
+/// The status a DB cluster reports once its stop has finished, from the same published list
+/// as [`DB_CLUSTER_STATUS_STOPPING`]. A stopped cluster keeps every other fact about it —
+/// "Aurora retains the DB cluster's metadata, including its endpoints and DB parameter
+/// groups".
+pub const DB_CLUSTER_STATUS_STOPPED: &str = "stopped";
+
+/// The status a DB cluster reports while a failover is running, from the same published
+/// list as [`DB_CLUSTER_STATUS_STOPPING`].
+///
+/// Transient, like the other two: `FailoverDBCluster` "forces a failover" and answers
+/// before it is over ("failover times are typically less than 35 seconds"), so the clock
+/// owes the cluster [`DB_CLUSTER_STATUS_AVAILABLE`] and a caller polling straight after the
+/// call observes the failover.
+pub const DB_CLUSTER_STATUS_FAILING_OVER: &str = "failing-over";
 
 /// The status an event notification subscription reports once it is set up and
 /// delivering, from `EventSubscription$Status`'s published list ("creating | modifying |
@@ -1460,10 +1496,14 @@ impl ComAmazonawsRdsAmazonrdsv19State {
         self.db_clusters.get(&(region.to_string(), identifier))
     }
 
-    /// What a DB cluster reports about the records AROUND it — see [`ClusterMembership`].
-    fn cluster_membership(&self, record: &DbClusterRecord) -> ClusterMembership {
-        // The member DB instances, earliest-created first: the cluster's writer is the
-        // instance that was created in it first, and every later one is a reader.
+    /// The member DB instances of `record` — the instances that name this cluster — WRITER
+    /// FIRST, then the readers earliest-created first.
+    ///
+    /// That is the order `DBClusterMembers` reports them in, and the one
+    /// `FailoverDBCluster` reads to find the primary it is being asked to move, so both
+    /// agree about which member is the writer by construction; see
+    /// [`DbClusterRecord::writer_identifier`].
+    pub fn cluster_members(&self, record: &DbClusterRecord) -> Vec<&DbInstanceRecord> {
         let mut members: Vec<&DbInstanceRecord> = self
             .instances_in(&record.region)
             .into_iter()
@@ -1475,11 +1515,31 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             })
             .collect();
         members.sort_by(|left, right| {
-            left.instance_create_time
-                .as_secs_f64()
-                .total_cmp(&right.instance_create_time.as_secs_f64())
+            // The writer first, then the rest earliest-created first. A cluster nobody has
+            // failed over names no writer, so the order is purely by creation and the
+            // first-created instance is the primary; after a failover the promoted member
+            // sorts ahead of it, which is what moves `IsClusterWriter`.
+            let writes = |instance: &DbInstanceRecord| {
+                record
+                    .writer_identifier
+                    .as_ref()
+                    .is_some_and(|named| named.eq_ignore_ascii_case(&instance.identifier))
+            };
+            writes(right)
+                .cmp(&writes(left))
+                .then_with(|| {
+                    left.instance_create_time
+                        .as_secs_f64()
+                        .total_cmp(&right.instance_create_time.as_secs_f64())
+                })
                 .then_with(|| left.identifier.cmp(&right.identifier))
         });
+        members
+    }
+
+    /// What a DB cluster reports about the records AROUND it — see [`ClusterMembership`].
+    fn cluster_membership(&self, record: &DbClusterRecord) -> ClusterMembership {
+        let members = self.cluster_members(record);
         ClusterMembership {
             // "Indicates whether the DB cluster has instances in multiple Availability
             // Zones" — read off the zones its members are actually in, so it cannot
@@ -2435,6 +2495,17 @@ pub struct DbClusterRecord {
     pub global_write_forwarding_requested: bool,
     /// `ClusterCreateTime`.
     pub cluster_create_time: ::aws_smithy_types::DateTime,
+    /// The member instance the cluster currently WRITES through — the one
+    /// `DBClusterMembers` reports `IsClusterWriter` for.
+    ///
+    /// `None` while nothing has moved it, in which case the writer is the member that was
+    /// created first (a cluster's first instance is its primary and every later one is a
+    /// replica), so a cluster nobody failed over needs no stored choice. `FailoverDBCluster`
+    /// sets it, which is the whole observable effect of a failover: "failover for a DB
+    /// cluster promotes one of the Aurora Replicas (read-only instances) in the DB cluster
+    /// to be the primary DB instance (the cluster writer)". It names the member, not an
+    /// index, so an instance leaving the cluster cannot leave it pointing at another one.
+    pub writer_identifier: Option<String>,
     /// `TagList`.
     pub tags: Vec<Tag>,
 }
@@ -2799,9 +2870,9 @@ impl DbSnapshotRecord {
             kms_key_id: instance.kms_key_id.clone(),
             iops: instance.iops,
             license_model: instance.license_model.clone(),
-            status: "creating".to_string(),
-            pending_status: Some(PendingStatus::in_a_moment("available")),
-            snapshot_type: "manual".to_string(),
+            status: SNAPSHOT_STATUS_CREATING.to_string(),
+            pending_status: Some(PendingStatus::in_a_moment(SNAPSHOT_STATUS_AVAILABLE)),
+            snapshot_type: SNAPSHOT_TYPE_MANUAL.to_string(),
             instance_create_time: instance.instance_create_time,
             snapshot_create_time: now_as_wire_timestamp(),
             tags,
@@ -3341,12 +3412,12 @@ impl OptionGroupRecord {
 /// A stored DB CLUSTER snapshot: the cluster's settings as they stood when the snapshot
 /// was taken, which is why they are copied rather than re-read later.
 ///
-/// `CopyDBClusterSnapshot` writes one (a copy of another snapshot) and
-/// `DeleteDBClusterSnapshot` removes one; the operations that take a snapshot OF a
-/// cluster — `CreateDBClusterSnapshot` and the final snapshot `DeleteDBCluster` takes —
-/// are still scaffolded in this crate and are their own stub issues, so they write none
-/// yet. The reading operations are implemented against these records rather than against
-/// a canned answer, so they report exactly what is stored.
+/// `CreateDBClusterSnapshot` writes one (a snapshot OF a cluster, through
+/// [`DbClusterSnapshotRecord::from_cluster`]), `CopyDBClusterSnapshot` writes one (a copy
+/// of another snapshot) and `DeleteDBClusterSnapshot` removes one; the final snapshot
+/// `DeleteDBCluster` takes is still scaffolded in this crate and is its own stub issue, so
+/// it writes none yet. The reading operations are implemented against these records rather
+/// than against a canned answer, so they report exactly what is stored.
 #[derive(Debug, Clone)]
 pub struct DbClusterSnapshotRecord {
     /// `DBClusterSnapshotIdentifier`, lowercased, and this record's key within its
@@ -3390,6 +3461,50 @@ pub struct DbClusterSnapshotRecord {
 }
 
 impl DbClusterSnapshotRecord {
+    /// Take a snapshot OF `cluster`: its settings as they stand now, copied onto the
+    /// snapshot so a later change to the cluster cannot rewrite what the snapshot holds.
+    ///
+    /// `SnapshotType` is `manual` — the class AWS gives every snapshot a caller asked for,
+    /// `automated` being reserved for the backups the service schedules itself — and the
+    /// snapshot answers [`SNAPSHOT_STATUS_CREATING`] with the clock owing it
+    /// [`SNAPSHOT_STATUS_AVAILABLE`], so a caller that reads it straight back sees the
+    /// snapshot still being taken. `source_snapshot_arn` is absent because nothing was
+    /// copied: that member names "the DB cluster snapshot that was copied to create this
+    /// one".
+    pub fn from_cluster(
+        cluster: &DbClusterRecord,
+        snapshot_identifier: &str,
+        tags: Vec<Tag>,
+    ) -> Self {
+        Self {
+            snapshot_identifier: snapshot_identifier.to_string(),
+            region: cluster.region.clone(),
+            db_cluster_identifier: cluster.identifier.clone(),
+            db_cluster_resource_id: cluster.resource_id.clone(),
+            engine: cluster.engine.clone(),
+            engine_version: cluster.engine_version.clone(),
+            engine_mode: Some(cluster.engine_mode.clone()),
+            allocated_storage: cluster.allocated_storage,
+            master_username: cluster.master_username.clone(),
+            availability_zones: cluster.availability_zones.clone(),
+            port: cluster.port,
+            storage_type: cluster.storage_type.clone(),
+            storage_encrypted: cluster.storage_encrypted,
+            kms_key_id: cluster.kms_key_id.clone(),
+            // `LicenseModel` is a property of a DB INSTANCE, which a DB cluster record
+            // holds none of, so the snapshot reports none rather than inventing one.
+            license_model: None,
+            snapshot_type: SNAPSHOT_TYPE_MANUAL.to_string(),
+            status: SNAPSHOT_STATUS_CREATING.to_string(),
+            pending_status: Some(PendingStatus::in_a_moment(SNAPSHOT_STATUS_AVAILABLE)),
+            cluster_create_time: cluster.cluster_create_time,
+            snapshot_create_time: now_as_wire_timestamp(),
+            source_snapshot_arn: None,
+            restore_attribute: BTreeSet::new(),
+            tags,
+        }
+    }
+
     /// Apply a change whose due instant has passed. Returns whether the record is now
     /// gone, exactly as [`DbInstanceRecord::settle`] does.
     fn settle(&mut self, now: Instant) -> bool {
@@ -3616,6 +3731,43 @@ pub fn check_free_form(member: &str, value: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// The message a `DBClusterNotFoundFault` carries where the call LOOKS a DB cluster UP —
+/// it reports the cluster or resolves one it reads something else out of.
+///
+/// `named` is the value the REQUEST carried, not the key the store folded it to: the
+/// members that name a DB cluster accept "the user-supplied DB cluster identifier or the
+/// Amazon Resource Name (ARN)", and the fault names the one the caller wrote, in the
+/// spelling they wrote it in, so a caller matching the message against what it sent finds
+/// it there.
+pub fn db_cluster_not_found_message(named: &str) -> String {
+    format!("DBCluster {named} not found.")
+}
+
+/// The message a `DBClusterNotFoundFault` carries where the DB cluster is the SUBJECT of
+/// the call and the call acts on the cluster itself — the delete that removes it, and the
+/// failover that moves its primary.
+///
+/// This front door words the one fault by the ROLE the cluster plays in the call, the same
+/// way it words a DB subnet group's ([`db_subnet_group_not_found_message`] beside
+/// [`db_subnet_group_does_not_exist_message`]), so the wording lives here rather than in
+/// each handler. `named` is the value the request carried, as in
+/// [`db_cluster_not_found_message`].
+pub fn db_cluster_cannot_be_accessed_message(named: &str) -> String {
+    format!("The source cluster could not be found or cannot be accessed: {named}")
+}
+
+/// The third wording this front door gives a `DBClusterNotFoundFault`, the one the call
+/// that takes a SNAPSHOT of the cluster answers.
+///
+/// Three wordings, one fault: AWS words it by the ROLE the cluster plays in the call (see
+/// [`db_cluster_not_found_message`] for a call that REPORTS the cluster or stops it, and
+/// [`db_cluster_cannot_be_accessed_message`] for one that acts on the cluster itself), so
+/// each operation answers with the one its own API uses rather than with a single house
+/// style. `named` is the value the request carried, as in the other two.
+pub fn db_cluster_not_found_colon_message(named: &str) -> String {
+    format!("DBCluster not found: {named}")
 }
 
 /// The name AWS gives the DB subnet group it creates alongside an account's default

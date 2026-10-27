@@ -123,5 +123,7 @@ mod standing_alarm_suppression;
 mod start_metric_streams;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/statistic_name_refusals.rs"]
+mod statistic_name_refusals;
 #[path = "all/stop_metric_streams.rs"]
 mod stop_metric_streams;

@@ -572,6 +572,76 @@ async fn the_agent_plane_states_its_own_account_qualified_not_found_text() {
     }
 }
 
+/// RULE 2: `GetNotificationConfiguration` states the LOOKUP it performed for a group it
+/// cannot find — the account the lookup was scoped to and the name it looked for — rather
+/// than the sentence the other group-scoped reads state.
+///
+/// The rows differ in the name asked for, in length and in which characters of the name
+/// alphabet they use; the sentence does not.
+#[tokio::test]
+async fn the_notification_configuration_states_the_lookup_it_performed() {
+    let harness = Harness::new();
+    // (case, the name asked for)
+    let names: [(&str, String); 4] = [
+        ("one character", "k".to_string()),
+        (
+            "the recorded instance",
+            "sim2real-cgp-missing-ff66336e5f9e".to_string(),
+        ),
+        (
+            "every character of the name alphabet",
+            "Group_9-name".to_string(),
+        ),
+        ("the longest name the model allows", "n".repeat(255)),
+    ];
+
+    for (case, name) in names {
+        let answer = harness
+            .send(
+                "GET",
+                &format!("/profilingGroups/{name}/notificationConfiguration"),
+                Vec::new(),
+            )
+            .await;
+        let expected = format!("Profiling group not found with accountId: {ACCOUNT}, name: {name}.");
+        assert_eq!(
+            answer.status, 404,
+            "case {case:?}: expected 404, got {} ({})",
+            answer.status,
+            String::from_utf8_lossy(&answer.body)
+        );
+        assert_eq!(
+            answer.error_code(),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException, got {:?}",
+            answer.error_code()
+        );
+        assert_eq!(
+            answer.message(),
+            expected,
+            "case {case:?}: expected {expected:?}, got {:?}",
+            answer.message()
+        );
+    }
+
+    // A group that EXISTS is served instead of refused, so the sentence above is about a
+    // lookup that really found nothing.
+    harness.created("cgp-notified").await;
+    let served = harness
+        .send(
+            "GET",
+            "/profilingGroups/cgp-notified/notificationConfiguration",
+            Vec::new(),
+        )
+        .await;
+    assert_eq!(
+        served.status, 200,
+        "a stored group's notification configuration must be served, got {} ({})",
+        served.status,
+        String::from_utf8_lossy(&served.body)
+    );
+}
+
 /// RULE 2: a create that collides with a stored group is refused 409 naming the group AND
 /// the account that holds it.
 ///
@@ -649,7 +719,7 @@ async fn get_profile_states_its_fixed_text_for_a_window_no_profile_covers() {
         .send(
             "POST",
             "/profilingGroups/cgp-held/agentProfile",
-            b"{\"ion\": \"payload\"}".to_vec(),
+            b"{\"start\":1600000000000,\"ion\": \"payload\"}".to_vec(),
         )
         .await;
     assert_eq!(
@@ -674,7 +744,7 @@ async fn get_profile_states_its_fixed_text_for_a_window_no_profile_covers() {
     );
     assert_eq!(
         read_back.body,
-        b"{\"ion\": \"payload\"}".to_vec(),
+        b"{\"start\":1600000000000,\"ion\": \"payload\"}".to_vec(),
         "case the stored profile: GetProfile must return the posted bytes"
     );
 

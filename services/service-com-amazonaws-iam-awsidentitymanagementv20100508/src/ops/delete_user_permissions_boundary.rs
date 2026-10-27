@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteUserPermissionsBoundary
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteUserPermissionsBoundary`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteUserPermissionsBoundary::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Clears the permissions boundary of the user the request names, so `GetUser` stops
+//! reporting one for it. A name the account holds no user under is a
+//! `NoSuchEntityException`, and so is a user carrying NO boundary: there is no boundary
+//! to delete.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +153,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteUserPermissionsBoundary` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteUserPermissionsBoundaryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteUserPermissionsBoundary"))
+        // `ctx` carries request metadata only: nothing about a boundary depends on it —
+        // IAM is global and the user is named by the request.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeleteUserPermissionsBoundaryErrorModeled::ServiceFailureException(
+                    ServiceFailureException {
+                        message: Some("the IAM store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut store = state.lock();
+
+        // IAM entity names "are not distinguished by case", so the user is found under
+        // the case-folded name whatever case the request spelled it in; a name the
+        // account holds no user under "referenced a resource entity that does not exist",
+        // worded as every reader of a user in this crate words that absence.
+        let key = crate::state::name_key(&input.user_name);
+        let Some(user) = store.users.get_mut(&key) else {
+            return Err(
+                DeleteUserPermissionsBoundaryErrorModeled::NoSuchEntityException(
+                    NoSuchEntityException {
+                        message: Some(format!(
+                            "The user with name {} cannot be found.",
+                            input.user_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // What this operation deletes is the BOUNDARY, so a user carrying none
+        // "referenced a resource entity that does not exist" and nothing is written: the
+        // refusal describes the resource that is missing — the boundary — rather than the
+        // user, which is there. The same rule `DeleteRolePermissionsBoundary` applies to a
+        // role's.
+        if user.permissions_boundary.is_none() {
+            return Err(
+                DeleteUserPermissionsBoundaryErrorModeled::NoSuchEntityException(
+                    NoSuchEntityException {
+                        message: Some(format!(
+                            "No permissions boundary is set for the user with name {}.",
+                            input.user_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        user.permissions_boundary = None;
+
+        Ok(DeleteUserPermissionsBoundaryOutput)
     }
 }

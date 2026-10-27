@@ -30,3 +30,21 @@ botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling
 Boot the verifiedpermissions emulator
 Call IsAuthorizedWithToken and observe HTTP 501 with no state persisted
 Replay any of the blocked units above and observe it fail on that refusal
+
+## Resolution note: one open divergence, outside this issue's key
+
+`IsAuthorizedWithToken` is implemented: it verifies each presented token's signature
+against the key set the issuing user pool publishes and decides for the principal,
+groups and attributes the token's claims name. Four of the five units above pass.
+
+`xsvc-cognito-idp-2-avp-token-from-foreign-pool-rejected` still diverges on one value:
+for a token whose `iss` matches no identity source of the policy store, the recorded
+behaviour is `ResourceNotFoundException` with HTTP 404 — which the handler now answers,
+with `resourceType` `IDENTITY_SOURCE` and `resourceId` the issuer the token claimed —
+but the recorded MESSAGE is not the one this emulator answers. It answers the sentence
+this service's own corpus records for an authorization call's not-found (the kind of
+resource and the id the request referenced it by), and three other wordings grounded in
+the same corpus were tried and are not it either. Whoever has the recorded sentence
+should set it in `refused()` in
+`services/service-com-amazonaws-verifiedpermissions-verifiedpermissions/src/ops/is_authorized_with_token.rs`
+and in the matching row of `tests/all/is_authorized_with_token.rs`.

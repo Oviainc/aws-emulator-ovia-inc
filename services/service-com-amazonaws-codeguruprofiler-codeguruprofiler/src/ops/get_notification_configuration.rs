@@ -155,9 +155,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let group = guard.groups.get(&input.profiling_group_name).ok_or_else(|| {
             GetNotificationConfigurationErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    // The ONE sentence every group-scoped refusal of this service uses,
-                    // so this operation cannot word the same refusal a second way.
-                    message: crate::state::group_not_found_message(&input.profiling_group_name),
+                    // This operation states the LOOKUP that found nothing — the account
+                    // it was scoped to and the name it looked for — rather than the
+                    // sentence the other group-scoped reads state; see
+                    // `crate::state::notification_group_not_found_message`.
+                    message: crate::state::notification_group_not_found_message(
+                        &input.profiling_group_name,
+                    ),
                 },
             )
         })?;

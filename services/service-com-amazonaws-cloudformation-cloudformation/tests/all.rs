@@ -87,6 +87,8 @@ mod hook_result_detail;
 mod hook_result_invocations;
 #[path = "all/iam_capability_gate.rs"]
 mod iam_capability_gate;
+#[path = "all/iam_identity_resources.rs"]
+mod iam_identity_resources;
 #[path = "all/include_transform.rs"]
 mod include_transform;
 #[path = "all/in_flight_resource_status.rs"]

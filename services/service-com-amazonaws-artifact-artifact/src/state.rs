@@ -1383,11 +1383,10 @@ pub struct ComAmazonawsArtifactArtifactState {
     pub reports: BTreeMap<String, Report>,
     /// Every term grant `GetTermForReport` has minted, keyed by its token.
     ///
-    /// A `BTreeMap` rather than a hash map because the tokens are minted from a
-    /// monotonic counter in fixed-width hex, so their lexicographic order IS their issue
-    /// order: the first entry is always the oldest grant, which is what lets
-    /// [`ComAmazonawsArtifactArtifactState::mint_term_grant`] hold the map to
-    /// [`TERM_GRANT_CAPACITY`] without scanning it.
+    /// A `BTreeMap` rather than a hash map because the tokens come from [`mint_counter_id`],
+    /// whose fixed-width hex ids make their lexicographic order their issue order — which
+    /// is what lets that one rule hold this map to [`TERM_GRANT_CAPACITY`] without
+    /// scanning it.
     pub term_tokens: BTreeMap<String, TermGrant>,
     /// The counter term tokens are minted from, so two calls never share a token.
     pub term_token_seq: u64,
@@ -1396,9 +1395,9 @@ pub struct ComAmazonawsArtifactArtifactState {
     pub account_settings: AccountSettingsRecord,
     /// Every compliance inquiry `CreateComplianceInquiry` has created, keyed by its id.
     ///
-    /// A `BTreeMap` because the ids are minted from a monotonic counter in fixed-width
-    /// hex, so their lexicographic order IS their creation order: that is the stable
-    /// total order `ListComplianceInquiries` can index a pagination token into.
+    /// A `BTreeMap` because the ids come from [`mint_counter_id`], whose fixed-width hex
+    /// ids make their lexicographic order their creation order: that is the stable total
+    /// order `ListComplianceInquiries` can index a pagination token into.
     pub inquiries: BTreeMap<String, ComplianceInquiry>,
     /// The counter inquiry ids are minted from, so two creates never share an id.
     pub inquiry_seq: u64,
@@ -1425,10 +1424,9 @@ pub struct ComAmazonawsArtifactArtifactState {
     /// Every document `ExportComplianceInquiry` has exported, keyed by its export id.
     ///
     /// A `BTreeMap` for the same reason as [`term_tokens`](Self::term_tokens): the ids
-    /// are minted from a monotonic counter in fixed-width hex, so the first entry is
-    /// always the oldest export, which is what lets
-    /// [`ComAmazonawsArtifactArtifactState::record_inquiry_export`] hold the map to
-    /// [`INQUIRY_EXPORT_CAPACITY`] without scanning it.
+    /// come from [`mint_counter_id`], so the first entry is always the oldest export,
+    /// which is what lets that one rule hold this map to [`INQUIRY_EXPORT_CAPACITY`]
+    /// without scanning it.
     pub inquiry_exports: BTreeMap<String, InquiryExport>,
     /// The counter export ids are minted from, so two exports never share an id.
     pub inquiry_export_seq: u64,
@@ -1483,18 +1481,21 @@ impl ComAmazonawsArtifactArtifactState {
 
     /// Mint an unused `InquiryId`.
     ///
-    /// The counter advances on every call and the loop skips an id the store already
-    /// holds, so no two inquiries ever share one. The 16 lower-case hex digits satisfy
-    /// `InquiryId`'s `^compliance-inquiry-[a-zA-Z0-9]{16}$`, and they rise with the
-    /// counter, so the store's key order is its creation order.
+    /// The one minting rule ([`mint_counter_id`]) under the `compliance-inquiry` prefix,
+    /// whose 16 lower-case hex digits complete into `InquiryId`'s
+    /// `^compliance-inquiry-[a-zA-Z0-9]{16}$`.
+    ///
+    /// Nothing is RELEASED to make room, so the rule is asked for no capacity here: an
+    /// inquiry is a resource the caller created and a later read must still find it, which
+    /// is why this store is bounded by refusing the create
+    /// ([`accepts_another_inquiry`](Self::accepts_another_inquiry)) instead.
     pub fn mint_inquiry_id(&mut self) -> String {
-        loop {
-            self.inquiry_seq = self.inquiry_seq.wrapping_add(1);
-            let candidate = format!("compliance-inquiry-{:016x}", self.inquiry_seq);
-            if !self.inquiries.contains_key(&candidate) {
-                return candidate;
-            }
-        }
+        mint_counter_id(
+            &mut self.inquiries,
+            &mut self.inquiry_seq,
+            INQUIRY_ID_PREFIX,
+            None,
+        )
     }
 
     /// Remember that `token` created `inquiry_id` from the request `fingerprint`,
@@ -1541,32 +1542,23 @@ impl ComAmazonawsArtifactArtifactState {
     /// The grant covers the TERM document governing `report`, so the token it returns
     /// authorises every version of every report that document governs.
     ///
-    /// The counter advances on every call and the loop skips a token the store already
-    /// holds, so no OUTSTANDING grant ever shares a token with another — which is what
-    /// makes a grant the receipt for one acceptance. (Short of the counter's wrap, which
-    /// 2^64 acceptances away is unreachable, the tokens also rise lexicographically, so
-    /// the store's first entry is its oldest grant.)
-    ///
-    /// The store is held to [`TERM_GRANT_CAPACITY`] by releasing the oldest grants first,
-    /// so a caller accepting terms in a loop cannot grow this map without end.
+    /// The token is minted, and the store held to [`TERM_GRANT_CAPACITY`], by the one rule
+    /// ([`mint_counter_id`]): no OUTSTANDING grant ever shares a token with another —
+    /// which is what makes a grant the receipt for one acceptance — and a caller accepting
+    /// terms in a loop cannot grow this map without end, because the oldest grants are
+    /// released first.
     pub fn mint_term_grant(
         &mut self,
         report: &Report,
         report_version: i64,
         now: SystemTime,
     ) -> String {
-        while self.term_tokens.len() >= TERM_GRANT_CAPACITY {
-            if self.term_tokens.pop_first().is_none() {
-                break;
-            }
-        }
-        let token = loop {
-            self.term_token_seq = self.term_token_seq.wrapping_add(1);
-            let candidate = format!("term-{:016x}", self.term_token_seq);
-            if !self.term_tokens.contains_key(&candidate) {
-                break candidate;
-            }
-        };
+        let token = mint_counter_id(
+            &mut self.term_tokens,
+            &mut self.term_token_seq,
+            TERM_TOKEN_PREFIX,
+            Some(TERM_GRANT_CAPACITY),
+        );
         self.term_tokens.insert(
             token.clone(),
             TermGrant {
@@ -1633,8 +1625,9 @@ impl ComAmazonawsArtifactArtifactState {
     ///
     /// Every call produces a NEW document — that is what exporting is — so the id is
     /// fresh on every call and two exports of one inquiry are two records with two URLs.
-    /// The map is held to [`INQUIRY_EXPORT_CAPACITY`] by releasing the oldest export
-    /// first, so a caller exporting in a loop cannot grow it without end.
+    /// Minted, and the map held to [`INQUIRY_EXPORT_CAPACITY`] by releasing the oldest
+    /// export first, by the one rule ([`mint_counter_id`]), so a caller exporting in a
+    /// loop cannot grow it without end.
     pub fn record_inquiry_export(
         &mut self,
         inquiry_id: &str,
@@ -1643,18 +1636,12 @@ impl ComAmazonawsArtifactArtifactState {
         document: Vec<u8>,
         now: SystemTime,
     ) -> String {
-        while self.inquiry_exports.len() >= INQUIRY_EXPORT_CAPACITY {
-            if self.inquiry_exports.pop_first().is_none() {
-                break;
-            }
-        }
-        let id = loop {
-            self.inquiry_export_seq = self.inquiry_export_seq.wrapping_add(1);
-            let candidate = format!("export-{:016x}", self.inquiry_export_seq);
-            if !self.inquiry_exports.contains_key(&candidate) {
-                break candidate;
-            }
-        };
+        let id = mint_counter_id(
+            &mut self.inquiry_exports,
+            &mut self.inquiry_export_seq,
+            EXPORT_ID_PREFIX,
+            Some(INQUIRY_EXPORT_CAPACITY),
+        );
         self.inquiry_exports.insert(
             id.clone(),
             InquiryExport {
@@ -1690,6 +1677,65 @@ fn remember_token<R>(
                 tokens.remove(&oldest);
             }
             None => break,
+        }
+    }
+}
+
+/// The prefix a term grant's token carries. `GetReport`'s `termToken` admits
+/// `^[a-zA-Z0-9_\-\s]*$`, which this and the hex digits [`mint_counter_id`] appends
+/// satisfy.
+const TERM_TOKEN_PREFIX: &str = "term";
+
+/// The prefix a compliance inquiry's id carries — the literal part of `InquiryId`'s
+/// `^compliance-inquiry-[a-zA-Z0-9]{16}$`, which [`is_inquiry_id`] judges a value against.
+const INQUIRY_ID_PREFIX: &str = "compliance-inquiry";
+
+/// The prefix an inquiry export's id carries. The model constrains it nowhere — an export
+/// id is this emulator's own, named only inside the document URL the export announces
+/// ([`export_document_path`]) — so it is spelled like the modelled id attributes.
+const EXPORT_ID_PREFIX: &str = "export";
+
+/// Mint an id no entry of `store` holds, after holding `store` to `capacity` by releasing
+/// its oldest entries.
+///
+/// The ONE place this rule lives, for every store this service keys by an id it mints —
+/// the term grants, the compliance inquiries and the inquiry exports — as [`walk_page`] is
+/// the one place the page walk lives: a correction to the eviction order, to the collision
+/// re-roll or to the id width is then made once rather than once per store.
+///
+/// `seq` advances on every call and the loop skips an id the store already holds, so no
+/// two entries a store holds at one time ever share an id. An id is `prefix` followed by
+/// 16 lower-case hex digits, which satisfies the `<prefix>-[a-zA-Z0-9]{16}` shape this
+/// model's id attributes declare; short of the counter's wrap, which 2^64 calls away is
+/// unreachable, the ids rise with the counter, so their lexicographic order IS their issue
+/// order — that is what makes the `BTreeMap`'s FIRST entry its oldest and lets `capacity`
+/// be held with `pop_first`, without scanning the store.
+///
+/// `capacity` is `Some(bound)` for a store whose oldest entry may be released to make
+/// room, and `None` for a store bounded another way: one whose records a later call must
+/// still find refuses the write when it is full instead (see
+/// [`ComAmazonawsArtifactArtifactState::mint_inquiry_id`]), so nothing may be released
+/// from it here.
+pub fn mint_counter_id<Record>(
+    store: &mut BTreeMap<String, Record>,
+    seq: &mut u64,
+    prefix: &str,
+    capacity: Option<usize>,
+) -> String {
+    if let Some(bound) = capacity {
+        while store.len() >= bound {
+            if store.pop_first().is_none() {
+                // A store holding nothing can release nothing: unreachable for a positive
+                // bound, and what keeps a zero one from looping for ever.
+                break;
+            }
+        }
+    }
+    loop {
+        *seq = seq.wrapping_add(1);
+        let candidate = format!("{prefix}-{:016x}", *seq);
+        if !store.contains_key(&candidate) {
+            return candidate;
         }
     }
 }

@@ -1183,9 +1183,10 @@ pub fn environment_not_found_message(name: &str) -> String {
 /// Airflow web server before any of this service's own code runs. A name that resolves to
 /// nothing is refused by that front door, so the sentence is the endpoint's own and is
 /// FIXED: it states the condition and names no environment, ahead of the request-derived
-/// builder above. Every one of them carries it in the `message` of its modelled
-/// `ResourceNotFoundException`, which is the envelope an AWS SDK's error parser reads a
-/// code and a message out of.
+/// builder above. Every one of them raises it as the `message` of its modelled
+/// `ResourceNotFoundException`, and the front door answers that one refusal with the
+/// sentence as the whole body, the code travelling in the `x-amzn-errortype` header
+/// restJson1 resolves an error shape from (`crate::service::env_endpoint`).
 ///
 /// The text itself is only an example; what a client branches on is the 404 and the
 /// `x-amzn-errortype` code beside it. What is NOT an example is that the sentence is fixed:

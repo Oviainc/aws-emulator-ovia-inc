@@ -4,6 +4,8 @@
 //! Stores an agent profile against its profiling group — the bytes verbatim, the
 //! `Content-Type` it was posted under, and the receipt time — and records
 //! `profilingStatus.latestAgentProfileReportedAt`. Idempotent on `profileToken`.
+//! The submitted data is PARSED first: data that is not a profile is refused with the
+//! operation's modelled `ValidationException` and stored nowhere.
 //!
 //! ## Shape of an operation
 //!
@@ -72,6 +74,138 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use ::ion_rs::{Element, IonType, Value as IonValue};
+
+/// The member a submitted profile has to carry: a profile states the start of the period
+/// it covers, which is what an aggregated profile is assembled by, so profiling data
+/// without it says nothing about when it was collected.
+const PROFILE_START_MEMBER: &str = "start";
+
+/// Why submitted profiling data is not an agent profile.
+///
+/// The submitted data is a document, and what makes it a profile is read off that
+/// document alone: its root is a struct, and that struct carries its start. Each variant
+/// is one way that fails, and each words itself in [`NotAProfile::message`].
+#[derive(Debug)]
+enum NotAProfile {
+    /// The document's root is a value of this Ion type, which is not a struct.
+    Root(&'static str),
+    /// The root IS a struct, and it carries no [`PROFILE_START_MEMBER`].
+    NoStart,
+    /// The bytes are no document at all, in either representation this service reads one
+    /// in, so there is no root to report the type of.
+    Unreadable,
+}
+
+impl NotAProfile {
+    /// The `ValidationException` message for this refusal: the service states that the
+    /// submitted profile is invalid, then the one thing about it that is — so a caller
+    /// reads which part of its own profile to fix out of the message.
+    fn message(&self) -> String {
+        let reason = match self {
+            Self::Root(ion_type) => format!(
+                "Unexpected type for profile root. Expected {}, got {ion_type}.",
+                ion_type_name(IonType::Struct)
+            ),
+            Self::NoStart => format!("Profile must contain a {PROFILE_START_MEMBER} field."),
+            Self::Unreadable => "Profile could not be parsed.".to_string(),
+        };
+        format!("Invalid agent profile: {reason}.")
+    }
+}
+
+/// Ion's own name for the type `ion_type`, which is how a refusal about a value's type
+/// names it.
+fn ion_type_name(ion_type: IonType) -> &'static str {
+    match ion_type {
+        IonType::Null => "NULL",
+        IonType::Bool => "BOOL",
+        IonType::Int => "INT",
+        IonType::Float => "FLOAT",
+        IonType::Decimal => "DECIMAL",
+        IonType::Timestamp => "TIMESTAMP",
+        IonType::Symbol => "SYMBOL",
+        IonType::String => "STRING",
+        IonType::Clob => "CLOB",
+        IonType::Blob => "BLOB",
+        IonType::List => "LIST",
+        IonType::SExp => "SEXP",
+        IonType::Struct => "STRUCT",
+    }
+}
+
+/// Why `bytes` are not an agent profile, or `None` when they are one.
+///
+/// The data is read as a document and judged on that document, NOT on the media type it
+/// was announced under: the `Content-Type` says how to read the bytes, it cannot make
+/// bytes that carry no profile into one.
+///
+/// A SCALAR root is named first, from the Ion reading of the bytes: Ion's text encoding
+/// is a superset of JSON, so one reading names the root of profiling data in either
+/// representation, and a scalar is never a profile whatever else the bytes hold.
+fn not_a_profile(bytes: &[u8]) -> Option<NotAProfile> {
+    if let Some(ion_type) = scalar_root_type(bytes) {
+        return Some(NotAProfile::Root(ion_type_name(ion_type)));
+    }
+    let Some(document) = super::get_profile::submitted_document(bytes) else {
+        return Some(NotAProfile::Unreadable);
+    };
+    // A null struct is a struct that carries no member at all, so it reaches the same
+    // refusal as an empty one rather than being reported as a root of another type.
+    if document.ion_type() == IonType::Struct {
+        let has_start = matches!(document.value(), IonValue::Struct(fields)
+            if fields
+                .fields()
+                .any(|(name, _)| name.text() == Some(PROFILE_START_MEMBER)));
+        return (!has_start).then_some(NotAProfile::NoStart);
+    }
+    Some(NotAProfile::Root(ion_type_name(document.ion_type())))
+}
+
+/// The Ion type of the first value in `bytes` when that value is a SCALAR, and `None`
+/// otherwise — which is what names the root of data that is no document this service
+/// reads as a whole.
+///
+/// A scalar holds nothing to descend into, so its type is read without following a
+/// caller-chosen nesting: that is what lets this read a root in Ion's TEXT encoding,
+/// which [`super::get_profile::submitted_document`] does not read a document in, because
+/// finding where a CONTAINER ends there means reading through everything nested inside it
+/// first. Data that opens more containers than a scalar is written with is therefore
+/// never handed to the reader at all ([`SCALAR_TOKEN_BRACE_BUDGET`]), so how deeply the
+/// submitted data nests is not what decides how deep this read goes.
+fn scalar_root_type(bytes: &[u8]) -> Option<IonType> {
+    if opened_containers(bytes) > SCALAR_TOKEN_BRACE_BUDGET {
+        return None;
+    }
+    let mut reader = ::ion_rs::Reader::new(::ion_rs::AnyEncoding, bytes).ok()?;
+    let value = reader.next().ok()??;
+    match value.read().ok()? {
+        ::ion_rs::ValueRef::List(_)
+        | ::ion_rs::ValueRef::SExp(_)
+        | ::ion_rs::ValueRef::Struct(_) => None,
+        _ => Some(Element::try_from(value).ok()?.ion_type()),
+    }
+}
+
+/// How many container-opening bytes submitted data may hold and still be read for a
+/// SCALAR root: no scalar of the Ion text grammar is written with more than the two
+/// braces a blob (`{{ }}`) or a clob opens, so data holding more than this opens a
+/// container and is read — if it is read at all — by the bounded document readers
+/// instead.
+const SCALAR_TOKEN_BRACE_BUDGET: usize = 2;
+
+/// An upper bound on how deeply `bytes` nest containers, read without parsing them.
+///
+/// Every level of nesting is opened by one of these bytes, so counting them cannot
+/// UNDER-state the nesting; a byte inside a quoted value only makes the bound larger,
+/// which is the safe direction for the caller of this.
+fn opened_containers(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .filter(|byte| matches!(byte, b'[' | b'{' | b'('))
+        .count()
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -152,6 +286,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut guard = state.lock();
+        // The group the request addresses is resolved first: the profile is submitted TO
+        // a profiling group, so a name that names none is answered before the submitted
+        // data is looked at.
+        if !guard.groups.contains_key(&input.profiling_group_name) {
+            return Err(PostAgentProfileErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    // The agent plane words a missing group its own way:
+                    // account-qualified, unlike every other operation's text.
+                    message: crate::state::agent_group_not_found_message(
+                        &input.profiling_group_name,
+                    ),
+                },
+            )
+            .into());
+        }
+        // Submitted profiling data is PARSED before anything is stored, so data that is
+        // not an agent profile is refused and leaves the group exactly as it was — its
+        // `profilingStatus` reports no profile reported, and no aggregated profile
+        // carries it.
+        if let Some(refused) = not_a_profile(&input.agent_profile) {
+            return Err(PostAgentProfileErrorModeled::ValidationException(
+                ValidationException {
+                    message: refused.message(),
+                },
+            )
+            .into());
+        }
         // `post_profile` is the single writer: it honours `profileToken` as an
         // idempotency token (a replay stores nothing and still succeeds), records
         // `profilingStatus.latestAgentProfileReportedAt`, and applies every retention

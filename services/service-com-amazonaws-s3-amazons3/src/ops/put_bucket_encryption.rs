@@ -301,8 +301,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::unmodeled(
                 crate::state::MALFORMED_XML_CODE,
                 MALFORMED_XML_STATUS,
-                "ServerSideEncryptionConfiguration names no Rule; a default encryption \
-                 configuration carries at least one rule",
+                // The FIXED sentence that code publishes, which is what a schema refusal
+                // carries however the document failed to validate — here: the container
+                // names no `Rule`, where `ServerSideEncryptionConfiguration$Rules` is
+                // required.
+                crate::state::MALFORMED_XML_MESSAGE,
             ));
         }
         if rules.len() > crate::state::MAX_SERVER_SIDE_ENCRYPTION_RULES {
@@ -328,10 +331,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(crate::scaffolded::Scaffolded::unmodeled(
                         crate::state::MALFORMED_XML_CODE,
                         MALFORMED_XML_STATUS,
-                        format!(
-                            "ApplyServerSideEncryptionByDefault.SSEAlgorithm must be one of \
-                             {SERVER_SIDE_ENCRYPTION_VALUES:?}, got {algorithm:?}"
-                        ),
+                        crate::state::MALFORMED_XML_MESSAGE,
                     ));
                 }
             }
@@ -350,12 +350,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(crate::scaffolded::Scaffolded::unmodeled(
                     crate::state::INVALID_ARGUMENT_CODE,
                     INVALID_ARGUMENT_STATUS,
-                    format!(
-                        "ApplyServerSideEncryptionByDefault.KMSMasterKeyID is allowed if and \
-                         only if SSEAlgorithm is one of {:?}, got {:?}",
-                        crate::state::KMS_SSE_ALGORITHMS,
-                        rule.sse_algorithm
-                    ),
+                    KMS_KEY_WITHOUT_KMS_ALGORITHM_MESSAGE,
                 ));
             }
 
@@ -371,9 +366,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(crate::scaffolded::Scaffolded::unmodeled(
                     crate::state::MALFORMED_XML_CODE,
                     MALFORMED_XML_STATUS,
-                    "a ServerSideEncryptionConfiguration Rule names neither \
-                     ApplyServerSideEncryptionByDefault nor BucketKeyEnabled nor \
-                     BlockedEncryptionTypes",
+                    crate::state::MALFORMED_XML_MESSAGE,
                 ));
             }
         }
@@ -407,6 +400,19 @@ const MALFORMED_XML_STATUS: u16 = 400;
 /// The HTTP status AWS answers `InvalidArgument` with: 400, the status S3's
 /// error-responses list carries for it.
 const INVALID_ARGUMENT_STATUS: u16 = 400;
+
+/// The `<Message>` S3 answers a default-encryption rule that names a KMS key beside an
+/// algorithm that is not a KMS one: "a KMSMasterKeyID is not applicable if the default sse
+/// algorithm is not aws:kms or aws:kms:dsse".
+///
+/// FIXED text — it names neither the algorithm the rule carried nor the key, which is why it
+/// is a constant rather than a sentence built from the request. It states the rule
+/// `ApplyServerSideEncryptionByDefault$KMSMasterKeyID` publishes ("This parameter is allowed
+/// if and only if SSEAlgorithm is set to aws:kms or aws:kms:dsse") in the words the service
+/// sends it in.
+const KMS_KEY_WITHOUT_KMS_ALGORITHM_MESSAGE: &str =
+    "a KMSMasterKeyID is not applicable if the default sse algorithm is not aws:kms or \
+     aws:kms:dsse";
 
 /// The status `ExpectedBucketOwner` names for a mismatch: "the request fails with the HTTP
 /// status code 403 Forbidden (access denied)".

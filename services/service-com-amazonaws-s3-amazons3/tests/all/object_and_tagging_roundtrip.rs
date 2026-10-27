@@ -665,12 +665,13 @@ async fn object_writes_and_reads_are_refused_outside_what_is_stored() {
 
     // Members whose semantics this emulator cannot carry out keep the scaffold's 501
     // rather than being stripped and answered as a plain success — and the request they
-    // were refused on changes nothing. Two members are NOT among them any more: the
+    // were refused on changes nothing. Three members are NOT among them any more: the
     // server-side-encryption pair is recorded with the object and reported back (the
-    // `object_encryption` suite covers it), and `x-amz-tagging`'s tag set is parsed and
-    // stored (`object_tagging_on_put.rs`). SSE-C stays, because S3 stores no customer key.
+    // `object_encryption` suite covers it), `x-amz-tagging`'s tag set is parsed and
+    // stored (`object_tagging_on_put.rs`), and the conditional members are judged against
+    // what the key holds (`object_conditional_writes.rs`). SSE-C stays, because S3 stores no
+    // customer key.
     for (case, headers) in [
-        ("a conditional write", &[("if-none-match", "*")][..]),
         (
             "a customer-provided encryption key",
             &[(
@@ -714,11 +715,16 @@ async fn object_writes_and_reads_are_refused_outside_what_is_stored() {
 
     // `versionId` is NOT in this table: it names one stored version of the key, which
     // this emulator does keep (see the `object_versioning` suite), so a read naming one
-    // is answered rather than refused.
+    // is answered rather than refused. Neither is a PARTIAL read: a `Range` and a
+    // `partNumber` each name a span of the object, which is served as the 206 the
+    // `zz_probe` suite reads back in pieces.
     for (case, headers, query) in [
-        ("a ranged read", &[("range", "bytes=0-3")][..], ""),
         ("a conditional read", &[("if-none-match", "\"x\"")][..], ""),
-        ("a part number", &[][..], "?partNumber=1"),
+        (
+            "a modified-since read",
+            &[("if-modified-since", "2026-10-21T07:28:00Z")][..],
+            "",
+        ),
     ] {
         let refused = get_object(&router, "refusal-bucket", "dags/held.py", query, headers).await;
         assert_eq!(
@@ -727,6 +733,18 @@ async fn object_writes_and_reads_are_refused_outside_what_is_stored() {
              answer, got {} with body {:?}",
             refused.status,
             text(&refused)
+        );
+    }
+    for (case, headers, query) in [
+        ("a ranged read", &[("range", "bytes=0-3")][..], ""),
+        ("a part-scoped read", &[][..], "?partNumber=1"),
+    ] {
+        let partial = get_object(&router, "refusal-bucket", "dags/held.py", query, headers).await;
+        assert_eq!(
+            partial.status, 206,
+            "case {case:?}: expected the partial-content status, got {} with body {:?}",
+            partial.status,
+            text(&partial)
         );
     }
 

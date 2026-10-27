@@ -2,11 +2,13 @@
 
 //! AWS Batch publishes a `Batch Job State Change` event for every job transition.
 //!
-//! The RULE under test: every status a Batch job takes — the `SUBMITTED` a submit
-//! stores, each move the clock materialises, and the terminal status a cancel or a
-//! terminate writes — is published once onto the account's DEFAULT EventBridge bus as
-//! `source` `aws.batch` / `detail-type` `Batch Job State Change`, carrying that job's own
-//! description as the event `detail` and the job's ARN in `resources`. EventBridge then
+//! The RULE under test: every status a Batch job MOVES INTO — each move the clock
+//! materialises, and the terminal status a cancel or a terminate writes — is published
+//! once onto the account's DEFAULT EventBridge bus as `source` `aws.batch` /
+//! `detail-type` `Batch Job State Change`, carrying that job's own description as the
+//! event `detail` and the job's ARN in `resources`; the status the submit itself stored is
+//! not a move, so no event carries it (the exclusion has its own suite,
+//! `job_submission_publishes_no_event`). EventBridge then
 //! routes it: a rule whose `EventPattern` matches delivers it to its targets, and a rule
 //! that does not match receives nothing. Source: the EventBridge reference page "AWS Batch
 //! events" (`events-ref-batch.html`), which names the source, the detail type and the
@@ -15,8 +17,8 @@
 //!
 //! The tests assert that rule over a TABLE of job lifecycles, which differ along what the
 //! rule generalises over — WHICH statuses a job takes and WHICH operation materialises
-//! them: a job left to the clock (`SUBMITTED` -> `RUNNABLE` -> `FAILED`, published by the
-//! reader that materialises them), a job terminated before it was placed, a job cancelled
+//! them: a job left to the clock (`RUNNABLE`, published by the
+//! reader that materialises it), a job terminated before it was placed, a job cancelled
 //! before it was placed, and a job that waits on another (`PENDING`). Every row's
 //! published `detail` is checked against what `DescribeJobs` reports for the same job, so
 //! the event is the job's own state and not a second, invented copy of it.
@@ -50,16 +52,16 @@ const OTHER_RULE: &str = "unrelated-events";
 
 /// One published event, projected onto what this suite asserts.
 #[derive(Debug, Clone)]
-struct Published {
-    source: String,
-    detail_type: String,
-    resources: Vec<String>,
-    detail: Value,
-    matched_rules: Vec<String>,
+pub(crate) struct Published {
+    pub(crate) source: String,
+    pub(crate) detail_type: String,
+    pub(crate) resources: Vec<String>,
+    pub(crate) detail: Value,
+    pub(crate) matched_rules: Vec<String>,
 }
 
 /// Every event EventBridge has routed, oldest first, as this suite reads them.
-fn published(batch: &Batch) -> Vec<Published> {
+pub(crate) fn published(batch: &Batch) -> Vec<Published> {
     batch
         .event_bus_store()
         .lock()
@@ -80,7 +82,7 @@ fn published(batch: &Batch) -> Vec<Published> {
 }
 
 /// The events published for ONE job, oldest first.
-fn published_for(batch: &Batch, job_id: &str) -> Vec<Published> {
+pub(crate) fn published_for(batch: &Batch, job_id: &str) -> Vec<Published> {
     published(batch)
         .into_iter()
         .filter(|event| event.detail["jobId"] == json!(job_id))
@@ -89,7 +91,7 @@ fn published_for(batch: &Batch, job_id: &str) -> Vec<Published> {
 
 /// An SQS queue called `name`, created through SQS itself; answers its url and the ARN a
 /// rule names it by.
-async fn given_queue(batch: &Batch, name: &str) -> (String, String) {
+pub(crate) async fn given_queue(batch: &Batch, name: &str) -> (String, String) {
     let (status, body) = batch.sqs("CreateQueue", json!({ "QueueName": name })).await;
     assert_eq!(
         status, 200,
@@ -117,7 +119,7 @@ async fn given_queue(batch: &Batch, name: &str) -> (String, String) {
 }
 
 /// Every message waiting on the queue at `url`, as parsed JSON bodies.
-async fn drain(batch: &Batch, url: &str) -> Vec<Value> {
+pub(crate) async fn drain(batch: &Batch, url: &str) -> Vec<Value> {
     let (status, body) = batch
         .sqs(
             "ReceiveMessage",
@@ -144,7 +146,7 @@ async fn drain(batch: &Batch, url: &str) -> Vec<Value> {
 /// state change, one whose pattern cannot. Each gets its own SQS queue as its target, so
 /// a delivery is attributable to the rule that matched; answers the two queue urls,
 /// matching one first.
-async fn given_rules(batch: &Batch) -> (String, String) {
+pub(crate) async fn given_rules(batch: &Batch) -> (String, String) {
     let (matching_url, matching_arn) = given_queue(batch, "batch-events-queue").await;
     let (other_url, other_arn) = given_queue(batch, "unrelated-queue").await;
     let rows = [
@@ -187,7 +189,7 @@ async fn given_rules(batch: &Batch) -> (String, String) {
 
 /// Submit a job onto `queue` against `definition`, optionally waiting on `depends_on`;
 /// answers its id and ARN.
-async fn submit(
+pub(crate) async fn submit(
     batch: &Batch,
     name: &str,
     queue: &str,
@@ -217,7 +219,7 @@ async fn submit(
 /// Long enough for every clock-owed transition of a job with no dependencies to fall
 /// due: each takes [`state::JOB_PHASE_MILLIS`], a plain job makes ONE (`SUBMITTED` ->
 /// `RUNNABLE`, where it rests), and the margin covers a slow machine.
-async fn wait_past_the_clock() {
+pub(crate) async fn wait_past_the_clock() {
     let span = u64::try_from(state::JOB_PHASE_MILLIS).unwrap_or(500);
     tokio::time::sleep(Duration::from_millis(span * 3)).await;
 }
@@ -226,7 +228,7 @@ async fn wait_past_the_clock() {
 /// job therefore takes.
 #[derive(Debug, Clone, Copy)]
 enum Row {
-    /// Left to the clock, then read back: SUBMITTED -> RUNNABLE, where the job rests
+    /// Left to the clock, then read back: it moves into RUNNABLE, where the job rests
     /// because nothing here places it on compute capacity.
     LeftToTheClock,
     /// Terminated while still `SUBMITTED`.
@@ -239,12 +241,13 @@ enum Row {
 }
 
 impl Row {
-    /// The statuses the job takes, in order.
+    /// The statuses the job MOVES INTO, in order — the status it was submitted in is
+    /// not one of them, so no event reports it.
     fn statuses(self) -> &'static [&'static str] {
         match self {
-            Row::LeftToTheClock => &["SUBMITTED", "RUNNABLE"],
-            Row::Terminated | Row::Cancelled => &["SUBMITTED", "FAILED"],
-            Row::WaitingOnADependency => &["SUBMITTED", "PENDING", "FAILED"],
+            Row::LeftToTheClock => &["RUNNABLE"],
+            Row::Terminated | Row::Cancelled => &["FAILED"],
+            Row::WaitingOnADependency => &["PENDING", "FAILED"],
         }
     }
 }
@@ -513,12 +516,13 @@ async fn a_rule_filtering_on_the_job_detail_sees_only_the_matching_transitions()
     let queue = job_queue(&batch, "jq-filtered", &environment).await;
     let (definition, _) = job_definition(&batch, "jd-filtered", container_properties()).await;
 
-    // One rule per status of the chain a plain job walks, plus two naming statuses this
-    // job never takes (nothing places it, so it rests in RUNNABLE): each must see exactly
+    // One rule per status of the chain a plain job walks, plus rules naming statuses no
+    // event reports: the status the submit stored (never published) and two this job
+    // never takes (nothing places it, so it rests in RUNNABLE). Each must see exactly
     // the transitions its pattern names, and each delivers to its own queue, so what a
     // rule saw is observable from the queue too.
     let rows = [
-        ("submitted-only", "SUBMITTED", 1),
+        ("submitted-only", "SUBMITTED", 0),
         ("runnable-only", "RUNNABLE", 1),
         ("failed-only", "FAILED", 0),
         ("succeeded-only", "SUCCEEDED", 0),
@@ -620,7 +624,7 @@ async fn the_clock_owed_transitions_arrive_without_any_further_batch_call() {
 
     assert_eq!(
         statuses,
-        vec!["SUBMITTED".to_string(), "RUNNABLE".to_string()],
+        vec!["RUNNABLE".to_string()],
         "expected the whole clock-owed chain delivered without a further Batch call, got \
          {statuses:?}"
     );

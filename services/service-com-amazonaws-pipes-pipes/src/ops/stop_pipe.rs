@@ -2,8 +2,9 @@
 
 //! @op StopPipe
 //! IMPLEMENTED: moves the stored pipe's `DesiredState` to `STOPPED` and its
-//! `CurrentState` through `STOPPING`. An unknown name is `NotFoundException` (404). This
-//! is the ONLY file to touch for this operation.
+//! `CurrentState` through `STOPPING`. A stop that lands while a move is already in
+//! flight is `ConflictException` (409); an unknown name is `NotFoundException` (404).
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -166,6 +167,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let pipe = state.pipes.get_mut(&input.name).ok_or_else(|| {
             StopPipeErrorModeled::NotFoundException(crate::state::pipe_not_found(&input.name))
         })?;
+
+        // The same gate a start passes: the move already in flight has to land before
+        // another is started, so a stop that arrives mid-transition is refused with the
+        // modelled conflict.
+        if pipe.transient_state().is_some() {
+            return Err(StopPipeErrorModeled::ConflictException(
+                crate::state::pipe_conflict(&pipe.name),
+            )
+            .into());
+        }
 
         pipe.desired_state = crate::state::requested_state::STOPPED.to_string();
         pipe.begin_transition(

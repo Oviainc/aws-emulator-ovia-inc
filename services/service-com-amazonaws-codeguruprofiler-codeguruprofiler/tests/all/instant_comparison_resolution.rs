@@ -291,7 +291,8 @@ async fn get_profile_window_bounds_are_exact_at_nanosecond_resolution() {
         let label = case.label;
         let name = format!("instant-window-{index}");
         create_group(&harness, &name).await;
-        let payload = format!("{{\"profile\":\"{name}\"}}").into_bytes();
+        let payload =
+            format!("{{\"start\":1600000000000,\"profile\":\"{name}\"}}").into_bytes();
         assert_eq!(
             harness
                 .post_agent_profile(&name, "application/json", None, payload.clone())

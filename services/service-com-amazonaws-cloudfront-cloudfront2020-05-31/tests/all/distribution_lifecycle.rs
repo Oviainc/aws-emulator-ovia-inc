@@ -696,7 +696,10 @@ pub(crate) fn batch_xml(reference: &str, paths: &[&str]) -> String {
 
 /// An `InvalidationBatch` XML body that states `quantity` whatever `paths` carries, so a
 /// test can submit a wrapper whose `Quantity` disagrees with its `Items`.
-fn batch_xml_with_quantity(reference: &str, paths: &[&str], quantity: i32) -> String {
+///
+/// `pub(crate)` so every suite that submits a batch — against a distribution or against a
+/// distribution TENANT — builds it here rather than carrying its own copy.
+pub(crate) fn batch_xml_with_quantity(reference: &str, paths: &[&str], quantity: i32) -> String {
     let mut out = format!(
         "<InvalidationBatch xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">\
          <Paths><Quantity>{quantity}</Quantity><Items>"
@@ -708,6 +711,23 @@ fn batch_xml_with_quantity(reference: &str, paths: &[&str], quantity: i32) -> St
         "</Items></Paths><CallerReference>{reference}</CallerReference></InvalidationBatch>"
     ));
     out
+}
+
+/// The sentence an `InconsistentQuantities` refusal carries for one list wrapper, built
+/// from the request: the wrapper, the `Quantity` the request stated and the number of items
+/// it really carried.
+///
+/// `pub(crate)` and written once here so every suite that asserts this refusal's wording
+/// expects the same sentence rather than carrying its own spelling of it.
+pub(crate) fn inconsistent_quantities_message(
+    wrapper: &str,
+    stated: i32,
+    carried: usize,
+) -> String {
+    format!(
+        "The specified quantity of {wrapper} ({stated}) does not match the actual quantity \
+         supplied ({carried})."
+    )
 }
 
 /// `Distribution$Id`'s shape: `E` followed by 13 uppercase alphanumerics, checked here

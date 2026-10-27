@@ -442,6 +442,52 @@ where
     None
 }
 
+/// Why this organization-association request's `accountIds` cannot be acted on,
+/// if it cannot, as the service's own validation report ([`constraint_report`],
+/// which echoes no request value).
+///
+/// The list of member accounts an association request names is read by both
+/// association operations, so what makes it refusable is judged here once as
+/// well: a list one of them cannot act on is one the other cannot act on either,
+/// and the two cannot drift apart over which requests they refuse, over the
+/// bound they refuse them at or over how they word the refusal. The clause is
+/// the documented SIZE of the list, which the `AccountIdList` shape carries no
+/// `@length` for: the paired operations name "one or more member accounts" and
+/// the member reads "You can specify up to 50 account IDs"
+/// ([`MAX_ACCOUNT_IDS_PER_REQUEST`]), so a request naming none, and one naming
+/// more, is refused rather than acted on for a prefix of the list.
+pub fn account_ids_violation(account_ids: &[String]) -> Option<String> {
+    if account_ids.is_empty() {
+        return Some(constraint_report(
+            "accountIds",
+            "Member must have length greater than or equal to 1",
+        ));
+    }
+    if account_ids.len() > MAX_ACCOUNT_IDS_PER_REQUEST {
+        return Some(constraint_report(
+            "accountIds",
+            &format!("Member must have length less than or equal to {MAX_ACCOUNT_IDS_PER_REQUEST}"),
+        ));
+    }
+    None
+}
+
+/// The accounts an organization-association request names, each ONCE and in the
+/// order the request first names them.
+///
+/// An id repeated in the list names the same account, and an account is
+/// associated or it is not, so both association operations read their request's
+/// list this way — once, here, so the two cannot disagree about what a repeated
+/// id means or about the order they answer in.
+pub fn distinct_account_ids(account_ids: &[String]) -> Vec<String> {
+    let mut seen: HashSet<&str> = HashSet::with_capacity(account_ids.len());
+    account_ids
+        .iter()
+        .filter(|account_id| seen.insert(account_id.as_str()))
+        .cloned()
+        .collect()
+}
+
 /// Now, as the wire timestamp type. The ONE clock the handlers read, so a stored
 /// timestamp is always the real store time.
 pub fn now() -> ::aws_smithy_types::DateTime {

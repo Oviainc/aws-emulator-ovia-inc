@@ -163,6 +163,20 @@ pub(crate) fn profile_document(profile: &crate::state::AgentProfile) -> Option<E
     decoded(&profile.bytes, Representation::of(&profile.content_type)?)
 }
 
+/// `bytes` read as a document in WHICHEVER representation they are one in, or `None` when
+/// they are one in neither.
+///
+/// `pub(crate)` because the bytes a caller SUBMITS are read without being told which
+/// representation they are in: `PostAgentProfile` parses the profile it is handed to
+/// decide whether it is a profile at all, and the representations it can be one in are
+/// exactly the ones read here — so a document this service accepts is a document it can
+/// also serve.
+pub(crate) fn submitted_document(bytes: &[u8]) -> Option<Element> {
+    Representation::ALL
+        .into_iter()
+        .find_map(|representation| decoded(bytes, representation))
+}
+
 /// The representations this service serves an aggregated profile in, as the model's
 /// `GetProfile$accept` doc names them: "application/json — standard JSON format" and
 /// "application/x-amzn-ion — the Amazon Ion data format".

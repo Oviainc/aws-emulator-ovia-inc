@@ -229,6 +229,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // inline policies (`PutRolePolicy`) and instance profiles
         // (`AddRoleToInstanceProfile`) are what can hold a role today, and each of them
         // blocks the delete until the caller removes it.
+        //
+        // WHICH of them blocks it decides the sentence, and each sentence is the fixed
+        // text IAM words that class of blocking dependent with
+        // (`crate::state::DELETE_CONFLICT_*`): no count, no policy name and no profile
+        // name, so the refusal says what class of thing to remove and nothing about the
+        // account's shape. The order is the order this operation's own documentation
+        // lists the items to remove in.
         let attached = store
             .role_attached_policies
             .get(&key)
@@ -238,41 +245,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&key)
             .map_or(0, ::std::collections::BTreeMap::len);
         let profiles = store.instance_profiles_holding_role(&key);
-        if attached > 0 || embedded > 0 || !profiles.is_empty() {
-            // Only the kinds that actually hold the role back are named, so the
-            // message says what the caller has to remove and nothing else, and each
-            // clause agrees in number with its own count.
-            let mut blockers = Vec::new();
-            if attached > 0 {
-                blockers.push(format!(
-                    "{attached} managed {} must be detached",
-                    if attached == 1 { "policy" } else { "policies" }
-                ));
-            }
-            if embedded > 0 {
-                blockers.push(format!(
-                    "{embedded} inline {} must be deleted",
-                    if embedded == 1 { "policy" } else { "policies" }
-                ));
-            }
-            if !profiles.is_empty() {
-                blockers.push(format!(
-                    "the role must be removed from instance {} {}",
-                    if profiles.len() == 1 {
-                        "profile"
-                    } else {
-                        "profiles"
-                    },
-                    profiles.join(", ")
-                ));
-            }
+        let blocker = if embedded > 0 {
+            Some(crate::state::DELETE_CONFLICT_DELETE_POLICIES)
+        } else if attached > 0 {
+            Some(crate::state::DELETE_CONFLICT_DETACH_POLICIES)
+        } else if !profiles.is_empty() {
+            Some(crate::state::DELETE_CONFLICT_REMOVE_ROLES_FROM_INSTANCE_PROFILE)
+        } else {
+            None
+        };
+        if let Some(blocker) = blocker {
             return Err(DeleteRoleErrorModeled::DeleteConflictException(
                 DeleteConflictException {
-                    message: Some(format!(
-                        "Cannot delete entity: {} from the role {} first.",
-                        blockers.join(", and "),
-                        input.role_name
-                    )),
+                    message: Some(blocker.to_string()),
                 },
             )
             .into());

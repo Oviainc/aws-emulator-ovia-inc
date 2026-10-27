@@ -17,10 +17,81 @@ pub struct GetFunctionCodeSigningConfigInput {
     pub function_name: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.lambda#GetFunctionCodeSigningConfigResponse")]
+/// `GetFunctionCodeSigningConfigResponse`: the function, and the code signing
+/// configuration it is associated with — a member that is ABSENT when it holds none.
+///
+/// Written out rather than generated from the shape because the association is optional
+/// in fact while the member carries `@required`, which the shape derive renders as a bare
+/// `String` written on every response. A function nothing has associated a configuration
+/// with has no ARN to report, and `CodeSigningConfigArn`'s own pattern
+/// (`^arn:…:code-signing-config:csc-[a-z0-9]{17}$`, from
+/// `smithy_query(query="shape", shape="CodeSigningConfigArn")`) admits no string that
+/// stands for "none" — the empty string least of all, since it satisfies the pattern no
+/// better than any other non-ARN. So "no association" is reported by leaving the member
+/// out of the body, which is what AWS answers and what every other optional member of
+/// this service reports absence with.
 #[derive(Debug, Clone, Default)]
 pub struct GetFunctionCodeSigningConfigOutput {
-    pub code_signing_config_arn: String,
+    /// The configuration the function is associated with, or `None` when it holds none.
+    pub code_signing_config_arn: Option<String>,
     pub function_name: String,
+}
+
+#[allow(non_upper_case_globals)]
+impl GetFunctionCodeSigningConfigOutput {
+    /// `GetFunctionCodeSigningConfigResponse$CodeSigningConfigArn`, member 0 of the shape.
+    const M_CODE_SIGNING_CONFIG_ARN: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.lambda#GetFunctionCodeSigningConfigResponse$CodeSigningConfigArn",
+                "com.amazonaws.lambda",
+                "CodeSigningConfigArn",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "CodeSigningConfigArn",
+            0,
+        );
+
+    /// `GetFunctionCodeSigningConfigResponse$FunctionName`, member 1 of the shape.
+    const M_FUNCTION_NAME: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.lambda#GetFunctionCodeSigningConfigResponse$FunctionName",
+                "com.amazonaws.lambda",
+                "FunctionName",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "FunctionName",
+            1,
+        );
+
+    /// The shape itself, with its members in the order the model declares them.
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.lambda#GetFunctionCodeSigningConfigResponse",
+            "com.amazonaws.lambda",
+            "GetFunctionCodeSigningConfigResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[&Self::M_CODE_SIGNING_CONFIG_ARN, &Self::M_FUNCTION_NAME],
+    );
+}
+
+pub static GET_FUNCTION_CODE_SIGNING_CONFIG_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
+    &GetFunctionCodeSigningConfigOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for GetFunctionCodeSigningConfigOutput {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        // Exactly as a non-`@required` member is written: the member reaches the body
+        // only when the function holds an association.
+        if let Some(arn) = self.code_signing_config_arn.as_ref() {
+            serializer.write_string(&Self::M_CODE_SIGNING_CONFIG_ARN, arn.as_str())?;
+        }
+        serializer.write_string(&Self::M_FUNCTION_NAME, self.function_name.as_str())?;
+        Ok(())
+    }
 }
 

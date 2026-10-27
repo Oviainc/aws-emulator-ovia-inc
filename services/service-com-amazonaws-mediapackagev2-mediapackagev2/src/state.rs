@@ -613,11 +613,16 @@ impl ComAmazonawsMediapackagev2Mediapackagev2State {
         self.channel_group(region, target.resource.group())
     }
 
-    /// Apply `mutate` to the tags of the resource `target` names and COMMIT the change
-    /// (new `ModifiedAt`, new entity tag), reporting whether the resource was there.
+    /// Apply `mutate` to the tags of the resource `target` names and commit the change it
+    /// made (new `ModifiedAt`, new entity tag), reporting whether the resource was there.
     ///
-    /// `false` means nothing was written: the resource the ARN names does not exist in
-    /// `region` (see [`Self::resolved_group`]).
+    /// The tags are part of each record's content, so a tag write that CHANGED them
+    /// commits a new version of the record, and one that stored exactly the tags that were
+    /// already there commits nothing — the same rule every other write is judged by
+    /// ([`VersionedRecord::commit_if_changed`]).
+    ///
+    /// `false` means the resource the ARN names does not exist in `region` (see
+    /// [`Self::resolved_group`]), so there was nothing to write to.
     pub fn with_tags_mut(
         &mut self,
         region: &str,
@@ -633,16 +638,18 @@ impl ComAmazonawsMediapackagev2Mediapackagev2State {
         };
         match &target.resource {
             TaggedResource::ChannelGroup { .. } => {
+                let before = group.configuration_fingerprint();
                 mutate(&mut group.tags);
-                group.commit(at);
+                group.commit_if_changed(&before, at);
                 true
             }
             TaggedResource::Channel { channel, .. } => {
                 let Some(channel) = group.channels.get_mut(channel) else {
                     return false;
                 };
+                let before = channel.configuration_fingerprint();
                 mutate(&mut channel.tags);
-                channel.commit(at);
+                channel.commit_if_changed(&before, at);
                 true
             }
             TaggedResource::OriginEndpoint {
@@ -655,8 +662,9 @@ impl ComAmazonawsMediapackagev2Mediapackagev2State {
                 else {
                     return false;
                 };
+                let before = endpoint.configuration_fingerprint();
                 mutate(&mut endpoint.tags);
-                endpoint.commit(at);
+                endpoint.commit_if_changed(&before, at);
                 true
             }
             TaggedResource::HarvestJob {
@@ -673,8 +681,9 @@ impl ComAmazonawsMediapackagev2Mediapackagev2State {
                 else {
                     return false;
                 };
+                let before = job.configuration_fingerprint();
                 mutate(&mut job.tags);
-                job.commit(at);
+                job.commit_if_changed(&before, at);
                 true
             }
         }
@@ -789,6 +798,128 @@ pub struct ChannelGroup {
     /// carrying the same token can be told apart from a changed one.
     pub fingerprint: String,
     pub channels: BTreeMap<String, Channel>,
+}
+
+/// A persisted record whose writes are VERSIONED: every committed change bumps its
+/// commit count, restamps `ModifiedAt` and re-derives its entity tag, so the tag a caller
+/// holds names exactly one version of the record.
+///
+/// Implemented by every resource a caller-submitted write can store content into, so the
+/// question each of those handlers has to answer before it commits — did this write
+/// actually CHANGE the record? — is decided in ONE place instead of once per handler.
+pub trait VersionedRecord {
+    /// A fingerprint of everything this record IS, except the bookkeeping a commit writes
+    /// (its commit count, its entity tag and its modification instant) and the
+    /// sub-resources hanging off it, which commit versions of their own.
+    ///
+    /// Compared only within one request: derived `Debug` output is not a stability
+    /// contract, so the value is never stored or returned.
+    fn configuration_fingerprint(&self) -> String;
+
+    /// Commit a change: bump the version, stamp `at` on `ModifiedAt`, re-derive the tag.
+    fn commit_version(&mut self, at: ::aws_smithy_types::DateTime);
+
+    /// Commit the write that has just run, but only if it CHANGED the record.
+    ///
+    /// `before` is [`Self::configuration_fingerprint`] taken before the write. A write
+    /// that changed ANY member commits a new version of the record, which rotates the
+    /// entity tag — so the tag the caller held is necessarily stale, which is what makes a
+    /// conditional write that lost a race detectable. A write that stored exactly what was
+    /// already there changed nothing, so it commits nothing: neither the tag nor
+    /// `ModifiedAt` moves, and the tag the caller holds stays usable as the precondition of
+    /// the write it is entitled to make.
+    fn commit_if_changed(&mut self, before: &str, at: ::aws_smithy_types::DateTime) {
+        if self.configuration_fingerprint() != before {
+            self.commit_version(at);
+        }
+    }
+}
+
+/// One record's fingerprint, taken from the record with its bookkeeping and its
+/// sub-resources already scrubbed, plus the tags scrubbed out of it.
+///
+/// Rendered through the record's own `Debug`, so it covers every member BY CONSTRUCTION —
+/// including a member added to the struct later, which is exactly what a hand-listed
+/// digest gets wrong. The tags come separately, through [`tag_fingerprint`], because a
+/// `HashMap`'s `Debug` order is unspecified and a rehash must not look like a change.
+fn scrubbed_fingerprint(
+    scrubbed: &impl ::std::fmt::Debug,
+    tags: &HashMap<String, String>,
+) -> String {
+    format!("{}\u{1f}{scrubbed:?}", tag_fingerprint(tags))
+}
+
+impl VersionedRecord for ChannelGroup {
+    fn configuration_fingerprint(&self) -> String {
+        let mut own = self.clone();
+        own.version = 0;
+        own.etag = String::new();
+        own.modified_at = ::aws_smithy_types::DateTime::from_secs(0);
+        let tags = ::std::mem::take(&mut own.tags);
+        // The channels beneath the group are resources in their own right, each with its
+        // own version and entity tag, so they are no part of the group's content.
+        own.channels = BTreeMap::new();
+        scrubbed_fingerprint(&own, &tags)
+    }
+
+    fn commit_version(&mut self, at: ::aws_smithy_types::DateTime) {
+        self.commit(at);
+    }
+}
+
+impl VersionedRecord for Channel {
+    fn configuration_fingerprint(&self) -> String {
+        let mut own = self.clone();
+        own.version = 0;
+        own.etag = String::new();
+        own.modified_at = ::aws_smithy_types::DateTime::from_secs(0);
+        let tags = ::std::mem::take(&mut own.tags);
+        // The attached policy, the origin endpoints and what the ingest data plane
+        // accepted are not channel members — no `Channel*` shape in the model carries
+        // them and they take no part in the channel's entity tag either — so they are no
+        // part of its content here.
+        own.policy = None;
+        own.origin_endpoints = BTreeMap::new();
+        own.ingested_objects = BTreeMap::new();
+        scrubbed_fingerprint(&own, &tags)
+    }
+
+    fn commit_version(&mut self, at: ::aws_smithy_types::DateTime) {
+        self.commit(at);
+    }
+}
+
+impl VersionedRecord for OriginEndpoint {
+    fn configuration_fingerprint(&self) -> String {
+        let mut own = self.clone();
+        own.version = 0;
+        own.etag = String::new();
+        own.modified_at = ::aws_smithy_types::DateTime::from_secs(0);
+        let tags = ::std::mem::take(&mut own.tags);
+        // The harvest jobs are left out for the same reason the attached policy is: a
+        // sub-resource commits versions of its own.
+        own.harvest_jobs = BTreeMap::new();
+        scrubbed_fingerprint(&own, &tags)
+    }
+
+    fn commit_version(&mut self, at: ::aws_smithy_types::DateTime) {
+        self.commit(at);
+    }
+}
+
+impl VersionedRecord for HarvestJobRecord {
+    fn configuration_fingerprint(&self) -> String {
+        let mut own = self.clone();
+        own.version = 0;
+        own.etag = String::new();
+        own.modified_at = ::aws_smithy_types::DateTime::from_secs(0);
+        let tags = ::std::mem::take(&mut own.tags);
+        scrubbed_fingerprint(&own, &tags)
+    }
+
+    fn commit_version(&mut self, at: ::aws_smithy_types::DateTime) {
+        self.commit(at);
+    }
 }
 
 impl ChannelGroup {
@@ -1002,31 +1133,6 @@ impl OriginEndpoint {
         self.version = self.version.saturating_add(1);
         self.modified_at = at;
         self.etag = origin_endpoint_etag(self);
-    }
-
-    /// A fingerprint of everything this endpoint IS, except the bookkeeping a commit
-    /// writes (its commit count, its entity tag and its modification instant).
-    ///
-    /// Taken over the record's own `Debug` rendering, so it covers every member BY
-    /// CONSTRUCTION — including a member added to the struct later, which is exactly what
-    /// a hand-listed digest gets wrong. `tags` is rendered through [`tag_fingerprint`]
-    /// and then taken out of that rendering, because a `HashMap`'s `Debug` order is
-    /// unspecified and a rehash must not look like a change; `harvest_jobs` is left out
-    /// for the same reason the policy is — a sub-resource commits versions of its own.
-    ///
-    /// `UpdateOriginEndpoint` captures it before it writes and compares afterwards, so a
-    /// write that changed ANY member commits (and rotates the tag) while one that stored
-    /// exactly what was there does not. Compared only within one request: derived `Debug`
-    /// output is not a stability contract, so the value is never stored or returned.
-    pub fn configuration_fingerprint(&self) -> String {
-        let mut own = self.clone();
-        own.version = 0;
-        own.etag = String::new();
-        own.modified_at = ::aws_smithy_types::DateTime::from_secs(0);
-        let tags = tag_fingerprint(&own.tags);
-        own.tags = HashMap::new();
-        own.harvest_jobs = BTreeMap::new();
-        format!("{tags}\u{1f}{own:?}")
     }
 }
 

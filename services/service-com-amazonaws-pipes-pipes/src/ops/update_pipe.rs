@@ -238,11 +238,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // of its own states the pipe is passing through is not the caller's business and
         // does not change what the caller must do (wait for it to land and ask again).
         if pipe.transient_state().is_some() {
-            return Err(UpdatePipeErrorModeled::ConflictException(ConflictException {
-                message: format!("Pipe {} is updating concurrently.", pipe.name),
-                resource_id: pipe.name.clone(),
-                resource_type: crate::state::PIPE_RESOURCE_TYPE.to_string(),
-            })
+            return Err(UpdatePipeErrorModeled::ConflictException(
+                crate::state::pipe_conflict(&pipe.name),
+            )
             .into());
         }
 
