@@ -19,6 +19,12 @@
 //!
 //! This operation REPORTS; it writes nothing to the store.
 //!
+//! Compute Optimizer is a REGIONAL service, so a request addresses one region's endpoint:
+//! the groups it answers for are that region's, and every ARN it reports — and matches an
+//! `autoScalingGroupArns` entry against — names that region
+//! ([`crate::state::request_region`], [`crate::state::AnalyzedAutoScalingGroup::arn_in`]),
+//! as this service's other readers do.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -187,7 +193,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // Compute Optimizer is a REGIONAL service, so the request addresses ONE region's
+        // endpoint: the groups it asks about are that region's, and the ARNs its answer
+        // names carry that region ([`crate::state::request_region`]).
+        let region = crate::state::request_region(ctx);
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetAutoScalingGroupRecommendationsErrorModeled::InternalServerException(
                 InternalServerException {
@@ -306,10 +315,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let last_refresh_timestamp = guard.enrollment.last_analysis_refresh();
 
         let analyses = guard.visible_auto_scaling_group_analyses();
-        let for_account: Vec<&crate::state::AnalyzedAutoScalingGroup> = analyses
+        // Each analysed group of the requested account, with the ARN THIS endpoint reports
+        // it under: a row holds the group's region-free identity, so the ARN is built for
+        // the region the request addressed and the ARNs the request names are matched
+        // against it. An ARN naming another region names a group this regional endpoint does
+        // not analyse, so it selects nothing here.
+        let for_account: Vec<(&crate::state::AnalyzedAutoScalingGroup, String)> = analyses
             .iter()
             .filter(|group| group.account_id == account_id)
-            .filter(|group| requested_arns.is_empty() || requested_arns.contains(&group.arn))
+            .map(|group| (group, group.arn_in(&region)))
+            .filter(|(_, arn)| requested_arns.is_empty() || requested_arns.contains(arn))
             .collect();
 
         // An identifier the request named that this analysis holds no recommendation for
@@ -318,7 +333,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // caller can tell "no recommendation for this group" from "not asked about".
         let errors: Vec<GetRecommendationError> = requested_arns
             .iter()
-            .filter(|arn| !for_account.iter().any(|group| &&group.arn == arn))
+            .filter(|arn| !for_account.iter().any(|(_, group_arn)| group_arn == *arn))
             .map(|arn| GetRecommendationError {
                 identifier: Some(arn.clone()),
                 code: Some(NO_RECOMMENDATION_CODE.to_string()),
@@ -330,21 +345,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Each surviving group with the preferences its recommendation is generated
         // under: the account's stored preferences resolved for that group's ARN.
-        let resolved: Vec<(&crate::state::AnalyzedAutoScalingGroup, crate::state::EffectivePreferences)> =
-            for_account
-                .into_iter()
-                .filter_map(|group| {
-                    let parsed = crate::state::parse_resource_arn(&group.arn)?;
-                    Some((group, guard.effective_preferences(&group.arn, parsed)))
-                })
-                .filter(|(group, preferences)| {
-                    input
-                        .filters
-                        .iter()
-                        .flatten()
-                        .all(|filter| filter_matches(filter, group, preferences))
-                })
-                .collect();
+        let resolved: Vec<(
+            &crate::state::AnalyzedAutoScalingGroup,
+            String,
+            crate::state::EffectivePreferences,
+        )> = for_account
+            .into_iter()
+            .filter_map(|(group, arn)| {
+                let parsed = crate::state::parse_resource_arn(&arn)?;
+                let preferences = guard.effective_preferences(&arn, parsed);
+                Some((group, arn, preferences))
+            })
+            .filter(|(group, _, preferences)| {
+                input
+                    .filters
+                    .iter()
+                    .flatten()
+                    .all(|filter| filter_matches(filter, group, preferences))
+            })
+            .collect();
 
         // One page of the selected recommendations, resuming at the group a `nextToken`
         // names, plus a token naming the group the page after this one starts at. A token
@@ -354,7 +373,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // caller would read as "no more recommendations".
         let start = match &resume_at {
             None => 0,
-            Some(arn) => match resolved.iter().position(|(group, _)| &group.arn == arn) {
+            Some(wanted) => match resolved.iter().position(|(_, arn, _)| arn == wanted) {
                 Some(index) => index,
                 None => {
                     return Err(invalid_parameter(
@@ -366,14 +385,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page = resolved.get(start..).unwrap_or_default();
         let next_token = page
             .get(page_size)
-            .map(|(group, _)| crate::state::encode_resource_page_token(&group.arn));
+            .map(|(_, arn, _)| crate::state::encode_resource_page_token(arn));
 
         let recommendations = page
             .iter()
             .take(page_size)
-            .map(|(group, preferences)| {
+            .map(|(group, arn, preferences)| {
                 recommendation(
                     group,
+                    arn,
                     preferences,
                     &requested_architectures,
                     last_refresh_timestamp,
@@ -448,13 +468,15 @@ fn filter_matches(
 }
 
 /// One Auto Scaling group's recommendation, computed from the stored analysis and the
-/// preferences in force for the group.
+/// preferences in force for the group, under `arn` — the ARN the endpoint this request
+/// addressed reports the group under.
 ///
 /// `currentInstanceGpuInfo` and an option's `instanceGpuInfo` are left unreported: no
 /// instance type in this analysis has an attached accelerator, and those members describe
 /// "the GPU accelerator settings" of one that does.
 fn recommendation(
     group: &crate::state::AnalyzedAutoScalingGroup,
+    arn: &str,
     preferences: &crate::state::EffectivePreferences,
     requested_architectures: &[String],
     last_refresh_timestamp: Option<::aws_smithy_types::DateTime>,
@@ -519,7 +541,7 @@ fn recommendation(
 
     AutoScalingGroupRecommendation {
         account_id: Some(group.account_id.clone()),
-        auto_scaling_group_arn: Some(group.arn.clone()),
+        auto_scaling_group_arn: Some(arn.to_string()),
         auto_scaling_group_name: Some(group.name.clone()),
         finding: Some(group.finding().to_string()),
         utilization_metrics: Some(group.utilization_metrics()),

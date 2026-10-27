@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteNetworkInsightsPath
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteNetworkInsightsPath`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: takes the Reachability Analyzer path the request names out of
+//! [`crate::state`] and answers the id it removed. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteNetworkInsightsPath::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `NetworkInsightsPathId` carries no modelled pattern, and this operation asks ONE question
+//! about it: does it resolve to a path this account holds? Every id that does not — whatever
+//! its form — is refused with EC2's `InvalidParameterValue` stating that the
+//! `NetworkInsightsPathId` it was given is not a valid one
+//! ([`crate::state::invalid_network_insights_path_id_value`]), rather than with the
+//! `Invalid<Resource>Id.NotFound` the describes and `StartNetworkInsightsAnalysis` answer:
+//! WHICH of the two EC2 answers for an id it cannot resolve is a fact of the operation and
+//! not of the id. A delete of a path that is already gone is therefore a refusal and not a
+//! silent success, so a caller can tell the deletion it performed from one it did not.
+//!
+//! `DryRun` is answered AFTER the id is resolved, the way the rest of this surface orders the
+//! two: a dry run naming a path the account does not hold is refused with that reason, and
+//! one that would have succeeded reports `DryRunOperation` having removed nothing.
+//!
+//! The analyses already started on the path are resources of their own, named by their own
+//! ids and removed by their own operation (`DeleteNetworkInsightsAnalysis`); "deletes the
+//! specified path" is what this call does, so it neither removes them nor refuses because
+//! they exist.
 //!
 //! ## Shape of an operation
 //!
@@ -133,18 +146,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteNetworkInsightsPath` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteNetworkInsightsPathErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteNetworkInsightsPath"))
+        use crate::state;
+
+        // A path is named by id, and nothing this call answers is a fact of the Region the
+        // request was signed for, so none of the request metadata `ctx` carries is read.
+        let _ = ctx;
+
+        let path_id = input.network_insights_path_id;
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+
+        // "Deletes the specified path": an id that resolves to no path of the account is
+        // refused rather than answered as a delete that happened (see the module docs for
+        // which refusal this operation answers with).
+        if !store.network_insights_paths.contains_key(&path_id) {
+            return Err(state::invalid_network_insights_path_id_value(&path_id));
+        }
+
+        // The request is one that would have succeeded, so the dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (`DryRun`).
+        // Nothing has been removed yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The remove is what takes the path out of the store — the bytes it held go back to
+        // the store's budget with it — so the answer reports a removal that happened rather
+        // than one this handler assumed.
+        if store.remove_network_insights_path(&path_id).is_none() {
+            return Err(state::internal_error(
+                "the network insights path checked a moment ago could not be removed",
+            ));
+        }
+
+        Ok(DeleteNetworkInsightsPathOutput {
+            // "The ID of the path" (`DeleteNetworkInsightsPathResult$NetworkInsightsPathId`):
+            // the path this call removed.
+            network_insights_path_id: Some(path_id),
+        })
     }
 }

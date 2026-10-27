@@ -179,6 +179,12 @@ pub const STATUS_INACTIVE: &str = "Inactive";
 pub const RESOURCE_TYPE_EC2_INSTANCE: &str = "Ec2Instance";
 /// See [`RESOURCE_TYPE_EC2_INSTANCE`].
 pub const RESOURCE_TYPE_AUTO_SCALING_GROUP: &str = "AutoScalingGroup";
+
+/// The service namespace an Auto Scaling group's ARN carries
+/// (`arn:aws:autoscaling:<region>:<account>:autoScalingGroup:…`), stated once so the ARN a
+/// reader builds and the ARN form the preference API accepts cannot drift apart.
+pub const AUTO_SCALING_ARN_SERVICE: &str = "autoscaling";
+
 /// The `ResourceType` an Amazon ECS service is analysed as (`RESOURCE_TYPE_VALUES`). A
 /// preference written for it is what `GetECSServiceRecommendations` resolves its effective
 /// look-back period from.
@@ -1881,8 +1887,11 @@ pub fn parse_volume_arn(arn: &str) -> Option<ParsedVolumeArn<'_>> {
 pub struct AnalyzedAutoScalingGroup {
     /// The account that owns the group.
     pub account_id: String,
-    /// `autoScalingGroupArn`.
-    pub arn: String,
+    /// The group's own id — the identifier segment of its ARN. A row keeps the group's
+    /// REGION-FREE identity, because Compute Optimizer is regional: the ARN a reader reports
+    /// names the region of the endpoint the request addressed, which [`Self::arn_in`] builds
+    /// from this id and the group's name.
+    pub group_id: String,
     /// `autoScalingGroupName`.
     pub name: String,
     /// The group's current configuration.
@@ -1908,6 +1917,25 @@ pub struct AnalyzedAutoScalingGroup {
 }
 
 impl AnalyzedAutoScalingGroup {
+    /// This group's identity WITHOUT the region — the resource part of its ARN.
+    pub fn arn_resource(&self) -> String {
+        format!(
+            "autoScalingGroup:{}:autoScalingGroupName/{}",
+            self.group_id, self.name
+        )
+    }
+
+    /// This group's ARN as the endpoint in `region` reports it — the form
+    /// `AutoScalingGroupRecommendation$autoScalingGroupArn` carries ([`resource_arn_in`]).
+    pub fn arn_in(&self, region: &str) -> String {
+        resource_arn_in(
+            AUTO_SCALING_ARN_SERVICE,
+            region,
+            &self.account_id,
+            &self.arn_resource(),
+        )
+    }
+
     /// The group's `Finding`.
     ///
     /// "An Auto Scaling group is considered not optimized when Compute Optimizer
@@ -2027,19 +2055,14 @@ impl AnalyzedAutoScalingGroup {
     /// reason codes (`AutoScalingGroupRecommendation` declares no such member), so the
     /// row carries none.
     pub fn to_analysed_resource(&self) -> AnalysedResource {
-        // The catalog records a resource's REGION-FREE identity
-        // ([`AnalysedResource::arn_in`]), so the group's own ARN is split back into the
-        // fields a reader rebuilds it from.
-        let parsed = parse_arn(&self.arn);
         AnalysedResource {
             account_id: self.account_id.clone(),
             resource_type: SOURCE_TYPE_AUTO_SCALING_GROUP.to_string(),
-            arn_service: parsed
-                .map(|arn| arn.service.to_string())
-                .unwrap_or_default(),
-            arn_resource: parsed
-                .map(|arn| arn.resource.to_string())
-                .unwrap_or_default(),
+            // The catalog records a resource's REGION-FREE identity
+            // ([`AnalysedResource::arn_in`]), which for a group is the id and name its ARN
+            // names it by.
+            arn_service: AUTO_SCALING_ARN_SERVICE.to_string(),
+            arn_resource: self.arn_resource(),
             finding: self.finding().to_string(),
             finding_reason_codes: Vec::new(),
             current_performance_risk: self.current_performance_risk.clone(),
@@ -2168,6 +2191,11 @@ impl EffectivePreferences {
 
 /// The Auto Scaling group analysis this emulator holds, built once with the store.
 ///
+/// A row keeps the group's REGION-FREE identity (its id and its name), because Compute
+/// Optimizer is regional: every reader builds the ARN for the region the request addressed
+/// ([`AnalyzedAutoScalingGroup::arn_in`]), so the same groups are reported at every regional
+/// endpoint, each under that endpoint's own ARN.
+///
 /// The emulator observes no real workload, so WHICH groups are analysed is a fixed set
 /// rather than something derived from traffic; every figure a recommendation reports is
 /// nevertheless computed from the observations stored here (cost, saving, percentage,
@@ -2180,19 +2208,11 @@ impl EffectivePreferences {
 /// mixed-instance-type group with a Savings Plans discount against its spend.
 fn seed_auto_scaling_group_analyses() -> Vec<AnalyzedAutoScalingGroup> {
     let account_id = ::engine::emulator_account_id().to_string();
-    let region = "us-east-1";
-    let arn = |group_id: &str, name: &str| {
-        ::engine::emulator_arn(
-            "autoscaling",
-            region,
-            &format!("autoScalingGroup:{group_id}:autoScalingGroupName/{name}"),
-        )
-    };
 
     vec![
         AnalyzedAutoScalingGroup {
             account_id: account_id.clone(),
-            arn: arn("6f3a7a2c-0d6c-4a3e-9c2b-0a1b2c3d4e51", "web-tier-asg"),
+            group_id: "6f3a7a2c-0d6c-4a3e-9c2b-0a1b2c3d4e51".to_string(),
             name: "web-tier-asg".to_string(),
             current: GroupConfiguration {
                 instance_types: vec!["m5.2xlarge".to_string()],
@@ -2242,7 +2262,7 @@ fn seed_auto_scaling_group_analyses() -> Vec<AnalyzedAutoScalingGroup> {
         },
         AnalyzedAutoScalingGroup {
             account_id: account_id.clone(),
-            arn: arn("6f3a7a2c-0d6c-4a3e-9c2b-0a1b2c3d4e52", "batch-worker-asg"),
+            group_id: "6f3a7a2c-0d6c-4a3e-9c2b-0a1b2c3d4e52".to_string(),
             name: "batch-worker-asg".to_string(),
             current: GroupConfiguration {
                 instance_types: vec!["c5.4xlarge".to_string()],
@@ -2280,7 +2300,7 @@ fn seed_auto_scaling_group_analyses() -> Vec<AnalyzedAutoScalingGroup> {
         },
         AnalyzedAutoScalingGroup {
             account_id,
-            arn: arn("6f3a7a2c-0d6c-4a3e-9c2b-0a1b2c3d4e53", "mixed-fleet-asg"),
+            group_id: "6f3a7a2c-0d6c-4a3e-9c2b-0a1b2c3d4e53".to_string(),
             name: "mixed-fleet-asg".to_string(),
             current: GroupConfiguration {
                 instance_types: vec![
