@@ -156,12 +156,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // name, or a later read could not say which one a name denotes. The model cannot
         // express the uniqueness (the list carries no `@uniqueItems` and the key is one
         // member of the element), so the boundary validator let it through and it is
-        // refused here.
-        if let Some(duplicate) = first_duplicate_grouping_name(&input.grouping_attribute_definitions)
-        {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "GroupingAttributeDefinitions must not define the grouping name {duplicate} more than once"
-            )));
+        // refused here — worded by the service's one constraint-violation builder, member
+        // path and requirement with no echo of the rejected name, so this constraint reads
+        // exactly like the same member's modelled bounds refused at the boundary.
+        if repeats_a_grouping_name(&input.grouping_attribute_definitions) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::validation_envelope(&[crate::state::constraint_clause(
+                    GROUPING_DEFINITIONS_MEMBER_PATH,
+                    "Member must not define the same grouping name more than once",
+                )]),
+            ));
         }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
@@ -184,12 +188,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The first `GroupingName` that occurs twice in `definitions`, or `None` when every name is
-/// distinct.
-fn first_duplicate_grouping_name(definitions: &[GroupingAttributeDefinition]) -> Option<&str> {
+/// The member path the refusal of a repeated `GroupingName` names, in the lowerCamel casing
+/// this service's `ValidationException` envelope states a member with.
+const GROUPING_DEFINITIONS_MEMBER_PATH: &str = "groupingAttributeDefinitions";
+
+/// Whether some `GroupingName` occurs twice in `definitions`.
+fn repeats_a_grouping_name(definitions: &[GroupingAttributeDefinition]) -> bool {
     let mut seen = ::std::collections::HashSet::new();
     definitions
         .iter()
-        .find(|definition| !seen.insert(definition.grouping_name.as_str()))
-        .map(|definition| definition.grouping_name.as_str())
+        .any(|definition| !seen.insert(definition.grouping_name.as_str()))
 }

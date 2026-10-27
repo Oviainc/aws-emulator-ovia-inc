@@ -213,8 +213,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(cursor) => Some(cursor),
                 None => {
                     return Err(crate::scaffolded::Scaffolded::validation(
-                        "NextToken is not a token this service issued for this service, \
-                         environment and instrumentation type",
+                        crate::state::unissued_next_token_in(
+                            "this service, environment and instrumentation type",
+                        ),
                     ))
                 }
             },

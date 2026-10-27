@@ -237,6 +237,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reporting — and executing the actions those transitions owe — is what keeps this
         // read's answer the same for every later caller.
         crate::state::alarm_actions::settle_alarms(&*self.engine, ctx).await;
+        // The evaluations this read settled were already due; the ones the clock owes NEXT are
+        // not, and a client that polls for an alarm's state looks for what their actions
+        // deliver on the target rather than here, so the clock is left running for them.
+        crate::state::alarm_actions::drive_alarm_clock(&self.engine, ctx);
         let store = state.lock();
 
         // "If you specify ChildrenOfAlarmName, you cannot specify any other parameters in
