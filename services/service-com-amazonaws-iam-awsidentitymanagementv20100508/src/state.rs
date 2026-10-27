@@ -182,6 +182,16 @@ pub const MAX_USERS_PER_ACCOUNT: usize = 5_000;
 /// the limit exceeded". It is also what stops the group map growing without end.
 pub const MAX_GROUPS_PER_ACCOUNT: usize = 300;
 
+/// How many IAM groups one IAM user may belong to. AWS's "IAM and STS quotas" page
+/// gives the quota "IAM groups that an IAM user can be a member of: 10", and an add
+/// past it is refused with `LimitExceededException`, whose documentation says "the
+/// error message describes the limit exceeded" — here, the maximum number of groups
+/// per user, for the user the add names. It is also what bounds the memberships one
+/// user can accumulate in [`group_members`].
+///
+/// [`group_members`]: ComAmazonawsIamAwsidentitymanagementv20100508State::group_members
+pub const MAX_GROUPS_PER_USER: usize = 10;
+
 /// The status a key IAM has just minted carries. `CreateAccessKey`'s
 /// documentation states "the default status for new keys is Active", and `Active`
 /// is one of the three values `statusType` declares
@@ -1030,9 +1040,7 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// The membership is held HERE rather than on either entity, so the group and the
     /// user records stay what their own reads report and one place answers which
     /// users a group holds. `AddUserToGroup` is what fills it and
-    /// `RemoveUserFromGroup` what empties it; both are still scaffolded 501s with
-    /// their own stub issues, so the account holds no membership yet and `GetGroup`
-    /// reports each group's members as the empty list this map answers with.
+    /// `RemoveUserFromGroup` what empties it.
     pub group_members: BTreeMap<String, BTreeSet<String>>,
     /// Inline user policies: [`name_key`] of the user name -> [`name_key`] of the
     /// policy name -> the policy. Policy names are case-folded for the same reason
@@ -1315,6 +1323,22 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
             .count()
     }
 
+    /// The groups the user keyed by `user_key` belongs to, by the key
+    /// [`Self::groups`] holds each of them under, in that map's stable key order.
+    ///
+    /// The one place the membership is read from the group-keyed map
+    /// ([`Self::group_members`]) the other way round, so every caller that asks what
+    /// a USER belongs to agrees: the measure IAM's groups-per-user quota
+    /// ([`MAX_GROUPS_PER_USER`]) is taken against, what tells a delete that the user
+    /// still belongs to a group, what a report of the user's groups lists, and where
+    /// the group policies in force on the user are collected from.
+    pub fn group_keys_held_by<'a>(&'a self, user_key: &'a str) -> impl Iterator<Item = &'a String> {
+        self.group_members
+            .iter()
+            .filter(move |(_, members)| members.contains(user_key))
+            .map(|(group_key, _)| group_key)
+    }
+
     /// Materialise the status changes the clock has already made due: a
     /// service-specific credential whose `ExpirationDate` has passed is `Expired`,
     /// whether or not anybody called.
@@ -1531,7 +1555,9 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// the one that is in effect for the IAM users, groups, and roles to which the
     /// policy is attached" (`SetDefaultPolicyVersion`). A resource-based policy is
     /// not one of them, so a role's trust policy — which says who may assume the
-    /// role rather than what the role may do — is not collected.
+    /// role rather than what the role may do — is not collected. For a USER, the
+    /// policies in force on the groups it belongs to are collected too, each keeping
+    /// the group it is attached to as its provenance.
     ///
     /// The provenance is kept because a caller can be asked about the policies as
     /// INDIVIDUAL policies rather than as one set: `SimulatePrincipalPolicy`'s
@@ -1560,10 +1586,6 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
                 if user.arn != arn {
                     return None;
                 }
-                // `AddUserToGroup` is still scaffolded, so no user carries a group
-                // membership; when it is implemented, the policies of the groups
-                // the user belongs to join this collection, which is why nothing
-                // else caches it.
                 self.user_attached_policies
                     .get(&key)
                     .map(|attached| attached.iter().cloned().collect())
@@ -1621,6 +1643,29 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
                 },
                 document,
             });
+        }
+
+        // A user's permissions include the policies in force on every group it belongs
+        // to: "if you specify a user, the simulation also includes all policies that
+        // are attached to any groups the user belongs to"
+        // (`SimulatePrincipalPolicy$PolicySourceArn`). Each inherited policy keeps the
+        // GROUP as its provenance, because the group is the entity it is attached to;
+        // collecting it through the group's OWN ARN is what makes one rule answer for
+        // both, so a policy a group carries is in force on its members however the
+        // group came to carry it.
+        if source.kind == EntityKind::User {
+            let group_arns: Vec<String> = self
+                .group_keys_held_by(&key)
+                .filter_map(|group_key| self.groups.get(group_key))
+                .map(|group| group.arn.clone())
+                .collect();
+            for group_arn in group_arns {
+                collected.extend(
+                    self.principal_sourced_policies(&group_arn)
+                        .into_iter()
+                        .flatten(),
+                );
+            }
         }
         Some(collected)
     }
