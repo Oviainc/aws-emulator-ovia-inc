@@ -27,8 +27,8 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     Destination, EncryptionAlgorithmOptions, HashAlgorithmOptions, S3SignedObject,
     SignatureValidityPeriod, SignedObject, SigningConfiguration, SigningImageFormat,
-    SigningJobRevocationRecord, SigningMaterial, SigningPlatformOverrides, SigningProfile,
-    SigningProfileRevocationRecord, Source,
+    SigningJobRevocationRecord, SigningMaterial, SigningPlatform, SigningPlatformOverrides,
+    SigningProfile, SigningProfileRevocationRecord, Source,
 };
 
 /// The region an ARN is built for when the request carries no SigV4 credential
@@ -92,6 +92,17 @@ pub const JOB_STATUS_SUCCEEDED: &str = "Succeeded";
 /// the request names no `maxResults`: `ListSigningProfilesRequest$maxResults` is
 /// modelled `@range(min: 1, max: 25)`.
 pub const PROFILE_PAGE_LIMIT: i32 = 25;
+
+/// The largest page `ListSigningPlatforms` serves, and the page size it uses
+/// when the request names no `maxResults`:
+/// `ListSigningPlatformsRequest$maxResults` is modelled
+/// `@range(min: 1, max: 25)`.
+///
+/// Stated per operation rather than shared with [`PROFILE_PAGE_LIMIT`], which
+/// carries the same bound today: each is the range ITS own request member is
+/// modelled with, so one operation's model changing does not silently move the
+/// other's page size.
+pub const PLATFORM_PAGE_LIMIT: i32 = 25;
 
 /// The most tags one signing profile can hold.
 ///
@@ -1171,6 +1182,25 @@ impl SigningPlatformEntry {
             default_format: default_value(self.image_formats),
         }
     }
+
+    /// The `SigningPlatform` summary a platform listing reports for this entry.
+    ///
+    /// Every member is read off the SAME catalog entry `GetSigningPlatform`
+    /// reports, so what a listing says about a platform and what a get says
+    /// about it cannot drift apart.
+    pub fn to_signing_platform(&self) -> SigningPlatform {
+        SigningPlatform {
+            platform_id: Some(self.platform_id.to_string()),
+            display_name: self.display_name.map(str::to_string),
+            partner: Some(self.partner.to_string()),
+            target: Some(self.target().to_string()),
+            category: Some(self.category.to_string()),
+            signing_configuration: Some(self.signing_configuration()),
+            signing_image_format: Some(self.signing_image_format()),
+            max_size_in_mb: self.max_size_in_mb,
+            revocation_supported: self.revocation_supported,
+        }
+    }
 }
 
 /// `values` as the owned strings a modelled list member holds.
@@ -1482,15 +1512,23 @@ pub struct ProfileListing {
     pub statuses: Vec<String>,
 }
 
-/// Version marker every profile pagination token carries, so a value in any
-/// other shape is refused instead of being read as a cursor.
-const PROFILE_PAGE_TOKEN_VERSION: &str = "v1";
+/// Version marker every pagination token carries, so a value in any other
+/// shape is refused instead of being read as a cursor.
+const PAGE_TOKEN_VERSION: &str = "v1";
 
-/// What separates the listing a cursor was issued for from the profile name it
+/// What separates the listing a cursor was issued for from the element it
 /// resumes at. A unit separator starts no rendered field (each one starts with a
-/// digit, see [`ProfileListing::canonical`]), so the boundary is unambiguous
-/// whatever a request put in the fields.
-const PROFILE_PAGE_TOKEN_SEPARATOR: char = '\u{1f}';
+/// digit, see [`rendered_field`]), so the boundary is unambiguous whatever a
+/// request put in the fields.
+const PAGE_TOKEN_SEPARATOR: char = '\u{1f}';
+
+/// Which paginated read a cursor was issued for: the first field of every
+/// canonical rendering, so a token handed out by one listing resolves to no
+/// resume point in another however alike their filter fields render.
+const LISTING_KIND_PROFILES: &str = "signing-profiles";
+
+/// The platform listing's kind marker (see [`LISTING_KIND_PROFILES`]).
+const LISTING_KIND_PLATFORMS: &str = "signing-platforms";
 
 /// One field of a rendered listing: its byte length, then the value.
 ///
@@ -1511,7 +1549,8 @@ impl ProfileListing {
         let mut statuses: Vec<&str> = self.statuses.iter().map(String::as_str).collect();
         statuses.sort_unstable();
         statuses.dedup();
-        let mut canonical = String::from(PROFILE_PAGE_TOKEN_VERSION);
+        let mut canonical = String::from(PAGE_TOKEN_VERSION);
+        canonical.push_str(&rendered_field(LISTING_KIND_PROFILES));
         canonical.push_str(&rendered_field(&self.region));
         canonical.push_str(&rendered_field(
             self.platform_id.as_deref().unwrap_or_default(),
@@ -1530,11 +1569,7 @@ impl ProfileListing {
     /// caller, which can only carry it back, and built from the unreserved
     /// characters an `@httpQuery` value travels in unescaped.
     pub fn page_token(&self, resume_at: &str) -> String {
-        let cursor = format!(
-            "{}{PROFILE_PAGE_TOKEN_SEPARATOR}{resume_at}",
-            self.canonical()
-        );
-        format!("{}{}", ::hex::encode(&cursor), cursor_digest(&cursor))
+        rendered_page_token(&self.canonical(), resume_at)
     }
 
     /// The profile name `token` resumes THIS listing at, or `None` when `token`
@@ -1542,20 +1577,112 @@ impl ProfileListing {
     /// the cursor it carries (so anything truncated or altered in transit), or a
     /// cursor issued for another region or another filter set.
     pub fn resume_at(&self, token: &str) -> Option<String> {
-        // Every token is hex digits, so the split below lands on a character
-        // boundary and a value in any other alphabet is already not one of ours.
-        if !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return None;
-        }
-        let (encoded, digest) = token.split_at(token.len().checked_sub(DIGEST_HEX_LEN)?);
-        let cursor = String::from_utf8(::hex::decode(encoded).ok()?).ok()?;
-        if !cursor_digest(&cursor).eq_ignore_ascii_case(digest) {
-            return None;
-        }
-        let issued_for = format!("{}{PROFILE_PAGE_TOKEN_SEPARATOR}", self.canonical());
-        let resume_at = cursor.strip_prefix(&issued_for)?;
-        is_profile_name(resume_at).then(|| resume_at.to_string())
+        let resume_at = decoded_resume_at(&self.canonical(), token)?;
+        is_profile_name(&resume_at).then_some(resume_at)
     }
+}
+
+/// Which signing platforms one platform listing enumerates: the catalog this
+/// service publishes, narrowed to the category, partner and target the caller
+/// filtered on.
+///
+/// A pagination token is issued FOR one listing and resumes only a call that
+/// enumerates that same listing, so a token carried over to another filter set
+/// is refused rather than serving a page out of a different enumeration.
+#[derive(Debug, Default)]
+pub struct PlatformListing {
+    /// The `category` filter, or `None` when the call filters on no category.
+    pub category: Option<String>,
+    /// The `partner` filter, or `None` when the call filters on no partner.
+    pub partner: Option<String>,
+    /// The `target` filter, or `None` when the call filters on no target.
+    pub target: Option<String>,
+}
+
+impl PlatformListing {
+    /// Whether `entry` is one of the platforms this listing enumerates: each
+    /// filter the caller named has to equal the value the catalog publishes for
+    /// that member of the platform, and a member it named no filter for narrows
+    /// nothing.
+    pub fn includes(&self, entry: &SigningPlatformEntry) -> bool {
+        fn kept(filter: Option<&str>, published: &str) -> bool {
+            filter.is_none_or(|filter| filter == published)
+        }
+        kept(self.category.as_deref(), entry.category)
+            && kept(self.partner.as_deref(), entry.partner)
+            && kept(self.target.as_deref(), entry.target())
+    }
+
+    /// The platforms this listing enumerates, in the order the catalog publishes
+    /// them — the one order every page of this listing is cut out of.
+    pub fn platforms(&self) -> impl Iterator<Item = &'static SigningPlatformEntry> + '_ {
+        SIGNING_PLATFORM_CATALOG
+            .iter()
+            .filter(|entry| self.includes(entry))
+    }
+
+    /// What this listing enumerates, rendered canonically (see
+    /// [`ProfileListing::canonical`]).
+    fn canonical(&self) -> String {
+        let mut canonical = String::from(PAGE_TOKEN_VERSION);
+        canonical.push_str(&rendered_field(LISTING_KIND_PLATFORMS));
+        for filter in [&self.category, &self.partner, &self.target] {
+            canonical.push_str(&rendered_field(filter.as_deref().unwrap_or_default()));
+        }
+        canonical
+    }
+
+    /// The `nextToken` a page of this listing that stops BEFORE the platform
+    /// `resume_at` hands back.
+    pub fn page_token(&self, resume_at: &str) -> String {
+        rendered_page_token(&self.canonical(), resume_at)
+    }
+
+    /// The platform id `token` resumes THIS listing at, or `None` when `token`
+    /// is not one this listing handed out: a value whose digest does not match
+    /// the cursor it carries, a cursor issued for another filter set or another
+    /// paginated read, or one resuming at a platform this service publishes no
+    /// entry for.
+    pub fn resume_at(&self, token: &str) -> Option<String> {
+        let resume_at = decoded_resume_at(&self.canonical(), token)?;
+        signing_platform(&resume_at).map(|entry| entry.platform_id.to_string())
+    }
+}
+
+/// The `nextToken` a page of the listing rendered as `canonical` hands back when
+/// the next page starts at `resume_at`.
+///
+/// The cursor — the listing it was issued for and the element the next page
+/// starts at — hex-encoded and followed by its digest: opaque to the caller,
+/// which can only carry it back, and built from the unreserved characters an
+/// `@httpQuery` value travels in unescaped.
+fn rendered_page_token(canonical: &str, resume_at: &str) -> String {
+    let cursor = format!("{canonical}{PAGE_TOKEN_SEPARATOR}{resume_at}");
+    format!("{}{}", ::hex::encode(&cursor), cursor_digest(&cursor))
+}
+
+/// The resume point `token` carries for the listing rendered as `canonical`, or
+/// `None` when it is not a token that listing handed out: a value whose digest
+/// does not match the cursor it carries (so anything truncated or altered in
+/// transit), or a cursor issued for a different listing.
+///
+/// The resume point is returned as the cursor spelled it; it is for the CALLER
+/// to hold it to the form its own elements take.
+fn decoded_resume_at(canonical: &str, token: &str) -> Option<String> {
+    // Every token is hex digits, so the split below lands on a character
+    // boundary and a value in any other alphabet is already not one of ours.
+    if !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let (encoded, digest) = token.split_at(token.len().checked_sub(DIGEST_HEX_LEN)?);
+    let cursor = String::from_utf8(::hex::decode(encoded).ok()?).ok()?;
+    if !cursor_digest(&cursor).eq_ignore_ascii_case(digest) {
+        return None;
+    }
+    let issued_for = format!("{canonical}{PAGE_TOKEN_SEPARATOR}");
+    cursor
+        .strip_prefix(&issued_for)
+        .map(|resume_at| resume_at.to_string())
 }
 
 /// How many hex digits of a cursor's digest a pagination token carries.
