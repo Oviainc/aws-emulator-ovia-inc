@@ -206,28 +206,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let knowledge_base_id = knowledge_base.knowledge_base_id.clone();
         let knowledge_base_arn = knowledge_base.knowledge_base_arn.clone();
 
-        // A retried create carrying the same `clientToken` answers with the quick
-        // response the first call created under THIS knowledge base, rather than minting
-        // a second one. The token's scope is the parent, so the same token used under
-        // another knowledge base is a different create.
-        if let Some(token) = input.client_token.as_deref() {
-            let replayed = state
-                .replayed_resource_id(Self::NAME, &knowledge_base_id, token)
-                .cloned()
-                .and_then(|id| state.quick_response(&knowledge_base_id, &id))
-                .map(crate::state::QuickResponse::to_data);
-            if let Some(quick_response) = replayed {
-                return Ok(CreateQuickResponseOutput {
-                    quick_response: Some(quick_response),
-                });
-            }
-        }
-
         // The model puts no bound on the `tags` map, so the store does: AWS's tagging
         // restrictions allow at most 50 tags on a resource, and a request past that is
         // outside what the service accepts. The count is taken from what the caller sent,
         // before the map is stored.
-        let requested_tags = input.tags.unwrap_or_default();
+        let requested_tags = input.tags.clone().unwrap_or_default();
         if requested_tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
             return Err(CreateQuickResponseErrorModeled::ValidationException(
                 ValidationException {
@@ -238,6 +221,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let tags: ::std::collections::BTreeMap<String, String> =
             requested_tags.into_iter().collect();
+
+        // What this create's `clientToken` identifies: every member the record below is
+        // built from, with the tag map fingerprinted in key order
+        // (`crate::state::tags_fingerprint`). The members that carry no map are
+        // fingerprinted through their `Debug` rendering, which is stable for one request.
+        let fingerprint = crate::state::request_fingerprint(&[
+            input.name.clone(),
+            format!("{:?}", input.content),
+            input.content_type.clone().unwrap_or_default(),
+            format!("{:?}", input.grouping_configuration),
+            input.description.clone().unwrap_or_default(),
+            input.shortcut_key.clone().unwrap_or_default(),
+            format!("{:?}", input.is_active),
+            format!("{:?}", input.channels),
+            input.language.clone().unwrap_or_default(),
+            crate::state::tags_fingerprint(&tags),
+        ]);
+
+        // A retried create carrying the same `clientToken` answers with the quick
+        // response the first call created under THIS knowledge base, rather than minting
+        // a second one — while the same token carrying a DIFFERENT request is the modelled
+        // idempotency conflict rather than a record the caller did not ask for. The
+        // token's scope is the parent, so the same token used under another knowledge base
+        // is a different create.
+        match state.replayed_create(
+            Self::NAME,
+            &knowledge_base_id,
+            input.client_token.as_deref(),
+            &fingerprint,
+        ) {
+            crate::state::Replay::Conflict => {
+                return Err(CreateQuickResponseErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(crate::state::MESSAGE_IDEMPOTENCY_CONFLICT.to_string()),
+                    },
+                )
+                .into())
+            }
+            crate::state::Replay::Retry(created) => {
+                if let Some(quick_response) = state
+                    .quick_response(&knowledge_base_id, &created)
+                    .map(crate::state::QuickResponse::to_data)
+                {
+                    return Ok(CreateQuickResponseOutput {
+                        quick_response: Some(quick_response),
+                    });
+                }
+            }
+            crate::state::Replay::Fresh => {}
+        }
 
         // A quick response's name identifies it inside its knowledge base, so a create
         // under a name a live one already holds is the modelled conflict (HTTP 409)
@@ -324,14 +357,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
-        if let Some(token) = input.client_token.as_deref() {
-            state.remember_client_token(
-                Self::NAME,
-                &knowledge_base_id,
-                token,
-                &quick_response_id,
-            );
-        }
+        state.remember_client_token(
+            Self::NAME,
+            &knowledge_base_id,
+            input.client_token.as_deref(),
+            &fingerprint,
+            &quick_response_id,
+        );
 
         // Answer from what was just persisted, so this response and a later
         // `GetQuickResponse` cannot disagree.

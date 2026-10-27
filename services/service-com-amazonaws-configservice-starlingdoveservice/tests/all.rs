@@ -144,5 +144,7 @@ mod describe_conformance_packs;
 mod delete_evaluation_results;
 #[path = "all/conformance_pack_compliance.rs"]
 mod conformance_pack_compliance;
+#[path = "all/remediation_runs_its_runbook.rs"]
+mod remediation_runs_its_runbook;
 #[path = "all/batch_get_resource_config.rs"]
 mod batch_get_resource_config;

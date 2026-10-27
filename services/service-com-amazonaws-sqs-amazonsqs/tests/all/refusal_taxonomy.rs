@@ -17,9 +17,9 @@
 //! range, value outside a value set, value of the wrong form, a parameter the queue type
 //! does not take, a collection that names nothing, a count past a published bound), and
 //! the MEMBER it sits in. Every row asserts the status, the code and the WHOLE message:
-//! three of those messages are a divergence from AWS's own sentence that this change
-//! could not resolve (the issue report records which, and why the recorded text is not
-//! obtainable here), so their rows pin the template the handler builds and will fail the
+//! where a message is a divergence from AWS's own sentence that a change could not
+//! resolve (the issue report records which, and why the recorded text is not obtainable
+//! here), its row pins the template the handler builds and will fail the
 //! day it is corrected — which is what a later change needs them to do. Every observed
 //! code is also checked against the closed set of codes this service's API has — which is
 //! what makes a refusal answered as `ValidationException`, a shape the model does not
@@ -657,10 +657,7 @@ async fn every_input_refusal_carries_a_code_this_service_has() {
             address: Address::SourceArn("standard"),
             request: json!({}),
             code: "InvalidParameterValue",
-            message: "This action is currently limited to supporting message redrive from \
-                      queues that are configured as dead-letter queues (DLQs) of other Amazon \
-                      SQS queues only."
-                .to_string(),
+            message: "Source queue must be configured as a Dead Letter Queue.".to_string(),
         },
     ];
 

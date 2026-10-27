@@ -182,15 +182,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Changing a forwarder changes the directory's own DNS, exactly as creating or
         // dropping one does, so it needs a directory that is in service: one still being
         // built by the transition its create owes is unavailable, which is the modelled
-        // refusal for exactly that.
+        // refusal for exactly that. The diagnostic is this service's shared one for a
+        // directory a call cannot reach: the requested id and nothing about the stage it
+        // is in.
         if directory.stage != crate::state::STAGE_ACTIVE {
             return Err(
                 UpdateConditionalForwarderErrorModeled::DirectoryUnavailableException(
-                    crate::state::refusal(format!(
-                        "Directory {id} is in stage {stage} and is not available for \
-                         conditional forwarder changes",
-                        id = directory.directory_id,
-                        stage = directory.stage
+                    crate::state::refusal(crate::state::directory_unavailable(
+                        &input.directory_id,
                     )),
                 )
                 .into(),

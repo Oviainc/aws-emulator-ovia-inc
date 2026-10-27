@@ -115,15 +115,20 @@ impl From<StartUserAccessTasksErrorModeled> for StartUserAccessTasksError {
 /// before any task is minted.
 ///
 /// A user access task is started per authorization, and what decides each
-/// reported item is the authorization's (`app`, tenant) pair and whether it has
-/// completed the connect handshake — so those four fields are all this call
-/// needs, and holding them by name keeps the snapshot readable where a tuple
-/// would not be.
+/// reported item is the authorization's (`app`, tenant) pair, the status its
+/// refusal reports and whether it has completed the connect handshake — so those
+/// fields are all this call needs, and holding them by name keeps the snapshot
+/// readable where a tuple would not be.
 struct Authorization {
     app: String,
     tenant_identifier: String,
     tenant_display_name: String,
     status: String,
+    /// Whether the authorization had completed the connect handshake when it was
+    /// snapshotted, as `crate::state::AppAuthorizationRecord::is_connected`
+    /// decides it — AppFabric reaches an application only through such an
+    /// authorization, so this is what the fan-out below mints a task on.
+    connected: bool,
 }
 
 impl Authorization {
@@ -138,14 +143,9 @@ impl Authorization {
                 tenant_identifier: authorization.tenant_identifier.clone(),
                 tenant_display_name: authorization.tenant_display_name.clone(),
                 status: authorization.status.clone(),
+                connected: authorization.is_connected(),
             })
             .collect()
-    }
-
-    /// Whether this authorization has completed the connect handshake, which is
-    /// what AppFabric needs to reach the application at all.
-    fn is_connected(&self) -> bool {
-        self.status == crate::state::APP_AUTHORIZATION_STATUS_CONNECTED
     }
 }
 
@@ -230,7 +230,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .iter()
             .map(|authorization| {
                 authorization
-                    .is_connected()
+                    .connected
                     .then(|| crate::state::UserAccessTaskRecord {
                         id: crate::state::new_uuid(),
                         app: authorization.app.clone(),
