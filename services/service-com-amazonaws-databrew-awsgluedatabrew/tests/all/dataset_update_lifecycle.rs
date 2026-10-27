@@ -449,55 +449,9 @@ async fn the_reported_principal_is_the_emulator_identity_whatever_key_signs_the_
     }
 }
 
-/// A `ResourceNotFoundException` carries the message the model documents for the
-/// error shape (`smithy_query(query="shape", shape="ResourceNotFoundException")`:
-/// "One or more resources can't be found."), for every operation that answers it and
-/// every resource kind it is answered for — the name that was not found is the
-/// caller's own request, so the service does not echo it back in the message.
-#[tokio::test]
-async fn resource_not_found_answers_the_message_the_model_documents() {
-    /// The sentence the model documents for `ResourceNotFoundException`.
-    const DOCUMENTED: &str = "One or more resources can't be found.";
-
-    let emulator = Emulator::new();
-    // (case, method, uri) — one per operation that answers the error, across both
-    // resource kinds this service stores.
-    let cases = [
-        ("DescribeDataset", "GET", "/datasets/absent-ds"),
-        ("UpdateDataset", "PUT", "/datasets/absent-ds"),
-        ("DeleteDataset", "DELETE", "/datasets/absent-ds"),
-        ("DescribeJob", "GET", "/jobs/absent-job"),
-        ("StartJobRun", "POST", "/jobs/absent-job/startJobRun"),
-        ("ListJobRuns", "GET", "/jobs/absent-job/jobRuns"),
-        (
-            "DescribeJobRun",
-            "GET",
-            "/jobs/absent-job/jobRun/db_000000000000000000000001",
-        ),
-    ];
-
-    for (case, method, uri) in cases {
-        let body = (method == "PUT").then(|| json!({"Input": s3_input("in/data.csv")}));
-        let refused = emulator.call(method, uri, body).await;
-        assert_eq!(
-            refused.status, 404,
-            "case {case:?}: expected 404, got {} {:?}",
-            refused.status, refused.body
-        );
-        assert_eq!(
-            refused.error_type.as_deref(),
-            Some("ResourceNotFoundException"),
-            "case {case:?}: expected ResourceNotFoundException, got {:?}",
-            refused.error_type
-        );
-        assert_eq!(
-            refused.text("Message"),
-            DOCUMENTED,
-            "case {case:?}: expected the documented message, got {:?}",
-            refused.member("Message")
-        );
-    }
-}
+// The message a lookup miss answers with is a property of the error rather than of
+// the dataset lifecycle, so it is pinned across every operation and resource kind in
+// `tests/all/resource_not_found_message.rs`.
 
 /// An update this service cannot apply changes nothing: the stored definition and the
 /// last-modified pair are exactly what they were before the refused call.
