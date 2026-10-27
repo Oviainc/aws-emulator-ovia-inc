@@ -15,7 +15,10 @@
 //! expected text is written out here rather than imported from the crate, so a wrong
 //! constant in the service cannot make these cases pass.
 
+use std::time::Duration;
+
 use serde_json::{json, Value};
+use service_com_amazonaws_s3outposts_s3outposts::state::ENDPOINT_TRANSITION;
 
 use crate::endpoint_lifecycle::{
     another_accounts_endpoint_id, create, delete_endpoint, emulator, endpoint_id_of, list_shared,
@@ -247,16 +250,18 @@ async fn an_unresolvable_endpoint_under_a_resolvable_outpost_carries_the_same_te
         assert_not_found(case, &answer, &[outpost_id, endpoint_id]);
     }
 
-    // And a delete that did remove a record: the repeat is the same fixed text.
+    // And a delete that did start a teardown: once the clock has completed it the record
+    // is gone, and naming it is the same fixed text.
     let deleted = delete_endpoint(&router, &owned[0], &mine).await;
     assert_eq!(
         deleted.status, 200,
         "deleting an endpoint of this account must succeed, got {} with {:?}",
         deleted.status, deleted.body
     );
+    std::thread::sleep(ENDPOINT_TRANSITION + Duration::from_millis(200));
     let repeated = delete_endpoint(&router, &owned[0], &mine).await;
     assert_not_found(
-        "a second delete of the same endpoint",
+        "a delete of an endpoint whose teardown completed",
         &repeated,
         &[owned[0].as_str(), mine.as_str()],
     );

@@ -195,10 +195,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // lens's content does not define is refused as a field validation, the same rule
         // every operation that takes a pillar or a question of a lens review applies.
         //
-        // The content comes from the whole lens catalog, so a pillar and a question of a
-        // CUSTOM lens are judged against the document that lens imported exactly as an
-        // official lens's are against its catalog row.
-        let content = store.lens_content(&input.lens_arn);
+        // The content comes from the whole lens catalog, for the version this workload's
+        // review of the lens is against, so a pillar and a question of a CUSTOM lens are
+        // judged against the document that version published exactly as an official lens's
+        // are against its catalog row.
+        let pinned = workload.lens_review_version(&input.lens_arn);
+        let content = store.lens_content_at(&input.lens_arn, pinned);
         if let Some(exception) = crate::state::undefined_pillar_refusal(
             crate::state::PILLAR_ID_MEMBER,
             &input.lens_arn,
@@ -227,7 +229,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it, which is the rule the pillar and question helpers above already apply: for a
         // lens this emulator holds content for every identifier of the path is judged, and
         // for one it holds none all three are taken as given.
-        let question = store.lens_review_question(&input.lens_arn, &input.question_id);
+        let question = store.lens_review_question(&input.lens_arn, pinned, &input.question_id);
         if let Some(question) = question.as_ref() {
             if let Some(exception) = crate::state::undefined_choice_member_refusal(
                 crate::state::CHOICE_ID_MEMBER,

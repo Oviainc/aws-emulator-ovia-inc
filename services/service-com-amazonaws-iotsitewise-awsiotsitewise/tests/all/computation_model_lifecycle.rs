@@ -88,13 +88,13 @@ pub(crate) fn asset_model_property(asset_model_id: &str, property_id: &str) -> V
 }
 
 /// A `ComputationModelDataBindingValue` naming one asset's property.
-fn asset_property(asset_id: &str, property_id: &str) -> Value {
+pub(crate) fn asset_property(asset_id: &str, property_id: &str) -> Value {
     json!({ "assetProperty": { "assetId": asset_id, "propertyId": property_id } })
 }
 
 /// A `ComputationModelDataBindingValue` naming a LIST of binding values, the
 /// third form `ComputationModelDataBindingValue` carries.
-fn binding_list(values: Vec<Value>) -> Value {
+pub(crate) fn binding_list(values: Vec<Value>) -> Value {
     json!({ "list": values })
 }
 

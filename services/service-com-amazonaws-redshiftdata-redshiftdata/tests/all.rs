@@ -14,6 +14,9 @@
 #[path = "all/batch_execute_statement.rs"]
 mod batch_execute_statement;
 
+#[path = "all/contended_transactions.rs"]
+mod contended_transactions;
+
 #[path = "all/data_api_surface.rs"]
 mod data_api_surface;
 

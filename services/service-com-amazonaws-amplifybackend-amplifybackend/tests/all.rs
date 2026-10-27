@@ -27,6 +27,8 @@ mod backend_storage;
 mod challenge_tokens;
 #[path = "all/control_plane_fidelity.rs"]
 mod control_plane_fidelity;
+#[path = "all/error_message_form.rs"]
+mod error_message_form;
 #[path = "all/remove_all_backends.rs"]
 mod remove_all_backends;
 #[path = "all/s3_buckets.rs"]

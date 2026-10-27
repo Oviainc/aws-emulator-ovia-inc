@@ -17,7 +17,8 @@
 //! `BatchDeleteBuilds` removes a build, and the reporting operations
 //! (`BatchGetProjects`, `BatchGetBuilds`, `BatchGetBuildBatches`,
 //! `BatchGetFleets`, `BatchGetSandboxes`, `BatchGetCommandExecutions`,
-//! `BatchGetReportGroups`, `BatchGetReports`, `ListProjects`, `ListSharedProjects`,
+//! `BatchGetReportGroups`, `BatchGetReports`, `GetReportGroupTrend`, `ListProjects`,
+//! `ListSharedProjects`,
 //! `ListBuildsForProject`, `ListBuildBatches`, `ListSandboxes`, `ListSandboxesForProject`,
 //! `ListSourceCredentials`) only read them.
 //!
@@ -267,6 +268,16 @@ pub const REPORT_GROUP_ACTIVE_STATUS: &str = "ACTIVE";
 /// refused with the same text and a client can key on it. Recorded behaviour — the
 /// model states no message for the error.
 pub const INVALID_REPORT_ARN_MESSAGE: &str = "Invalid report ARN";
+
+/// What CodeBuild states as the reason a value handed to a report-group-addressing
+/// operation is not a report group ARN, carried by the modelled
+/// `InvalidInputException`.
+///
+/// [`INVALID_REPORT_ARN_MESSAGE`]'s rule for the other resource a report operation
+/// addresses by ARN alone: the sentence is wholly fixed, quoting neither the rejected
+/// value nor the ARN form that would be accepted, so every malformed value is refused
+/// with the same text and a client can key on it.
+pub const INVALID_REPORT_GROUP_ARN_MESSAGE: &str = "Invalid report group ARN";
 
 /// Build records this emulator retains, across every project.
 ///
@@ -1531,6 +1542,34 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
         self.reports.get(arn)
     }
 
+    /// Every report of the report group `report_group_arn`, MOST RECENT FIRST.
+    ///
+    /// A report states the group it belongs to in its own `reportGroupArn` ("The ARN of
+    /// the report group associated with this report"), so membership is read from that
+    /// member rather than from the shape of the report's own ARN: the ARN is the group's
+    /// whole identity, so a report of a group in another partition, region or account
+    /// belongs to no local one.
+    ///
+    /// Ordered by the instant each run occurred (`Report$created` — "The date and time
+    /// this report run occurred"), newest first, which is the order an operation that
+    /// analyses "the most recent reports" cuts its selection from. The report's own ARN
+    /// breaks a tie, so two runs recorded in the same millisecond still have exactly one
+    /// order; a report carrying no `created` instant sorts oldest, there being no instant
+    /// to place it after one that states its own.
+    pub fn reports_of_report_group(&self, report_group_arn: &str) -> Vec<&Report> {
+        let mut reports: Vec<&Report> = self
+            .reports
+            .values()
+            .filter(|report| report.report_group_arn.as_deref() == Some(report_group_arn))
+            .collect();
+        reports.sort_by(|left, right| {
+            report_created_key(right)
+                .cmp(&report_created_key(left))
+                .then_with(|| left.arn.cmp(&right.arn))
+        });
+        reports
+    }
+
     /// Read a fleet, first materialising the transition the clock already owes
     /// it. Like [`Self::settled_build`] this is the only write a reporting
     /// operation makes: the move out of `CREATING` was due at
@@ -2193,6 +2232,18 @@ pub fn now_millis() -> i64 {
 /// float.
 pub fn datetime(millis: i64) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from_millis(millis)
+}
+
+/// The instant a report run occurred, as the sortable `(seconds, nanoseconds)` pair its
+/// `created` timestamp carries — the epoch's lowest pair when the record states none, so
+/// a report with no instant sorts before every report that has one.
+fn report_created_key(report: &Report) -> (i64, u32) {
+    report
+        .created
+        .as_ref()
+        .map_or((i64::MIN, 0), |created| {
+            (created.secs(), created.subsec_nanos())
+        })
 }
 
 /// A build's unique identifier — the UUID AWS puts after `<projectName>:`, and

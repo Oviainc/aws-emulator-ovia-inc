@@ -47,7 +47,10 @@ const ROLE_ID_PREFIX: &str = "AROA";
 const ROLE_ID_LEN: usize = 21;
 
 /// The access key id every call that is not signed with a minted session presents.
-const LONG_TERM_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
+///
+/// Shared with the sibling IAM/STS suites in this crate, which drive the same two services
+/// over the same wire through the harness below.
+pub(crate) const LONG_TERM_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
 
 /// A SigV4 `Authorization` header whose credential scope names `signing_name` and
 /// `access_key_id`. The signature is never checked: the router here runs with request
@@ -62,7 +65,7 @@ fn authorization(access_key_id: &str, signing_name: &str) -> String {
 /// The emulator with IAM and STS mounted on ONE engine, as `core/router/src/lib.rs`
 /// mounts them. STS reads the assumed role's id from IAM through the in-process
 /// callback, which re-enters this same router.
-fn build_router() -> MultiServiceRouter {
+pub(crate) fn build_router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -108,7 +111,7 @@ async fn query(
 }
 
 /// One IAM action.
-async fn iam(
+pub(crate) async fn iam(
     router: &MultiServiceRouter,
     action: &str,
     parameters: &[(&str, String)],
@@ -125,7 +128,7 @@ async fn iam(
 }
 
 /// One STS action, signed with `access_key_id`.
-async fn sts(
+pub(crate) async fn sts(
     router: &MultiServiceRouter,
     access_key_id: &str,
     action: &str,
@@ -143,7 +146,7 @@ async fn sts(
 }
 
 /// The member, or a panic naming the case and the whole body.
-fn member(case: &str, body: &str, name: &str) -> String {
+pub(crate) fn member(case: &str, body: &str, name: &str) -> String {
     opt_element(body, name).unwrap_or_else(|| panic!("case {case:?}: no <{name}> in {body}"))
 }
 

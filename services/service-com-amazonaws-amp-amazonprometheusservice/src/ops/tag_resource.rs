@@ -158,6 +158,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A map's KEYS carry the key shape's own modelled constraints, which nothing in
+        // the request walk applies (see the map-keys section of `crate::state`). Checked
+        // BEFORE the rule this handler adds, so a key that misses both is refused by the
+        // modelled constraint the request boundary stands for.
+        crate::state::check_map_keys("tags", input.tags.keys(), &crate::state::TAG_KEY)
+            .map_err(TagResourceErrorModeled::ValidationException)?;
+
         // "Keys must not begin with aws:" (`TagResource$tags`) — a rule the model
         // cannot express, so it is refused here as a 400 ValidationException, in the one
         // form every aps refusal takes.
@@ -170,11 +177,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-
-        // A map's KEYS carry the key shape's own modelled constraints, which nothing in
-        // the request walk applies (see the map-keys section of `crate::state`).
-        crate::state::check_map_keys("tags", input.tags.keys(), &crate::state::TAG_KEY)
-            .map_err(TagResourceErrorModeled::ValidationException)?;
 
         let mut store = state.lock();
         store.materialize_due(::std::time::SystemTime::now());

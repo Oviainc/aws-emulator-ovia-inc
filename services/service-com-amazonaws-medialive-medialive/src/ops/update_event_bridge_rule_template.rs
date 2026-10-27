@@ -216,7 +216,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let event_targets = event_targets(input.event_targets.as_deref())?;
+        // The `EventTargets` rule has ONE owner in `state`, shared with
+        // `CreateEventBridgeRuleTemplate`, because it is the same member of the
+        // same resource; what is left here is the update's own "member omitted"
+        // case — no `EventTargets` member leaves the stored targets alone —
+        // and carrying the shared message in this operation's own modelled
+        // client error.
+        let event_targets = match input.event_targets.as_deref() {
+            Some(targets) => Some(
+                crate::state::event_targets_from_request(targets).map_err(bad_request)?,
+            ),
+            None => None,
+        };
 
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
@@ -255,48 +266,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The target ARNs the request's `EventTargets` asks the template to carry, in
-/// the order it listed them, or `None` when the request carries no
-/// `EventTargets` member at all (which leaves the stored targets alone).
-///
-/// A template carries at most
-/// [`crate::state::MAX_EVENT_BRIDGE_RULE_TEMPLATE_TARGETS`] targets (the count
-/// the model can report is `__integerMax5`), each one an ARN of the two kinds the
-/// member documents ("Target ARNs must be either an SNS topic or CloudWatch log
-/// group") and within the length its target shape names — the same rule the
-/// create applies, because it is the same member of the same resource.
-fn event_targets(
-    targets: Option<&[EventBridgeRuleTemplateTarget]>,
-) -> Result<Option<Vec<String>>, UpdateEventBridgeRuleTemplateError> {
-    let Some(targets) = targets else {
-        return Ok(None);
-    };
-    if targets.len() > crate::state::MAX_EVENT_BRIDGE_RULE_TEMPLATE_TARGETS {
-        return Err(bad_request(format!(
-            "eventTargets must carry at most {} targets, but carried {}",
-            crate::state::MAX_EVENT_BRIDGE_RULE_TEMPLATE_TARGETS,
-            targets.len()
-        )));
-    }
-    for target in targets {
-        bounded(
-            "eventTargets.arn",
-            Some(target.arn.as_str()),
-            1,
-            crate::state::MAX_EVENT_TARGET_ARN_LEN,
-        )?;
-        if !crate::state::is_event_target_arn(&target.arn) {
-            return Err(bad_request(format!(
-                "eventTargets.arn must be the ARN of an SNS topic or a CloudWatch log group, but was {}",
-                target.arn
-            )));
-        }
-    }
-    Ok(Some(
-        targets.iter().map(|target| target.arn.clone()).collect(),
-    ))
-}
-
 /// Turn a store refusal into this operation's own modelled error: an identifier
 /// no template in the region has and a group identifier no group in it has are
 /// both its 404 (neither leaves a template to change, or a group to move it
@@ -327,24 +296,16 @@ fn refused(
 }
 
 /// Refuse a member whose length is outside the bounds its target shape names,
-/// with the operation's own modelled client error and a message built from the
-/// request: the member, the bound and the length that broke it.
+/// with the operation's own modelled client error carrying the message the
+/// shared length rule ([`crate::state::bounded_length`]) states — the same rule
+/// the create applies, because these are the same members of the same resource.
 fn bounded(
     member: &str,
     value: Option<&str>,
     min: usize,
     max: usize,
 ) -> Result<(), UpdateEventBridgeRuleTemplateError> {
-    let Some(value) = value else {
-        return Ok(());
-    };
-    let len = value.chars().count();
-    if len >= min && len <= max {
-        return Ok(());
-    }
-    Err(bad_request(format!(
-        "{member} must be between {min} and {max} characters long, but was {len}"
-    )))
+    crate::state::bounded_length(member, value, min, max).map_err(bad_request)
 }
 
 /// This operation's modelled 400, for a request the model's own constraints do

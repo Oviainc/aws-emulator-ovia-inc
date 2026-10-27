@@ -19,7 +19,10 @@
 //! `PutManagedInsightRules`), so the recorded case is one row among many rather than the
 //! specification.
 
-use crate::harness::{build_router, call, error_code, error_message, ok};
+use crate::harness::{
+    build_router, build_router_with_engine, call, error_code, error_message, ok,
+    publish_managed_rule_template,
+};
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -366,7 +369,10 @@ async fn a_managed_rule_is_enabled_and_disabled_by_the_same_operations() {
     ];
 
     for (row, resource_arn) in resources {
-        let router = build_router();
+        let (router, engine) = build_router_with_engine();
+        // A managed rule is enabled from a template the service publishes for the resource
+        // (`ManagedRule$TemplateName`), so the row's template is published first.
+        publish_managed_rule_template(&engine, "ServiceLogRule-DynamoDB", resource_arn);
         ok(
             &router,
             "PutManagedInsightRules",

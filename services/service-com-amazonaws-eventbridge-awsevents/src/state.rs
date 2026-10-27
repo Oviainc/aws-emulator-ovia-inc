@@ -40,9 +40,9 @@
 //! ([`ComAmazonawsEventbridgeAwseventsState::api_destination_state`]).
 //!
 //! It also owns the GLOBAL ENDPOINT ([`EndpointRecord`]), the pair of event
-//! buses `CreateEndpoint` writes and `DescribeEndpoint` reports: an endpoint
-//! answered in a non-terminal state reaches its next one on its own,
-//! [`ENDPOINT_TRANSITION`] later
+//! buses `CreateEndpoint` writes, `DescribeEndpoint` reports and
+//! `DeleteEndpoint` removes: an endpoint answered in a non-terminal state
+//! reaches its next one on its own, [`ENDPOINT_TRANSITION`] later
 //! ([`ComAmazonawsEventbridgeAwseventsState::settle_endpoints`]).
 //!
 //! It also owns the PARTNER EVENT SOURCE ([`PartnerEventSourceRecord`]), the one
@@ -2501,6 +2501,16 @@ impl ComAmazonawsEventbridgeAwseventsState {
     /// `CreateEndpoint`, never through a write to one that does not exist.
     pub fn endpoint_mut(&mut self, name: &str) -> Option<&mut EndpointRecord> {
         self.endpoints.get_mut(name)
+    }
+
+    /// Remove the global endpoint `name` names, answering the record that was
+    /// removed — and `None` when this store held none under that name.
+    ///
+    /// Mirrors [`Self::remove_api_destination`]: the removal is keyed by the
+    /// endpoint's name, which is its identity, so the name holds nothing
+    /// afterwards and is free for another create.
+    pub fn remove_endpoint(&mut self, name: &str) -> Option<EndpointRecord> {
+        self.endpoints.remove(name)
     }
 
     /// Materialise every global-endpoint transition the clock has ALREADY made

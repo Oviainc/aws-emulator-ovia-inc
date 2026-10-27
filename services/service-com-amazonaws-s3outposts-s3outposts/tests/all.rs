@@ -23,6 +23,8 @@ mod endpoint_commitment_conflict;
 mod endpoint_lifecycle;
 #[path = "all/endpoint_paging.rs"]
 mod endpoint_paging;
+#[path = "all/endpoint_teardown.rs"]
+mod endpoint_teardown;
 #[path = "all/not_found_messages.rs"]
 mod not_found_messages;
 #[path = "all/one_listing_rule.rs"]

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListResolverConfigs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListResolverConfigs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListResolverConfigs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +162,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListResolverConfigs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListResolverConfigsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListResolverConfigs"))
+        // The engine is reachable from `&self` (constructor-injected); this
+        // operation mints no ARN, so it takes nothing from `ctx`.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListResolverConfigsErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some("the Route 53 Resolver store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "Retrieves the Resolver configurations that you have defined": a pure
+        // read. A VPC's Resolver behavior configuration is a per-VPC singleton
+        // the service maintains itself — no operation creates or deletes one —
+        // so the collection is "one `ResolverConfigs` element for each Resolver
+        // configuration that is associated with the current Amazon Web Services
+        // account": the configuration `GetResolverConfig` reports for each VPC
+        // of the account, and not one per stored override. The store's own
+        // records are what say which VPCs the account has, in the order the
+        // service came to know of them, so a VPC that becomes known while a
+        // caller is paging only appends past the page it already read.
+        let page = {
+            let store = state.lock();
+            let now = ::std::time::Instant::now();
+            let all: Vec<ResolverConfig> = store
+                .known_vpc_ids()
+                .iter()
+                .map(|vpc_id| store.resolver_config(vpc_id).to_resolver_config(now))
+                .collect();
+            crate::state::paginate(
+                all,
+                crate::state::RESOLVER_CONFIG_LIST_SCOPE,
+                input.max_results,
+                input.next_token.as_deref(),
+            )
+        };
+
+        let Some(page) = page else {
+            // A cursor this service did not mint for this collection is refused
+            // with the `InvalidNextTokenException` this operation models ("The
+            // value that you specified for NextToken in a List request isn't
+            // valid"), rather than being read as "start from the beginning" and
+            // silently repeating page one.
+            return Err(
+                ListResolverConfigsErrorModeled::InvalidNextTokenException(
+                    InvalidNextTokenException {
+                        message: Some(
+                            "The NextToken you provided was not issued by this service for this query"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(ListResolverConfigsOutput {
+            // A page is always reported as a list, so a caller iterating it
+            // needs no special case for an account with no VPC the service knows
+            // of yet.
+            resolver_configs: Some(page.items),
+            next_token: page.next_token,
+        })
     }
 }

@@ -91,6 +91,8 @@ mod subscriber_address_validation;
 mod subscriber_creation;
 #[path = "all/subscriber_deletion.rs"]
 mod subscriber_deletion;
+#[path = "all/subscriber_growth_address_rule.rs"]
+mod subscriber_growth_address_rule;
 #[path = "all/subscriber_notification_reads.rs"]
 mod subscriber_notification_reads;
 #[path = "all/subscriber_set_identity.rs"]

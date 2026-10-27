@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SetDefaultPolicyVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SetDefaultPolicyVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SetDefaultPolicyVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Makes a version the ACCOUNT's own managed policy already carries that policy's
+//! default (operative) version, so the version in effect for every entity the policy is
+//! attached to changes with it. Every refusal is the modelled one for what the request
+//! got wrong: the shape of the `PolicyArn`, an ARN naming a policy the account cannot
+//! change, the absence of the policy that ARN names, or the absence of the version it
+//! asks for.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +168,129 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SetDefaultPolicyVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SetDefaultPolicyVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SetDefaultPolicyVersion"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(SetDefaultPolicyVersionErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `arnType` constrains only the length, so a value that is not a
+        // managed-policy ARN at all is an "invalid … value … supplied for an input
+        // parameter" — a different refusal from an ARN naming a policy that is not
+        // held. The form is checked through the one definition of the ARN grammar this
+        // crate holds, the same one every operation taking a `PolicyArn` reads one with.
+        if crate::state::parse_policy_arn(&input.policy_arn).is_none() {
+            return Err(SetDefaultPolicyVersionErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!("ARN {} is not valid.", input.policy_arn)),
+                },
+            )
+            .into());
+        }
+
+        // Which version is operative is part of a managed policy the ACCOUNT holds: an
+        // ARN in AWS's own managed-policy namespace names a policy AWS owns and an
+        // account cannot change, so such an ARN is an out-of-range value for this
+        // parameter rather than a missing entity — the same rule, and the same refusal,
+        // `CreatePolicyVersion`, `DeletePolicy` and `UntagPolicy` apply to a change of an
+        // AWS-owned policy. The refusal does not depend on whether this emulator's
+        // catalog carries that entry, because no entry of it could change its operative
+        // version either.
+        if crate::state::is_aws_managed_policy_arn(&input.policy_arn) {
+            return Err(SetDefaultPolicyVersionErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Policy {} is an AWS managed policy, which cannot be modified.",
+                        input.policy_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before the default is moved, and before the STORE is consulted for the
+        // policy — so a caller that may not move a policy's operative version learns that
+        // it may not, never whether the account holds that policy. (The refusals above are
+        // about the ARN the request itself supplied, which the caller already knows.) The
+        // decision is made on the ARN the request addresses, while the refusal NAMES the
+        // entity that ARN identifies.
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::SET_DEFAULT_POLICY_VERSION,
+            &input.policy_arn,
+            &format!("policy {}", input.policy_arn),
+        )?;
+
+        // The write is addressed exactly as a read of the same ARN is, so it reaches the
+        // one record `GetPolicy` reports; an ARN the account holds no policy under
+        // "referenced a resource entity that does not exist", through the one wording
+        // `crate::state` holds for a missing managed policy, which every operation taking
+        // a `PolicyArn` answers with.
+        let Some(held) = store.policy_by_arn_mut(&input.policy_arn) else {
+            return Err(SetDefaultPolicyVersionErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(crate::state::policy_not_found(&input.policy_arn)),
+                },
+            )
+            .into());
+        };
+
+        // "Policy version identifiers always begin with v (always lowercase)"
+        // (`PolicyVersion$VersionId`), and the version map is keyed by exactly that
+        // identifier: only a version the policy CARRIES can be made its operative one, so
+        // an identifier it does not carry "referenced a resource entity that does not
+        // exist", worded through the one spelling this crate holds for a policy version a
+        // request cannot be served from — the same one `GetPolicyVersion` answers with.
+        if !held.versions.contains_key(&input.version_id) {
+            return Err(SetDefaultPolicyVersionErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(crate::state::policy_version_not_found(
+                        &input.policy_arn,
+                        &input.version_id,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "Sets the specified version of the specified policy as the policy's default
+        // (operative) version": exactly one version of a policy is the operative one, so
+        // every other version stops being it — including the one that was default before
+        // this call. Setting the version that is ALREADY the default is therefore the same
+        // write, and leaves the policy exactly as it stands.
+        for (version_id, version) in held.versions.iter_mut() {
+            version.is_default_version = *version_id == input.version_id;
+        }
+        held.policy.default_version_id = Some(input.version_id.clone());
+
+        // `Policy$UpdateDate` reports when the policy's most recent VERSION was created,
+        // and this call creates none — it only moves which held version is operative — so
+        // the policy's dates are left exactly as they stand, the same way a tag call
+        // leaves them.
+
+        // Audit record for the change: the acting principal, the operation and which
+        // version it made operative on which policy, so a state-changing call leaves a
+        // local record — the same shape `CreatePolicyVersion` and `UntagPolicy` emit.
+        ::tracing::info!(
+            audit = true,
+            operation = "SetDefaultPolicyVersion",
+            outcome = "default_version_set",
+            caller_akid = %::engine::extract_akid(&ctx.parts().headers),
+            policy_arn = %input.policy_arn,
+            version_id = %input.version_id,
+            "a managed policy's operative version was set"
+        );
+
+        // The operation models no output members, so a served call answers an empty 200
+        // and the change is read back through `GetPolicy`, `GetPolicyVersion` and
+        // `ListPolicyVersions`.
+        Ok(SetDefaultPolicyVersionOutput)
     }
 }

@@ -237,7 +237,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request's filters and paged through the service's shared question cursor. The
         // question set is the LENS's own content — an AWS-official lens's catalog entry or
         // a custom lens's imported document — which is what
-        // `crate::state::...::lens_review_questions` resolves. `PillarId` and
+        // `crate::state::...::lens_review_questions` resolves, for the lens VERSION this
+        // review is against. `PillarId` and
         // `QuestionPriority` FILTER that set rather than resolving anything, so a value
         // that matches no question is an empty page.
         //
@@ -247,7 +248,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let priority_selects = input.question_priority.as_deref().is_none_or(|priority| {
             priority == crate::state::question_priority_of(crate::state::DEFAULT_QUESTION_TYPE)
         });
-        let questions = store.lens_review_questions(&input.lens_alias);
+        let questions = store.lens_review_questions(
+            &input.lens_alias,
+            workload.lens_review_version(&input.lens_alias),
+        );
         let page = crate::state::question_page(
             &questions,
             |question| {

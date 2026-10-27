@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EvaluatePullRequestApprovalRules
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `EvaluatePullRequestApprovalRules`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`EvaluatePullRequestApprovalRules::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reporting only: the evaluation is read out of the stored pull request — the
+//! approval rules applied to it and the approvals it holds — so asking for it
+//! leaves the pull request exactly as the next caller would have found it.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +168,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `EvaluatePullRequestApprovalRules` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EvaluatePullRequestApprovalRulesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("EvaluatePullRequestApprovalRules"))
+        let _ = ctx;
+        // Which ids address a pull request is `crate::state`'s rule, so every
+        // operation taking a `pullRequestId` agrees about it; this only maps each
+        // outcome onto the error THIS operation models for it.
+        let pull_request_id = crate::state::normalize_pull_request_id(&input.pull_request_id)
+            .map_err(|problem| match problem {
+                crate::state::PullRequestIdProblem::Missing => {
+                    EvaluatePullRequestApprovalRulesErrorModeled::PullRequestIdRequiredException(
+                        PullRequestIdRequiredException {
+                            message: Some(
+                                crate::state::PULL_REQUEST_ID_REQUIRED_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                }
+                crate::state::PullRequestIdProblem::Invalid => {
+                    EvaluatePullRequestApprovalRulesErrorModeled::InvalidPullRequestIdException(
+                        InvalidPullRequestIdException {
+                            message: Some(
+                                crate::state::INVALID_PULL_REQUEST_ID_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                }
+            })?;
+
+        // Which values can name a revision of a pull request is likewise
+        // `crate::state`'s rule.
+        let revision_id = crate::state::normalize_revision_id(&input.revision_id).map_err(
+            |problem| match problem {
+                crate::state::RevisionIdProblem::Missing => {
+                    EvaluatePullRequestApprovalRulesErrorModeled::RevisionIdRequiredException(
+                        RevisionIdRequiredException {
+                            message: Some(crate::state::REVISION_ID_REQUIRED_MESSAGE.to_string()),
+                        },
+                    )
+                }
+                crate::state::RevisionIdProblem::Invalid => {
+                    EvaluatePullRequestApprovalRulesErrorModeled::InvalidRevisionIdException(
+                        InvalidRevisionIdException {
+                            message: Some(crate::state::INVALID_REVISION_ID_MESSAGE.to_string()),
+                        },
+                    )
+                }
+            },
+        )?;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        // Reporting only: the evaluation is a lookup in stored state, so asking for
+        // it leaves the pull request as the next caller would have found it.
+        let store = state.lock();
+        let pull_request = store.pull_request(pull_request_id).ok_or_else(|| {
+            EvaluatePullRequestApprovalRulesErrorModeled::PullRequestDoesNotExistException(
+                PullRequestDoesNotExistException {
+                    message: Some(crate::state::pull_request_does_not_exist_message(
+                        &pull_request_id.to_string(),
+                    )),
+                },
+            )
+        })?;
+
+        // An evaluation answers for the revision it was asked about, so a request
+        // naming a revision the pull request has moved past is refused rather than
+        // answered with the state of a revision the caller did not ask about.
+        if !pull_request.is_current_revision(&revision_id) {
+            return Err(
+                EvaluatePullRequestApprovalRulesErrorModeled::RevisionNotCurrentException(
+                    RevisionNotCurrentException {
+                        message: Some(crate::state::REVISION_NOT_CURRENT_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Each rule applied to the pull request is counted against the approvals the
+        // pull request HOLDS, in the one place this crate splits met from unmet, so
+        // the rules reported here are the same ones a merge of it reads.
+        let (approval_rules_satisfied, approval_rules_not_satisfied) =
+            pull_request.approval_rules_by_condition();
+
+        Ok(EvaluatePullRequestApprovalRulesOutput {
+            evaluation: Evaluation {
+                // An override sets the rules' conditions aside, so the pull request
+                // is approved either when every rule's conditions are met or when
+                // they no longer need to be — the same question a merge asks.
+                approved: pull_request.approval_rules_satisfied(),
+                overridden: pull_request.approval_rules_overridden,
+                approval_rules_satisfied: Some(approval_rules_satisfied),
+                approval_rules_not_satisfied: Some(approval_rules_not_satisfied),
+            },
+        })
     }
 }

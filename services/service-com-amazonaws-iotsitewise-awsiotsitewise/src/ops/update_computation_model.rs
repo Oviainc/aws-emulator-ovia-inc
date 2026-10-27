@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateComputationModel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateComputationModel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateComputationModel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: the handler below replaces the stored definition of a computation
+//! model with the one this request carries — its name, description, configuration
+//! and data binding — counts the write as the model's next version and starts the
+//! `UPDATING` -> `ACTIVE` transition the call owes, so a later
+//! `DescribeComputationModel` reports exactly what was written here.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +170,208 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateComputationModel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateComputationModelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateComputationModelError::Modeled(
+                UpdateComputationModelErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+
+        // A request addressing a computation model this store does not hold is the
+        // modelled 404 whatever else it carries, so the lookup comes first — the order
+        // `UpdateWorkspace` keeps — and nothing below can write to a model that is not
+        // there.
+        if !store
+            .computation_models
+            .contains_key(&input.computation_model_id)
+        {
+            return Err(not_found(&input.computation_model_id));
+        }
+
+        // `clientToken` makes this update idempotent, as the member documents: "A
+        // unique case-sensitive identifier that you can provide to ensure the
+        // idempotency of the request." A retry carries the token of the call it
+        // repeats, so it reports that model's status and writes nothing — it counts no
+        // second version and does not restart the transition the first call owes; a
+        // token already spent on a DIFFERENT request belongs to another call, which is
+        // the modelled conflict. It is decided before every rule about the body,
+        // because the call it repeats was already accepted and it is that very call
+        // which left the model UPDATING.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateComputationModel"))
+        // The data binding is a MAP, which has no order of its own, so its entries are
+        // rendered through a `BTreeMap`: a retry of one request has to render
+        // identically however its map was built.
+        let binding_entries: ::std::collections::BTreeMap<_, _> =
+            input.computation_model_data_binding.iter().collect();
+        let fingerprint = crate::state::request_fingerprint(
+            &[
+                &input.computation_model_id,
+                &input.computation_model_name,
+                &input.computation_model_description,
+                &input.computation_model_configuration,
+                &binding_entries,
+            ],
+            None,
+        );
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(replayed) => {
+                // The fingerprint carries the `computationModelId`, so a replay
+                // addresses the model the first call updated — which the lookup above
+                // found. A model deleted since leaves the retry nothing to answer
+                // from, so that retry is served as the fresh update it now is.
+                if let Some(model) = store.computation_models.get(&replayed) {
+                    return Ok(UpdateComputationModelOutput {
+                        computation_model_status: model.status(now),
+                    });
+                }
+            }
+            crate::state::TokenVerdict::Spent(spent_on) => {
+                let arn = store
+                    .computation_models
+                    .get(&spent_on)
+                    .map(|model| model.arn.clone())
+                    .unwrap_or_else(|| crate::state::computation_model_arn(&region, &spent_on));
+                return Err(token_spent(&spent_on, arn));
+            }
+            crate::state::TokenVerdict::Serve => {}
+        }
+
+        // The configuration names the computation type and references its data
+        // binding's variables, so the two shapes are checked together by the one rule
+        // that holds for them — the rule the create is checked by — and before
+        // anything is written: a refused update leaves the stored model and its state
+        // exactly as they were.
+        crate::state::check_computation_model(
+            &input.computation_model_configuration,
+            &input.computation_model_data_binding,
+        )
+        .map_err(invalid_request)?;
+
+        let model = store
+            .computation_models
+            .get_mut(&input.computation_model_id)
+            .ok_or_else(|| not_found(&input.computation_model_id))?;
+
+        // A model still settling a call it already accepted has an operation in flight
+        // on it, so a second mutating call on that same resource at that same instant
+        // is the modelled conflict rather than a write layered onto a pending one —
+        // the rule `UpdateWorkspace` states for a resource that is not settled. A
+        // retry once the owed transition has fallen due succeeds.
+        let settling_state = model.state(now).to_string();
+        if settling_state != crate::state::STATE_ACTIVE {
+            return Err(conflicting_operation(
+                format!(
+                    "The computation model {} is in the {settling_state} state; it can be \
+                     updated only in the {} state.",
+                    model.id,
+                    crate::state::STATE_ACTIVE
+                ),
+                model.id.clone(),
+                model.arn.clone(),
+            ));
+        }
+
+        // Every member this operation carries REPLACES the stored one, so an omitted
+        // optional member clears the value the model held: the request states the
+        // model's new definition rather than patching selected members, which is why
+        // the configuration and the data binding are required on it.
+        //
+        // The actions a model exposes follow from the computation type its
+        // configuration names, so a configuration naming another type publishes that
+        // type's actions and one naming the same type leaves the action ids the model
+        // already published where they are — nothing a read reports changes for an
+        // update that did not change the type.
+        let model_type =
+            crate::state::computation_model_type(&input.computation_model_configuration);
+        if model_type != crate::state::computation_model_type(&model.configuration) {
+            model.action_definitions = model_type
+                .map(crate::state::action_definitions_for)
+                .unwrap_or_default();
+        }
+        model.name = input.computation_model_name.clone();
+        model.description = input.computation_model_description.clone();
+        model.configuration = input.computation_model_configuration.clone();
+        model.data_binding = input.computation_model_data_binding.clone();
+        // The model counts this write as its next version and reports UPDATING until
+        // the transition this call owes falls due, which is the state the output
+        // reports: "a state (UPDATING after successfully calling this operation)".
+        model.begin_update(now);
+
+        let output = UpdateComputationModelOutput {
+            computation_model_status: model.status(now),
+        };
+
+        // The token is spent only now that the update has succeeded: a refused request
+        // changed nothing, so the caller may send its token again.
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &input.computation_model_id,
+            now,
+        );
+
+        Ok(output)
     }
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> UpdateComputationModelError {
+    UpdateComputationModelError::Modeled(
+        UpdateComputationModelErrorModeled::InvalidRequestException(InvalidRequestException {
+            message,
+        }),
+    )
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the computation model the request
+/// addressed, worded by this service's one not-found rule rather than by a
+/// template of this handler's own.
+fn not_found(requested: &str) -> UpdateComputationModelError {
+    UpdateComputationModelError::Modeled(
+        UpdateComputationModelErrorModeled::ResourceNotFoundException(
+            ResourceNotFoundException {
+                message: crate::state::not_found_message(
+                    crate::state::RESOURCE_COMPUTATION_MODEL,
+                    requested,
+                ),
+            },
+        ),
+    )
+}
+
+/// HTTP 409 `ConflictingOperationException` carrying `message`, naming the
+/// computation model the conflict is with.
+fn conflicting_operation(
+    message: String,
+    resource_id: String,
+    resource_arn: String,
+) -> UpdateComputationModelError {
+    UpdateComputationModelError::Modeled(
+        UpdateComputationModelErrorModeled::ConflictingOperationException(
+            ConflictingOperationException {
+                message,
+                resource_id,
+                resource_arn,
+            },
+        ),
+    )
+}
+
+/// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
+/// request already spent: the conflict is with the computation model that request
+/// updated, so `resourceId`/`resourceArn` name it.
+fn token_spent(computation_model_id: &str, arn: String) -> UpdateComputationModelError {
+    conflicting_operation(
+        crate::state::already_using_message("computation model", "clientToken"),
+        computation_model_id.to_string(),
+        arn,
+    )
 }

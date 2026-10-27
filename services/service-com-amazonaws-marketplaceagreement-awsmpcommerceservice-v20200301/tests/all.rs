@@ -37,6 +37,8 @@ mod cancellation_request_rejection;
 mod cancellation_request_withdrawal;
 #[path = "all/charge_amounts.rs"]
 mod charge_amounts;
+#[path = "all/client_token_scope.rs"]
+mod client_token_scope;
 #[path = "all/error_bodies.rs"]
 mod error_bodies;
 #[path = "all/idempotency_token_conflicts.rs"]

@@ -23,6 +23,8 @@ mod create_scan_tag_merge;
 mod findings_metrics;
 #[path = "all/list_scans_scan_type.rs"]
 mod list_scans_scan_type;
+#[path = "all/metrics_open_as_of.rs"]
+mod metrics_open_as_of;
 #[path = "all/metrics_summary.rs"]
 mod metrics_summary;
 #[path = "all/reserved_tag_keys.rs"]

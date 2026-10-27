@@ -75,6 +75,13 @@ pub const DELETION_DELAY: Duration = Duration::from_millis(500);
 /// instant it falls due is stored on the record and never slept on.
 pub const RESHARD_DELAY: Duration = Duration::from_millis(500);
 
+/// How long after a capacity-mode change the stream's `UPDATING` -> `ACTIVE` transition
+/// falls due. A CHOSEN span, not an AWS-documented duration: it only has to be non-zero,
+/// so a caller that reads the stream straight after the change still observes `UPDATING`,
+/// and a second change that overlaps the first is refused rather than served. The instant
+/// it falls due is stored on the record and never slept on.
+pub const MODE_UPDATE_DELAY: Duration = Duration::from_millis(500);
+
 /// How many shard-count changes one stream may be scaled by inside [`RESHARD_WINDOW`]: by
 /// default you cannot "scale more than ten times per rolling 24-hour period per stream"
 /// (`UpdateShardCount`).
@@ -89,6 +96,16 @@ pub const RESHARD_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 /// (`IncreaseStreamRetentionPeriod`), which is also the minimum
 /// `StreamDescription$RetentionPeriodHours` publishes.
 pub const DEFAULT_RETENTION_PERIOD_HOURS: i32 = 24;
+
+/// The shortest retention window a stream may carry, in hours: "The minimum value of a
+/// stream's retention period is 24 hours" (`DecreaseStreamRetentionPeriod`), which is also
+/// the window a stream starts with ([`DEFAULT_RETENTION_PERIOD_HOURS`]).
+pub const MIN_RETENTION_PERIOD_HOURS: i32 = DEFAULT_RETENTION_PERIOD_HOURS;
+
+/// The longest retention window a stream may carry, in hours: "The maximum value of a
+/// stream's retention period is 8760 hours (365 days)"
+/// (`IncreaseStreamRetentionPeriod`).
+pub const MAX_RETENTION_PERIOD_HOURS: i32 = 8_760;
 
 /// The shards an on-demand stream starts with. The capacity an on-demand stream starts
 /// with is 4 MiB/s of writes, and a shard supports "writes up to 1,000 records per
@@ -848,6 +865,113 @@ impl Stream {
         open_before
     }
 
+    /// Whether the stream's shard map holds a shard named `shard_id`, open or closed.
+    pub fn holds_shard(&self, shard_id: &str) -> bool {
+        self.shards.iter().any(|shard| shard.shard_id == shard_id)
+    }
+
+    /// The position in [`Self::shards`] of the OPEN shard named `shard_id`, if the map
+    /// holds one: only an open shard still covers a slice of the hash key space, so only
+    /// an open one can be split or merged.
+    pub fn open_shard_index(&self, shard_id: &str) -> Option<usize> {
+        self.shards
+            .iter()
+            .position(|shard| shard.shard_id == shard_id && shard.is_open())
+    }
+
+    /// Close the two open shards at `first` and `second` and cover their joined slice of
+    /// the hash key space with ONE new open shard, answering that child's id.
+    ///
+    /// "After the merge, the single child shard receives data for all hash key values
+    /// covered by the two parent shards" (`MergeShards`), and the child names both shards
+    /// it was produced from (`Shard$ParentShardId` / `Shard$AdjacentParentShardId`). The
+    /// shard count is being changed, so the stream owes the `ACTIVE` it goes back to — an
+    /// instant the record stores rather than sleeps on.
+    ///
+    /// Bounded by the caller: both shards are resolved, checked to be open and checked to
+    /// be adjacent BEFORE this closes either of them.
+    pub fn merge_shards(&mut self, first: usize, second: usize, at: SystemTime) -> Option<String> {
+        let bounds = |position: usize| -> Option<(u128, u128, String)> {
+            let shard = self.shards.get(position)?;
+            let (starting, ending) = shard.hash_key_bounds()?;
+            Some((starting, ending, shard.shard_id.clone()))
+        };
+        let one = bounds(first)?;
+        let two = bounds(second)?;
+        // The child covers both ranges, so it starts where the lower parent starts and
+        // ends where the upper one ends, whichever order the request named them in.
+        let (lower, upper) = if one.0 <= two.0 { (one, two) } else { (two, one) };
+
+        let index = u32::try_from(self.shards.len()).unwrap_or(u32::MAX);
+        let child = ShardRecord::from_parents(
+            index,
+            at,
+            lower.0.to_string(),
+            upper.1.to_string(),
+            &[lower.2, upper.2],
+        );
+        let child_shard_id = child.shard_id.clone();
+        for position in [first, second] {
+            if let Some(shard) = self.shards.get_mut(position) {
+                shard.close_at(at);
+            }
+        }
+        self.shards.push(child);
+        self.updating_until = Some(at + RESHARD_DELAY);
+        Some(child_shard_id)
+    }
+
+    /// Close the open shard at `index` and cover its slice of the hash key space with TWO
+    /// new open shards, answering their ids lowest first.
+    ///
+    /// "The NewStartingHashKey hash key value and all higher hash key values in hash key
+    /// range are distributed to one of the child shards. All the lower hash key values in
+    /// the range are distributed to the other child shard"
+    /// (`SplitShardInput$NewStartingHashKey`), and each child names the shard it was
+    /// produced from. The shard count is being changed, so the stream owes the `ACTIVE` it
+    /// goes back to — an instant the record stores rather than sleeps on.
+    ///
+    /// Bounded by the caller: the shard is resolved, checked to be open and
+    /// `new_starting_hash_key` checked to fall strictly inside its range BEFORE this closes
+    /// it, so neither child covers an empty slice.
+    pub fn split_shard(
+        &mut self,
+        index: usize,
+        new_starting_hash_key: u128,
+        at: SystemTime,
+    ) -> Option<(String, String)> {
+        let (parent_shard_id, starting, ending) = {
+            let shard = self.shards.get(index)?;
+            let (starting, ending) = shard.hash_key_bounds()?;
+            (shard.shard_id.clone(), starting, ending)
+        };
+        let first_index = u32::try_from(self.shards.len()).unwrap_or(u32::MAX);
+        // Both children are a split's, so each names the ONE shard it was produced from.
+        let parent = ::std::slice::from_ref(&parent_shard_id);
+        let lower = ShardRecord::from_parents(
+            first_index,
+            at,
+            starting.to_string(),
+            new_starting_hash_key.checked_sub(1)?.to_string(),
+            parent,
+        );
+        let upper = ShardRecord::from_parents(
+            first_index.saturating_add(1),
+            at,
+            new_starting_hash_key.to_string(),
+            ending.to_string(),
+            parent,
+        );
+        let children = (lower.shard_id.clone(), upper.shard_id.clone());
+        if let Some(shard) = self.shards.get_mut(index) {
+            shard.close_at(at);
+        }
+        self.shards.push(lower);
+        self.shards.push(upper);
+        self.updating_until = Some(at + RESHARD_DELAY);
+        Some(children)
+    }
+
     /// The children of the shard `shard_id`, as `GetRecords` reports them — "the existing
     /// child shard of the current shard" (`ChildShard`), which is what a reader that has
     /// reached the end of a closed shard reads on from.
@@ -1263,6 +1387,137 @@ pub fn stream_not_active_message(identifier: &str, status: &str) -> String {
 pub fn stream_on_demand_message(stream_name: &str) -> String {
     format!(
         "Request is invalid. Stream {stream_name} under account {} is in On-Demand mode.",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// How `UpdateShardCount` refuses a target below half the stream's current open shard
+/// count: "you cannot do the following: ... scale down below half your current shard count
+/// for a stream" (`UpdateShardCount`). Built FROM the stored record and the request, so the
+/// count the bound was taken against and the target at fault both name it.
+pub fn scale_down_below_half_message(open_shard_count: i32, target_shard_count: i32) -> String {
+    format!(
+        "UpdateShardCount cannot scale down below half your current open shard count. \
+         Current open shard count: {open_shard_count} Target shard count: {target_shard_count}"
+    )
+}
+
+/// How `UpdateShardCount` refuses a target over double the stream's current open shard
+/// count: "you cannot do the following: ... scale up to more than double your current shard
+/// count for a stream" (`UpdateShardCount`). Built FROM the stored record and the request,
+/// so the count the bound was taken against and the target at fault both name it.
+pub fn scale_up_over_double_message(open_shard_count: i32, target_shard_count: i32) -> String {
+    format!(
+        "UpdateShardCount cannot scale up over double your current open shard count. \
+         Current open shard count: {open_shard_count} Target shard count: {target_shard_count}"
+    )
+}
+
+/// How a retention change refuses a window past the longest one a stream may carry
+/// ([`MAX_RETENTION_PERIOD_HOURS`]). Built FROM the request, so the window at fault names
+/// it.
+///
+/// ONE sentence for the one rule: both retention operations carry the same member against
+/// the same ceiling, so they refuse it identically rather than each wording it.
+pub fn retention_period_too_long_message(requested_hours: i32) -> String {
+    format!(
+        "Maximum allowed retention period is {MAX_RETENTION_PERIOD_HOURS} hours. Requested \
+         retention period ({requested_hours} hours) is too long."
+    )
+}
+
+/// How a retention change refuses a window below the shortest one a stream may carry
+/// ([`MIN_RETENTION_PERIOD_HOURS`]). The counterpart of
+/// [`retention_period_too_long_message`], for the other end of the same window.
+pub fn retention_period_too_short_message(requested_hours: i32) -> String {
+    format!(
+        "Minimum allowed retention period is {MIN_RETENTION_PERIOD_HOURS} hours. Requested \
+         retention period ({requested_hours} hours) is too short."
+    )
+}
+
+/// How `IncreaseStreamRetentionPeriod` refuses a window shorter than the one the stream
+/// already carries: its member is "the new retention period of the stream, in hours. Must
+/// be more than the current retention period"
+/// (`IncreaseStreamRetentionPeriodInput$RetentionPeriodHours`), and shortening a window is
+/// the other operation's to serve. Built FROM the request and the stored record, so the
+/// window at fault and the one the stream carries both name it.
+pub fn retention_period_not_longer_message(
+    stream_identifier: &str,
+    requested_hours: i32,
+    current_hours: i32,
+) -> String {
+    format!(
+        "Requested retention period ({requested_hours} hours) for stream {stream_identifier} \
+         can not be shorter than existing value ({current_hours} hours). Use \
+         DecreaseStreamRetentionPeriod API."
+    )
+}
+
+/// How `DecreaseStreamRetentionPeriod` refuses a window longer than the one the stream
+/// already carries: its member is "the new retention period of the stream, in hours. Must
+/// be less than the current retention period"
+/// (`DecreaseStreamRetentionPeriodInput$RetentionPeriodHours`), and lengthening a window is
+/// the other operation's to serve.
+pub fn retention_period_not_shorter_message(
+    stream_identifier: &str,
+    requested_hours: i32,
+    current_hours: i32,
+) -> String {
+    format!(
+        "Requested retention period ({requested_hours} hours) for stream {stream_identifier} \
+         can not be longer than existing value ({current_hours} hours). Use \
+         IncreaseStreamRetentionPeriod API."
+    )
+}
+
+/// How a manual reshard refuses a shard that is no longer open: a closed shard has already
+/// given up its slice of the hash key space to the children a split or a merge minted, so
+/// there is nothing left of it to re-tile.
+///
+/// ONE sentence for the one rule: `SplitShard` and `MergeShards` both re-tile OPEN shards,
+/// so they refuse a closed one identically rather than each wording it.
+pub fn shard_not_open_message(shard_id: &str, stream_identifier: &str) -> String {
+    format!(
+        "Shard {shard_id} in stream {stream_identifier} under account {} has already been \
+         merged or split, so it is not eligible for merging or splitting.",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// How `MergeShards` refuses two shards whose ranges do not meet: "two shards are
+/// considered adjacent if the union of the hash key ranges for the two shards form a
+/// contiguous set with no gaps" (`MergeShards`). Built FROM the request and the stored
+/// shards, so the pair at fault names it.
+pub fn shards_not_adjacent_message(
+    shard_to_merge: &str,
+    adjacent_shard_to_merge: &str,
+    stream_identifier: &str,
+) -> String {
+    format!(
+        "Shards {shard_to_merge} and {adjacent_shard_to_merge} in stream {stream_identifier} \
+         under account {} are not adjacent, so the union of their hash key ranges does not \
+         form a contiguous set with no gaps.",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// How `SplitShard` refuses a `NewStartingHashKey` that does not fall strictly inside the
+/// parent shard's own range — a key that would leave one of the two children covering no
+/// hash key at all. Built FROM the request and the stored shard, so the key at fault and
+/// the range it had to fall inside both name it.
+pub fn split_hash_key_outside_the_parent_message(
+    new_starting_hash_key: &str,
+    shard_id: &str,
+    stream_identifier: &str,
+    starting_hash_key: &str,
+    ending_hash_key: &str,
+) -> String {
+    format!(
+        "NewStartingHashKey {new_starting_hash_key} used in SplitShard() on shard {shard_id} \
+         in stream {stream_identifier} under account {} is not both greater than one plus the \
+         shard's StartingHashKey {starting_hash_key} and less than the shard's EndingHashKey \
+         {ending_hash_key}.",
         ::engine::emulator_account_id()
     )
 }

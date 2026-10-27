@@ -243,13 +243,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // Only an authorization the snapshot HOLDS can be released: an account
-        // that was never authorized, or whose grant an earlier revoke already
-        // released, is the modelled `AuthorizationNotFoundFault`. Unlike the
-        // grant path this operation asserts nothing about the snapshot's status —
-        // "if the account is currently restoring the snapshot, the restore will
-        // run to completion" — so the restore a revoke interrupts is the
-        // CALLER's problem, not a precondition on the snapshot.
+        // Only an authorization the snapshot HOLDS can be released, and the
+        // snapshot RESOLVED here, so the refusal is the authorization-specific
+        // one rather than a not-found: `AccessToSnapshotDeniedFault` is "the
+        // owner of the specified snapshot has not authorized your account to
+        // access the snapshot", which is exactly an account that was never
+        // authorized or whose grant an earlier revoke already released. Nothing
+        // is written on this path, so every other account's grant on the
+        // snapshot stays as it was and the unauthorized account is not added.
+        // Unlike the grant path this operation asserts nothing about the
+        // snapshot's status — "if the account is currently restoring the
+        // snapshot, the restore will run to completion" — so the restore a
+        // revoke interrupts is the CALLER's problem, not a precondition on the
+        // snapshot.
         let Some(position) = snapshot
             .accounts_with_restore_access
             .iter()
@@ -257,12 +263,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .position(|held| st::same_restore_account(held, &revoked))
         else {
             return Err(
-                RevokeSnapshotAccessErrorModeled::AuthorizationNotFoundFault(
-                    AuthorizationNotFoundFault {
+                RevokeSnapshotAccessErrorModeled::AccessToSnapshotDeniedFault(
+                    AccessToSnapshotDeniedFault {
                         message: Some(format!(
-                            "Account {} is not authorized to restore cluster snapshot {}.",
-                            input.account_with_restore_access,
-                            snapshot.snapshot_identifier.as_deref().unwrap_or_default()
+                            "The owner of the specified snapshot {} has not authorized your \
+                             account {} to access the snapshot.",
+                            snapshot.snapshot_identifier.as_deref().unwrap_or_default(),
+                            input.account_with_restore_access
                         )),
                     },
                 )

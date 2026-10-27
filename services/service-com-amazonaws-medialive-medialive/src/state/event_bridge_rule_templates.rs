@@ -110,6 +110,50 @@ pub fn is_event_target_arn(arn: &str) -> bool {
         .is_some_and(|service| EVENT_TARGET_SERVICES.contains(&service))
 }
 
+/// The target ARNs a request's `EventTargets` asks a template to carry, in the
+/// order it listed them, or the message the list is refused with.
+///
+/// A template carries at most [`MAX_EVENT_BRIDGE_RULE_TEMPLATE_TARGETS`]
+/// targets (the count the model can report is `__integerMax5`), each one an ARN
+/// of the two kinds the member documents ("Target ARNs must be either an SNS
+/// topic or CloudWatch log group", [`is_event_target_arn`]) and within the
+/// length its target shape names ([`MAX_EVENT_TARGET_ARN_LEN`]).
+///
+/// ONE copy of that rule for every operation that writes a template's targets
+/// (`CreateEventBridgeRuleTemplate` and `UpdateEventBridgeRuleTemplate`), which
+/// document the member identically, so the count ceiling, the per-ARN length
+/// bound, the ARN kinds and the refusal wording cannot drift apart between
+/// them; the handler's job is only to carry the message in its own modelled
+/// client error. The whole list is checked before the caller writes anything,
+/// so a refused request leaves the stored targets as they were rather than
+/// keeping a prefix of the ones it listed.
+pub fn event_targets_from_request(
+    targets: &[crate::ops::types::EventBridgeRuleTemplateTarget],
+) -> Result<Vec<String>, String> {
+    if targets.len() > MAX_EVENT_BRIDGE_RULE_TEMPLATE_TARGETS {
+        return Err(format!(
+            "eventTargets must carry at most {} targets, but carried {}",
+            MAX_EVENT_BRIDGE_RULE_TEMPLATE_TARGETS,
+            targets.len()
+        ));
+    }
+    for target in targets {
+        super::bounded_length(
+            "eventTargets.arn",
+            Some(target.arn.as_str()),
+            1,
+            MAX_EVENT_TARGET_ARN_LEN,
+        )?;
+        if !is_event_target_arn(&target.arn) {
+            return Err(format!(
+                "eventTargets.arn must be the ARN of an SNS topic or a CloudWatch log group, but was {}",
+                target.arn
+            ));
+        }
+    }
+    Ok(targets.iter().map(|target| target.arn.clone()).collect())
+}
+
 /// Why [`ComAmazonawsMedialiveMedialiveState::insert_event_bridge_rule_template`]
 /// stored nothing. Each variant is one modelled refusal of
 /// `CreateEventBridgeRuleTemplate`.

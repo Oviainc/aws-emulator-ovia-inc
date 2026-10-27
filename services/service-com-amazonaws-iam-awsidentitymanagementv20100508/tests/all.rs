@@ -83,6 +83,8 @@ mod open_id_connect_provider_tag_updates;
 mod open_id_connect_providers;
 #[path = "all/policies_granting_service_access.rs"]
 mod policies_granting_service_access;
+#[path = "all/policy_default_version.rs"]
+mod policy_default_version;
 #[path = "all/policy_deletion.rs"]
 mod policy_deletion;
 #[path = "all/policy_listing.rs"]

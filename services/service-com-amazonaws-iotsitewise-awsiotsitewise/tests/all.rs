@@ -536,3 +536,9 @@ mod list_projects;
 #[path = "all/update_gateway.rs"]
 mod update_gateway;
 
+// Declared last, for the same reason the suites above it are: both stretches
+// higher up are where every concurrent iotsitewise change inserts a declaration
+// of its own. Fold it into the sorted list once the churn settles.
+#[path = "all/update_computation_model.rs"]
+mod update_computation_model;
+

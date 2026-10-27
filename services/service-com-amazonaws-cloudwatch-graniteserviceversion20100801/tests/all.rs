@@ -67,6 +67,8 @@ mod insight_rules;
 mod list_metric_streams;
 #[path = "all/log_alarms.rs"]
 mod log_alarms;
+#[path = "all/managed_insight_rule_catalog.rs"]
+mod managed_insight_rule_catalog;
 #[path = "all/managed_insight_rules.rs"]
 mod managed_insight_rules;
 #[path = "all/metric_data.rs"]
