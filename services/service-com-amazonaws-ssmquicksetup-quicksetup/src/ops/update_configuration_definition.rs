@@ -260,6 +260,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // So a manager whose teardown has come due is gone before this request looks
         // for it, rather than being updated on its way out of the store.
         store.settle(now);
+        // How many configurations the store holds BESIDE the ones this definition is
+        // already deployed to, read before the manager is borrowed. An update redeploys
+        // its definition, so the configurations it already has are replaced rather than
+        // added to: the bound below is read against the rest of the store.
+        let held_configurations = {
+            let deployed_here = store
+                .configurations
+                .values()
+                .filter(|configuration| {
+                    configuration.manager_arn == input.manager_arn
+                        && configuration.configuration_definition_id == input.id
+                })
+                .count();
+            store.configurations.len().saturating_sub(deployed_here)
+        };
 
         let Some(manager) = store.manager_in_mut(&region, &input.manager_arn) else {
             return Err(
@@ -304,6 +319,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // An update replaces a definition's whole parameter set, and those parameters
+        // name where it is deployed, so only an update CARRYING parameters can change
+        // the deployments this definition fans out to — one that carries none redeploys
+        // the same set. The store's bound on configurations is read once the manager and
+        // the definition are known to exist, and before anything is written, so an
+        // update the store cannot take changes nothing. The Region is the manager's own:
+        // only the endpoint that created a manager serves it.
+        if let Some(parameters) = input.parameters.as_ref() {
+            let planned = crate::state::deployment_targets(
+                parameters,
+                ::engine::emulator_account_id(),
+                &region,
+            )
+            .len();
+            if let Some(why) =
+                crate::state::configuration_capacity_rejection(held_configurations, planned)
+            {
+                return Err(
+                    UpdateConfigurationDefinitionErrorModeled::ConflictException(
+                        ConflictException { message: Some(why) },
+                    )
+                    .into(),
+                );
+            }
+        }
+
         // A `TypeVersion` names one shipped revision of the service-owned template
         // this definition's `Type` deploys, so it is resolved against the published
         // catalog before anything is written: a version that type publishes (or the
@@ -342,7 +383,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             definition.type_version = Some(type_version);
         }
         if let Some(parameters) = input.parameters {
-            definition.parameters = crate::state::to_btree_map(Some(parameters));
+            definition.parameters = crate::state::to_shared_parameters(Some(parameters));
         }
         if let Some(role_name) = input.local_deployment_execution_role_name {
             definition.local_deployment_execution_role_name = Some(role_name);
@@ -368,7 +409,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // deployment in an account or Region the definition no longer targets. `Type`
         // is not an input of this operation, so it is untouched.
         let targets = crate::state::deployment_targets(
-            &definition.parameters,
+            &*definition.parameters,
             ::engine::emulator_account_id(),
             &manager_region,
         );

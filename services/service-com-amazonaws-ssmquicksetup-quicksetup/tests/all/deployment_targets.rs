@@ -19,7 +19,9 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_ssmquicksetup_quicksetup::state::MAX_DEPLOYMENT_TARGETS;
+use service_com_amazonaws_ssmquicksetup_quicksetup::state::{
+    MAX_CONFIGURATIONS, MAX_DEPLOYMENT_TARGETS,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every request below signs for: the Region a created manager owns, and so
@@ -800,4 +802,256 @@ async fn a_definition_past_the_deployment_bound_is_refused() {
             seen.len()
         );
     }
+}
+
+/// What ONE request may deploy is bounded by what the store holds, not by the product
+/// of the per-definition bounds: a create whose definitions together fan out past
+/// `MAX_CONFIGURATIONS` is refused and stores nothing, while one at that bound deploys
+/// every configuration it names.
+#[tokio::test]
+async fn a_create_whose_definitions_outgrow_the_store_is_refused() {
+    // One definition per `MAX_DEPLOYMENT_TARGETS` deployments, so a whole-request
+    // fan-out is named by how many definitions the create carries.
+    let definitions_per_store = MAX_CONFIGURATIONS / MAX_DEPLOYMENT_TARGETS;
+    let definitions = |count: usize| {
+        let targeted: String = (0..MAX_DEPLOYMENT_TARGETS)
+            .map(|index| format!("eu-west-{}", index + 1))
+            .collect::<Vec<String>>()
+            .join(",");
+        (0..count)
+            .map(|_| {
+                json!({
+                    "Type": TYPE,
+                    "Parameters": {
+                        "TargetOrganizationalUnits": "ou-1",
+                        "TargetRegions": targeted,
+                    },
+                })
+            })
+            .collect::<Vec<Value>>()
+    };
+
+    // (case, how many definitions the create carries, the status it must answer)
+    let cases: Vec<(&str, usize, u16)> = vec![
+        ("one definition under the store bound", definitions_per_store - 1, 200),
+        ("exactly the store bound", definitions_per_store, 200),
+        ("one definition past the store bound", definitions_per_store + 1, 409),
+    ];
+
+    for (case, carried, want_status) in cases {
+        // A store of its own per row, so what each create may deploy is measured
+        // against an empty one.
+        let router = emulator();
+        let body = json!({ "Name": "capacity", "ConfigurationDefinitions": definitions(carried) });
+        let (status, answer) = call(&router, "POST", "/configurationManager", Some(&body)).await;
+        assert_eq!(
+            status, want_status,
+            "case {case}: expected {want_status}, got {status} / {answer:?}"
+        );
+        if want_status == 200 {
+            // Everything this create named is deployed: a one-row page of a listing
+            // that holds more rows hands back the token to resume from.
+            let manager_arn = answer["ManagerArn"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case}: expected a ManagerArn, got {answer:?}"))
+                .to_string();
+            let (status, listed) = call(
+                &router,
+                "POST",
+                "/listConfigurations",
+                Some(&json!({ "ManagerArn": manager_arn, "MaxItems": 1 })),
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case}: ListConfigurations must succeed, got {status} / {listed:?}"
+            );
+            assert!(
+                listed.get("NextToken").and_then(Value::as_str).is_some(),
+                "case {case}: this create deployed {} configurations, so a one-row page must \
+                 hand back a token, got {listed:?}",
+                carried * MAX_DEPLOYMENT_TARGETS
+            );
+            continue;
+        }
+        assert_eq!(
+            error_code(&answer),
+            "ConflictException",
+            "case {case}: expected ConflictException, got {answer:?}"
+        );
+        // A refused create stores nothing at all: neither the manager it would have
+        // minted nor any configuration of it.
+        let (status, managers) = call(&router, "POST", "/listConfigurationManagers", Some(&json!({})))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case}: ListConfigurationManagers must succeed, got {status} / {managers:?}"
+        );
+        let held = managers["ConfigurationManagersList"]
+            .as_array()
+            .map_or(0, Vec::len);
+        assert_eq!(
+            held, 0,
+            "case {case}: a refused create stores no manager, got {managers:?}"
+        );
+        let (status, configurations) =
+            call(&router, "POST", "/listConfigurations", Some(&json!({}))).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: ListConfigurations must succeed, got {status} / {configurations:?}"
+        );
+        let deployed = configurations["ConfigurationsList"]
+            .as_array()
+            .map_or(0, Vec::len);
+        assert_eq!(
+            deployed, 0,
+            "case {case}: a refused create deploys nothing, got {configurations:?}"
+        );
+    }
+}
+
+/// Every id `ListConfigurations` reports for one manager, paged to the end — the store
+/// below holds more configurations than one page, and more than one request examines.
+async fn deployed_ids(
+    router: &MultiServiceRouter,
+    case: &str,
+    manager_arn: &str,
+) -> BTreeSet<String> {
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut token: Option<String> = None;
+    loop {
+        let mut body = serde_json::Map::new();
+        body.insert("ManagerArn".to_string(), json!(manager_arn));
+        if let Some(token) = &token {
+            body.insert("StartingToken".to_string(), json!(token));
+        }
+        let (status, page) =
+            call(router, "POST", "/listConfigurations", Some(&Value::Object(body))).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: ListConfigurations must succeed, got {status} / {page:?}"
+        );
+        for row in page["ConfigurationsList"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+        {
+            seen.insert(row["Id"].as_str().unwrap_or_default().to_string());
+        }
+        match page.get("NextToken").and_then(Value::as_str) {
+            Some(next) => token = Some(next.to_string()),
+            None => break,
+        }
+    }
+    seen
+}
+
+/// What an UPDATE may deploy is bounded by the store exactly as a create is: an update
+/// whose targets would take the store past `MAX_CONFIGURATIONS` is refused with the
+/// modelled 409 and changes nothing, while one the store can take is deployed in full.
+/// The deployments the definition already has are replaced by the update, so they are
+/// not counted against it as well as the new ones.
+#[tokio::test]
+async fn an_update_whose_targets_outgrow_the_store_is_refused() {
+    let case = "store capacity on update";
+    let router = emulator();
+    let regions = |count: usize| {
+        (0..count)
+            .map(|index| format!("eu-west-{}", index + 1))
+            .collect::<Vec<String>>()
+            .join(",")
+    };
+
+    // Fill the store close to its bound through managers of their own: definitions that
+    // fan out to the deployment bound, then definitions that deploy once each, so what
+    // is left for the update below is a known number of configurations.
+    let fanned_out = MAX_CONFIGURATIONS / MAX_DEPLOYMENT_TARGETS - 1;
+    let fanned: Vec<Value> = (0..fanned_out)
+        .map(|_| {
+            json!({
+                "Type": TYPE,
+                "Parameters": {
+                    "TargetOrganizationalUnits": "ou-1",
+                    "TargetRegions": regions(MAX_DEPLOYMENT_TARGETS),
+                },
+            })
+        })
+        .collect();
+    let singles: Vec<Value> = (0..MAX_DEPLOYMENT_TARGETS / 2)
+        .map(|index| {
+            json!({
+                "Type": TYPE,
+                "Parameters": { "TargetOrganizationalUnits": format!("ou-{}", index + 2) },
+            })
+        })
+        .collect();
+    for (label, definitions) in [("fanned", fanned), ("singles", singles)] {
+        let body = json!({ "Name": label, "ConfigurationDefinitions": definitions });
+        let (status, answer) = call(&router, "POST", "/configurationManager", Some(&body)).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: the {label} create must succeed, got {status} / {answer:?}"
+        );
+    }
+    // The store now holds everything but one of the configurations it may hold, so an
+    // update of the definition below has exactly that many left to deploy into.
+    let left = MAX_CONFIGURATIONS - fanned_out * MAX_DEPLOYMENT_TARGETS - MAX_DEPLOYMENT_TARGETS / 2;
+
+    let subject = create_ok(
+        &router,
+        case,
+        "subject",
+        &json!({ "TargetOrganizationalUnits": "ou-subject" }),
+    )
+    .await;
+    let id = definition_id(&router, case, &subject).await;
+    let before = deployed_ids(&router, case, &subject).await;
+    assert_eq!(
+        before.len(),
+        1,
+        "case {case}: the subject definition names one target, got {before:?}"
+    );
+
+    // One target past what the store has left: refused, and the definition keeps the
+    // deployment it had.
+    let past = json!({
+        "Parameters": {
+            "TargetOrganizationalUnits": "ou-subject",
+            "TargetRegions": regions(left + 1),
+        },
+    });
+    let (status, answer) = update_definition(&router, &subject, &id, &past).await;
+    assert_eq!(
+        status, 409,
+        "case {case}: an update past the store's capacity must be refused, got {status} / {answer:?}"
+    );
+    assert_eq!(
+        error_code(&answer),
+        "ConflictException",
+        "case {case}: expected ConflictException, got {answer:?}"
+    );
+    assert_eq!(
+        deployed_ids(&router, case, &subject).await,
+        before,
+        "case {case}: a refused update deploys nothing and reclaims nothing"
+    );
+
+    // Exactly what the store has left: deployed in full, and the configuration the
+    // definition already had is replaced rather than counted beside the new ones.
+    let fits = json!({
+        "Parameters": {
+            "TargetOrganizationalUnits": "ou-subject",
+            "TargetRegions": regions(left),
+        },
+    });
+    let (status, answer) = update_definition(&router, &subject, &id, &fits).await;
+    assert_eq!(
+        status, 200,
+        "case {case}: an update the store can take must succeed, got {status} / {answer:?}"
+    );
+    assert_eq!(
+        deployed_ids(&router, case, &subject).await.len(),
+        left,
+        "case {case}: the update must deploy every target it names"
+    );
 }
