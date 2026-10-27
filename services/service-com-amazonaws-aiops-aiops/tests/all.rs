@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/error_message_rules.rs"]
 mod error_message_rules;
+#[path = "all/group_reader_and_id_shape.rs"]
+mod group_reader_and_id_shape;
 #[path = "all/investigation_group_identifier_forms.rs"]
 mod investigation_group_identifier_forms;
 #[path = "all/investigation_group_name_identity.rs"]
