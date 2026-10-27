@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListFunctionsByCodeSigningConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListFunctionsByCodeSigningConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListFunctionsByCodeSigningConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the ARN of every function associated with the code-signing configuration the
+//! request names, out of the single function-level association
+//! [`crate::state::FunctionRecord::code_signing_config_arn`] that
+//! `PutFunctionCodeSigningConfig` and `CreateFunction` persist — the same association
+//! `GetFunctionCodeSigningConfig` reports and `DeleteCodeSigningConfig` refuses a delete
+//! for ([`crate::state::ComAmazonawsLambdaAwsgirapiserviceState::code_signing_config_users`]).
+//! The configuration itself has to be one this account holds, so an ARN naming none is
+//! the configuration's own 404 rather than an empty list.
+//!
+//! The reported ARNs are ordered by the ARN itself, which is both the only member this
+//! operation reports and therefore the pagination token: one page of at most `MaxItems`
+//! entries starting at the first function ordered after the caller's `Marker`.
+//!
+//! This operation only reports: nothing it answers is written anywhere.
 //!
 //! ## Shape of an operation
 //!
@@ -147,20 +153,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListFunctionsByCodeSigningConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListFunctionsByCodeSigningConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListFunctionsByCodeSigningConfig"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListFunctionsByCodeSigningConfigErrorModeled::ServiceException(ServiceException {
+                    r#type: None,
+                    message: Some("Lambda state is not reachable on this engine".to_string()),
+                })
+                .into(),
+            );
+        };
+
+        // `MaxItems` is modelled `MaxListItems`, `@range(min: 1, max: 10000)`, so the
+        // boundary validator has already refused anything outside it; this handler
+        // enforces the same floor itself rather than letting a page size of zero reach
+        // the pagination arithmetic below.
+        if let Some(requested) = input.max_items.filter(|requested| *requested < 1) {
+            return Err(
+                ListFunctionsByCodeSigningConfigErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        r#type: None,
+                        message: Some(format!(
+                            "1 validation error detected: Value '{requested}' at 'maxItems' \
+                             failed to satisfy constraint: Member must have value greater \
+                             than or equal to 1"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        let page_size = input
+            .max_items
+            .and_then(|requested| usize::try_from(requested).ok())
+            .unwrap_or(MAX_FUNCTION_ARNS_PER_PAGE)
+            .clamp(1, MAX_FUNCTION_ARNS_PER_PAGE);
+
+        let store = state.lock();
+
+        // No clock-owed transition is materialised first because none can reach what this
+        // call reads: a function's code-signing association is set only by a request, and
+        // the clock removes no function.
+
+        // The configuration is addressed by the ARN it was minted with, which is the key
+        // the store holds it under — the same lookup `GetCodeSigningConfig` makes, so the
+        // two surfaces agree on which ARNs name a configuration this account holds, and a
+        // configuration that was deleted reads exactly like one that never existed.
+        if !store
+            .code_signing_configs
+            .contains_key(&input.code_signing_config_arn)
+        {
+            return Err(
+                ListFunctionsByCodeSigningConfigErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        r#type: None,
+                        message: Some(crate::state::code_signing_config_gone_message(
+                            &input.code_signing_config_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Every function holding this configuration, out of the stored association. The
+        // ARN is the only member reported, so it is also the pagination key: ordering by
+        // it makes the sequence a stable one to continue after a `Marker`.
+        let mut arns = store.code_signing_config_users(&input.code_signing_config_arn);
+        arns.sort();
+
+        // The marker is the ARN of the last function the previous page reported, so the
+        // next page starts at the first function ordered after it and no function is ever
+        // reported twice.
+        let start = match input.marker.as_deref() {
+            Some(marker) => arns
+                .iter()
+                .position(|arn| arn.as_str() > marker)
+                .unwrap_or(arns.len()),
+            None => 0,
+        };
+        let page = match arns.get(start..) {
+            Some(remaining) => &remaining[..page_size.min(remaining.len())],
+            None => &[][..],
+        };
+        let truncated = start + page.len() < arns.len();
+
+        Ok(ListFunctionsByCodeSigningConfigOutput {
+            // "The pagination token that's included if more results are available" — so
+            // it is absent on the last page, and it is the ARN of the last function THIS
+            // page reported, which is what the next page continues after.
+            next_marker: page.last().filter(|_| truncated).cloned(),
+            function_arns: Some(page.to_vec()),
+        })
     }
 }
+
+/// The most function ARNs one page reports.
+///
+/// The operation documents no page cap of its own, so the bound is the ceiling the model
+/// puts on `MaxItems` (`MaxListItems`, `@range(min: 1, max: 10000)`, from
+/// `smithy_query(query="operation", operation="ListFunctionsByCodeSigningConfig")`). It is
+/// therefore both the page size a caller that names no `MaxItems` gets and the ceiling on
+/// the one who does.
+const MAX_FUNCTION_ARNS_PER_PAGE: usize = 10_000;
