@@ -210,6 +210,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .queues
             .get_mut(&name)
             .expect("the queue was resolved out of this same store");
+        // A `TagKeys` entry names a tag key, so it is held to the key rule every
+        // tag-naming request is held to — a key's length, and the reserved namespace only
+        // the provider writes — BEFORE anything is removed, so a refused request leaves
+        // the queue's tag map exactly as it was. A key the rule does not accept is a
+        // parameter VALUE this service does not take, which is what
+        // `InvalidParameterValue` reports.
+        if let Some(why) = input.tag_keys.iter().find_map(|key| state::tag_key_refusal(key)) {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(why));
+        }
         // Each named key is removed; one the queue does not carry leaves the map as it is,
         // so a repeated request is the same request. Keys are matched verbatim, since
         // "Tags are case-sensitive".

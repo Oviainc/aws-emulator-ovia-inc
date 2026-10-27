@@ -1322,17 +1322,15 @@ async fn retire_grant_deletes_the_grant_it_identifies() {
     let router = router();
 
     // "To identify the grant to retire, use a grant token, or both the grant ID and a
-    // key identifier (key ID or key ARN) of the KMS key."
-    for case in [
-        "a grant token",
-        "a key id and a grant id",
-        "a key ARN and a grant id",
-    ] {
+    // key identifier (key ID or key ARN) of the KMS key" — and that key identifier is
+    // "the key ARN KMS key associated with the grant"
+    // (`smithy_query(query="doc",shape="RetireGrantRequest",member="KeyId")`), which is
+    // the key ARN alone.
+    for case in ["a grant token", "a key ARN and a grant id"] {
         let (key_id, key_arn, grant_id, grant_token) = key_with_grant(&router, case).await;
         let request = match case {
             "a grant token" => json!({"GrantToken": grant_token}),
-            "a key ARN and a grant id" => json!({"KeyId": key_arn, "GrantId": grant_id}),
-            _ => json!({"KeyId": key_id, "GrantId": grant_id}),
+            _ => json!({"KeyId": key_arn, "GrantId": grant_id}),
         };
 
         let answer = ok(&router, "RetireGrant", &request).await;
@@ -1355,16 +1353,16 @@ async fn retire_grant_deletes_the_grant_it_identifies() {
     }
 
     // Every refusal leaves the grant exactly as it was.
-    let (key_id, _, grant_id, grant_token) = key_with_grant(&router, "refusals").await;
+    let (key_id, key_arn, grant_id, grant_token) = key_with_grant(&router, "refusals").await;
     let rows: Vec<(&str, Value, &str)> = vec![
         ("nothing identifying a grant", json!({}), "ValidationException"),
         (
-            "a key id with no grant id",
-            json!({"KeyId": key_id}),
+            "a key ARN with no grant id",
+            json!({"KeyId": key_arn}),
             "ValidationException",
         ),
         (
-            "a grant id with no key id",
+            "a grant id with no key ARN",
             json!({"GrantId": grant_id}),
             "ValidationException",
         ),
@@ -1375,12 +1373,19 @@ async fn retire_grant_deletes_the_grant_it_identifies() {
         ),
         (
             "a grant id that is not one",
-            json!({"KeyId": key_id, "GrantId": "not-a-grant-id"}),
+            json!({"KeyId": key_arn, "GrantId": "not-a-grant-id"}),
             "InvalidGrantIdException",
         ),
         (
+            // The one `KeyId` in this service that is the key ARN alone, so a key id
+            // names no key for it.
+            "a key id rather than the key ARN",
+            json!({"KeyId": key_id, "GrantId": grant_id}),
+            "NotFoundException",
+        ),
+        (
             "a well-formed grant id nothing holds",
-            json!({"KeyId": key_id, "GrantId": "a".repeat(64)}),
+            json!({"KeyId": key_arn, "GrantId": "a".repeat(64)}),
             "AccessDeniedException",
         ),
         (
@@ -1389,8 +1394,8 @@ async fn retire_grant_deletes_the_grant_it_identifies() {
             "DryRunOperationException",
         ),
         (
-            "a dry run by key id and grant id",
-            json!({"KeyId": key_id, "GrantId": grant_id, "DryRun": true}),
+            "a dry run by key ARN and grant id",
+            json!({"KeyId": key_arn, "GrantId": grant_id, "DryRun": true}),
             "DryRunOperationException",
         ),
     ];
@@ -1421,7 +1426,9 @@ async fn list_retirable_grants_selects_by_retiring_principal() {
 
     // Two keys, so the selection is shown to span keys rather than to be one key's
     // grant list under another name.
-    let first_key = text("setup", &enabled_key(&router).await, "KeyId");
+    let first = enabled_key(&router).await;
+    let first_key = text("setup", &first, "KeyId");
+    let first_arn = text("setup", &first, "Arn");
     let second_key = text("setup", &enabled_key(&router).await, "KeyId");
 
     let mut retirable: Vec<String> = Vec::new();
@@ -1569,11 +1576,12 @@ async fn list_retirable_grants_selects_by_retiring_principal() {
         );
     }
 
-    // A grant that has been retired is no longer retirable.
+    // A grant that has been retired is no longer retirable. `RetireGrant` takes the
+    // grant's key ARN, not its key id.
     ok(
         &router,
         "RetireGrant",
-        &json!({"KeyId": first_key, "GrantId": retirable[0]}),
+        &json!({"KeyId": first_arn, "GrantId": retirable[0]}),
     )
     .await;
     let after = list_retirable(

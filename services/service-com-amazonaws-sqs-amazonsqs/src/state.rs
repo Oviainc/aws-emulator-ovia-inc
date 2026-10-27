@@ -523,15 +523,6 @@ pub const VISIBILITY_TIMEOUT: &str = "VisibilityTimeout";
 /// Amazon Web Services policy.").
 pub const POLICY: &str = "Policy";
 
-/// The attributes a re-create of an existing name does NOT have to match.
-///
-/// `CreateQueue` "will return the URL of the existing queue instead of creating a new
-/// one" for a request that asks for nothing different about the queue, and refuses one
-/// that does — but the queue's ACCESS POLICY is not part of what it compares: a request
-/// that re-asserts an existing queue under a different (or no) `Policy` is served with
-/// the existing url, and leaves the stored policy as it was. Every other settable
-/// attribute is compared.
-pub const ATTRIBUTES_NOT_COMPARED_ON_RECREATE: &[&str] = &[POLICY];
 /// The attribute that makes a queue a dead-letter SOURCE queue: it names the queue its
 /// messages are driven to.
 pub const REDRIVE_POLICY: &str = "RedrivePolicy";
@@ -656,22 +647,46 @@ pub fn next_count_cursor(start: usize, handed: usize, total: usize) -> Option<St
     (next < total).then(|| next.to_string())
 }
 
+/// How one listing states the reason it will not take the page size it was given.
+///
+/// The sentence is the listing's OWN: Amazon SQS words the same refusal differently per
+/// operation, so the call site names the wording it answers with rather than every
+/// listing sharing one. Neither form carries the rejected value — only the bounds that
+/// listing's `MaxResults` member publishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaxResultsWording {
+    /// "MaxResults must be an integer between <min> and <max>." — how the queue listings
+    /// state the range their `MaxResults` publishes ("Value range is 1 to 1000").
+    IntegerBetween,
+    /// "You must enter a number that's between <min> and <max>." — how the message-move
+    /// task listing states its own ("The upper limit is 10").
+    NumberBetween,
+}
+
 /// Why the value a listing's page-size parameter carried was refused, as the text of the
 /// refusal a caller has to fix the request from, or `None` when `requested` is inside the
 /// inclusive `(min, max)` that parameter publishes.
 ///
-/// One template for every listing of this service — `ListQueues`'
-/// [`LIST_QUEUES_MAX_RESULTS_RANGE`] and `ListMessageMoveTasks`' own documented upper
-/// limit — so two operations cannot drift on how they word the same refusal. The wording
-/// is how Amazon SQS words a parameter whose value it will not take: the value, the
-/// parameter it was given for, and the reason it was refused.
-pub fn max_results_refusal(parameter: &str, (min, max): (i32, i32), requested: i32) -> Option<String> {
+/// One place for the RULE — a page size outside the range its member publishes is refused
+/// rather than clamped — with `wording` choosing the sentence the listing answers with
+/// (see [`MaxResultsWording`]). The bounds in that sentence are the ones passed in, which
+/// are each parameter's documented range.
+pub fn max_results_refusal(
+    parameter: &str,
+    (min, max): (i32, i32),
+    requested: i32,
+    wording: MaxResultsWording,
+) -> Option<String> {
     (requested < min || requested > max).then(|| {
-        invalid_parameter_message(
-            &requested.to_string(),
-            parameter,
-            &format!("must be between {min} and {max}."),
-        )
+        let reason = match wording {
+            MaxResultsWording::IntegerBetween => {
+                format!("{parameter} must be an integer between {min} and {max}.")
+            }
+            MaxResultsWording::NumberBetween => {
+                format!("You must enter a number that's between {min} and {max}.")
+            }
+        };
+        invalid_parameter_message_without_value(parameter, &reason)
     })
 }
 
@@ -3349,6 +3364,46 @@ pub fn queue_name_refusal(name: &str, fifo: bool) -> Option<String> {
     })
 }
 
+/// How this service refuses a call that would create, change or remove a tag in the
+/// reserved [`RESERVED_TAG_KEY_PREFIX`] namespace: those tags belong to the provider, so
+/// the refusal is about who the caller is rather than about the key's form, and it names
+/// neither the key nor the operation.
+pub const SYSTEM_TAG_REFUSAL: &str = "Caller is an end user and not allowed to mutate system tags";
+
+/// Why a tag KEY a caller named is not one this service takes, as the text of the refusal
+/// a caller has to fix the request from, or `None` when the key is acceptable.
+///
+/// The rule holds wherever a request NAMES a tag key — the `tags` of a create, the `Tags`
+/// of a `TagQueue`, the `TagKeys` of an `UntagQueue` — so all of them refuse the same key
+/// the same way: a key of 1 to [`MAX_TAG_KEY_LENGTH`] characters, and no key in the
+/// reserved [`RESERVED_TAG_KEY_PREFIX`] namespace, which only the provider writes.
+///
+/// Each refusal STATES THE RULE and carries nothing of the request: the rejected key is
+/// not echoed back, and the bounds are the published ones rather than a measurement of
+/// what was supplied.
+pub fn tag_key_refusal(key: &str) -> Option<String> {
+    let length = key.chars().count();
+    if length == 0 || length > MAX_TAG_KEY_LENGTH {
+        return Some(format!(
+            "Tag keys must be between 1 and {MAX_TAG_KEY_LENGTH} characters in length."
+        ));
+    }
+    if is_reserved_tag_key(key) {
+        return Some(SYSTEM_TAG_REFUSAL.to_string());
+    }
+    None
+}
+
+/// Why a tag VALUE a caller supplied is not one this service takes, or `None` when the
+/// value is acceptable: a value carries up to [`MAX_TAG_VALUE_LENGTH`] characters and may
+/// be empty, so the rule the refusal states spans zero to that bound. Like
+/// [`tag_key_refusal`], it carries nothing of the request.
+pub fn tag_value_refusal(value: &str) -> Option<String> {
+    (value.chars().count() > MAX_TAG_VALUE_LENGTH).then(|| {
+        format!("Tag values must be between 0 and {MAX_TAG_VALUE_LENGTH} characters in length.")
+    })
+}
+
 /// Why a `tags` map a caller supplied was refused, as the text of the refusal a caller
 /// has to fix the request from, or `None` when the map is acceptable.
 ///
@@ -3370,37 +3425,11 @@ pub fn tag_refusal(
     let mut keys: Vec<&String> = supplied.keys().collect();
     keys.sort();
     for key in &keys {
-        // Each refusal is worded as Amazon SQS words a parameter whose value it will
-        // not take: the parameter it was given for, and the reason. The VALUE is named
-        // only where it is already known to be inside its length bound, so a refusal
-        // never echoes an unbounded string back to the caller.
-        let length = key.chars().count();
-        if length == 0 || length > MAX_TAG_KEY_LENGTH {
-            return Some(invalid_parameter_message_without_value(
-                "TagKey",
-                &format!(
-                    "must be between 1 and {MAX_TAG_KEY_LENGTH} characters long, but was {length}."
-                ),
-            ));
+        if let Some(why) = tag_key_refusal(key) {
+            return Some(why);
         }
-        if is_reserved_tag_key(key) {
-            return Some(invalid_parameter_message(
-                key,
-                "TagKey",
-                &format!(
-                    "must not start with the reserved prefix {RESERVED_TAG_KEY_PREFIX}."
-                ),
-            ));
-        }
-        let value_length = supplied[*key].chars().count();
-        if value_length > MAX_TAG_VALUE_LENGTH {
-            return Some(invalid_parameter_message_without_value(
-                "TagValue",
-                &format!(
-                    "the value of tag key {key} must be at most {MAX_TAG_VALUE_LENGTH} \
-                     characters long, but was {value_length}."
-                ),
-            ));
+        if let Some(why) = tag_value_refusal(&supplied[*key]) {
+            return Some(why);
         }
     }
     let merged: BTreeSet<&String> = existing.keys().chain(supplied.keys()).collect();
@@ -3424,11 +3453,16 @@ pub fn tag_refusal(
 ///
 /// `requested` is the attribute map the request would leave the queue with (the
 /// documented defaults overlaid with what it supplied), compared attribute by attribute
-/// in name order so a request differing in two is always refused for the same one.
-/// [`ATTRIBUTES_NOT_COMPARED_ON_RECREATE`] is left out of that comparison. `tags` is the
-/// tag map the request supplied, and `None` when it supplied no `tags` member at all:
-/// tags carry no default, so a request that supplies none includes nothing about them,
-/// while one that supplies them has to name the set the queue already holds.
+/// in name order so a request differing in two is always refused for the same one. EVERY
+/// settable attribute is part of that comparison, including the queue's access policy —
+/// see [`attribute_value_unchanged`] for how each one is compared. `tags` is the tag map
+/// the request supplied, and `None` when it supplied no `tags` member at all: tags carry
+/// no default, so a request that supplies none includes nothing about them, while one
+/// that supplies them has to name the set the queue already holds.
+///
+/// The two refusals are worded apart because a tag is not an attribute: an attribute
+/// conflict is repaired with `SetQueueAttributes` and a tag conflict with `TagQueue`, so a
+/// caller can tell them apart from the sentence alone.
 pub fn recreate_refusal(
     existing: &Queue,
     requested: &BTreeMap<String, String>,
@@ -3438,22 +3472,81 @@ pub fn recreate_refusal(
         .attributes
         .keys()
         .chain(requested.keys())
-        .filter(|name| !ATTRIBUTES_NOT_COMPARED_ON_RECREATE.contains(&name.as_str()))
         .collect();
     for name in compared {
-        if existing.attributes.get(name) != requested.get(name) {
+        if !attribute_value_unchanged(
+            name,
+            existing.attributes.get(name).map(String::as_str),
+            requested.get(name).map(String::as_str),
+        ) {
             return Some(format!(
                 "A queue already exists with the same name and a different value for attribute {name}"
             ));
         }
     }
     if tags.is_some_and(|supplied| *supplied != existing.tags) {
-        return Some(
-            "A queue already exists with the same name and a different value for attribute Tags"
-                .to_string(),
-        );
+        return Some(RECREATE_TAGS_CONFLICT_MESSAGE.to_string());
     }
     None
+}
+
+/// How `CreateQueue` states that a re-create of an existing name supplied a different TAG
+/// SET. Fixed text that names no attribute, because tags are not one, and carries nothing
+/// of the request or of the queue.
+pub const RECREATE_TAGS_CONFLICT_MESSAGE: &str =
+    "A queue already exists with the same name and a different value for tags ";
+
+/// Whether the value a re-create supplies for attribute `name` is the one the queue
+/// already carries, each side `None` where that side carries the attribute at all.
+///
+/// Every attribute is compared on its VALUE, which for all but one of them is the string
+/// it is stored as. The access policy is a JSON document, so it is compared on what it
+/// GRANTS: two documents saying the same thing about the same principals, actions and
+/// resources are the same policy however they are spelled, and a statement's `Sid` is not
+/// part of it, since an id names a statement without changing who may do what. A `Policy`
+/// value that is not a JSON document at all cannot be read that way and is compared
+/// verbatim.
+fn attribute_value_unchanged(name: &str, existing: Option<&str>, requested: Option<&str>) -> bool {
+    match (name, existing, requested) {
+        (POLICY, Some(existing), Some(requested)) => {
+            match (comparable_policy(existing), comparable_policy(requested)) {
+                (Some(existing), Some(requested)) => existing == requested,
+                _ => existing == requested,
+            }
+        }
+        _ => existing == requested,
+    }
+}
+
+/// A policy document as the content a comparison is about: its members with `Statement`
+/// normalised to a list — "an array of individual statements", and the policy language
+/// takes a lone statement object too — and each statement's `Sid` dropped. `None` for a
+/// value that is not a JSON object, which is not a policy document and carries no
+/// statements to compare.
+fn comparable_policy(policy: &str) -> Option<::serde_json::Value> {
+    let mut document = match ::serde_json::from_str(policy) {
+        Ok(::serde_json::Value::Object(members)) => members,
+        _ => return None,
+    };
+    let statements = match document.get(POLICY_STATEMENT_MEMBER) {
+        Some(::serde_json::Value::Array(statements)) => statements.clone(),
+        Some(statement @ ::serde_json::Value::Object(_)) => vec![statement.clone()],
+        _ => Vec::new(),
+    };
+    let statements: Vec<::serde_json::Value> = statements
+        .into_iter()
+        .map(|mut statement| {
+            if let ::serde_json::Value::Object(members) = &mut statement {
+                members.remove(POLICY_SID_MEMBER);
+            }
+            statement
+        })
+        .collect();
+    document.insert(
+        POLICY_STATEMENT_MEMBER.to_string(),
+        ::serde_json::Value::Array(statements),
+    );
+    Some(::serde_json::Value::Object(document))
 }
 
 /// The region a request is scoped to: the one its SigV4 credential scope names, or

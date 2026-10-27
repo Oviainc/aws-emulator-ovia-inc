@@ -36,6 +36,12 @@
 //! same rule `create_approval_team.rs` and `tag_resource.rs` hold: such a key is AWS's,
 //! not the caller's, so no path that writes tags writes one.
 //!
+//! `IdentitySourceParameters.IamIdentityCenter.Region` names the Region the IAM Identity
+//! Center instance is located in, and the member is a plain string the constraint
+//! boundary cannot hold to a value set, so a value naming no Region
+//! ([`crate::state::is_aws_region`]) earns `ValidationException` (400) here and nothing
+//! is stored — the store never keeps a Region no AWS endpoint has.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -257,6 +263,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let source_type = crate::state::IdentitySourceType::IamIdentityCenter;
+
+        // `IamIdentityCenter$Region` names the Amazon Web Services Region the IAM
+        // Identity Center instance is located in, so it has to name a Region that
+        // exists: the member is a plain string with only a length bound, so the
+        // constraint boundary cannot decide it and the store would otherwise keep — and
+        // later report — a value that names no Region at all. The source is refused with
+        // the `ValidationException` (400) the operation declares before anything is
+        // written.
+        if !crate::state::is_aws_region(&parameters.region) {
+            return Err(CreateIdentitySourceErrorModeled::ValidationException(
+                crate::state::invalid_region("Region", &parameters.region),
+            )
+            .into());
+        }
 
         // The store is bounded, so a caller looping on create cannot grow this process's
         // memory without end. The model declares `ServiceQuotaExceededException` for

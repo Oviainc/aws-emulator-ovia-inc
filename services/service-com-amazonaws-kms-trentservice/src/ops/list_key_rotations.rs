@@ -300,6 +300,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ([`crate::state::ImportedKeyMaterial`]) and are absent for material KMS
         // generated.
         let external = key.origin == crate::state::ORIGIN_EXTERNAL;
+        // The rotations this key has had, which includes one the clock has completed
+        // but the record does not hold yet ([`crate::state::Cmk::reported_rotations`]).
+        let rotations = key.reported_rotations();
         let mut listed: Vec<RotationsListEntry> = Vec::new();
         if include_first_material {
             let first_key_material_id = key.first_key_material_id();
@@ -309,7 +312,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let imported = key
                 .imported_material
                 .as_ref()
-                .filter(|_| external && key.rotations.is_empty());
+                .filter(|_| external && rotations.is_empty());
             listed.push(RotationsListEntry {
                 key_id: Some(key.key_id.clone()),
                 key_material_state: Some(material_state(key, first_key_material_id.as_deref())),
@@ -337,7 +340,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 rotation_type: None,
             });
         }
-        listed.extend(key.rotations.iter().map(|rotation| {
+        listed.extend(rotations.iter().map(|rotation| {
             // A rotation onto material a CALLER supplied carries what the caller stated
             // about it; one onto material KMS generated has nothing to state.
             let imported = rotation.imported.as_ref().filter(|_| external);
@@ -396,7 +399,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     Some(position) => position + 1,
                     None => {
                         return Err(ListKeyRotationsErrorModeled::InvalidMarkerException(
-                            InvalidMarkerException { message: None },
+                            InvalidMarkerException {
+                                message: crate::state::invalid_marker_message(),
+                            },
                         )
                         .into());
                     }
@@ -439,7 +444,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// and NON_CURRENT key material only for decryption"
 /// (`smithy_query(query="shape",shape="RotationsListEntry")`).
 fn material_state(key: &crate::state::Cmk, key_material_id: Option<&str>) -> String {
-    if key_material_id.is_some() && key_material_id == key.current_key_material_id.as_deref() {
+    if key_material_id.is_some() && key_material_id == key.reported_key_material_id().as_deref() {
         KEY_MATERIAL_STATE_CURRENT.to_string()
     } else {
         KEY_MATERIAL_STATE_NON_CURRENT.to_string()

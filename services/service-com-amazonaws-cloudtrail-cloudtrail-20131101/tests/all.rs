@@ -167,3 +167,8 @@ mod page_size_and_query_id_refusals;
 // what the clock owes the store it brings back, and how it refuses an identifier.
 #[path = "all/event_data_store_restore.rs"]
 mod event_data_store_restore;
+// `dashboard_update_status` pins the `DashboardStatus` a write leaves a dashboard in:
+// the status an accepted update reports from the moment it returns, and that a read or
+// a refusal moves none.
+#[path = "all/dashboard_update_status.rs"]
+mod dashboard_update_status;

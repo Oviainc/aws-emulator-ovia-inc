@@ -20,10 +20,11 @@
 //! exactly as `KeyMetadata` carries them, so `DescribeKey` and this operation cannot
 //! disagree about what a key supports.
 //!
-//! `GrantTokens` is treated as every other cryptographic operation in this service
-//! treats it: a presented token is the only permission a handler here can judge,
-//! because there is no caller identity to evaluate a key policy or an IAM policy
-//! against.
+//! Permission is judged as it is for every other cryptographic operation in this
+//! service, through the service's one authorization decision
+//! ([`crate::state::authorization`]): the key policy, the calling principal's identity
+//! policies and the grants in force, with the presented-token divergence
+//! [`crate::state::authorization::authorize`] records.
 //!
 //! ## Shape of an operation
 //!
@@ -267,6 +268,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(internal("the KMS state store is unavailable"));
         };
 
+        // Who the request speaks for, resolved BEFORE this service's store is locked, so
+        // the IAM and STS stores the resolution reads are never reached while this
+        // service's guard is held.
+        let caller = crate::state::authorization::caller(&*self.engine, ctx);
         let region = crate::state::request_region(ctx);
         let state = state.lock();
 
@@ -323,34 +328,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The permission a request draws from a grant is exactly what that grant
-        // carries: the grant is on THIS key and it permits this operation. A token
-        // that is not one this service minted names no grant at all, so the TOKEN "is
-        // not valid". A request presenting no grant token is not asking to be
-        // authorized by a grant and is not judged here.
-        if !tokens.is_empty() {
-            let named = match state.grants_for_tokens(&region, &tokens) {
-                Ok(named) => named,
-                Err(crate::state::GrantRefusal::MalformedToken) => {
-                    return Err(GetPublicKeyErrorModeled::InvalidGrantTokenException(
-                        InvalidGrantTokenException {
-                            message: Some("The specified grant token is not valid.".to_string()),
-                        },
-                    )
-                    .into());
-                }
-                Err(crate::state::GrantRefusal::NotAuthorized) => Vec::new(),
-            };
-            // `GetPublicKey` takes no `EncryptionContext`, so no encryption-context
-            // grant constraint applies to it.
-            let permitted = named
-                .iter()
-                .any(|grant| grant.permits(&key.key_id, Self::NAME, None));
-            if !permitted {
-                return Err(crate::scaffolded::Scaffolded::access_denied(
-                    crate::state::grant_access_denied_message(Self::NAME, &key.arn),
-                ));
+        // A token that is not one this service minted names no grant at all, so the
+        // TOKEN "is not valid". Everything else about permission is the service's one
+        // authorization decision (`crate::state::authorization`): the key's own key
+        // policy, the calling principal's identity policies, and the grants on this key
+        // the caller holds or presented a token for, judged together. `GetPublicKey`
+        // takes no `EncryptionContext`, so no encryption-context grant constraint
+        // applies to it.
+        let named = match state.grants_for_tokens(&region, &tokens) {
+            Ok(named) => named,
+            Err(crate::state::GrantRefusal::MalformedToken) => {
+                return Err(GetPublicKeyErrorModeled::InvalidGrantTokenException(
+                    InvalidGrantTokenException {
+                        message: Some("The specified grant token is not valid.".to_string()),
+                    },
+                )
+                .into());
             }
+            // Every token is well formed but names a grant the store no longer holds,
+            // which carries no permission; what else the caller holds is judged below.
+            Err(crate::state::GrantRefusal::NotAuthorized) => Vec::new(),
+        };
+        let presented = (!tokens.is_empty()).then_some(named.as_slice());
+        if let Err(message) = crate::state::authorization::authorize(
+            &caller,
+            &state,
+            &region,
+            key,
+            Self::NAME,
+            None,
+            presented,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(message));
         }
 
         // "Valid values for asymmetric key pairs are ENCRYPT_DECRYPT, SIGN_VERIFY, and

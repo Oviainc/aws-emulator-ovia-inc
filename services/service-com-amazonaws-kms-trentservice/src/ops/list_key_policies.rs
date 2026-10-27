@@ -195,15 +195,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::KeyRef::UnauthorizedAccount => {
                 return Err(crate::state::unauthorized_account(Self::NAME));
             }
-            crate::state::KeyRef::MalformedArn => {
-                return Err(ListKeyPoliciesErrorModeled::InvalidArnException(
-                    InvalidArnException {
-                        message: Some(crate::state::invalid_arn_message(&input.key_id)),
-                    },
-                )
-                .into());
-            }
-            crate::state::KeyRef::NotFound => {
+            // This listing reports an identifier it cannot resolve as a resource that
+            // does not exist, whatever is wrong with the identifier: it answers "the key
+            // policies attached to a KMS key", and with no such key there are none to
+            // list. That is the refusal the recording carries for an unresolvable but
+            // account-scoped identifier, and the message still says what was wrong with
+            // the identifier ([`crate::state::key_not_found_message`]). The modelled
+            // `InvalidArnException` is therefore unreachable from this handler: a
+            // cross-account ARN is refused by the account check above, and every other
+            // identifier this operation cannot resolve is a key that is not there.
+            crate::state::KeyRef::MalformedArn | crate::state::KeyRef::NotFound => {
                 return Err(ListKeyPoliciesErrorModeled::NotFoundException(
                     NotFoundException {
                         message: Some(crate::state::key_not_found_message(&region, &input.key_id)),

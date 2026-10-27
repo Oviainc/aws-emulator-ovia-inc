@@ -32,7 +32,7 @@ use crate::wire::{call, error_code, error_message, medialive};
 ///
 /// `settings` is `None` for the request that carries no
 /// `MultiplexProgramSettings` at all, which the model makes optional.
-async fn update_program(
+pub(crate) async fn update_program(
     router: &MultiServiceRouter,
     multiplex_id: &str,
     program_name: &str,

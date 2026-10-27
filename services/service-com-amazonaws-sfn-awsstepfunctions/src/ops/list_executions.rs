@@ -2,7 +2,9 @@
 
 //! @op ListExecutions
 //! IMPLEMENTED: a REPORTING operation. It pages the Execution records
-//! `StartExecution` stored for one state machine, most recent first.
+//! `StartExecution` stored for one state machine, most recent first — or, for a
+//! request naming a Map Run, the child workflow executions that Map Run's own
+//! Distributed Map items ran as.
 //!
 //! A request this operation cannot serve is refused with one of the operation's own
 //! modelled errors; it never answers 501.
@@ -222,12 +224,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 // The page token is judged on this branch too, so one request is
                 // refused for the same defect whichever selector it names.
-                if crate::state::page_offset(input.next_token.as_deref()).is_none() {
+                let Some(offset) = crate::state::page_offset(input.next_token.as_deref()) else {
                     return Err(ListExecutionsErrorModeled::InvalidToken(InvalidToken {
                         message: Some(crate::state::invalid_token_message()),
                     })
                     .into());
-                }
+                };
                 let mut store = state.lock();
                 store.settle(crate::state::now());
                 if !store.map_runs.contains_key(map_run) {
@@ -239,16 +241,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                     .into());
                 }
-                // A Map Run that EXISTS reports the child workflow executions it
-                // started. This emulator interprets a Distributed Map's items in the
-                // parent execution's own walk rather than starting child executions,
-                // so the store holds no execution RECORD that names a map run and
-                // this page is empty — `DescribeMapRun` counts the items that ran,
-                // which is what this emulator does know about them. The child
-                // execution records are their own issue's work.
+                // "If the mapRunArn field is specified, a list of all of the child
+                // workflow executions started by a Map Run is returned": the
+                // executions that Map Run's own items ran as, which the store indexes
+                // under it, most recent first and filtered exactly as a state
+                // machine's own listing is.
+                let matching: Vec<&crate::state::Execution> = store
+                    .child_executions_newest_first(map_run)
+                    .into_iter()
+                    .filter(|child| {
+                        input
+                            .status_filter
+                            .as_deref()
+                            .is_none_or(|status| child.status == status)
+                            && match input.redrive_filter.as_deref() {
+                                Some("REDRIVEN") => child.redrive_count > 0,
+                                Some("NOT_REDRIVEN") => child.redrive_count == 0,
+                                _ => true,
+                            }
+                    })
+                    .collect();
+                let executions: Vec<ExecutionListItem> = matching
+                    .iter()
+                    .skip(offset)
+                    .take(crate::state::page_size(input.max_results))
+                    .map(|child| list_item(child, Some(map_run)))
+                    .collect();
+                let next_token =
+                    crate::state::next_page_token(offset, executions.len(), matching.len());
                 return Ok(ListExecutionsOutput {
-                    executions: Vec::new(),
-                    next_token: None,
+                    executions,
+                    next_token,
                 });
             }
             (None, None) => {
@@ -377,23 +400,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .iter()
             .skip(offset)
             .take(page)
-            .map(|execution| ExecutionListItem {
-                execution_arn: execution.arn.clone(),
-                state_machine_arn: execution.state_machine_arn.clone(),
-                name: execution.name.clone(),
-                status: execution.status.clone(),
-                start_date: crate::state::to_date_time(execution.start_date),
-                stop_date: execution.stop_date.map(crate::state::to_date_time),
-                map_run_arn: None,
-                item_count: None,
-                // The alias and version the start was made through, from the
-                // execution's own record — the same attribution `DescribeExecution`
-                // reports.
-                state_machine_version_arn: execution.state_machine_version_arn.clone(),
-                state_machine_alias_arn: execution.state_machine_alias_arn.clone(),
-                redrive_count: Some(execution.redrive_count),
-                redrive_date: execution.redrive_date.map(crate::state::to_date_time),
-            })
+            .map(|execution| list_item(execution, None))
             .collect();
 
         let next_token =
@@ -402,5 +409,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             executions,
             next_token,
         })
+    }
+}
+
+/// One listed execution.
+///
+/// `map_run` is the Map Run the request asked for, when it asked for one: `mapRunArn`
+/// "is returned only if mapRunArn was specified in the ListExecutions API action. If
+/// stateMachineArn was specified [...] the mapRunArn isn't returned", and `itemCount`
+/// — "the total number of items processed in a child workflow execution" — is
+/// reported under exactly the same condition.
+fn list_item(execution: &crate::state::Execution, map_run: Option<&str>) -> ExecutionListItem {
+    ExecutionListItem {
+        execution_arn: execution.arn.clone(),
+        state_machine_arn: execution.state_machine_arn.clone(),
+        name: execution.name.clone(),
+        status: execution.status.clone(),
+        start_date: crate::state::to_date_time(execution.start_date),
+        stop_date: execution.stop_date.map(crate::state::to_date_time),
+        map_run_arn: map_run.map(str::to_string),
+        item_count: map_run.and(execution.item_count),
+        // The alias and version the start was made through, from the execution's own
+        // record — the same attribution `DescribeExecution` reports.
+        state_machine_version_arn: execution.state_machine_version_arn.clone(),
+        state_machine_alias_arn: execution.state_machine_alias_arn.clone(),
+        redrive_count: Some(execution.redrive_count),
+        redrive_date: execution.redrive_date.map(crate::state::to_date_time),
     }
 }
