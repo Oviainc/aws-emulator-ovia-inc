@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteWorkloadShare
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteWorkloadShare`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteWorkloadShare::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +170,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteWorkloadShare` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteWorkloadShareErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteWorkloadShareErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool workload store is unavailable".to_string(),
+            })
+        })?;
+
+        // `ClientRequestToken` is `@idempotencyToken`, and the rule it documents holds here
+        // exactly as it does for `DeleteProfileShare` and `DeleteTemplateShare`: a retry
+        // under the same token and the same parameters, after the original request completed
+        // successfully, replays that request's result. The parameters besides the token are
+        // the workload the share belongs to and the share itself, so the fingerprint is over
+        // those two.
+        let fingerprint = crate::state::parameter_fingerprint(&serde_json::json!({
+            "WorkloadId": &input.workload_id,
+            "ShareId": &input.share_id,
+        }));
+
+        let mut store = state.lock();
+
+        // Read before the workload and the share are resolved: the original request removed
+        // the share, so neither resolves to it any more and only the recorded delete can
+        // answer the retry.
+        match crate::state::delete_replay(
+            &store.delete_workload_share_tokens,
+            &input.client_request_token,
+            crate::state::WORKLOAD_SHARE_RESOURCE_TYPE,
+            &fingerprint,
+        ) {
+            crate::state::DeleteReplay::Replay => return Ok(DeleteWorkloadShareOutput),
+            crate::state::DeleteReplay::Conflict(exception) => {
+                return Err(DeleteWorkloadShareErrorModeled::ConflictException(exception).into())
+            }
+            crate::state::DeleteReplay::Fresh => {}
+        }
+
+        // The share belongs to the workload the request names, so that workload has to
+        // resolve first — through the same lookup `GetWorkload` and `UpdateWorkloadShare`
+        // resolve a `WorkloadId` through. A workload that does not resolve holds no shares,
+        // so what is missing is the WORKLOAD; only once it resolves can a `ShareId` be
+        // reported as the missing share.
+        if !store.workloads.contains_key(&input.workload_id) {
+            return Err(DeleteWorkloadShareErrorModeled::ResourceNotFoundException(
+                crate::state::workload_not_found(&input.workload_id),
+            )
+            .into());
+        }
+
+        // What the delete removes is the SHARE, and nothing about the workload itself: the
+        // workload stays exactly as it was, and so does every OTHER share of it. The
+        // invitation the share raised is derived from the share, so withdrawing the grant
+        // withdraws the invitation with it.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteWorkloadShare"))
+        // The share is resolved within the workload that holds it, so a `ShareId` belonging
+        // to another workload — or to a workload that holds no shares — is as absent here as
+        // one belonging to no share.
+        if store
+            .remove_workload_share(&input.workload_id, &input.share_id)
+            .is_none()
+        {
+            return Err(DeleteWorkloadShareErrorModeled::ResourceNotFoundException(
+                crate::state::workload_share_not_found(&input.workload_id, &input.share_id),
+            )
+            .into());
+        }
+
+        // Recorded only now the delete has COMPLETED SUCCESSFULLY, as the sibling deletes
+        // record theirs: a refused request has no result to replay, so the token it carried
+        // is still free. The share is named by its own `ShareId`, which is what a token
+        // spent on another share reports in its conflict.
+        store.delete_workload_share_tokens.remember(
+            input.client_request_token,
+            crate::state::CompletedDeleteToken {
+                resource_id: input.share_id,
+                fingerprint,
+            },
+        );
+
+        Ok(DeleteWorkloadShareOutput)
     }
 }

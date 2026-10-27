@@ -99,6 +99,8 @@ mod listing_optional_members;
 mod multipart_part_upload;
 #[path = "all/multipart_upload_abort.rs"]
 mod multipart_upload_abort;
+#[path = "all/multipart_upload_completion.rs"]
+mod multipart_upload_completion;
 #[path = "all/multipart_upload_initiation.rs"]
 mod multipart_upload_initiation;
 #[path = "all/multipart_upload_listing.rs"]

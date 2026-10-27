@@ -322,28 +322,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let kind = match requested_kind {
             // Exactly one packaging configuration is stored at a time, so the one the
             // request names REPLACES the stored set rather than merging into it. The CMAF
-            // parameter shape is materialised by the same function the create uses, so an
-            // updated CMAF package carries the derived child-manifest URLs, the documented
-            // `SegmentPrefix` default and the endpoint `ManifestName` an unnamed child
-            // inherits.
+            // package is stored as what the service derives from the parameters the request
+            // sent, so those parameters are what the record takes; the package itself is
+            // re-derived from them below, with the endpoint's effective `ManifestName`.
             Some(kind) => {
                 record.hls_package = input.hls_package.take();
                 record.dash_package = input.dash_package.take();
                 record.mss_package = input.mss_package.take();
-                record.cmaf_package = input.cmaf_package.as_ref().map(|params| {
-                    crate::state::stored_cmaf_package(
-                        params,
-                        &region,
-                        &channel_id,
-                        &id,
-                        &manifest_name,
-                    )
-                });
+                record.cmaf_package_parameters = input.cmaf_package.take();
                 kind
             }
             // An endpoint always packages its channel in exactly one format, so a request
             // that names no packaging configuration leaves the stored one in place: no
-            // request can leave an endpoint with nothing to package.
+            // request can leave an endpoint with nothing to package. The parameters it was
+            // stored with are left in place too, so the children this update still has to
+            // re-derive below are derived from what their own write sent.
             None => match record.packaging_kind() {
                 Some(kind) => kind,
                 // Unreachable: a create stores exactly one packaging configuration.
@@ -373,6 +366,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // whenever it or the packaging format changes.
         record.url = crate::state::playback_url(&region, &channel_id, &id, &manifest_name, kind);
         record.manifest_name = Some(manifest_name);
+        // The children of a CMAF package are derived from that same effective
+        // `ManifestName` — an unnamed child IS the endpoint's manifest name, and every
+        // child's playback URL is built from the name it carries — so they are re-derived
+        // from the parameters the package was stored with on EVERY update, whether or not
+        // this request resent a packaging configuration: an update that moves the
+        // endpoint's name must not leave a child naming the path the endpoint no longer
+        // serves.
+        crate::state::rederive_cmaf_package(record);
 
         // An update is a write of the endpoint, so it is server-filled exactly as a create
         // is: every optional configuration member this request left unset takes that

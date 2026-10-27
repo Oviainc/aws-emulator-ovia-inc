@@ -240,6 +240,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // How long Recycle Bin can retain a deleted resource depends on WHAT it retains,
+        // and the modelled `@range` on the period is the union over every resource type,
+        // so a period inside that range can still be one the requested type does not
+        // support. The request always names the type ([`ResourceType`] is required), so
+        // the per-type bound is read off it and a period past it is refused before
+        // anything is minted.
+        if let Some(refusal) = crate::state::retention_period_unsupported(
+            &input.resource_type,
+            &input.retention_period,
+        ) {
+            return Err(CreateRuleErrorModeled::ValidationException(refusal).into());
+        }
 
         let region = crate::state::request_region(ctx.parts());
         // A rule holds at most one tag per key, so the request's tags are assigned the

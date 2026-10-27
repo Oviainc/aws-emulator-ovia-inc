@@ -292,7 +292,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `MAX_TAGS_PER_TABLE` tags, and no key in the reserved `aws:` namespace.
         let requested_tags: &[Tag] = input.tags.as_deref().unwrap_or_default();
         if requested_tags.len() > crate::state::MAX_TAGS_PER_TABLE {
-            return Err(too_many_tags(requested_tags.len()));
+            return Err(too_many_tags());
         }
         let tags = crate::state::tag_set_from_request(requested_tags).map_err(lift)?;
 
@@ -313,9 +313,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // type is resolved before anything is stored, so a specification that cannot
         // hold together refuses the whole create.
         let stream_view_type = match input.stream_specification.as_ref() {
-            Some(specification) => crate::state::stream_view_type(specification)
-                .map_err(lift)?
-                .map(str::to_string),
+            Some(specification) => crate::state::stream_view_type(
+                specification,
+                crate::state::STREAM_VIEW_TYPE_REQUIRED,
+            )
+            .map_err(lift)?
+            .map(str::to_string),
             None => None,
         };
         let (billing_mode, provisioned_throughput) = validated_throughput(&input).map_err(lift)?;
@@ -360,6 +363,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             &name,
             now,
+        )
+        .map_err(lift)?;
+        // The projection budget is summed across EVERY secondary index of the table,
+        // so it can only be checked once all of them are known.
+        crate::state::check_projection_budget(
+            global_secondary_indexes
+                .iter()
+                .map(|index| &index.projection)
+                .chain(
+                    local_secondary_indexes
+                        .iter()
+                        .map(|index| &index.projection),
+                ),
         )
         .map_err(lift)?;
 
@@ -564,16 +580,17 @@ fn lift(error: crate::state::RequestError) -> CreateTableError {
     crate::scaffolded::Scaffolded::validation(error.message())
 }
 
-/// The modelled limit error for a create carrying more tags than a table may hold:
-/// "You can add up to 50 tags to a single DynamoDB table" (the `Tag` doc).
-fn too_many_tags(requested: usize) -> CreateTableError {
-    CreateTableErrorModeled::LimitExceededException(LimitExceededException {
-        message: Some(format!(
-            "Subscriber limit exceeded: a table may carry at most {} tags, got {requested}",
-            crate::state::MAX_TAGS_PER_TABLE
-        )),
-    })
-    .into()
+/// The refusal for a create carrying more tags than a table may hold: "You can add up
+/// to 50 tags to a single DynamoDB table" (the `Tag` doc).
+///
+/// A `ValidationException`, for the same reason `TagResource` answers one: the tag count
+/// bounds the REQUEST's own members, so a call past it is wrong rather than throttled.
+/// The sentence names the member the tags were counted for — here the table being
+/// created, which is what this request addresses instead of a `ResourceArn`.
+fn too_many_tags() -> CreateTableError {
+    crate::scaffolded::Scaffolded::validation(
+        "Number of Tags exceed the current limit for the provided TableName",
+    )
 }
 
 /// Lift a refusal of the `ResourcePolicy` document into this operation's error
@@ -821,9 +838,9 @@ fn validated_key_schema(
             .iter()
             .find(|definition| definition.attribute_name == name)
         else {
-            return Err(crate::state::RequestError::Validation(format!(
-                "Invalid KeySchema: no AttributeDefinition was provided for key attribute {name}"
-            )));
+            return Err(crate::state::RequestError::Validation(
+                UNDEFINED_TABLE_KEY_MESSAGE.to_string(),
+            ));
         };
         if !matches!(definition.attribute_type.as_str(), "S" | "N" | "B") {
             return Err(crate::state::RequestError::Validation(format!(
@@ -1130,10 +1147,19 @@ pub(crate) fn validated_index_key_schema(
             .iter()
             .find(|definition| definition.attribute_name == name)
         else {
-            return Err(crate::state::RequestError::Validation(format!(
-                "Invalid KeySchema for index {index_name}: no AttributeDefinition was provided \
-                 for key attribute {name}"
-            )));
+            // Every key attribute with no definition is named, not just the first:
+            // AWS states both sides of the mismatch so the caller can see which list
+            // to extend.
+            let missing: Vec<&str> = key_schema
+                .iter()
+                .map(|element| element.attribute_name.as_str())
+                .filter(|name| {
+                    !definitions
+                        .iter()
+                        .any(|definition| definition.attribute_name == *name)
+                })
+                .collect();
+            return Err(undefined_index_keys(&missing, definitions));
         };
         if !matches!(definition.attribute_type.as_str(), "S" | "N" | "B") {
             return Err(crate::state::RequestError::Validation(format!(
@@ -1172,6 +1198,31 @@ pub(crate) fn validated_projection(
     Ok(())
 }
 
+/// AWS's fixed text for a TABLE whose own `KeySchema` names an attribute
+/// `AttributeDefinitions` does not declare — "The attributes in KeySchema must also be
+/// defined in the AttributeDefinitions array" (`CreateTable$KeySchema`).
+pub(crate) const UNDEFINED_TABLE_KEY_MESSAGE: &str =
+    "Invalid KeySchema: Some index key attribute have no definition";
+
+/// The refusal for SECONDARY-INDEX key attributes `AttributeDefinitions` does not
+/// declare: AWS's parameter-value template, naming every key attribute that has no
+/// definition and the attribute names the request did define.
+pub(crate) fn undefined_index_keys(
+    missing: &[&str],
+    definitions: &[AttributeDefinition],
+) -> crate::state::RequestError {
+    let defined: Vec<&str> = definitions
+        .iter()
+        .map(|definition| definition.attribute_name.as_str())
+        .collect();
+    crate::state::RequestError::Validation(format!(
+        "One or more parameter values were invalid: Some index key attributes are not defined \
+         in AttributeDefinitions. Keys: [{}], AttributeDefinitions: [{}]",
+        missing.join(", "),
+        defined.join(", ")
+    ))
+}
+
 /// One index's provisioned throughput, held to the table's billing mode: a
 /// `PROVISIONED` table's index must carry one (with both dimensions at least 1), and a
 /// `PAY_PER_REQUEST` table's index must not.
@@ -1183,8 +1234,9 @@ pub(crate) fn validated_index_throughput(
     match (billing_mode, throughput) {
         ("PAY_PER_REQUEST", None) => Ok(None),
         ("PAY_PER_REQUEST", Some(_)) => Err(crate::state::RequestError::Validation(format!(
-            "ProvisionedThroughput cannot be specified for index {index_name} when BillingMode \
-             is PAY_PER_REQUEST"
+            "One or more parameter values were invalid: Neither ReadCapacityUnits nor \
+             WriteCapacityUnits can be specified when BillingMode is PAY_PER_REQUEST for \
+             index: {index_name}"
         ))),
         (_, Some(throughput)) => {
             if throughput.read_capacity_units < 1 || throughput.write_capacity_units < 1 {
@@ -1197,8 +1249,8 @@ pub(crate) fn validated_index_throughput(
             Ok(Some(throughput))
         }
         (_, None) => Err(crate::state::RequestError::Validation(format!(
-            "ProvisionedThroughput must be specified for index {index_name} when BillingMode is \
-             PROVISIONED"
+            "One or more parameter values were invalid: Both ReadCapacityUnits and \
+             WriteCapacityUnits must be specified for index: {index_name}"
         ))),
     }
 }
@@ -1217,7 +1269,8 @@ fn validated_throughput(
     match (billing_mode.as_str(), input.provisioned_throughput.clone()) {
         ("PAY_PER_REQUEST", None) => Ok((billing_mode, None)),
         ("PAY_PER_REQUEST", Some(_)) => Err(crate::state::RequestError::Validation(
-            "ProvisionedThroughput cannot be specified when BillingMode is PAY_PER_REQUEST"
+            "One or more parameter values were invalid: Neither ReadCapacityUnits nor \
+             WriteCapacityUnits can be specified when BillingMode is PAY_PER_REQUEST"
                 .to_string(),
         )),
         ("PROVISIONED", Some(throughput)) => {
@@ -1231,7 +1284,9 @@ fn validated_throughput(
             Ok((billing_mode, Some(throughput)))
         }
         ("PROVISIONED", None) => Err(crate::state::RequestError::Validation(
-            "ProvisionedThroughput must be specified when BillingMode is PROVISIONED".to_string(),
+            "One or more parameter values were invalid: Both ReadCapacityUnits and \
+             WriteCapacityUnits must be specified when BillingMode is PROVISIONED"
+                .to_string(),
         )),
         (other, _) => Err(crate::state::RequestError::Validation(format!(
             "Invalid BillingMode: {other} must be PROVISIONED or PAY_PER_REQUEST"

@@ -158,7 +158,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(stored) = store.api_destination(&input.name).cloned() else {
             return Err(DescribeApiDestinationErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Api destination {} does not exist.", input.name)),
+                    message: Some(crate::state::no_such_api_destination(
+                        "describe",
+                        &input.name,
+                    )),
                 },
             )
             .into());

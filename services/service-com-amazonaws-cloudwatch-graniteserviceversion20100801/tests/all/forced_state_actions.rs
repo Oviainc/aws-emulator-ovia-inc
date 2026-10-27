@@ -20,7 +20,7 @@
 use serde_json::{json, Value};
 
 use crate::harness::{
-    element, emulator, rpc_in_region, sns_in_region, Emulator, PAST_EVALUATION_DELAY,
+    element, emulator, now_secs, rpc_in_region, sns_in_region, Emulator, PAST_EVALUATION_DELAY,
 };
 
 /// The CloudWatch target prefix, for `rpc_in_region`.
@@ -129,7 +129,7 @@ fn alarm_request(name: &str, state: &str, topic: &str) -> Value {
         "Namespace": "Custom/ForcedState",
         "MetricName": "Errors",
         "Statistic": "Average",
-        "Period": 60,
+        "Period": PERIOD_SECS,
         "EvaluationPeriods": 1,
         "Threshold": 1.0,
         "ComparisonOperator": "GreaterThanThreshold",
@@ -223,14 +223,41 @@ async fn reported_state(emulator: &Emulator, region: &str, name: &str) -> String
         .to_string()
 }
 
-/// Wait until every evaluation started before now is due, so the evaluation has taken back
-/// whatever a caller forced.
+/// Publish one datapoint of the series the alarm watches, stamped far enough in the past to
+/// fall outside the alarm's evaluation range, and wait for the evaluation it makes due.
 ///
-/// A thread sleep rather than `tokio::time::sleep`: this workspace enables tokio's `macros`,
-/// `rt` and `rt-multi-thread` features only, so there is no timer driver to await on.
-fn wait_past_the_forced_span() {
+/// An alarm's evaluation is owed from the arrival of the data it grades, so the datapoint is
+/// what brings the next evaluation forward and takes the forced state back — the alarm
+/// "returns to [its] actual state quickly, often within seconds" (`SetAlarmState`). The
+/// datapoint is older than the look-back this alarm evaluates (one period of
+/// `PERIOD_SECS`), so the state that evaluation computes is the data-less
+/// `INSUFFICIENT_DATA` rather than one this datapoint's value decided.
+async fn reclaim_the_forced_state(emulator: &Emulator, region: &str) {
+    cw(
+        emulator,
+        region,
+        "PutMetricData",
+        &json!({
+            "Namespace": "Custom/ForcedState",
+            "MetricData": [{
+                "MetricName": "Errors",
+                "Value": 0.0,
+                "Timestamp": now_secs() - STALE_DATAPOINT_AGE_SECS,
+            }],
+        }),
+    )
+    .await;
     std::thread::sleep(PAST_EVALUATION_DELAY);
 }
+
+/// How far before now the datapoint [`reclaim_the_forced_state`] publishes is stamped: well
+/// past the evaluation range of an alarm of [`PERIOD_SECS`] and one evaluation period, and
+/// well inside the two weeks `PutMetricData` accepts.
+const STALE_DATAPOINT_AGE_SECS: f64 = 3_600.0;
+
+/// The period every alarm in this suite evaluates, in seconds — the span a state forced on it
+/// stands for, being the alarm's next evaluation.
+const PERIOD_SECS: u32 = 60;
 
 /// The runtime flavour the emulator boots on, so this row runs with the service's own alarm
 /// clock really waking up between the legs rather than only when the test awaits.
@@ -266,6 +293,7 @@ async fn the_clock_delivers_each_forced_transition_once_and_nothing_further() {
         );
         // Long enough for several of the clock's wake-ups, each of which settles this store:
         // the alarm's evaluated state is reached once and nothing further is published for it.
+        reclaim_the_forced_state(&emulator, region).await;
         ::tokio::time::sleep(PAST_EVALUATION_DELAY * 3).await;
         let since = notifications(&emulator, region, &url).await;
         assert!(
@@ -357,10 +385,11 @@ async fn each_forced_transition_invokes_the_actions_of_the_state_it_moves_to() {
              {notification}"
         );
 
-        // "Metric alarms returns to their actual state quickly": the evaluation takes the alarm
-        // back, and with no datapoint of this series and missing data treated as `missing` the
-        // state it computes is INSUFFICIENT_DATA.
-        wait_past_the_forced_span();
+        // "Metric alarms returns to their actual state quickly": the datapoint the alarm
+        // watches is what its next evaluation is owed from, and with no datapoint inside the
+        // window that evaluation grades and missing data treated as `missing`, the state it
+        // computes is INSUFFICIENT_DATA.
+        reclaim_the_forced_state(&emulator, region).await;
         let reclaimed = reported_state(&emulator, region, alarm).await;
         assert_eq!(
             reclaimed, "INSUFFICIENT_DATA",
@@ -424,7 +453,7 @@ async fn disabling_the_actions_withholds_the_forced_transitions_notification() {
 
         // Leg 2: the same force with the actions off. The state still changes — the switch gates
         // the dispatch, not the transition — and nothing is delivered.
-        wait_past_the_forced_span();
+        reclaim_the_forced_state(&emulator, region).await;
         switch_actions(&emulator, region, alarm, false).await;
         force(&emulator, region, alarm, "ALARM").await;
         let reported = reported_state(&emulator, region, alarm).await;
@@ -441,7 +470,7 @@ async fn disabling_the_actions_withholds_the_forced_transitions_notification() {
 
         // Leg 3: the actions back on, the same force once more. The notification withheld in
         // leg 2 is not delivered late: only this transition's own is.
-        wait_past_the_forced_span();
+        reclaim_the_forced_state(&emulator, region).await;
         switch_actions(&emulator, region, alarm, true).await;
         force(&emulator, region, alarm, "ALARM").await;
         let restored = notifications(&emulator, region, &url).await;

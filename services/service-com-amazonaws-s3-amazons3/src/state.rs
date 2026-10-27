@@ -87,7 +87,7 @@ pub const DEFAULT_STORAGE_CLASS: &str = "STANDARD";
 /// The `ObjectAttributes` value naming an object's entity tag, as the
 /// `x-amz-object-attributes` header spells it.
 ///
-/// The four root-level fields `GetObjectAttributes` reports are each named by one value of
+/// The five root-level fields `GetObjectAttributes` reports are each named by one value of
 /// that enum (`smithy_query(query="shape",shape="ObjectAttributes")` publishes `[ETag,
 /// Checksum, ObjectParts, StorageClass, ObjectSize]`); these constants are what the handler
 /// matches the header's values against, so the spelling lives in one place.
@@ -96,6 +96,11 @@ pub const OBJECT_ATTRIBUTE_ETAG: &str = "ETag";
 pub const OBJECT_ATTRIBUTE_OBJECT_SIZE: &str = "ObjectSize";
 /// See [`OBJECT_ATTRIBUTE_ETAG`] — the value naming the object's storage class.
 pub const OBJECT_ATTRIBUTE_STORAGE_CLASS: &str = "StorageClass";
+/// See [`OBJECT_ATTRIBUTE_ETAG`] — the value naming the object's checksum container.
+pub const OBJECT_ATTRIBUTE_CHECKSUM: &str = "Checksum";
+/// See [`OBJECT_ATTRIBUTE_ETAG`] — the value naming the collection of parts a multipart
+/// upload assembled the object from.
+pub const OBJECT_ATTRIBUTE_OBJECT_PARTS: &str = "ObjectParts";
 
 /// The `StorageClass` values whose objects are ARCHIVED: not readable, not copyable and
 /// not usable until a temporary copy of them has been restored.
@@ -528,6 +533,15 @@ pub const MIN_PART_NUMBER: i32 = 1;
 /// "a part number uniquely identifies a part" (`UploadPart`'s own documentation).
 pub const MAX_PART_NUMBER: i32 = 10_000;
 
+/// The fewest bytes a part of a multipart upload may carry, EXCEPT the last one.
+///
+/// The published multipart upload limit: "Part size: 5 MiB to 5 GiB. There is no minimum
+/// size limit on the last part of your multipart upload" (Amazon S3 User Guide, *Amazon S3
+/// multipart upload limits*). Nothing refuses a smaller part when it is UPLOADED — a part
+/// is only known to be the last one once a completion names the parts to assemble — so this
+/// is what a completion judges every part but the final one against.
+pub const MIN_MULTIPART_PART_BYTES: usize = 5 * 1024 * 1024;
+
 /// What [`ComAmazonawsS3Amazons3State::upload_part`] did, so the caller answers each
 /// outcome without re-deriving it — and cannot record a part without having gone through
 /// the byte budgets, per bucket AND service-wide.
@@ -562,6 +576,25 @@ pub enum UploadAbort {
     /// The bucket has no such upload in progress under that id and key — never initiated,
     /// or already discarded — so nothing was removed.
     NoSuchUpload,
+}
+
+/// What [`ComAmazonawsS3Amazons3State::complete_multipart_upload`] did, so the caller
+/// answers each outcome without re-deriving it — and cannot turn an upload into an object
+/// without having gone through the object-write ceilings, per bucket AND service-wide.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UploadCompletion {
+    /// The parts became the object at the upload's key, and the upload is no longer in
+    /// progress: "after you successfully complete … a multipart upload, you can no longer
+    /// use the upload ID" (`ListParts`'s own documentation). The write is what the object
+    /// write did — [`ObjectWrite::Created`] or [`ObjectWrite::Replaced`].
+    Completed(ObjectWrite),
+    /// The bucket has no such upload in progress under that id and key — never initiated,
+    /// or already completed or aborted — so nothing was written.
+    NoSuchUpload,
+    /// The object write the completion performs was refused (an over-long key, or one of
+    /// the ceilings), so nothing was written and the upload is left in progress exactly as
+    /// it was, with every part it held.
+    Refused(ObjectWrite),
 }
 
 /// How many tags one bucket's tag set may carry.
@@ -6012,6 +6045,23 @@ pub struct Object {
     /// cannot use PutObject to only update a single piece of metadata for an existing
     /// object."
     pub encryption: ObjectEncryption,
+    /// The checksum the write that stored this object computed over the bytes it stored —
+    /// see [`ObjectChecksum`] — or `None` when that write named no checksum algorithm,
+    /// which is the state an object whose reader reports no checksum at all is in.
+    ///
+    /// Decided by that write, like [`Self::encryption`]: "this checksum is only present if
+    /// the checksum was uploaded with the object" (`GetObjectOutput$ChecksumSHA256`), so
+    /// nothing afterwards computes one for an object that was stored without it.
+    pub checksum: Option<ObjectChecksum>,
+    /// The parts a multipart upload assembled this object from — see [`ObjectPartRecord`] —
+    /// or empty for an object one write stored whole.
+    ///
+    /// "A collection of parts associated with a multipart upload"
+    /// (`GetObjectAttributesParts`) is what a read of the object's attributes reports from
+    /// this: the parts are gone as parts once the upload is completed (no `ListParts` reaches
+    /// them), but the object remembers how it was assembled, which is the only way that
+    /// collection can be reported at all.
+    pub parts: Vec<ObjectPartRecord>,
     /// The Object Lock retention in force on this stored version — see
     /// [`ObjectRetention`] — or `None` while no retention is associated with it, which is
     /// the state a write leaves a version in.
@@ -6553,6 +6603,11 @@ impl Object {
             restore: None,
             annotations: BTreeMap::new(),
             acl: None,
+            // A writer that carries only bytes names no checksum algorithm, so the object
+            // it stores carries no checksum either.
+            checksum: None,
+            // Nor is it assembled from parts: one write stored it whole.
+            parts: Vec::new(),
         }
     }
 
@@ -6574,6 +6629,15 @@ impl Object {
             + self.annotation_bytes()
             + acl_grants_bytes(self.acl.as_deref().unwrap_or_default())
             + self.encryption.retained_bytes()
+            + self
+                .checksum
+                .as_ref()
+                .map_or(0, ObjectChecksum::retained_bytes)
+            + self
+                .parts
+                .iter()
+                .map(ObjectPartRecord::retained_bytes)
+                .sum::<usize>()
             + self
                 .retention
                 .as_ref()
@@ -6823,6 +6887,29 @@ pub fn object_etag(body: &[u8]) -> String {
     format!("\"{}\"", hex::encode(Md5::digest(body)))
 }
 
+/// The entity tag S3 reports for an object a multipart upload was completed into, over the
+/// parts it was assembled from, in the order they were assembled.
+///
+/// A multipart object's tag is NOT the digest of its bytes: "if an object is uploaded as a
+/// multipart upload, then the ETag of the object is not an MD5 digest of the entire object.
+/// Amazon S3 calculates the MD5 digest of each individual part as it is uploaded. The MD5
+/// digests are used to determine the ETag for the final object. Amazon S3 concatenates the
+/// bytes for the MD5 digests together and then calculates the MD5 digest of these
+/// concatenated values" (Amazon S3 User Guide, *Checking object integrity*). S3 then
+/// "appends a dash with the total number of parts to the ETag", which is what makes a
+/// multipart tag recognisable as one.
+///
+/// So the digest is over the raw digest BYTES of each part, not over their hex renderings,
+/// and the count is the number of parts the completion assembled — one part included, which
+/// still carries the dashed form.
+pub fn multipart_object_etag(parts: &[&[u8]]) -> String {
+    let mut digest = Md5::new();
+    for part in parts {
+        digest.update(Md5::digest(part));
+    }
+    format!("\"{}-{}\"", hex::encode(digest.finalize()), parts.len())
+}
+
 /// The entity tag's own VALUE: the digest [`object_etag`] rendered, without the double
 /// quotes around it.
 ///
@@ -6841,6 +6928,241 @@ pub fn etag_value(etag: &str) -> &str {
 /// (`PutObjectRequest$ContentMD5`), which is what makes that header checkable.
 pub fn content_md5(body: &[u8]) -> String {
     ::aws_smithy_types::base64::encode(Md5::digest(body))
+}
+
+/// The `ChecksumType` of a checksum computed over the object's own bytes, whole.
+///
+/// One of the two values `ChecksumType` carries
+/// (`smithy_query(query="shape",shape="ChecksumType")` publishes `[COMPOSITE,
+/// FULL_OBJECT]`), and the one a single write's checksum has: there are no parts for it to
+/// be composed of.
+pub const CHECKSUM_TYPE_FULL_OBJECT: &str = "FULL_OBJECT";
+
+/// The `ChecksumType` of a checksum computed over the CHECKSUMS of an object's parts —
+/// "the checksum type … determines how part-level checksums are combined to create an
+/// object-level checksum for multipart objects"
+/// (`CompleteMultipartUploadRequest$ChecksumType`) — and the one a completed multipart
+/// upload's checksum has unless the algorithm admits no such composition.
+pub const CHECKSUM_TYPE_COMPOSITE: &str = "COMPOSITE";
+
+/// The `ChecksumAlgorithm` values whose checksum is only ever over the whole object.
+///
+/// "The CRC64NVME checksum is always a full object checksum"
+/// (`CompleteMultipartUploadRequest$ChecksumCRC64NVME`), so a multipart object checksummed
+/// with it carries [`CHECKSUM_TYPE_FULL_OBJECT`] rather than a composition of its parts'
+/// checksums.
+pub const FULL_OBJECT_CHECKSUM_ALGORITHMS: [&str; 1] = ["CRC64NVME"];
+
+/// The RAW digest bytes the `ChecksumAlgorithm` value `algorithm` computes over `data`, or
+/// `None` for a value this emulator has no implementation of.
+///
+/// Each algorithm is computed by a crate that implements it rather than by anything written
+/// here: the five S3 has long published (`CRC32`, `CRC32C`, `CRC64NVME`, `SHA1`, `SHA256`)
+/// through `aws-smithy-checksums`, the AWS SDK's own implementation of exactly these
+/// checksums, and the others through the hash crate for each (`sha2` for `SHA512`, `md-5`
+/// for `MD5`, `xxhash-rust` for the three `XXHASH` values). The bytes are the digest's own,
+/// big-endian for the integer-valued ones, because that is what a Base64 checksum value and
+/// a composition over part checksums are both built from.
+fn checksum_digest(algorithm: &str, data: &[u8]) -> Option<Vec<u8>> {
+    match algorithm {
+        "CRC32" | "CRC32C" | "CRC64NVME" | "SHA1" | "SHA256" => {
+            // The SDK crate names these in lowercase, which is the spelling its
+            // `FromStr` accepts (and the spelling the header names carry).
+            let parsed: ::aws_smithy_checksums::ChecksumAlgorithm =
+                algorithm.to_ascii_lowercase().parse().ok()?;
+            let mut checksum = parsed.into_impl();
+            checksum.update(data);
+            Some(checksum.finalize().to_vec())
+        }
+        "SHA512" => {
+            use ::sha2::Digest as _;
+            Some(::sha2::Sha512::digest(data).to_vec())
+        }
+        "MD5" => Some(Md5::digest(data).to_vec()),
+        "XXHASH64" => Some(::xxhash_rust::xxh64::xxh64(data, 0).to_be_bytes().to_vec()),
+        "XXHASH3" => Some(::xxhash_rust::xxh3::xxh3_64(data).to_be_bytes().to_vec()),
+        "XXHASH128" => Some(::xxhash_rust::xxh3::xxh3_128(data).to_be_bytes().to_vec()),
+        _ => None,
+    }
+}
+
+/// The checksum of `data` under `algorithm`, as a response reports it: "the Base64 encoded
+/// … checksum of the object" (every `Checksum*` member's own documentation), over the whole
+/// of the object's bytes.
+///
+/// `None` for an algorithm [`checksum_digest`] has no implementation of, in which case
+/// nothing is recorded and nothing is reported — never a value under another algorithm.
+pub fn full_object_checksum(algorithm: &str, data: &[u8]) -> Option<String> {
+    Some(::aws_smithy_types::base64::encode(checksum_digest(
+        algorithm, data,
+    )?))
+}
+
+/// The COMPOSITE checksum of an object assembled from `parts`, under `algorithm`.
+///
+/// The rule is the one the Amazon S3 User Guide states for a multipart object's
+/// object-level checksum (*Checking object integrity*): S3 checksums each part, then
+/// "concatenates the … checksums … and then calculates the checksum of these concatenated
+/// values", reporting it "with the total number of parts" after a dash — the same
+/// composition an entity tag of a multipart object is built with ([`multipart_object_etag`]),
+/// over the request's checksum algorithm instead of MD5. So a COMPOSITE value is the
+/// algorithm's digest of the parts' RAW digests, Base64 encoded, followed by `-<parts>`.
+pub fn composite_checksum(algorithm: &str, parts: &[&[u8]]) -> Option<String> {
+    let mut digests: Vec<u8> = Vec::new();
+    for part in parts {
+        digests.extend_from_slice(&checksum_digest(algorithm, part)?);
+    }
+    let combined = checksum_digest(algorithm, &digests)?;
+    Some(format!(
+        "{}-{}",
+        ::aws_smithy_types::base64::encode(combined),
+        parts.len()
+    ))
+}
+
+/// The checksum one completed multipart upload's object carries: its value and its
+/// `ChecksumType`, under the algorithm the upload was initiated with — or `None` when the
+/// upload named no algorithm, or named one this emulator cannot compute, in which case the
+/// object carries no checksum at all rather than one it did not compute.
+///
+/// The type is the one the upload settled when it named one, and otherwise the one the
+/// algorithm admits: a composition over the parts' checksums, except for an algorithm whose
+/// checksum "is always a full object checksum" ([`FULL_OBJECT_CHECKSUM_ALGORITHMS`]). The
+/// value follows from the type — a composition over the parts, or the digest of the whole
+/// assembled object — so the two can never describe different computations.
+pub fn multipart_checksum(
+    algorithm: Option<&str>,
+    requested_type: Option<&str>,
+    parts: &[&[u8]],
+) -> Option<ObjectChecksum> {
+    let algorithm = algorithm?;
+    let checksum_type = match requested_type {
+        Some(CHECKSUM_TYPE_FULL_OBJECT) => CHECKSUM_TYPE_FULL_OBJECT,
+        Some(CHECKSUM_TYPE_COMPOSITE) => CHECKSUM_TYPE_COMPOSITE,
+        _ if FULL_OBJECT_CHECKSUM_ALGORITHMS.contains(&algorithm) => CHECKSUM_TYPE_FULL_OBJECT,
+        _ => CHECKSUM_TYPE_COMPOSITE,
+    };
+    let value = if checksum_type == CHECKSUM_TYPE_COMPOSITE {
+        composite_checksum(algorithm, parts)?
+    } else {
+        full_object_checksum(algorithm, &parts.concat())?
+    };
+    Some(ObjectChecksum {
+        algorithm: algorithm.to_string(),
+        value,
+        checksum_type: checksum_type.to_string(),
+    })
+}
+
+/// The checksum one stored object was written with: which algorithm computed it, the value
+/// a reader reports, and whether it was computed over the object's bytes or over its parts'
+/// checksums.
+///
+/// Recorded by the write that stored the object, from the bytes it stored, so every later
+/// read reports the same value — "this checksum is only present if the checksum was uploaded
+/// with the object" (`Checksum*`'s own documentation), which is why an object written with no
+/// checksum algorithm carries none of this and reports no checksum at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectChecksum {
+    /// The `ChecksumAlgorithm` value the write named, which decides WHICH `Checksum*`
+    /// member carries [`Self::value`].
+    pub algorithm: String,
+    /// The Base64 checksum, with the `-<parts>` suffix a composition carries.
+    pub value: String,
+    /// [`CHECKSUM_TYPE_FULL_OBJECT`] or [`CHECKSUM_TYPE_COMPOSITE`].
+    pub checksum_type: String,
+}
+
+impl ObjectChecksum {
+    /// How many bytes this record retains — the strings kept beside the object, which the
+    /// per-bucket and service-wide budgets count the way they count every other string an
+    /// object holds ([`ObjectEncryption::retained_bytes`] counts its own the same way).
+    pub fn retained_bytes(&self) -> usize {
+        self.algorithm.len() + self.value.len() + self.checksum_type.len()
+    }
+}
+
+/// One part a completed multipart upload assembled an object from, as a read of the
+/// object's attributes reports it.
+///
+/// The members `ObjectPart` declares for a general purpose bucket
+/// (`smithy_query(query="shape",shape="com.amazonaws.s3#ObjectPart")`): "the part number
+/// identifying the part", "the size of the uploaded part in bytes", and the part's own
+/// checksum under the algorithm the upload was initiated with — nothing else of the part
+/// survives the completion, because its bytes become the object's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectPartRecord {
+    /// "The part number identifying the part. This value is a positive integer between 1
+    /// and 10,000" (`ObjectPart$PartNumber`) — the number the completion assembled it under.
+    pub part_number: i32,
+    /// "The size of the uploaded part in bytes" (`ObjectPart$Size`).
+    pub size: i64,
+    /// The Base64 checksum of this part's own bytes, under the object's checksum algorithm,
+    /// or `None` when the upload named no algorithm — in which case a read of the object's
+    /// attributes reports no `Part` element at all for a general purpose bucket ("if an
+    /// additional checksum … isn't applied to the object specified in the request, the
+    /// response doesn't return the Part element", `GetObjectAttributesParts$Parts`).
+    pub checksum: Option<String>,
+}
+
+impl ObjectPartRecord {
+    /// How many bytes this record retains: the checksum string kept with it, which the
+    /// budgets count like every other string beside an object.
+    pub fn retained_bytes(&self) -> usize {
+        self.checksum.as_ref().map_or(0, String::len)
+    }
+}
+
+/// The `Checksum*` members a reader reports for a stored checksum: the one its algorithm
+/// names, and the `ChecksumType` beside it. Every other member is `None`, because an object
+/// carries the checksum of ONE algorithm — the one its write named.
+///
+/// One place for the algorithm-to-member mapping, so the four readers that report a stored
+/// checksum (the write that computed it, `GetObject`, `HeadObject` and the completion of a
+/// multipart upload) cannot map it differently.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReportedChecksums {
+    pub crc32: Option<String>,
+    pub crc32c: Option<String>,
+    pub crc64nvme: Option<String>,
+    pub sha1: Option<String>,
+    pub sha256: Option<String>,
+    pub sha512: Option<String>,
+    pub md5: Option<String>,
+    pub xxhash64: Option<String>,
+    pub xxhash3: Option<String>,
+    pub xxhash128: Option<String>,
+    pub checksum_type: Option<String>,
+}
+
+/// The members a reader reports for `checksum`, or nothing at all for an object that
+/// carries none — see [`ReportedChecksums`].
+pub fn reported_checksums(checksum: Option<&ObjectChecksum>) -> ReportedChecksums {
+    let Some(checksum) = checksum else {
+        return ReportedChecksums::default();
+    };
+    let value = Some(checksum.value.clone());
+    let mut reported = ReportedChecksums {
+        checksum_type: Some(checksum.checksum_type.clone()),
+        ..ReportedChecksums::default()
+    };
+    match checksum.algorithm.as_str() {
+        "CRC32" => reported.crc32 = value,
+        "CRC32C" => reported.crc32c = value,
+        "CRC64NVME" => reported.crc64nvme = value,
+        "SHA1" => reported.sha1 = value,
+        "SHA256" => reported.sha256 = value,
+        "SHA512" => reported.sha512 = value,
+        "MD5" => reported.md5 = value,
+        "XXHASH64" => reported.xxhash64 = value,
+        "XXHASH3" => reported.xxhash3 = value,
+        "XXHASH128" => reported.xxhash128 = value,
+        // An algorithm no member of the model names cannot be reported under one; nothing
+        // records such a checksum ([`checksum_digest`] computes none for it), so this is
+        // unreachable rather than a silent drop.
+        _ => return ReportedChecksums::default(),
+    }
+    reported
 }
 
 /// The one `EncodingType` the model declares: `url`
@@ -7323,6 +7645,69 @@ impl ComAmazonawsS3Amazons3State {
         }
         held_bucket.multipart_uploads.remove(upload_id);
         Some(UploadAbort::Discarded)
+    }
+
+    /// Turn the multipart upload `upload_id` names in the bucket named `bucket` into
+    /// `object` at `key`, reporting what that did — or `None` when this emulator holds no
+    /// such bucket (so a completion refuses a name that is not a bucket instead of creating
+    /// one).
+    ///
+    /// An upload is addressed by its id AND the key it was initiated for, exactly as
+    /// [`Self::upload_part`] and [`Self::abort_multipart_upload`] address it, so an id named
+    /// under another key names no upload ([`UploadCompletion::NoSuchUpload`]) and nothing is
+    /// written.
+    ///
+    /// The upload is taken out BEFORE the object is written, because the parts BECOME the
+    /// object: "upon receiving this request, Amazon S3 concatenates all the parts in
+    /// ascending order by part number to create a new object"
+    /// (`CompleteMultipartUpload`'s own documentation), and the storage the parts held is
+    /// not held twice. That is also what keeps the completion inside the byte budgets a
+    /// store this size has room for: the bytes the parts retained are released as the same
+    /// bytes are recorded under the key.
+    ///
+    /// The write goes through [`Self::put_object`], the one place an object is recorded, so
+    /// a completed upload is subject to exactly the ceilings a one-shot write is and mints
+    /// its version id the same way. A write that is REFUSED leaves the upload in progress
+    /// with every part it held, so a caller can retry it rather than losing the parts.
+    pub fn complete_multipart_upload(
+        &mut self,
+        bucket: &str,
+        upload_id: &str,
+        key: &str,
+        object: Object,
+    ) -> Option<UploadCompletion> {
+        let held_bucket = self.buckets.get_mut(bucket)?;
+        if held_bucket
+            .multipart_upload(upload_id)
+            .is_none_or(|upload| upload.key != key)
+        {
+            return Some(UploadCompletion::NoSuchUpload);
+        }
+        let Some(upload) = held_bucket.multipart_uploads.remove(upload_id) else {
+            return Some(UploadCompletion::NoSuchUpload);
+        };
+
+        let write = self.put_object(bucket, key, object);
+        match write {
+            Some(write @ (ObjectWrite::Created | ObjectWrite::Replaced)) => {
+                Some(UploadCompletion::Completed(write))
+            }
+            // Either refusal leaves the upload where it was: the bucket is reached again
+            // because the write borrowed the whole store, and the upload goes back under
+            // the id it was addressed by. The bucket is still held — the write above was
+            // measured against it and nothing in between removes a bucket — so the upload
+            // really does go back; the conditional is what keeps a store that somehow no
+            // longer held it from panicking on a request path, there being nothing left to
+            // put the upload into.
+            refused => {
+                if let Some(held_bucket) = self.buckets.get_mut(bucket) {
+                    held_bucket
+                        .multipart_uploads
+                        .insert(upload_id.to_string(), upload);
+                }
+                refused.map(UploadCompletion::Refused)
+            }
+        }
     }
 
     /// Record `configuration` as the whole notification configuration of the bucket named
@@ -7959,6 +8344,12 @@ impl ComAmazonawsS3Amazons3State {
                     // with, the owner's `FULL_CONTROL`, which a reader derives rather than
                     // this recording it.
                     acl: None,
+                    // And no checksum: the catalog publishes bytes and a content type, so
+                    // nothing named a checksum algorithm for these objects to be stored
+                    // under.
+                    checksum: None,
+                    // Nor parts: a published object is stored whole.
+                    parts: Vec::new(),
                 };
                 let _ = self.put_object(published.name, object.key, stored);
             }
@@ -9150,6 +9541,10 @@ mod tests {
             annotations: BTreeMap::new(),
             // Nor an ACL; `replace_object_acl` is what does.
             acl: None,
+            // And no checksum: a write that names no checksum algorithm stores none.
+            checksum: None,
+            // Nor parts: this object is stored whole.
+            parts: Vec::new(),
         }
     }
 

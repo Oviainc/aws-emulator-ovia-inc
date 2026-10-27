@@ -58,8 +58,9 @@
 //! evaluation of an alarm becomes due [`EVALUATION_DELAY_SECS`] after the write that
 //! configured it ("When this operation creates an alarm, the alarm state is immediately set
 //! to INSUFFICIENT_DATA. The alarm is then evaluated and its state is set appropriately." —
-//! `PutMetricAlarm`), and a state `SetAlarmState` forced stands for that same short span
-//! ([`forced_state_span_secs`]) before the evaluation takes the alarm back over.
+//! `PutMetricAlarm`), and a state `SetAlarmState` forced stands until that alarm's next
+//! evaluation, one of its own periods away ([`forced_state_span_secs`]) or sooner if a
+//! datapoint of the series it watches arrives before then.
 //!
 //! What is NOT evaluated here keeps the state it has, rather than being answered with a
 //! state nothing computed: an alarm over a `Metrics` query array (metric math), one with
@@ -235,23 +236,27 @@ impl EvaluationBudget {
     }
 }
 
-/// How long a state `SetAlarmState` forced on a metric alarm stands before the evaluation
-/// takes the alarm back over.
+/// How long after a force the SCHEDULED evaluation that takes the state back is owed, for an
+/// alarm with NO datapoint arriving to trigger one.
 ///
-/// "Temporarily sets the state of an alarm for testing purposes. […] Metric alarms returns to
-/// their actual state quickly, often within seconds. Because the metric alarm state change
-/// happens quickly, it is typically only visible in the alarm's History tab […] or through
-/// DescribeAlarmHistory" (`SetAlarmState`) — so the thing that takes the alarm back, its next
-/// evaluation, is owed the same short span as every other transition this store's clock owes
-/// ([`EVALUATION_DELAY_SECS`]), not one evaluation period of the alarm: a caller reading
-/// straight after the call still sees the state it forced, and a caller that comes back for
-/// the alarm's actual state finds the evaluation owning it again. Each later force into a
-/// state the evaluation has since taken back is therefore a state CHANGE of its own, which is
-/// what invokes that state's actions again.
-#[must_use]
-pub fn forced_state_span_secs() -> f64 {
-    EVALUATION_DELAY_SECS
-}
+/// This span is the emulator's OWN choice, and it is deliberately outside the 250-750 ms window
+/// a transition this store's clock usually owes. "Metric alarms returns to their actual state
+/// quickly, often within seconds. Because the metric alarm state change happens quickly, it is
+/// typically only visible in the alarm's History tab […] or through DescribeAlarmHistory"
+/// (`SetAlarmState`) is the only thing CloudWatch states about the latency, and the recorded
+/// behaviour of a force on an alarm over a metric nothing writes pins it from both sides: a
+/// caller's own reads right after the call still report the state it forced, which a sub-second
+/// span could not show at all, and the state is nevertheless taken back with no further call.
+/// So the span has to be SECONDS.
+///
+/// Ten of them: the shortest period CloudWatch evaluates an alarm on at all ("Valid values are
+/// 10, 20, 30, and any multiple of 60", `PutMetricAlarmInput$Period`) — so it is the alarm's own
+/// period for a high-resolution alarm, and for a longer-period alarm it is that alarm's
+/// scheduled pass brought FORWARD, which keeps the reclaim observable inside one client's
+/// session rather than minutes after it. The COMPRESSION is the choice; nothing else about the
+/// evaluation is compressed, since what the pass computes stays a pure function of the stored
+/// datapoints and the clock.
+const SCHEDULED_EVALUATION_SECS: f64 = 10.0;
 
 /// How one evaluated window's datapoint stands against the alarm's threshold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,6 +267,52 @@ enum Datapoint {
     NotBreaching,
     /// The window held no datapoint of this metric.
     Missing,
+}
+
+/// The series ONE metric alarm watches: namespace, metric name and normalised dimension set,
+/// the identity its evaluation reads and the one a datapoint is stored under.
+///
+/// The one place an alarm's configuration is turned into a series identity, so the evaluation,
+/// the forced-state span and [`State::make_alarms_due`] can never resolve it three ways.
+pub(super) fn watched_series(alarm: &MetricAlarm) -> MetricKey {
+    MetricKey {
+        namespace: alarm.namespace.clone().unwrap_or_default(),
+        metric_name: alarm.metric_name.clone().unwrap_or_default(),
+        dimensions: dimension_set(alarm.dimensions.as_deref()),
+    }
+}
+
+/// How many of the alarm's periods ONE evaluation grades — its `EvaluationPeriods`, within the
+/// capacity bound — or `None` for an alarm that names none.
+fn evaluated_periods(alarm: &MetricAlarm) -> Option<usize> {
+    usize::try_from(alarm.evaluation_periods?)
+        .ok()
+        .filter(|periods| *periods >= 1)
+        .map(|periods| periods.min(MAX_EVALUATED_PERIODS))
+}
+
+/// How many period windows the EVALUATION RANGE spans for a look-back of `evaluation_periods`
+/// ([`EVALUATION_RANGE_FACTOR`]).
+fn evaluation_range_periods(evaluation_periods: usize) -> usize {
+    evaluation_periods.saturating_mul(EVALUATION_RANGE_FACTOR)
+}
+
+/// Whether `datum` is one the alarm's `Unit` selects ([`alarm_grades_unit`]).
+fn carries_alarm_unit(alarm: &MetricAlarm, datum: &StoredDatum) -> bool {
+    alarm_grades_unit(alarm, datum.unit.as_deref())
+}
+
+/// Whether a datapoint carrying `unit` is one this alarm GRADES: "If you specify a unit, the
+/// operation returns only data that was collected with that unit specified." An alarm naming no
+/// unit grades every datapoint of the series it watches.
+///
+/// The one definition of that selector, so the evaluation fold, the forced-state span and
+/// [`State::make_alarms_due`] cannot answer "is this data for this alarm?" three ways.
+pub(super) fn alarm_grades_unit(alarm: &MetricAlarm, unit: Option<&str>) -> bool {
+    alarm
+        .unit
+        .as_deref()
+        .is_none_or(|wanted| unit == Some(wanted))
 }
 
 /// One datapoint ONE evaluation evaluated.
@@ -302,6 +353,86 @@ struct Evaluation {
 }
 
 impl State {
+    /// Arm the span the state `SetAlarmState` has just forced on the metric alarm `name` stands
+    /// for: its next evaluation is owed at the end of it
+    /// ([`Self::forced_state_span_secs`]). A name no metric alarm carries arms nothing.
+    pub fn arm_forced_state(&mut self, name: &str, now_secs: f64) {
+        // The alarm as it now stands, read before the write: the span is a function of its own
+        // configuration and of the series it watches.
+        let Some(alarm) = self.alarms.get(name).map(|stored| stored.alarm.clone()) else {
+            return;
+        };
+        let due = now_secs + self.forced_state_span_secs(&alarm, now_secs);
+        if let Some(stored) = self.alarms.get_mut(name) {
+            stored.evaluation_due_secs = due;
+        }
+    }
+
+    /// How long a state `SetAlarmState` forces on `alarm` stands before the evaluation takes
+    /// the alarm back over: until that alarm's NEXT evaluation.
+    ///
+    /// "Temporarily sets the state of an alarm for testing purposes. […] Metric alarms returns
+    /// to their actual state quickly, often within seconds." (`SetAlarmState`) — what takes the
+    /// alarm back is its next evaluation, and an alarm is evaluated from the datapoints of the
+    /// metric it watches, "the length, in seconds, used each time the metric specified in
+    /// MetricName is evaluated" being its own `Period` (`PutMetricAlarmInput$Period`). So:
+    ///
+    /// * a metric that is really being published — one whose series holds a datapoint inside
+    ///   the range this alarm's evaluation grades — is evaluated again as soon as its next
+    ///   datapoint lands, which is what "within seconds" describes, so the force stands for the
+    ///   span every transition this store's clock owes ([`EVALUATION_DELAY_SECS`]) and the
+    ///   datapoint that arrives meanwhile is what the reclaiming evaluation grades
+    ///   ([`State::make_alarms_due`]);
+    /// * a metric nothing writes has no arriving datapoint to trigger an evaluation, so the
+    ///   force stands until the alarm's next SCHEDULED pass
+    ///   ([`SCHEDULED_EVALUATION_SECS`]), bounded by the alarm's own period.
+    ///
+    /// An alarm whose configuration names no period at all — one evaluated over a `Metrics`
+    /// query array or an `EvaluationCriteria` query, where the period belongs to each query —
+    /// has no scheduled pass of its own, so the force stands for that same clock span. Either
+    /// way the span is never zero, so a caller reading straight after the call still sees the
+    /// state it forced.
+    #[must_use]
+    pub fn forced_state_span_secs(&self, alarm: &MetricAlarm, now_secs: f64) -> f64 {
+        let Some(period) = alarm.period.filter(|period| *period >= 1).map(f64::from) else {
+            return EVALUATION_DELAY_SECS;
+        };
+        if self.evaluation_range_holds_datapoint(alarm, period, now_secs) {
+            return EVALUATION_DELAY_SECS;
+        }
+        period.clamp(EVALUATION_DELAY_SECS, SCHEDULED_EVALUATION_SECS)
+    }
+
+    /// Whether the series `alarm` watches holds a datapoint inside the range its evaluation
+    /// grades at `now_secs`: the window span [`evaluation_range_periods`] covers, the series
+    /// identity [`watched_series`] resolves and the unit selector [`carries_alarm_unit`]
+    /// applies are the SAME ones [`Self::metric_alarm_evaluation`] folds with, so "the metric
+    /// is being published" means exactly "this alarm has a datapoint to grade".
+    ///
+    /// One series is visited, bounded on its own by [`super::MAX_DATAPOINTS_PER_SERIES`].
+    fn evaluation_range_holds_datapoint(
+        &self,
+        alarm: &MetricAlarm,
+        period: f64,
+        now_secs: f64,
+    ) -> bool {
+        let range_periods = evaluation_range_periods(evaluated_periods(alarm).unwrap_or(1));
+        // The periods are ANCHORED at multiples of the period, exactly as the fold anchors
+        // them: the oldest window of the range is the one whose index is `range_periods - 1`
+        // counting back from the window `now_secs` falls in, so the range starts where that
+        // window starts rather than one span back from this instant.
+        #[allow(clippy::cast_precision_loss)]
+        let oldest_window = (now_secs / period).floor() - (range_periods.saturating_sub(1) as f64);
+        let range_from = oldest_window * period;
+        self.metrics
+            .get(&watched_series(alarm))
+            .is_some_and(|series| {
+                series.iter().any(|datum| {
+                    datum.timestamp_secs >= range_from && carries_alarm_unit(alarm, datum)
+                })
+            })
+    }
+
     /// Materialise every metric-alarm evaluation the clock has already made due, within what
     /// `budget` lets this request pay for.
     ///
@@ -365,9 +496,6 @@ impl State {
         stored.alarm.state_value = Some(evaluation.state.to_string());
         stored.alarm.state_reason = Some(evaluation.reason);
         stored.alarm.state_reason_data = Some(evaluation.reason_data);
-        // The evaluation owns the alarm's state again: whatever a caller forced has been
-        // taken back over.
-        stored.forced_state_until_secs = None;
         stored.alarm.state_updated_timestamp = Some(to_timestamp(now_secs));
         // "The timestamp of the last change to the alarm's StateValue."
         // (`MetricAlarm$StateTransitionedTimestamp`) — this evaluation changed it.
@@ -423,20 +551,18 @@ impl State {
         let comparison = comparison_of(alarm.comparison_operator.as_deref()?)?;
         let statistic = AlarmStatistic::of(alarm)?;
         let period = f64::from(alarm.period.filter(|period| *period >= 1)?);
-        let evaluation_periods = usize::try_from(alarm.evaluation_periods?)
-            .ok()
-            .filter(|periods| *periods >= 1)?
-            .min(MAX_EVALUATED_PERIODS);
-        let key = MetricKey {
-            namespace: alarm.namespace.clone()?,
-            metric_name: alarm.metric_name.clone()?,
-            dimensions: dimension_set(alarm.dimensions.as_deref()),
-        };
+        let evaluation_periods = evaluated_periods(alarm)?;
+        let key = watched_series(alarm);
+        // An alarm this engine evaluates names the series it watches, which `watched_series`
+        // resolves from those same members.
+        if key.namespace.is_empty() || key.metric_name.is_empty() {
+            return None;
+        }
 
         // One pass over the series fills every window of the EVALUATION RANGE: window 0 is
         // the period the evaluation instant falls in, window i the period before it, and the
         // range reaches further back than the look-back ([`EVALUATION_RANGE_FACTOR`]).
-        let range_periods = evaluation_periods.saturating_mul(EVALUATION_RANGE_FACTOR);
+        let range_periods = evaluation_range_periods(evaluation_periods);
         let mut windows: Vec<Vec<&StoredDatum>> = vec![Vec::new(); range_periods];
         let series = self.metrics.get(&key);
         // The period the evaluation instant falls in, as a count of whole periods since the
@@ -446,14 +572,8 @@ impl State {
         // the factor that multiplies with the number of alarms one request evaluates.
         budget.charge_datapoints(series.map_or(0, Vec::len));
         for datum in series.into_iter().flatten() {
-            // "If you specify a unit, the operation returns only data that was collected
-            // with that unit specified." — the alarm's `Unit` selects which datapoints of the
-            // series it watches.
-            if alarm
-                .unit
-                .as_deref()
-                .is_some_and(|unit| datum.unit.as_deref() != Some(unit))
-            {
+            // The alarm's `Unit` selects which datapoints of the series it watches.
+            if !carries_alarm_unit(alarm, datum) {
                 continue;
             }
             // A datapoint belongs to the period its OWN time stamp falls in, so which window

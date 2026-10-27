@@ -177,7 +177,8 @@ impl SerializableStruct for ValidationException {
     }
 }
 
-/// The error code a refusal raised by this service's TAGGING surface carries.
+/// The error code a refusal raised by this service's TAGGING surface carries for a request
+/// it will not accept.
 ///
 /// Tagging is served by the tag frontend rather than by this service's own request
 /// validator, so a refusal that frontend raises — a tag map outside the bounds
@@ -190,6 +191,24 @@ impl SerializableStruct for ValidationException {
 /// (`crate::service`) words boundary refusals of the tag map with this same code, so both
 /// layers answer one code.
 pub const TAGGING_REFUSAL_CODE: &str = "BadRequestException";
+
+/// The error code that same surface carries for a well-formed `resourceArn` that names no
+/// resource.
+///
+/// A request the frontend cannot read and a resource that is not there are different
+/// failures, and the tag layer classifies them apart: recorded for an `UntagResource`
+/// against a well-formed ARN of a job queue that does not exist, so a caller tearing a
+/// resource down can swallow "already gone" and re-raise everything else. HTTP 404, the
+/// status that classification carries. The model declares the shape no more than it
+/// declares [`TAGGING_REFUSAL_CODE`].
+pub const TAGGING_NOT_FOUND_CODE: &str = "NotFoundException";
+
+/// The HTTP status [`TAGGING_REFUSAL_CODE`] carries: a request the tag layer will not
+/// accept, like every other client refusal of this service.
+const TAGGING_REFUSAL_STATUS: u16 = 400;
+
+/// The HTTP status [`TAGGING_NOT_FOUND_CODE`] carries.
+const TAGGING_NOT_FOUND_STATUS: u16 = 404;
 
 /// The `message` member of the synthetic tagging-refusal error shape.
 static TAGGING_REFUSAL_MESSAGE: Schema = Schema::new_member(
@@ -220,28 +239,44 @@ pub static TAGGING_REFUSAL_SCHEMA: Schema = Schema::new_struct(
     &[&TAGGING_REFUSAL_MESSAGE],
 );
 
-/// The payload of a tagging refusal: which part of the request the tag frontend would
-/// not accept.
+/// The payload of a tagging refusal: what the tag frontend would not accept, and how that
+/// layer classifies it.
 #[derive(Debug, Clone)]
 pub struct TaggingRefusal {
     pub message: String,
+    /// The wire error code this classification carries ([`TAGGING_REFUSAL_CODE`],
+    /// [`TAGGING_NOT_FOUND_CODE`]).
+    pub code: &'static str,
+    /// The HTTP status that goes with `code`.
+    pub status: u16,
 }
 
 impl TaggingRefusal {
-    /// A tagging refusal carrying `message`.
+    /// A tagging refusal of the REQUEST, carrying `message`.
     ///
     /// Build `message` from the REQUEST — the member at fault and the rule it broke — so
     /// a caller can fix the call from the text alone.
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            code: TAGGING_REFUSAL_CODE,
+            status: TAGGING_REFUSAL_STATUS,
+        }
+    }
+
+    /// A tagging refusal of a reference that names NO resource, carrying `message`.
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            code: TAGGING_NOT_FOUND_CODE,
+            status: TAGGING_NOT_FOUND_STATUS,
         }
     }
 }
 
 impl std::fmt::Display for TaggingRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{TAGGING_REFUSAL_CODE}: {}", self.message)
+        write!(f, "{}: {}", self.code, self.message)
     }
 }
 
@@ -262,8 +297,8 @@ pub enum Scaffolded<E> {
     NotImplemented(NotImplemented),
     /// A modeled error the operation declares. Renders with the model's own status.
     Modeled(E),
-    /// A refusal raised by the TAGGING surface, carried under
-    /// [`TAGGING_REFUSAL_CODE`]. HTTP 400.
+    /// A refusal raised by the TAGGING surface, carried under the code that surface
+    /// classifies it with ([`TaggingRefusal::code`]).
     TaggingRefusal(TaggingRefusal),
     /// A modeled error answered with the status the REAL service returns, where
     /// that is not the status the model annotates.
@@ -327,10 +362,21 @@ impl<E> Scaffolded<E> {
     /// request that frontend refuses before this service resolves anything — a
     /// `resourceArn` that is not an ARN at all
     /// ([`crate::state::malformed_resource_arn`]), or a tag map outside its declared
-    /// bounds. Every other client refusal, the lookup that finds no such resource
-    /// included, is this service's own modeled `ClientException`.
+    /// bounds. A `resourceArn` that names no resource is that layer's refusal too, under
+    /// its own code ([`Scaffolded::tagging_not_found`]); every other client refusal is this
+    /// service's own modeled `ClientException`.
     pub fn tagging_refusal(message: impl Into<String>) -> Self {
         Self::TaggingRefusal(TaggingRefusal::new(message))
+    }
+
+    /// Refuse a TAGGING request whose `resourceArn` is well formed and names no resource
+    /// the way that frontend does: [`TAGGING_NOT_FOUND_CODE`], in both the body's `__type`
+    /// and the `x-amzn-errortype` header.
+    ///
+    /// Reach for this only through [`crate::state::unknown_resource_arn`], which words it,
+    /// so the one sentence and the one code stay together.
+    pub fn tagging_not_found(message: impl Into<String>) -> Self {
+        Self::TaggingRefusal(TaggingRefusal::not_found(message))
     }
 }
 
@@ -389,7 +435,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => "NotImplemented",
             // The tag frontend's code, not a shape this service's model declares.
-            Self::TaggingRefusal(_) => TAGGING_REFUSAL_CODE,
+            Self::TaggingRefusal(e) => e.code,
             Self::Modeled(e) | Self::ModeledWithStatus { error: e, .. } => e.shape_name(),
             Self::ValidationException(_) => "ValidationException",
         }
@@ -406,9 +452,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
-            // The tagging surface refuses a request it cannot accept with 400, the
-            // status every client refusal of this service carries.
-            Self::TaggingRefusal(_) => 400,
+            // The status that goes with the code the tagging surface classified this
+            // refusal under.
+            Self::TaggingRefusal(e) => e.status,
             // The one variant whose status is NOT the model's: the handler stated the
             // status the service answers with.
             Self::ModeledWithStatus { status, .. } => *status,

@@ -638,7 +638,7 @@ async fn a_state_that_blocks_a_lock_modify_or_delete_is_reported_as_the_conditio
         "tag-level rule",
         json!({
             "ResourceType": RESOURCE_TYPES[0],
-            "RetentionPeriod": retention(10),
+            "RetentionPeriod": retention(7),
             "ResourceTags": [{ "ResourceTagKey": "retain", "ResourceTagValue": "yes" }],
         }),
     )
@@ -648,7 +648,7 @@ async fn a_state_that_blocks_a_lock_modify_or_delete_is_reported_as_the_conditio
         "Region-level rule with exclusion tags",
         json!({
             "ResourceType": RESOURCE_TYPES[1],
-            "RetentionPeriod": retention(10),
+            "RetentionPeriod": retention(7),
             "ExcludeResourceTags": [{ "ResourceTagKey": "scratch" }],
         }),
     )
@@ -658,7 +658,7 @@ async fn a_state_that_blocks_a_lock_modify_or_delete_is_reported_as_the_conditio
         "locked rule",
         json!({
             "ResourceType": RESOURCE_TYPES[2],
-            "RetentionPeriod": retention(10),
+            "RetentionPeriod": retention(7),
             "LockConfiguration": lock_configuration(UNLOCK_DELAY_MIN),
         }),
     )
@@ -666,7 +666,7 @@ async fn a_state_that_blocks_a_lock_modify_or_delete_is_reported_as_the_conditio
     let (never_locked, _) = created_rule(
         &router,
         "never locked rule",
-        json!({ "ResourceType": RESOURCE_TYPES[0], "RetentionPeriod": retention(10) }),
+        json!({ "ResourceType": RESOURCE_TYPES[0], "RetentionPeriod": retention(7) }),
     )
     .await;
     // A rule inside its unlock delay: still lock-protected, and the one case whose
@@ -677,7 +677,7 @@ async fn a_state_that_blocks_a_lock_modify_or_delete_is_reported_as_the_conditio
         "rule inside its unlock delay",
         json!({
             "ResourceType": RESOURCE_TYPES[1],
-            "RetentionPeriod": retention(10),
+            "RetentionPeriod": retention(7),
             "LockConfiguration": lock_configuration(UNLOCK_DELAY_MAX),
         }),
     )

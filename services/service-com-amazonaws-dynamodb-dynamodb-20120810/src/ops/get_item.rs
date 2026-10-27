@@ -218,7 +218,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         let name = crate::state::resolve_table_name(&input.table_name).map_err(lift)?;
 
-        if input.projection_expression.is_some() {
+        if let Some(expression) = input.projection_expression.as_deref() {
+            // The member is VALIDATED whether or not projecting is served: whether the
+            // expression is one this service's language accepts — a bare reserved
+            // word, an undefined `#name`, a syntax error — is a fact of the request,
+            // and refusing it as unwritten would answer "nobody implemented this" for
+            // a request no implementation could serve. The names it resolves to are
+            // this reader's to use once it serves the member.
+            crate::state::projection_expression_attributes(
+                "ProjectionExpression",
+                expression,
+                crate::state::Substitutions::new(input.expression_attribute_names.as_ref(), None),
+            )
+            .map_err(lift)?;
             return Err(crate::scaffolded::Scaffolded::not_implemented(
                 "GetItem with ProjectionExpression",
             ));

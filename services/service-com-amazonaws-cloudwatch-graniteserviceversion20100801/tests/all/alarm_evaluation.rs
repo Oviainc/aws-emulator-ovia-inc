@@ -839,12 +839,13 @@ async fn a_forced_state_holds_until_the_next_evaluation_is_due() {
          {described}"
     );
 
-    // Past the forced span, the evaluation owns the state again: a datapoint under the
-    // threshold puts the alarm in OK. "Metric alarms returns to their actual state quickly,
-    // often within seconds" (`SetAlarmState`), so that span is the one every transition the
-    // clock owes takes.
-    wait_for_evaluation();
+    // The datapoint the alarm watches is what its next evaluation is owed from, so publishing
+    // one brings that evaluation forward and the state the evaluation computes takes the
+    // forced one back a span later: a datapoint under the threshold puts the alarm in OK.
+    // "Metric alarms returns to their actual state quickly, often within seconds."
+    // (`SetAlarmState`)
     publish(&router, "forced", &[datum(1.0, 0.0)]).await;
+    wait_for_evaluation();
     let described = ok(&router, "DescribeAlarms", &json!({"AlarmNames": ["forced"]})).await;
     assert_eq!(
         described["MetricAlarms"][0]

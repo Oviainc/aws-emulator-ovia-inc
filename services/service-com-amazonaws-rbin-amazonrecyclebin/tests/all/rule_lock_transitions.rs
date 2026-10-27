@@ -135,7 +135,7 @@ async fn lock_rule_locks_every_region_level_rule_and_persists_its_configuration(
     for (case, resource_type, unlock_delay, description) in rows {
         let mut body = json!({
             "ResourceType": resource_type,
-            "RetentionPeriod": retention(30),
+            "RetentionPeriod": retention(7),
         });
         if let Some(text) = description {
             body["Description"] = json!(text);
@@ -234,7 +234,7 @@ async fn lock_rule_locks_every_region_level_rule_and_persists_its_configuration(
         for (operation, (status, body)) in [
             (
                 "UpdateRule",
-                update_rule(&router, &identifier, json!({ "RetentionPeriod": retention(31) })).await,
+                update_rule(&router, &identifier, json!({ "RetentionPeriod": retention(5) })).await,
             ),
             ("DeleteRule", delete_rule(&router, &identifier).await),
         ] {
@@ -265,7 +265,7 @@ async fn lock_rule_is_refused_for_every_rule_that_cannot_be_locked() {
         "tag-level rule",
         json!({
             "ResourceType": "EBS_SNAPSHOT",
-            "RetentionPeriod": retention(10),
+            "RetentionPeriod": retention(7),
             "ResourceTags": [{ "ResourceTagKey": "retain", "ResourceTagValue": "yes" }],
         }),
     )
@@ -275,7 +275,7 @@ async fn lock_rule_is_refused_for_every_rule_that_cannot_be_locked() {
         "region-level rule with exclusion tags",
         json!({
             "ResourceType": "EBS_VOLUME",
-            "RetentionPeriod": retention(10),
+            "RetentionPeriod": retention(7),
             "ExcludeResourceTags": [{ "ResourceTagKey": "scratch" }],
         }),
     )
@@ -285,7 +285,7 @@ async fn lock_rule_is_refused_for_every_rule_that_cannot_be_locked() {
         "already locked rule",
         json!({
             "ResourceType": "EC2_IMAGE",
-            "RetentionPeriod": retention(10),
+            "RetentionPeriod": retention(7),
             "LockConfiguration": lock_configuration(UNLOCK_DELAY_MIN),
         }),
     )
@@ -503,7 +503,7 @@ async fn unlock_rule_is_refused_unless_the_rule_is_locked() {
     let never_locked = created_identifier(
         &router,
         "never locked rule",
-        json!({ "ResourceType": "EBS_VOLUME", "RetentionPeriod": retention(10) }),
+        json!({ "ResourceType": "EBS_VOLUME", "RetentionPeriod": retention(7) }),
     )
     .await;
     let pending_unlock = created_identifier(
@@ -511,7 +511,7 @@ async fn unlock_rule_is_refused_unless_the_rule_is_locked() {
         "rule already inside its unlock delay",
         json!({
             "ResourceType": "EBS_SNAPSHOT",
-            "RetentionPeriod": retention(10),
+            "RetentionPeriod": retention(7),
             "LockConfiguration": lock_configuration(UNLOCK_DELAY_MIN),
         }),
     )

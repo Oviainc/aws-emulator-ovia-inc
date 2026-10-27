@@ -215,7 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // The merge is computed first, and the whole store is still free to be read
         // afterwards, because the cross-rule quota below counts the OTHER rules.
-        let (merged_resource_tags, merged_exclude_resource_tags, holds_lock) = {
+        let (merged_resource_tags, merged_exclude_resource_tags, holds_lock, resource_type) = {
             let Some(rule) = store.rule_mut(&region, &input.identifier) else {
                 return Err(UpdateRuleErrorModeled::ResourceNotFoundException(
                     crate::state::rule_not_found(&input.identifier),
@@ -247,8 +247,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .exclude_resource_tags
                     .unwrap_or_else(|| rule.exclude_resource_tags.clone()),
                 rule.holds_lock(),
+                rule.resource_type.clone(),
             )
         };
+        // How long Recycle Bin can retain a deleted resource depends on WHAT the rule
+        // retains, and the modelled `@range` on the period is the union over every
+        // resource type, so a period inside that range can still be one this rule's type
+        // does not support. The type is the STORED one — it cannot be updated — and the
+        // refusal comes before any write, so a rule a request like this addresses keeps
+        // the period, the status and the lock state it already had.
+        if let Some(retention_period) = input.retention_period.as_ref() {
+            if let Some(refusal) =
+                crate::state::retention_period_unsupported(&resource_type, retention_period)
+            {
+                return Err(UpdateRuleErrorModeled::ValidationException(refusal).into());
+            }
+        }
         if !merged_resource_tags.is_empty() && !merged_exclude_resource_tags.is_empty() {
             // A rule the MODEL cannot express, stated in the same envelope a modelled
             // constraint takes: the member that cannot hold, and what it must satisfy.

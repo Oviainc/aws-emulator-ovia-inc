@@ -901,7 +901,10 @@ fn is_resource_arn_byte(byte: u8) -> bool {
 /// 1. the value is inside the SYNTAX this service's own resource ARNs take — the
 ///    modelled `ResourceArn` `length 1..2048` and [`RESOURCE_ARN_CHARACTER_CLASS`];
 /// 2. it parses as a resource ARN whose vendor field is this service's
-///    [`ARN_NAMESPACE`] — the one ARN parse, [`::service_common::arn`].
+///    [`ARN_NAMESPACE`] — the one ARN parse, [`::service_common::arn`], refused
+///    with the one shared sentence,
+///    [`::service_common::validation_message::expected_vendor`], so this service
+///    and every other that refuses a foreign ARN word it identically.
 ///
 /// Everything that passes both is a resource ARN this API can address, and whether
 /// it names a stored record is then the store's question
@@ -916,9 +919,9 @@ pub fn validate_resource_arn(candidate: &str) -> Result<(), crate::scaffolded::B
         )));
     }
     if !::service_common::arn::is_resource_arn_of(candidate, ARN_NAMESPACE) {
-        return Err(crate::scaffolded::BadRequest::new(format!(
-            "Invalid input resource arn: expected vendor {ARN_NAMESPACE}"
-        )));
+        return Err(crate::scaffolded::BadRequest::new(
+            ::service_common::validation_message::expected_vendor(ARN_NAMESPACE),
+        ));
     }
     Ok(())
 }

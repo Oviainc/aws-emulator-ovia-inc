@@ -21,8 +21,8 @@ use serde_json::{json, Value};
 use crate::error_response_bodies::{error_code, message};
 use crate::resource_tags::percent_encode;
 use crate::retention_rule_lifecycle::{
-    call_signed_for, lock_configuration, list_of, retention, router, RESOURCE_TYPES,
-    UNLOCK_DELAY_MIN,
+    call_signed_for, lock_configuration, list_of, retention, router, supported_retention,
+    RESOURCE_TYPES, UNLOCK_DELAY_MIN,
 };
 use service_com_amazonaws_rbin_amazonrecyclebin::state::{
     MAX_RULES, MAX_RULES_PER_RESOURCE_TAG, RULE_STORE_LIMIT,
@@ -223,7 +223,7 @@ async fn a_rule_is_reported_only_through_the_region_it_was_created_in() {
             &case,
             json!({
                 "ResourceType": resource_type,
-                "RetentionPeriod": retention(1 + row as i64),
+                "RetentionPeriod": retention(supported_retention(resource_type, row)),
             }),
         )
         .await;
@@ -387,7 +387,7 @@ async fn the_rules_per_region_quota_counts_only_the_signed_region() {
             saturated,
             json!({
                 "ResourceType": resource_type,
-                "RetentionPeriod": retention(1 + (nth as i64 % 3650)),
+                "RetentionPeriod": retention(supported_retention(resource_type, nth)),
             }),
         )
         .await;
@@ -530,7 +530,7 @@ async fn the_store_ceiling_bounds_the_whole_store_however_the_region_varies() {
                 region,
                 json!({
                     "ResourceType": resource_type,
-                    "RetentionPeriod": retention(1 + (nth as i64 % 3650)),
+                    "RetentionPeriod": retention(supported_retention(resource_type, nth)),
                 }),
             )
             .await;

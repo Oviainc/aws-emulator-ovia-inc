@@ -413,6 +413,11 @@ pub const DOMAIN_STATUS_CREATING: &str = "CREATING";
 /// [`crate::ops::types::DOMAIN_STATUS_TYPE_VALUES`].
 pub const DOMAIN_STATUS_ACTIVE: &str = "ACTIVE";
 
+/// The `DomainStatusType` a domain whose configuration has just changed is in,
+/// until the clock makes it [`DOMAIN_STATUS_ACTIVE`] again: one of the modelled
+/// [`crate::ops::types::DOMAIN_STATUS_TYPE_VALUES`].
+pub const DOMAIN_STATUS_UPDATING: &str = "UPDATING";
+
 /// How long a created domain stays `CREATING` before the clock owes it `ACTIVE`.
 ///
 /// A chosen span, not a documented duration: `CreateUserPoolDomain` only says
@@ -1828,6 +1833,16 @@ impl UserPool {
             .find(|stored| stored.domain == domain)
     }
 
+    /// This pool's domain under the name `domain`, mutably — the same lookup as
+    /// [`UserPool::domain_named`], for an operation that writes the stored
+    /// domain back.
+    pub fn domain_named_mut(&mut self, domain: &str) -> Option<&mut UserPoolDomain> {
+        [self.domain.as_mut(), self.custom_domain.as_mut()]
+            .into_iter()
+            .flatten()
+            .find(|stored| stored.domain == domain)
+    }
+
     /// Take this pool's domain under the name `domain` out of the pool — its
     /// prefix domain or its custom one — and hand back the record that was
     /// stored, or `None` when this pool holds no domain of that name.
@@ -2174,9 +2189,13 @@ pub struct UserPoolDomain {
     pub cloud_front_distribution: Option<String>,
     /// When the domain was created.
     pub creation_date: SystemTime,
-    /// The instant the clock owes this domain's `CREATING` -> `ACTIVE` move.
-    /// Stored, never slept on: a read computes the status from it.
+    /// The instant the clock owes this domain's move to `ACTIVE`. Stored, never
+    /// slept on: a read computes the status from it.
     pub active_at: SystemTime,
+    /// The `DomainStatusType` this domain reports until [`Self::active_at`] is
+    /// due: `CREATING` for a domain that was just created, `UPDATING` for one
+    /// whose configuration was just changed.
+    pub status_until_active: &'static str,
 }
 
 impl UserPoolDomain {
@@ -2205,6 +2224,7 @@ impl UserPoolDomain {
             cloud_front_distribution,
             creation_date: now,
             active_at: now + DOMAIN_ACTIVATION_SPAN,
+            status_until_active: DOMAIN_STATUS_CREATING,
         }
     }
 
@@ -2213,13 +2233,25 @@ impl UserPoolDomain {
         self.custom_domain_config.is_some()
     }
 
-    /// This domain's `DomainStatusType` as of `now`: `CREATING` until the clock
-    /// has made its activation due, `ACTIVE` from then on.
+    /// Record that this domain's configuration changed at `now`, which the
+    /// service does not serve instantly: "Changes to the domain branding version
+    /// take up to one minute to take effect for a prefix domain and up to five
+    /// minutes for a custom domain" (`UpdateUserPoolDomain`), so the domain is
+    /// `UPDATING` until the clock makes it `ACTIVE` again one
+    /// [`DOMAIN_ACTIVATION_SPAN`] from `now`.
+    pub fn begin_update(&mut self, now: SystemTime) {
+        self.active_at = now + DOMAIN_ACTIVATION_SPAN;
+        self.status_until_active = DOMAIN_STATUS_UPDATING;
+    }
+
+    /// This domain's `DomainStatusType` as of `now`: the status its last write
+    /// left it in until the clock has made its activation due, `ACTIVE` from
+    /// then on.
     pub fn status(&self, now: SystemTime) -> &'static str {
         if now >= self.active_at {
             DOMAIN_STATUS_ACTIVE
         } else {
-            DOMAIN_STATUS_CREATING
+            self.status_until_active
         }
     }
 

@@ -5,7 +5,10 @@
 //! to, so `DescribeJobRun` and `ListJobRuns` read it back rather than recomputing it. The
 //! run starts `PENDING` and the clock owes it `RUNNING`
 //! ([`crate::state::TRANSITION_SPAN`]) — but only once the cluster has a free running
-//! slot, when it configures a `schedulerConfiguration.maxConcurrentJobRuns`. A
+//! slot, when it configures a `schedulerConfiguration.maxConcurrentJobRuns`. The
+//! admission is what starts the run's driver, so from there the clock owes the run its
+//! outcome in turn ([`crate::state::JOB_OUTCOME_SPAN`]), and a run reaches a terminal
+//! state with a `finishedAt` without anybody cancelling it. A
 //! submission into a queue that is already `maxInQueueJobRuns` deep is refused, and so is
 //! one that names no job template and does not itself carry the `executionRoleArn`,
 //! `releaseLabel` and `jobDriver` a run cannot exist without.
@@ -445,7 +448,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A submitted job run is accepted PENDING and reaches RUNNING on the clock,
             // so a caller that reads straight back sees the transient state. The
             // admission is gated by the cluster's `maxConcurrentJobRuns`, so a run with
-            // no free slot waits in PENDING past its due instant (`state::settle`).
+            // no free slot waits in PENDING past its due instant (`state::settle`), and
+            // the admission is what makes the run's outcome due in turn.
             state: crate::state::JOB_PENDING.to_string(),
             client_token: input.client_token.clone(),
             request_fingerprint: fingerprint,
@@ -456,7 +460,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             retry_policy_configuration: candidate.retry_policy_configuration,
             created_at_millis: crate::state::now_millis(),
             finished_at_millis: None,
+            // A run that is only waiting has no detail beyond its state, has not failed,
+            // and has had no attempt made on its driver yet: each of the three is filled
+            // in by the transitions the clock owes this run.
             state_details: None,
+            failure_reason: None,
+            attempt_count: 0,
             tags: candidate.tags.unwrap_or_default(),
             sequence,
             // The principal this request authenticated as, recorded now so every later

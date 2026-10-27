@@ -236,6 +236,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             now + crate::state::STATUS_TRANSITION,
         )
         .map_err(|fault| lift_policy_fault(&input.resource_arn, fault))?;
+        // "Set this parameter to true to confirm that you want to remove your
+        // permissions to change the policy of this resource in the future"
+        // (`ConfirmRemoveSelfResourceAccess`): a document that denies the caller the
+        // policy-management actions does exactly that, so without the confirmation it
+        // is refused rather than attached — once attached, no later call could take it
+        // off again.
+        if !input.confirm_remove_self_resource_access
+            && crate::state::locks_the_caller_out(&policy, &resource.arn)
+        {
+            return Err(crate::scaffolded::Scaffolded::access_denied(
+                "The new resource policy will not allow you to update the resource policy in the \
+                 future.",
+            ));
+        }
 
         let mut store = state.lock();
         store.apply_due_transitions(now);

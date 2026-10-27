@@ -53,6 +53,8 @@ mod disable_alarm_actions;
 mod ec2_alarm_actions;
 #[path = "all/forced_state_actions.rs"]
 mod forced_state_actions;
+#[path = "all/forced_state_lifetime.rs"]
+mod forced_state_lifetime;
 #[path = "all/get_dashboard_reader.rs"]
 mod get_dashboard_reader;
 #[path = "all/harness.rs"]

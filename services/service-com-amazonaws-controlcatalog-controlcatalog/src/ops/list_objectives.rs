@@ -184,42 +184,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let state = state.lock();
 
-        // `ObjectiveFilter.Domains` is modeled as a list — `DomainResourceFilterList`
-        // carries no `@length`, so the boundary validator admits several entries — but
-        // its documentation is explicit that it carries one domain ARN at a time and
-        // that passing several is not supported, which is the constraint enforced here.
-        // An entry without an ARN names no domain to filter on. Either way the filter
-        // is one this operation does not accept, so both are refused with the service's
-        // one fixed invalid-filter sentence, which names neither the member nor the
-        // number of entries that were sent.
-        let mut domain_filter: Option<String> = None;
-        if let Some(filter) = input.objective_filter.as_ref() {
-            if let Some(domains) = filter.domains.as_ref() {
-                if domains.len() > 1 {
-                    return Err(ListObjectivesErrorModeled::ValidationException(
-                        ValidationException {
-                            message: Some(crate::service::INVALID_FILTER_MESSAGE.to_string()),
-                        },
-                    )
-                    .into());
-                }
-                if let Some(entry) = domains.first() {
-                    let Some(arn) = entry.arn.as_ref() else {
-                        return Err(ListObjectivesErrorModeled::ValidationException(
-                            ValidationException {
-                                message: Some(crate::service::INVALID_FILTER_MESSAGE.to_string()),
-                            },
-                        )
-                        .into());
-                    };
-                    // A filter ARN names a domain by the identifier it carries, not by
-                    // the partition it is written in, so it is read as the ARN the
-                    // catalog stores for that domain before anything is compared with
-                    // it — the identity rule GetControl applies to a control ARN.
-                    domain_filter = Some(crate::state::canonical_catalog_arn("domain", arn));
-                }
-            }
-        }
+        // `ObjectiveFilter.Domains` is one of this service's single-ARN resource
+        // filters: it carries one domain ARN at a time and that entry must name a
+        // domain. Which entry counts and which entries are acceptable, the sentence a
+        // filter outside that is refused with, and reading the accepted ARN by the
+        // domain's identity rather than by the partition it is written in, are all the
+        // one rule in `crate::state::single_resource_filter_arn` — shared with the
+        // filter ListCommonControls takes, because it is one rule for the class and not
+        // one per operation.
+        let domain_filter = crate::state::single_resource_filter_arn(
+            "domain",
+            input
+                .objective_filter
+                .as_ref()
+                .and_then(|filter| filter.domains.as_deref()),
+        )
+        .map_err(|refusal| {
+            ListObjectivesErrorModeled::ValidationException(ValidationException {
+                message: Some(refusal),
+            })
+        })?;
 
         let fingerprint = crate::state::filter_fingerprint(&[(
             "domains",

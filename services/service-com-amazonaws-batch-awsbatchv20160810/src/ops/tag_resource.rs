@@ -9,12 +9,14 @@
 //! resource's own record in [`crate::state`] — the map `ListTagsForResource` reports and
 //! every `Describe*` reader already reports, so there is no second copy.
 //!
-//! An ARN this service holds no resource for is refused with the modelled
-//! `ClientException` (HTTP 400), as is a merge that would leave one resource holding more
-//! tags than `TagrisTagsMap` can carry
-//! ([`crate::state::limits::MAX_TAGS_PER_RESOURCE`]), and a tag key or value outside the
-//! bounds that shape declares ([`crate::state::validate_tags`] — the boundary walk
-//! enforces the map's own length but does not reach the shapes inside it).
+//! A `resourceArn` this service holds no resource for is refused by the tag layer that
+//! resolves it, under that layer's not-found code
+//! ([`crate::state::unknown_resource_arn`]), as is a merge that would leave one resource
+//! holding more tags than `TagrisTagsMap` can carry
+//! ([`crate::state::limits::MAX_TAGS_PER_RESOURCE`]). A tag key or value outside the
+//! bounds that shape declares is the modelled `ClientException` (HTTP 400)
+//! ([`crate::state::validate_tags`] — the boundary walk enforces the map's own length but
+//! does not reach the shapes inside it).
 //!
 //! ## Shape of an operation
 //!
@@ -182,11 +184,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let Some(tags) = state.resource_tags_mut(&input.resource_arn) else {
-            return Err(TagResourceErrorModeled::ClientException(batch::not_found_exception(
-                "Resource",
-                &input.resource_arn,
-            ))
-            .into());
+            // A well-formed ARN that resolves to nothing is the tag layer's not-found,
+            // which is a different classification from the malformed ARN above.
+            return Err(batch::unknown_resource_arn());
         };
 
         // The merge, computed before anything is stored: a key the resource already
@@ -195,11 +195,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut merged = tags.clone().unwrap_or_default();
         merged.extend(input.tags);
         if merged.len() > batch::limits::MAX_TAGS_PER_RESOURCE {
-            let requested = merged.len();
-            return Err(TagResourceErrorModeled::ClientException(batch::client_exception(
-                batch::tag_limit_message(&input.resource_arn, requested),
-            ))
-            .into());
+            // The resultant tag set is what the ceiling is about, so a merge past it is
+            // the same refusal, in the same words, as a request that carries more tags
+            // than the map admits (`crate::service`).
+            return Err(batch::tag_set_limit_exceeded());
         }
         *tags = Some(merged);
 

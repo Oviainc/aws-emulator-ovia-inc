@@ -453,6 +453,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::unmodeled(code, 404, message));
         };
 
+        // "To retrieve the checksum, this parameter must be enabled"
+        // (`HeadObjectRequest$ChecksumMode`): the checksum the write stored with the object
+        // is reported only to a read that asked for it, and an object stored under no
+        // checksum algorithm reports none however the mode is set.
+        let reported = crate::state::reported_checksums(
+            object
+                .checksum
+                .as_ref()
+                .filter(|_| input.checksum_mode.is_some()),
+        );
+
         Ok(HeadObjectOutput {
             e_tag: Some(object.etag.clone()),
             content_length: Some(i64::try_from(object.body.len()).unwrap_or(i64::MAX)),
@@ -514,13 +525,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // slice does not serve is true of the object: it is a delete marker
             // (`DeleteMarker`, which a delete records none of), it is in an
             // S3 Intelligent-Tiering archive tier (`ArchiveStatus`, which no stored object
-            // here is: a restore is asked for on a storage CLASS), a checksum was uploaded
-            // with it (`Checksum*`,
-            // `ChecksumType`), metadata could not be decoded (`MissingMeta`), the read was
+            // here is: a restore is asked for on a storage CLASS), metadata could not be
+            // decoded (`MissingMeta`), the read was
             // partial (`ContentRange`, `PartsCount`), a customer-provided key encrypted it
             // (`SSECustomer*`, which `PutObject` refuses), it is replicated
             // (`ReplicationStatus`), it is locked (`ObjectLock*`) or the bucket is
             // Requester Pays (`RequestCharged`).
+            checksum_crc32: reported.crc32,
+            checksum_crc32_c: reported.crc32c,
+            checksum_crc64_nvme: reported.crc64nvme,
+            checksum_sha1: reported.sha1,
+            checksum_sha256: reported.sha256,
+            checksum_sha512: reported.sha512,
+            checksum_md5: reported.md5,
+            checksum_xxhash64: reported.xxhash64,
+            checksum_xxhash3: reported.xxhash3,
+            checksum_xxhash128: reported.xxhash128,
+            checksum_type: reported.checksum_type,
             ..HeadObjectOutput::default()
         })
     }
@@ -544,11 +565,16 @@ fn unserved_feature(input: &HeadObjectInput) -> Option<&'static str> {
             "SSECustomerAlgorithm",
         ),
         (input.sse_customer_key.is_some(), "SSECustomerKey"),
-        // Nothing here charges a requester or stores a checksum, so a request asking to
-        // be charged or to be answered with one is refused rather than answered as if it
-        // had been honoured.
+        // Nothing here charges a requester, so a request asking to be charged is refused
+        // rather than answered as if it had been honoured.
         (input.request_payer.is_some(), "RequestPayer"),
-        (input.checksum_mode.is_some(), "ChecksumMode"),
+        // `ChecksumMode` is NOT in this list: "to retrieve the checksum, this parameter must
+        // be enabled" (`HeadObjectRequest$ChecksumMode`) asks for the checksum the object
+        // was STORED with, which the write that stored it recorded when it named a checksum
+        // algorithm ([`crate::state::ObjectChecksum`]). So an enabled mode is honoured by
+        // reporting the checksum the store holds — and a read of an object stored without
+        // one reports no checksum and 200, which is what AWS answers for it; refusing the
+        // member would refuse every SDK that enables it by default.
     ]
     .into_iter()
     .find_map(|(asked, name)| asked.then_some(name))

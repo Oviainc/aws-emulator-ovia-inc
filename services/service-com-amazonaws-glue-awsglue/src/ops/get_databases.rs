@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDatabases
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDatabases`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDatabases::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Lists the databases actually stored in one Data Catalog, in folded-name order, and
+//! serves each of them through the SAME projection the single-database read serves
+//! ([`crate::state::DatabaseEntry::to_database`]), so a client that works from a listing
+//! is never less informed than one that re-reads each database: a member a create left
+//! unset stays absent on the listed element too, and one it set round-trips.
+//!
+//! `MaxResults` truncates the page and the returned `NextToken` is the last name on it,
+//! so the next call resumes at the first stored name strictly after it — which stays
+//! correct across databases created or deleted between two calls. A catalog this account
+//! holds but nothing has written a database into yet lists none, which is an empty page
+//! and not a miss; a `CatalogId` of another account is refused before any database is
+//! looked up, exactly as every other catalog read refuses one
+//! ([`crate::state::foreign_catalog_refusal`]).
+//!
+//! Every input member IS acted on: `CatalogId` selects the catalog, `MaxResults` and
+//! `NextToken` page, `AttributesToGet` projects each returned database (and its
+//! documented validation is enforced), and `ResourceShareType` selects which share of the
+//! catalog is listed — a stored database being federated exactly when it carries a
+//! `FederatedDatabase`, and none being foreign, because this store holds one account's
+//! catalog.
 //!
 //! ## Shape of an operation
 //!
@@ -91,6 +105,77 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The largest page this operation serves, and the page size it uses when the request
+/// names no `MaxResults`. Source: the model's `MaxResults` target `CatalogGetterPageSize`,
+/// whose range is 1..100.
+const MAX_PAGE_SIZE: i32 = 100;
+
+/// Which members of each `Database` the request asked for.
+///
+/// From `AttributesToGet`, which "doesn't accept an empty list" and whose "request must
+/// include the NAME" (`GetDatabasesRequest$AttributesToGet`); its member enum
+/// `DatabaseAttributes` declares exactly `NAME` and `TARGET_DATABASE`, so those two are
+/// the only values a request may name. Absent, the whole `Database` is returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Projection {
+    Full,
+    Name,
+    NameAndTargetDatabase,
+}
+
+impl Projection {
+    /// Narrow a rebuilt `Database` to the members this projection asked for.
+    fn apply(self, database: Database) -> Database {
+        match self {
+            Self::Full => database,
+            Self::Name => Database {
+                name: database.name,
+                ..Database::default()
+            },
+            Self::NameAndTargetDatabase => Database {
+                name: database.name,
+                target_database: database.target_database,
+                ..Database::default()
+            },
+        }
+    }
+}
+
+/// Which databases of the catalog the request lists at all, from `ResourceShareType`.
+///
+/// The member "[a]llows you to specify that you want to list the databases shared with
+/// your account": `FEDERATED` lists only the databases referencing an external entity,
+/// `FOREIGN` only the ones shared with this account from another, and `ALL` the shared
+/// ones as well as this account's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Share {
+    /// This account's own databases, which is what a request naming no share type lists.
+    Local,
+    /// Only databases that reference an entity outside the Glue Data Catalog.
+    Federated,
+    /// Only databases shared with this account from another one.
+    Foreign,
+    /// Both the shared and the local ones.
+    All,
+}
+
+impl Share {
+    /// Whether this share type admits a stored database. A stored database is federated
+    /// exactly when it carries a `FederatedDatabase`, and no stored database is foreign:
+    /// the store holds one account's catalog, so there is nothing in it shared from
+    /// another account — the same reading `SearchTables` gives the member. That is also
+    /// why [`Self::Local`] and [`Self::All`] admit the same databases here: `ALL` lists
+    /// the shared ones "as well as the databases in yor local account", and this store
+    /// holds only the latter. The two stay distinct because they are different questions.
+    fn admits(self, database: &crate::state::DatabaseEntry) -> bool {
+        match self {
+            Self::Local | Self::All => true,
+            Self::Federated => database.federated_database.is_some(),
+            Self::Foreign => false,
+        }
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -102,9 +187,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-glue-awsglue.json");
 // here — hence the `GetDatabasesError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.glue#GetDatabases")]
+//
+// `AccessDeniedException` — "Access to a resource was denied." — is widened in through
+// `extra_errors`: this SERVICE models the shape, but this operation's own `errors` list
+// omits it, and a cross-account read of a Data Catalog the caller holds no grant on is
+// refused as unauthorized rather than as a missing entity.
+#[smithy_macros::operation_error(
+    "com.amazonaws.glue#GetDatabases",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum GetDatabasesErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     EntityNotFoundException(EntityNotFoundException),
     FederationSourceException(FederationSourceException),
     FederationSourceRetryableException(FederationSourceRetryableException),
@@ -165,18 +259,165 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDatabases` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDatabasesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDatabases"))
+        // `AttributesToGet` projects each returned database. The model: it "doesn't accept
+        // an empty list" and "must include the NAME", and its member enum declares exactly
+        // `NAME` and `TARGET_DATABASE`.
+        let projection = match input.attributes_to_get.as_deref() {
+            None => Projection::Full,
+            Some([]) => {
+                return Err(GetDatabasesErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some("AttributesToGet does not accept an empty list".into()),
+                        from_federation_source: None,
+                    },
+                )
+                .into())
+            }
+            Some(attributes) => {
+                let wanted: Vec<&str> = attributes.iter().map(String::as_str).collect();
+                match wanted.as_slice() {
+                    ["NAME"] => Projection::Name,
+                    ["NAME", "TARGET_DATABASE"] | ["TARGET_DATABASE", "NAME"] => {
+                        Projection::NameAndTargetDatabase
+                    }
+                    _ => {
+                        return Err(GetDatabasesErrorModeled::InvalidInputException(
+                            InvalidInputException {
+                                message: Some(format!(
+                                    "AttributesToGet must include NAME; the valid combinations \
+                                     are NAME and NAME,TARGET_DATABASE, not {wanted:?}"
+                                )),
+                                from_federation_source: None,
+                            },
+                        )
+                        .into())
+                    }
+                }
+            }
+        };
+
+        let share = match input.resource_share_type.as_deref() {
+            None => Share::Local,
+            Some("ALL") => Share::All,
+            Some("FEDERATED") => Share::Federated,
+            Some("FOREIGN") => Share::Foreign,
+            Some(other) => {
+                return Err(GetDatabasesErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(format!(
+                            "ResourceShareType {other} is not one of FEDERATED, FOREIGN, ALL"
+                        )),
+                        from_federation_source: None,
+                    },
+                )
+                .into())
+            }
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetDatabasesErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue Data Catalog store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        let region = crate::state::request_region(ctx.parts());
+        // Whether the caller may read this catalog at all is decided BEFORE any database
+        // is looked up: a `CatalogId` of another account is reachable only through that
+        // catalog's own resource policy (see `crate::state::foreign_catalog_refusal`).
+        if let Some(message) =
+            crate::state::foreign_catalog_refusal(&catalog_id, &region, Self::NAME)
+        {
+            return Err(GetDatabasesErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // Absent `MaxResults`, page at the largest value the model accepts for it
+        // (`CatalogGetterPageSize`, range 1..100). The clamp re-states that range in the
+        // handler so the page size is never 0 even if the boundary validator ever stops
+        // enforcing it.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(MAX_PAGE_SIZE as usize)
+            .clamp(1, MAX_PAGE_SIZE as usize);
+
+        // The page is built under the store's guard and the guard released before KMS is
+        // asked anything: the key material of the databases on the page travels out with
+        // it. Read-only: the stored definitions are projected out and nothing is written.
+        let (database_list, next_token, encryptions) = {
+            let store = state.lock();
+            // A catalog this account holds but nothing has written a database into yet
+            // holds none, which is an empty listing and not a miss.
+            let matching: Vec<&crate::state::DatabaseEntry> = store
+                .catalogs
+                .get(&catalog_id)
+                .map(|catalog| catalog.databases_ordered())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|database| share.admits(database))
+                .collect();
+
+            // The token is the last name of the previous page, so the page resumes at the
+            // first stored name strictly after it — which stays correct across databases
+            // created or deleted between two calls.
+            let start = match input.next_token.as_deref() {
+                Some(cursor) => {
+                    matching.partition_point(|database| database.name.as_str() <= cursor)
+                }
+                None => 0,
+            };
+            let end = start.saturating_add(page_size).min(matching.len());
+
+            let page = &matching[start..end];
+            // The listing serves the SAME projection as the single-database read, element
+            // by element, so only `AttributesToGet` narrows an element, and then to exactly
+            // the members it named.
+            let database_list: Vec<Database> = page
+                .iter()
+                .map(|database| projection.apply(database.to_database()))
+                .collect();
+            // The key material of every database ON THE PAGE: this read answers each of
+            // them, so each has to be decrypted before any is served.
+            let encryptions: Vec<crate::state::catalog_encryption::ObjectEncryption> = page
+                .iter()
+                .filter_map(|database| database.encryption.clone())
+                .collect();
+            // The token names the last entry of the page, taken from the page itself so
+            // there is no index arithmetic to underflow on an empty page, and is absent
+            // once the page reaches the end of the listing.
+            let next_token = if end < matching.len() {
+                page.last().map(|database| database.name.clone())
+            } else {
+                None
+            };
+            (database_list, next_token, encryptions)
+        };
+
+        // A database written while its catalog encrypted catalog writes under a KMS key is
+        // listed only while that key is usable, exactly as the single-database read serves
+        // it (`crate::ops::get_database`): the page is answered once KMS has opened the
+        // data key of every database on it, and KMS's own refusal is relayed as this
+        // operation's `GlueEncryptionException`.
+        if let Err(message) =
+            crate::state::catalog_encryption::unseal_all(ctx, &region, &encryptions).await
+        {
+            return Err(GetDatabasesErrorModeled::GlueEncryptionException(
+                GlueEncryptionException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        Ok(GetDatabasesOutput {
+            database_list,
+            next_token,
+        })
     }
 }

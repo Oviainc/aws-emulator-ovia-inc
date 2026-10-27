@@ -106,6 +106,10 @@ fn object(body: &[u8]) -> Object {
         annotations: BTreeMap::new(),
         // Nor an ACL; `PutObjectAcl` is what sets one.
         acl: None,
+        // And no checksum: a write that names no checksum algorithm stores none.
+        checksum: None,
+        // Nor is it assembled from parts: one write stored it whole.
+        parts: Vec::new(),
     }
 }
 

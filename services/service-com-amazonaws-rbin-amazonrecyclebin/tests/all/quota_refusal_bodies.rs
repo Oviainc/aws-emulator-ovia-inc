@@ -28,8 +28,8 @@ use serde_json::{json, Value};
 use crate::error_response_bodies::{error_code, message};
 use crate::resource_tags::{list_tags, tag_resource};
 use crate::retention_rule_lifecycle::{
-    create_rule, delete_rule, get_rule, list_of, list_rules, retention, router, RESOURCE_TYPES,
-    RETENTION_VALUE_MAX,
+    create_rule, delete_rule, get_rule, list_of, list_rules, retention, router, supported_retention,
+    supported_retention_max, RESOURCE_TYPES,
 };
 use service_com_amazonaws_rbin_amazonrecyclebin::ops::types::{
     ServiceQuotaExceededException, SERVICE_QUOTA_EXCEEDED_EXCEPTION_REASON_VALUES,
@@ -337,11 +337,12 @@ async fn create_rule_answers_one_rules_per_region_quota_body() {
     let router = router();
     // Fill the Region to its published quota of retention rules.
     for nth in 0..MAX_RULES {
+        let resource_type = RESOURCE_TYPES[nth % RESOURCE_TYPES.len()];
         let (status, body) = create_rule(
             &router,
             json!({
-                "ResourceType": RESOURCE_TYPES[nth % RESOURCE_TYPES.len()],
-                "RetentionPeriod": retention(1 + (nth as i64 % RETENTION_VALUE_MAX)),
+                "ResourceType": resource_type,
+                "RetentionPeriod": retention(supported_retention(resource_type, nth)),
             }),
         )
         .await;
@@ -369,7 +370,7 @@ async fn create_rule_answers_one_rules_per_region_quota_body() {
             "a rule with tags past the quota",
             json!({
                 "ResourceType": RESOURCE_TYPES[1],
-                "RetentionPeriod": retention(RETENTION_VALUE_MAX),
+                "RetentionPeriod": retention(supported_retention_max(RESOURCE_TYPES[1])),
                 "Tags": tag_list(&plain_tags(3)),
                 "Description": "one past the quota",
             }),

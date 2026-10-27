@@ -25,7 +25,8 @@ use service_com_amazonaws_rbin_amazonrecyclebin::state::{
 
 use super::retention_rule_lifecycle::{
     RESOURCE_TYPES, RETENTION_VALUE_MAX, RETENTION_VALUE_MIN, UNLOCK_DELAY_MIN, call, create_rule,
-    delete_rule, get_rule, list_of, list_rules, lock_configuration, retention, router, update_rule,
+    delete_rule, get_rule, list_of, list_rules, lock_configuration, retention, router,
+    supported_retention, supported_retention_max, update_rule,
 };
 
 /// The envelope every constraint refusal opens with, for a request that violates one
@@ -95,10 +96,10 @@ async fn a_new_rule_is_pending_and_the_clock_makes_it_available() {
             }),
         ),
         (
-            "region-level rule at the maximum retention period",
+            "region-level rule at the maximum retention period its type supports",
             serde_json::json!({
                 "ResourceType": "EBS_VOLUME",
-                "RetentionPeriod": retention(RETENTION_VALUE_MAX),
+                "RetentionPeriod": retention(supported_retention_max("EBS_VOLUME")),
             }),
         ),
         (
@@ -122,7 +123,7 @@ async fn a_new_rule_is_pending_and_the_clock_makes_it_available() {
             "locked rule",
             serde_json::json!({
                 "ResourceType": "EBS_VOLUME",
-                "RetentionPeriod": retention(366),
+                "RetentionPeriod": retention(supported_retention("EBS_VOLUME", 5)),
                 "LockConfiguration": lock_configuration(UNLOCK_DELAY_MIN),
             }),
         ),
@@ -205,7 +206,7 @@ async fn an_absent_rule_answers_the_not_exist_message_composed_from_the_request(
     assert_eq!(status, 201, "setup: expected HTTP 201 from CreateRule, got {status}");
     let (status, deleted_rule) = create_rule(
         &router,
-        serde_json::json!({ "ResourceType": "EBS_VOLUME", "RetentionPeriod": retention(9) }),
+        serde_json::json!({ "ResourceType": "EBS_VOLUME", "RetentionPeriod": retention(6) }),
     )
     .await;
     assert_eq!(status, 201, "setup: expected HTTP 201 from CreateRule, got {status}");

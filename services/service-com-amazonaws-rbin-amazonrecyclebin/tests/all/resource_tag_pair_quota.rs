@@ -25,7 +25,8 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::retention_rule_lifecycle::{
-    create_rule, delete_rule, get_rule, list_of, list_rules, retention, router, update_rule,
+    create_rule, delete_rule, get_rule, list_of, list_rules, retention, router,
+    supported_retention, update_rule,
 };
 use service_com_amazonaws_rbin_amazonrecyclebin::state::{
     MAX_RULES_PER_RESOURCE_TAG, RULE_STATUS_AVAILABLE, STATUS_TRANSITION,
@@ -325,7 +326,10 @@ async fn update_rule_is_refused_when_it_would_oversubscribe_a_resource_tag_pair(
         let (status, updated) = update_rule(
             &router,
             &identifier,
-            json!({ "Description": "still updatable", "RetentionPeriod": retention(30) }),
+            json!({
+                "Description": "still updatable",
+                "RetentionPeriod": retention(supported_retention(resource_type, 30)),
+            }),
         )
         .await;
         assert_eq!(

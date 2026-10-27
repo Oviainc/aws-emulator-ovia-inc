@@ -444,6 +444,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .or_else(|| object.expires.clone());
 
+        // "To retrieve the checksum, this mode must be enabled"
+        // (`GetObjectRequest$ChecksumMode`): the checksum the write stored with the object is
+        // reported only to a read that asked for it, through the one mapping `HeadObject`
+        // reports it through, so a GET and a HEAD of the same version cannot disagree about
+        // it. An object stored under no checksum algorithm reports none however the mode is
+        // set.
+        let reported = crate::state::reported_checksums(
+            object
+                .checksum
+                .as_ref()
+                .filter(|_| input.checksum_mode.is_some()),
+        );
+
         Ok(GetObjectOutput {
             body: object.body.clone(),
             // `Content-Length` is the length of the body actually being returned.
@@ -515,13 +528,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // it is reported rather than being invented: `AcceptRanges` would advertise
             // the ranged reads refused above, `DeleteMarker` needs a delete marker (a
             // delete records none, so no read can be of one), `ArchiveStatus` needs an
-            // S3 Intelligent-Tiering archive tier, the checksum members need a checksum
-            // `PutObject` did
-            // not compute, the SSE-C members are refused at write time, `PartsCount` needs
+            // S3 Intelligent-Tiering archive tier,
+            // the SSE-C members are refused at write time, `PartsCount` needs
             // a multipart upload, `ContentRange` belongs to a ranged read, `MissingMeta`
             // counts unreadable metadata headers (there are none), `ReplicationStatus`
             // needs a replication configuration and `RequestCharged` a Requester Pays
             // charge this emulator does not model.
+            checksum_crc32: reported.crc32,
+            checksum_crc32_c: reported.crc32c,
+            checksum_crc64_nvme: reported.crc64nvme,
+            checksum_sha1: reported.sha1,
+            checksum_sha256: reported.sha256,
+            checksum_sha512: reported.sha512,
+            checksum_md5: reported.md5,
+            checksum_xxhash64: reported.xxhash64,
+            checksum_xxhash3: reported.xxhash3,
+            checksum_xxhash128: reported.xxhash128,
+            checksum_type: reported.checksum_type,
             ..GetObjectOutput::default()
         })
     }

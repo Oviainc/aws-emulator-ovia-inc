@@ -831,9 +831,13 @@ impl FindingsReport {
 
     /// Whether the profile window this report analysed overlaps the closed interval
     /// `[start, end]` — the time range a listing asks about.
+    ///
+    /// Both bound tests go through [`instant_key`], so a window that ends a fraction of
+    /// a microsecond before the range starts (or begins a fraction of a microsecond
+    /// after it ends) is excluded rather than collapsing onto the bound.
     pub fn overlaps(&self, start: DateTime, end: DateTime) -> bool {
-        self.profile_end_time.as_secs_f64() >= start.as_secs_f64()
-            && self.profile_start_time.as_secs_f64() <= end.as_secs_f64()
+        instant_key(self.profile_end_time) >= instant_key(start)
+            && instant_key(self.profile_start_time) <= instant_key(end)
     }
 }
 
@@ -1208,10 +1212,12 @@ impl ProfilingGroup {
             .iter()
             .filter(|report| keep(report))
             .collect();
+        // Instants are ordered through `instant_key`, exact at nanosecond resolution, so
+        // two analysed windows starting a fraction of a microsecond apart still order by
+        // window rather than falling through to the id tie-break.
         reports.sort_by(|left, right| {
-            left.profile_start_time
-                .as_secs_f64()
-                .total_cmp(&right.profile_start_time.as_secs_f64())
+            instant_key(left.profile_start_time)
+                .cmp(&instant_key(right.profile_start_time))
                 .then_with(|| left.id.cmp(&right.id))
         });
         reports
@@ -1247,17 +1253,22 @@ impl ProfilingGroup {
     /// profile ([`AgentProfile::is_aggregated`]) is not one `GetProfile` can serve: the
     /// operation reports the aggregated profile of a window, and there is none covering
     /// a profile whose aggregation is still pending.
+    ///
+    /// Both inclusive-bound tests go through [`instant_key`], so a receipt time a
+    /// fraction of a microsecond outside the requested window is excluded rather than
+    /// comparing equal to the bound.
     pub fn latest_profile_in(
         &self,
         start: Option<DateTime>,
         end: Option<DateTime>,
         at: DateTime,
     ) -> Option<&AgentProfile> {
+        let (lower, upper) = (start.map(instant_key), end.map(instant_key));
         self.profiles.iter().rfind(|profile| {
-            let received = profile.received_at.as_secs_f64();
+            let received = instant_key(profile.received_at);
             profile.is_aggregated(at)
-                && start.is_none_or(|s| received >= s.as_secs_f64())
-                && end.is_none_or(|e| received <= e.as_secs_f64())
+                && lower.is_none_or(|s| received >= s)
+                && upper.is_none_or(|e| received <= e)
         })
     }
 }
@@ -1676,8 +1687,12 @@ impl ComAmazonawsCodeguruprofilerCodeguruprofilerState {
     /// The oldest retained profile anywhere in the store, as (group name, index),
     /// skipping the newest profile of `keep_newest_of` so a post is never evicted by
     /// its own budget pass.
+    ///
+    /// Receipt times are ordered through [`instant_key`], exact at nanosecond
+    /// resolution, so the oldest of two profiles received a fraction of a microsecond
+    /// apart is the one that really is older.
     fn oldest_evictable_profile(&self, keep_newest_of: &str) -> Option<(String, usize)> {
-        let mut oldest: Option<(String, usize, f64)> = None;
+        let mut oldest: Option<(String, usize, (i64, u32))> = None;
         for (name, group) in &self.groups {
             let protected = if name == keep_newest_of {
                 group.profiles.len().saturating_sub(1)
@@ -1688,7 +1703,7 @@ impl ComAmazonawsCodeguruprofilerCodeguruprofilerState {
                 if index == protected {
                     continue;
                 }
-                let at = profile.received_at.as_secs_f64();
+                let at = instant_key(profile.received_at);
                 if oldest
                     .as_ref()
                     .is_none_or(|(_, _, candidate)| at < *candidate)

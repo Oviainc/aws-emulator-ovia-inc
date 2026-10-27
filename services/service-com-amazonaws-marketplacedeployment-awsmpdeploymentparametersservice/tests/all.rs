@@ -21,6 +21,8 @@ mod deployment_parameter_expiry;
 mod deployment_parameter_identity_key;
 #[path = "all/deployment_parameters.rs"]
 mod deployment_parameters;
+#[path = "all/expected_vendor_sentence.rs"]
+mod expected_vendor_sentence;
 #[path = "all/expiration_date_wire_form.rs"]
 mod expiration_date_wire_form;
 #[path = "all/front_door_forbidden.rs"]

@@ -851,7 +851,9 @@ async fn update_table_moves_the_capacity_it_is_given() {
                     },
                 ],
             }),
-            "ValidationException",
+            // A second index to create in one call is over the per-call index
+            // lifecycle limit, which is the control plane's limit error.
+            "LimitExceededException",
         ),
     ];
     for (case, request_region, body, expected_code) in refusals {

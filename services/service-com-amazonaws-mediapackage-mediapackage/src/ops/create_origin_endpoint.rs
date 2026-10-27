@@ -353,18 +353,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at: crate::state::now_iso8601(),
             hls_package: input.hls_package.clone(),
             dash_package: input.dash_package.clone(),
-            cmaf_package: input.cmaf_package.as_ref().map(|params| {
-                // A child manifest sent without a `ManifestName` inherits the endpoint's
-                // effective one, resolved just above, so the name and the derived child URL
-                // agree with the endpoint's own.
-                crate::state::stored_cmaf_package(
-                    params,
-                    &region,
-                    &input.channel_id,
-                    &input.id,
-                    &manifest_name,
-                )
-            }),
+            // The CMAF package is STORED as what the service derives from these
+            // parameters, so the parameters are what the record keeps and the package
+            // itself is materialised from them below, by the one function every write of
+            // an endpoint re-derives it with.
+            cmaf_package_parameters: input.cmaf_package.clone(),
+            cmaf_package: None,
             mss_package: input.mss_package.clone(),
             authorization: input.authorization.clone(),
             origination: input.origination.clone(),
@@ -375,6 +369,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             manifest_name: Some(manifest_name),
             id: input.id.clone(),
         };
+        // A child manifest sent without a `ManifestName` inherits the endpoint's effective
+        // one, which the record now carries, so the name and the derived child URL agree
+        // with the endpoint's own.
+        crate::state::rederive_cmaf_package(&mut record);
         // MediaPackage does not store the endpoint as the request wrote it: every optional
         // configuration member the request left unset is server-filled with that member's
         // default FIRST, so the stored record — and therefore every later projection of it

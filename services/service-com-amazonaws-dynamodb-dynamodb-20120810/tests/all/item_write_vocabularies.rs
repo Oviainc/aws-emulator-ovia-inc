@@ -49,27 +49,27 @@ async fn legacy_attribute_updates_and_update_expressions_leave_the_same_item() {
     let mutations = vec![
         Mutation {
             case: "ADD adds to a number",
-            before: json!({"counter": {"N": "10"}}),
-            legacy: json!({"counter": {"Action": "ADD", "Value": {"N": "5"}}}),
-            expression: "ADD counter :operand",
+            before: json!({"counters": {"N": "10"}}),
+            legacy: json!({"counters": {"Action": "ADD", "Value": {"N": "5"}}}),
+            expression: "ADD counters :operand",
             values: json!({":operand": {"N": "5"}}),
-            after: json!({"counter": {"N": "15"}}),
+            after: json!({"counters": {"N": "15"}}),
         },
         Mutation {
             case: "ADD of a negative number subtracts",
-            before: json!({"counter": {"N": "10"}}),
-            legacy: json!({"counter": {"Action": "ADD", "Value": {"N": "-4.5"}}}),
-            expression: "ADD counter :operand",
+            before: json!({"counters": {"N": "10"}}),
+            legacy: json!({"counters": {"Action": "ADD", "Value": {"N": "-4.5"}}}),
+            expression: "ADD counters :operand",
             values: json!({":operand": {"N": "-4.5"}}),
-            after: json!({"counter": {"N": "5.5"}}),
+            after: json!({"counters": {"N": "5.5"}}),
         },
         Mutation {
             case: "ADD on an attribute that does not exist stores the value",
             before: json!({}),
-            legacy: json!({"counter": {"Action": "ADD", "Value": {"N": "7"}}}),
-            expression: "ADD counter :operand",
+            legacy: json!({"counters": {"Action": "ADD", "Value": {"N": "7"}}}),
+            expression: "ADD counters :operand",
             values: json!({":operand": {"N": "7"}}),
-            after: json!({"counter": {"N": "7"}}),
+            after: json!({"counters": {"N": "7"}}),
         },
         Mutation {
             case: "ADD unions a string set, keeping the stored order",
@@ -105,11 +105,11 @@ async fn legacy_attribute_updates_and_update_expressions_leave_the_same_item() {
         },
         Mutation {
             case: "PUT overwrites a scalar",
-            before: json!({"data": {"S": "before"}}),
-            legacy: json!({"data": {"Action": "PUT", "Value": {"S": "after"}}}),
-            expression: "SET data = :operand",
+            before: json!({"payload": {"S": "before"}}),
+            legacy: json!({"payload": {"Action": "PUT", "Value": {"S": "after"}}}),
+            expression: "SET payload = :operand",
             values: json!({":operand": {"S": "after"}}),
-            after: json!({"data": {"S": "after"}}),
+            after: json!({"payload": {"S": "after"}}),
         },
         Mutation {
             case: "PUT with no Action named defaults to PUT and creates the attribute",
@@ -155,9 +155,9 @@ async fn legacy_attribute_updates_and_update_expressions_leave_the_same_item() {
         },
         Mutation {
             case: "DELETE with no value removes the attribute, as REMOVE does",
-            before: json!({"data": {"S": "before"}, "kept": {"S": "yes"}}),
-            legacy: json!({"data": {"Action": "DELETE"}}),
-            expression: "REMOVE data",
+            before: json!({"payload": {"S": "before"}, "kept": {"S": "yes"}}),
+            legacy: json!({"payload": {"Action": "DELETE"}}),
+            expression: "REMOVE payload",
             values: json!({}),
             after: json!({"kept": {"S": "yes"}}),
         },
@@ -221,36 +221,44 @@ async fn an_update_expression_computes_from_the_stored_item() {
         "PutItem",
         json!({"TableName": "Computed", "Item": {
             "pk": {"S": "one"},
-            "counter": {"N": "10"},
+            "counters": {"N": "10"},
             "credits": {"L": [{"S": "vocals"}]},
             "meta": {"M": {"label": {"S": "indie"}}}
         }}),
     )
     .await;
-    // One row per operand form `UpdateItem$UpdateExpression` documents.
+    // One row per operand form `UpdateItem$UpdateExpression` documents: the case, the
+    // expression, its values, what `UPDATED_NEW` reports, and what the item STORES.
+    // The two differ for a document path: `UPDATED_NEW` "returns only the updated
+    // attributes", read per document PATH, so a write inside a map reports that map
+    // carrying only the entry the expression wrote.
     let cases = vec![
         (
             "a number plus a value",
-            "SET counter = counter + :one",
+            "SET counters = counters + :one",
             json!({":one": {"N": "1"}}),
-            json!({"counter": {"N": "11"}}),
+            json!({"counters": {"N": "11"}}),
+            json!({"counters": {"N": "11"}}),
         ),
         (
             "a number minus a value",
-            "SET counter = counter - :two",
+            "SET counters = counters - :two",
             json!({":two": {"N": "2"}}),
-            json!({"counter": {"N": "8"}}),
+            json!({"counters": {"N": "8"}}),
+            json!({"counters": {"N": "8"}}),
         ),
         (
             "if_not_exists keeps the stored value",
-            "SET counter = if_not_exists(counter, :fallback)",
+            "SET counters = if_not_exists(counters, :fallback)",
             json!({":fallback": {"N": "99"}}),
-            json!({"counter": {"N": "10"}}),
+            json!({"counters": {"N": "10"}}),
+            json!({"counters": {"N": "10"}}),
         ),
         (
             "if_not_exists falls back for an absent path",
-            "SET fresh = if_not_exists(missing, :fallback)",
+            "SET fresh = if_not_exists(missed, :fallback)",
             json!({":fallback": {"N": "99"}}),
+            json!({"fresh": {"N": "99"}}),
             json!({"fresh": {"N": "99"}}),
         ),
         (
@@ -258,11 +266,13 @@ async fn an_update_expression_computes_from_the_stored_item() {
             "SET credits = list_append(credits, :more)",
             json!({":more": {"L": [{"S": "bass"}]}}),
             json!({"credits": {"L": [{"S": "vocals"}, {"S": "bass"}]}}),
+            json!({"credits": {"L": [{"S": "vocals"}, {"S": "bass"}]}}),
         ),
         (
             "a document path writes inside a map",
             "SET meta.tracks = :tracks",
             json!({":tracks": {"N": "12"}}),
+            json!({"meta": {"M": {"tracks": {"N": "12"}}}}),
             json!({"meta": {"M": {"label": {"S": "indie"}, "tracks": {"N": "12"}}}}),
         ),
         (
@@ -270,9 +280,10 @@ async fn an_update_expression_computes_from_the_stored_item() {
             "SET #size = :size",
             json!({":size": {"N": "3"}}),
             json!({"size": {"N": "3"}}),
+            json!({"size": {"N": "3"}}),
         ),
     ];
-    for (case, expression, values, expected) in cases {
+    for (case, expression, values, reported, stored) in cases {
         let mut request = json!({
             "TableName": "Computed",
             "Key": {"pk": {"S": "one"}},
@@ -284,12 +295,14 @@ async fn an_update_expression_computes_from_the_stored_item() {
             request["ExpressionAttributeNames"] = json!({"#size": "size"});
         }
         let updated = ok(&router, "UpdateItem", request).await;
-        for (attribute, value) in expected.as_object().expect("the expected attributes") {
+        for (attribute, value) in reported.as_object().expect("the reported attributes") {
             assert_eq!(
                 updated["Attributes"][attribute], *value,
                 "case {case:?}: expected UPDATED_NEW to report {attribute}={value}, got {}",
                 updated["Attributes"]
             );
+        }
+        for (attribute, value) in stored.as_object().expect("the stored attributes") {
             let read = ok(
                 &router,
                 "GetItem",
@@ -308,7 +321,7 @@ async fn an_update_expression_computes_from_the_stored_item() {
             "PutItem",
             json!({"TableName": "Computed", "Item": {
                 "pk": {"S": "one"},
-                "counter": {"N": "10"},
+                "counters": {"N": "10"},
                 "credits": {"L": [{"S": "vocals"}]},
                 "meta": {"M": {"label": {"S": "indie"}}}
             }}),
@@ -330,13 +343,13 @@ async fn a_legacy_expected_condition_gates_the_write() {
     let cases: Vec<(&str, Value, Option<&str>, bool)> = vec![
         (
             "Value equal to the stored value holds",
-            json!({"status": {"Value": {"S": "active"}}}),
+            json!({"flag": {"Value": {"S": "active"}}}),
             None,
             true,
         ),
         (
             "Value different from the stored value does not",
-            json!({"status": {"Value": {"S": "retired"}}}),
+            json!({"flag": {"Value": {"S": "retired"}}}),
             None,
             false,
         ),
@@ -348,49 +361,49 @@ async fn a_legacy_expected_condition_gates_the_write() {
         ),
         (
             "Exists false on a stored attribute does not",
-            json!({"status": {"Exists": false}}),
+            json!({"flag": {"Exists": false}}),
             None,
             false,
         ),
         (
             "EQ holds for the stored value",
-            json!({"status": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "active"}]}}),
+            json!({"flag": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "active"}]}}),
             None,
             true,
         ),
         (
             "NE holds for another value",
-            json!({"status": {"ComparisonOperator": "NE", "AttributeValueList": [{"S": "retired"}]}}),
+            json!({"flag": {"ComparisonOperator": "NE", "AttributeValueList": [{"S": "retired"}]}}),
             None,
             true,
         ),
         (
             "LT compares numbers numerically",
-            json!({"counter": {"ComparisonOperator": "LT", "AttributeValueList": [{"N": "11"}]}}),
+            json!({"counters": {"ComparisonOperator": "LT", "AttributeValueList": [{"N": "11"}]}}),
             None,
             true,
         ),
         (
             "LE holds at the bound",
-            json!({"counter": {"ComparisonOperator": "LE", "AttributeValueList": [{"N": "10"}]}}),
+            json!({"counters": {"ComparisonOperator": "LE", "AttributeValueList": [{"N": "10"}]}}),
             None,
             true,
         ),
         (
             "GT does not hold at the bound",
-            json!({"counter": {"ComparisonOperator": "GT", "AttributeValueList": [{"N": "10"}]}}),
+            json!({"counters": {"ComparisonOperator": "GT", "AttributeValueList": [{"N": "10"}]}}),
             None,
             false,
         ),
         (
             "GE holds at the bound",
-            json!({"counter": {"ComparisonOperator": "GE", "AttributeValueList": [{"N": "10"}]}}),
+            json!({"counters": {"ComparisonOperator": "GE", "AttributeValueList": [{"N": "10"}]}}),
             None,
             true,
         ),
         (
             "NOT_NULL holds for a stored attribute",
-            json!({"status": {"ComparisonOperator": "NOT_NULL"}}),
+            json!({"flag": {"ComparisonOperator": "NOT_NULL"}}),
             None,
             true,
         ),
@@ -414,33 +427,33 @@ async fn a_legacy_expected_condition_gates_the_write() {
         ),
         (
             "BEGINS_WITH matches a prefix",
-            json!({"status": {"ComparisonOperator": "BEGINS_WITH", "AttributeValueList": [{"S": "act"}]}}),
+            json!({"flag": {"ComparisonOperator": "BEGINS_WITH", "AttributeValueList": [{"S": "act"}]}}),
             None,
             true,
         ),
         (
             "IN holds for one of the candidates",
-            json!({"status": {"ComparisonOperator": "IN", "AttributeValueList": [{"S": "retired"}, {"S": "active"}]}}),
+            json!({"flag": {"ComparisonOperator": "IN", "AttributeValueList": [{"S": "retired"}, {"S": "active"}]}}),
             None,
             true,
         ),
         (
             "BETWEEN holds inside the range",
-            json!({"counter": {"ComparisonOperator": "BETWEEN", "AttributeValueList": [{"N": "1"}, {"N": "10"}]}}),
+            json!({"counters": {"ComparisonOperator": "BETWEEN", "AttributeValueList": [{"N": "1"}, {"N": "10"}]}}),
             None,
             true,
         ),
         (
             "BETWEEN does not hold outside it",
-            json!({"counter": {"ComparisonOperator": "BETWEEN", "AttributeValueList": [{"N": "11"}, {"N": "20"}]}}),
+            json!({"counters": {"ComparisonOperator": "BETWEEN", "AttributeValueList": [{"N": "11"}, {"N": "20"}]}}),
             None,
             false,
         ),
         (
             "AND needs every entry",
             json!({
-                "status": {"Value": {"S": "active"}},
-                "counter": {"Value": {"N": "99"}}
+                "flag": {"Value": {"S": "active"}},
+                "counters": {"Value": {"N": "99"}}
             }),
             Some("AND"),
             false,
@@ -448,8 +461,8 @@ async fn a_legacy_expected_condition_gates_the_write() {
         (
             "OR needs only one entry",
             json!({
-                "status": {"Value": {"S": "active"}},
-                "counter": {"Value": {"N": "99"}}
+                "flag": {"Value": {"S": "active"}},
+                "counters": {"Value": {"N": "99"}}
             }),
             Some("OR"),
             true,
@@ -457,8 +470,8 @@ async fn a_legacy_expected_condition_gates_the_write() {
         (
             "OR with no entry holding does not apply",
             json!({
-                "status": {"Value": {"S": "retired"}},
-                "counter": {"Value": {"N": "99"}}
+                "flag": {"Value": {"S": "retired"}},
+                "counters": {"Value": {"N": "99"}}
             }),
             Some("OR"),
             false,
@@ -472,8 +485,8 @@ async fn a_legacy_expected_condition_gates_the_write() {
             "PutItem",
             json!({"TableName": "Gated", "Item": {
                 "pk": key["pk"].clone(),
-                "status": {"S": "active"},
-                "counter": {"N": "10"},
+                "flag": {"S": "active"},
+                "counters": {"N": "10"},
                 "tags": {"SS": ["x", "b"]}
             }}),
         )
@@ -481,7 +494,7 @@ async fn a_legacy_expected_condition_gates_the_write() {
         let mut request = json!({
             "TableName": "Gated",
             "Key": key.clone(),
-            "AttributeUpdates": {"status": {"Action": "PUT", "Value": {"S": "updated"}}},
+            "AttributeUpdates": {"flag": {"Action": "PUT", "Value": {"S": "updated"}}},
             "Expected": expected,
         });
         if let Some(operator) = operator {
@@ -512,9 +525,9 @@ async fn a_legacy_expected_condition_gates_the_write() {
         .await;
         let expected_status = if applies { "updated" } else { "active" };
         assert_eq!(
-            read["Item"]["status"],
+            read["Item"]["flag"],
             json!({"S": expected_status}),
-            "case {case:?}: expected the stored status to read {expected_status}, got {}",
+            "case {case:?}: expected the stored flag to read {expected_status}, got {}",
             read["Item"]
         );
     }
@@ -530,13 +543,13 @@ async fn a_condition_expression_gates_every_single_item_write() {
     let cases: Vec<(&str, &str, Value, bool)> = vec![
         (
             "attribute_exists on a stored attribute",
-            "attribute_exists(status)",
+            "attribute_exists(flag)",
             json!({}),
             true,
         ),
         (
             "attribute_not_exists on a stored attribute",
-            "attribute_not_exists(status)",
+            "attribute_not_exists(flag)",
             json!({}),
             false,
         ),
@@ -548,13 +561,13 @@ async fn a_condition_expression_gates_every_single_item_write() {
         ),
         (
             "attribute_type names the stored type",
-            "attribute_type(counter, :type)",
+            "attribute_type(counters, :type)",
             json!({":type": {"S": "N"}}),
             true,
         ),
         (
             "begins_with on a prefix",
-            "begins_with(status, :prefix)",
+            "begins_with(flag, :prefix)",
             json!({":prefix": {"S": "act"}}),
             true,
         ),
@@ -572,43 +585,43 @@ async fn a_condition_expression_gates_every_single_item_write() {
         ),
         (
             "an equality",
-            "status = :active",
+            "flag = :active",
             json!({":active": {"S": "active"}}),
             true,
         ),
         (
             "an inequality",
-            "counter <> :eleven",
+            "counters <> :eleven",
             json!({":eleven": {"N": "11"}}),
             true,
         ),
         (
             "a BETWEEN",
-            "counter BETWEEN :low AND :high",
+            "counters BETWEEN :low AND :high",
             json!({":low": {"N": "1"}, ":high": {"N": "10"}}),
             true,
         ),
         (
             "an IN list",
-            "status IN (:retired, :active)",
+            "flag IN (:retired, :active)",
             json!({":retired": {"S": "retired"}, ":active": {"S": "active"}}),
             true,
         ),
         (
             "a NOT",
-            "NOT status = :active",
+            "NOT flag = :active",
             json!({":active": {"S": "active"}}),
             false,
         ),
         (
             "an OR of a failing and a holding branch",
-            "status = :retired OR counter = :ten",
+            "flag = :retired OR counters = :ten",
             json!({":retired": {"S": "retired"}, ":ten": {"N": "10"}}),
             true,
         ),
         (
             "an AND with a failing branch",
-            "(status = :active) AND counter = :eleven",
+            "(flag = :active) AND counters = :eleven",
             json!({":active": {"S": "active"}, ":eleven": {"N": "11"}}),
             false,
         ),
@@ -619,8 +632,8 @@ async fn a_condition_expression_gates_every_single_item_write() {
             let key = json!({"pk": {"S": format!("{operation}-{case}")}});
             let stored = json!({
                 "pk": key["pk"].clone(),
-                "status": {"S": "active"},
-                "counter": {"N": "10"},
+                "flag": {"S": "active"},
+                "counters": {"N": "10"},
                 "tags": {"SS": ["x", "b"]}
             });
             ok(
@@ -639,7 +652,7 @@ async fn a_condition_expression_gates_every_single_item_write() {
             match operation {
                 "UpdateItem" => {
                     request["Key"] = key.clone();
-                    request["UpdateExpression"] = json!("SET status = :next");
+                    request["UpdateExpression"] = json!("SET flag = :next");
                     request["ExpressionAttributeValues"] = {
                         let mut merged = values.clone();
                         merged["::next"] = json!(null);
@@ -651,7 +664,7 @@ async fn a_condition_expression_gates_every_single_item_write() {
                 }
                 "PutItem" => {
                     let mut replacement = stored.clone();
-                    replacement["status"] = json!({"S": "replaced"});
+                    replacement["flag"] = json!({"S": "replaced"});
                     request["Item"] = replacement;
                 }
                 _ => request["Key"] = key.clone(),
@@ -685,7 +698,7 @@ async fn a_condition_expression_gates_every_single_item_write() {
             let actual = if read["Item"].is_null() {
                 Value::Null
             } else {
-                read["Item"]["status"].clone()
+                read["Item"]["flag"].clone()
             };
             assert_eq!(
                 actual, expected_item,
@@ -709,31 +722,31 @@ async fn partiql_dml_and_the_classic_api_share_one_item_store() {
     let statements: Vec<(&str, &str, Value, Value)> = vec![
         (
             "INSERT stores an item",
-            "INSERT INTO \"Shared\" VALUE {'pk':'one','body':'written','counter':1}",
+            "INSERT INTO \"Shared\" VALUE {'pk':'one','body':'written','counters':1}",
             json!([]),
-            json!({"pk": {"S": "one"}, "body": {"S": "written"}, "counter": {"N": "1"}}),
+            json!({"pk": {"S": "one"}, "body": {"S": "written"}, "counters": {"N": "1"}}),
         ),
         (
             "UPDATE sets an attribute",
             "UPDATE \"Shared\" SET body = 'partiql-updated' WHERE pk = 'one'",
             json!([]),
-            json!({"pk": {"S": "one"}, "body": {"S": "partiql-updated"}, "counter": {"N": "1"}}),
+            json!({"pk": {"S": "one"}, "body": {"S": "partiql-updated"}, "counters": {"N": "1"}}),
         ),
         (
             "UPDATE computes from the stored value",
-            "UPDATE \"Shared\" SET counter = counter + 4 WHERE pk = 'one'",
+            "UPDATE \"Shared\" SET counters = counters + 4 WHERE pk = 'one'",
             json!([]),
-            json!({"pk": {"S": "one"}, "body": {"S": "partiql-updated"}, "counter": {"N": "5"}}),
+            json!({"pk": {"S": "one"}, "body": {"S": "partiql-updated"}, "counters": {"N": "5"}}),
         ),
         (
             "UPDATE fills its ? parameters in order",
             "UPDATE \"Shared\" SET body = ? WHERE pk = ?",
             json!([{"S": "parameterised"}, {"S": "one"}]),
-            json!({"pk": {"S": "one"}, "body": {"S": "parameterised"}, "counter": {"N": "5"}}),
+            json!({"pk": {"S": "one"}, "body": {"S": "parameterised"}, "counters": {"N": "5"}}),
         ),
         (
             "UPDATE with several clauses sets and removes",
-            "UPDATE \"Shared\" SET note = 'kept' REMOVE counter WHERE pk = 'one'",
+            "UPDATE \"Shared\" SET note = 'kept' REMOVE counters WHERE pk = 'one'",
             json!([]),
             json!({"pk": {"S": "one"}, "body": {"S": "parameterised"}, "note": {"S": "kept"}}),
         ),
@@ -912,21 +925,21 @@ async fn return_values_reports_the_item_before_or_after_the_update() {
         ("NONE", Value::Null),
         (
             "ALL_OLD",
-            json!({"pk": {"S": "one"}, "status": {"S": "active"}, "counter": {"N": "1"}}),
+            json!({"pk": {"S": "one"}, "flag": {"S": "active"}, "counters": {"N": "1"}}),
         ),
         (
             "ALL_NEW",
-            json!({"pk": {"S": "one"}, "status": {"S": "updated"}, "counter": {"N": "1"}}),
+            json!({"pk": {"S": "one"}, "flag": {"S": "updated"}, "counters": {"N": "1"}}),
         ),
-        ("UPDATED_OLD", json!({"status": {"S": "active"}})),
-        ("UPDATED_NEW", json!({"status": {"S": "updated"}})),
+        ("UPDATED_OLD", json!({"flag": {"S": "active"}})),
+        ("UPDATED_NEW", json!({"flag": {"S": "updated"}})),
     ];
     for (setting, expected) in cases {
         ok(
             &router,
             "PutItem",
             json!({"TableName": "Returned", "Item": {
-                "pk": {"S": "one"}, "status": {"S": "active"}, "counter": {"N": "1"}
+                "pk": {"S": "one"}, "flag": {"S": "active"}, "counters": {"N": "1"}
             }}),
         )
         .await;
@@ -936,7 +949,7 @@ async fn return_values_reports_the_item_before_or_after_the_update() {
             json!({
                 "TableName": "Returned",
                 "Key": {"pk": {"S": "one"}},
-                "AttributeUpdates": {"status": {"Action": "PUT", "Value": {"S": "updated"}}},
+                "AttributeUpdates": {"flag": {"Action": "PUT", "Value": {"S": "updated"}}},
                 "ReturnValues": setting,
             }),
         )
@@ -966,8 +979,8 @@ async fn one_request_may_not_mix_the_two_vocabularies() {
             json!({
                 "TableName": "Mixed",
                 "Key": {"pk": {"S": "one"}},
-                "AttributeUpdates": {"status": {"Value": {"S": "a"}}},
-                "UpdateExpression": "SET status = :next",
+                "AttributeUpdates": {"flag": {"Value": {"S": "a"}}},
+                "UpdateExpression": "SET flag = :next",
                 "ExpressionAttributeValues": {":next": {"S": "b"}},
             }),
             "AttributeUpdates",
@@ -979,10 +992,10 @@ async fn one_request_may_not_mix_the_two_vocabularies() {
             json!({
                 "TableName": "Mixed",
                 "Key": {"pk": {"S": "one"}},
-                "UpdateExpression": "SET status = :next",
+                "UpdateExpression": "SET flag = :next",
                 "ExpressionAttributeValues": {":next": {"S": "b"}},
-                "Expected": {"status": {"Exists": false}},
-                "ConditionExpression": "attribute_not_exists(status)",
+                "Expected": {"flag": {"Exists": false}},
+                "ConditionExpression": "attribute_not_exists(flag)",
             }),
             "Expected",
             "ConditionExpression",
@@ -993,8 +1006,8 @@ async fn one_request_may_not_mix_the_two_vocabularies() {
             json!({
                 "TableName": "Mixed",
                 "Item": {"pk": {"S": "one"}},
-                "Expected": {"status": {"Exists": false}},
-                "ConditionExpression": "attribute_not_exists(status)",
+                "Expected": {"flag": {"Exists": false}},
+                "ConditionExpression": "attribute_not_exists(flag)",
             }),
             "Expected",
             "ConditionExpression",
@@ -1005,8 +1018,8 @@ async fn one_request_may_not_mix_the_two_vocabularies() {
             json!({
                 "TableName": "Mixed",
                 "Key": {"pk": {"S": "one"}},
-                "Expected": {"status": {"Exists": false}},
-                "ConditionExpression": "attribute_not_exists(status)",
+                "Expected": {"flag": {"Exists": false}},
+                "ConditionExpression": "attribute_not_exists(flag)",
             }),
             "Expected",
             "ConditionExpression",
@@ -1139,7 +1152,7 @@ async fn an_update_to_an_absent_key_creates_the_item() {
         json!({
             "TableName": "Upserts",
             "Key": key.clone(),
-            "AttributeUpdates": {"counter": {"Action": "ADD", "Value": {"N": "3"}}},
+            "AttributeUpdates": {"counters": {"Action": "ADD", "Value": {"N": "3"}}},
         }),
     )
     .await;
@@ -1151,7 +1164,7 @@ async fn an_update_to_an_absent_key_creates_the_item() {
     .await;
     assert_eq!(
         read["Item"],
-        json!({"pk": {"S": "new"}, "sk": {"N": "1"}, "counter": {"N": "3"}}),
+        json!({"pk": {"S": "new"}, "sk": {"N": "1"}, "counters": {"N": "3"}}),
         "case upsert: expected the key plus what the update wrote, got {}",
         read["Item"]
     );

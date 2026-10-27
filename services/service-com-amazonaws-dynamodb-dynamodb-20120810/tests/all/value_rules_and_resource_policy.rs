@@ -654,7 +654,15 @@ async fn a_resource_policy_decides_whether_the_data_plane_serves_the_request() {
         let attached = ok(
             &router,
             "PutResourcePolicy",
-            json!({"ResourceArn": arn, "Policy": document}),
+            // Several of these documents deny the caller the policy-management actions
+            // too (a `dynamodb:*` Deny does), which the operation refuses unless the
+            // request confirms it; the rule under test here is what the data plane
+            // does with the attached document, so every row confirms.
+            json!({
+                "ResourceArn": arn,
+                "Policy": document,
+                "ConfirmRemoveSelfResourceAccess": true,
+            }),
         )
         .await;
         // The document and its revision id round trip through the reader.

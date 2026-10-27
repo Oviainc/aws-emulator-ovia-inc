@@ -233,19 +233,6 @@ fn force_state(
         if changed {
             stored.alarm.state_transitioned_timestamp = Some(crate::state::to_timestamp(now));
         }
-        // "Temporarily sets the state of an alarm for testing purposes. […] Metric alarms
-        // returns to their actual state quickly, often within seconds" — the thing that
-        // takes a metric alarm back is its next evaluation against the stored metric data,
-        // which is owed the same short span as every other transition this store's clock
-        // owes: the forced state is what a caller reading straight after this call sees, and
-        // the evaluation owns the state again from the end of that span. A later force into
-        // a state the evaluation has since taken the alarm out of is therefore a state
-        // change of its own, and invokes that state's actions again.
-        stored.evaluation_due_secs =
-            now + crate::state::alarm_evaluation::forced_state_span_secs();
-        // And the state stands for that span even as new datapoints arrive, which is what
-        // makes it a forced state rather than a value the next write overwrites.
-        stored.forced_state_until_secs = Some(stored.evaluation_due_secs);
         // "When the updated state differs from the previous value, the action configured
         // for the appropriate state is invoked. For example, if your alarm is configured
         // to send an Amazon SNS message when an alarm is triggered, temporarily changing
@@ -325,6 +312,16 @@ fn force_state(
         })
         .into());
     };
+
+    // "Temporarily sets the state of an alarm for testing purposes. […] Metric alarms returns
+    // to their actual state quickly, often within seconds" — the thing that takes a METRIC
+    // alarm back is its next evaluation against the stored metric data, which this arms at the
+    // end of the span that evaluation is owed. So the forced state is what every caller reading
+    // inside that span sees, and the evaluation owns the state again from its end; a later force
+    // into a state the evaluation has since taken the alarm out of is a state change of its own,
+    // and invokes that state's actions again. A composite alarm is not armed by a span but by
+    // its children's states, which the snapshot above holds.
+    store.arm_forced_state(&input.alarm_name, now);
 
     // "A summary of the alarm history, in text format."
     // (`AlarmHistoryItem$HistorySummary`) — which state the alarm moved from and which

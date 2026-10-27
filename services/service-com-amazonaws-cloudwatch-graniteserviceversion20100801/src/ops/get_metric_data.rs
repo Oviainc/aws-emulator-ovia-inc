@@ -1046,7 +1046,7 @@ const ARITHMETIC_ERROR_CODE: &str = "ArithmeticError";
 /// expression had no number for some of the range's periods, and the periods it does have a
 /// number for are in the result beside it.
 const ARITHMETIC_ERROR_MESSAGE: &str =
-    "One or more data points have been dropped due to non-numeric values (NaN, -Infinite, \
+    "One or more data-points have been dropped due to non-numeric values (NaN, -Infinite, \
      +Infinite)";
 
 /// The granularity an expression's constructed series takes when its query names no `Period`:
