@@ -25,6 +25,8 @@ mod attachment_lifecycle;
 mod attachment_routing_policy_associations;
 #[path = "all/attachment_routing_policy_label.rs"]
 mod attachment_routing_policy_label;
+#[path = "all/attachment_routing_policy_label_removal.rs"]
+mod attachment_routing_policy_label_removal;
 #[path = "all/connect_peer_association_lifecycle.rs"]
 mod connect_peer_association_lifecycle;
 #[path = "all/connect_peer_delete.rs"]

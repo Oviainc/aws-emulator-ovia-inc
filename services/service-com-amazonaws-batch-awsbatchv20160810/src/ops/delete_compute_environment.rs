@@ -182,13 +182,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Ok(DeleteComputeEnvironmentOutput {});
         }
         if environment.state != batch::STATE_DISABLED {
+            // The rule's own sentence, which names the KIND of resource and the state to
+            // set first and nothing from the request
+            // ([`batch::delete_enabled_message`]).
             return Err(DeleteComputeEnvironmentErrorModeled::ClientException(
-                batch::client_exception(format!(
-                    "Cannot delete compute environment {name} while its state is {}: set it \
-                     to {} with UpdateComputeEnvironment first",
-                    environment.state,
-                    batch::STATE_DISABLED
-                )),
+                batch::client_exception(batch::delete_enabled_message("compute environment")),
             )
             .into());
         }

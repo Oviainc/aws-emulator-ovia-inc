@@ -228,13 +228,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let region = crate::state::request_region(ctx);
 
-        // The model types `jobDefinitionName` as a plain `String`, so the framework
-        // admits any text; the member's doc states the alphabet and the length.
+        // The model types `jobDefinitionName` as a plain `String`, so the framework admits
+        // any text; the service applies the pattern the member documents and refuses a
+        // value outside it with the pattern sentence every name refusal of this service
+        // carries (`crate::state::name_pattern_detail`).
         if !crate::state::is_valid_job_definition_name(&input.job_definition_name) {
-            return Err(client_exception(&format!(
-                "jobDefinitionName must be up to {} letters, numbers, hyphens (-) and \
-                 underscores (_)",
-                crate::state::MAX_JOB_DEFINITION_NAME_LEN
+            return Err(client_exception(&crate::state::name_pattern_detail(
+                "jobDefinitionName",
             )));
         }
 

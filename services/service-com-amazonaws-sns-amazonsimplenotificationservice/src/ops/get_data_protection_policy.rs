@@ -141,18 +141,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // Argument validation, BEFORE the store is consulted: a `ResourceArn` that is
-        // not an ARN at all is bad input, not a topic that does not exist.
+        // not an ARN at all — or one naming another region, which this endpoint does
+        // not serve — is bad input, not a topic that does not exist.
         //
-        // The SHAPE is all this judges — the same rule `GetTopicAttributes` holds its
-        // `TopicArn` to, because this operation's `ResourceArn` is modelled as a
-        // `topicARN` too. An ARN-shaped value that names no topic of this account is
+        // The SHAPE and the region are all this judges — the same rule
+        // `GetTopicAttributes` holds its `TopicArn` to, because this operation's
+        // `ResourceArn` is modelled as a `topicARN` too. An ARN-shaped value of this
+        // region that names no topic of this account is
         // left to the lookup below, which is this operation's modelled miss; the
         // narrower `state::tagged_topic_arn_refusal` belongs to the TAG operations,
         // whose refusal says a tag is held by a topic.
-        if let Some(message) = state::arn_refusal("ResourceArn", &input.resource_arn) {
+        let region = state::request_region(ctx.parts());
+        if let Some(message) =
+            state::regional_arn_refusal("ResourceArn", &input.resource_arn, &region)
+        {
             return Err(GetDataProtectionPolicyErrorModeled::InvalidParameterException(
                 InvalidParameterException {
                     message: Some(message),

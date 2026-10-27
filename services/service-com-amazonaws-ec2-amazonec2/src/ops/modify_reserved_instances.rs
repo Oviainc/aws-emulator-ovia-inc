@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyReservedInstances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyReservedInstances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyReservedInstances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: records a modification request for the Reserved Instances the request
+//! names and answers with the `ReservedInstancesModificationId` it was given. This is the
+//! ONLY file to touch for this operation.
+//!
+//! The operation does NOT edit a Reserved Instance in place. A request is stored in
+//! `processing`
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::reserved_instances_modifications`]), and
+//! the clock owes it the `fulfilled` the status catalog's remaining member names: the
+//! purchases the target configurations describe are minted then, and the ones the request
+//! named are left `retired`, because a modification replaces a Reserved Instance rather
+//! than changing it. That is
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::fulfill_due_reserved_instances_modifications`],
+//! reached through `materialize_due_transitions`, so the new purchases exist from the
+//! instant the fulfilment fell due whether or not anybody called again.
+//!
+//! What this file holds is this operation's own validation: a `reservedInstancesIds` entry
+//! must name a Reserved Instance this account holds and that is in effect, those purchases
+//! must be interchangeable with each other ("identical, except for Availability Zone,
+//! network platform, and instance type"), and the target configurations must together
+//! account for the reservations those Reserved Instances hold. Everything about a Reserved
+//! Instance that more than one operation needs lives in
+//! [`crate::state::reserved_instances`].
 //!
 //! ## Shape of an operation
 //!
@@ -70,6 +84,58 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::{
+    MAX_CLIENT_TOKEN_CHARS, MAX_RESERVED_INSTANCES_TARGET_CONFIGURATIONS, MAX_RESOURCE_IDS,
+    MAX_STORED_BYTES, MAX_STORED_RESERVED_INSTANCES, MAX_STORED_RESERVED_INSTANCES_MODIFICATIONS,
+    RESERVED_INSTANCE_SCOPE_REGION, RESERVED_INSTANCE_SCOPE_ZONE, RESERVED_INSTANCE_STATE_ACTIVE,
+    ReservedInstancesIdentity, ReservedInstancesModificationSpec, availability_zones_in_region,
+    idempotent_parameter_mismatch, invalid_input, invalid_parameter_combination,
+    invalid_parameter_value, missing_parameter, reserved_instances_identity,
+    reserved_instances_limit_exceeded, reserved_instances_modification_payload_bytes,
+    reserved_instances_not_active, reserved_instances_not_found, reserved_instances_not_identical,
+};
+
+/// One target configuration as a value that can be COMPARED with another, so a replayed
+/// `ClientToken` can be told from a different request carrying the same token.
+///
+/// The modelled `ReservedInstancesConfiguration` derives no equality, and comparing it
+/// member by member at the one call site would be the only place its member list is
+/// restated: [`configuration_key`] is that list, in one function, and this is the value it
+/// answers — every member of the shape, borrowed from the configuration itself.
+type ConfigurationKey<'a> = (
+    Option<&'a str>,
+    Option<&'a str>,
+    Option<i32>,
+    Option<&'a str>,
+    Option<&'a str>,
+    Option<&'a str>,
+);
+
+/// Every member of `configuration`, as a value two configurations can be compared by.
+fn configuration_key(configuration: &ReservedInstancesConfiguration) -> ConfigurationKey<'_> {
+    (
+        configuration.availability_zone.as_deref(),
+        configuration.availability_zone_id.as_deref(),
+        configuration.instance_count,
+        configuration.instance_type.as_deref(),
+        configuration.platform.as_deref(),
+        configuration.scope.as_deref(),
+    )
+}
+
+/// Whether `configurations` is the list the stored modification's `results` was recorded
+/// with: the same configurations, in the same order.
+fn same_target_configurations(
+    results: &[ReservedInstancesModificationResult],
+    configurations: &[ReservedInstancesConfiguration],
+) -> bool {
+    results.len() == configurations.len()
+        && results.iter().zip(configurations).all(|(result, asked)| {
+            result.target_configuration.as_ref().map(configuration_key)
+                == Some(configuration_key(asked))
+        })
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -138,18 +204,230 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyReservedInstances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyReservedInstancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state::{deduplicate_ids, request_region, require_service_state};
+
+        // A new Reserved Instance is reported in an Availability Zone of the Region the
+        // request was signed for, so a target configuration's zone is read against that
+        // Region.
+        let region = request_region(ctx.parts());
+
+        // `ReservedInstancesIds` is `@required`, so reaching here means at least one id;
+        // the model bounds neither list, so both are bounded here, before any work
+        // proportional to them is done. One Reserved Instance is modified ONCE however many
+        // times the request names it.
+        if input.reserved_instances_ids.len() > MAX_RESOURCE_IDS {
+            return Err(invalid_parameter_value(format!(
+                "ReservedInstancesIds carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                input.reserved_instances_ids.len()
+            )));
+        }
+        if input.target_configurations.len() > MAX_RESERVED_INSTANCES_TARGET_CONFIGURATIONS {
+            return Err(invalid_parameter_value(format!(
+                "TargetConfigurations carries {} configurations, above the maximum of \
+                 {MAX_RESERVED_INSTANCES_TARGET_CONFIGURATIONS}",
+                input.target_configurations.len()
+            )));
+        }
+        if input
+            .client_token
+            .as_deref()
+            .is_some_and(|token| token.chars().count() > MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(invalid_parameter_value(format!(
+                "clientToken accepts at most {MAX_CLIENT_TOKEN_CHARS} characters"
+            )));
+        }
+        let reserved_instances_ids = deduplicate_ids(&input.reserved_instances_ids);
+
+        // Every target configuration is read before anything is looked up or stored: the
+        // count it asks for is "a required field for a request"
+        // (`ReservedInstancesConfiguration$InstanceCount`), and a configuration cannot both
+        // be of Regional scope and name an Availability Zone.
+        let zones = availability_zones_in_region(&region);
+        let mut asked_instance_count: i64 = 0;
+        for target in &input.target_configurations {
+            let Some(instance_count) = target.instance_count else {
+                return Err(missing_parameter(
+                    "The request must contain the parameter instanceCount",
+                ));
+            };
+            if instance_count < 1 {
+                return Err(invalid_parameter_value(format!(
+                    "Invalid value '{instance_count}' for instanceCount. It must be at least 1"
+                )));
+            }
+            asked_instance_count = asked_instance_count.saturating_add(i64::from(instance_count));
+            let named_zone =
+                target.availability_zone.is_some() || target.availability_zone_id.is_some();
+            // The two contradictions a configuration can carry. Every OTHER value of these
+            // members is already refused before this handler runs: `Scope` targets the
+            // modelled `scope` enum and `InstanceType` the `InstanceType` enum, so the
+            // boundary validator answers `ValidationError` for anything outside those
+            // catalogs, and reaching here means `_` is the enum's other member or nothing.
+            match target.scope.as_deref() {
+                Some(RESERVED_INSTANCE_SCOPE_REGION) if named_zone => {
+                    return Err(invalid_parameter_combination(format!(
+                        "A target configuration of '{RESERVED_INSTANCE_SCOPE_REGION}' scope \
+                         must not name an Availability Zone"
+                    )));
+                }
+                Some(RESERVED_INSTANCE_SCOPE_ZONE) if !named_zone => {
+                    return Err(invalid_parameter_combination(format!(
+                        "A target configuration of '{RESERVED_INSTANCE_SCOPE_ZONE}' scope must \
+                         name an Availability Zone"
+                    )));
+                }
+                _ => {}
+            }
+            // A zone a Region does not have is the caller's mistake, not a purchase this
+            // service can report: the zones of a Region are facts of that Region
+            // ([`availability_zones_in_region`]), named either way round.
+            if let Some(zone_name) = target.availability_zone.as_deref() {
+                if !zones.iter().any(|zone| zone.zone_name == zone_name) {
+                    return Err(invalid_parameter_value(format!(
+                        "Invalid availability zone: [{zone_name}]"
+                    )));
+                }
+            }
+            if let Some(zone_id) = target.availability_zone_id.as_deref() {
+                if !zones.iter().any(|zone| zone.zone_id == zone_id) {
+                    return Err(invalid_parameter_value(format!(
+                        "Invalid availability zone: [{zone_id}]"
+                    )));
+                }
+            }
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // Every move the clock already owed is applied before anything is read or written,
+        // so a Reserved Instance a fulfilled modification retired is seen as retired here
+        // rather than modified a second time.
+        store.materialize_due_transitions();
+
+        // "A unique, case-sensitive token you provide to ensure idempotency of your
+        // modification request": the repeat of a request answers with the modification the
+        // first one recorded, and the SAME token carrying a different request is the
+        // mismatch EC2 refuses rather than a second modification.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(recorded) = store
+                .reserved_instances_modification_for_token(token)
+                .map(str::to_string)
+            {
+                let replayed = store
+                    .reserved_instances_modifications
+                    .get(&recorded)
+                    .is_some_and(|record| {
+                        let named: Vec<&str> = record
+                            .view
+                            .reserved_instances_ids
+                            .iter()
+                            .flatten()
+                            .filter_map(|named| named.reserved_instances_id.as_deref())
+                            .collect();
+                        named == reserved_instances_ids
+                            && same_target_configurations(
+                                record
+                                    .view
+                                    .modification_results
+                                    .as_deref()
+                                    .unwrap_or_default(),
+                                &input.target_configurations,
+                            )
+                    });
+                if !replayed {
+                    return Err(idempotent_parameter_mismatch());
+                }
+                return Ok(ModifyReservedInstancesOutput {
+                    reserved_instances_modification_id: Some(recorded),
+                });
+            }
+        }
+
+        // Each id must name a Reserved Instance this account holds, and one that is in
+        // effect: a queued purchase has not been made yet and a retired one is over, so
+        // neither has a term to carry onto a new configuration. The purchases must also be
+        // interchangeable with each other — "The Reserved Instances to be modified must be
+        // identical, except for Availability Zone, network platform, and instance type" —
+        // which is what lets the reservations of one be carried onto a configuration of
+        // another. The whole batch is resolved before anything is written, so a request
+        // naming one id it cannot act on records no modification at all.
+        let mut held_instance_count: i64 = 0;
+        let mut identity: Option<ReservedInstancesIdentity> = None;
+        for reserved_instances_id in &reserved_instances_ids {
+            let Some(reserved_instances) = store.reserved_instances.get(reserved_instances_id)
+            else {
+                return Err(reserved_instances_not_found(reserved_instances_id));
+            };
+            let held = reserved_instances.state.as_deref().unwrap_or_default();
+            if held != RESERVED_INSTANCE_STATE_ACTIVE {
+                return Err(reserved_instances_not_active(reserved_instances_id, held));
+            }
+            let held_identity = reserved_instances_identity(reserved_instances);
+            if identity.get_or_insert_with(|| held_identity.clone()) != &held_identity {
+                return Err(reserved_instances_not_identical());
+            }
+            held_instance_count = held_instance_count.saturating_add(i64::from(
+                reserved_instances.instance_count.unwrap_or_default(),
+            ));
+        }
+
+        // A modification carries the reservations it holds onto the configurations it is
+        // given, so the two counts are the same number: "The number of modified Reserved
+        // Instances" (`ReservedInstancesConfiguration$InstanceCount`) is how many of the
+        // ones being modified that configuration accounts for.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyReservedInstances"))
+        // COUNTS, not normalized footprints: EC2's size flexibility, where the reservations
+        // of a Linux/UNIX Regional purchase may be re-expressed as another size of the same
+        // instance family, is not applied here, so a configuration that changes the size
+        // keeps the count. That is a narrower rule than the real service's, and it is
+        // written down rather than implied: it refuses a re-sizing split the real service
+        // would serve, and serves nothing the count rule does not account for.
+        if asked_instance_count != held_instance_count {
+            return Err(invalid_input(format!(
+                "Invalid value for 'targetConfigurations'. The total instance count of the \
+                 target configurations ({asked_instance_count}) must equal the instance count \
+                 of the Reserved Instances being modified ({held_instance_count})."
+            )));
+        }
+
+        let spec = ReservedInstancesModificationSpec {
+            reserved_instances_ids,
+            target_configurations: input.target_configurations,
+            client_token: input.client_token,
+            region,
+            requested_at: ::std::time::SystemTime::now(),
+        };
+        let payload_bytes = reserved_instances_modification_payload_bytes(&spec);
+
+        // Both ceilings are asked BEFORE anything is written: the record this call stores,
+        // and the purchases its fulfilment will mint — one per target configuration — since
+        // a modification is all of them or none of them. Without them a client could grow
+        // this process's memory without bound, because nothing reclaims either record.
+        if !store.has_reserved_instances_modification_capacity() {
+            return Err(reserved_instances_limit_exceeded(format!(
+                "This emulator holds {MAX_STORED_RESERVED_INSTANCES_MODIFICATIONS} Reserved \
+                 Instances modifications, which is as many as it stores"
+            )));
+        }
+        if !store.has_reserved_instances_capacity(spec.target_configurations.len()) {
+            return Err(reserved_instances_limit_exceeded(format!(
+                "This emulator holds {MAX_STORED_RESERVED_INSTANCES} Reserved Instances, which \
+                 is as many as it stores"
+            )));
+        }
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(reserved_instances_limit_exceeded(format!(
+                "This emulator holds {held} of at most {MAX_STORED_BYTES} bytes of \
+                 caller-supplied data, so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+            )));
+        }
+
+        let modification_id = store.insert_reserved_instances_modification(spec);
+        Ok(ModifyReservedInstancesOutput {
+            reserved_instances_modification_id: Some(modification_id),
+        })
     }
 }

@@ -166,8 +166,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The reset holds the store's lock; the event it raises is published once
+        // that lock is released, because a publish is an in-process call into
+        // another service and must not run under it.
+        let (output, group_name) = self.reset(input)?;
+
+        // Putting a value back changes what the group holds just as setting one
+        // does, so this write raises the same catalog event the modify path does:
+        // every subscription scoped to it is told, on its own topic.
+        crate::state::notifications::raise(
+            ctx,
+            &*self.engine,
+            crate::state::EVENT_ID_PARAMETER_GROUP_UPDATED,
+            &group_name,
+            &[(
+                crate::state::notifications::PARAMETER_GROUP_NAME,
+                &group_name,
+            )],
+        )
+        .await;
+
+        Ok(output)
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ResetClusterParameterGroup<Eng> {
+    /// The reset itself: the output it reports, and the stored name of the group
+    /// it changed — the source the event it raises is about.
+    ///
+    /// Everything that touches the store lives here, so the lock is held for the
+    /// write ALONE and nothing is awaited while it is.
+    fn reset(
+        &self,
+        input: ResetClusterParameterGroupInput,
+    ) -> Result<(ResetClusterParameterGroupOutput, String), ResetClusterParameterGroupError> {
         use crate::state as st;
 
         let Some(state) = st::service_state(&*self.engine) else {
@@ -324,9 +358,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         store.mark_parameter_group_pending_reboot(&group_name, &pending_reboot);
 
-        Ok(ResetClusterParameterGroupOutput {
-            parameter_group_name: Some(group_name),
-            parameter_group_status: Some(st::PARAMETER_GROUP_STATUS_UPDATED.to_string()),
-        })
+        Ok((
+            ResetClusterParameterGroupOutput {
+                parameter_group_name: Some(group_name.clone()),
+                parameter_group_status: Some(st::PARAMETER_GROUP_STATUS_UPDATED.to_string()),
+            },
+            group_name,
+        ))
     }
 }

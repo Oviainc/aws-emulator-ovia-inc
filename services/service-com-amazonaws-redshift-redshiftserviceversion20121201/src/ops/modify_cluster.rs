@@ -347,6 +347,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The modify holds the store's lock; the events it raises are published
+        // once that lock is released, because a publish is an in-process call
+        // into another service and must not run under it.
+        let (output, master_password_updated) = self.modify(&input, ctx)?;
+
+        // The cluster carries the changes this call asked for, which is the event
+        // every modify raises; a rename and a change of the admin password are
+        // events of their own in the published catalog, so each is raised when
+        // this call made it. Every one of them is about the cluster the request
+        // addressed, so that is the source a subscription's `SourceIds` scopes
+        // them to.
+        crate::state::notifications::raise(
+            ctx,
+            &*self.engine,
+            crate::state::EVENT_ID_CLUSTER_MODIFIED,
+            &input.cluster_identifier,
+            &[(
+                crate::state::notifications::CLUSTER_NAME,
+                &input.cluster_identifier,
+            )],
+        )
+        .await;
+        if let Some(new_identifier) = input.new_cluster_identifier.as_deref() {
+            crate::state::notifications::raise(
+                ctx,
+                &*self.engine,
+                crate::state::EVENT_ID_CLUSTER_RENAMED,
+                &input.cluster_identifier,
+                &[
+                    (
+                        crate::state::notifications::CLUSTER_NAME,
+                        &input.cluster_identifier,
+                    ),
+                    (
+                        crate::state::notifications::NEW_CLUSTER_NAME,
+                        new_identifier,
+                    ),
+                ],
+            )
+            .await;
+        }
+        if master_password_updated {
+            crate::state::notifications::raise(
+                ctx,
+                &*self.engine,
+                crate::state::EVENT_ID_MASTER_PASSWORD_UPDATED,
+                &input.cluster_identifier,
+                &[(
+                    crate::state::notifications::CLUSTER_NAME,
+                    &input.cluster_identifier,
+                )],
+            )
+            .await;
+        }
+
+        Ok(output)
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ModifyCluster<Eng> {
+    /// The modify itself: the output it reports, and whether it changed the
+    /// cluster's admin credentials — which is an event of its own.
+    ///
+    /// Everything that touches the store lives here, so the lock is held for the
+    /// write ALONE and nothing is awaited while it is.
+    fn modify(
+        &self,
+        input: &ModifyClusterInput,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+    ) -> Result<(ModifyClusterOutput, bool), ModifyClusterError> {
         use crate::state as st;
 
         let Some(state) = st::service_state(&*self.engine) else {
@@ -487,6 +557,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let stored = &mut store.clusters[position];
+        // Whether this call changes the cluster's admin credentials — either by
+        // handing them to Secrets Manager to manage, or by setting a new password
+        // — which is an event of its own in the published catalog.
+        let master_password_updated =
+            input.manage_master_password == Some(true) || input.master_user_password.is_some();
         stored.cluster_type = cluster_type;
         stored.cluster.number_of_nodes = Some(number_of_nodes);
         if let Some(node_type) = input.node_type.clone() {
@@ -628,9 +703,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &cluster_type,
             ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now()),
         );
+        let cluster = stored.cluster.clone();
 
-        Ok(ModifyClusterOutput {
-            cluster: Some(stored.cluster.clone()),
-        })
+        Ok((
+            ModifyClusterOutput {
+                cluster: Some(cluster),
+            },
+            master_password_updated,
+        ))
     }
 }

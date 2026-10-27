@@ -188,10 +188,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_deref()
             .unwrap_or(batch::UPDATE_OPERATION_SET);
         if !batch::CONSUMABLE_RESOURCE_UPDATE_OPERATIONS.contains(&operation) {
+            // The same rule, in the same words, as every other closed set this service
+            // applies itself ([`batch::closed_set_detail`]).
             return Err(UpdateConsumableResourceErrorModeled::ClientException(
-                batch::client_exception(format!(
-                    "operation {operation} is not one of {}",
-                    batch::CONSUMABLE_RESOURCE_UPDATE_OPERATIONS.join(", ")
+                batch::client_exception_enveloped(batch::closed_set_detail(
+                    "operation",
+                    &batch::CONSUMABLE_RESOURCE_UPDATE_OPERATIONS,
                 )),
             )
             .into());

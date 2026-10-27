@@ -165,9 +165,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        if let Some(message) = crate::state::arn_refusal("EndpointArn", &input.endpoint_arn) {
+        let region = crate::state::request_region(ctx.parts());
+        if let Some(message) =
+            crate::state::regional_arn_refusal("EndpointArn", &input.endpoint_arn, &region)
+        {
             return Err(DeleteEndpointErrorModeled::InvalidParameterException(
                 InvalidParameterException {
                     message: Some(message),
