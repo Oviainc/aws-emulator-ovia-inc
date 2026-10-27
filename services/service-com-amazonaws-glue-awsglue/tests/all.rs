@@ -79,6 +79,8 @@ mod error_messages;
 mod etl_connections;
 #[path = "all/etl_jobs_and_connections.rs"]
 mod etl_jobs_and_connections;
+#[path = "all/event_batching_conditions.rs"]
+mod event_batching_conditions;
 #[path = "all/form_type_deletion.rs"]
 mod form_type_deletion;
 #[path = "all/form_types.rs"]

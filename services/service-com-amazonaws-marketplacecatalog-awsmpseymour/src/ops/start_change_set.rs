@@ -234,8 +234,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // `claimed` holds the (entity, change type) pairs the changes have taken,
         // keyed by the entity each change NAMES rather than by the record it
-        // resolves to.
-        let mut claimed: Vec<(String, String)> = Vec::with_capacity(input.change_set.len());
+        // resolves to. A SET, so taking a pair costs one lookup rather than a
+        // scan of the pairs already taken.
+        //
+        // `RequestedChangeList` is `@length(min: 1, max: 20)`, and that count is
+        // what sizes this set, the scan below it and the records this call
+        // stores. The boundary walk judges that modelled length before `handle`
+        // runs; it is re-read HERE as well, before anything is allocated from
+        // the submitted count, so the work and the state one request leaves
+        // behind are bounded by the constant at the point they are incurred.
+        if input.change_set.len() > crate::state::MAX_CHANGES_PER_CHANGE_SET {
+            return Err(StartChangeSetErrorModeled::ValidationException(
+                crate::state::too_many_changes(input.change_set.len()),
+            )
+            .into());
+        }
+        let mut claimed: ::std::collections::HashSet<(String, String)> =
+            ::std::collections::HashSet::with_capacity(input.change_set.len());
         for change in &input.change_set {
             // `Entity$Type` names an entity type, on its own or at a schema
             // version (`<EntityType>@<version>`) — the form the service accepts
@@ -245,6 +260,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !crate::state::is_entity_type_reference(&change.entity.r#type) {
                 return Err(StartChangeSetErrorModeled::ValidationException(
                     crate::state::invalid_entity_type(&change.entity.r#type),
+                )
+                .into());
+            }
+            // `Change$ChangeType` names the change the catalog is to make
+            // ("single string values that describe your intention for the
+            // change"), so it is judged against the changes this catalog
+            // PERFORMS, the way the entity type above is judged against the
+            // types it has: a value inside `ChangeType`'s pattern that names
+            // none of them asks for no change the catalog can make, and is
+            // refused rather than stored as a change nothing could apply.
+            if !crate::state::is_change_type(&change.change_type) {
+                return Err(StartChangeSetErrorModeled::ValidationException(
+                    crate::state::invalid_change_type(&change.change_type),
                 )
                 .into());
             }
@@ -280,16 +308,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // request NAMES: a change set that contradicts itself is refused
             // whether or not that entity exists.
             let entity_id = crate::state::entity_id_of(identifier).to_string();
-            if claimed
-                .iter()
-                .any(|(held, held_type)| *held == entity_id && *held_type == change.change_type)
-            {
+            if !claimed.insert((entity_id.clone(), change.change_type.clone())) {
                 return Err(StartChangeSetErrorModeled::ValidationException(
                     crate::state::duplicate_change_pair(&change.change_type, &entity_id),
                 )
                 .into());
             }
-            claimed.push((entity_id, change.change_type.clone()));
         }
 
         // "The intent related to the request. The default is APPLY." `Intent`
