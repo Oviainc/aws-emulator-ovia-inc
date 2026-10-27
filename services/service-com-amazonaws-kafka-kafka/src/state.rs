@@ -108,7 +108,8 @@ use std::time::{Duration, SystemTime};
 use regex::RegexSet;
 
 use crate::ops::types::{
-    BrokerEBSVolumeInfo, BrokerNodeGroupInfo, BrokerNodeInfo, BrokerSoftwareInfo,
+    BadRequestException, BrokerEBSVolumeInfo, BrokerNodeGroupInfo, BrokerNodeInfo,
+    BrokerSoftwareInfo,
     ChannelLoggingInfo, ClientAuthentication, ClusterInfo, ClusterOperationInfo, ClusterOperationV2,
     ClusterOperationV2Provisioned, Configuration,
     ConfigurationInfo, ConfigurationRevision, ConnectivityInfo, ConsumerGroupReplicationUpdate,
@@ -1273,16 +1274,31 @@ pub const CONFIGURATION_STATE_ACTIVE: &str = "ACTIVE";
 /// `DELETING`.
 pub const CONFIGURATION_STATE_DELETING: &str = "DELETING";
 
-/// What Amazon MSK answers a configuration delete whose `Arn` names no
+/// What Amazon MSK answers any configuration operation whose `Arn` names no
 /// configuration it holds.
 ///
-/// A CONSTANT of the service, not built from the request: the configuration
-/// delete reports an ARN it cannot resolve as a bad request with this one fixed
-/// sentence — not as the `NotFoundException` the resource readers answer — which
-/// is what the behavioural corpus records the real service answering. The
-/// parameter at fault is named by `BadRequestException$InvalidParameter`, not by
-/// the message.
+/// A CONSTANT of the service, not built from the request: every operation of the
+/// configuration family reports an ARN it cannot resolve as a bad request with
+/// this one fixed sentence — not as the `NotFoundException` the other resource
+/// families answer — which is what the behavioural corpus records the real
+/// service answering. The parameter at fault is named by
+/// `BadRequestException$InvalidParameter`, not by the message.
 pub const CONFIGURATION_ARN_NOT_FOUND_MESSAGE: &str = "Configuration ARN does not exist.";
+
+/// The refusal every configuration operation answers an `Arn` that resolves to
+/// no configuration of the endpoint's region with: a `BadRequestException`
+/// (HTTP 400) carrying [`CONFIGURATION_ARN_NOT_FOUND_MESSAGE`] and naming `Arn`
+/// as the parameter at fault.
+///
+/// Built HERE rather than in each handler so the readers, the update and the
+/// delete cannot drift apart on how an unresolvable configuration reference is
+/// reported: one condition, one envelope, whichever operation met it.
+pub fn configuration_arn_not_found() -> BadRequestException {
+    BadRequestException {
+        invalid_parameter: Some("Arn".to_string()),
+        message: Some(CONFIGURATION_ARN_NOT_FOUND_MESSAGE.to_string()),
+    }
+}
 
 /// How this emulator refuses a delete of a configuration a cluster still uses:
 /// one fixed sentence about the condition, in the same request-independent form
@@ -5318,13 +5334,6 @@ fn resource_type_of_arn(value: &str) -> Result<&str, TagTargetRejected> {
 /// service draws between a request it cannot parse and a resource it cannot find.
 pub fn is_cluster_arn(value: &str) -> bool {
     is_kafka_arn_for(value, "cluster")
-}
-
-/// Whether `value` is shaped like an MSK configuration ARN —
-/// `arn:<partition>:kafka:<region>:<account>:configuration/<name>/<id>`. The same
-/// distinction as [`is_cluster_arn`], for the configuration readers.
-pub fn is_configuration_arn(value: &str) -> bool {
-    is_kafka_arn_for(value, "configuration")
 }
 
 /// Whether `value` is shaped like an MSK replicator ARN —

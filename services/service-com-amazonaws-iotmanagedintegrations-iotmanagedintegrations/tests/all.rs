@@ -19,6 +19,8 @@ mod cloud_connector_lifecycle;
 mod connector_destination_lifecycle;
 #[path = "all/credential_locker_lifecycle.rs"]
 mod credential_locker_lifecycle;
+#[path = "all/custom_endpoint_registration.rs"]
+mod custom_endpoint_registration;
 #[path = "all/default_encryption_configuration.rs"]
 mod default_encryption_configuration;
 #[path = "all/destination_lifecycle.rs"]

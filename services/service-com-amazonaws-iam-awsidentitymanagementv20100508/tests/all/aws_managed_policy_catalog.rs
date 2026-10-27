@@ -13,8 +13,9 @@
 //! the account's own policies AND AWS's catalog of AWS-managed policies (the
 //! `arn:aws:iam::aws:policy/` namespace, which exists in every account), reports metadata
 //! computed from state — `AttachmentCount` is the number of entities attached to the
-//! policy at that instant — and reserves `NoSuchEntity` for an ARN naming a policy the
-//! ACCOUNT does not hold, never for a policy AWS owns.
+//! policy at that instant — and refuses an ARN it resolves no policy under with one of
+//! the codes the operation MODELS: `NoSuchEntity` for an ARN naming no policy it can
+//! report, `InvalidInput` for a value that is not a managed-policy ARN at all.
 //!
 //! Each suite is a table whose rows differ along what the rule generalises over: the
 //! policy's owner (AWS or the account), the ARN's path depth, the catalog entry (every
@@ -470,11 +471,12 @@ struct MissCase {
     code: &'static str,
 }
 
-/// An ARN naming no readable policy is refused by its KIND: an account ARN the
-/// account does not hold is the missing entity `NoSuchEntity` is for; a value that is
-/// not a managed-policy ARN at all is an invalid input; and an ARN in AWS's own
-/// namespace whose catalog entry this emulator does not carry is NOT reported as
-/// absent — it answers 501, because AWS does serve that policy.
+/// An ARN naming no readable policy is refused by its KIND, and always with a code
+/// this operation MODELS (`smithy_query(query="operation", operation="GetPolicy")`
+/// declares exactly `InvalidInputException`, `NoSuchEntityException` and
+/// `ServiceFailureException`): an ARN naming no policy the service can report — the
+/// account's own or an entry of AWS's catalog — is the missing entity `NoSuchEntity`
+/// is for, while a value that is not a managed-policy ARN at all is an invalid input.
 #[tokio::test]
 async fn an_arn_outside_the_catalog_is_refused_by_its_kind() {
     let router = router();
@@ -495,14 +497,20 @@ async fn an_arn_outside_the_catalog_is_refused_by_its_kind() {
         MissCase {
             name: "an AWS-managed policy under /job-function/ the catalog does not carry",
             arn: "arn:aws:iam::aws:policy/job-function/ViewOnlyAccess".to_string(),
-            status: 501,
-            code: "NotImplemented",
+            status: 404,
+            code: "NoSuchEntity",
         },
         MissCase {
             name: "an AWS-managed policy at the root the catalog does not carry",
             arn: "arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess".to_string(),
-            status: 501,
-            code: "NotImplemented",
+            status: 404,
+            code: "NoSuchEntity",
+        },
+        MissCase {
+            name: "an AWS-managed policy under /service-role/ the catalog does not carry",
+            arn: "arn:aws:iam::aws:policy/service-role/NoSuchAwsManagedPolicyHere".to_string(),
+            status: 404,
+            code: "NoSuchEntity",
         },
         MissCase {
             name: "an ARN of another service",
@@ -545,6 +553,14 @@ async fn an_arn_outside_the_catalog_is_refused_by_its_kind() {
             case.arn,
             case.code
         );
+        if case.code == "NoSuchEntity" {
+            assert_eq!(
+                element(&body, "Message"),
+                format!("Policy {} was not found.", case.arn),
+                "case {name:?}: expected IAM's missing-policy wording, got {:?}",
+                element(&body, "Message")
+            );
+        }
 
         // The same ARN resolution answers the document read, so it refuses the same
         // way — a reader must not be able to tell two different stories about one ARN.

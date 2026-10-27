@@ -243,9 +243,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is not account state and is taken as present: AWS's catalog runs to well
         // over a thousand policies and `crate::state::AWS_MANAGED_POLICIES` carries
         // a subset of it, so refusing the ARNs outside that subset would refuse
-        // attachments AWS accepts. The reads of such a policy
-        // (`crate::ops::get_policy`) answer from the catalog where it is carried and
-        // 501 where it is not — never that AWS holds no such policy. A
+        // attachments AWS accepts. A
         // customer-managed policy, by contrast, exists exactly when this account
         // holds it — which is what the policy store `CreatePolicy` writes records.
         let aws_managed = policy.account == crate::state::AWS_MANAGED_POLICY_ACCOUNT;

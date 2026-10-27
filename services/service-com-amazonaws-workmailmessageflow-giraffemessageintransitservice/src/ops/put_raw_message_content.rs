@@ -185,7 +185,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let content = match resolved {
             Ok(bytes) => bytes,
-            Err(reason) => {
+            Err(Unreadable::Oversize(octets)) => {
+                // The object is readable; it is its CONTENT that is beyond what
+                // this emulator will read, so the answer is the content refusal.
+                // It is decided before the bytes are copied, so an object this
+                // large is never duplicated to refuse it.
+                return Err(refuse_rejected(
+                    &akid,
+                    &input.message_id,
+                    &reference,
+                    &request_region,
+                    oversize_content(octets),
+                ));
+            }
+            Err(Unreadable::Location(reason)) => {
                 // Which of the documented conditions fired stays in the access
                 // record: the wire error carries the model's own generic wording,
                 // the way the real service answers, rather than the stored object's
@@ -212,16 +225,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // Validation runs with NO lock held.
-        if let Err(reason) = validate_mime(&content) {
-            return Err(refuse_rejected(
-                &akid,
-                &input.message_id,
-                &reference,
-                &request_region,
-                reason,
-            ));
-        }
+        // Validation runs with NO lock held, and hands back the header block it
+        // read: the comparison in the second critical section reads the update's
+        // fields from it rather than parsing the content a second time.
+        let fields = match validate_mime(&content) {
+            Ok(fields) => fields,
+            Err(reason) => {
+                return Err(refuse_rejected(
+                    &akid,
+                    &input.message_id,
+                    &reference,
+                    &request_region,
+                    reason,
+                ));
+            }
+        };
 
         // SECOND critical section: install the bytes. The lock was released while
         // the content was validated, so the eligibility the first section checked is
@@ -236,7 +254,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // may not change a header the message carried on its way into the flow.
             let conflict = state
                 .message(&request_region, &input.message_id)
-                .and_then(|message| immutable_header_conflict(&message.content, &content));
+                .and_then(|message| immutable_header_conflict(&message.content, &fields));
             if let Some(reason) = conflict {
                 drop(state);
                 return Err(refuse_rejected(
@@ -413,27 +431,49 @@ fn resolve_content(
     state: &crate::state::ComAmazonawsWorkmailmessageflowGiraffemessageintransitserviceState,
     reference: &S3Ref,
     request_region: &str,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, Unreadable> {
     let Some(object) = state.resolve_s3_object(reference) else {
-        return Err("no object is stored at that bucket, key and object version".to_string());
+        return Err(Unreadable::Location(
+            "no object is stored at that bucket, key and object version".to_string(),
+        ));
     };
 
     if object.region != request_region {
-        return Err(format!(
+        return Err(Unreadable::Location(format!(
             "the bucket is in region {} but the request was made in region {request_region}",
             object.region
-        ));
+        )));
     }
 
     let caller = ::engine::emulator_account_id();
     if object.owner_account_id != caller {
-        return Err(format!(
+        return Err(Unreadable::Location(format!(
             "the bucket owner {} is not the calling AWS account {caller}",
             object.owner_account_id
-        ));
+        )));
+    }
+
+    // The ceiling is decided here, where the object is still BORROWED from the
+    // store, so content beyond it is refused without being copied: the copy below
+    // is what hands the bytes out of the critical section, and it is the one place
+    // this operation duplicates an object.
+    if object.content.len() > MAX_CONTENT_OCTETS {
+        return Err(Unreadable::Oversize(object.content.len()));
     }
 
     Ok(object.content.clone())
+}
+
+/// Why a reference did not yield content this operation can work on.
+enum Unreadable {
+    /// The object is not readable at all, and this is the reason for the access
+    /// record — the model's `InvalidContentLocation` for the caller.
+    Location(String),
+    /// The object is readable, and carries more octets than [`MAX_CONTENT_OCTETS`],
+    /// the ceiling this emulator reads content up to. A statement about the
+    /// content, so it is answered as unusable content and not as a location
+    /// failure.
+    Oversize(usize),
 }
 
 /// Headers RFC 5322 §3.6 permits at most once in a message.
@@ -496,6 +536,32 @@ const MAX_LINE_OCTETS: usize = 1000;
 /// the scans below are linear in the content and run inside one request.
 const MAX_CONTENT_OCTETS: usize = 128 * 1024 * 1024;
 
+/// The most of a message's HEADER BLOCK this emulator will read — the second guard
+/// on the process, for the same reason as [`MAX_CONTENT_OCTETS`] and with a bound
+/// of its own because the block is the one part of the content this operation
+/// takes APART into fields: reading it costs memory per line and not only per
+/// octet, and it is the caller who decides how many lines stand before the empty
+/// line that ends the block.
+///
+/// Not a fidelity limit, and far above any header block a mail system accepts — a
+/// message carries tens of header fields and a few KiB of them, and a widely
+/// deployed mail transfer agent's default ceiling is around a hundred KiB — so it
+/// refuses nothing the real service takes. Content beyond it is refused as
+/// unusable, with a message that says the ceiling is this emulator's.
+const MAX_HEADER_BLOCK_OCTETS: usize = 1024 * 1024;
+
+/// How many header lines this emulator will read out of one header block, the
+/// other half of the guard [`MAX_HEADER_BLOCK_OCTETS`] states.
+const MAX_HEADER_FIELDS: usize = 10_000;
+
+/// One header field of a message: its ASCII-lowercased name and its value, both
+/// as the OCTETS the message carries — the pair [`header_field`] reads off a line.
+type HeaderField = (Vec<u8>, Vec<u8>);
+
+/// A message's header block: its fields in the order the message carries them,
+/// which is what [`header_fields`] reads and [`validate_mime`] hands back.
+type HeaderBlock = Vec<HeaderField>;
+
 /// Whether `content` is usable MIME content on its own, answering why it is not
 /// when it is not — the `message` of `MessageRejected`, which the model documents
 /// as carrying "more information about what caused the error".
@@ -522,10 +588,17 @@ const MAX_CONTENT_OCTETS: usize = 128 * 1024 * 1024;
 /// attachment content types Amazon SES supports (an external appendix).
 ///
 /// One refusal is not a fidelity rule but a guard on this process, and says so in
-/// the message it produces: content beyond [`MAX_CONTENT_OCTETS`]. That ceiling
-/// sits far above anything a mail system accepts, so it refuses nothing the real
-/// service takes; everything else here is a single linear scan of the content.
-fn validate_mime(content: &[u8]) -> Result<(), String> {
+/// the message it produces: content beyond [`MAX_CONTENT_OCTETS`], or a header
+/// block beyond [`MAX_HEADER_BLOCK_OCTETS`] or [`MAX_HEADER_FIELDS`]. Those
+/// ceilings sit far above anything a mail system accepts, so they refuse nothing
+/// the real service takes. What they buy is that every scan here is bounded: the
+/// ones before them are linear in the content and allocate nothing, and the one
+/// that takes the block apart runs only inside them.
+///
+/// The fields this read come back, so the content is taken apart ONCE per request:
+/// the comparison [`immutable_header_conflict`] makes against the message in
+/// transit reads the update's fields from what this returns.
+fn validate_mime(content: &[u8]) -> Result<HeaderBlock, String> {
     if content.is_empty() {
         return Err(
             "The message content is empty; a message must contain the required header fields."
@@ -534,11 +607,7 @@ fn validate_mime(content: &[u8]) -> Result<(), String> {
     }
 
     if content.len() > MAX_CONTENT_OCTETS {
-        return Err(format!(
-            "The message is {} octets long, beyond the {MAX_CONTENT_OCTETS} octets this emulator \
-             will read.",
-            content.len()
-        ));
+        return Err(oversize_content(content.len()));
     }
 
     if !starts_with_header_field(content) {
@@ -556,7 +625,14 @@ fn validate_mime(content: &[u8]) -> Result<(), String> {
         ));
     }
 
-    let counts = header_field_counts(content);
+    // Decided BEFORE the block is taken apart, so no content beyond the ceilings
+    // is ever read into fields.
+    if let Some(reason) = oversize_header_block(content) {
+        return Err(reason);
+    }
+
+    let fields = header_fields(content);
+    let counts = field_counts(&fields);
 
     let missing: Vec<&str> = REQUIRED_HEADERS
         .iter()
@@ -578,12 +654,62 @@ fn validate_mime(content: &[u8]) -> Result<(), String> {
         }
     }
 
-    Ok(())
+    Ok(fields)
+}
+
+/// The refusal for content of `octets` octets, which is beyond
+/// [`MAX_CONTENT_OCTETS`]. One wording in one place: the ceiling is decided where
+/// the object is still in the store ([`resolve_content`]), so nothing that large
+/// is copied to refuse it, and again of the bytes themselves ([`validate_mime`]).
+fn oversize_content(octets: usize) -> String {
+    format!(
+        "The message is {octets} octets long, beyond the {MAX_CONTENT_OCTETS} octets this \
+         emulator will read."
+    )
+}
+
+/// Why `content`'s header block is beyond what this emulator reads, and `None`
+/// when the block is inside both of the ceilings [`MAX_HEADER_BLOCK_OCTETS`] and
+/// [`MAX_HEADER_FIELDS`] state.
+///
+/// The block is the content up to the first empty line, so it is the caller who
+/// decides how long it is and how many lines it carries. This walks it without
+/// allocating anything and stops at the first ceiling it crosses, so the walk is
+/// bounded by the ceiling rather than by the content.
+fn oversize_header_block(content: &[u8]) -> Option<String> {
+    let mut octets = 0usize;
+    let mut lines = 0usize;
+    for line in content.split(|byte| *byte == b'\n') {
+        if line.strip_suffix(b"\r").unwrap_or(line).is_empty() {
+            // The end of the header block.
+            return None;
+        }
+        // The LF that ended the line belongs to the block as well.
+        octets = octets.saturating_add(line.len()).saturating_add(1);
+        lines += 1;
+        if octets > MAX_HEADER_BLOCK_OCTETS {
+            return Some(format!(
+                "The message's header block is longer than the {MAX_HEADER_BLOCK_OCTETS} octets \
+                 this emulator will read."
+            ));
+        }
+        if lines > MAX_HEADER_FIELDS {
+            return Some(format!(
+                "The message's header block carries more than the {MAX_HEADER_FIELDS} header \
+                 lines this emulator will read."
+            ));
+        }
+    }
+    None
 }
 
 /// Why `updated` may not replace `current`, when it changes the value of a header
 /// in [`IMMUTABLE_HEADERS`], and `None` when every one of those headers reads
 /// exactly as it does on the message in transit.
+///
+/// `updated` is the header block [`validate_mime`] already read, so this reads
+/// only the message in transit — one bounded walk, which is all this decision
+/// costs inside the critical section that installs the bytes.
 ///
 /// "Unchanged" is compared over the whole sequence of a header's values, in order:
 /// a header that may legitimately appear several times (the `Received` trace) is
@@ -595,12 +721,11 @@ fn validate_mime(content: &[u8]) -> Result<(), String> {
 /// out of them: a message's content is arbitrary bytes, and any decoding that
 /// maps distinct byte sequences onto one string would read two different values
 /// as the same one and let a change through.
-fn immutable_header_conflict(current: &[u8], updated: &[u8]) -> Option<String> {
+fn immutable_header_conflict(current: &[u8], updated: &[HeaderField]) -> Option<String> {
     let before = header_fields(current);
-    let after = header_fields(updated);
     for name in IMMUTABLE_HEADERS {
         let before: Vec<&[u8]> = values_of(&before, name);
-        let after: Vec<&[u8]> = values_of(&after, name);
+        let after: Vec<&[u8]> = values_of(updated, name);
         if before == after {
             continue;
         }
@@ -624,7 +749,7 @@ fn immutable_header_conflict(current: &[u8], updated: &[u8]) -> Option<String> {
 /// The values of the header field `name` in `fields`, in the order the message
 /// carries them. `name` is an ASCII-lowercased field name, which is the form
 /// [`header_fields`] keys a field by.
-fn values_of<'a>(fields: &'a [(Vec<u8>, Vec<u8>)], name: &str) -> Vec<&'a [u8]> {
+fn values_of<'a>(fields: &'a [HeaderField], name: &str) -> Vec<&'a [u8]> {
     fields
         .iter()
         .filter(|(field, _)| field.as_slice() == name.as_bytes())
@@ -632,18 +757,19 @@ fn values_of<'a>(fields: &'a [(Vec<u8>, Vec<u8>)], name: &str) -> Vec<&'a [u8]> 
         .collect()
 }
 
-/// How many times each header field name appears in the message's header block,
-/// lowercased (RFC 5322 field names are case-insensitive).
+/// How many times each header field name appears in `fields`, the header block
+/// [`header_fields`] read: names are lowercased there, because RFC 5322 makes
+/// field names case-insensitive.
 ///
 /// A name is counted by its octets, so two fields are the same field only when
 /// their names are the same bytes up to ASCII case: a name that merely resembles
 /// another once its bytes are decoded is a different field and is counted on its
-/// own.
-fn header_field_counts(content: &[u8]) -> ::std::collections::BTreeMap<Vec<u8>, usize> {
-    let mut counts: ::std::collections::BTreeMap<Vec<u8>, usize> =
+/// own. The names are BORROWED from `fields`, so counting copies none of them.
+fn field_counts<'a>(fields: &'a [HeaderField]) -> ::std::collections::BTreeMap<&'a [u8], usize> {
+    let mut counts: ::std::collections::BTreeMap<&'a [u8], usize> =
         ::std::collections::BTreeMap::new();
-    for (name, _) in header_fields(content) {
-        *counts.entry(name).or_default() += 1;
+    for (name, _) in fields {
+        *counts.entry(name.as_slice()).or_default() += 1;
     }
     counts
 }
@@ -654,8 +780,8 @@ fn header_field_counts(content: &[u8]) -> ::std::collections::BTreeMap<Vec<u8>, 
 /// The block is the content up to the first empty line, and a line that opens with
 /// a space or a tab continues the field before it (RFC 5322 §2.2.3 folding) rather
 /// than starting a new one, so a folded value is compared as the one value it is.
-/// Field names are ASCII-lowercased because RFC 5322 makes them case-insensitive;
-/// values are not, since a value is what it says.
+/// Every other line is read by [`header_field`], the single rule this module
+/// decides what field a line carries by.
 ///
 /// Both halves stay bytes. A message's content is an arbitrary octet stream — the
 /// model recommends encoding anything outside 7-bit ASCII but requires nothing —
@@ -663,15 +789,28 @@ fn header_field_counts(content: &[u8]) -> ::std::collections::BTreeMap<Vec<u8>, 
 /// map byte sequences that differ onto one string and read two different fields,
 /// or two different values, as one. Only [`trim_wsp`] comes off either half, so
 /// every octet that is not RFC 5322 whitespace belongs to the name or the value.
-fn header_fields(content: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let mut fields: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+///
+/// Reading stops at the ceilings [`MAX_HEADER_BLOCK_OCTETS`] and
+/// [`MAX_HEADER_FIELDS`] state, so what this holds is bounded however long the
+/// content is. Content this operation installs is inside those ceilings —
+/// [`oversize_header_block`] refuses it otherwise, before anything is read — so
+/// only content that reached the store by another route can have a block that
+/// ends here rather than at its empty line.
+fn header_fields(content: &[u8]) -> HeaderBlock {
+    let mut fields: HeaderBlock = Vec::new();
+    let mut octets = 0usize;
     for line in content.split(|byte| *byte == b'\n') {
+        // The LF that ended the line belongs to the block as well.
+        octets = octets.saturating_add(line.len()).saturating_add(1);
+        if octets > MAX_HEADER_BLOCK_OCTETS || fields.len() >= MAX_HEADER_FIELDS {
+            break;
+        }
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         if line.is_empty() {
             // The end of the header block.
             break;
         }
-        if line[0] == b' ' || line[0] == b'\t' {
+        if is_folded_continuation(line) {
             // A folded continuation of the field above: unfolding removes the line
             // break and keeps the rest of the line, including its leading
             // whitespace.
@@ -680,14 +819,58 @@ fn header_fields(content: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
             }
             continue;
         }
-        let Some(colon) = line.iter().position(|byte| *byte == b':') else {
+        let Some(field) = header_field(line) else {
             continue;
         };
-        let name = trim_wsp(&line[..colon]).to_ascii_lowercase();
-        let value = trim_wsp(&line[colon + 1..]).to_vec();
-        fields.push((name, value));
+        fields.push(field);
     }
     fields
+}
+
+/// Whether `line` continues the field above it instead of carrying one of its own:
+/// RFC 5322 §2.2.3 folds a long field by breaking the line and opening the next
+/// one with whitespace, so a line that starts with whitespace belongs to the field
+/// before it.
+fn is_folded_continuation(line: &[u8]) -> bool {
+    matches!(line.first(), Some(b' ' | b'\t'))
+}
+
+/// The (ASCII-lowercased name, value) octets of the header field `line` carries,
+/// and `None` when it carries none.
+///
+/// This is the ONE rule this module decides what field a line is by, wherever the
+/// line sits in the block: [`header_fields`] reads the whole block with it and
+/// [`starts_with_header_field`] asks it about the first line, so one and the same
+/// line is the same field first, last or in the middle.
+///
+/// A line carries a field when it has a colon on it and the octets before that
+/// colon are a field name: RFC 5322 §3.6.8 makes a name one or more printable
+/// US-ASCII octets other than the colon, and the obsolete field syntax of §4.5.8
+/// admits ASCII whitespace between the name and the colon, which [`trim_wsp`]
+/// takes off — so a name padded with a space or a horizontal tab is still the
+/// field it names. A line with no colon, with nothing but whitespace before it, or
+/// whose name carries an octet outside those printable ones carries no field.
+///
+/// The name is ASCII-lowercased because RFC 5322 makes field names
+/// case-insensitive; the value is not, since a value is what it says.
+fn header_field(line: &[u8]) -> Option<HeaderField> {
+    let colon = line.iter().position(|byte| *byte == b':')?;
+    let name = trim_wsp(&line[..colon]);
+    if name.is_empty() || !name.iter().copied().all(is_field_name_octet) {
+        return None;
+    }
+    Some((
+        name.to_ascii_lowercase(),
+        trim_wsp(&line[colon + 1..]).to_vec(),
+    ))
+}
+
+/// Whether `byte` is an octet a header field name is made of: printable US-ASCII,
+/// which RFC 5322 §3.6.8 calls `ftext`. The colon is inside that range and
+/// excluded by taking a name up to the FIRST colon on its line, so no name this
+/// module reads can carry one.
+fn is_field_name_octet(byte: u8) -> bool {
+    (33..=126).contains(&byte)
 }
 
 /// `octets` without the whitespace RFC 5322 pads a header field with.
@@ -736,20 +919,21 @@ fn overlong_line(content: &[u8]) -> Option<(usize, usize)> {
     None
 }
 
-/// Whether `content` opens with an RFC 5322 header field: a field name of
-/// printable US-ASCII without a colon, then a colon.
+/// Whether `content` opens with an RFC 5322 header field, so the message has a
+/// header block at all.
+///
+/// Decided by [`header_field`], the same rule [`header_fields`] reads every other
+/// line of the block by, so a line that is a header field anywhere in the block is
+/// one on the first line too: the first line opens a field when it is not a folded
+/// continuation — there is no field above it to continue — and carries a field
+/// name before a colon, whatever ASCII whitespace pads that name.
 fn starts_with_header_field(content: &[u8]) -> bool {
     let first_line = content
         .split(|byte| *byte == b'\n')
         .next()
         .unwrap_or_default();
-    let Some(colon) = first_line.iter().position(|byte| *byte == b':') else {
-        return false;
-    };
-    colon > 0
-        && first_line[..colon]
-            .iter()
-            .all(|byte| (33..=126).contains(byte))
+    let first_line = first_line.strip_suffix(b"\r").unwrap_or(first_line);
+    !is_folded_continuation(first_line) && header_field(first_line).is_some()
 }
 
 /// The answer when this service's store is not reachable at all.

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeCapacityBlockStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeCapacityBlockStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeCapacityBlockStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the availability of capacity of the Capacity Blocks
+//! [`crate::state`] holds, narrowed by `CapacityBlockIds` and the documented
+//! `interconnect-status` filter and paged by `MaxResults`/`NextToken`. Each block's
+//! capacity is SUMMED over the Capacity Reservations it holds that capacity as, and its
+//! interconnect status is read off where the clock stands in its reserved window and
+//! whether the reservations it names are serving capacity. This is the ONLY file to touch
+//! for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +141,351 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeCapacityBlockStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeCapacityBlockStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            decode_page_token, encode_page_token, invalid_pagination_token_for,
+            require_known_capacity_block, require_service_state, CompiledFilter, MatchBudget,
+            MAX_FILTERS, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES, MAX_FILTER_VALUE_BYTES,
+            MAX_PAGE_SIZE, MAX_RESOURCE_IDS,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it — the store
+        // holds Capacity Blocks per account, so the Region a request was signed for does not
+        // narrow them. The store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        let requested_ids = input.capacity_block_ids.clone().unwrap_or_default();
+        if requested_ids.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "CapacityBlockIds carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                requested_ids.len()
+            )));
+        }
+
+        // Matching cost is filters x values x held values x stored blocks and the model
+        // bounds none of them, so the request-controlled factors are capped here, before any
+        // work proportional to them is done — and their PRODUCT is charged to one
+        // [`MatchBudget`] below, which is the bound the per-factor caps cannot give.
+        let supplied_filters = input.filters.as_ref().map_or(0, Vec::len);
+        if supplied_filters > MAX_FILTERS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The request carries {supplied_filters} filters, above the maximum \
+                 of {MAX_FILTERS}"
+            )));
+        }
+
+        // A filter name this operation does not document is refused whether or not any block
+        // would have matched it, so an unsupported filter can never read as "no results".
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        let mut selectors: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            let canonical = canonical_filter_name(name).ok_or_else(|| {
+                Scaffolded::invalid_parameter_value(format!("The filter '{name}' is invalid"))
+            })?;
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            selectors.push(CompiledFilter::new(canonical.to_string(), values.to_vec()));
+        }
+
+        // "The token to use to retrieve the next page of results" — anything else is refused
+        // rather than read as an id, and it is refused before any other member is looked at,
+        // so whether a bogus token is caught never depends on the rest of the request.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                Some(decode_page_token(token).ok_or_else(|| invalid_pagination_token_for(token))?)
+            }
+        };
+
+        let state = require_service_state(&*self.engine)?;
+        let store = state.lock();
+
+        // "The ID of the Capacity Block": an id that names no block of the account is an
+        // error, not an absent row.
+        for capacity_block_id in &requested_ids {
+            require_known_capacity_block(&store, capacity_block_id)?;
+        }
+
+        // DryRun sits AFTER every parameter has been validated and every named block
+        // resolved: the flag asks whether the request WOULD have succeeded, so one that would
+        // have been refused is refused with that reason instead.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // The availability of each block's capacity is COMPUTED from the stored block and the
+        // stored reservations it holds that capacity as, as of `now` — nothing is written, so
+        // this read changes nothing a later caller sees, and the `interconnect-status` filter
+        // therefore compares against the status the caller is shown.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeCapacityBlockStatus"))
+        // Every comparison is charged to ONE budget, so the PRODUCT of stored blocks,
+        // filters, values, held values and value length is bounded however the caller
+        // combines them — which is also what bounds how long this holds the state lock.
+        let now = ::std::time::SystemTime::now();
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<CapacityBlockStatus> = Vec::new();
+        for record in store.capacity_blocks.values() {
+            if budget.exhausted() {
+                break;
+            }
+            // The id narrowing is read off the stored record, so a block the request did not
+            // name costs no projection and no comparison at all.
+            if !requested_ids.is_empty()
+                && !requested_ids
+                    .iter()
+                    .any(|id| record.block.capacity_block_id.as_deref() == Some(id.as_str()))
+            {
+                continue;
+            }
+            let status = capacity_block_status_at(&store, record, now);
+            if matches_every_filter(&status, &selectors, &mut budget) {
+                selected.push(status);
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report as
+        // a result: the request asked for more filtering than one call will do, and is told
+        // so rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow them or page with MaxResults"
+            )));
+        }
+
+        // Page in `CapacityBlockId` order, which the cursor below names a position in. The
+        // store is an ordered map, so its iteration order already satisfies this sort; doing
+        // it here establishes the invariant the cursor depends on at the point of use.
+        selected.sort_by(|left, right| left.capacity_block_id.cmp(&right.capacity_block_id));
+
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected.partition_point(|status| {
+                status.capacity_block_id.as_deref().unwrap_or_default() < cursor
+            }),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // `MaxResults` carries the modelled `range 1..1000`
+        // (`smithy_query(query="shape",shape="DescribeCapacityBlockStatusMaxResults")`), so
+        // the boundary validator has already refused anything outside it, and a request that
+        // names no page size gets the largest page this service serves — the `NextToken` path
+        // then behaves the same whether or not a page size was asked for.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+
+        // A token only when a block follows this page: "This value is null when there are no
+        // more results to return" (`DescribeCapacityBlockStatusResult$NextToken`).
+        let next_token = page
+            .get(limit)
+            .and_then(|status| status.capacity_block_id.as_deref())
+            .map(encode_page_token);
+
+        Ok(DescribeCapacityBlockStatusOutput {
+            capacity_block_statuses: Some(page.iter().take(limit).cloned().collect()),
+            next_token,
+        })
     }
+}
+
+/// "`ok` the accelerator interconnect is healthy"
+/// (`CapacityBlockStatus$InterconnectStatus`): one member of the modelled
+/// `CapacityBlockInterconnectStatus` enum
+/// (`smithy_query(query="shape",shape="CapacityBlockInterconnectStatus")`, whose wire values
+/// this crate also keeps in [`CAPACITY_BLOCK_INTERCONNECT_STATUS_VALUES`]).
+const INTERCONNECT_STATUS_OK: &str = "ok";
+
+/// "`impaired` - accelerator interconnect communication is impaired" (same member): that
+/// enum's second value.
+const INTERCONNECT_STATUS_IMPAIRED: &str = "impaired";
+
+/// "`insufficient-data` - insufficient data to determine accelerator interconnect status"
+/// (same member): that enum's third value.
+const INTERCONNECT_STATUS_INSUFFICIENT_DATA: &str = "insufficient-data";
+
+/// The availability of `record`'s capacity as of `now`.
+///
+/// A Capacity Block holds its capacity as Capacity Reservations, so the block's capacity IS
+/// those reservations' capacity: each one contributes "the combined amount of `Available` and
+/// `Unavailable` capacity" it reserves (`CapacityReservationStatus$TotalCapacity`), of which
+/// the part that can still be launched into is available (`$TotalAvailableCapacity`) and the
+/// rest is not (`$TotalUnavailableCapacity`); the block's three totals are the sums of its
+/// reservations' (`CapacityBlockStatus$TotalCapacity`). Capacity of a reservation that is not
+/// serving capacity at `now` — one whose payment has not settled, one held for a later date,
+/// one that has expired or been cancelled — cannot be launched into, so none of it is
+/// available.
+///
+/// Every number is derived from the stored block, the stored reservations and the clock, so
+/// two calls a moment apart answer the same and neither writes anything.
+fn capacity_block_status_at(
+    store: &crate::state::ComAmazonawsEc2Amazonec2State,
+    record: &crate::state::CapacityBlockRecord,
+    now: ::std::time::SystemTime,
+) -> CapacityBlockStatus {
+    let named = record
+        .block
+        .capacity_reservation_ids
+        .as_deref()
+        .unwrap_or_default();
+    let mut capacity_reservation_statuses: Vec<CapacityReservationStatus> =
+        Vec::with_capacity(named.len());
+    let mut serving = 0usize;
+    for capacity_reservation_id in named {
+        // A reservation this store no longer holds reports no capacity rather than a row of
+        // zeroes: there is nothing to report the availability of.
+        let Some(reservation) = store.capacity_reservations.get(capacity_reservation_id) else {
+            continue;
+        };
+        let delivering =
+            reservation.state_at(now) == crate::state::CAPACITY_RESERVATION_STATE_ACTIVE;
+        if delivering {
+            serving = serving.saturating_add(1);
+        }
+        let total = reservation
+            .view
+            .total_instance_count
+            .unwrap_or_default()
+            .max(0);
+        // "The remaining capacity. Indicates the amount of resources that can be launched
+        // into the Capacity Reservation" (`CapacityReservationStatus$TotalAvailableCapacity`)
+        // — which is none of it while the reservation is not serving capacity.
+        let available = if delivering {
+            reservation.available_instance_count().clamp(0, total)
+        } else {
+            0
+        };
+        capacity_reservation_statuses.push(CapacityReservationStatus {
+            capacity_reservation_id: Some(capacity_reservation_id.clone()),
+            total_capacity: Some(total),
+            total_available_capacity: Some(available),
+            // The two parts of `TotalCapacity` are exhaustive, so what is not available is
+            // unavailable — "the used capacity" of a reservation being served
+            // (`$TotalUnavailableCapacity`), and all of it for one that is not.
+            total_unavailable_capacity: Some(total.saturating_sub(available)),
+        });
+    }
+
+    let sum = |of: fn(&CapacityReservationStatus) -> Option<i32>| -> i32 {
+        capacity_reservation_statuses
+            .iter()
+            .fold(0i32, |total, status| {
+                total.saturating_add(of(status).unwrap_or_default())
+            })
+    };
+
+    CapacityBlockStatus {
+        capacity_block_id: record.block.capacity_block_id.clone(),
+        interconnect_status: Some(
+            interconnect_status_at(record, named.len(), serving, now).to_string(),
+        ),
+        total_capacity: Some(sum(|status| status.total_capacity)),
+        total_available_capacity: Some(sum(|status| status.total_available_capacity)),
+        total_unavailable_capacity: Some(sum(|status| status.total_unavailable_capacity)),
+        capacity_reservation_statuses: Some(capacity_reservation_statuses),
+    }
+}
+
+/// The status of the accelerator interconnect of the block `record` holds, `serving` of whose
+/// `named` Capacity Reservations are serving capacity at `now`.
+///
+/// The interconnect links the accelerators of capacity that is being served, so there is
+/// something to measure only while the block's reserved window is open and the block holds
+/// its capacity as reservations at all: a block the clock does not put inside that window —
+/// scheduled, expired, cancelled, or waiting on its payment
+/// ([`crate::state::CapacityBlockRecord::state_at`]) — and one naming no reservation report
+/// `insufficient-data`. An open block whose every named reservation is serving capacity is
+/// healthy; one missing some of it — a reservation not serving capacity, or one the account
+/// no longer holds — is impaired.
+fn interconnect_status_at(
+    record: &crate::state::CapacityBlockRecord,
+    named: usize,
+    serving: usize,
+    now: ::std::time::SystemTime,
+) -> &'static str {
+    if record.state_at(now) != crate::state::CAPACITY_BLOCK_STATE_ACTIVE || named == 0 {
+        return INTERCONNECT_STATUS_INSUFFICIENT_DATA;
+    }
+    if serving == named {
+        return INTERCONNECT_STATUS_OK;
+    }
+    INTERCONNECT_STATUS_IMPAIRED
+}
+
+/// The filter names this operation documents, from
+/// `DescribeCapacityBlockStatusRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeCapacityBlockStatusRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// That list names exactly one: "`interconnect-status` - The status of the interconnect for
+/// the Capacity Block". Every entry must be answered by [`filter_values`].
+const CAPACITY_BLOCK_STATUS_FILTERS: [&str; 1] = ["interconnect-status"];
+
+/// The name [`filter_values`] answers for the filter the request called `name`, or `None`
+/// when this operation documents no such filter.
+///
+/// "Filter names are case-sensitive" (`Filter$Name`), so the comparison is exact.
+fn canonical_filter_name(name: &str) -> Option<&str> {
+    CAPACITY_BLOCK_STATUS_FILTERS
+        .contains(&name)
+        .then_some(name)
+}
+
+/// The values the EC2 filter `name` compares against this Capacity Block's status.
+///
+/// `name` is a name [`canonical_filter_name`] resolved.
+fn filter_values<'a>(
+    status: &'a CapacityBlockStatus,
+    name: &str,
+) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    match name {
+        "interconnect-status" => status
+            .interconnect_status
+            .as_deref()
+            .map(Cow::Borrowed)
+            .into_iter()
+            .collect(),
+        // Unreachable: `canonical_filter_name` has already refused every other name. An
+        // undefined name compares against nothing, so it could never widen a result even if
+        // that check were bypassed.
+        _ => Vec::new(),
+    }
+}
+
+/// Does `status` satisfy every filter?
+///
+/// The AND/OR evaluation, the wildcard matching and the budget charging all live in
+/// [`crate::state::matches_every_filter`], so this operation only says WHERE a filter's
+/// values come from.
+fn matches_every_filter(
+    status: &CapacityBlockStatus,
+    selectors: &[crate::state::CompiledFilter],
+    budget: &mut crate::state::MatchBudget,
+) -> bool {
+    crate::state::matches_every_filter(selectors, budget, &|name| filter_values(status, name))
 }

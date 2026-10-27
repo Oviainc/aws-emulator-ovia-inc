@@ -3,8 +3,8 @@
 //! Tagging a CodeDeploy resource by its ARN, driven over the wire.
 //!
 //! RULE under test: `TagResource` reads its `ResourceArn` as the resource that
-//! ARN identifies — an application, a deployment group or a deployment
-//! configuration, by the names the ARN's resource part carries — and merges the
+//! ARN identifies — an application or a deployment group, by the names the ARN's
+//! resource part carries — and merges the
 //! request's key/value tags onto that resource's own record, replacing the value
 //! of a key it already carries rather than duplicating the key, so
 //! `ListTagsForResource` reports exactly those tags; a value that is not in the
@@ -71,33 +71,22 @@ async fn tags_of(emulator: &Emulator, resource_arn: &str) -> Vec<(String, String
         .collect()
 }
 
-/// Create a `Server` deployment configuration under `name`.
-async fn create_config(emulator: &Emulator, name: &str) {
-    emulator
-        .ok(
-            "CreateDeploymentConfig",
-            json!({
-                "deploymentConfigName": name,
-                "computePlatform": "Server",
-                "minimumHealthyHosts": {"type": "HOST_COUNT", "value": 1},
-            }),
-        )
-        .await;
-}
-
 /// RULE: the tags a call applies are merged onto the resource its ARN names, and
 /// `ListTagsForResource` reports exactly those tags — whatever the resource
 /// kind, the number of tags or the form of a tag's value.
 #[tokio::test]
 async fn tags_applied_by_arn_read_back_from_the_resource() {
     let emulator = Emulator::new();
-    // One resource of every taggable kind, each created through the API a client
+    // Two resources of each taggable kind, each created through the API a client
     // uses, so the ARN under test names a record the store really holds.
     emulator
         .ok("CreateApplication", json!({"applicationName": "tagged-app"}))
         .await;
     let group = seeded_group(&emulator, "grouped-app", "Server").await;
-    create_config(&emulator, "tagged-config").await;
+    emulator
+        .ok("CreateApplication", json!({"applicationName": "valued-app"}))
+        .await;
+    let punctuated = seeded_group(&emulator, "punctuated-app", "Server").await;
 
     // Rows differ along the resource KIND the ARN names, the number of tags
     // applied, and the form of the tag values (ordinary, empty — the service
@@ -114,13 +103,13 @@ async fn tags_applied_by_arn_read_back_from_the_resource() {
             &[("Env", "dev"), ("Owner", "ana"), ("Tier", "api")],
         ),
         (
-            "deployment configuration, empty tag value",
-            state::deployment_config_arn(REGION, "tagged-config"),
+            "a second application, empty tag value",
+            state::application_arn(REGION, "valued-app"),
             &[("Marker", ""), ("Env", "staging")],
         ),
         (
-            "predefined deployment configuration, punctuated value",
-            state::deployment_config_arn(REGION, "CodeDeployDefault.OneAtATime"),
+            "a second deployment group, punctuated value",
+            state::deployment_group_arn(REGION, "punctuated-app", &punctuated),
             &[("Owner", "team platform/eu, on-call")],
         ),
     ];
@@ -353,6 +342,12 @@ async fn a_resource_arn_is_refused_by_what_is_wrong_with_it() {
             "arn:aws:codedeploy:us-east-1:000000000000:deployment:d-ABCDEFGHI".to_string(),
         ),
         (
+            "a deployment configuration, a type these operations do not act on",
+            state::deployment_config_arn(REGION, "absent-config"),
+            "ArnNotSupportedException",
+            state::deployment_config_arn(REGION, "absent-config"),
+        ),
+        (
             "an application that does not exist",
             state::application_arn(REGION, "absent-app"),
             "ApplicationDoesNotExistException",
@@ -369,12 +364,6 @@ async fn a_resource_arn_is_refused_by_what_is_wrong_with_it() {
             state::deployment_group_arn(REGION, "present-group-app", "absent-group"),
             "DeploymentGroupDoesNotExistException",
             "absent-group".to_string(),
-        ),
-        (
-            "a deployment configuration that does not exist",
-            state::deployment_config_arn(REGION, "absent-config"),
-            "DeploymentConfigDoesNotExistException",
-            "absent-config".to_string(),
         ),
     ];
 

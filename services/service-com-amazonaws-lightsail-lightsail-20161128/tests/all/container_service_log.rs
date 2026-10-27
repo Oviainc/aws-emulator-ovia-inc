@@ -17,7 +17,9 @@
 //!   since there is no page after one that displayed everything. The call writes
 //!   nothing a later caller can see.
 //! * The containers it answers about are the ones a deployment that BECAME ACTIVE
-//!   declared: before the clock activates a service's first deployment, no
+//!   declared — the deployment active now AND every superseded one the store still
+//!   holds, since a container of a deployment a later one replaced previously ran
+//!   on the service: before the clock activates a service's first deployment, no
 //!   container has run on it, and a service created without a deployment never has
 //!   one. Every other container name — and every service name that names no
 //!   container service in the region the request is made in — earns the service's
@@ -33,7 +35,9 @@
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use service_com_amazonaws_lightsail_lightsail_20161128::state::MAX_CONTAINERS_PER_DEPLOYMENT;
+use service_com_amazonaws_lightsail_lightsail_20161128::state::{
+    MAX_CONTAINERS_PER_DEPLOYMENT, MAX_DEPLOYMENTS_PER_SERVICE,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The `X-Amz-Target` prefix this service routes on (`OPERATIONS.md`, "Wire
@@ -121,6 +125,21 @@ impl Emulator {
     /// HTTP 201 (its modelled success status).
     async fn create(&self, region: &str, body: Value) -> Value {
         self.ok(region, "CreateContainerService", body, 201).await["containerService"].clone()
+    }
+
+    /// Deploy a deployment declaring `containers` to the container service
+    /// `service` in `region`, answering the `containerService` the call reports.
+    /// `CreateContainerServiceDeployment` answers HTTP 201 (its modelled success
+    /// status).
+    async fn deploy(&self, region: &str, service: &str, containers: &[&str]) -> Value {
+        let mut body = json!({"serviceName": service, "containers": {}});
+        for container in containers {
+            body["containers"][*container] =
+                json!({"image": "nginx:latest", "ports": {"80": "HTTP"}});
+        }
+        self.ok(region, "CreateContainerServiceDeployment", body, 201)
+            .await["containerService"]
+            .clone()
     }
 
     /// The stored container service `name` in `region`, as `GetContainerServices`
@@ -247,6 +266,31 @@ async fn wait_for_state(emulator: &Emulator, region: &str, name: &str, want: &st
             Instant::now() < deadline,
             "case waiting for '{want}' on {name}: expected it within 5s, got {:?}",
             service["state"]
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Poll `GetContainerServices` until the deployment `version` of the service
+/// `name` in `region` is its `currentDeployment`, answering the whole record. The
+/// activation is owed by the clock, not by the poll.
+async fn wait_for_current_deployment(
+    emulator: &Emulator,
+    region: &str,
+    name: &str,
+    version: i64,
+) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let service = emulator.service(region, name).await;
+        if service["currentDeployment"]["version"].as_i64() == Some(version) {
+            return service;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case waiting for deployment {version} of {name} to activate: expected it within \
+             10s, got {:?}",
+            service["currentDeployment"]
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
@@ -823,5 +867,246 @@ async fn the_table_rows_are_inside_the_modelled_bounds() {
             "case {}: a public endpoint must front a container the deployment declares",
             row.case
         );
+    }
+    for row in HISTORY_ROWS {
+        assert!(
+            (1..=63).contains(&row.name.len()),
+            "case {}: service name {:?} is outside the modelled 1..63 length, got {}",
+            row.case,
+            row.name,
+            row.name.len()
+        );
+        for (index, containers) in row.deployments.iter().enumerate() {
+            assert!(
+                containers.len() <= MAX_CONTAINERS_PER_DEPLOYMENT,
+                "case {} / deployment {index}: expected at most the \
+                 {MAX_CONTAINERS_PER_DEPLOYMENT} containers one deployment accepts, got {}",
+                row.case,
+                containers.len()
+            );
+        }
+        assert!(
+            row.deployments.len() >= 2,
+            "case {}: a deployment history needs at least two deployments to supersede one \
+             another, got {}",
+            row.case,
+            row.deployments.len()
+        );
+        assert!(
+            row.deployments.len() <= MAX_DEPLOYMENTS_PER_SERVICE,
+            "case {}: expected at most the {MAX_DEPLOYMENTS_PER_SERVICE} deployments \
+             the store keeps, so none of the row's own is forgotten, got {}",
+            row.case,
+            row.deployments.len()
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The deployments that ran before
+// ---------------------------------------------------------------------------
+
+/// One container service whose deployments supersede one another. The rows differ
+/// along what the rule generalises over: how many deployments the service has had
+/// (two, three, four), whether its first came with the create or from
+/// `CreateContainerServiceDeployment`, how many containers each deployment
+/// declares, and whether successive deployments share a container name.
+#[derive(Debug, Clone, Copy)]
+struct HistoryRow {
+    case: &'static str,
+    region: &'static str,
+    name: &'static str,
+    /// The containers each deployment declares, in the order the deployments are
+    /// created. An EMPTY first entry means the service is created with no
+    /// deployment at all, so its first one comes from
+    /// `CreateContainerServiceDeployment`.
+    deployments: &'static [&'static [&'static str]],
+}
+
+/// The table of deployment histories.
+const HISTORY_ROWS: &[HistoryRow] = &[
+    HistoryRow {
+        case: "a second deployment declaring a different container",
+        region: "us-east-1",
+        name: "superseded",
+        deployments: &[&["first-app"], &["second-app"]],
+    },
+    HistoryRow {
+        case: "three deployments, the middle one keeping one container of the first",
+        region: "us-west-2",
+        name: "three-times",
+        deployments: &[&["api", "worker"], &["api"], &["web", "cache", "queue"]],
+    },
+    HistoryRow {
+        case: "four deployments of one container each, on the shortest name the modelled \
+               pattern admits",
+        region: "eu-west-1",
+        name: "qq",
+        deployments: &[&["a"], &["b"], &["c"], &["d"]],
+    },
+    HistoryRow {
+        case: "a service created with no deployment, then two of them",
+        region: "ap-northeast-1",
+        name: "late-start-2026",
+        deployments: &[&[], &["bootstrap"], &["steady"]],
+    },
+];
+
+/// `row`'s first deployment as a [`ServiceRow`], which is what the create carries.
+fn history_service_row(row: &HistoryRow) -> ServiceRow {
+    ServiceRow {
+        case: row.case,
+        region: row.region,
+        name: row.name,
+        containers: row.deployments.first().copied().unwrap_or(&[]),
+        public_endpoint: false,
+    }
+}
+
+/// RULE: the containers a container service can be asked about are the ones
+/// declared by every deployment of it that became active — the one active now AND
+/// the ones it superseded — so a container that ran under an earlier deployment
+/// keeps reporting its (empty) log after a later deployment replaced it, while a
+/// name no deployment of the service ever declared is still refused.
+#[tokio::test]
+async fn a_container_of_a_superseded_deployment_still_reports_its_log() {
+    let emulator = Emulator::new();
+    // Per row: the version of the newest deployment activated so far (0 while
+    // none has), and every container that has run on that service.
+    let mut version: Vec<i64> = vec![0; HISTORY_ROWS.len()];
+    let mut ran: Vec<Vec<&str>> = vec![Vec::new(); HISTORY_ROWS.len()];
+
+    // Every service is created first, and each round below starts a deployment
+    // on every row before waiting for any: the activations the clock owes then
+    // overlap instead of running one after another.
+    for row in HISTORY_ROWS {
+        emulator
+            .create(row.region, create_body(&history_service_row(row)))
+            .await;
+    }
+
+    let rounds = HISTORY_ROWS
+        .iter()
+        .map(|row| row.deployments.len())
+        .max()
+        .unwrap_or(0);
+    for round in 0..rounds {
+        for (index, row) in HISTORY_ROWS.iter().enumerate() {
+            let Some(containers) = row.deployments.get(round) else {
+                continue;
+            };
+            if containers.is_empty() {
+                // The create carried no deployment, so nothing is deploying in
+                // this round and no version was taken.
+                continue;
+            }
+            if round > 0 {
+                emulator.deploy(row.region, row.name, containers).await;
+            }
+            version[index] += 1;
+            ran[index].extend(containers.iter().copied());
+        }
+        for (index, row) in HISTORY_ROWS.iter().enumerate() {
+            if version[index] == 0 {
+                continue;
+            }
+            wait_for_current_deployment(&emulator, row.region, row.name, version[index]).await;
+        }
+
+        for (index, row) in HISTORY_ROWS.iter().enumerate() {
+            if version[index] == 0 {
+                continue;
+            }
+            // Every container of every deployment that became active — the
+            // newest one and each it superseded — still reports its log, over
+            // each form of read the table covers.
+            for container in &ran[index] {
+                for read in READ_ROWS {
+                    let case = format!(
+                        "{} / {container} after deployment {} activated / {}",
+                        row.case, version[index], read.case
+                    );
+                    let (status, answered) = emulator
+                        .log(row.region, row.name, container, read_body(read))
+                        .await;
+                    assert_empty_log(&case, status, &answered);
+                }
+            }
+
+            // A name no deployment of this service declared is still refused,
+            // and the refusal names every container that HAS run on it.
+            let case = format!(
+                "{} / a name no deployment declared after deployment {} activated",
+                row.case, version[index]
+            );
+            let (status, refused) = emulator
+                .log(row.region, row.name, "absent", json!({}))
+                .await;
+            assert_does_not_exist(&case, status, &refused);
+            for container in &ran[index] {
+                assert!(
+                    refused["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains(container)),
+                    "case {case}: expected the refusal to name {container:?} among the \
+                     containers that have run on the service, got {refused:?}"
+                );
+            }
+        }
+    }
+}
+
+/// RULE: a deployment that is still WAITING on the clock has run nothing, so its
+/// containers are refused until it activates — while the container of the
+/// deployment it is about to supersede is answered before AND after, because that
+/// one previously ran.
+#[tokio::test]
+async fn a_container_of_the_waiting_deployment_is_refused_until_it_activates() {
+    let emulator = Emulator::new();
+    let row = ServiceRow {
+        case: "a second deployment still waiting on the clock",
+        region: "eu-central-1",
+        name: "waiting-next",
+        containers: &["first-app"],
+        public_endpoint: true,
+    };
+    emulator.create(row.region, create_body(&row)).await;
+    wait_for_current_deployment(&emulator, row.region, row.name, 1).await;
+
+    let deploying = emulator.deploy(row.region, row.name, &["second-app"]).await;
+    // Only assert the early refusal while the new deployment really has not
+    // become the current one yet: the activation is owed by the clock, and this
+    // read must not race it.
+    if deploying["currentDeployment"]["version"].as_i64() == Some(1) {
+        let case = format!("{} / its container before activation", row.case);
+        let (status, refused) = emulator
+            .log(row.region, row.name, "second-app", json!({}))
+            .await;
+        assert_does_not_exist(&case, status, &refused);
+        assert!(
+            refused["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("first-app")),
+            "case {case}: expected the refusal to name the container that did run, got \
+             {refused:?}"
+        );
+    }
+
+    // The container of the deployment being superseded keeps answering through
+    // the whole handover.
+    let (status, answered) = emulator
+        .log(row.region, row.name, "first-app", json!({}))
+        .await;
+    assert_empty_log(
+        "the container that ran, while the next deployment waits",
+        status,
+        &answered,
+    );
+
+    wait_for_current_deployment(&emulator, row.region, row.name, 2).await;
+    for container in ["first-app", "second-app"] {
+        let case = format!("{} / {container} after the handover", row.case);
+        let (status, answered) = emulator.log(row.region, row.name, container, json!({})).await;
+        assert_empty_log(&case, status, &answered);
     }
 }

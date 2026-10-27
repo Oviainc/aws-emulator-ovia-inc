@@ -9,7 +9,9 @@
 //! A profile is one record holding every version of itself, so the delete is the
 //! single removal of that record: no version of a deleted profile is readable
 //! afterwards, nor are the tags that were held on it, and the content bytes and
-//! the profile slot it occupied are given back. The output carries no status
+//! the profile slot it occupied are given back — as is every idempotency token
+//! that minted it, so a `ClientToken` never outlives the profile it names. The
+//! output carries no status
 //! member, so the profile is gone the instant this call answers and owes the clock
 //! no transition. A profile no record holds — including one an earlier call
 //! already deleted — is a `ResourceNotFoundException`.
@@ -166,8 +168,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Deletes a data transformation profile and all its versions, including the
         // DRAFT and all published versions": every version lives on the one record,
         // so removing it drops them together — and the content bytes and the profile
-        // slot it held are given back by the record being dropped.
-        let Some(profile) = store.profiles.remove(&input.profile_id) else {
+        // slot it held are given back by the record being dropped. The removal goes
+        // through the state's own `remove_profile`, so the idempotency tokens that
+        // minted this profile die with it rather than outliving the record they name.
+        let Some(profile) = store.remove_profile(&input.profile_id) else {
             return Err(not_found(crate::state::PROFILE_NOT_FOUND_MESSAGE));
         };
 

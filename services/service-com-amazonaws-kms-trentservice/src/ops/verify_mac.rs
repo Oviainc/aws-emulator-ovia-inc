@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op VerifyMac
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `VerifyMac`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: recomputes the HMAC of the caller's message under the key material of
+//! the HMAC KMS key a `KeyId` names, with the MAC algorithm the request asks for, and
+//! compares it with the HMAC the request carries. This is the only file holding THIS
+//! operation's own request walk; the HMAC and the comparison live in `crate::state`
+//! beside the key material, so this operation judges exactly what `GenerateMac`
+//! produces.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`VerifyMac::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A tag that matches is answered with `MacValid` true, the key's ARN and the
+//! algorithm the verification used; a tag that does not — because the message, the
+//! key or the algorithm is not the one it was computed with — is the modelled
+//! `KMSInvalidMacException`, since "if the HMAC is not verified, the VerifyMac
+//! operation fails". The comparison is the library's own, over this key's material;
+//! nothing here compares bytes it composed itself.
+//!
+//! A key that cannot verify a MAC is refused with the modelled error for why: an
+//! identifier that names no key, a key state no cryptographic operation runs in, a
+//! `KeyUsage` other than `GENERATE_VERIFY_MAC`, or an algorithm the key's `KeySpec`
+//! does not support. A request that verifies is a USE of the key, so it is recorded as
+//! the key's last usage.
 //!
 //! ## Shape of an operation
 //!
@@ -217,18 +227,190 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `VerifyMac` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(VerifyMacErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal("the KMS state store is unavailable"));
+        };
+
+        // Who the request speaks for, resolved BEFORE this service's store is locked, so
+        // the IAM and STS stores the resolution reads are never reached while this
+        // service's guard is held.
+        let caller = crate::state::authorization::caller(&*self.engine, ctx);
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+
+        // Permission a request draws from a grant is judged below, once the key is
+        // known and its key state has been judged.
+        let tokens = input.grant_tokens.clone().unwrap_or_default();
+
+        // `VerifyMac` models no `InvalidArnException`, so an identifier shaped like an
+        // ARN but not a valid one is reported the same way as one that names nothing.
+        let key = match state.resolve(&region, &input.key_id) {
+            crate::state::KeyRef::Found(key) => key,
+            crate::state::KeyRef::UnauthorizedAccount => {
+                return Err(crate::state::unauthorized_account(Self::NAME));
+            }
+            crate::state::KeyRef::NotFound | crate::state::KeyRef::MalformedArn => {
+                return Err(VerifyMacErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::key_not_found_message(&region, &input.key_id)),
+                })
+                .into());
+            }
+        };
+
+        // "The KMS key that you use for this operation must be in a compatible key
+        // state" (this operation's own doc): a disabled key answers
+        // `DisabledException`, and any other state a cryptographic operation cannot run
+        // in answers `KMSInvalidStateException`, which names the state the key is
+        // actually in. Judged BEFORE the grant tokens, so a key that cannot be used at
+        // all reports why rather than reporting an authorization failure.
+        if !key.is_usable() {
+            if key.key_state == crate::state::KEY_STATE_DISABLED {
+                return Err(VerifyMacErrorModeled::DisabledException(DisabledException {
+                    message: Some(crate::state::invalid_state_message(key)),
+                })
+                .into());
+            }
+            return Err(VerifyMacErrorModeled::KMSInvalidStateException(
+                KMSInvalidStateException {
+                    message: Some(crate::state::invalid_state_message(key)),
+                },
+            )
+            .into());
+        }
+
+        // A grant token is handed out by `CreateGrant` and names the grant it was
+        // minted for. A token that is not one this service minted names no grant at
+        // all, so the TOKEN "is not valid".
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("VerifyMac"))
+        // Everything else about permission is the service's one authorization decision
+        // (`crate::state::authorization`): the key's own key policy, the calling
+        // principal's identity policies, and the grants on this key the caller holds or
+        // presented a token for, judged together.
+        let named = match state.grants_for_tokens(&region, &tokens) {
+            Ok(named) => named,
+            Err(crate::state::GrantRefusal::MalformedToken) => {
+                return Err(VerifyMacErrorModeled::InvalidGrantTokenException(
+                    InvalidGrantTokenException {
+                        message: Some("The specified grant token is not valid.".to_string()),
+                    },
+                )
+                .into());
+            }
+            // Every token is well formed but names a grant the store no longer holds,
+            // which carries no permission; what else the caller holds is judged below.
+            Err(crate::state::GrantRefusal::NotAuthorized) => Vec::new(),
+        };
+        let presented = (!tokens.is_empty()).then_some(named.as_slice());
+        // `VerifyMac` takes no `EncryptionContext`, so no encryption-context grant
+        // constraint applies to it.
+        if let Err(message) = crate::state::authorization::authorize(
+            &caller,
+            &state,
+            &region,
+            key,
+            Self::NAME,
+            None,
+            presented,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(message));
+        }
+
+        // Two requirements, each with its own refusal, which are the two halves of
+        // `InvalidKeyUsageException` — "the KeyUsage value of the KMS key is
+        // incompatible with the API operation" and the algorithm "is incompatible with
+        // the type of key material in the KMS key (KeySpec)"
+        // (`smithy_query(query="doc",shape="InvalidKeyUsageException")`). "For
+        // generating and verifying message authentication codes (MACs), the KeyUsage
+        // must be GENERATE_VERIFY_MAC", and the algorithm "must be supported by the
+        // HMAC KMS key identified by the KeyId parameter"
+        // (`smithy_query(query="doc",shape="VerifyMacRequest",member="MacAlgorithm")`),
+        // which is what its key spec decides. The usage is judged first, so a key that
+        // does no MACing at all is refused for being the wrong kind of key rather than
+        // for the algorithm the request happened to name.
+        if key.key_usage != crate::state::KEY_USAGE_GENERATE_VERIFY_MAC {
+            return Err(invalid_key_usage(format!(
+                "{} key usage is {} which is not valid for {}.",
+                key.arn,
+                key.key_usage,
+                Self::NAME
+            )));
+        }
+        let algorithms = key
+            .algorithms_under(crate::state::KEY_USAGE_GENERATE_VERIFY_MAC)
+            .unwrap_or_default();
+        if !algorithms.contains(&input.mac_algorithm) {
+            return Err(invalid_key_usage(format!(
+                "Algorithm {} is incompatible with key spec {}.",
+                input.mac_algorithm, key.key_spec
+            )));
+        }
+
+        // "The request was rejected because the DryRun parameter was specified"
+        // (`smithy_query(query="doc",shape="DryRunOperationException")`): a dry run
+        // checks the request and then always fails, so it is answered AFTER every check
+        // above and BEFORE the HMAC is compared.
+        if input.dry_run == Some(true) {
+            return Err(VerifyMacErrorModeled::DryRunOperationException(
+                DryRunOperationException {
+                    message: Some(
+                        "The request was rejected because the DryRun parameter was specified."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // "HMAC verification fails when the HMAC computed by using the specified
+        // message, HMAC KMS key, and MAC algorithm does not match the HMAC specified in
+        // the request" (`smithy_query(query="doc",shape="KMSInvalidMacException")`), so
+        // a tag computed over another message, under another key or with another
+        // algorithm is refused rather than reported as a verification that answered
+        // false.
+        if !crate::state::mac_matches(key, &input.mac_algorithm, &input.message, &input.mac) {
+            return Err(invalid_mac());
+        }
+        // KMS answers with "the HMAC KMS key used in the verification" by its key ARN,
+        // not with the identifier the request used.
+        let key_arn = key.arn.clone();
+        let key_id = key.key_id.clone();
+
+        // The key was just used in a successful cryptographic operation, and `VerifyMac`
+        // is one of the operations that use is reported for
+        // (`smithy_query(query="shape",shape="KeyLastUsageTrackingOperation")`).
+        state.record_last_usage(&region, &key_id, Self::NAME);
+
+        Ok(VerifyMacOutput {
+            key_id: Some(key_arn),
+            mac_valid: true,
+            mac_algorithm: Some(input.mac_algorithm),
+        })
     }
+}
+
+/// The tag the request carried is not the HMAC of its message under this key and
+/// algorithm.
+///
+/// The refusal carries NO message. What it would have to say is which of the message,
+/// the key and the algorithm is not the one the tag was computed with, and a caller
+/// that presented a tag that does not verify is told none of that: the exception
+/// shape's own documentation is API-reference prose, not a message the wire carries.
+fn invalid_mac() -> VerifyMacError {
+    VerifyMacErrorModeled::KMSInvalidMacException(KMSInvalidMacException { message: None }).into()
+}
+
+/// Refuse a key or a MAC algorithm that cannot perform this operation.
+fn invalid_key_usage(message: impl Into<String>) -> VerifyMacError {
+    VerifyMacErrorModeled::InvalidKeyUsageException(InvalidKeyUsageException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The state store is missing: a server fault rather than anything about the request.
+fn internal(message: impl Into<String>) -> VerifyMacError {
+    VerifyMacErrorModeled::KMSInternalException(KMSInternalException {
+        message: Some(message.into()),
+    })
+    .into()
 }

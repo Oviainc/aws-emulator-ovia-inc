@@ -1256,10 +1256,14 @@ pub fn default_account_id() -> &'static str {
     ::engine::emulator_account_id()
 }
 
-/// The account id a request with an OPTIONAL account-id member operates on: the
-/// member is absent, so the call is the standalone one on the caller's own
-/// account ([`default_account_id`]), or it names a member account of the
-/// caller's organization.
+/// The account id a request operates on: the member is absent, so the call is
+/// the standalone one on the caller's own account ([`default_account_id`]), or
+/// it names a member account of the caller's organization.
+///
+/// Every operation taking an account id resolves through here, whether that
+/// member is optional or required: a required member always names an account,
+/// so it is passed as `Some(..)` and the standalone arm simply never applies to
+/// it.
 ///
 /// `Err` when the member names the caller's OWN account: every account-id member
 /// of this service documents that "the management account can't specify its own

@@ -15,6 +15,8 @@
 mod alert_manager_definition;
 #[path = "all/anomaly_detector_creation_by_put.rs"]
 mod anomaly_detector_creation_by_put;
+#[path = "all/anomaly_detector_deletion.rs"]
+mod anomaly_detector_deletion;
 #[path = "all/anomaly_detector_lifecycle.rs"]
 mod anomaly_detector_lifecycle;
 #[path = "all/anomaly_detector_listing.rs"]

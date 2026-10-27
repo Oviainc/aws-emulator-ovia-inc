@@ -3,8 +3,8 @@
 //! Removing tags from a CodeDeploy resource by its ARN, driven over the wire.
 //!
 //! RULE under test: `UntagResource` reads its `ResourceArn` as the resource that
-//! ARN identifies — an application, a deployment group or a deployment
-//! configuration — and drops from that resource's own record every tag whose key
+//! ARN identifies — an application or a deployment group — and drops from that
+//! resource's own record every tag whose key
 //! the `TagKeys` list names, whatever value the record holds for it, leaving
 //! every other tag in place; a key the resource does not carry names no tag of
 //! it, so it removes nothing and the call still succeeds, which makes the
@@ -98,20 +98,6 @@ async fn apply_tags(emulator: &Emulator, resource_arn: &str, tags: &[(&str, &str
         .await;
 }
 
-/// Create a `Server` deployment configuration under `name`.
-async fn create_config(emulator: &Emulator, name: &str) {
-    emulator
-        .ok(
-            "CreateDeploymentConfig",
-            json!({
-                "deploymentConfigName": name,
-                "computePlatform": "Server",
-                "minimumHealthyHosts": {"type": "HOST_COUNT", "value": 1},
-            }),
-        )
-        .await;
-}
-
 /// RULE: the keys a removal call names are dropped from the resource its ARN
 /// identifies, whatever value the resource holds for them, and every other tag
 /// is left in place — whatever the resource kind, the number of keys named, or
@@ -119,13 +105,16 @@ async fn create_config(emulator: &Emulator, name: &str) {
 #[tokio::test]
 async fn tags_removed_by_key_read_back_from_the_resource() {
     let emulator = Emulator::new();
-    // One resource of every taggable kind, each created through the API a
+    // Two resources of each taggable kind, each created through the API a
     // client uses, so the ARN under test names a record the store really holds.
     emulator
         .ok("CreateApplication", json!({"applicationName": "untag-app"}))
         .await;
     let group = seeded_group(&emulator, "untag-group-app", "Server").await;
-    create_config(&emulator, "untag-config").await;
+    emulator
+        .ok("CreateApplication", json!({"applicationName": "untag-app-2"}))
+        .await;
+    let second_group = seeded_group(&emulator, "untag-group-app-2", "Server").await;
 
     // Rows differ along the resource KIND the ARN names, how many keys the call
     // names (one, several, all, none of the resource's own), whether a named key
@@ -145,13 +134,13 @@ async fn tags_removed_by_key_read_back_from_the_resource() {
             &[("Owner", "ana")],
         ),
         (
-            "deployment configuration, every key",
+            "a second application, every key",
             &[("Env", "staging"), ("Marker", "")],
             &["Env", "Marker"],
             &[],
         ),
         (
-            "predefined deployment configuration, a key it does not carry",
+            "a second deployment group, a key it does not carry",
             &[("Owner", "team platform/eu, on-call")],
             &["Env"],
             &[("Owner", "team platform/eu, on-call")],
@@ -169,24 +158,24 @@ async fn tags_removed_by_key_read_back_from_the_resource() {
             &[("Env", "prod")],
         ),
         (
-            "deployment configuration, a key outside ASCII",
+            "a second application, a key outside ASCII",
             &[("Ümlaut", "ja"), ("Env", "prod")],
             &["Ümlaut"],
             &[("Env", "prod")],
         ),
     ];
 
-    // The resource each row acts on, chosen so every taggable kind is exercised
+    // The resource each row acts on, chosen so both taggable kinds are exercised
     // and a row never depends on the row before it: the tags are re-applied in
     // full first, and the case's expectation is the whole remaining list.
     let arns: Vec<String> = vec![
         state::application_arn(REGION, "untag-app"),
         state::deployment_group_arn(REGION, "untag-group-app", &group),
-        state::deployment_config_arn(REGION, "untag-config"),
-        state::deployment_config_arn(REGION, "CodeDeployDefault.OneAtATime"),
+        state::application_arn(REGION, "untag-app-2"),
+        state::deployment_group_arn(REGION, "untag-group-app-2", &second_group),
         state::application_arn(REGION, "untag-app"),
         state::deployment_group_arn(REGION, "untag-group-app", &group),
-        state::deployment_config_arn(REGION, "untag-config"),
+        state::application_arn(REGION, "untag-app-2"),
     ];
 
     for ((case, applied, keys, expected), resource_arn) in cases.iter().zip(&arns) {
@@ -381,10 +370,10 @@ async fn an_unresolvable_resource_arn_removes_nothing() {
             "absent-group".to_string(),
         ),
         (
-            "a deployment configuration that does not exist",
+            "a deployment configuration, a type these operations do not act on",
             state::deployment_config_arn(REGION, "absent-config"),
-            "DeploymentConfigDoesNotExistException",
-            "absent-config".to_string(),
+            "ArnNotSupportedException",
+            state::deployment_config_arn(REGION, "absent-config"),
         ),
     ];
 
