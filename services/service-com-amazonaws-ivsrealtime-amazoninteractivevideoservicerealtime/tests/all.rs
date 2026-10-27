@@ -95,5 +95,7 @@ mod storage_configurations;
 mod tagging;
 #[path = "all/update_ingest_configuration.rs"]
 mod update_ingest_configuration;
+#[path = "all/update_stage_recording_active.rs"]
+mod update_stage_recording_active;
 #[path = "all/wire_probe.rs"]
 mod wire_probe;
