@@ -865,12 +865,12 @@ async fn cryptographic_operations_over_a_non_symmetric_key_are_never_fabricated(
             "NotImplemented",
         ),
         (
-            "GenerateMac with an HMAC key",
+            "GenerateMac with a symmetric encryption key",
             "GenerateMac",
-            json!({"KeyId": hmac["KeyId"], "Message": plaintext,
+            json!({"KeyId": symmetric["KeyId"], "Message": plaintext,
                    "MacAlgorithm": "HMAC_SHA_256"}),
-            501,
-            "NotImplemented",
+            400,
+            "InvalidKeyUsageException",
         ),
     ];
 

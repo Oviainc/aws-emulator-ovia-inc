@@ -29,9 +29,11 @@
 //! name), raised before the store is consulted at all. The `tags` it carries are
 //! judged as an input in the same way and just as early
 //! (`crate::state::validate_tags_member`), so every refusal a request earns on its
-//! own content — a reserved key, a key or value outside its length bound — is the
-//! modelled `ValidationException` (HTTP 400) whatever the store holds; only the
-//! per-resource cap, a property of the resulting stored set, is judged at the merge.
+//! own content — a reserved key, a key or value outside its length bound, a tag map
+//! of more entries than one resource may hold — is the modelled `ValidationException`
+//! (HTTP 400) whatever the store holds; only the part of the per-resource cap that
+//! needs the record — whether merging onto the tags it ALREADY holds would pass the
+//! cap — is judged at the merge.
 //! An ARN that IS one of this service's and names no stored record is a 404 carrying
 //! this service's own
 //! `NotFoundException` code (`crate::state::parameter_not_found`), which is the code
@@ -188,11 +190,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that reads only the request is made there, so the answer to a bad tag set
         // does not depend on whether the store holds the ARN. A key in the namespace
         // AWS reserves for its own generated tags, a key outside the length bound a
-        // tag key may hold, and a value longer than a tag value may be are each bad
+        // tag key may hold, a value longer than a tag value may be and a map
+        // carrying more entries than one resource may hold at all are each bad
         // requests — the modelled `ValidationException` (HTTP 400) — whether the
-        // target exists or not, and nothing is stored either way. Only the
-        // per-resource cap, which is a property of the RESULTING stored set rather
-        // than of the request, is left to the merge below.
+        // target exists or not, and nothing is stored either way. Only the part of
+        // the per-resource cap that needs the record — whether merging onto the tags
+        // it already holds would pass the cap — is left to the merge below.
         //
         // `TagConstraints::Unconstrained` because this operation's `tags` member
         // targets the map the model leaves unconstrained; the character class the

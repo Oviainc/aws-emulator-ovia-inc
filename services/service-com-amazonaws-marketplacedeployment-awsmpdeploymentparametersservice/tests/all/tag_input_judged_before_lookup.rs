@@ -5,24 +5,27 @@
 //!
 //! The rule under test: every part of the tag judgement that reads only the request
 //! — a key in the namespace AWS reserves, a key outside the characters a tag key may
-//! hold, a value longer than a tag value may be — is answered the SAME way whether
-//! or not the ARN the request names resolves to a stored record: HTTP 400 with the
-//! modelled `ValidationException`, the same message and the same `fieldName`. Only
-//! the per-resource cap is a property of the RESULTING stored set rather than of the
-//! request, so only it may wait for the record to be resolved; nothing is stored or
-//! changed either way.
+//! hold, a value longer than a tag value may be, a map of more entries than one
+//! resource may hold — is answered the SAME way whether or not the ARN the request
+//! names resolves to a stored record: HTTP 400 with the modelled
+//! `ValidationException`, the same message and the same `fieldName`. Only the part of
+//! the per-resource cap that needs the record — whether the set would pass the cap on
+//! top of the tags the record ALREADY holds — may wait for the record to be resolved;
+//! nothing is stored or changed either way.
 //!
 //! The complement holds too: a tag set the request-level judgement ADMITS carries no
 //! verdict of its own, so against a stored record it is the success the merge earns
 //! and against an ARN that names no record it is still this service's
 //! `NotFoundException` (HTTP 404) — the ordering may not turn a missing resource
-//! into a bad request.
+//! into a bad request. The store's three states are covered: a live record, an ARN
+//! that was never minted, and a record the clock has already expired.
 //!
 //! `TagResource$tags` targets the tag map the model leaves unconstrained
 //! (`smithy_query(query="operation",operation="TagResource")`:
 //! `tags` -> `Tags`, `map<String,String>`), so the bounds under test are AWS's own
-//! tagging limits (`state::TAG_KEY_MAX_LEN` / `state::TAG_VALUE_MAX_LEN`) and not
-//! the character class the model's constrained `TagsMap` adds.
+//! tagging limits (`state::TAG_KEY_MAX_LEN` / `state::TAG_VALUE_MAX_LEN` /
+//! `state::MAX_TAGS_PER_RESOURCE`) and not the character class the model's
+//! constrained `TagsMap` adds.
 //!
 //! Every case drives the real wire path through the harness the
 //! `deployment_parameters` suite owns.
@@ -32,13 +35,13 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 use service_com_amazonaws_marketplacedeployment_awsmpdeploymentparametersservice::scaffolded::NOT_FOUND_CODE;
 use service_com_amazonaws_marketplacedeployment_awsmpdeploymentparametersservice::state::{
-    RESERVED_TAG_KEY_PREFIX, TAG_KEY_MAX_LEN, TAG_VALUE_MAX_LEN,
+    MAX_TAGS_PER_RESOURCE, RESERVED_TAG_KEY_PREFIX, TAG_KEY_MAX_LEN, TAG_VALUE_MAX_LEN,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::deployment_parameters::{
-    emulator, error_code, field_name, list_tags, message, provision, put, tag, tag_map, tags_of,
-    ACCOUNT, CATALOG, REGION, SIGNING_NAME,
+    emulator, error_code, field_name, list_tags, message, provision, put, rfc3339, tag, tag_map,
+    tags_of, ACCOUNT, CATALOG, REGION, SIGNING_NAME,
 };
 
 /// The agreement and product the one stored record below is written against.
@@ -47,6 +50,9 @@ const PRODUCT: &str = "prod-input-first";
 /// The tag map that record carries, which no refused call may change.
 const STORED_KEY: &str = "env";
 const STORED_VALUE: &str = "dev";
+/// `2020-01-01T00:00:00Z` as epoch seconds: a date long past, so a record written
+/// with it is already scheduled for deletion by the time the write returns.
+const PAST_2020: i64 = 1_577_836_800;
 
 /// One emulator holding exactly one deployment parameter, and the ARN minted for it.
 async fn emulator_with_one_parameter() -> (MultiServiceRouter, String) {
@@ -101,18 +107,37 @@ fn unresolved_arns(live: &str) -> Vec<(&'static str, String)> {
 }
 
 /// Tag maps the request-level judgement refuses, spanning what that judgement
-/// generalises over: which side of a pair is at fault (key or value), which bound it
-/// crosses (the lower bound of a key, the upper bound of a key, the upper bound of a
-/// value), by how much, whether the offending pair arrives alone or beside legal
-/// ones, and whether it sorts first or last among them. The non-ASCII row is there
-/// because the bound counts CHARACTERS, not the bytes UTF-8 took to carry them.
+/// generalises over: what is at fault (the number of entries, or one side of one
+/// pair), which bound it crosses (the number of entries, the lower bound of a key,
+/// the upper bound of a key, the upper bound of a value), by how much, whether the
+/// offending pair arrives alone or beside legal ones, and whether it sorts first or
+/// last among them. The non-ASCII row is there because the length bounds count
+/// CHARACTERS, not the bytes UTF-8 took to carry them.
 ///
-/// `RESERVED_TAG_KEY_PREFIX`, `TAG_KEY_MAX_LEN` and `TAG_VALUE_MAX_LEN` are the
-/// service's own statements of AWS's tagging limits; the `reserved_tag_keys` and
-/// `deployment_parameters` suites pin what each one is.
+/// `RESERVED_TAG_KEY_PREFIX`, `TAG_KEY_MAX_LEN`, `TAG_VALUE_MAX_LEN` and
+/// `MAX_TAGS_PER_RESOURCE` are the service's own statements of AWS's tagging limits;
+/// the `reserved_tag_keys` and `deployment_parameters` suites pin what each one is.
 fn refused_by_the_input() -> Vec<(&'static str, BTreeMap<String, String>)> {
     let long_key = "k".repeat(TAG_KEY_MAX_LEN + 1);
     vec![
+        // The COUNT the request itself carries. Applying a tag set can only leave a
+        // resource holding at least as many tags as the set, so a map past the
+        // per-resource cap could not be stored on any resource in any state. The
+        // merge's own cap — what the set would leave on top of the tags a record
+        // ALREADY holds — is a different judgement and keeps needing the record
+        // (the `deployment_parameters` suite pins that one).
+        (
+            "a map one entry past the per-resource cap",
+            (0..=MAX_TAGS_PER_RESOURCE)
+                .map(|index| (format!("over-{index:03}"), "v".to_string()))
+                .collect(),
+        ),
+        (
+            "a map far past the per-resource cap",
+            (0..MAX_TAGS_PER_RESOURCE * 4)
+                .map(|index| (format!("over-{index:03}"), "v".to_string()))
+                .collect(),
+        ),
         ("an empty key alone", tag_map(&[("", "v")])),
         (
             "an empty key beside a legal pair",
@@ -284,6 +309,114 @@ async fn a_tag_set_the_input_refuses_is_refused_identically_whether_the_arn_reso
             tags_of(&listed),
             stored,
             "case {case:?}: a refused tag write must store nothing, got {listed:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_count_the_request_carries_is_judged_at_the_number_a_resource_may_hold() {
+    // The bound itself, from below and from above, against ARNs naming no record: at
+    // and under the cap the request decides nothing on its own, so the answer is the
+    // store's not-found; past it the request alone is already refused. Every entry of
+    // every row is a legal pair, so the only thing a row varies is how many there are.
+    let (router, live) = emulator_with_one_parameter().await;
+    let rows: Vec<(&str, usize, u16)> = vec![
+        ("one tag", 1, 404),
+        ("one short of the cap", MAX_TAGS_PER_RESOURCE - 1, 404),
+        ("exactly the cap", MAX_TAGS_PER_RESOURCE, 404),
+        ("one past the cap", MAX_TAGS_PER_RESOURCE + 1, 400),
+        ("twice the cap", MAX_TAGS_PER_RESOURCE * 2, 400),
+    ];
+
+    for (case, count, expected_status) in rows {
+        let tags: BTreeMap<String, String> = (0..count)
+            .map(|index| (format!("count-{index:03}"), "v".to_string()))
+            .collect();
+        assert_eq!(
+            tags.len(),
+            count,
+            "case {case:?}: the row must carry {count} distinct keys, got {}",
+            tags.len()
+        );
+        for (arn_case, arn) in unresolved_arns(&live) {
+            let (status, answered) = tag(&router, &arn, &tags).await;
+            assert_eq!(
+                status, expected_status,
+                "case {case:?}/{arn_case}: expected HTTP {expected_status}, got {status} \
+                 {answered:?}"
+            );
+            let expected_code = if expected_status == 400 {
+                "ValidationException"
+            } else {
+                NOT_FOUND_CODE
+            };
+            assert_eq!(
+                error_code(&answered),
+                expected_code,
+                "case {case:?}/{arn_case}: expected code {expected_code}, got {answered:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_record_the_clock_has_expired_answers_exactly_as_an_unknown_arn_does() {
+    // A record written with a date already past is expired the moment it is stored, so
+    // its ARN is a THIRD state of the store — one the handler resolves to nothing only
+    // after materialising the expiry — and the rule may not tell it apart from an ARN
+    // that was never minted: what the request decides on its own is still a 400, and
+    // what it does not is still the not-found.
+    let (router, engine) = emulator();
+    provision(&engine, CATALOG, "agmt-expired", &["prod-expired"]);
+    let (status, body) = put(
+        &router,
+        CATALOG,
+        "prod-expired",
+        &json!({
+            "agreementId": "agmt-expired",
+            "deploymentParameter": { "name": "Expired", "secretString": "s" },
+            "tags": { STORED_KEY: STORED_VALUE },
+            "expirationDate": rfc3339(PAST_2020),
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "the setup Put must succeed, got {body:?}");
+    let expired = body
+        .get("resourceArn")
+        .and_then(Value::as_str)
+        .expect("a minted resourceArn")
+        .to_string();
+
+    for (case, tags) in refused_by_the_input() {
+        let (status, answered) = tag(&router, &expired, &tags).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}/expired: a tag set the input refuses must be 400 whatever the \
+             store holds, got {status} {answered:?}"
+        );
+        assert_eq!(
+            error_code(&answered),
+            "ValidationException",
+            "case {case:?}/expired: expected ValidationException, got {answered:?}"
+        );
+        assert_eq!(
+            field_name(&answered),
+            "tags",
+            "case {case:?}/expired: expected fieldName tags, got {answered:?}"
+        );
+    }
+
+    for (case, tags) in admitted_by_the_input() {
+        let (status, answered) = tag(&router, &expired, &tags).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}/expired: a legal tag set against an expired record must stay \
+             not-found, got {status} {answered:?}"
+        );
+        assert_eq!(
+            error_code(&answered),
+            NOT_FOUND_CODE,
+            "case {case:?}/expired: expected code {NOT_FOUND_CODE}, got {answered:?}"
         );
     }
 }

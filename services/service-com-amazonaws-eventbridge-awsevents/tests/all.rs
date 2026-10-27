@@ -47,6 +47,8 @@ mod global_endpoint_identity;
 mod implicit_default_bus;
 #[path = "all/input_validation.rs"]
 mod input_validation;
+#[path = "all/kinesis_target_delivery.rs"]
+mod kinesis_target_delivery;
 #[path = "all/missing_resource_wording.rs"]
 mod missing_resource_wording;
 #[path = "all/or_relationship_branches.rs"]

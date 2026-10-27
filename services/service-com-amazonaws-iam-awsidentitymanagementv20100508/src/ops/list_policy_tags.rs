@@ -217,14 +217,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The policy is resolved the one way every managed-policy read resolves it, so
         // AWS's own policies are served from the catalog beside the account's.
         let Some(resolved) = store.resolve_policy(&input.policy_arn) else {
-            // An ARN in AWS's own namespace names a policy AWS owns, and this emulator
-            // carries only part of AWS's catalog: answering `NoSuchEntity` here would
-            // assert that AWS holds no such policy, which this emulator cannot know.
-            if crate::state::is_aws_managed_policy_arn(&input.policy_arn) {
-                return Err(crate::scaffolded::Scaffolded::NotImplemented(
-                    crate::state::uncarried_aws_managed_policy(&input.policy_arn, "tags"),
-                ));
-            }
+            // An ARN this service can resolve no policy under "referenced a resource
+            // entity that does not exist" — the refusal this operation models for a
+            // policy it cannot report, whichever namespace the ARN is in, since a code
+            // outside its modelled set is one no SDK has a branch for.
             return Err(ListPolicyTagsErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
                     message: Some(crate::state::policy_not_found(&input.policy_arn)),

@@ -328,9 +328,10 @@ async fn reading_a_revision_leaves_the_history_as_it_found_it() {
     );
 }
 
-/// RULE: an update names the configuration by ARN, so a value that is not an MSK
-/// configuration ARN is a bad request (400) and a well-formed one this region
-/// holds no configuration for is not found (404) — neither appends anything.
+/// RULE: an update names the configuration by ARN, so an `Arn` that resolves to
+/// no configuration of this endpoint's region is refused HTTP 400
+/// `BadRequestException` — whether it is not an MSK configuration ARN at all or
+/// a well-formed one nothing holds — and neither appends anything.
 #[tokio::test]
 async fn an_unknown_or_malformed_arn_is_refused_by_update_and_by_the_revision_reader() {
     let emulator = Emulator::new();
@@ -364,8 +365,8 @@ async fn an_unknown_or_malformed_arn_is_refused_by_update_and_by_the_revision_re
         ),
         (
             "arn:aws:kafka:us-west-2:000000000000:configuration/absent/0e7b1f9a-1",
-            404,
-            "NotFoundException",
+            400,
+            "BadRequestException",
         ),
     ];
 
@@ -412,7 +413,7 @@ async fn an_unknown_or_malformed_arn_is_refused_by_update_and_by_the_revision_re
     let elsewhere = update_in(&emulator, "eu-central-1", &arn, &row).await;
     assert_eq!(
         (elsewhere.status, elsewhere.error_code()),
-        (404, "NotFoundException"),
+        (400, "BadRequestException"),
         "case region=eu-central-1: another region's endpoint must not update it, got {} {}",
         elsewhere.status,
         elsewhere.body
@@ -420,7 +421,7 @@ async fn an_unknown_or_malformed_arn_is_refused_by_update_and_by_the_revision_re
     let read_elsewhere = describe_revision_in(&emulator, "eu-central-1", &arn, 1).await;
     assert_eq!(
         (read_elsewhere.status, read_elsewhere.error_code()),
-        (404, "NotFoundException"),
+        (400, "BadRequestException"),
         "case region=eu-central-1: another region's endpoint must not read its revisions, \
          got {} {}",
         read_elsewhere.status,

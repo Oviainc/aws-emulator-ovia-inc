@@ -295,8 +295,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.predicate.as_ref(),
         ) {
             let message = match missing {
-                crate::state::TriggerReference::Job(name) => {
-                    crate::state::messages::job_not_found(name)
+                // The job-definition miss is the same fixed sentence wherever a job is
+                // looked up, so a trigger that would run a job nothing holds is refused
+                // with it too, and discloses no name.
+                crate::state::TriggerReference::Job(_) => {
+                    crate::state::messages::JOB_NOT_FOUND.to_string()
                 }
                 crate::state::TriggerReference::Crawler(name) => {
                     crate::state::messages::crawler_not_found(name)

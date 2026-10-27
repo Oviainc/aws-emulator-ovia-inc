@@ -1,15 +1,32 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAggregateComplianceByConformancePacks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAggregateComplianceByConformancePacks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAggregateComplianceByConformancePacks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the compliance of each conformance pack a configuration aggregator's sources
+//! hold, computed from the packs this service's store holds (`conformance_packs` in
+//! [`crate::state::ComAmazonawsConfigserviceStarlingdoveserviceState`]) and the
+//! evaluation results recorded against the Config rules each of them deployed.
+//!
+//! One entry per pack: the pack's name, the source account and Region its data is
+//! aggregated from, and the pack's compliance — the `ComplianceType` the rules IT
+//! deployed roll up to, which is the roll-up
+//! [`crate::state::ComAmazonawsConfigserviceStarlingdoveserviceState::conformance_pack_compliance`]
+//! computes for every report of a pack's compliance, so this read and the pack's own
+//! `DescribeConformancePackCompliance` cannot disagree about it — beside how many of
+//! those rules are compliant, how many are noncompliant, and how many there are in
+//! total, which is every rule the pack deployed including the ones no result places
+//! either way.
+//!
+//! This store stands for ONE account in ONE Region, so it contributes entries only while
+//! one of the aggregator's sources names that account and Region
+//! ([`crate::state::ConfigurationAggregatorEntry::aggregates_source`]) and the request's
+//! own `Filters` admit it; a filter may also select ONE pack by name or keep only the
+//! packs at one compliance status. A source the aggregator does not take in, filters that
+//! exclude it and an account holding no conformance pack all leave the empty result page
+//! this operation documents.
+//!
+//! It is a REPORT: it writes nothing, so the packs and the results a later caller sees
+//! are the ones this call saw.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +184,203 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAggregateComplianceByConformancePacks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAggregateComplianceByConformancePacksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAggregateComplianceByConformancePacks"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // `Limit` is the page size, and 0 asks for the default (`Limit`: "The maximum
+        // number of conformance packs compliance details returned on each page. The
+        // default is maximum. If you specify 0, Config uses the default"). The modelled
+        // 0..100 range is refused before this handler runs; a value outside it reaching
+        // here is still the limit error this operation models, never a page.
+        let max = crate::state::AGGREGATE_COMPLIANCE_BY_CONFORMANCE_PACKS_PAGE_SIZE;
+        let page_size = match usize::try_from(input.limit)
+            .ok()
+            .filter(|limit| *limit <= max)
+        {
+            Some(0) => max,
+            Some(limit) => limit,
+            None => {
+                // Defensive, and unreachable in the assembled emulator: the shared
+                // request validation refuses the modelled 0..100 range before this
+                // handler runs, so nothing reaches this arm.
+                return Err(
+                    DescribeAggregateComplianceByConformancePacksErrorModeled::InvalidLimitException(
+                        InvalidLimitException {
+                            message: Some(format!(
+                                "The specified Limit {} is outside the allowable range of \
+                                 0 to {max}.",
+                                input.limit
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        };
+
+        // The token is opaque: anything this operation did not issue is malformed.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(resume_at) => Some(resume_at),
+                None => {
+                    return Err(
+                        DescribeAggregateComplianceByConformancePacksErrorModeled::InvalidNextTokenException(
+                            InvalidNextTokenException {
+                                message: Some(
+                                    crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            },
+        };
+
+        // A filter may name only a compliance status a conformance pack's compliance can
+        // CARRY (`AggregateConformancePackComplianceFilters$ComplianceType`, a
+        // `ConformancePackComplianceType`), so one that names another value is a bad
+        // request rather than a filter that matches nothing.
+        let filtered_compliance = input
+            .filters
+            .as_ref()
+            .and_then(|filters| filters.compliance_type.as_deref())
+            .filter(|compliance_type| !compliance_type.is_empty());
+        if let Some(rejected) = filtered_compliance.filter(|compliance_type| {
+            !CONFORMANCE_PACK_COMPLIANCE_TYPE_VALUES.contains(compliance_type)
+        }) {
+            return Err(
+                DescribeAggregateComplianceByConformancePacksErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::state::unaccepted_value_message(
+                            "ComplianceType",
+                            rejected,
+                            CONFORMANCE_PACK_COMPLIANCE_TYPE_VALUES,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // This store stands for ONE account in ONE Region, so the Config data it holds
+        // is this account's, in the Region the request is signed for — which is what
+        // every reported entry names as its source.
+        let account_id = ::emulator_server::emulator_account_id();
+        let region = crate::state::request_region(ctx);
+        let store = state.lock();
+
+        let Some(aggregator) = store
+            .configuration_aggregators
+            .get(&input.configuration_aggregator_name)
+        else {
+            return Err(
+                DescribeAggregateComplianceByConformancePacksErrorModeled::NoSuchConfigurationAggregatorException(
+                    NoSuchConfigurationAggregatorException {
+                        message: Some(
+                            crate::state::NO_SUCH_CONFIGURATION_AGGREGATOR_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `Filters` narrows the results to one source account and/or one source Region
+        // ("Filters the conformance packs based on an account ID, region, compliance
+        // type, and the name of the conformance pack"), so a filter naming any other
+        // source leaves this store contributing nothing, exactly as a source the
+        // aggregator does not take in does.
+        let excluded_source = input.filters.as_ref().is_some_and(|filters| {
+            filters
+                .account_id
+                .as_deref()
+                .filter(|named| !named.is_empty())
+                .is_some_and(|named| named != account_id)
+                || filters
+                    .aws_region
+                    .as_deref()
+                    .filter(|named| !named.is_empty())
+                    .is_some_and(|named| named != region)
+        }) || !aggregator.aggregates_source(account_id, &region);
+
+        // The pack name filter selects ONE pack by name (`ConformancePackName`: "The name
+        // of the conformance pack"); a name this account holds no pack under selects
+        // none, which is an empty page rather than a refusal.
+        let filtered_name = input
+            .filters
+            .as_ref()
+            .and_then(|filters| filters.conformance_pack_name.as_deref())
+            .filter(|name| !name.is_empty());
+
+        // A reporting operation: every entry is computed from the packs, the rules they
+        // deployed and the evaluation results already in state, and nothing is written.
+        // Paging follows the store's own name ordering, so a token holds the NAME the
+        // next page resumes at and survives packs deployed or deleted between pages.
+        let mut page = Vec::new();
+        let mut next_token = None;
+        if !excluded_source {
+            for (name, pack) in &store.conformance_packs {
+                if resume_at.as_ref().is_some_and(|resume_at| name < resume_at) {
+                    continue;
+                }
+                if filtered_name.is_some_and(|requested| requested != name) {
+                    continue;
+                }
+
+                // What the rules the pack deployed roll up to, which is both the pack's
+                // own compliance status and what the two per-status rule counts count.
+                // The total counts EVERY rule the pack deployed, including the ones no
+                // result places either way ("Total number of compliant rules,
+                // noncompliant rules, and the rules that do not have any applicable
+                // resources to evaluate upon resulting in insufficient data").
+                let rule_compliance = store.conformance_pack_rule_compliance(pack);
+                let mut compliant_rule_count = 0i32;
+                let mut non_compliant_rule_count = 0i32;
+                let mut total_rule_count = 0i32;
+                for placed in rule_compliance.values() {
+                    total_rule_count = total_rule_count.saturating_add(1);
+                    match *placed {
+                        crate::state::COMPLIANCE_TYPE_COMPLIANT => {
+                            compliant_rule_count = compliant_rule_count.saturating_add(1);
+                        }
+                        crate::state::COMPLIANCE_TYPE_NON_COMPLIANT => {
+                            non_compliant_rule_count = non_compliant_rule_count.saturating_add(1);
+                        }
+                        _ => {}
+                    }
+                }
+                let compliance_type = store.conformance_pack_compliance(pack);
+
+                // The compliance filter selects on what the pack ROLLS UP TO, so a pack
+                // the filter does not place is left out rather than reported with another
+                // compliance status.
+                if filtered_compliance.is_some_and(|requested| requested != compliance_type) {
+                    continue;
+                }
+                if page.len() == page_size {
+                    next_token = Some(crate::state::encode_page_token(name));
+                    break;
+                }
+                page.push(AggregateComplianceByConformancePack {
+                    conformance_pack_name: Some(pack.name.clone()),
+                    compliance: Some(AggregateConformancePackCompliance {
+                        compliance_type: Some(compliance_type.to_string()),
+                        compliant_rule_count,
+                        non_compliant_rule_count,
+                        total_rule_count,
+                    }),
+                    account_id: Some(account_id.to_string()),
+                    aws_region: Some(region.clone()),
+                });
+            }
+        }
+
+        Ok(DescribeAggregateComplianceByConformancePacksOutput {
+            aggregate_compliance_by_conformance_packs: Some(page),
+            next_token,
+        })
     }
 }

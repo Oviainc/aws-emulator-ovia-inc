@@ -157,34 +157,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let region = crate::state::request_region(ctx.parts());
 
-        // A value that is not an MSK configuration ARN names no resource of this
-        // kind: a request this operation cannot parse rather than a resource it
-        // cannot find — the same split the configuration readers draw.
-        if !crate::state::is_configuration_arn(&input.arn) {
-            return Err(
-                UpdateConfigurationErrorModeled::BadRequestException(BadRequestException {
-                    invalid_parameter: Some("Arn".to_string()),
-                    message: Some(format!(
-                        "{} is not a valid Amazon MSK configuration ARN.",
-                        input.arn
-                    )),
-                })
-                .into(),
-            );
-        }
-
         let mut state = state.lock();
+        // ONE condition, one refusal: an `Arn` that resolves to no configuration
+        // of this endpoint's region — malformed, absent, already deleted, or
+        // another region's — is the configuration family's unresolvable-
+        // reference bad request, resolved before anything is appended so a
+        // refused update stores nothing.
         let Some(configuration) = state.configuration_in_mut(&region, &input.arn) else {
-            return Err(
-                UpdateConfigurationErrorModeled::NotFoundException(NotFoundException {
-                    invalid_parameter: Some("Arn".to_string()),
-                    message: Some(format!(
-                        "No configuration exists in {region} with the ARN {}",
-                        input.arn
-                    )),
-                })
-                .into(),
-            );
+            return Err(UpdateConfigurationErrorModeled::BadRequestException(
+                crate::state::configuration_arn_not_found(),
+            )
+            .into());
         };
 
         // The one append path on the record: the submitted body is stored as the

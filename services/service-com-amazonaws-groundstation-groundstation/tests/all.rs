@@ -75,6 +75,8 @@ mod ground_station_reservations;
 mod lifecycle_writes;
 #[path = "all/minute_usage.rs"]
 mod minute_usage;
+#[path = "all/mission_profile_deletion.rs"]
+mod mission_profile_deletion;
 #[path = "all/not_found_messages.rs"]
 mod not_found_messages;
 #[path = "all/recording_bucket_refusal_message.rs"]
