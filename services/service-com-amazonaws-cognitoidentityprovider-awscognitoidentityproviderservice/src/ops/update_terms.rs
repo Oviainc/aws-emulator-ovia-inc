@@ -216,7 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let stored = pool
                 .terms
                 .get(&input.terms_id)
-                .ok_or_else(|| terms_not_found(&input.terms_id))?;
+                .ok_or_else(terms_not_found)?;
             (stored.client_id.clone(), stored.terms_name.clone())
         };
 
@@ -234,7 +234,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let terms = pool
             .terms
             .get_mut(&input.terms_id)
-            .ok_or_else(|| terms_not_found(&input.terms_id))?;
+            .ok_or_else(terms_not_found)?;
 
         // "Modifies existing terms documents for the requested app client"
         // (`UpdateTerms`), whose updatable members are each optional: one the
@@ -277,10 +277,12 @@ fn user_pool_not_found(user_pool_id: &str) -> UpdateTermsError {
 }
 
 /// This operation's `ResourceNotFoundException` for a `TermsId` the pool does not
-/// hold.
-fn terms_not_found(terms_id: &str) -> UpdateTermsError {
+/// hold, worded as [`crate::state::TERMS_NOT_FOUND_MESSAGE`] — the one sentence
+/// every terms-document lookup that resolves nothing answers, whatever it looked
+/// the documents up by.
+fn terms_not_found() -> UpdateTermsError {
     UpdateTermsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("Terms documents {terms_id} do not exist.")),
+        message: Some(crate::state::TERMS_NOT_FOUND_MESSAGE.to_string()),
     })
     .into()
 }
