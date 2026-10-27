@@ -105,10 +105,10 @@ fn make_validation_due_now(engine: &Arc<engine::InMemoryEngine>) {
 /// requires of a certificate ("You can only revoke certificates that have been
 /// previously exported").
 ///
-/// `ExportCertificate` is what sets this flag in production and is still a scaffold
-/// stub (cause 1 of
-/// `issues/.../20261022T143245Z-acm-seven-modeled-operations-answer-http-501-notimplemented.md`),
-/// so the test writes the single boolean the emulator itself stores — exactly the
+/// `ExportCertificate` is what sets this flag in production, and it cannot set it here:
+/// this service mints no key pair for a certificate it was asked to issue, so there is
+/// no material for an export to hand back. The test therefore writes the single boolean
+/// the emulator itself stores — exactly the
 /// record that operation will leave behind — and drives the revocation and every read
 /// of it over the wire.
 pub(crate) fn mark_exported(engine: &Arc<engine::InMemoryEngine>, arn: &str) {

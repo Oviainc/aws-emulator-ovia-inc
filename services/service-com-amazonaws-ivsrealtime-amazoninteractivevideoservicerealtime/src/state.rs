@@ -4797,6 +4797,41 @@ pub fn check_tag_keys_unreserved<'a>(
     ))
 }
 
+/// Refuse a request whose `attributes` map is larger than the documented
+/// [`MAX_ATTRIBUTES_BYTES`] total. `Err` is the sentence to put on the
+/// `ValidationException`.
+///
+/// The limit is documented and carried by no modelled trait, so — like this service's
+/// other documented-but-unmodelled rules ([`check_tag_count`],
+/// [`check_tag_keys_unreserved`]) — it lives here once and every operation taking an
+/// `attributes` map maps the sentence onto its own error. The measure is the one
+/// [`attributes_size`] computes.
+///
+/// `member` is the dotted path of the member the map arrived in (`attributes` for a
+/// request carrying one directly, `participantTokenConfigurations.<n>.member.attributes`
+/// for one inside a list), so the refusal reads in the construction this service states
+/// every constraint refusal with ([`violation_clause`]): the operation, the member path
+/// and the bound it violated, with what the request actually sent.
+///
+/// The bound is a property of the request alone, so a caller runs this before any lookup
+/// and before anything is minted or persisted: a request that is both oversized and names
+/// no resource is answered as malformed, and a refused request leaves the store exactly as
+/// it was.
+pub fn check_attributes_size(
+    operation: &str,
+    member: &str,
+    attributes: &HashMap<String, String>,
+) -> Result<(), String> {
+    let size = attributes_size(attributes);
+    if size <= MAX_ATTRIBUTES_BYTES {
+        return Ok(());
+    }
+    Err(format!(
+        "{operation}.{member} is required to have a maximum size of {MAX_ATTRIBUTES_BYTES} \
+         bytes, found {size}"
+    ))
+}
+
 /// The resource type an IVS ARN names (`stage`, `encoder-configuration`, …), or `None`
 /// when the string carries no sixth `:`-field at all.
 ///

@@ -812,14 +812,16 @@ async fn a_create_using_import_outside_the_rules_is_refused() {
             "ValidationException",
         ),
         (
-            "a role ARN outside the modelled pattern",
+            // The pass-role decision is taken before the shape check, so a value that
+            // names no role the caller may pass is the authorization failure it is.
+            "a role ARN that names no IAM role",
             json!({
                 "graphName": "bad-role",
                 "roleArn": "not-an-arn",
                 "source": "s3://import-bucket/csv",
             }),
-            400,
-            "ValidationException",
+            403,
+            "AccessDeniedException",
         ),
         (
             "a format outside the modelled enum",

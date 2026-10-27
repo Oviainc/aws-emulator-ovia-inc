@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Merges the submitted key-value pairs into the tag set of the Amazon EMR resource the
+//! request names — a cluster, an EMR Studio, or a session of the cluster `ClusterId`
+//! scopes the call to — in the shared engine, so a later `DescribeCluster` /
+//! `DescribeStudio` / `GetSession` reports exactly the merged set. A key the resource
+//! already carries takes the submitted value rather than being added twice, an id
+//! naming no resource this account holds is refused with `InvalidRequestException`, and
+//! so is a tag Amazon EMR would not have held (see [`crate::state::validate_tags`]).
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +140,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddTags"))
+        use crate::state::{merge_tags, validate_tags, STUDIO_ID_PREFIX};
+
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        // What a submitted tag has to be is the same whichever resource it is for, so
+        // the list is refused before any resource is resolved.
+        validate_tags(&input.tags).map_err(refuse)?;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(AddTagsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the EMR resource store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // "The ID of the cluster that scopes the tag operation. Required when the
+        // resource being tagged is a session-scoped resource." (`AddTags$ClusterId`
+        // doc.) A request carrying one is tagging that cluster or something that lives
+        // on it and nothing outside it, so the `ResourceId` is resolved against the
+        // named cluster alone. `ClusterId` is `len 0..256`, so the empty string reaches
+        // this handler, and it scopes nothing.
+        if let Some(cluster_id) = input.cluster_id.as_deref().filter(|id| !id.is_empty()) {
+            // `cluster_mut` materialises the transitions the clock already made due,
+            // which were owed at this instant whether or not anybody added a tag.
+            let Some(cluster) = store.cluster_mut(cluster_id, now) else {
+                return Err(refuse(crate::state::unknown_cluster_message(cluster_id)));
+            };
+            if cluster.id == input.resource_id {
+                merge_tags(&mut cluster.tags, &input.tags).map_err(refuse)?;
+                return Ok(AddTagsOutput {});
+            }
+            let Some(session) = cluster.session_mut(&input.resource_id) else {
+                return Err(refuse(crate::state::unknown_session_message(
+                    &input.resource_id,
+                    cluster_id,
+                )));
+            };
+            let mut held = session.tags.clone().unwrap_or_default();
+            merge_tags(&mut held, &input.tags).map_err(refuse)?;
+            session.tags = Some(held);
+            return Ok(AddTagsOutput {});
+        }
+
+        // "The Amazon EMR resource identifier to which tags will be added. For example,
+        // a cluster identifier or an Amazon EMR Studio ID." (`AddTags$ResourceId` doc.)
+        // The id alone says which resource it names, so it is resolved against the
+        // resources this service holds a tag set for.
+        if let Some(cluster) = store.cluster_mut(&input.resource_id, now) {
+            merge_tags(&mut cluster.tags, &input.tags).map_err(refuse)?;
+            return Ok(AddTagsOutput {});
+        }
+        if let Some(studio) = store.studios.get_mut(&input.resource_id) {
+            // A Studio reports `Tags` only when it carries some (`CreateStudio`), which
+            // a merge leaves true either way: it never takes a tag off.
+            let mut held = studio.tags.clone().unwrap_or_default();
+            merge_tags(&mut held, &input.tags).map_err(refuse)?;
+            studio.tags = (!held.is_empty()).then_some(held);
+            return Ok(AddTagsOutput {});
+        }
+
+        // Nothing resolved: the refusal is the one the surface that owns an id of this
+        // form answers, so a caller reads here the same sentence a read of the resource
+        // it asked to tag answers.
+        if input.resource_id.starts_with(STUDIO_ID_PREFIX) {
+            return Err(AddTagsErrorModeled::InvalidRequestException(
+                crate::state::resource_not_found(crate::state::unknown_studio_message()),
+            )
+            .into());
+        }
+        Err(refuse(crate::state::unknown_cluster_message(
+            &input.resource_id,
+        )))
     }
+}
+
+/// Refuse the request with the client error this operation models: HTTP 400
+/// `InvalidRequestException` carrying `message`.
+///
+/// No `ErrorCode`: the classes refused through here reject what the request carried
+/// rather than reporting a named resource as absent, and that discriminator belongs to
+/// the absent-resource class alone ([`crate::state::resource_not_found`]).
+fn refuse(message: String) -> AddTagsError {
+    AddTagsErrorModeled::InvalidRequestException(InvalidRequestException {
+        error_code: None,
+        message: Some(message),
+    })
+    .into()
 }

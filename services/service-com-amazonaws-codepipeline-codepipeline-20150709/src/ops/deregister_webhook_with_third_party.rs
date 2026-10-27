@@ -16,14 +16,16 @@
 //! The connection itself is held by the external tool, not by this service: this
 //! emulator reaches no external tool and serves no webhook trigger plane, so there is
 //! nothing of a connection here to drop, and the acceptance asserts only what it
-//! checked — that the account holds a webhook of that name, targeting an action this
-//! operation supports. The webhook itself is left exactly as it is: deleting one is
-//! `DeleteWebhook`.
+//! checked — that the account holds a webhook of that name, configured with the
+//! authentication this connection is made with. The webhook itself is left exactly as
+//! it is: deleting one is `DeleteWebhook`.
 //!
-//! The support is stated by the operation itself — "Currently supported only for
-//! webhooks that target an action type of GitHub" — so a webhook whose target action
-//! declares any other provider is refused with `ValidationException`, the other error
-//! the operation models.
+//! The connection is a GitHub HMAC one — it is the webhook's shared secret the
+//! external tool signs its trigger requests with — so a webhook whose stored
+//! `WebhookDefinition$authentication` is any other `WebhookAuthenticationType` is
+//! refused with `ValidationException`, the other error the operation models, stating
+//! the requirement and the authentication the webhook carries
+//! ([`crate::state::webhook_authentication_unsupported_message`]).
 //!
 //! ## Shape of an operation
 //!
@@ -167,26 +169,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // Resolved against the stored webhooks under ONE guard, so the name and what
-        // the webhook targets are read from one snapshot of the store: a well-formed
-        // name the account holds no webhook for is a terminal, handleable condition the
-        // model has an error for. `WebhookNotFoundException` models no `message`
-        // member, so the code is the whole refusal.
+        // Resolved against the stored webhooks under ONE guard, so the name and the
+        // webhook's authentication are read from one snapshot of the store: a
+        // well-formed name the account holds no webhook for is a terminal, handleable
+        // condition the model has an error for. `WebhookNotFoundException` models no
+        // `message` member, so the code is the whole refusal.
         //
-        // "Currently supported only for webhooks that target an action type of
-        // GitHub": what a webhook targets is the action its `targetPipeline` and
-        // `targetAction` name, so the question is put to the store through the one rule
-        // both third-party webhook operations ask it with. A webhook targeting anything
-        // else is a request this operation does not support, which is the condition its
-        // `ValidationException` states.
-        let supported = {
+        // The connection this operation removes is the GitHub HMAC one the webhook's
+        // shared secret authenticates, so what decides whether there is such a
+        // connection at all is the authentication the webhook was configured with —
+        // the one rule both third-party webhook operations ask the store with. Any
+        // other `WebhookAuthenticationType` is a request this operation does not
+        // serve, which is the condition its `ValidationException` states, and the
+        // refusal reports the type that blocked it.
+        let authentication = {
             let store = state.lock();
-            store
-                .webhooks
-                .get(name)
-                .map(|webhook| store.webhook_targets_third_party(&webhook.definition))
+            store.webhook_authentication(name).map(str::to_string)
         };
-        match supported {
+        match authentication.as_deref() {
             None => {
                 return Err(
                     DeregisterWebhookWithThirdPartyErrorModeled::WebhookNotFoundException(
@@ -195,22 +195,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
                 )
             }
-            Some(false) => {
+            Some(crate::state::AUTHENTICATION_GITHUB_HMAC) => {}
+            Some(authentication) => {
                 return Err(
                     DeregisterWebhookWithThirdPartyErrorModeled::ValidationException(
                         ValidationException {
-                            message: Some(format!(
-                                "Webhook {name} does not target an action type of {}, and \
-                                 deregistering a webhook with a third party is supported \
-                                 only for those",
-                                crate::state::PROVIDER_GITHUB
-                            )),
+                            message: Some(
+                                crate::state::webhook_authentication_unsupported_message(
+                                    name,
+                                    authentication,
+                                ),
+                            ),
                         },
                     )
                     .into(),
                 )
             }
-            Some(true) => {}
         }
 
         Ok(DeregisterWebhookWithThirdPartyOutput {})

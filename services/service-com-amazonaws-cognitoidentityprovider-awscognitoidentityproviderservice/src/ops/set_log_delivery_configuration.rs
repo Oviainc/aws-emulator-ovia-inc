@@ -233,8 +233,12 @@ fn check_request(
             continue;
         };
         if let Some(plan) = rule.required_plan {
-            if user_pool_tier != plan.tier {
-                return Err(tier_excludes_source(user_pool_tier, plan.feature));
+            if let Some(message) = crate::state::feature_plan_refusal(
+                user_pool_tier,
+                plan.tier,
+                plan.feature,
+            ) {
+                return Err(tier_excludes_source(message));
             }
         }
     }
@@ -347,10 +351,10 @@ struct DeliverableSource {
     required_plan: Option<RequiredPlan>,
 }
 
-/// The feature plan a source needs, and the feature a tier refusal names.
+/// One feature plan a source needs, and the feature a tier refusal names.
 #[derive(Clone, Copy)]
 struct RequiredPlan {
-    /// A `UserPoolTierType` value.
+    /// The cheapest `UserPoolTierType` value that includes this source.
     tier: &'static str,
     /// What the refusal calls the feature, in the tail of
     /// [`crate::state::feature_unavailable_in_tier_message`].
@@ -381,12 +385,12 @@ const DELIVERABLE_SOURCES: [DeliverableSource; 2] = [
         ],
         // `LogConfigurationType.EventSource`: "To send info-level logs about
         // threat-protection user activity in user pools with the Plus feature
-        // plan, set to `userAuthEvents`" — the plan, and the feature as the
-        // operation's own documentation names what is exported ("user-activity
-        // logs", "Exporting user pool logs").
+        // plan, set to `userAuthEvents`" — the plan, and the feature as Amazon
+        // Cognito's own feature-plan comparison names the capability of
+        // streaming those logs to a destination.
         required_plan: Some(RequiredPlan {
             tier: crate::state::PLUS_USER_POOL_TIER,
-            feature: "User Activity Logs",
+            feature: "Log Streaming",
         }),
     },
 ];
@@ -417,16 +421,10 @@ const DESTINATIONS: [Destination; 3] = [
 
 /// The tier refusal for a source the pool's feature plan does not include,
 /// reported with the same template every tier refusal uses.
-fn tier_excludes_source(
-    user_pool_tier: &str,
-    feature: &str,
-) -> SetLogDeliveryConfigurationError {
+fn tier_excludes_source(message: String) -> SetLogDeliveryConfigurationError {
     SetLogDeliveryConfigurationErrorModeled::FeatureUnavailableInTierException(
         FeatureUnavailableInTierException {
-            message: Some(crate::state::feature_unavailable_in_tier_message(
-                user_pool_tier,
-                feature,
-            )),
+            message: Some(message),
         },
     )
     .into()

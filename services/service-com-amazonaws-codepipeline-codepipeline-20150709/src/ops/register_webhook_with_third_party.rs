@@ -9,16 +9,16 @@
 //! with PutWebhook to register with a supported third party", so the name is RESOLVED
 //! against the stored webhooks and a name no stored webhook carries is refused with the
 //! error the model declares for that — `WebhookNotFoundException` — while a webhook
-//! whose target action is not the supported third party is refused with the other error
-//! it models, `ValidationException`. Which webhooks those are is the one rule its
-//! sibling `DeregisterWebhookWithThirdParty` asks too
-//! ([`crate::state::ComAmazonawsCodepipelineCodepipeline20150709State::webhook_targets_third_party`]).
+//! whose stored authentication is not the GitHub HMAC one this connection is made with
+//! is refused with the other error it models, `ValidationException`. Which webhooks
+//! those are is the one rule its sibling `DeregisterWebhookWithThirdParty` asks too
+//! ([`crate::state::ComAmazonawsCodepipelineCodepipeline20150709State::webhook_authentication`]).
 //!
 //! The connection itself is held by the external tool, not by this service: this
 //! emulator reaches no external tool and serves no webhook trigger plane, so there is
 //! nothing of a connection for it to make, and the acceptance asserts only what it
-//! checked — that the account holds a webhook of that name, targeting an action this
-//! operation supports.
+//! checked — that the account holds a webhook of that name, configured with the
+//! authentication the connection is made with.
 //!
 //! ## Shape of an operation
 //!
@@ -161,20 +161,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // Resolved against the stored webhooks under ONE guard, so the name and what
-        // the webhook targets are read from one snapshot of the store: only a webhook
-        // `PutWebhook` created can be registered, and it has to be a webhook of the
-        // supported third party, by the one rule both third-party webhook operations
-        // ask the store with. `WebhookNotFoundException` models no `message` member, so
-        // the code is the whole refusal.
-        let supported = {
+        // Resolved against the stored webhooks under ONE guard, so the name and the
+        // webhook's authentication are read from one snapshot of the store: only a
+        // webhook `PutWebhook` created can be registered, and the connection it makes
+        // with the external tool is the GitHub HMAC one the webhook's shared secret
+        // authenticates — the one rule both third-party webhook operations ask the
+        // store with. `WebhookNotFoundException` models no `message` member, so the
+        // code is the whole refusal; a webhook configured with any other
+        // `WebhookAuthenticationType` is refused with the operation's
+        // `ValidationException`, stating the type that blocked it.
+        let authentication = {
             let store = state.lock();
-            store
-                .webhooks
-                .get(name)
-                .map(|webhook| store.webhook_targets_third_party(&webhook.definition))
+            store.webhook_authentication(name).map(str::to_string)
         };
-        match supported {
+        match authentication.as_deref() {
             None => {
                 return Err(
                     RegisterWebhookWithThirdPartyErrorModeled::WebhookNotFoundException(
@@ -183,22 +183,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
                 )
             }
-            Some(false) => {
+            Some(crate::state::AUTHENTICATION_GITHUB_HMAC) => {}
+            Some(authentication) => {
                 return Err(
                     RegisterWebhookWithThirdPartyErrorModeled::ValidationException(
                         ValidationException {
-                            message: Some(format!(
-                                "Webhook {name} does not target an action type of {}, and \
-                                 registering a webhook with a third party is supported \
-                                 only for those",
-                                crate::state::PROVIDER_GITHUB
-                            )),
+                            message: Some(
+                                crate::state::webhook_authentication_unsupported_message(
+                                    name,
+                                    authentication,
+                                ),
+                            ),
                         },
                     )
                     .into(),
                 )
             }
-            Some(true) => {}
         }
 
         Ok(RegisterWebhookWithThirdPartyOutput {})

@@ -88,3 +88,5 @@ mod pagination_token_refusal;
 mod harvest_job_idempotency;
 #[path = "all/multiview_channel_ingest.rs"]
 mod multiview_channel_ingest;
+#[path = "all/quota_refusal_form.rs"]
+mod quota_refusal_form;

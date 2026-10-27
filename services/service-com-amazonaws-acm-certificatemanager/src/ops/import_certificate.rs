@@ -376,7 +376,7 @@ struct ImportedCertificate {
     /// Every name the certificate covers: [`Self::domain_name`] first, then the DNS
     /// subject alternative names, deduplicated.
     subject_alternative_names: Vec<String>,
-    /// The subject distinguished name, as RFC 4514 writes one.
+    /// The subject distinguished name, as [`distinguished_name`] writes one.
     subject: String,
     /// The issuer distinguished name — "the name of the certificate authority that
     /// issued and signed the certificate" (`CertificateDetail$Issuer` doc).
@@ -565,8 +565,8 @@ fn imported_certificate(
         chain: chain_pem,
         domain_name,
         subject_alternative_names: names,
-        subject: tbs.subject.to_string(),
-        issuer: tbs.issuer.to_string(),
+        subject: distinguished_name(&tbs.subject),
+        issuer: distinguished_name(&tbs.issuer),
         serial: ::hex::encode(tbs.serial_number.as_bytes()),
         key_algorithm: public_key.key_algorithm,
         signature_algorithm: signature_algorithm(&certificate.signature_algorithm.oid),
@@ -873,6 +873,36 @@ where
         .iter()
         .find(|extension| extension.extn_id == T::OID)
         .and_then(|extension| T::from_der(extension.extn_value.as_bytes()).ok())
+}
+
+/// An X.509 `Name` as the one-line distinguished name ACM reports it as: each of its
+/// relative distinguished names written `Type=Value` and joined with commas, IN THE
+/// ORDER THE CERTIFICATE'S DER CARRIES THEM, so the component the certificate encodes
+/// first is the component the name begins with.
+///
+/// A certificate encodes a `Name` most-general component first, and ACM reads it off in
+/// that order: a subject encoded as a common name followed by an organizational unit is
+/// reported with the common name first. The type's own `Display` cannot be used for
+/// this — it writes the string form RFC 4514 section 2.1 defines, which emits the
+/// components in REVERSE encoding order — so the sequence is walked here and each
+/// component is rendered by the attribute's own `Display` (the attribute type's short
+/// name and the value, escaped as that form requires).
+///
+/// The attributes of ONE multi-valued relative distinguished name belong to the same
+/// component and are joined with `+`, the separator that form reserves for them, also
+/// in encoding order.
+fn distinguished_name(name: &Name) -> String {
+    name.0
+        .iter()
+        .map(|rdn| {
+            rdn.0
+                .iter()
+                .map(|attribute| attribute.to_string())
+                .collect::<Vec<_>>()
+                .join("+")
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// The value of the first `attribute` a distinguished name carries, as the string a

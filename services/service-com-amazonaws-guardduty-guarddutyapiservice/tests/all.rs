@@ -103,6 +103,8 @@ mod malware_scan;
 mod malware_scan_description;
 #[path = "all/malware_scan_lifecycle.rs"]
 mod malware_scan_lifecycle;
+#[path = "all/malware_scan_page_window.rs"]
+mod malware_scan_page_window;
 #[path = "all/malware_scan_settings.rs"]
 mod malware_scan_settings;
 #[path = "all/master_account_disassociation.rs"]

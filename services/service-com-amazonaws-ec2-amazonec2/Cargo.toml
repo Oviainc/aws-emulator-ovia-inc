@@ -24,6 +24,13 @@ tracing = { workspace = true }
 # Opaque pagination cursors: hex makes a `NextToken` this service did not mint
 # detectable, which is what lets a paginating describe refuse a malformed one.
 hex = { workspace = true }
+# JPEG codec for the instance console screen `GetConsoleScreenshot` reports: the
+# operation documents its image as a JPG, so the bytes have to be one.
+jpeg-encoder = "0.6"
+# The 8x8 monochrome console font that screen's text is drawn with.
+font8x8 = "0.3"
+# `GetConsoleScreenshotResult$ImageData` carries the image as base64 text.
+base64 = "0.22"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -35,6 +42,9 @@ sha2 = { workspace = true }
 tokio = { workspace = true, features = ["time"] }
 # Reads the ec2Query XML responses the integration tests assert on.
 roxmltree = "0.20"
+# Decoder used only by the tests, to prove the console screenshot really decodes
+# as a JPEG of the screen geometry the handler reports.
+zune-jpeg = "0.4"
 
 [lints]
 workspace = true
