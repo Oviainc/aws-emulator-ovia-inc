@@ -815,6 +815,13 @@ async fn cryptographic_operations_over_a_non_symmetric_key_are_never_fabricated(
         &json!({"KeySpec": "HMAC_256", "KeyUsage": "GENERATE_VERIFY_MAC"}),
     )
     .await;
+    // An ML-DSA key pair is the one signing key pair no library in this workspace
+    // generates, so the KMS key is real and holds no private half to sign with.
+    let ml_dsa = create_key(
+        &router,
+        &json!({"KeySpec": "ML_DSA_44", "KeyUsage": "SIGN_VERIFY"}),
+    )
+    .await;
     let symmetric = create_key(&router, &json!({"Description": "symmetric"})).await;
 
     let plaintext = b64(b"attack at dawn");
@@ -842,10 +849,18 @@ async fn cryptographic_operations_over_a_non_symmetric_key_are_never_fabricated(
             "InvalidKeyUsageException",
         ),
         (
-            "Sign with a signing key",
+            "Sign with an encryption key",
             "Sign",
-            json!({"KeyId": rsa_sign["KeyId"], "Message": plaintext,
+            json!({"KeyId": rsa_encrypt["KeyId"], "Message": plaintext,
                    "SigningAlgorithm": "RSASSA_PSS_SHA_256"}),
+            400,
+            "InvalidKeyUsageException",
+        ),
+        (
+            "Sign with a key pair this emulator does not generate",
+            "Sign",
+            json!({"KeyId": ml_dsa["KeyId"], "Message": plaintext,
+                   "SigningAlgorithm": "ML_DSA_SHAKE_256"}),
             501,
             "NotImplemented",
         ),
