@@ -5637,6 +5637,19 @@ impl Bucket {
         )
     }
 
+    /// Drop the S3 Inventory configuration the bucket carries under `id`, reporting whether
+    /// there was one to drop.
+    ///
+    /// Per-ID, like the put: a delete "deletes an S3 Inventory configuration (identified by
+    /// the inventory ID) from the bucket" (`DeleteBucketInventoryConfiguration`'s own
+    /// documentation) removes THAT configuration and leaves every other id the bucket carries
+    /// in place. `false` means the bucket carried none under that id, which is what makes a
+    /// delete answer [`NO_SUCH_CONFIGURATION_CODE`] rather than report a removal it did not
+    /// make.
+    pub fn delete_inventory_configuration(&mut self, id: &str) -> bool {
+        self.inventory_configurations.remove(id).is_some()
+    }
+
     /// Every S3 Intelligent-Tiering configuration the bucket carries, in ascending id
     /// order — empty for a bucket that carries none.
     ///

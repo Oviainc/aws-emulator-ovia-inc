@@ -65,6 +65,8 @@ mod resource_tags;
 mod seq_token_pagination;
 #[path = "all/session_cancellation.rs"]
 mod session_cancellation;
+#[path = "all/session_filter_value_bound.rs"]
+mod session_filter_value_bound;
 #[path = "all/session_listing.rs"]
 mod session_listing;
 #[path = "all/state_roundtrip.rs"]

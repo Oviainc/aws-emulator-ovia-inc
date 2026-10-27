@@ -257,12 +257,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             matched.push(request.to_summary());
         }
 
-        // The token resumes THIS list: one minted for a different party type or
-        // a different selector would index into a different sequence. The
-        // sequence itself is the store's own order over payment request ids,
-        // which are minted from a counter, so a page indexes into the same
-        // sequence on every call.
-        let scope = crate::state::payment_request_scope(
+        // The token resumes THIS list: the scope names the operation as well as
+        // every selector, so one minted for a different party type, a different
+        // selector, or by the sibling listing over seller-submitted requests
+        // indexes into a different sequence. The sequence itself is the store's
+        // own order over payment request ids, which are minted from a counter,
+        // so a page indexes into the same sequence on every call.
+        let scope = crate::state::submitted_request_scope(
+            Self::NAME,
             &input.party_type,
             input.agreement_id.as_deref(),
             input.agreement_type.as_deref(),

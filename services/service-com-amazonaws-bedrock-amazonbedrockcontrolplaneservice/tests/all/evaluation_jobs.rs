@@ -15,8 +15,10 @@
 //!    type, key spelling, description, tag count and name length (both modelled bounds).
 //! 2. **`jobType` is the `EvaluationConfig` variant the request carried**: `automated` ->
 //!    `Automated`, `human` -> `Human`, over the rows of 1 and never read off anything else.
-//! 3. **`status` is `InProgress` and a read changes nothing**: the job is reported running
-//!    from the create onwards, and two reads of one job answer identically.
+//! 3. **`status` is `InProgress` while the run is still owed**: the job is reported running
+//!    from the create onwards, and two reads inside that span answer identically. The end of
+//!    the run — the move to `Completed` the clock owes — is asserted in
+//!    `evaluation_job_completion.rs`.
 //! 4. **A `jobName` names at most one job per account per region**, so a create reusing one
 //!    conflicts with 400 `ConflictException` while the same name in another region is
 //!    minted.

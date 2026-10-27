@@ -125,6 +125,8 @@ mod policy_tag_listing;
 mod policy_tag_removal;
 #[path = "all/policy_tags.rs"]
 mod policy_tags;
+#[path = "all/policy_variable_scoping.rs"]
+mod policy_variable_scoping;
 #[path = "all/policy_version_creation.rs"]
 mod policy_version_creation;
 #[path = "all/policy_version_deletion.rs"]

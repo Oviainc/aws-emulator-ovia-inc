@@ -57,7 +57,7 @@ const CONFIGURATIONS_PER_PAGE: usize = 100;
 
 /// `GET /<bucket>?inventory` — `ListBucketInventoryConfigurations`, optionally continuing at
 /// `token` and with any extra bound headers.
-async fn list_inventory(
+pub(crate) async fn list_inventory(
     router: &MultiServiceRouter,
     bucket: &str,
     token: Option<&str>,

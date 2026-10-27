@@ -20,7 +20,9 @@
 //!   modelled `ValidationException`, never an empty page.
 //! * a `timeFilter` whose `from` is later than its `to` names no window a caller could
 //!   have meant, so it is refused the way `ListTransactions` refuses an inverted
-//!   `fromBlockchainInstant`/`toBlockchainInstant` pair.
+//!   `fromBlockchainInstant`/`toBlockchainInstant` pair — literally the same rule, which
+//!   `crate::state::InstantWindow` states once for both listings and which also decides
+//!   which events a window keeps.
 //!
 //! ## Shape of an operation
 //!
@@ -116,6 +118,17 @@ use super::types::*;
 /// is `ValidationExceptionField$name`, and the value that violated it is the caller's
 /// own, so neither is interpolated into the sentence.
 const UNSUPPORTED_NETWORK_MESSAGE: &str = "Please use a blockchain network supported by this API.";
+
+/// Which members of this request bound the window the listing covers, for the shared
+/// window rule (`crate::state::InstantWindow`).
+///
+/// The `fieldList` entry names the member carrying the start of the window, the one a
+/// caller repairs to name a window this operation can answer.
+const WINDOW_MEMBERS: crate::state::WindowMembers = crate::state::WindowMembers {
+    field: "timeFilter.from",
+    from: "timeFilter.from",
+    to: "timeFilter.to",
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -263,29 +276,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The window the listing covers, measured on the event's own
         // `blockchainInstant` — which is the instant of the transaction that emitted it.
-        let from = crate::state::instant_to_secs(
-            input
-                .time_filter
-                .as_ref()
-                .and_then(|filter| filter.from.as_ref()),
-        );
-        let to = crate::state::instant_to_secs(
-            input
-                .time_filter
-                .as_ref()
-                .and_then(|filter| filter.to.as_ref()),
-        );
-        // A window that ends before it starts selects nothing a caller could have meant,
-        // so it is refused rather than answered with an empty page.
-        if let (Some(earliest), Some(latest)) = (from, to) {
-            if earliest > latest {
-                fields.push(crate::state::validation_field(
-                    "timeFilter.from",
-                    "The 'time' field in timeFilter.from must be less than or equal to \
-                     the 'time' field in timeFilter.to.",
-                ));
+        // Both halves of the window rule — which pairs of bounds are refused, and which
+        // records a window keeps — are `crate::state::InstantWindow`'s, shared with the
+        // other listing a request narrows by an instant window, so the two can never
+        // disagree about a boundary.
+        let time_filter = input.time_filter.as_ref();
+        let window = match crate::state::InstantWindow::from_bounds(
+            time_filter.and_then(|filter| filter.from.as_ref()),
+            time_filter.and_then(|filter| filter.to.as_ref()),
+            WINDOW_MEMBERS,
+        ) {
+            Ok(window) => window,
+            Err(field) => {
+                fields.push(field);
+                // A request whose window was refused is answered with that refusal below,
+                // so nothing is listed through the window that stands in here.
+                crate::state::InstantWindow::UNBOUNDED
             }
-        }
+        };
 
         // Nothing is read until every rule has had its say.
         if !fields.is_empty() {
@@ -359,10 +367,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &transaction.confirmation_status,
                 wanted_statuses.as_deref(),
             );
-            if from.is_some_and(|earliest| instant < earliest)
-                || to.is_some_and(|latest| instant > latest)
-                || refused_status
-            {
+            if !window.contains(instant) || refused_status {
                 continue;
             }
 

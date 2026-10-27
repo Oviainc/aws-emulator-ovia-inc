@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateConfigurationSetEventDestination
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateConfigurationSetEventDestination`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateConfigurationSetEventDestination::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records an event destination on a configuration set: the one destination the
+//! request provides, under the name it gives it, so the set publishes the event
+//! types it matches there. The name is the destination's key within the set, so
+//! a second create of one name is a conflict rather than a replacement, and the
+//! set has to be one the account holds.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +154,148 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateConfigurationSetEventDestination` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateConfigurationSetEventDestinationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateConfigurationSetEventDestination"))
+        // `ctx` carries the request's Region, which is the Region an ARN this
+        // request names has to be in; nothing else here needs it.
+        let region = crate::state::region_from_request(ctx.parts());
+        let configuration_set_name = input.configuration_set_name;
+        let mut destination = input.event_destination;
+        let destination_name = destination.name.clone();
+        // The ARN members are read, and the topic asked about, as the trimmed
+        // values they name a resource by — so the destination is STORED the same
+        // way, the way `set_identity_notification_topic` stores a topic ARN:
+        // reporting back a value no later lookup of this service would match
+        // would make the record disagree with the resource it names.
+        if let Some(sns_destination) = destination.sns_destination.as_mut() {
+            sns_destination.topic_arn = sns_destination.topic_arn.trim().to_string();
+        }
+        if let Some(firehose) = destination.kinesis_firehose_destination.as_mut() {
+            firehose.delivery_stream_arn = firehose.delivery_stream_arn.trim().to_string();
+            firehose.iam_role_arn = firehose.iam_role_arn.trim().to_string();
+        }
+
+        // What the request DESCRIBES is read first, through the one shared rule
+        // both event-destination writers follow: a destination that describes
+        // nothing Amazon SES could publish to is refused whether or not the set
+        // it names is there.
+        crate::state::check_event_destination(&destination, &region).map_err(|fault| {
+            refusal(fault, &configuration_set_name, &destination_name)
+        })?;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // See `verify_email_identity.rs`: an engine with no store for this
+            // service cannot serve the operation at all, and every error this
+            // operation models is a client error, so none of them fits.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateConfigurationSetEventDestination",
+            ));
+        };
+        let mut state = state.lock();
+        let Some(configuration_set) = state.configuration_sets.get_mut(&configuration_set_name)
+        else {
+            // "Indicates that the configuration set does not exist", in the
+            // wording every operation of this service uses for a set that is not
+            // there.
+            return Err(
+                CreateConfigurationSetEventDestinationErrorModeled::ConfigurationSetDoesNotExistException(
+                    ConfigurationSetDoesNotExistException {
+                        configuration_set_name: Some(configuration_set_name.clone()),
+                        message: Some(format!(
+                            "Configuration set <{configuration_set_name}> does not exist."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        // The name is the destination's key within the set: "the event
+        // destination could not be created because of a naming conflict", so the
+        // destination the set already carries is kept and
+        // `UpdateConfigurationSetEventDestination` is what replaces it.
+        if configuration_set.event_destination(&destination_name).is_some() {
+            return Err(
+                CreateConfigurationSetEventDestinationErrorModeled::EventDestinationAlreadyExistsException(
+                    EventDestinationAlreadyExistsException {
+                        configuration_set_name: Some(configuration_set_name.clone()),
+                        event_destination_name: Some(destination_name.clone()),
+                        message: Some(format!(
+                            "An event destination with name <{destination_name}> already exists \
+                             for configuration set <{configuration_set_name}>."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // "Indicates that a resource could not be created because of service
+        // limits": a set already holding as many destinations as Amazon SES
+        // allows one takes no further destination.
+        if !configuration_set.add_event_destination(destination) {
+            return Err(
+                CreateConfigurationSetEventDestinationErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "Configuration set <{configuration_set_name}> may not have more than \
+                             {} event destinations.",
+                            crate::state::MAX_EVENT_DESTINATIONS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `CreateConfigurationSetEventDestinationResponse` has no members: what
+        // the call produced is the state it wrote, which
+        // `DescribeConfigurationSet` reports as `EventDestinations`.
+        Ok(CreateConfigurationSetEventDestinationOutput {})
+    }
+}
+
+/// The refusal one of [`crate::state::check_event_destination`]'s faults is
+/// reported with: each destination class has its own modelled error, and the
+/// destination-independent half of the rule has none, so it is reported as the
+/// parameter violation it is. Every modelled one carries the set and the
+/// destination the request named, which are the members those errors declare.
+fn refusal(
+    fault: crate::state::EventDestinationFault,
+    configuration_set_name: &str,
+    event_destination_name: &str,
+) -> CreateConfigurationSetEventDestinationError {
+    let configuration_set_name = Some(configuration_set_name.to_string());
+    let event_destination_name = Some(event_destination_name.to_string());
+    match fault {
+        crate::state::EventDestinationFault::Parameter(message) => {
+            crate::scaffolded::Scaffolded::invalid_parameter_value(message)
+        }
+        crate::state::EventDestinationFault::CloudWatch(message) => {
+            CreateConfigurationSetEventDestinationErrorModeled::InvalidCloudWatchDestinationException(
+                InvalidCloudWatchDestinationException {
+                    configuration_set_name,
+                    event_destination_name,
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+        crate::state::EventDestinationFault::Firehose(message) => {
+            CreateConfigurationSetEventDestinationErrorModeled::InvalidFirehoseDestinationException(
+                InvalidFirehoseDestinationException {
+                    configuration_set_name,
+                    event_destination_name,
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+        crate::state::EventDestinationFault::Sns(message) => {
+            CreateConfigurationSetEventDestinationErrorModeled::InvalidSNSDestinationException(
+                InvalidSNSDestinationException {
+                    configuration_set_name,
+                    event_destination_name,
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
     }
 }

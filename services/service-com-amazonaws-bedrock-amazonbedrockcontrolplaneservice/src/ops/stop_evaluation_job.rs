@@ -178,15 +178,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "Stops an evaluation job that is current being created or running": a job in any
-        // other status has nothing left to stop, so asking again is refused.
+        // other status has nothing left to stop, so asking for a stop of a job whose run is
+        // already over is refused.
         //
         // The refusal is the modelled `ValidationException` rather than the
         // `ConflictException` this operation also models, and its message names the job the
         // stop addressed and reports that the job is already stopped: that is what the
         // corpus `simparity-behavioral-ga-prod-v1` records Amazon Bedrock answering for a
-        // stop of a job that is already stopped. The two non-running statuses reachable
-        // here are the two a stop itself produces (`Stopping` and `Stopped`), so that is
-        // what every refusal this branch words is about.
+        // stop of a job that is no longer running.
         if !job.is_stoppable() {
             return Err(StopEvaluationJobErrorModeled::ValidationException(
                 ValidationException {

@@ -83,7 +83,7 @@ async fn get_config(router: &MultiServiceRouter, id: &str) -> Answer {
 
 /// `GET /2020-05-31/field-level-encryption`, with `query` appended verbatim
 /// (`?MaxItems=2&Marker=C…`), from the operation's `http` binding.
-async fn list_configs(router: &MultiServiceRouter, query: &str) -> Answer {
+pub(crate) async fn list_configs(router: &MultiServiceRouter, query: &str) -> Answer {
     call(
         router,
         "GET",
@@ -431,7 +431,7 @@ fn page_summaries(answer: &Answer) -> Vec<&Node> {
 }
 
 /// The ids a page reports, in the order the page carries them.
-fn page_ids(answer: &Answer) -> Vec<String> {
+pub(crate) fn page_ids(answer: &Answer) -> Vec<String> {
     page_summaries(answer)
         .into_iter()
         .map(|summary| summary.text_at("Id").unwrap_or_default().to_string())

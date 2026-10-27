@@ -1,15 +1,43 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSyncResources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSyncResources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the resources one sync job has synchronised, one page at a time,
+//! read from [`crate::state`]: a sync job is addressed by the workspace that
+//! holds it and its sync source, so the job the page is taken over is looked up
+//! through that pair and the rows are the resources THAT job holds
+//! ([`crate::state::SyncJob::sync_resources`]) — never a resource of another
+//! job, another workspace or another Region.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSyncResources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A sync resource is identified in the sync source by its `externalId`, which
+//! is the key of that map, so iterating it IS external-id order and a page
+//! resumes from a `nextToken` carrying the external id it starts AT (inclusive)
+//! rather than an offset: a page boundary survives the set changing between two
+//! pages. The token is bound to the workspace AND the sync source it was minted
+//! for, so a token from another listing — or from this listing taken over
+//! another job — is refused rather than silently resumed. This operation models
+//! no `ResourceNotFoundException`, so a workspace or a sync job this service
+//! does not hold is refused with the `ValidationException` it does model,
+//! exactly as `ListSyncJobs` refuses the same miss.
+//!
+//! `filters` NARROWS the page, and only the combinations the member documents
+//! are accepted ([`SUPPORTED_FILTER_COMBINATIONS`]); each filter's enumerated
+//! value is checked here, because the boundary validator does not enforce a
+//! value list. The page size is this operation's OWN documented one — "The
+//! default is 50 … Minimum value of 0. Maximum value of 200" — not the 25 the
+//! workspace, entity and component-type listings document; see
+//! [`DEFAULT_PAGE_SIZE`].
+//!
+//! This listing REPORTS: it writes nothing at all, not even the lifecycle
+//! transition the clock owes the JOB, because no member it reports is that
+//! job's own status — the operations that report the status are the ones that
+//! materialise it. Authorization is not emulated, so the modelled
+//! `AccessDeniedException` is never returned.
+//!
+//! What a job HOLDS is written by its synchronisation, which this emulator does
+//! not perform ([`crate::state::SyncResource`]), so a job accepted by this
+//! emulator's create path holds no resource and this listing reports a present
+//! but empty page for it — the page the record says, not a page invented for a
+//! synchronisation that never ran.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +182,348 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSyncResources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSyncResourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSyncResources"))
+        // Every call is recorded, successful or refused: the real service logs
+        // control-plane access, and a page served is a read of tenant state.
+        ::tracing::info!(
+            operation = "ListSyncResources",
+            workspace_id = %input.workspace_id,
+            sync_source = %input.sync_source,
+            "serving a request"
+        );
+        // The Region this request is signed for picks the store that answers
+        // it: a workspace created through another Region's endpoint is not in
+        // it, so neither are the sync jobs it holds or their resources.
+        let region = crate::state::request_region(ctx.parts());
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListSyncResourcesErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the iottwinmaker store is unavailable".to_string()),
+            })
+        })?;
+        // The store is read through the REPORTING accessor: this listing writes
+        // nothing, so a Region nothing has been created in is answered for
+        // without materialising a store a later caller could observe.
+        let state = state.lock();
+        let state = state.region(&region);
+
+        // The outcome is recorded where the refusal is BUILT, so one record
+        // covers every refusal this handler owns and says which one it was.
+        let invalid = |message: String| {
+            ::tracing::info!(
+                operation = "ListSyncResources",
+                outcome = "ValidationException",
+                reason = ?message,
+                "refusing a request"
+            );
+            ListSyncResourcesErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+        };
+
+        // A sync job lives INSIDE a workspace, and its resources inside the
+        // job, so a workspace this service does not hold holds no resource to
+        // list. This operation models no `ResourceNotFoundException`, so the
+        // refusal is the `ValidationException` it does model — the same choice
+        // `ListSyncJobs` makes for the same missing parent.
+        let Some(workspace) = state.workspaces.get(&input.workspace_id) else {
+            return Err(invalid(crate::state::workspace_not_found_message(
+                &input.workspace_id,
+            ))
+            .into());
+        };
+        // The sync SOURCE is the job's identity inside its workspace, so the
+        // pair the request names addresses at most one job; a workspace that
+        // syncs from no such source has no resources synchronised from it, which
+        // includes every source this service does not support.
+        let Some(job) = workspace.sync_jobs.get(&input.sync_source) else {
+            return Err(invalid(crate::state::sync_job_not_found_message(
+                &input.workspace_id,
+                &input.sync_source,
+            ))
+            .into());
+        };
+
+        // Every filter the request names NARROWS the page: a resource is
+        // reported only when it satisfies all of them, so a request naming none
+        // lists every resource the job holds. How many a listing accepts is
+        // bounded FIRST ([`MAX_FILTERS`]), so neither the checks below nor the
+        // scan further down can be made to cost more by sending a longer list.
+        let filters = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > MAX_FILTERS {
+            return Err(invalid(format!(
+                "filters accepts at most {MAX_FILTERS} objects, got {}",
+                filters.len()
+            ))
+            .into());
+        }
+        // `state` and `resourceType` are modelled enumerations, whose value
+        // lists the boundary validator does not enforce (the same reason
+        // `ListMetadataTransferJobs` checks its own filter's state here), so a
+        // value outside them is refused rather than quietly selecting no
+        // resource. The message is built from the request: it names the member,
+        // the value and the values the model admits.
+        for filter in filters {
+            let (member, wanted, admitted) = match filter {
+                SyncResourceFilter::State(wanted) => ("state", wanted, SYNC_RESOURCE_STATE_VALUES),
+                SyncResourceFilter::resourceType(wanted) => {
+                    ("resourceType", wanted, SYNC_RESOURCE_TYPE_VALUES)
+                }
+                // The ids are plain `Id` strings, whose length and pattern the
+                // boundary validator has already enforced.
+                SyncResourceFilter::resourceId(_) | SyncResourceFilter::externalId(_) => continue,
+            };
+            if !admitted.contains(&wanted.as_str()) {
+                return Err(invalid(format!(
+                    "filters names {member} {wanted}, which is not one of {}",
+                    admitted.join(", ")
+                ))
+                .into());
+            }
+        }
+        // WHICH filters a request may combine is documented on the member, and a
+        // combination outside that set narrows the listing on no dimension the
+        // service defines — so it is refused rather than served as if it had
+        // selected what the caller meant.
+        let combination = filter_combination(filters);
+        if !SUPPORTED_FILTER_COMBINATIONS.contains(&combination.as_slice()) {
+            return Err(invalid(format!(
+                "filters names {}, which is not one of the supported filter combinations: {}",
+                combination.join(" and "),
+                supported_combinations_message()
+            ))
+            .into());
+        }
+
+        // A `nextToken` carries the `externalId` the page resumes AT
+        // (inclusive), not an offset, so a page boundary survives the
+        // synchronised set changing between two pages. It is bound to the job it
+        // was minted over, so a token from another listing — or from this
+        // listing taken over another workspace or sync source — is refused
+        // rather than silently resumed.
+        let resume_at = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => Some(
+                decode_next_token(token, &input.workspace_id, &input.sync_source).ok_or_else(
+                    || {
+                        // The token itself is NOT echoed back: it is opaque to
+                        // the caller and modelled up to 17880 characters, so the
+                        // refusal names the member and what is wrong with it
+                        // rather than copying an arbitrary request string into
+                        // the response.
+                        invalid("nextToken is not a token this listing minted".to_string())
+                    },
+                )?,
+            ),
+        };
+
+        // The page size served, under the rule every paginated operation of this
+        // service shares (`crate::state::page_size`): the documented default
+        // when the request names none, otherwise what it asks for, capped at the
+        // most this service ever serves. Like `ListSyncJobs` — and unlike the
+        // listings whose `maxResults` documents a minimum of 1 — THIS member
+        // documents a minimum of 0 (see [`DEFAULT_PAGE_SIZE`]), so a zero is a
+        // page of no rows, the maximum number of results to return at one time
+        // taken literally, and not a refusal; the `nextToken` then still names
+        // where the listing stands, so a caller that asked for nothing can
+        // resume. Anything outside the member's modelled range is refused by the
+        // boundary validator before this handler runs. The token such a page
+        // answers names the position the call STARTED from — a page of no rows
+        // consumed none — so a generated paginator must not be driven at zero:
+        // it would ask again from the same place forever.
+        let page_size = crate::state::page_size(
+            input.max_results,
+            crate::state::PageSizeRule::minimum_zero(DEFAULT_PAGE_SIZE),
+        )
+        .map_err(invalid)?;
+
+        // `sync_resources` is keyed by `externalId`, so iterating the map IS
+        // external-id order and resuming is a `range` from the token's key: the
+        // page starts at the first resource at or past it without walking what
+        // came before.
+        let mut matching = match &resume_at {
+            Some(from) => job.sync_resources.range(from.clone()..),
+            None => job.sync_resources.range::<String, _>(..),
+        }
+        .map(|(_, resource)| resource)
+        .filter(|resource| filters.iter().all(|filter| matches_filter(resource, filter)));
+
+        let mut sync_resources = Vec::new();
+        for resource in matching.by_ref().take(page_size) {
+            sync_resources.push(SyncResourceSummary {
+                resource_type: Some(resource.resource_type.clone()),
+                // The resource's identity in the SOURCE, always known: it is
+                // what the job holds the resource under.
+                external_id: Some(resource.external_id.clone()),
+                // Its identity in the WORKSPACE, absent while the
+                // synchronisation has created no resource there for it.
+                resource_id: resource.resource_id.clone(),
+                // Carries BOTH its modelled members — the stored state and the
+                // `error` structure every reported status of this service
+                // carries — read through the accessor on the record, as every
+                // status this service reports is.
+                status: Some(resource.status()),
+                update_date_time: Some(crate::state::timestamp(resource.update_date_time)),
+            });
+        }
+        // The token the next call resumes at: the first resource this page left
+        // over. Absent on the last page, which is how a caller knows to stop.
+        let next_token = matching.next().map(|resource| {
+            encode_next_token(
+                &input.workspace_id,
+                &input.sync_source,
+                &resource.external_id,
+            )
+        });
+
+        // The outcome is recorded too, so the record of this call says what the
+        // service answered and not only that it was asked.
+        ::tracing::info!(
+            operation = "ListSyncResources",
+            outcome = "served",
+            reported = sync_resources.len(),
+            truncated = next_token.is_some(),
+            "served a request"
+        );
+
+        Ok(ListSyncResourcesOutput {
+            // Present, not omitted, for a job that has synchronised nothing: the
+            // member is how a caller reads the set, and an empty list says there
+            // is none where an absent member cannot be told from an unanswered
+            // read.
+            sync_resources: Some(sync_resources),
+            next_token,
+        })
     }
+}
+
+/// Whether `resource` is in the set this one `filter` selects.
+fn matches_filter(resource: &crate::state::SyncResource, filter: &SyncResourceFilter) -> bool {
+    match filter {
+        // The resource's own `SyncResourceState` — the state of ITS
+        // synchronisation, which is what this filter selects on, not the state
+        // of the job holding it.
+        SyncResourceFilter::State(wanted) => resource.state == *wanted,
+        SyncResourceFilter::resourceType(wanted) => resource.resource_type == *wanted,
+        // The id in the WORKSPACE: a resource the synchronisation has created
+        // nothing for yet has none, so no `resourceId` selects it.
+        SyncResourceFilter::resourceId(wanted) => {
+            resource.resource_id.as_deref() == Some(wanted.as_str())
+        }
+        // The id in the SOURCE, which every synchronised resource carries.
+        SyncResourceFilter::externalId(wanted) => resource.external_id == *wanted,
+    }
+}
+
+/// The member names `filters` names, SORTED — the combination a request sent,
+/// compared against [`SUPPORTED_FILTER_COMBINATIONS`] whatever order the caller
+/// listed them in, and with a member named twice kept twice, so such a request
+/// is no combination the member documents either.
+fn filter_combination(filters: &[SyncResourceFilter]) -> Vec<&'static str> {
+    let mut named: Vec<&'static str> = filters.iter().map(filter_member).collect();
+    named.sort_unstable();
+    named
+}
+
+/// The name of the `SyncResourceFilter` member `filter` names, as the model
+/// spells it on the wire.
+fn filter_member(filter: &SyncResourceFilter) -> &'static str {
+    match filter {
+        SyncResourceFilter::State(_) => "state",
+        SyncResourceFilter::resourceType(_) => "resourceType",
+        SyncResourceFilter::resourceId(_) => "resourceId",
+        SyncResourceFilter::externalId(_) => "externalId",
+    }
+}
+
+/// The filter combinations this operation accepts, each SORTED the way
+/// [`filter_combination`] sorts a request's.
+///
+/// Taken from the member's own documentation, not chosen here: `filters` is "a
+/// list of objects that filter the request. The following filter combinations
+/// are supported: Filter with state. Filter with ResourceType and ResourceId.
+/// Filter with ResourceType and ExternalId."
+/// (`smithy_query(query="doc",shape="ListSyncResourcesRequest",member="filters")`),
+/// plus the empty combination of a request that names no filter at all and so
+/// asks for the whole set.
+pub const SUPPORTED_FILTER_COMBINATIONS: &[&[&str]] = &[
+    &[],
+    &["state"],
+    &["resourceId", "resourceType"],
+    &["externalId", "resourceType"],
+];
+
+/// The supported combinations as a refusal names them: the members of each, in
+/// the order the documentation lists them, so a caller reads what it may send
+/// rather than only that what it sent is wrong.
+fn supported_combinations_message() -> String {
+    SUPPORTED_FILTER_COMBINATIONS
+        .iter()
+        .filter(|combination| !combination.is_empty())
+        .map(|combination| combination.join(" and "))
+        .collect::<Vec<String>>()
+        .join(", ")
+}
+
+/// The most `filters` one listing accepts.
+///
+/// No combination the member documents names more than two members
+/// ([`SUPPORTED_FILTER_COMBINATIONS`]), so a longer list is refused on its
+/// length before anything is compared: the work one listing costs is the number
+/// of filters times the resources scanned, and bounding the request-sized factor
+/// is what keeps that product bounded whatever a caller sends. Checked at
+/// COMPILE time against the documented combinations, so admitting a longer one
+/// without raising this bound fails the build.
+pub const MAX_FILTERS: usize = 2;
+const _: () = {
+    let mut index = 0;
+    while index < SUPPORTED_FILTER_COMBINATIONS.len() {
+        assert!(SUPPORTED_FILTER_COMBINATIONS[index].len() <= MAX_FILTERS);
+        index += 1;
+    }
+};
+
+/// The page size this listing serves when a request names no `maxResults`.
+///
+/// THIS operation's own documented default, not the service-wide
+/// [`crate::state::DEFAULT_PAGE_SIZE`]: the `maxResults` member of
+/// `ListSyncResourcesRequest` documents "The maximum number of results to return
+/// at one time. The default is 50. Valid Range: Minimum value of 0. Maximum
+/// value of 200."
+/// (`smithy_query(query="doc",shape="ListSyncResourcesRequest",member="maxResults")`),
+/// where the workspace, entity and component-type listings document a default of
+/// 25 and a minimum of 1 — so both the default and what a zero means are
+/// per-operation, each taken from that member's own documentation.
+pub const DEFAULT_PAGE_SIZE: usize = 50;
+
+/// The top of the `maxResults` member's modelled `range` (0..200), which is also
+/// the maximum its documentation publishes.
+///
+/// This listing never serves a page larger than
+/// [`crate::state::MAX_PAGE_SIZE`], so that ceiling must be EXACTLY what this
+/// operation's member admits — no larger, or a page could leave the range the
+/// model allows; no smaller, or a `maxResults` this member publishes would be
+/// silently narrowed — and the default may never exceed it. Checked at COMPILE
+/// time, so moving either past what the model allows fails the build instead of
+/// serving a page the member could not have asked for or quietly shortening one
+/// it did.
+const MODELLED_MAX_RESULTS: usize = 200;
+const _: () = assert!(crate::state::MAX_PAGE_SIZE == MODELLED_MAX_RESULTS);
+const _: () = assert!(DEFAULT_PAGE_SIZE <= crate::state::MAX_PAGE_SIZE);
+
+/// The envelope a `nextToken` of this listing carries, so a token minted
+/// elsewhere — by another listing of this service, over another sync job, or by
+/// hand — is recognisably not one of ours. The token itself is the shape every
+/// paginated operation of this service mints
+/// ([`crate::state::encode_page_token`]), scoped to the job whose page it is.
+const NEXT_TOKEN_PREFIX: &str = "iottwinmaker:syncResources:1:";
+
+/// The opaque `nextToken` for a page of the resources the sync job
+/// `workspace_id`/`sync_source` holds, starting at `external_id`.
+fn encode_next_token(workspace_id: &str, sync_source: &str, external_id: &str) -> String {
+    crate::state::encode_page_token(NEXT_TOKEN_PREFIX, &[workspace_id, sync_source], external_id)
+}
+
+/// The external id inside a `nextToken` minted over this sync job, or `None`
+/// when the token is not one this listing minted for it.
+fn decode_next_token(token: &str, workspace_id: &str, sync_source: &str) -> Option<String> {
+    crate::state::decode_page_token(NEXT_TOKEN_PREFIX, &[workspace_id, sync_source], token)
 }

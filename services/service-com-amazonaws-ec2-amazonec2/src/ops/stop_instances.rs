@@ -172,7 +172,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::scaffolded::Scaffolded;
         use crate::state::{
             deduplicate_ids, require_known_instance, require_service_state, user_initiated_reason,
-            InstanceStateName, PendingTransition, MAX_RESOURCE_IDS,
+            INSTANCE_STATE_REASON_MESSAGE_USER_INITIATED_SHUTDOWN,
+            INSTANCE_STATE_REASON_USER_INITIATED_SHUTDOWN, InstanceStateName, PendingTransition,
+            MAX_RESOURCE_IDS,
         };
 
         let _ = ctx;
@@ -247,8 +249,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ));
                 instance.state_transition_reason = Some(user_initiated_reason(now));
                 instance.state_reason = Some((
-                    "Client.UserInitiatedShutdown".to_string(),
-                    "Client.UserInitiatedShutdown: User initiated shutdown".to_string(),
+                    INSTANCE_STATE_REASON_USER_INITIATED_SHUTDOWN.to_string(),
+                    INSTANCE_STATE_REASON_MESSAGE_USER_INITIATED_SHUTDOWN.to_string(),
                 ));
             }
             changes.push(InstanceStateChange {

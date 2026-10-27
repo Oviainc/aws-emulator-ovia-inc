@@ -24,12 +24,26 @@
 //! it answered. The expression is the `ConditionExpression` language, parsed by the
 //! one parser this crate has for it ([`crate::state::ParsedCondition`]).
 //!
-//! Secondary indexes (`IndexName`), the legacy filters (`ScanFilter`,
-//! `ConditionalOperator`) and projections (`ProjectionExpression`, the legacy
-//! `AttributesToGet`) are refused with the scaffold's 501 and are their own gap
-//! issues. `ConsistentRead`
-//! needs no handling beyond its effect on `ConsumedCapacity`: this store holds one
-//! copy of each item, so a scan of it always sees every completed write.
+//! A scan that names an `IndexName` walks that SECONDARY INDEX instead — "accessing
+//! every item in a table or a secondary index" — in the order the index holds its
+//! entries, which is its own key order with the table's primary key breaking the tie;
+//! an item the index does not cover is not there to be scanned, and each entry carries
+//! the attributes the index projects. A read that needs an attribute its index does not
+//! project is served from the parent table, which only a LOCAL index can do.
+//!
+//! What each reported item carries is the request's `Select` and whichever projection
+//! member it named — `ProjectionExpression` with its `ExpressionAttributeNames` aliases,
+//! or the legacy `AttributesToGet` — applied AFTER the filter, so an attribute the
+//! response does not carry can still narrow the scan. The legacy `ScanFilter` /
+//! `ConditionalOperator` pair states the same filter the expression states, lowered onto
+//! the one legacy comparison evaluator this crate has
+//! ([`crate::state::legacy_conditions_match`]).
+//!
+//! `ConsistentRead` needs no handling beyond its effect on `ConsumedCapacity` — this
+//! store holds one copy of each item, so a scan of it always sees every completed write
+//! — except on a global secondary index, which does not support it and refuses the
+//! request. A `ProjectionExpression` path that reaches INSIDE an attribute (`a.b`,
+//! `a[1]`) is its own gap issue and is refused with the scaffold's 501.
 //!
 //! A table whose resource-based policy denies the caller `dynamodb:Scan` is
 //! answered `AccessDeniedException` instead of its items.
@@ -349,56 +363,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         let name = crate::state::resolve_table_name(&input.table_name).map_err(lift)?;
 
-        // A request may not state its filter twice: the legacy `ScanFilter` and
-        // `ConditionalOperator` are what `FilterExpression` replaces ("This is a
-        // legacy parameter. Use FilterExpression instead"), so a request carrying
-        // both is refused the way the service refuses it, before either is read.
-        if input.filter_expression.is_some() {
-            if input.scan_filter.as_ref().is_some_and(|map| !map.is_empty()) {
-                return Err(lift(crate::state::expression_conflict(
-                    "ScanFilter",
-                    "FilterExpression",
-                )));
-            }
-            if input.conditional_operator.is_some() {
-                return Err(lift(crate::state::expression_conflict(
-                    "ConditionalOperator",
-                    "FilterExpression",
-                )));
-            }
-        }
-        // A `ProjectionExpression` the request sends is VALIDATED whether or not the
-        // projection itself is served: whether the expression is one this service's
-        // language accepts — a bare reserved word, an undefined `#name`, a syntax
-        // error — is a fact of the request, and refusing it as unwritten would answer
-        // "nobody implemented this" for a request no implementation could serve.
-        if let Some(expression) = input.projection_expression.as_deref() {
-            crate::state::projection_expression_attributes(
-                "ProjectionExpression",
-                expression,
-                crate::state::Substitutions::new(input.expression_attribute_names.as_ref(), None),
-            )
-            .map_err(lift)?;
-        }
-        if let Some(member) = unsupported_member(&input) {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
-                "Scan with {member}"
-            )));
-        }
-        // "ALL_ATTRIBUTES - Returns all of the item attributes from the specified
-        // table or index" is the default for a table scan; COUNT "returns the number
-        // of matching items, rather than the matching items themselves"
-        // (`Scan$Select`). The projected forms are "allowed only when querying an
-        // index", which this slice does not serve.
-        let count_only = match input.select.as_deref() {
-            None | Some("ALL_ATTRIBUTES") => false,
-            Some("COUNT") => true,
-            Some(other) => {
-                return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
-                    "Scan with Select {other}"
-                )))
-            }
-        };
+        // Everything that speaks only about the REQUEST is settled before any table is
+        // looked up, so a request that cannot hold together is refused as the client
+        // error it is whatever the store holds and whichever members it carries.
+        //
+        // "A filter expression is applied after a Scan finishes but before the results
+        // are returned" (`Scan$FilterExpression`), stated either in that language or
+        // through the legacy map it replaced ([`Filter`]); it is read BEFORE the store
+        // is, so a filter the service would refuse is refused without reading anything.
+        let filter = Filter::resolve(&input).map_err(lift)?;
+        let requested = requested_attributes(&input)?;
         // A substitution token has nothing to substitute into unless the request
         // carries an expression, so one supplied beside no expression at all is
         // refused rather than silently ignored.
@@ -407,28 +381,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "{member} can only be specified when using expressions"
             )));
         }
-        // "A filter expression is applied after a Scan finishes but before the
-        // results are returned" (`Scan$FilterExpression`): it is the
-        // `ConditionExpression` language — one grammar, parsed in one place — judged
-        // against each item the scan read rather than against a key. It is parsed
-        // BEFORE the store is read, so an expression the service would refuse is
-        // refused without reading anything.
-        let filter = match input.filter_expression.as_deref() {
-            Some(expression) => Some(
-                crate::state::ParsedCondition::parse(
-                    "FilterExpression",
-                    expression,
-                    crate::state::Substitutions::new(
-                        input.expression_attribute_names.as_ref(),
-                        input.expression_attribute_values.as_ref(),
-                    ),
-                )
-                .map_err(lift)?,
-            ),
-            None => None,
-        };
+        // Which member names the index is a fact of the request, so what each reported
+        // item carries is decided here too: the defaults differ between a table scan
+        // and an index scan ([`resolve_selection`]).
+        let selection =
+            resolve_selection(input.select.as_deref(), requested, input.index_name.is_some())
+                .map_err(lift)?;
         let segmentation = Segmentation::resolve(input.segment, input.total_segments)
             .map_err(crate::scaffolded::Scaffolded::validation)?;
+        let consistent_read = input.consistent_read.unwrap_or(false);
 
         let mut store = state.lock();
         store.apply_due_transitions(now);
@@ -438,29 +399,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(denial) = crate::state::policy_denial(table, "dynamodb:Scan", now) {
             return Err(crate::scaffolded::Scaffolded::access_denied(denial));
         }
-        // "The data type for ExclusiveStartKey must be String, Number or Binary. No
-        // set data types are allowed" — the store's key reader holds the map to this
-        // table's own key schema.
-        let resumed = input
-            .exclusive_start_key
-            .as_ref()
-            .map(|start| table.key_of_start_key(start))
-            .transpose()
-            .map_err(lift)?;
+        // "The name of a secondary index to scan. This index can be any local secondary
+        // index or global secondary index" (`Scan$IndexName`): a name this table
+        // declares no index for is the request's own mistake, stated over the name it
+        // sent, and the table was resolved either way.
+        let index = match input.index_name.as_deref() {
+            Some(index_name) => Some(
+                table
+                    .secondary_index(index_name)
+                    .ok_or_else(|| lift(crate::state::unknown_index_named(index_name)))?,
+            ),
+            None => None,
+        };
+        // "The ConsistentRead parameter is not supported on global secondary indexes. If
+        // you scan a global secondary index with ConsistentRead set to true, you will
+        // receive a ValidationException" (`Scan$ConsistentRead`) — an input rule,
+        // decided before anything is read, so the caller is told to fix the request
+        // rather than to retry it.
+        if consistent_read && index.is_some_and(|index| index.global) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                CONSISTENT_READ_ON_GLOBAL_INDEX_MESSAGE,
+            ));
+        }
+        // A read of every item attribute can only be served from an index that projects
+        // them all, because "global secondary index queries cannot fetch attributes from
+        // the parent table" (`Scan$Select`).
+        if let Some(index) = index {
+            if index.global
+                && matches!(selection, Selection::AllAttributes)
+                && !index.projects_all()
+            {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    all_attributes_unprojected(index.name),
+                ));
+            }
+        }
+        // "If any of the requested attributes are not projected into the local secondary
+        // index, DynamoDB fetches each of these attributes from the parent table"
+        // (`Scan$Select`) — which is also what makes that read cost more, since what it
+        // read is then the whole item rather than the index's entry.
+        let fetches_from_table = index.is_some_and(|index| {
+            !index.global && needs_unprojected(&index, &table.key_schema, &selection, &filter)
+        });
 
-        // The walk is over the whole stored table in primary-key order, which is the
-        // order a `LastEvaluatedKey` resumes from. Segment membership is decided from
-        // each item's position in that total order, NOT from the position within one
-        // page, so a later page of the same segment sees the same share of the table.
-        let evaluated = table
-            .items
+        // The walk is over what this scan READS, in the order that reading has: the
+        // table's items in primary-key order, or the entries one secondary index holds
+        // in the order the index orders them ([`crate::state::IndexItemKey`]). Either
+        // way it is the order a `LastEvaluatedKey` resumes from. The list is one entry
+        // per STORED item, so its size is the store's own admission ceilings
+        // ([`crate::state::MAX_ITEMS_PER_TABLE`]) and not anything this request chose;
+        // the entry each row is read as is built inside the page below, where the page
+        // budget bounds it.
+        let candidates: Vec<(Position<'_>, &crate::state::Item)> = match index {
+            None => table
+                .items
+                .iter()
+                .map(|(key, item)| (Position::Table(key), item))
+                .collect(),
+            Some(index) => {
+                // An item the index does not cover has no entry to scan at all — a
+                // sparse index holds only the items that carry its key attributes
+                // ([`crate::state::Table::index_item_key`]).
+                let mut entries: Vec<(crate::state::IndexItemKey, &crate::state::Item)> = table
+                    .items
+                    .iter()
+                    .filter_map(|(key, item)| {
+                        table
+                            .index_item_key(&index, key, item)
+                            .map(|position| (position, item))
+                    })
+                    .collect();
+                entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+                entries
+                    .into_iter()
+                    .map(|(position, item)| (Position::Index(position), item))
+                    .collect()
+            }
+        };
+        // "The data type for ExclusiveStartKey must be String, Number or Binary. No
+        // set data types are allowed" — read back through the schema this scan walks,
+        // which for an index scan is the index's key together with the table's.
+        let resumed = match (input.exclusive_start_key.as_ref(), index) {
+            (None, _) => None,
+            (Some(start), None) => Some(Resume::Table(
+                table.key_of_start_key(start).map_err(lift)?,
+            )),
+            (Some(start), Some(index)) => Some(Resume::Index(
+                table.index_key_of_start_key(&index, start).map_err(lift)?,
+            )),
+        };
+
+        // Segment membership is decided from each row's position in that total order,
+        // NOT from the position within one page, so a later page of the same segment
+        // sees the same share of what is scanned.
+        let evaluated = candidates
             .iter()
             .enumerate()
             .filter(|(position, _)| segmentation.owns(*position))
-            .map(|(_, entry)| entry)
+            .map(|(_, row)| row)
             // "Use this value to start a new operation, EXCLUDING this value in the
             // new request" (`Scan$LastEvaluatedKey`).
-            .filter(|(key, _)| resumed.as_ref().is_none_or(|resumed| *key > resumed));
+            .filter(|(position, _)| resumed.as_ref().is_none_or(|from| position.after(from)));
 
         // "A single Scan operation first reads up to the maximum number of items set
         // (if using the Limit parameter) or a maximum of 1 MB of data" (the `Scan`
@@ -469,13 +508,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let limit = input
             .limit
             .map_or(usize::MAX, |limit| usize::try_from(limit).unwrap_or(0));
-        let mut page: Vec<(&crate::state::ItemKey, &crate::state::Item)> = Vec::new();
+        let mut page: Vec<Read<'_>> = Vec::new();
         let mut page_size: i64 = 0;
         let mut truncated = false;
-        for (key, item) in evaluated {
-            let size = crate::state::item_size(item);
-            // The first item always fits, the way DynamoDB always returns at least
-            // one item it read; after that the page stops BEFORE the item that would
+        for (_, item) in evaluated {
+            let read = Read {
+                item,
+                entry: index.map(|index| index.entry(item, &table.key_schema)),
+                fetched: fetches_from_table,
+            };
+            let size = crate::state::item_size(read.seen());
+            // The first row always fits, the way DynamoDB always returns at least
+            // one item it read; after that the page stops BEFORE the row that would
             // carry it past the budget, so the response is bounded BY the budget
             // rather than by the budget plus one item.
             if page.len() >= limit
@@ -485,57 +529,393 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 break;
             }
             page_size = page_size.saturating_add(size);
-            page.push((key, item));
+            page.push(read);
         }
 
         // "The primary key of the item where the operation stopped" — reported when
         // the walk stopped with items left to evaluate; "If LastEvaluatedKey is
         // empty, then the 'last page' of results has been processed". A page that
-        // ends exactly on the table's last item reports none, which the member's own
-        // doc allows ("If LastEvaluatedKey is not empty, it does not necessarily mean
-        // that there is more data in the result set") and `Query` answers alike.
-        let last_evaluated_key = if truncated {
-            page.last().map(|(_, item)| table.key_attributes(item))
-        } else {
-            None
-        };
-        // "A filter expression is applied after a Scan finishes": every item the page
+        // ends exactly on the last row reports none, which the member's own doc allows
+        // ("If LastEvaluatedKey is not empty, it does not necessarily mean that there
+        // is more data in the result set") and `Query` answers alike. An index scan
+        // reports the index's key beside the table's, because that pair is what
+        // addresses one entry of an index.
+        let last_evaluated_key = truncated
+            .then(|| page.last())
+            .flatten()
+            .map(|read| match index {
+                Some(index) => table.index_key_attributes(&index, read.item),
+                None => table.key_attributes(read.item),
+            });
+        // "A filter expression is applied after a Scan finishes": every row the page
         // READ is scanned — and charged for — and the ones the filter does not match
         // are left out of the response. "ScannedCount [is] the number of items
         // evaluated, before any ScanFilter is applied"; with no filter, "Count is the
         // same as ScannedCount".
         let scanned_count = i32::try_from(page.len()).unwrap_or(i32::MAX);
-        let mut matched: Vec<&crate::state::Item> = Vec::with_capacity(page.len());
-        for (_, item) in &page {
-            let keep = match &filter {
-                Some(filter) => filter.evaluate(Some(item)).map_err(lift)?,
-                None => true,
-            };
-            if keep {
-                matched.push(item);
+        let mut matched: Vec<&Read<'_>> = Vec::with_capacity(page.len());
+        for read in &page {
+            if filter.matches(read.seen()).map_err(lift)? {
+                matched.push(read);
             }
         }
         let count = i32::try_from(matched.len()).unwrap_or(i32::MAX);
-        let items = if count_only {
-            None
-        } else {
-            Some(matched.iter().map(|item| (*item).clone()).collect())
+        // The projection is applied AFTER the filter, so an attribute the response does
+        // not carry still narrows the scan.
+        let items = match &selection {
+            Selection::Count => None,
+            Selection::AllAttributes => {
+                Some(matched.iter().map(|read| read.seen().clone()).collect())
+            }
+            Selection::AllProjected => Some(
+                matched
+                    .iter()
+                    .map(|read| read.projected().clone())
+                    .collect(),
+            ),
+            Selection::Specific(names) => Some(
+                matched
+                    .iter()
+                    .map(|read| crate::state::project_attributes(read.seen(), names))
+                    .collect(),
+            ),
         };
 
+        let units = crate::state::read_capacity_units(page_size, consistent_read);
+        let requested_capacity = input.return_consumed_capacity.as_deref();
         Ok(ScanOutput {
             items,
             count,
             scanned_count,
             last_evaluated_key,
-            consumed_capacity: crate::state::consumed_capacity(
-                input.return_consumed_capacity.as_deref(),
-                &name,
-                crate::state::read_capacity_units(
-                    page_size,
-                    input.consistent_read.unwrap_or(false),
+            consumed_capacity: match index {
+                Some(index) => crate::state::consumed_index_capacity(
+                    requested_capacity,
+                    &name,
+                    &index,
+                    units,
                 ),
-            ),
+                None => crate::state::consumed_capacity(requested_capacity, &name, units),
+            },
         })
+    }
+}
+
+/// How a strongly consistent scan of a GLOBAL secondary index is refused: "The
+/// ConsistentRead parameter is not supported on global secondary indexes. If you scan a
+/// global secondary index with ConsistentRead set to true, you will receive a
+/// ValidationException" (`Scan$ConsistentRead`). The index is not named: the rule holds
+/// for every global secondary index, so the refusal reports nothing of the table.
+const CONSISTENT_READ_ON_GLOBAL_INDEX_MESSAGE: &str =
+    "Consistent reads are not supported on global secondary indexes";
+
+/// How a read of every item attribute FROM a global secondary index that projects only
+/// some of them is refused: "If you query or scan a global secondary index, you can only
+/// request attributes that are projected into the index. Global secondary index queries
+/// cannot fetch attributes from the parent table" (`Scan$Select`), so the request names
+/// an index whose projection cannot answer it.
+fn all_attributes_unprojected(index_name: &str) -> String {
+    format!(
+        "One or more parameter values were invalid: Select type ALL_ATTRIBUTES is not supported \
+         for global secondary index {index_name} because its projection type is not ALL"
+    )
+}
+
+/// Where one row sits in the order a scan walks, which is what an `ExclusiveStartKey`
+/// resumes strictly after.
+#[derive(Debug)]
+enum Position<'a> {
+    /// A base-table scan walks the table's own primary-key order.
+    Table(&'a crate::state::ItemKey),
+    /// An index scan walks the order that index holds its entries in.
+    Index(crate::state::IndexItemKey),
+}
+
+/// The place a page resumes from, read out of `ExclusiveStartKey` through the schema the
+/// scan walks.
+#[derive(Debug)]
+enum Resume {
+    Table(crate::state::ItemKey),
+    Index(crate::state::IndexItemKey),
+}
+
+impl Position<'_> {
+    /// Whether this row comes strictly AFTER the place a previous page stopped at.
+    fn after(&self, resumed: &Resume) -> bool {
+        match (self, resumed) {
+            (Self::Table(key), Resume::Table(from)) => *key > from,
+            (Self::Index(key), Resume::Index(from)) => key > from,
+            // A resume token is read through the same schema this scan walks, so the
+            // two are always the same kind; a row is never skipped on a mismatch.
+            _ => true,
+        }
+    }
+}
+
+/// One row a scan read: the stored item, and the entry the index it was read through
+/// holds for it (`None` on a base-table scan).
+#[derive(Debug)]
+struct Read<'a> {
+    item: &'a crate::state::Item,
+    entry: Option<crate::state::Item>,
+    /// Whether this read went on to the parent table for the attributes its index does
+    /// not project, which only a local secondary index can do.
+    fetched: bool,
+}
+
+impl Read<'_> {
+    /// The attributes this read SAW — what its filter is judged against, what it is
+    /// charged for, and what `ALL_ATTRIBUTES` reports: the index's entry, or the whole
+    /// stored item wherever the table itself was read (a base-table scan, or an index
+    /// read that fetched).
+    fn seen(&self) -> &crate::state::Item {
+        match &self.entry {
+            Some(entry) if !self.fetched => entry,
+            _ => self.item,
+        }
+    }
+
+    /// The attributes the index HOLDS for this row, which is what
+    /// `ALL_PROJECTED_ATTRIBUTES` reports; on a base-table scan the item is its own
+    /// projection.
+    fn projected(&self) -> &crate::state::Item {
+        self.entry.as_ref().unwrap_or(self.item)
+    }
+}
+
+/// What a `Scan` reports for each item its page selected.
+#[derive(Debug)]
+enum Selection {
+    /// "ALL_ATTRIBUTES - Returns all of the item attributes from the specified table or
+    /// index" (`Scan$Select`) — the default when a table is scanned.
+    AllAttributes,
+    /// "ALL_PROJECTED_ATTRIBUTES - Allowed only when querying an index. Retrieves all
+    /// attributes that have been projected into the index" — the default when an index
+    /// is scanned.
+    AllProjected,
+    /// "SPECIFIC_ATTRIBUTES - Returns only the attributes listed in
+    /// ProjectionExpression", which is also what naming a projection and no `Select` at
+    /// all asks for.
+    Specific(::std::collections::BTreeSet<String>),
+    /// "COUNT - Returns the number of matching items, rather than the matching items
+    /// themselves."
+    Count,
+}
+
+/// What each reported item carries, from the request's `Select` and the attributes its
+/// projection named.
+///
+/// "If neither Select nor ProjectionExpression are specified, DynamoDB defaults to
+/// ALL_ATTRIBUTES when accessing a table, and ALL_PROJECTED_ATTRIBUTES when accessing an
+/// index. You cannot use both Select and ProjectionExpression together in a single
+/// request, unless the value for Select is SPECIFIC_ATTRIBUTES" (`Scan$Select`), which
+/// is the whole of the rule below.
+fn resolve_selection(
+    select: Option<&str>,
+    requested: Option<::std::collections::BTreeSet<String>>,
+    on_index: bool,
+) -> Result<Selection, crate::state::RequestError> {
+    if let Some(value) = select {
+        if !SELECT_VALUES.contains(&value) {
+            return Err(crate::state::invalid_member(
+                "select",
+                Some(value),
+                &crate::state::enum_value_requirement(SELECT_VALUES),
+            ));
+        }
+    }
+    match select {
+        None => Ok(match requested {
+            Some(names) => Selection::Specific(names),
+            None if on_index => Selection::AllProjected,
+            None => Selection::AllAttributes,
+        }),
+        Some("SPECIFIC_ATTRIBUTES") => requested.map(Selection::Specific).ok_or_else(|| {
+            crate::state::RequestError::Validation(
+                "One or more parameter values were invalid: Select type SPECIFIC_ATTRIBUTES \
+                 requires the attributes to be listed in ProjectionExpression"
+                    .to_string(),
+            )
+        }),
+        // "If you use the ProjectionExpression parameter, then the value for Select can
+        // only be SPECIFIC_ATTRIBUTES. Any other value for Select will return an error."
+        Some(other) if requested.is_some() => Err(crate::state::RequestError::Validation(format!(
+            "One or more parameter values were invalid: Select type {other} is not supported \
+             when the attributes to return are listed; the only Select type that is, is \
+             SPECIFIC_ATTRIBUTES"
+        ))),
+        Some("ALL_ATTRIBUTES") => Ok(Selection::AllAttributes),
+        Some("COUNT") => Ok(Selection::Count),
+        Some("ALL_PROJECTED_ATTRIBUTES") if on_index => Ok(Selection::AllProjected),
+        Some(other) => Err(crate::state::RequestError::Validation(format!(
+            "One or more parameter values were invalid: Select type {other} is allowed only \
+             when an index is scanned"
+        ))),
+    }
+}
+
+/// Whether a read needs an attribute its index does not project, which is what sends it
+/// on to the parent table.
+///
+/// What it needs is what it REPORTS plus what its FILTER reads: a filter is judged
+/// against the item, so an attribute only the filter names is still read even though no
+/// response carries it.
+fn needs_unprojected(
+    index: &crate::state::SecondaryIndex<'_>,
+    table_key_schema: &[KeySchemaElement],
+    selection: &Selection,
+    filter: &Filter<'_>,
+) -> bool {
+    if index.projects_all() {
+        return false;
+    }
+    if matches!(selection, Selection::AllAttributes) {
+        return true;
+    }
+    let mut needed = filter.attributes();
+    if let Selection::Specific(names) = selection {
+        needed.extend(names.iter().cloned());
+    }
+    needed
+        .iter()
+        .any(|name| !index.projects(table_key_schema, name))
+}
+
+/// The attributes the request's PROJECTION names, or `None` when it names none at all —
+/// in which case "all attributes will be returned" (`Scan$ProjectionExpression`).
+///
+/// The two members are the same ask one generation apart: `AttributesToGet` is "a legacy
+/// parameter. Use ProjectionExpression instead" (that member's doc), so a request that
+/// states the projection both ways is refused the way the service refuses a request that
+/// states one thing twice, and either member is read into the one name set the reader
+/// projects by.
+fn requested_attributes(
+    input: &ScanInput,
+) -> Result<Option<::std::collections::BTreeSet<String>>, ScanError> {
+    let legacy = input
+        .attributes_to_get
+        .as_deref()
+        .filter(|names| !names.is_empty());
+    match (input.projection_expression.as_deref(), legacy) {
+        (Some(_), Some(_)) => Err(lift(crate::state::expression_conflict(
+            "AttributesToGet",
+            "ProjectionExpression",
+        ))),
+        (Some(expression), None) => crate::state::projection_expression_attributes(
+            "ProjectionExpression",
+            expression,
+            crate::state::Substitutions::new(input.expression_attribute_names.as_ref(), None),
+        )
+        .map_err(lift)?
+        .map(Some)
+        // The shared reader answers no name list for a path that reaches INSIDE an
+        // attribute, which this reader does not serve yet and says so rather than
+        // refusing a request the real service accepts.
+        .ok_or_else(|| {
+            crate::scaffolded::Scaffolded::not_implemented(
+                "Scan with a ProjectionExpression path into an attribute",
+            )
+        }),
+        (None, Some(names)) => Ok(Some(names.iter().cloned().collect())),
+        (None, None) => Ok(None),
+    }
+}
+
+/// Which of the items a `Scan` page read it answers with: "a filter expression is
+/// applied after a Scan finishes but before the results are returned"
+/// (`Scan$FilterExpression`), stated either in the expression language or through the
+/// legacy map that language replaced.
+#[derive(Debug)]
+enum Filter<'a> {
+    /// No filter at all: every item the page evaluated is answered, so "Count is the
+    /// same as ScannedCount".
+    Unfiltered,
+    /// A `FilterExpression`: the `ConditionExpression` language — one grammar, parsed by
+    /// the one parser this crate has for it — judged against each item the scan read
+    /// rather than against a key.
+    Expression(crate::state::ParsedCondition),
+    /// The legacy `ScanFilter` map, its entries combined by `ConditionalOperator`.
+    Legacy {
+        conditions: &'a ::std::collections::HashMap<String, Condition>,
+        conditional_operator: Option<&'a str>,
+    },
+}
+
+impl<'a> Filter<'a> {
+    /// The filter this request states, refusing a request that states it twice or states
+    /// a comparison the service does not serve — both facts of the request, so both are
+    /// settled before anything is read.
+    fn resolve(input: &'a ScanInput) -> Result<Self, crate::state::RequestError> {
+        let legacy = input.scan_filter.as_ref().filter(|map| !map.is_empty());
+        let conditional_operator = input.conditional_operator.as_deref();
+        match (input.filter_expression.as_deref(), legacy) {
+            // A request may not state its filter twice: the legacy `ScanFilter` and
+            // `ConditionalOperator` are what `FilterExpression` replaces ("This is a
+            // legacy parameter. Use FilterExpression instead").
+            (Some(_), Some(_)) => Err(crate::state::expression_conflict(
+                "ScanFilter",
+                "FilterExpression",
+            )),
+            (Some(expression), None) => {
+                if conditional_operator.is_some() {
+                    return Err(crate::state::expression_conflict(
+                        "ConditionalOperator",
+                        "FilterExpression",
+                    ));
+                }
+                Ok(Self::Expression(crate::state::ParsedCondition::parse(
+                    "FilterExpression",
+                    expression,
+                    crate::state::Substitutions::new(
+                        input.expression_attribute_names.as_ref(),
+                        input.expression_attribute_values.as_ref(),
+                    ),
+                )?))
+            }
+            (None, Some(conditions)) => {
+                // How many entries the map states, whether each names a comparison this
+                // service serves with the operands it takes, and whether the operator
+                // combining them is one the model declares, are all facts of the
+                // request: settled once here rather than per item, so the work the
+                // filter does per row is bounded by this service's own constants.
+                crate::state::check_legacy_conditions(conditions, conditional_operator)?;
+                Ok(Self::Legacy {
+                    conditions,
+                    conditional_operator,
+                })
+            }
+            (None, None) => {
+                if conditional_operator.is_some() {
+                    return Err(crate::state::RequestError::Validation(
+                        "ConditionalOperator can only be used together with ScanFilter"
+                            .to_string(),
+                    ));
+                }
+                Ok(Self::Unfiltered)
+            }
+        }
+    }
+
+    /// Whether this filter answers the attributes one read saw.
+    fn matches(&self, seen: &crate::state::Item) -> Result<bool, crate::state::RequestError> {
+        match self {
+            Self::Unfiltered => Ok(true),
+            Self::Expression(condition) => condition.evaluate(Some(seen)),
+            Self::Legacy {
+                conditions,
+                conditional_operator,
+            } => crate::state::legacy_conditions_match(conditions, *conditional_operator, seen),
+        }
+    }
+
+    /// Every top-level attribute this filter READS, which is what a read served from an
+    /// index must have in order to judge it.
+    fn attributes(&self) -> ::std::collections::BTreeSet<String> {
+        match self {
+            Self::Unfiltered => ::std::collections::BTreeSet::new(),
+            Self::Expression(condition) => condition.attribute_reads().into_keys().collect(),
+            Self::Legacy { conditions, .. } => conditions.keys().cloned().collect(),
+        }
     }
 }
 
@@ -562,50 +942,29 @@ fn lift(error: crate::state::RequestError) -> ScanError {
     }
 }
 
-/// The first input member present that this slice does not serve, if any. The same
-/// members `Query` declines, for the same reason: each is its own gap issue.
-fn unsupported_member(input: &ScanInput) -> Option<&'static str> {
-    if input.index_name.is_some() {
-        return Some("IndexName");
-    }
-    if input.scan_filter.as_ref().is_some_and(|map| !map.is_empty()) {
-        return Some("ScanFilter");
-    }
-    if input.conditional_operator.is_some() {
-        return Some("ConditionalOperator");
-    }
-    if input.projection_expression.is_some() {
-        return Some("ProjectionExpression");
-    }
-    if input
-        .attributes_to_get
-        .as_ref()
-        .is_some_and(|names| !names.is_empty())
-    {
-        return Some("AttributesToGet");
-    }
-    None
-}
-
 /// The substitution map this request carries with no expression to substitute into:
 /// `ExpressionAttributeNames` holds "substitution tokens for attribute names in an
 /// expression" and `ExpressionAttributeValues` "values that can be substituted in an
 /// expression" (those members' docs), so neither has a meaning on its own.
+///
+/// A name token is substituted into either expression member a scan carries — it is how
+/// a reserved word is projected at all — while a value token has only the filter to
+/// substitute into, since a projection names attributes and compares nothing.
 fn substitution_without_expression(input: &ScanInput) -> Option<&'static str> {
-    if input.filter_expression.is_some() {
-        return None;
-    }
-    if input
-        .expression_attribute_names
-        .as_ref()
-        .is_some_and(|names| !names.is_empty())
+    if input.filter_expression.is_none()
+        && input.projection_expression.is_none()
+        && input
+            .expression_attribute_names
+            .as_ref()
+            .is_some_and(|names| !names.is_empty())
     {
         return Some("ExpressionAttributeNames");
     }
-    if input
-        .expression_attribute_values
-        .as_ref()
-        .is_some_and(|values| !values.is_empty())
+    if input.filter_expression.is_none()
+        && input
+            .expression_attribute_values
+            .as_ref()
+            .is_some_and(|values| !values.is_empty())
     {
         return Some("ExpressionAttributeValues");
     }

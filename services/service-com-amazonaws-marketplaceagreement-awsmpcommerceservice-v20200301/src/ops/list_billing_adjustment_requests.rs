@@ -200,6 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The token resumes THIS listing: one minted for a different set of
         // filters would index into a different sequence.
         let scope = crate::state::billing_adjustment_scope(
+            Self::NAME,
             input.agreement_id.as_deref(),
             input.status.as_deref(),
             input.catalog.as_deref(),

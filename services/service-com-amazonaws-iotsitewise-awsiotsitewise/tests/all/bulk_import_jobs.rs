@@ -104,9 +104,9 @@ async fn describe(
     call(router, "GET", &job_uri(job_id, workspace), None).await
 }
 
-/// How many jobs the store holds — the only way to observe that a refused create
-/// wrote nothing, since no reader enumerates the account's jobs yet
-/// (`ListBulkImportJobs` is still a stub).
+/// How many jobs the store holds, read straight off the store so that a refused
+/// create can be shown to have written nothing without depending on the scope or
+/// the filter any reader of the API applies.
 fn jobs_held(engine: &engine::InMemoryEngine) -> usize {
     let state = service_state(engine).expect("the service store");
     let store = state.lock();
