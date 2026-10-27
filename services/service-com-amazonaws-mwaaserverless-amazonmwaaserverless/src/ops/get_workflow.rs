@@ -282,13 +282,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             } else {
                 workflow.code_snapshotted_at
             })),
-            // No operation in this slice persists a schedule, and the definition body
-            // itself is never fetched from S3, so neither is reported.
-            schedule_configuration: None,
+            // The definition this version snapshotted when it was created, and the
+            // schedule that definition declares: both come from the frozen snapshot, so
+            // a read never goes to Amazon S3 and an overwrite of the object cannot
+            // change what this version reports.
+            schedule_configuration: snapshot.schedule_configuration.clone(),
             role_arn: Some(snapshot.role_arn.clone()),
             network_configuration: snapshot.network_configuration.clone(),
             trigger_mode: snapshot.trigger_mode.clone(),
-            workflow_definition: None,
+            workflow_definition: snapshot.workflow_definition.clone(),
         })
     }
 }
