@@ -118,12 +118,15 @@ async fn call(router: &MultiServiceRouter, uri: &str, body: Value) -> Answer {
 }
 
 /// A full `ContactInformation`, valid under `PutContactInformation`'s required
-/// members.
+/// members and under the `StateOrRegion` its own documentation requires in the
+/// United States — so a row that is refused is refused for the account it
+/// targets, not for its address.
 fn contact_information() -> Value {
     json!({
         "FullName": "Ada Lovelace",
         "AddressLine1": "1 Analytical Way",
         "City": "Seattle",
+        "StateOrRegion": "WA",
         "PostalCode": "98109",
         "CountryCode": "US",
         "PhoneNumber": "+12065550100",

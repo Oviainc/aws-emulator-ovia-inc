@@ -212,6 +212,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
+        // A resource of a stack of this Region whose owning service had not reported it
+        // ready when the create answered holds that stack's operation open: those services
+        // are asked, before the store is locked, what they report now
+        // ([`crate::state::provisioning::advance_stabilisations`]).
+        crate::state::provisioning::advance_stabilisations(ctx, &state).await;
         // The resource statuses a rollback the failure of an update already made due leaves
         // behind are that rollback's own: it is carried out here, before the records are
         // read, since it was owed at the instant that update failed whether or not anybody

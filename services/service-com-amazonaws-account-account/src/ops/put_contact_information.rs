@@ -184,8 +184,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Every modelled constraint on this input — the required members of
         // `ContactInformation`, their lengths, the phone number's pattern and
-        // `AccountId`'s `^\d{12}$` — was already refused at the boundary, so what
-        // reaches here is a structure this service can store as it stands.
+        // `AccountId`'s `^\d{12}$` — was already refused at the boundary. What
+        // the model states in PROSE rather than in constraints is this service's
+        // own: which two-letter strings are country codes, and in which
+        // countries an address must carry a state or region. Both are decided
+        // before the store is touched, so a refused put writes nothing.
+        if let Err(invalid) =
+            crate::state::validated_contact_information(&input.contact_information)
+        {
+            return Err(PutContactInformationErrorModeled::ValidationException(invalid).into());
+        }
+
         // The account this call acts on. An absent `AccountId` is the standalone
         // call on the caller's own account; a PRESENT one names a member account
         // of the caller's organization, which the caller's own account is not —
