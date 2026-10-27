@@ -103,6 +103,8 @@ mod shared_es_signing_name_claim;
 mod single_package_association;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_accumulation.rs"]
+mod tag_accumulation;
 #[path = "all/upgrade_eligibility_checks.rs"]
 mod upgrade_eligibility_checks;
 #[path = "all/upgrade_history.rs"]

@@ -815,7 +815,7 @@ async fn health_checks_the_rules_rule_out_are_refused() {
                 ..VALID
             },
             400,
-            Some("ValidationException"),
+            Some("ValidationError"),
         ),
         (
             "a target naming no protocol",
@@ -824,7 +824,7 @@ async fn health_checks_the_rules_rule_out_are_refused() {
                 ..VALID
             },
             400,
-            Some("ValidationException"),
+            Some("ValidationError"),
         ),
         (
             // "For HTTP/HTTPS, you must include a ping path in the string."
@@ -834,7 +834,7 @@ async fn health_checks_the_rules_rule_out_are_refused() {
                 ..VALID
             },
             400,
-            Some("ValidationException"),
+            Some("ValidationError"),
         ),
         (
             // "The range of valid ports is one (1) through 65535."
@@ -844,7 +844,7 @@ async fn health_checks_the_rules_rule_out_are_refused() {
                 ..VALID
             },
             400,
-            Some("ValidationException"),
+            Some("ValidationError"),
         ),
     ];
 

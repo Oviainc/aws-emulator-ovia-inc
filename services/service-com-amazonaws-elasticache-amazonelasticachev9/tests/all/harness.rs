@@ -181,6 +181,58 @@ impl Emulator {
         Self { router, engine }
     }
 
+    /// The same emulator with KMS mounted BESIDE this service on the one shared
+    /// engine, the way the assembled emulator mounts them.
+    ///
+    /// That is the only way a suite about an encrypted resource reaches the real
+    /// key records `kms CreateKey` / `CreateAlias` wrote, because resolving the
+    /// `KmsKeyId` a request names is a call into KMS.
+    pub fn with_kms() -> Self {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        router.set_request_authentication(false);
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        router.register_service(
+            service_com_amazonaws_kms_trentservice::EmulatedService::new(Arc::clone(&engine)),
+        );
+        Self { router, engine }
+    }
+
+    /// Send one KMS call through the same router and answer its HTTP status and
+    /// parsed body.
+    ///
+    /// KMS is an awsJson1_1 service addressed by the `TrentService` target
+    /// prefix; the router routes on the credential scope's service field, which
+    /// is why these headers differ from the `awsQuery` ones above.
+    pub async fn kms(
+        &self,
+        operation: &str,
+        body: &serde_json::Value,
+    ) -> (u16, serde_json::Value) {
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/kms/aws4_request, \
+             SignedHeaders=host;x-amz-target, Signature=deadbeef"
+        );
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", format!("kms.{REGION}.amazonaws.com"))
+            .header("authorization", authorization)
+            .header("content-type", "application/x-amz-json-1.1")
+            .header("x-amz-target", format!("TrentService.{operation}"))
+            .body(Bytes::from(body.to_string()))
+            .expect("build the KMS request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let bytes = response.into_body();
+        let parsed = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+        };
+        (status, parsed)
+    }
+
     /// Run `edit` against this service's own store in the shared engine — the
     /// same store the handlers read and write.
     pub fn with_state<R>(

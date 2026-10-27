@@ -248,6 +248,14 @@ mod filter_matcher_budget;
 mod fleet_instances;
 #[path = "all/fpga_image_tasks_and_volume_io.rs"]
 mod fpga_image_tasks_and_volume_io;
+// What `CreateRestoreImageTask` refuses — a bucket name that reaches no bucket, read as a
+// request parameter, and the stored AMI object this emulator holds none of — and what it
+// answers ahead of that read. Declared HERE, beside the suite it took those tests from,
+// rather than at the tail, for the reason the header note gives: the tail is where every
+// concurrent ec2 landing inserts its two lines, and these two have already lost two
+// serialized squash merges there.
+#[path = "all/create_restore_image_task.rs"]
+mod create_restore_image_task;
 #[path = "all/get_password_data.rs"]
 mod get_password_data;
 // Which ONE attribute of a stored AMI `DescribeImageAttribute` reports, and what it

@@ -75,6 +75,8 @@ mod recommendation_export_objects;
 mod recommendation_summaries;
 #[path = "all/reported_defaults_and_preference_validation.rs"]
 mod reported_defaults_and_preference_validation;
+#[path = "all/shared_paging_rules.rs"]
+mod shared_paging_rules;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/timestamp_probe.rs"]

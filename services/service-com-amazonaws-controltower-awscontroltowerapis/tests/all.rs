@@ -23,6 +23,8 @@ mod control_operations;
 mod delete_landing_zone_idempotence;
 #[path = "all/disable_baseline.rs"]
 mod disable_baseline;
+#[path = "all/disable_control.rs"]
+mod disable_control;
 #[path = "all/enable_baseline_persistence.rs"]
 mod enable_baseline_persistence;
 #[path = "all/enable_baseline_validation.rs"]

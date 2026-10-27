@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteKnownHostKeys
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteKnownHostKeys`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteKnownHostKeys::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The known host keys the Lightsail browser-based SSH and RDP clients authenticate an
+//! instance by: this operation deletes the ones the service has recorded for the
+//! instance the request names, which is how a caller recovers from a host key mismatch.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +161,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteKnownHostKeys` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteKnownHostKeysErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteKnownHostKeys"))
+        // An instance is addressed by name — the store holds it under that name
+        // alone — so nothing here comes from the request metadata `ctx` carries.
+        let _ = ctx;
+
+        // `instanceName` is a modelled `@required` member carrying the modelled
+        // `ResourceName` pattern, so the centralized walk refused an absent or a
+        // malformed one before this body ran.
+        let name = input.instance_name;
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // The record is READ first: a call naming no stored instance deletes
+            // nothing and logs nothing, exactly as every other instance-scoped
+            // call in this crate refuses one.
+            let Some(instance) = store.instance_mut(&name) else {
+                return Err(not_found(&name));
+            };
+            // The entry this call logs is written against the instance's own
+            // location, for the same reason every other entry in this crate is:
+            // the log says where the resource is.
+            let location = instance.location.clone();
+            // What this operation deletes: the host keys the service holds as
+            // KNOWN for this instance — the ones its browser-based SSH and RDP
+            // clients authenticate it by. Emptying that record is what lets
+            // those clients connect after a host key mismatch, because the next
+            // access records the key the instance presents then instead of
+            // comparing it with one recorded earlier. The record belongs to the
+            // one instance the request names, so no other instance's recorded
+            // keys are touched; an instance whose record is already empty is
+            // served the same way, because what the caller asked for — no known
+            // host keys for it — holds after the call either way.
+            instance.known_host_keys.clear();
+            // Those keys are gone as this call returns, and nothing about them
+            // is left for the clock to settle, so the entry is answered
+            // terminal — as every other immediate change in this crate logs a
+            // terminal entry.
+            //
+            // `operations` is a list because other Lightsail calls act on
+            // several resources at once; this one acts on exactly one instance,
+            // so it answers exactly one entry.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_DELETE_KNOWN_HOST_KEYS,
+                crate::state::RESOURCE_TYPE_INSTANCE,
+                &name,
+                &location,
+                None,
+            );
+            Ok(DeleteKnownHostKeysOutput {
+                operations: Some(vec![operation.view()]),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// No instance of that name is stored, so there is no recorded host key to
+/// delete: Lightsail's `DoesNotExist` rejection — HTTP 400, wire error
+/// `NotFoundException`, body `code` `DoesNotExist` and a message naming the
+/// resource type and the requested name.
+fn not_found(name: &str) -> DeleteKnownHostKeysError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(
+        crate::state::RESOURCE_TYPE_INSTANCE,
+        name,
+    )
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> DeleteKnownHostKeysError {
+    DeleteKnownHostKeysErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail instance store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

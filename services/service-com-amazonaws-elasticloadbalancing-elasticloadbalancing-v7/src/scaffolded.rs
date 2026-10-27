@@ -40,6 +40,13 @@
 //! place it can return an error its own model does not declare — `validation` above,
 //! for a service whose model carries no client-input error. Delete the wrapper and the
 //! handler has no way to refuse a bad request at all.
+//!
+//! This service's model carries no client-input error at all, and the code Elastic Load
+//! Balancing answers a request whose VALUES it cannot accept with is `ValidationError` —
+//! the same code the framework renders on the query protocols for a value outside a
+//! MODELLED bound. So beside `validation` there is [`Scaffolded::validation_error`], which
+//! answers under that code; reach for it rather than inventing a second code for one
+//! logical failure.
 
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
@@ -177,6 +184,41 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The `message` member of the synthetic `ValidationError` error shape.
+static VALIDATION_ERROR_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#ValidationError$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for the synthetic `ValidationError` error shape.
+///
+/// In the `smithy.framework` namespace for the same reason as `NotImplemented`: the shape
+/// is not in any service's model, so it must not collide with a modeled one. It exists
+/// because `ValidationError` — not the synthetic `ValidationException` above — is the
+/// error code Elastic Load Balancing answers a request whose VALUES it cannot accept
+/// with, for a rule its model documents in prose but declares no error shape for, and the
+/// error code is what a client branches on. The framework's own boundary validator already
+/// names that code for a value outside a modelled bound (`ProtocolError::Invalid` -> `400
+/// ValidationError` on the query protocols), so a handler enforcing a rule the model
+/// cannot express names the SAME code — otherwise one logical failure answers under two
+/// codes.
+pub static VALIDATION_ERROR_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#ValidationError",
+        "smithy.framework",
+        "ValidationError",
+    ),
+    ShapeType::Structure,
+    &[&VALIDATION_ERROR_MESSAGE],
+);
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -196,6 +238,11 @@ pub enum Scaffolded<E> {
     /// `MalformedQueryString` rather than `ValidationException`, so a client
     /// matching on the error code there sees two codes for one logical failure.
     ValidationException(ValidationException),
+    /// The request was refused as invalid, with HTTP 400 and the error code
+    /// `ValidationError` — the code THIS service answers an input it cannot accept with,
+    /// and the one its clients branch on. The payload is the same single `message`
+    /// member; only the wire code differs from [`Scaffolded::ValidationException`].
+    ValidationError(ValidationException),
 }
 
 impl<E> Scaffolded<E> {
@@ -221,6 +268,19 @@ impl<E> Scaffolded<E> {
     pub fn validation(message: impl Into<String>) -> Self {
         Self::ValidationException(ValidationException::new(message))
     }
+
+    /// Refuse the request as invalid with HTTP 400 `ValidationError`.
+    ///
+    /// This is the refusal Elastic Load Balancing itself answers a request whose values it
+    /// cannot accept with: a rule its model states in the documentation of a member rather
+    /// than as an error shape — a health-check timeout that is not below the interval, a
+    /// target that is not a protocol/port pair, a list past a bound. The model declares no
+    /// error for any of it, so the code lives here rather than on an operation's error
+    /// enum; say what was wrong and name the member and the rule, because the caller has to
+    /// fix the request from this text alone.
+    pub fn validation_error(message: impl Into<String>) -> Self {
+        Self::ValidationError(ValidationException::new(message))
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -229,6 +289,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
+            Self::ValidationError(e) => write!(f, "{e}"),
         }
     }
 }
@@ -241,6 +302,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
             Self::ValidationException(e) => e.source(),
+            Self::ValidationError(e) => e.source(),
         }
     }
 }
@@ -255,6 +317,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
             Self::ValidationException(e) => e,
+            Self::ValidationError(e) => e,
         }
     }
 
@@ -263,6 +326,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
+            Self::ValidationError(_) => &VALIDATION_ERROR_SCHEMA,
         }
     }
 
@@ -275,6 +339,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
             Self::ValidationException(_) => "ValidationException",
+            Self::ValidationError(_) => "ValidationError",
         }
     }
 
@@ -287,6 +352,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
             Self::ValidationException(_) => 400,
+            Self::ValidationError(_) => 400,
         }
     }
 
@@ -299,6 +365,10 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.query_error_code(),
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
+            // Same reason again: the `<Code>ValidationError</Code>` the envelope renders
+            // comes from `shape_name` above, which is already the code this refusal
+            // answers under.
+            Self::ValidationError(_) => None,
         }
     }
 }

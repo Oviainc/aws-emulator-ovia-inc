@@ -153,7 +153,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Bound the batch before reading it, so the work below is bounded by a constant
         // rather than by the caller.
         if instances.len() > crate::state::MAX_INSTANCES_PER_REQUEST {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
                 "Instances must carry at most {} instances; got {}",
                 crate::state::MAX_INSTANCES_PER_REQUEST,
                 instances.len()
