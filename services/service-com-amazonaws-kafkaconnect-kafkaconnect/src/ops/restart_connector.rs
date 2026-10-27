@@ -219,32 +219,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let connector_arn = connector.arn.clone();
         let connector_name = connector.name.clone();
 
-        // The operations stored against one connector are metered, so a
-        // connector restarted without end does not grow this store without end.
-        if state.connector_operation_quota_reached(&connector_arn) {
-            return Err(RestartConnectorErrorModeled::TooManyRequestsException(
-                TooManyRequestsException {
-                    message: Some(format!(
-                        "Limit exceeded. Resource limit reached: this connector already holds {} operations.",
-                        crate::state::RESOURCE_QUOTA
-                    )),
-                },
-            )
-            .into());
-        }
-
-        let id = state.mint_resource_id("connector-operation", &connector_name);
-        // The operation's ARN is derived from the connector's, so it names the
-        // same partition, region and account the connector itself lives in. The
-        // fallback covers only a connector ARN of a shape this service did not
-        // mint, which keeps the handler total without a panic.
-        let arn = crate::state::connector_operation_arn(&connector_arn, &id).unwrap_or_else(|| {
-            ::engine::emulator_arn(
-                crate::state::ARN_SERVICE,
-                &region,
-                &format!("connector-operation/{connector_name}/{id}"),
-            )
-        });
+        // The ONE rule both handlers that start a connector operation run: the
+        // per-connector operation meter, and the ARN the new operation is
+        // reported under. Only the modelled variant the refusal is answered
+        // with is this operation's own.
+        let arn = match state.start_connector_operation(&connector_arn, &connector_name, &region) {
+            Ok(arn) => arn,
+            Err(message) => {
+                return Err(RestartConnectorErrorModeled::TooManyRequestsException(
+                    TooManyRequestsException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+        };
 
         let operation = crate::state::ConnectorOperationRecord::restart(
             arn.clone(),
