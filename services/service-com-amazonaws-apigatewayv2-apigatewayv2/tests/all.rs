@@ -135,6 +135,8 @@ mod route_update;
 mod route_validation;
 #[path = "all/routing_rule_lifecycle.rs"]
 mod routing_rule_lifecycle;
+#[path = "all/routing_rule_read_back.rs"]
+mod routing_rule_read_back;
 #[path = "all/routing_rule_update.rs"]
 mod routing_rule_update;
 #[path = "all/server_applied_defaults.rs"]

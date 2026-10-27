@@ -176,12 +176,17 @@ fn alternate_contact_with(member: &str, value: &str) -> Value {
 
 /// A `PutContactInformation` body with every member valid except
 /// `ContactInformation.PhoneNumber`.
+///
+/// `StateOrRegion` is present because that member's own documentation requires
+/// it in the United States, so the only thing a row leaves invalid is the member
+/// it is about.
 fn contact_information(phone: &str) -> Value {
     json!({
         "ContactInformation": {
             "FullName": "Ada Lovelace",
             "AddressLine1": "410 Terry Ave N",
             "City": "Seattle",
+            "StateOrRegion": "WA",
             "PostalCode": "98109",
             "CountryCode": "US",
             "PhoneNumber": phone,
