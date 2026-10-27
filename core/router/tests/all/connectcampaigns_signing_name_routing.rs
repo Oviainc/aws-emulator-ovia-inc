@@ -22,11 +22,18 @@
 //! operation is implemented, or with its own scaffold `NotImplemented` when it is still
 //! a stub — and a path neither version models is refused only because nobody claims it.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use bytes::Bytes;
 use serde_json::Value;
+use service_com_amazonaws_connect_amazonconnectservice::state as connect_state;
 use smithy_server_runtime::MultiServiceRouter;
+
+/// The Connect instance the V2 rows name. V2 onboarding configures an EXISTING Amazon
+/// Connect instance, so the account has to hold one under this id.
+const V2_INSTANCE: &str = "instance-1";
 
 /// A SigV4 `Authorization` header whose credential scope names the signing name both
 /// API versions share. The signature is never checked: the router here runs with
@@ -76,7 +83,42 @@ fn build_router() -> MultiServiceRouter {
             Arc::clone(&engine),
         ),
     );
+    register_connect_instance(&engine, V2_INSTANCE);
     router
+}
+
+/// Give the account the Connect instance the V2 rows name, in Amazon Connect's own
+/// instance registry inside the shared engine — the registry V2
+/// `StartInstanceOnboardingJob` resolves a `connectInstanceId` against.
+///
+/// Written into Connect's store rather than created over `CreateInstance`, because that
+/// call mints the id it stores while these route rows name a fixed one; it is the
+/// record that call writes, already past its clock-owed activation instant.
+fn register_connect_instance(engine: &engine::InMemoryEngine, instance: &str) {
+    let state = connect_state::service_state(engine)
+        .expect("the shared in-memory engine carries Amazon Connect's store");
+    let now = SystemTime::now();
+    state.lock().instances.insert(
+        instance.to_string(),
+        connect_state::InstanceRecord {
+            id: instance.to_string(),
+            arn: connect_state::instance_arn("us-east-1", instance),
+            region: "us-east-1".to_string(),
+            identity_management_type: "CONNECT_MANAGED".to_string(),
+            instance_alias: Some(instance.to_string()),
+            directory_id: None,
+            inbound_calls_enabled: true,
+            outbound_calls_enabled: true,
+            service_role: connect_state::instance_service_role(instance),
+            instance_access_url: connect_state::instance_access_url(Some(instance), instance),
+            created_time: now,
+            active_at: now,
+            tags: BTreeMap::new(),
+            queues: BTreeMap::new(),
+            contact_flows: BTreeMap::new(),
+            hours_of_operations: BTreeMap::new(),
+        },
+    );
 }
 
 /// Onboard the Connect instance the V2 create bodies name, and wait out the span the
