@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDatasets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDatasets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDatasets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: the handler below enumerates the datasets this service's store
+//! holds, keeps the ones the request's filters select, cuts one page out of a
+//! stable order and reports each selected dataset from its stored record — so a
+//! listed dataset and the same dataset read through `DescribeDataset` never
+//! disagree, and the listing moves no dataset on.
 //!
 //! ## Shape of an operation
 //!
@@ -159,20 +156,169 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDatasets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDatasetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDatasets"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| internal_failure("the IoT SiteWise store is unavailable".to_string()))?;
+        let now = ::std::time::SystemTime::now();
+
+        // A read: every member reported below is read off the stored dataset or
+        // DERIVED from the instant a transition it owes falls due, so this listing
+        // moves no dataset on and two readers of one dataset cannot disagree.
+        let store = state.lock();
+
+        // `workspaceName` names the workspace whose datasets the request wants, and
+        // it is the ONLY resource a `ListDatasets` request names — so a workspace
+        // this service holds no record of is the modelled not-found refusal rather
+        // than an empty page, which would report absence as success. "Holds" is
+        // decided by the STORE: a dataset stored under a workspace is such a record,
+        // because the dataset writes key a dataset by its own id without consulting
+        // the workspace registry, so refusing on the registry alone would hide
+        // datasets this service really holds. Resolved BEFORE the page is cut, so a
+        // request that is wrong in both ways reports the resource that is absent.
+        if let Some(workspace) = input.workspace_name.as_deref() {
+            let holds_workspace = store.workspaces.contains_key(workspace)
+                || store
+                    .datasets
+                    .values()
+                    .any(|record| record.workspace_name.as_deref() == Some(workspace));
+            if !holds_workspace {
+                return Err(not_found(crate::state::not_found_message(
+                    crate::state::RESOURCE_WORKSPACE,
+                    workspace,
+                )));
+            }
+        }
+
+        // The filters, each one a member of this request: `sourceType` is required,
+        // so a listing always reports datasets of ONE data-source type, and
+        // `datasetType` and `workspaceName` narrow it further when present. A
+        // dataset created without a `datasetType`, or outside any workspace, is
+        // therefore selected only by a request that filters on neither.
+        let mut matching: Vec<&crate::state::DatasetRecord> = store
+            .datasets
+            .values()
+            .filter(|record| record.source.source_type == input.source_type)
+            .filter(|record| {
+                input
+                    .dataset_type
+                    .as_deref()
+                    .is_none_or(|wanted| record.dataset_type.as_deref() == Some(wanted))
+            })
+            .filter(|record| {
+                input
+                    .workspace_name
+                    .as_deref()
+                    .is_none_or(|wanted| record.workspace_name.as_deref() == Some(wanted))
+            })
+            .collect();
+
+        // A stable total order is what makes `nextToken` resumable: oldest first,
+        // ties broken by id so two datasets created in the same instant still order
+        // deterministically.
+        matching.sort_by(|left, right| {
+            left.creation_date
+                .cmp(&right.creation_date)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        // `nextToken` is this enumeration's resume point: the id of the first dataset
+        // of the next page, hex-encoded so the token matches the modelled
+        // `^[A-Za-z0-9+/=]+$`. A token whose resume point is not in this enumeration
+        // is refused rather than answered with an empty page.
+        let start = match input.next_token.as_deref() {
+            Some(token) => {
+                let resume = decode_token(token)?;
+                matching
+                    .iter()
+                    .position(|record| record.id == resume)
+                    .ok_or_else(invalid_token)?
+            }
+            None => 0,
+        };
+        // `maxResults` carries the modelled range 1..250, which the runtime validates
+        // BEFORE this handler runs, so a value that arrives here is already in range
+        // and nothing is being coerced; `max(1)` only keeps the slice arithmetic
+        // below total.
+        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
+        let end = start.saturating_add(max_results).min(matching.len());
+
+        // "The token for the next set of results, or null if there are no additional
+        // results": issued only when a dataset follows this page.
+        let next_token = matching
+            .get(end)
+            .map(|record| ::hex::encode(record.id.as_bytes()));
+
+        Ok(ListDatasetsOutput {
+            dataset_summaries: matching[start..end]
+                .iter()
+                .map(|record| summary(record, now))
+                .collect(),
+            next_token,
+            // The workspace this listing was scoped to, for a request that named
+            // one; a listing that was not scoped to a workspace reports none.
+            workspace_name: input.workspace_name.clone(),
+        })
     }
+}
+
+/// The page size this crate's list handlers serve when the caller gives no
+/// `maxResults`. The model states only `maxResults`'s `@range 1..250` and no
+/// default, so this is the crate-wide convention every sibling list handler
+/// already uses (`list_assets.rs`, `list_pipelines.rs`, `list_portals.rs`, ...),
+/// kept here so two listings of this service do not page differently.
+const DEFAULT_MAX_RESULTS: i32 = 50;
+
+/// One stored dataset as the summary this operation reports, read straight off the
+/// record `CreateDataset` persisted and `UpdateDataset` rewrites — so a listed
+/// dataset and a described one never disagree.
+fn summary(record: &crate::state::DatasetRecord, now: ::std::time::SystemTime) -> DatasetSummary {
+    DatasetSummary {
+        id: record.id.clone(),
+        arn: record.arn.clone(),
+        name: record.name.clone(),
+        // The model makes this member required while every member that writes it is
+        // optional, so a dataset nobody described reports the empty string rather
+        // than a description it was never given — the same way `DescribeDataset`
+        // reports it.
+        description: record.description.clone().unwrap_or_default(),
+        // `DatasetSource` requires its own `sourceType`, so every stored dataset has
+        // one and the summary reports the dataset's own rather than the request's
+        // filter.
+        source_type: Some(record.source.source_type.clone()),
+        dataset_type: record.dataset_type.clone(),
+        creation_date: crate::state::to_date_time(record.creation_date),
+        last_update_date: crate::state::to_date_time(record.last_update_date),
+        status: record.status(now),
+        // Nothing in this emulator enriches a dataset, so no enrichment status is
+        // reported; `DescribeDataset` answers the same way.
+        enrichment_status: None,
+    }
+}
+
+/// Decode a `nextToken` back into the dataset id it resumes from.
+fn decode_token(token: &str) -> Result<String, ListDatasetsError> {
+    ::hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(invalid_token)
+}
+
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued.
+fn invalid_token() -> ListDatasetsError {
+    ListDatasetsErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: "The nextToken is not a token this operation issued.".to_string(),
+    })
+    .into()
+}
+
+/// HTTP 404 `ResourceNotFoundException` carrying `message`.
+fn not_found(message: String) -> ListDatasetsError {
+    ListDatasetsErrorModeled::ResourceNotFoundException(ResourceNotFoundException { message })
+        .into()
+}
+
+/// HTTP 500 `InternalFailureException` carrying `message`.
+fn internal_failure(message: String) -> ListDatasetsError {
+    ListDatasetsErrorModeled::InternalFailureException(InternalFailureException { message }).into()
 }
