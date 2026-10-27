@@ -322,11 +322,11 @@ pub(crate) use multiplexes::{multiplex_description_output, multiplex_program_des
 pub mod nodes;
 
 pub use nodes::{
-    card_number_out_of_range_message, node_state, too_many_interface_mappings_message,
-    too_many_sdi_source_mappings_message, NodeChanges, NodeRecord, NodeRefusal, NodeStateRefusal,
-    NodeUpdateRefusal, FIRST_SDI_CARD_NUMBER, MAX_NODES, MAX_NODE_INTERFACE_MAPPINGS,
-    MAX_NODE_SDI_SOURCE_MAPPINGS, MAX_NODE_TOKENS, NODE_CONNECTION_STATE,
-    SDI_SOURCE_MAPPING_MEMBERS_MESSAGE,
+    card_number_out_of_range_message, node_not_idle_message, node_state,
+    too_many_interface_mappings_message, too_many_sdi_source_mappings_message, NodeChanges,
+    NodeDeleteRefusal, NodeRecord, NodeRefusal, NodeStateRefusal, NodeUpdateRefusal,
+    FIRST_SDI_CARD_NUMBER, MAX_NODES, MAX_NODE_INTERFACE_MAPPINGS, MAX_NODE_SDI_SOURCE_MAPPINGS,
+    MAX_NODE_TOKENS, NODE_CONNECTION_STATE, SDI_SOURCE_MAPPING_MEMBERS_MESSAGE,
 };
 
 pub(crate) use nodes::node_description_output;
@@ -1430,6 +1430,28 @@ impl ChannelRecord {
         self.is_idle()
             || self.state == channel_state::CREATE_FAILED
             || self.state == channel_state::UPDATE_FAILED
+    }
+
+    /// Whether this channel's pipelines are UP on the hardware it is placed on:
+    /// a start has been accepted for it and a stop has not finished, so it is
+    /// coming up (`STARTING`), up (`RUNNING`), bringing a pipeline back up
+    /// (`RECOVERING`) or coming down (`STOPPING`).
+    ///
+    /// The notion "this channel is running work" — what makes the MediaLive
+    /// Anywhere resource it runs on busy rather than idle
+    /// ([`ComAmazonawsMedialiveMedialiveState::channels_running_on_node`]). A
+    /// channel that is being created, having its configuration applied, waiting
+    /// `IDLE` or on its way out of the account runs nothing: `PipelineDetail`
+    /// is "Runtime details of a pipeline when a channel is running", and those
+    /// are exactly the states [`Self::healthy_pipelines`] reports none for.
+    pub fn is_on_air(&self) -> bool {
+        matches!(
+            self.state.as_str(),
+            channel_state::STARTING
+                | channel_state::RUNNING
+                | channel_state::RECOVERING
+                | channel_state::STOPPING
+        )
     }
 
     /// Whether this channel is in a state `DeleteChannel` accepts: a channel is
