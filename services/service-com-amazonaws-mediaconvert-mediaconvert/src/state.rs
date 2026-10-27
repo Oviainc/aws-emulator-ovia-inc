@@ -577,14 +577,19 @@ pub fn blank_member_message(member: &str) -> String {
     format!("{member} must not be empty.")
 }
 
-/// How this service words a `NotFoundException`: it names the REQUEST MEMBER that
-/// pointed at the resource, not the value the caller supplied.
+/// How this service words a reference that resolves to nothing: it names the REQUEST
+/// MEMBER that pointed at the resource, not the value the caller supplied.
 ///
 /// MediaConvert answers a lookup that resolves nothing with "The resource you specified
 /// in `<member>` was not found.", where `<member>` is the input member the handler read
 /// the reference from (`name` for a queue, `id` for a job, `queue` for a job's queue) —
 /// so the wording is built from the request, exactly as the other member-naming refusals
-/// in this crate are, and never from the missing resource's own name.
+/// in this crate are. It is the message of the `NotFoundException` a request that
+/// ADDRESSES a missing resource gets, and the same sentence names the member inside the
+/// settings-graph refusal ([`SettingsProblem::PresetNotFound`]), where the dangling
+/// reference is one member of a graph the service was asked to validate rather than the
+/// resource the request addressed: one sentence for a reference that resolves to nothing,
+/// whichever modelled error carries it.
 pub fn not_found_message(member: &str) -> String {
     format!("The resource you specified in {member} was not found.")
 }
@@ -1036,20 +1041,23 @@ pub fn invalid_job_engine_version_message() -> String {
     )
 }
 
-/// What a settings graph is missing for it to describe a transcode at all.
+/// Why a settings graph does not describe a transcode this service can run.
 ///
 /// `JobSettings$Inputs` is "Use Inputs to define source file used in the transcode job",
 /// `JobSettings$OutputGroups` is "Contains one group of settings for each set of outputs",
 /// `OutputGroup$Outputs` "holds groups of encoding settings, one group of settings per
 /// output" and `Output$Preset` is "Use Preset to specify a preset for your transcoding
-/// settings. … You can specify either Preset or Container settings, but not both": a graph
-/// with no input names nothing to read, and one with no output group, a group with no
-/// output, or an output that states neither the container to write nor the preset that
-/// states it, names nothing to write. In each case there is no transcode for the service to
-/// run. MediaConvert validates the settings graph when it is handed one — the error
-/// envelope's `settingsValidationErrorsJsonBlob` member exists to report exactly that — and
-/// refuses such a request with `BadRequestException` (400) rather than storing it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// settings. Provide the system or custom preset name. You can specify either Preset or
+/// Container settings, but not both": a graph with no input names nothing to read, and one
+/// with no output group, a group with no output, or an output that states neither the
+/// container to write nor the preset that states it, names nothing to write. An output that
+/// states BOTH states it twice, which the member forbids, and one that names a preset the
+/// account does not hold names settings nothing can supply — so neither describes a
+/// transcode either. In each case there is nothing for the service to run. MediaConvert
+/// validates the settings graph when it is handed one — the error envelope's
+/// `settingsValidationErrorsJsonBlob` member exists to report exactly that — and refuses
+/// such a request with `BadRequestException` (400) rather than storing it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SettingsProblem {
     /// Nothing supplies an input, so the graph names no source.
     NoInputs,
@@ -1067,6 +1075,24 @@ pub enum SettingsProblem {
         group: usize,
         /// The output's index in that group's `Outputs`.
         output: usize,
+    },
+    /// The output at this position states what it is written as TWICE: it names a preset
+    /// and carries container settings of its own, which `Output$Preset` forbids.
+    BothPresetAndContainer {
+        /// The group's index in `OutputGroups`, as the request stated it.
+        group: usize,
+        /// The output's index in that group's `Outputs`.
+        output: usize,
+    },
+    /// The output at this position names a preset this account does not hold, so nothing
+    /// supplies its encoding settings.
+    PresetNotFound {
+        /// The group's index in `OutputGroups`, as the request stated it.
+        group: usize,
+        /// The output's index in that group's `Outputs`.
+        output: usize,
+        /// The preset name the output stated, as the request sent it.
+        preset: String,
     },
 }
 
@@ -1097,49 +1123,109 @@ impl SettingsProblem {
                  it is written in, either in its own container settings or through the preset \
                  it names."
             ),
+            Self::BothPresetAndContainer { group, output } => format!(
+                "Your settings specify both Preset and ContainerSettings.Container for \
+                 OutputGroups[{group}].Outputs[{output}]: you can specify either Preset or \
+                 Container settings, but not both."
+            ),
+            Self::PresetNotFound {
+                group,
+                output,
+                preset,
+            } => format!(
+                "{} Provide the system or custom preset name: this account holds no preset \
+                 named {preset}.",
+                not_found_message(&format!(
+                    "OutputGroups[{group}].Outputs[{output}].Preset"
+                ))
+            ),
         }
     }
 }
 
-/// What is missing from a list of output groups for it to describe at least one output, or
-/// `None` when it does.
-///
-/// The ONE walk over `OutputGroups[].Outputs[]` in this module, so every operation handed a
-/// settings graph — a job at submit, a job template at create and at update — takes the
-/// same test and no two of them can disagree about what describes an output. An absent list
-/// and an empty list are the same thing: a list with no entries supplies nothing.
-pub fn output_groups_problem(groups: &[OutputGroup]) -> Option<SettingsProblem> {
-    if groups.is_empty() {
-        return Some(SettingsProblem::NoOutputGroups);
-    }
-    for (group, output_group) in groups.iter().enumerate() {
-        let outputs = output_group.outputs.as_deref().unwrap_or_default();
-        if outputs.is_empty() {
-            return Some(SettingsProblem::NoOutputs { group });
+// The walk over a settings graph's outputs. It lives on the store, beside the problem it
+// reports, because an output's `Preset` is a REFERENCE to a stored preset: deciding whether
+// an output describes something to write means resolving that reference, which only the
+// store can do.
+impl ComAmazonawsMediaconvertMediaconvertState {
+    /// Why a list of output groups does not describe at least one output this service can
+    /// produce, or `None` when it does.
+    ///
+    /// The ONE walk over `OutputGroups[].Outputs[]` in this module, so every operation
+    /// handed a settings graph — a job at submit, a job template at create and at update —
+    /// takes the same test and no two of them can disagree about what describes an output.
+    /// An absent list and an empty list are the same thing: a list with no entries supplies
+    /// nothing.
+    pub fn output_groups_problem(&self, groups: &[OutputGroup]) -> Option<SettingsProblem> {
+        if groups.is_empty() {
+            return Some(SettingsProblem::NoOutputGroups);
         }
-        if let Some(output) = outputs
-            .iter()
-            .position(|output| !output_states_a_container(output))
-        {
-            return Some(SettingsProblem::NoContainer { group, output });
+        for (group, output_group) in groups.iter().enumerate() {
+            let outputs = output_group.outputs.as_deref().unwrap_or_default();
+            if outputs.is_empty() {
+                return Some(SettingsProblem::NoOutputs { group });
+            }
+            for (output, entry) in outputs.iter().enumerate() {
+                if let Some(problem) = self.output_problem(group, output, entry) {
+                    return Some(problem);
+                }
+            }
         }
+        None
     }
-    None
+
+    /// Why ONE output does not say what this service is to write, or `None` when it does.
+    ///
+    /// `Output$Preset`: "Provide the system or custom preset name. You can specify either
+    /// Preset or Container settings, but not both" — so an output states its encoding
+    /// settings EXACTLY once, either by naming a preset or by carrying container settings
+    /// whose `Container` says what the output is ([`container_settings_name_a_container`]).
+    /// Stating both states it twice, which that member forbids; stating neither states it
+    /// not at all. A name is a reference, so the one an output does state is resolved
+    /// against the account's presets here — the built-in catalogue and whatever this account
+    /// created — exactly as every other reference a request makes is resolved against the
+    /// store that holds it, and a name the store does not hold supplies no settings however
+    /// well formed it is.
+    ///
+    /// The two halves are reported in that order: an output stating BOTH is refused for the
+    /// contradiction whether or not the preset it names resolves, because the request has
+    /// not yet said which of the two it means — resolving a reference the caller may not
+    /// have meant to make would report the wrong member. Keep that order if this is
+    /// reworked.
+    fn output_problem(
+        &self,
+        group: usize,
+        output: usize,
+        entry: &Output,
+    ) -> Option<SettingsProblem> {
+        let container = container_settings_name_a_container(entry.container_settings.as_ref());
+        let Some(preset) = named_preset(entry) else {
+            // Nothing names a preset, so the output's own container settings are the only
+            // thing that can say what it is.
+            return (!container).then_some(SettingsProblem::NoContainer { group, output });
+        };
+        if container {
+            return Some(SettingsProblem::BothPresetAndContainer { group, output });
+        }
+        (!self.presets.contains_key(preset)).then(|| SettingsProblem::PresetNotFound {
+            group,
+            output,
+            preset: preset.to_string(),
+        })
+    }
 }
 
-/// Whether an output says what it is written as.
+/// The preset an output names, or `None` when it names none.
 ///
-/// `Output$Preset`: "Provide the system or custom preset name. You can specify either
-/// Preset or Container settings, but not both" — so the container comes either from the
-/// preset the output names or from its own `ContainerSettings`, whose `Container` is the
-/// member that states it. A blank preset name names no preset, and container settings that
-/// state no container state no container.
-fn output_states_a_container(output: &Output) -> bool {
-    let preset = output
+/// `Output$Preset` is the "system or custom preset name", which is a preset's identity in
+/// this store, so it is read exactly as the caller sent it — as `GetPreset` reads it. A
+/// value made only of whitespace carries no name at all, the same reading every other
+/// optional free-text member in this module gets ([`optional_free_text`]).
+fn named_preset(output: &Output) -> Option<&str> {
+    output
         .preset
         .as_deref()
-        .is_some_and(|preset| !preset.trim().is_empty());
-    preset || container_settings_name_a_container(output.container_settings.as_ref())
+        .filter(|preset| !preset.trim().is_empty())
 }
 
 /// Whether a `ContainerSettings` names the container its output is written in.
@@ -1160,20 +1246,25 @@ fn container_settings_name_a_container(settings: Option<&ContainerSettings>) -> 
     })
 }
 
-/// What is missing from the settings a submitted job will be run from, or `None` when they
-/// describe a transcode.
-///
-/// `settings` is the EFFECTIVE graph: a job created from a job template states only what it
-/// wants to differ and inherits every member it leaves out, so the caller validates what
-/// [`merge_template_settings`] produced — the graph the job is stored with. That is why a
-/// job which carries only its inputs and takes its outputs from its template passes here
-/// just as one that spells both ends out does, and why the graph that is validated cannot
-/// differ from the graph that is stored.
-pub fn job_settings_problem(settings: &JobSettings) -> Option<SettingsProblem> {
-    if settings.inputs.as_deref().unwrap_or_default().is_empty() {
-        return Some(SettingsProblem::NoInputs);
+impl ComAmazonawsMediaconvertMediaconvertState {
+    /// Why the settings a submitted job will be run from do not describe a transcode, or
+    /// `None` when they do.
+    ///
+    /// `settings` is the EFFECTIVE graph: a job created from a job template states only what
+    /// it wants to differ and inherits every member it leaves out, so the caller validates
+    /// what [`merge_template_settings`] produced — the graph the job is stored with. That is
+    /// why a job which carries only its inputs and takes its outputs from its template
+    /// passes here just as one that spells both ends out does, and why the graph that is
+    /// validated cannot differ from the graph that is stored — including the presets its
+    /// outputs name, which are resolved against this store at SUBMIT time, so a preset that
+    /// was removed after the template was written refuses the submission rather than being
+    /// stored on a job no reader can resolve.
+    pub fn job_settings_problem(&self, settings: &JobSettings) -> Option<SettingsProblem> {
+        if settings.inputs.as_deref().unwrap_or_default().is_empty() {
+            return Some(SettingsProblem::NoInputs);
+        }
+        self.output_groups_problem(settings.output_groups.as_deref().unwrap_or_default())
     }
-    output_groups_problem(settings.output_groups.as_deref().unwrap_or_default())
 }
 
 /// How many entries `JobTemplateSettings$Inputs` can carry.
@@ -1192,9 +1283,11 @@ pub const MAX_JOB_TEMPLATE_INPUTS: usize = 1;
 /// be created from. Two members of it decide that:
 ///
 /// * `OutputGroups` is what the template supplies to every job created from it, so it takes
-///   the same test the submitted job's own graph takes ([`output_groups_problem`]): a group
-///   list with no entry, a group with no output, or an output that states no container
-///   describes nothing to write, and neither does any job that takes its outputs from it;
+///   the same test the submitted job's own graph takes
+///   ([`ComAmazonawsMediaconvertMediaconvertState::output_groups_problem`]): a group list
+///   with no entry, a group with no output, or an output that states no container — or
+///   states one twice, or names a preset the account does not hold — describes nothing to
+///   write, and neither does any job that takes its outputs from it;
 /// * `Inputs` states the cardinality: "There can only be one input in a job template."
 ///
 /// `Inputs` is otherwise the job's to state: `JobTemplateSettings$Inputs` is an
@@ -1203,11 +1296,12 @@ pub const MAX_JOB_TEMPLATE_INPUTS: usize = 1;
 ///
 /// Either way the request states a graph the service cannot save, which is the modelled
 /// `BadRequestException` (400) rather than a stored template.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobTemplateSettingsProblem {
     /// More inputs than a job template can hold, with the count the request carried.
     TooManyInputs(usize),
-    /// The graph describes no complete output, as [`output_groups_problem`] reports it.
+    /// The graph describes no complete output, as
+    /// [`ComAmazonawsMediaconvertMediaconvertState::output_groups_problem`] reports it.
     Outputs(SettingsProblem),
 }
 
@@ -1230,22 +1324,25 @@ impl JobTemplateSettingsProblem {
     }
 }
 
-/// What is wrong with the settings graph a request asks this service to SAVE in a job
-/// template, or `None` when the graph is one jobs can be created from.
-///
-/// Every door into a stored job template takes this test — creating one and updating one —
-/// so a template cannot be stored, or left, in a state no job can be built from. An absent
-/// list and an empty list are the same thing, exactly as in [`job_settings_problem`]: a
-/// list with no entries supplies nothing.
-pub fn job_template_settings_problem(
-    settings: &JobTemplateSettings,
-) -> Option<JobTemplateSettingsProblem> {
-    let inputs = settings.inputs.iter().flatten().count();
-    if inputs > MAX_JOB_TEMPLATE_INPUTS {
-        return Some(JobTemplateSettingsProblem::TooManyInputs(inputs));
+impl ComAmazonawsMediaconvertMediaconvertState {
+    /// What is wrong with the settings graph a request asks this service to SAVE in a job
+    /// template, or `None` when the graph is one jobs can be created from.
+    ///
+    /// Every door into a stored job template takes this test — creating one and updating
+    /// one — so a template cannot be stored, or left, in a state no job can be built from.
+    /// An absent list and an empty list are the same thing, exactly as in
+    /// [`Self::job_settings_problem`]: a list with no entries supplies nothing.
+    pub fn job_template_settings_problem(
+        &self,
+        settings: &JobTemplateSettings,
+    ) -> Option<JobTemplateSettingsProblem> {
+        let inputs = settings.inputs.iter().flatten().count();
+        if inputs > MAX_JOB_TEMPLATE_INPUTS {
+            return Some(JobTemplateSettingsProblem::TooManyInputs(inputs));
+        }
+        self.output_groups_problem(settings.output_groups.as_deref().unwrap_or_default())
+            .map(JobTemplateSettingsProblem::Outputs)
     }
-    output_groups_problem(settings.output_groups.as_deref().unwrap_or_default())
-        .map(JobTemplateSettingsProblem::Outputs)
 }
 
 /// Why a `PresetSettings` graph is not the encoder settings of an output.
@@ -2167,8 +2264,9 @@ const FRAMERATE_29_97: (i32, i32) = (30_000, 1_001);
 /// `JobTemplate$Settings` IS the template's "pre-made set of encoding instructions": a
 /// client lists this catalogue, picks an entry and creates a job from it, and that job
 /// inherits the entry's output group ([`merge_template_settings`]). The graph of every row
-/// therefore passes [`job_template_settings_problem`], the same test a template a caller
-/// stores has to pass.
+/// therefore passes the same test a template a caller
+/// stores has to pass
+/// ([`ComAmazonawsMediaconvertMediaconvertState::job_template_settings_problem`]).
 const SYSTEM_JOB_TEMPLATES: [SystemJobTemplate; 12] = [
     SystemJobTemplate {
         name: "System-Avc_16x9_1080p_29_97fps_8500kbps",
@@ -3659,7 +3757,10 @@ pub struct ComAmazonawsMediaconvertMediaconvertState {
     pub jobs: BTreeMap<String, JobRecord>,
     /// Presets by `Name`; "Each name must be unique within your account". Seeded with
     /// the built-in [`SYSTEM_PRESETS`]; a caller's own presets join them through
-    /// `CreatePreset`, which holds the total to [`MAX_PRESETS`].
+    /// `CreatePreset`, which holds the total to [`MAX_PRESETS`]. What an output's
+    /// `Preset` is resolved against
+    /// ([`ComAmazonawsMediaconvertMediaconvertState::output_groups_problem`]), so a
+    /// settings graph is only stored naming presets this map holds.
     pub presets: BTreeMap<String, PresetRecord>,
     /// The account's input policy, once `PutPolicy` has stored one. `None` until then
     /// and again after `DeletePolicy`, when the account carries no policy and

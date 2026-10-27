@@ -8,9 +8,11 @@
 //! carrying the deployment's id, the target's id and label, the `TargetStatus`
 //! the deployment's progress gives it and the instant that status last changed;
 //! the batch reader answers one entry per id in the order the request named
-//! them, and both refuse an id the deployment holds no target under, an id
-//! outside the form a target of that compute platform is reported under, and a
-//! deployment that has not started.
+//! them, and both refuse an id the deployment holds no target under and an id
+//! outside the form a target of that compute platform is reported under; a
+//! deployment that has not resolved its targets yet is refused by the batch
+//! reader as a whole and by the single-target reader as an id it holds no
+//! readable record under.
 //!
 //! The harness — the router, the `X-Amz-Target` request and the error-code
 //! helper — is the one `codedeploy_lifecycle` drives the rest of this service
@@ -332,8 +334,10 @@ async fn the_batch_answers_the_ids_in_the_order_the_request_named_them() {
 }
 
 /// RULE: a target carries the `TargetStatus` its deployment's own progress gives
-/// it, and a deployment that has not started has no target state to report at
-/// all — both readers refuse it with `DeploymentNotStartedException`.
+/// it, and a deployment that has not started holds no per-target record to
+/// report at all — the batch reader refuses that with
+/// `DeploymentNotStartedException`, and the single-target reader, which is keyed
+/// on the record alone, with `DeploymentTargetDoesNotExistException`.
 #[tokio::test]
 async fn a_targets_status_is_the_one_its_deployments_progress_implies() {
     // Rows span the model's `DeploymentStatus`
@@ -362,17 +366,26 @@ async fn a_targets_status_is_the_one_its_deployments_progress_implies() {
         force_status(&emulator, &deployment_id, status, *started);
 
         let Some(expected_status) = expected else {
-            for operation in ["BatchGetDeploymentTargets", "GetDeploymentTarget"] {
-                let request = if operation == "BatchGetDeploymentTargets" {
-                    json!({"deploymentId": deployment_id, "targetIds": ["host-a"]})
-                } else {
-                    json!({"deploymentId": deployment_id, "targetId": "host-a"})
-                };
-                let (code, body) = emulator.call(operation, request).await;
+            // The batch reader refuses the whole request about the deployment;
+            // the single-target reader answers the id, so it refuses the id.
+            let unreadable: &[(&str, Value, &str)] = &[
+                (
+                    "BatchGetDeploymentTargets",
+                    json!({"deploymentId": deployment_id, "targetIds": ["host-a"]}),
+                    "DeploymentNotStartedException",
+                ),
+                (
+                    "GetDeploymentTarget",
+                    json!({"deploymentId": deployment_id, "targetId": "host-a"}),
+                    "DeploymentTargetDoesNotExistException",
+                ),
+            ];
+            for (operation, request, expected_code) in unreadable {
+                let (code, body) = emulator.call(operation, request.clone()).await;
                 assert_eq!(
                     (code, error_code(&body).as_str()),
-                    (400, "DeploymentNotStartedException"),
-                    "case {status:?} on {operation}: expected the not-started refusal, got {code} \
+                    (400, *expected_code),
+                    "case {status:?} on {operation}: expected {expected_code}, got {code} \
                      {body:?}"
                 );
             }

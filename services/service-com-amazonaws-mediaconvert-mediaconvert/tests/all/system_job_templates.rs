@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_mediaconvert_mediaconvert::state::{
-    job_template_settings_problem, MAX_JOB_TEMPLATE_INPUTS, TYPE_CUSTOM, TYPE_SYSTEM,
+    MAX_JOB_TEMPLATE_INPUTS, TYPE_CUSTOM, TYPE_SYSTEM,
 };
 use service_com_amazonaws_mediaconvert_mediaconvert::{
     ComAmazonawsMediaconvertMediaconvertState, EmulatedService,
@@ -590,28 +590,36 @@ async fn a_fresh_account_serves_every_built_in_job_template() {
 #[tokio::test]
 async fn every_built_in_template_holds_a_graph_a_job_can_be_created_from() {
     let emulator = Emulator::new();
-    let records = emulator
+    let state = emulator
         .engine
-        .state::<ComAmazonawsMediaconvertMediaconvertState>()
-        .lock()
-        .job_templates
-        .values()
-        .filter(|record| record.template_type == TYPE_SYSTEM)
-        .cloned()
-        .collect::<Vec<_>>();
+        .state::<ComAmazonawsMediaconvertMediaconvertState>();
+    // The test a caller's template takes is the store's own, because an output's `Preset`
+    // is a reference the store resolves, so it is taken through the store that holds the
+    // catalogue.
+    let problems = {
+        let store = state.lock();
+        store
+            .job_templates
+            .values()
+            .filter(|record| record.template_type == TYPE_SYSTEM)
+            .map(|record| {
+                (
+                    record.name.clone(),
+                    store.job_template_settings_problem(&record.settings),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
     assert!(
-        !records.is_empty(),
+        !problems.is_empty(),
         "a fresh account must hold the service's built-in job templates"
     );
 
-    for record in &records {
+    for (name, problem) in &problems {
         assert_eq!(
-            job_template_settings_problem(&record.settings),
-            None,
-            "case {:?}: a built-in template's graph must pass the test a caller's template \
-             takes, got {:?}",
-            record.name,
-            job_template_settings_problem(&record.settings)
+            problem, &None,
+            "case {name:?}: a built-in template's graph must pass the test a caller's \
+             template takes, got {problem:?}"
         );
     }
 }

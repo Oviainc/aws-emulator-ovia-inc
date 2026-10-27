@@ -20,6 +20,11 @@
 #[path = "all/kinesisvideo_signing_name_routing.rs"]
 mod kinesisvideo_signing_name_routing;
 // Declared here, at the head, for the reason the entry above records: the appended tail and
+// the sorted `i…` span (where the other iam suites land) are both regions concurrently
+// landing suites add their line to.
+#[path = "all/iam_holds_the_principal_sts_reports.rs"]
+mod iam_holds_the_principal_sts_reports;
+// Declared beside the entry above, at the head, for the same reason: the appended tail and
 // the sorted `s…` span are both regions concurrently landing suites add their line to.
 #[path = "all/sts_does_not_disclose_an_absent_role.rs"]
 mod sts_does_not_disclose_an_absent_role;

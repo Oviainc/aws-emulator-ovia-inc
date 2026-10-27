@@ -1189,6 +1189,14 @@ impl Workspace {
     /// * an entity's component, through `ComponentRequest::componentTypeId` —
     ///   the component IS an instance of the type, so the type's definitions are
     ///   what give the component's properties their meaning;
+    /// * an entity's COMPOSITE component, through
+    ///   [`CompositeComponentRecord::component_type_id`] — a composite
+    ///   component is a component of the entity too (`GetEntity` reports it as
+    ///   one) and is an instance of the type the declaration its path resolved
+    ///   to named, so the type's definitions are equally what give its
+    ///   properties their meaning, whatever depth it sits at and whether or not
+    ///   the declaration that produced it is still on the holding component
+    ///   type;
     /// * another component type that `extendsFrom` it — the child inherits its
     ///   property definitions;
     /// * another component type that names it in its `compositeComponentTypes`
@@ -1212,6 +1220,14 @@ impl Workspace {
                         "entity {} component {}",
                         entity.entity_id, component.component_name
                     ));
+                }
+                for composite in component.composite_components.values() {
+                    if composite.component_type_id == component_type_id {
+                        references.push(format!(
+                            "entity {} compositeComponent {}",
+                            entity.entity_id, composite.component_path
+                        ));
+                    }
                 }
             }
         }

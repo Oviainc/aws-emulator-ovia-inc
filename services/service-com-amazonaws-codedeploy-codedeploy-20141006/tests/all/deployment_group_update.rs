@@ -555,16 +555,6 @@ async fn a_refused_update_answers_its_modelled_error_and_changes_nothing() {
             "DeploymentGroupAlreadyExistsException",
         ),
         (
-            "one alarm past the published maximum of ten",
-            json!({"alarmConfiguration": alarm_configuration(11)}),
-            "AlarmsLimitExceededException",
-        ),
-        (
-            "many alarms past the published maximum of ten",
-            json!({"alarmConfiguration": alarm_configuration(40)}),
-            "AlarmsLimitExceededException",
-        ),
-        (
             "an enabled alarm configuration with an empty alarm list",
             json!({"alarmConfiguration": {"enabled": true, "alarms": []}}),
             "InvalidAlarmConfigException",
@@ -837,8 +827,11 @@ async fn an_update_accepts_every_published_bound() {
     }
 }
 
-/// RULE: the alarm bound belongs to the alarm configuration, not to one
-/// operation — `CreateDeploymentGroup` enforces the same maximum of ten.
+/// RULE: the documented alarm figure is what a NEW deployment group is admitted
+/// under — `CreateDeploymentGroup` refuses a configuration past it — which is a
+/// gate on that admission and not on every write of a group's alarms; what an
+/// update of an existing group's configuration is admitted with is tabulated in
+/// [`super::deployment_group_alarm_counts`].
 #[tokio::test]
 async fn the_alarm_bound_holds_wherever_an_alarm_configuration_is_set() {
     let emulator = Emulator::new();

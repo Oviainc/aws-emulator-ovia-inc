@@ -34,8 +34,9 @@
 //!   `service::tag_bounds::violation` is the one check both handlers run.
 //! * `smithy_query(query="digest")` — the operations whose input carries a `TagMap` are
 //!   `CreateDomain` (`POST /domain`, 201) and `TagResource` (`POST /tags/{resourceArn}`,
-//!   204); `UntagResource` carries a `TagKeyList` and is still a 501 stub, so it has no
-//!   row here.
+//!   204); `UntagResource` carries a `TagKeyList` rather than a `TagMap`, so it has no row
+//!   here — the per-key half of the rule it DOES answer to has its own suite
+//!   (`tests/all/resource_tag_removal.rs`).
 //!
 //! The length sweep is EXHAUSTIVE over the lengths that can distinguish the rule (every
 //! length from 0 to two past each published bound) rather than randomly sampled: the rule

@@ -1029,7 +1029,12 @@ pub struct ServerCertificateRecord {
 /// Every map is a `BTreeMap` so enumeration order is total and stable, which is
 /// what lets a list operation hand out a resumable marker: the next page starts
 /// strictly after the key the marker names.
-#[derive(Debug, Default)]
+///
+/// `Default` is NOT derived: the account does not start out empty. It starts out holding
+/// the IAM user this emulator's own long-term credential belongs to
+/// ([`Self::default`]), which is why [`Self::empty`] — the account with nothing at all in
+/// it — is a separate constructor.
+#[derive(Debug)]
 pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// The persisted IAM users, keyed by [`name_key`] of the user name. IAM names
     /// "are not distinguished by case" (`CreateUser$UserName` documentation), so
@@ -1236,6 +1241,120 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// [`next_signing_certificate_id`](Self::next_signing_certificate_id).
     pub signing_certificate_id_seq: u64,
 }
+
+impl Default for ComAmazonawsIamAwsidentitymanagementv20100508State {
+    /// The account's IAM as it stands before any request: holding the one user this
+    /// emulator's own long-term credential belongs to, and nothing else.
+    ///
+    /// A long-term access key belongs to an IAM USER, so the principal STS reports for a
+    /// caller presenting the key the emulator publishes
+    /// ([`::service_common::caller_principal`]) is a user of this account — present from
+    /// the moment the account exists, exactly as the user behind an AWS access key is. It
+    /// is therefore a stored record and not a derived one: a caller that reads its own
+    /// identity and then manages that identity (embeds an inline policy, attaches a
+    /// managed one, tags it, reads it back) is managing the ACCOUNT's own user, which the
+    /// account's own collections have to carry for those writes to land and for a later
+    /// read to report them.
+    ///
+    /// Its access key is deliberately NOT seeded beside it: the key pair the emulator
+    /// publishes is held by the credential store, not by `iam:CreateAccessKey`, and
+    /// [`authorization`] resolves a caller's identity-based policies through
+    /// [`Self::access_keys`] — so seeding one there would start evaluating that caller
+    /// against an empty policy set instead of leaving it in the position this emulator's
+    /// published credential is in.
+    fn default() -> Self {
+        let mut account = Self::empty();
+        let caller = ambient_user();
+        account
+            .users
+            .insert(name_key(&caller.user_name), caller);
+        account
+    }
+}
+
+impl ComAmazonawsIamAwsidentitymanagementv20100508State {
+    /// An account holding NOTHING: every collection empty and every id counter at its
+    /// start.
+    ///
+    /// The base [`Self::default`] builds the account's starting records on top of. Written
+    /// out field by field rather than derived, so a field added later has to say here what
+    /// an account with nothing in it holds for it.
+    fn empty() -> Self {
+        Self {
+            users: BTreeMap::new(),
+            roles: BTreeMap::new(),
+            groups: BTreeMap::new(),
+            group_members: BTreeMap::new(),
+            user_inline_policies: BTreeMap::new(),
+            role_inline_policies: BTreeMap::new(),
+            group_inline_policies: BTreeMap::new(),
+            access_keys: BTreeMap::new(),
+            signing_certificates: BTreeMap::new(),
+            login_profiles: BTreeMap::new(),
+            service_specific_credentials: BTreeMap::new(),
+            policies: BTreeMap::new(),
+            instance_profiles: BTreeMap::new(),
+            role_attached_policies: BTreeMap::new(),
+            user_attached_policies: BTreeMap::new(),
+            group_attached_policies: BTreeMap::new(),
+            open_id_connect_providers: BTreeMap::new(),
+            saml_providers: BTreeMap::new(),
+            server_certificates: BTreeMap::new(),
+            account_alias: None,
+            account_properties: BTreeMap::new(),
+            delegation_requests: BTreeMap::new(),
+            saml_provider_uuid_seq: 0,
+            saml_private_key_id_seq: 0,
+            user_id_seq: 0,
+            role_id_seq: 0,
+            group_id_seq: 0,
+            policy_id_seq: 0,
+            instance_profile_id_seq: 0,
+            server_certificate_id_seq: 0,
+            signing_certificate_id_seq: 0,
+        }
+    }
+}
+
+/// The IAM user this emulator's own long-term credential belongs to, as the account holds
+/// it.
+///
+/// Every member is a pure function of the account contract, stated once by
+/// [`::service_common::caller_principal`] so this record and the one STS reports as the
+/// calling principal cannot differ: the name, the account-root path, the ARN of that path
+/// and name, and the `UserId` derived from that ARN. The `UserId` is NOT drawn from
+/// [`ComAmazonawsIamAwsidentitymanagementv20100508State::user_id_seq`] for that reason —
+/// the counter is what mints the id of a user a CALLER creates, and this user predates
+/// every request — and it cannot collide with one of those: the two are 17 characters
+/// drawn independently from the same 32-character alphabet.
+///
+/// Nothing in this account created the user — the key pair it holds was published before
+/// any request was served — so its `CreateDate` is the fixed instant a record the account
+/// starts out with reports ([`ACCOUNT_BOOTSTRAP_CREATE_MILLIS`]) rather than the clock at
+/// first touch, which would make the record differ between two emulators serving the same
+/// account. It carries no password (nothing here serves a console sign-in), no permissions
+/// boundary and no tags, because nothing has attached any.
+fn ambient_user() -> User {
+    User {
+        path: ::service_common::caller_principal::AMBIENT_USER_PATH.to_string(),
+        user_name: ::service_common::caller_principal::AMBIENT_USER_NAME.to_string(),
+        user_id: ::service_common::caller_principal::ambient_user_id(),
+        arn: ::service_common::caller_principal::ambient_user_arn(),
+        create_date: ::aws_smithy_types::DateTime::from_millis(ACCOUNT_BOOTSTRAP_CREATE_MILLIS),
+        password_last_used: None,
+        permissions_boundary: None,
+        tags: None,
+    }
+}
+
+/// The `CreateDate` a record the account STARTS OUT with reports: the epoch.
+///
+/// Nothing in this account created such a record, so there is no creation instant to
+/// report, and reading the clock would answer a different `CreateDate` on every fresh
+/// process. A FIXED instant keeps it stable, and the epoch is the value this repository
+/// already gives a record nothing created — the same choice
+/// [`SERVICE_PROVISIONED_ROLE_CREATE_MILLIS`] states for a service-linked role.
+const ACCOUNT_BOOTSTRAP_CREATE_MILLIS: i64 = 0;
 
 impl ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// Mint the next user's `UserId`.

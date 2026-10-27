@@ -284,7 +284,7 @@ async fn a_describe_reports_every_member_of_the_stored_record() {
 
     for (case, seeded) in cases {
         let amp = Amp::new();
-        seed_pair(&amp, &seeded, "ws-11111111-1111-1111-1111-111111111111");
+        seed_pair(&amp, region, &seeded, "ws-11111111-1111-1111-1111-111111111111");
 
         let reply = describe(&amp, region, &seeded.scraper_id).await;
         assert_reports_the_record(case, &reply, &seeded);
@@ -309,7 +309,7 @@ async fn a_describe_reports_whatever_status_the_record_is_in() {
             cloud_watch_logs("aws/prometheus/statuses"),
             components(&["COLLECTOR"]),
         );
-        seed_pair(&amp, &seeded, "ws-33333333-3333-3333-3333-333333333333");
+        seed_pair(&amp, region, &seeded, "ws-33333333-3333-3333-3333-333333333333");
 
         let reply = describe(&amp, region, scraper_id).await;
         assert_reports_the_record(status, &reply, &seeded);
@@ -329,7 +329,7 @@ async fn a_describe_changes_nothing_a_later_caller_reads() {
         cloud_watch_logs("aws/prometheus/repeatable"),
         components(&["COLLECTOR", "EXPORTER"]),
     );
-    seed_pair(&amp, &seeded, "ws-44444444-4444-4444-4444-444444444444");
+    seed_pair(&amp, region, &seeded, "ws-44444444-4444-4444-4444-444444444444");
 
     let first = describe(&amp, region, &seeded.scraper_id).await;
     assert_reports_the_record("first read", &first, &seeded);
@@ -347,6 +347,7 @@ async fn a_describe_changes_nothing_a_later_caller_reads() {
     let stored = amp
         .store()
         .lock()
+        .region(region)
         .scraper_logging
         .get(&seeded.scraper_id)
         .cloned()
@@ -378,6 +379,7 @@ async fn a_scraper_the_store_does_not_hold_is_not_found() {
     let held = "s-55555555-5555-5555-5555-555555555555";
     seed_pair(
         &amp,
+        region,
         &logging_configuration(
             held,
             SCRAPER_LOGGING_STATUS_ACTIVE,
@@ -433,6 +435,7 @@ async fn a_scraper_that_holds_no_configuration_is_not_found() {
         let scraper_id = "s-66666666-6666-6666-6666-666666666666";
         seed(
             &amp,
+            region,
             &scraper(
                 scraper_id,
                 Some("unlogged"),
@@ -472,7 +475,7 @@ async fn a_describe_reports_the_transition_the_clock_already_owed() {
         components(&["COLLECTOR"]),
     );
     deleting.transition_due = Some(SystemTime::now() + TRANSITION_DELAY);
-    seed_pair(&amp, &deleting, "ws-77777777-7777-7777-7777-777777777777");
+    seed_pair(&amp, region, &deleting, "ws-77777777-7777-7777-7777-777777777777");
 
     let pending = describe(&amp, region, deleting_id).await;
     assert_eq!(
@@ -508,9 +511,10 @@ async fn a_describe_reports_the_transition_the_clock_already_owed() {
             components(&["COLLECTOR"]),
         );
         pending.transition_due = Some(SystemTime::now());
-        seed_logging(&amp, &pending);
+        seed_logging(&amp, region, &pending);
         seed(
             &amp,
+            region,
             &scraper(
                 scraper_id,
                 Some("settling"),
@@ -530,6 +534,7 @@ async fn a_describe_reports_the_transition_the_clock_already_owed() {
         assert_eq!(
             amp.store()
                 .lock()
+                .region(region)
                 .scraper_logging
                 .get(scraper_id)
                 .and_then(|record| record.transition_due),
@@ -553,7 +558,7 @@ async fn a_describe_reports_the_deletion_a_caller_just_started() {
         cloud_watch_logs("aws/prometheus/round-trip"),
         components(&["COLLECTOR", "SERVICE_DISCOVERY"]),
     );
-    seed_pair(&amp, &seeded, "ws-99999999-9999-9999-9999-999999999999");
+    seed_pair(&amp, region, &seeded, "ws-99999999-9999-9999-9999-999999999999");
 
     let before = describe(&amp, region, scraper_id).await;
     assert_reports_the_record("before the delete", &before, &seeded);

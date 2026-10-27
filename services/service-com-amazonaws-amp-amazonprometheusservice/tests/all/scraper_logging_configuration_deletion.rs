@@ -87,11 +87,12 @@ pub(crate) fn logging_configuration(
     }
 }
 
-/// Seed one logging configuration into the store the mounted service reads — the SAME
-/// record the handler reads, not a second copy of it.
-pub(crate) fn seed_logging(amp: &Amp, record: &ScraperLoggingConfiguration) {
+/// Seed one logging configuration into the store of `region` the mounted service reads —
+/// the SAME record the handler reads, not a second copy of it.
+pub(crate) fn seed_logging(amp: &Amp, region: &str, record: &ScraperLoggingConfiguration) {
     amp.store()
         .lock()
+        .region_mut_for_create(region)
         .scraper_logging
         .insert(record.scraper_id.clone(), record.clone());
 }
@@ -113,14 +114,21 @@ async fn delete(
     amp.call("DELETE", &uri, region, "").await
 }
 
-/// The stored configuration of one scraper, or `None` once the store no longer holds it.
-fn stored(amp: &Amp, scraper_id: &str) -> Option<ScraperLoggingConfiguration> {
-    amp.store().lock().scraper_logging.get(scraper_id).cloned()
+/// The stored configuration of one scraper in `region`, or `None` once that store no
+/// longer holds it.
+fn stored(amp: &Amp, region: &str, scraper_id: &str) -> Option<ScraperLoggingConfiguration> {
+    amp.store()
+        .lock()
+        .region(region)
+        .scraper_logging
+        .get(scraper_id)
+        .cloned()
 }
 
 /// An `ACTIVE` scraper holding a logging configuration, seeded together.
 pub(crate) fn seed_pair(
     amp: &Amp,
+    region: &str,
     record: &ScraperLoggingConfiguration,
     destination_workspace: &str,
 ) -> Scraper {
@@ -131,8 +139,8 @@ pub(crate) fn seed_pair(
         eks_source("logging-cluster"),
         workspace_destination(destination_workspace),
     );
-    seed(amp, &host);
-    seed_logging(amp, record);
+    seed(amp, region, &host);
+    seed_logging(amp, region, record);
     host
 }
 
@@ -194,7 +202,7 @@ async fn deleting_a_configuration_moves_it_to_deleting_then_the_clock_removes_it
 
     for (case, seeded, client_token) in cases {
         let amp = Amp::new();
-        let host = seed_pair(&amp, &seeded, "ws-11111111-1111-1111-1111-111111111111");
+        let host = seed_pair(&amp, region, &seeded, "ws-11111111-1111-1111-1111-111111111111");
         let scraper_id = seeded.scraper_id.as_str();
 
         let reply = delete(&amp, region, scraper_id, client_token).await;
@@ -203,7 +211,7 @@ async fn deleting_a_configuration_moves_it_to_deleting_then_the_clock_removes_it
             "case {case:?}: DeleteScraperLoggingConfiguration is modelled 202, got {reply:?}"
         );
 
-        let pending = stored(&amp, scraper_id);
+        let pending = stored(&amp, region, scraper_id);
         let pending = pending.unwrap_or_else(|| {
             panic!("case {case:?}: the record must still be held while the removal is owed")
         });
@@ -234,6 +242,7 @@ async fn deleting_a_configuration_moves_it_to_deleting_then_the_clock_removes_it
         assert_eq!(
             amp.store()
                 .lock()
+                .region(region)
                 .scrapers
                 .get(scraper_id)
                 .map(|record| record.status_code.clone())
@@ -260,10 +269,10 @@ async fn deleting_a_configuration_moves_it_to_deleting_then_the_clock_removes_it
             "case {case:?}: expected the service's not-found sentence, got {repeated:?}"
         );
         assert_eq!(
-            stored(&amp, scraper_id).map(|record| record.status_code),
+            stored(&amp, region, scraper_id).map(|record| record.status_code),
             None,
             "case {case:?}: the store must no longer hold the configuration, got {:?}",
-            stored(&amp, scraper_id)
+            stored(&amp, region, scraper_id)
         );
     }
 }
@@ -284,6 +293,7 @@ async fn a_delete_is_accepted_from_every_status_and_a_replay_is_the_same_request
         let amp = Amp::new();
         seed_pair(
             &amp,
+            region,
             &logging_configuration(
                 scraper_id,
                 status,
@@ -298,16 +308,16 @@ async fn a_delete_is_accepted_from_every_status_and_a_replay_is_the_same_request
             first.status, 202,
             "case {status:?}: the delete must be accepted, got {first:?}"
         );
-        let owed = stored(&amp, scraper_id).and_then(|record| record.transition_due);
+        let owed = stored(&amp, region, scraper_id).and_then(|record| record.transition_due);
         assert!(
             owed.is_some(),
             "case {status:?}: the delete must leave a removal owed, got {owed:?}"
         );
         assert_eq!(
-            stored(&amp, scraper_id).map(|record| record.status_code),
+            stored(&amp, region, scraper_id).map(|record| record.status_code),
             Some(SCRAPER_LOGGING_STATUS_DELETING.to_string()),
             "case {status:?}: expected the status the call wrote, got {:?}",
-            stored(&amp, scraper_id).map(|record| record.status_code)
+            stored(&amp, region, scraper_id).map(|record| record.status_code)
         );
 
         for repeat_token in [Some(token), None, Some("idem-other")] {
@@ -317,7 +327,7 @@ async fn a_delete_is_accepted_from_every_status_and_a_replay_is_the_same_request
                 "case {status:?}/{repeat_token:?}: a deletion already under way must \
                  still be accepted, got {repeat:?}"
             );
-            let still_owed = stored(&amp, scraper_id).and_then(|record| record.transition_due);
+            let still_owed = stored(&amp, region, scraper_id).and_then(|record| record.transition_due);
             assert_eq!(
                 still_owed, owed,
                 "case {status:?}/{repeat_token:?}: the repeat must not move the instant \
@@ -337,6 +347,7 @@ async fn a_scraper_the_store_does_not_hold_is_not_found() {
     let held = "s-44444444-4444-4444-4444-444444444444";
     seed_pair(
         &amp,
+        region,
         &logging_configuration(
             held,
             SCRAPER_LOGGING_STATUS_ACTIVE,
@@ -388,11 +399,11 @@ async fn a_scraper_the_store_does_not_hold_is_not_found() {
     }
 
     assert_eq!(
-        stored(&amp, held).map(|record| record.status_code),
+        stored(&amp, region, held).map(|record| record.status_code),
         Some(SCRAPER_LOGGING_STATUS_ACTIVE.to_string()),
         "a delete that named another scraper must leave this configuration where it was, \
          got {:?}",
-        stored(&amp, held)
+        stored(&amp, region, held)
     );
 }
 
@@ -410,6 +421,7 @@ async fn a_scraper_that_holds_no_configuration_is_not_found() {
         let scraper_id = "s-55555555-5555-5555-5555-555555555555";
         seed(
             &amp,
+            region,
             &scraper(
                 scraper_id,
                 Some("unlogged"),
@@ -447,6 +459,7 @@ async fn a_scraper_that_holds_no_configuration_is_not_found() {
         assert_eq!(
             amp.store()
                 .lock()
+                .region(region)
                 .scrapers
                 .get(scraper_id)
                 .map(|record| record.status_code.clone()),
@@ -471,6 +484,7 @@ async fn a_delete_touches_only_the_configuration_it_names() {
     for id in ids {
         seed_pair(
             &amp,
+            region,
             &logging_configuration(
                 id,
                 SCRAPER_LOGGING_STATUS_ACTIVE,
@@ -489,7 +503,7 @@ async fn a_delete_touches_only_the_configuration_it_names() {
     );
 
     for id in ids {
-        let record = stored(&amp, id)
+        let record = stored(&amp, region, id)
             .unwrap_or_else(|| panic!("case {id:?}: every configuration is still held"));
         if id == ids[1] {
             assert_eq!(
@@ -528,6 +542,7 @@ async fn a_scraper_the_clock_removes_takes_its_configuration_with_it() {
     let scraper_id = "s-77777777-7777-7777-7777-777777777777";
     seed_pair(
         &amp,
+        region,
         &logging_configuration(
             scraper_id,
             SCRAPER_LOGGING_STATUS_ACTIVE,
@@ -558,9 +573,9 @@ async fn a_scraper_the_clock_removes_takes_its_configuration_with_it() {
         "expected the scraper not-found sentence, got {reply:?}"
     );
     assert_eq!(
-        stored(&amp, scraper_id).map(|record| record.status_code),
+        stored(&amp, region, scraper_id).map(|record| record.status_code),
         None,
         "the store must no longer hold the configuration, got {:?}",
-        stored(&amp, scraper_id)
+        stored(&amp, region, scraper_id)
     );
 }

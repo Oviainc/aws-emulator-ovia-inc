@@ -23,6 +23,8 @@ mod delete_slack_workspace_configuration;
 mod error_message_templates;
 #[path = "all/listing_pagination.rs"]
 mod listing_pagination;
+#[path = "all/notification_flag_default.rs"]
+mod notification_flag_default;
 #[path = "all/resource_preconditions.rs"]
 mod resource_preconditions;
 #[path = "all/slack_channel_configurations.rs"]

@@ -185,12 +185,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
-        store.materialize_due(now);
+        // This service is REGIONAL, so the store this call acts on is the one of the
+        // Region the request was signed for: a workspace created in another Region is not
+        // reachable from this endpoint and is not found here.
+        let region = crate::state::request_region(ctx.parts());
+        let mut guard = state.lock();
+        guard.materialize_due(now);
 
         // The configuration hangs off the workspace at `/workspaces/{workspaceId}/logging`,
-        // so an id naming no stored workspace is the missing resource — 404.
-        let Some(workspace) = store.workspaces.get_mut(&input.workspace_id) else {
+        // so an id naming no stored workspace is the missing resource — 404 — and a Region
+        // this account holds nothing in holds no workspace either.
+        let Some(workspace) = guard
+            .held_region_mut(&region)
+            .and_then(|store| store.workspaces.get_mut(&input.workspace_id))
+        else {
             return Err(
                 DeleteLoggingConfigurationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
@@ -228,7 +236,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // removal is owed at. The record's own `DELETING` status is that evidence, so no
         // token has to be remembered to recognise the replay.
         if logging.status_code == crate::state::LOGGING_STATUS_DELETING {
-            drop(store);
+            drop(guard);
             crate::state::record_state_change(Self::NAME, &workspace_arn, ctx.parts());
             return Ok(DeleteLoggingConfigurationOutput);
         }
@@ -268,7 +276,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it does not speak for a record on its way out, so a replay of that update is a
         // new request against a configuration that is being deleted.
         logging.update_token = None;
-        drop(store);
+        drop(guard);
 
         // The call changed stored state (or replayed the call that did), so it leaves an
         // access record naming the operation, the resource and the key id the request

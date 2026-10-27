@@ -15,6 +15,8 @@
 mod capacity_mode;
 #[path = "all/data_records.rs"]
 mod data_records;
+#[path = "all/encrypted_records.rs"]
+mod encrypted_records;
 #[path = "all/manual_resharding.rs"]
 mod manual_resharding;
 #[path = "all/max_record_size.rs"]

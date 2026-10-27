@@ -231,10 +231,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         store.materialize_due(now);
-
+        // This service is REGIONAL, so the store this call acts on is the one of the
+        // Region the request was signed for: a workspace created in another Region is not
+        // reachable from this endpoint and is not found here.
         // The namespace is created "within a workspace", so without that workspace
-        // there is nothing to create it in: `ResourceNotFoundException` (404).
-        let Some(workspace) = store.workspaces.get_mut(&input.workspace_id) else {
+        // there is nothing to create it in: `ResourceNotFoundException` (404) — and a
+        // Region this account holds nothing in holds no workspace either.
+        let Some(workspace) = store
+            .held_region_mut(&region)
+            .and_then(|store| store.workspaces.get_mut(&input.workspace_id))
+        else {
             return Err(
                 CreateRuleGroupsNamespaceErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {

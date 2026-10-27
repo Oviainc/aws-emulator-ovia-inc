@@ -242,12 +242,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // This service is REGIONAL, so this listing reports the scrapers of the Region
+        // the request was signed for and no other: a scraper created in another Region is
+        // not reachable from this endpoint.
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         store.materialize_due(::std::time::SystemTime::now());
+        // A report reaches that store through a SHARED borrow of the whole store
+        // (`&*store`), so the compiler itself refuses here any accessor that could bring a
+        // Region's store into being: only a create may do that, and only under the ceiling
+        // on Regions held at once.
+        let held = &*store;
+        let store = held.region(&region);
 
         // Every member of this input is OPTIONAL, so a call that carries none of them is
-        // a listing of everything the account holds — which is the empty page while it
-        // holds nothing. `filters` was bound from the query string by
+        // a listing of everything the account holds in this Region — which is the empty
+        // page while it holds nothing. `filters` was bound from the query string by
         // [`input_from_query`], which leaves the `@httpQuery` members out of it;
         // `scraper_matches_filters` honours the four keys the member documents and
         // ignores any other, rather than refusing a request AWS accepts.
