@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMediaInsightsPipeline
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMediaInsightsPipeline`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMediaInsightsPipeline::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a media insights pipeline against a stored media insights pipeline
+//! CONFIGURATION and persists it: the pipeline is minted with its own id and ARN, starts
+//! in the non-terminal `Initializing` status the clock moves to `InProgress`, and a
+//! configuration ARN the store does not hold is the modelled 404 `NotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +163,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMediaInsightsPipeline` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMediaInsightsPipelineErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMediaInsightsPipeline"))
+        // Modelled constraints — the configuration ARN's 1..1024 length and `^arn…$`
+        // pattern, `Tags`' 1..200 and the `ClientRequestToken` pattern — are refused
+        // BEFORE this handler runs, and `service.rs` words that refusal as this service's
+        // 400 `BadRequestException`.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateMediaInsightsPipelineErrorModeled::ServiceFailureException(
+                crate::state::service_failure("The media pipeline store is unavailable."),
+            )
+            .into());
+        };
+        // The tags given at create time go in the family's shared, ARN-keyed tag
+        // directory; resolved before anything is written so a create cannot half-succeed.
+        let Some(tag_directory) = crate::state::chime_tags(&*self.engine) else {
+            return Err(CreateMediaInsightsPipelineErrorModeled::ServiceFailureException(
+                crate::state::service_failure("The Chime tag directory is unavailable."),
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // Idempotent replay: the same `ClientRequestToken` answers with the pipeline the
+        // first create minted rather than minting a second.
+        if let Some(token) = input.client_request_token.as_deref() {
+            if let Some(existing) = store.insights_pipeline_for_request_token(token) {
+                return Ok(CreateMediaInsightsPipelineOutput {
+                    media_insights_pipeline: existing.as_modeled(),
+                });
+            }
+        }
+
+        // A pipeline runs the elements of a stored configuration, so one whose
+        // configuration the store does not hold names a resource that does not exist.
+        // Taken from the STORED record, so the pipeline reports the configuration's own
+        // ARN rather than whichever of its two identifying forms the request carried.
+        let Some(configuration_arn) = store
+            .insights_configuration(&input.media_insights_pipeline_configuration_arn)
+            .map(|configuration| configuration.arn.clone())
+        else {
+            return Err(CreateMediaInsightsPipelineErrorModeled::NotFoundException(
+                crate::state::not_found(format!(
+                    "No media insights pipeline configuration identified by {} exists.",
+                    input.media_insights_pipeline_configuration_arn
+                )),
+            )
+            .into());
+        };
+
+        let media_pipeline_id = store.mint_media_pipeline_id();
+        let media_pipeline_arn = crate::state::media_pipeline_arn(
+            &crate::state::request_region(ctx.parts()),
+            &media_pipeline_id,
+        );
+        let pipeline = crate::state::InsightsPipeline {
+            // Replaced by the store, which owns the creation sequence.
+            seq: 0,
+            media_pipeline_id,
+            media_pipeline_arn: media_pipeline_arn.clone(),
+            configuration_arn,
+            // `Initializing` is a non-terminal `MediaPipelineStatus`: the move to
+            // `InProgress` is the clock's, not a caller's.
+            status: crate::state::STATUS_INITIALIZING.to_string(),
+            kinesis_video_stream_source_runtime_configuration: input
+                .kinesis_video_stream_source_runtime_configuration,
+            media_insights_runtime_metadata: input.media_insights_runtime_metadata,
+            kinesis_video_stream_recording_source_runtime_configuration: input
+                .kinesis_video_stream_recording_source_runtime_configuration,
+            s3_recording_sink_runtime_configuration: input.s3_recording_sink_runtime_configuration,
+            created_timestamp: crate::state::timestamp(now),
+            in_progress_due_at: Some(now + crate::state::INITIALIZING_TO_IN_PROGRESS),
+        };
+
+        let stored = match store.insert_insights_pipeline(pipeline, input.client_request_token) {
+            Ok(stored) => stored.as_modeled(),
+            // The store is full: the quota the real service enforces, and the modelled
+            // error it declares for it.
+            Err(crate::state::InsightsPipelineRefused::LimitReached) => {
+                return Err(
+                    CreateMediaInsightsPipelineErrorModeled::ResourceLimitExceededException(
+                        crate::state::resource_limit_exceeded(format!(
+                            "The maximum number of media insights pipelines ({}) already \
+                             exists. Delete a pipeline before creating another.",
+                            crate::state::MAX_INSIGHTS_PIPELINES
+                        )),
+                    )
+                    .into(),
+                );
+            }
+        };
+
+        // `TagList` is `@length(min: 1)`, so the member is either absent or non-empty.
+        let tags: Vec<(String, String)> = input
+            .tags
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
+        if !tags.is_empty() {
+            tag_directory.lock().tag_within(
+                &media_pipeline_arn,
+                tags,
+                crate::state::MAX_TAGS_PER_RESOURCE,
+            );
+        }
+
+        Ok(CreateMediaInsightsPipelineOutput {
+            media_insights_pipeline: stored,
+        })
     }
 }

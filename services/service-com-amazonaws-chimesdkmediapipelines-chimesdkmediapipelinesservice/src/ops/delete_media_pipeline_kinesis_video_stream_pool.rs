@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteMediaPipelineKinesisVideoStreamPool
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteMediaPipelineKinesisVideoStreamPool`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteMediaPipelineKinesisVideoStreamPool::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes the stored Kinesis Video Stream pool the `Identifier` names — its name or its
+//! ARN — with its tags, and answers the modelled 404 `NotFoundException` when it names
+//! none.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +169,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteMediaPipelineKinesisVideoStreamPool` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteMediaPipelineKinesisVideoStreamPoolErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteMediaPipelineKinesisVideoStreamPool"))
+        let _ = ctx;
+        // A blank `Identifier` never reaches here: the label's modelled `\S` pattern and
+        // 0..1024 length are refused up front, and `service.rs` words that refusal as
+        // this service's 400 `BadRequestException`.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeleteMediaPipelineKinesisVideoStreamPoolErrorModeled::ServiceFailureException(
+                    crate::state::service_failure("The media pipeline store is unavailable."),
+                )
+                .into(),
+            );
+        };
+        // A deleted pool leaves no tags behind: its tags live in the family's shared
+        // ARN-keyed directory, so they are dropped there rather than with the record.
+        let Some(tag_directory) = crate::state::chime_tags(&*self.engine) else {
+            return Err(
+                DeleteMediaPipelineKinesisVideoStreamPoolErrorModeled::ServiceFailureException(
+                    crate::state::service_failure("The Chime tag directory is unavailable."),
+                )
+                .into(),
+            );
+        };
+
+        // Nothing in the store means nothing to delete, which is this operation's modelled
+        // 404 and the normal outcome of a delete-if-exists cleanup path.
+        let removed_arn = state.lock().remove_stream_pool(&input.identifier);
+        let Some(arn) = removed_arn else {
+            return Err(
+                DeleteMediaPipelineKinesisVideoStreamPoolErrorModeled::NotFoundException(
+                    crate::state::not_found(format!(
+                        "No Kinesis Video Stream pool identified by {} exists.",
+                        input.identifier
+                    )),
+                )
+                .into(),
+            );
+        };
+        tag_directory.lock().forget(&arn);
+
+        // 204, empty body: the modelled output shape has no members.
+        Ok(DeleteMediaPipelineKinesisVideoStreamPoolOutput)
     }
 }

@@ -164,7 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_clock(::std::time::SystemTime::now());
 
         let (page, next_token) = store
-            .page_capture_pipelines(input.next_token.as_deref(), input.max_results)
+            .page_media_pipelines(input.next_token.as_deref(), input.max_results)
             .map_err(|_| {
                 ListMediaPipelinesErrorModeled::BadRequestException(crate::state::bad_request(
                     crate::state::INVALID_NEXT_TOKEN_MESSAGE,
@@ -172,11 +172,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
         Ok(ListMediaPipelinesOutput {
-            media_pipelines: Some(
-                page.iter()
-                    .map(|pipeline| pipeline.as_pipeline_summary())
-                    .collect(),
-            ),
+            // Every kind of media pipeline the store holds, in creation order: this
+            // listing is over media pipelines, not over one of their kinds.
+            media_pipelines: Some(page),
             next_token,
         })
     }

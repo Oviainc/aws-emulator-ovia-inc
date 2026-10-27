@@ -19,6 +19,13 @@
 //! in whether that requirement names the resource by NAME or by ARN. Every row carries a
 //! WITNESS job on the same resource that stays live, so a handler that simply answered an
 //! empty listing would fail every case.
+//!
+//! Both the subject and the witness are OBSERVED at rest before a row acts. Each job's
+//! clock-owed `SUBMITTED` -> `RUNNABLE` falls due one span after THAT job's own submit, so
+//! the subject reaching `RUNNABLE` says nothing about the witness, which was submitted
+//! after it; a case that asserted the witness's status without observing it first would be
+//! asserting a transition the clock does not owe yet (`job_phase_is_per_job.rs` pins that
+//! rule).
 
 use serde_json::{json, Value};
 
@@ -304,6 +311,10 @@ async fn a_terminal_job_drops_out_of_every_listing_of_its_resource() {
             "case {}: expected the subject to be live before the release, got {detail}",
             row.case
         );
+        // The witness's own span runs from ITS submit, which is a later instant than the
+        // subject's: it is observed coming to rest HERE, so that what the case asserts
+        // about it after the release is about the release and nothing else.
+        until_status(&fixture.batch, row.case, witness, "RUNNABLE").await;
         let before = listed_names(
             &fixture.batch,
             row.case,
@@ -440,6 +451,10 @@ async fn the_listing_converges_once_the_job_is_terminal() {
     let (subject, witness, resource) = (&built.subject, &built.witness, &built.resource);
 
     until_status(&fixture.batch, row.case, subject, "RUNNABLE").await;
+    // The witness comes to rest on its OWN span, one span after its own submit, so it is
+    // observed there before the terminate: the probes below are then the only thing that
+    // could move it.
+    until_status(&fixture.batch, row.case, witness, "RUNNABLE").await;
     fixture
         .batch
         .ok(
