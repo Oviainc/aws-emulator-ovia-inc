@@ -98,8 +98,9 @@ fn version_number(version_id: &str) -> u64 {
 /// This is the state a run of `CreatePolicyVersion` ("creates a new version of the
 /// specified managed policy") plus a `SetDefaultPolicyVersion` leaves behind, written
 /// into the service's OWN store here rather than into a second copy, so a listing case
-/// can be arranged at any version numbers — `SetDefaultPolicyVersion` is still a
-/// scaffolded 501 with its own stub issue. Answers every version identifier the policy
+/// can be arranged at any version numbers — including the sparse numbering only a run of
+/// deletes reaches, and `DeletePolicyVersion` is still a scaffolded 501 with its own stub
+/// issue. Answers every version identifier the policy
 /// then carries, in the order the listing must report them: ascending by version number.
 fn seed_versions(
     engine: &engine::InMemoryEngine,

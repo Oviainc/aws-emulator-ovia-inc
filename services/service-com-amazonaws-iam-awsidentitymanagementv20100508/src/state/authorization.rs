@@ -135,6 +135,9 @@ pub const UNTAG_POLICY: &str = "iam:UntagPolicy";
 /// `iam:CreatePolicyVersion`.
 pub const CREATE_POLICY_VERSION: &str = "iam:CreatePolicyVersion";
 
+/// `iam:SetDefaultPolicyVersion`.
+pub const SET_DEFAULT_POLICY_VERSION: &str = "iam:SetDefaultPolicyVersion";
+
 /// `iam:GetAccountAuthorizationDetails`.
 pub const GET_ACCOUNT_AUTHORIZATION_DETAILS: &str = "iam:GetAccountAuthorizationDetails";
 
