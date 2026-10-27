@@ -233,7 +233,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
-        let requested_by = crate::state::request_principal(ctx.parts());
+        // `requestedBy` is "The IAM principal that requested the signing job":
+        // the principal the request's credentials resolve to, which is the one
+        // identity this emulator resolves a caller as (`None` for an unsigned
+        // request).
+        let requested_by = crate::state::caller_principal_arn(ctx.parts());
         // Signer is regional: a job signs with a profile of the region whose
         // endpoint started it, and the job belongs to that region too.
         let region = crate::state::request_region(ctx.parts());
