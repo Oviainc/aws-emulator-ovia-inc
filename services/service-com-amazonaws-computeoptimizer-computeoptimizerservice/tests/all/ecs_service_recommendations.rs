@@ -1094,6 +1094,152 @@ async fn only_the_services_of_the_requested_region_are_analysed() {
     }
 }
 
+/// Well-formed 12-digit account ids that are NOT the account this emulator answers for: the
+/// id the report cites, the documentation's own example account, and the extremes of the
+/// 12-digit range ("a 12-digit Amazon Web Services account ID", `Scope$value`).
+const OTHER_ACCOUNTS: [&str; 4] = ["210987654321", "111122223333", "000000000001", "999999999999"];
+
+/// An Amazon ECS service recommendation is reported only for the account the request asks
+/// about: the one `accountIds` names, or the caller's own when it names none. The account
+/// that OWNS a service is the account field of the service's own ARN, so a service record
+/// held under another account's ARN is analysed for no caller of this account — and a
+/// well-formed id naming another account is REFUSED rather than used to narrow the answer,
+/// because this emulator presents one standalone account and records no organization.
+///
+/// The rows are well-formed ids of other accounts ([`OTHER_ACCOUNTS`]); each moves one
+/// service of this region's inventory under that account and asks both ways.
+#[tokio::test]
+async fn only_the_services_of_the_requested_account_are_analysed() {
+    assert!(
+        !OTHER_ACCOUNTS.contains(&ACCOUNT),
+        "the other-account rows must not name the account this service answers for \
+         ({ACCOUNT}), got {OTHER_ACCOUNTS:?}"
+    );
+    let (router, engine) = emulator_with_analysed_services_and_engine();
+    opt_in(&router).await;
+    let cluster = "ownership";
+    create_cluster(&router, cluster, "setup").await;
+    let family = "ownershipfamily";
+    register_task_definition(&router, family, "1024", "2048", "setup").await;
+    let published_at = now_secs() - 3_600;
+    let mut both = Vec::new();
+    for service in ["kept", "handedover"] {
+        both.push(create_service(&router, cluster, service, family, "FARGATE", 1, "setup").await);
+        for metric in [CPU_METRIC, MEMORY_METRIC] {
+            publish(&engine, cluster, service, metric, &[20.0, 30.0], published_at);
+        }
+    }
+    both.sort();
+    let kept = vec![service_arn(cluster, "kept")];
+
+    // Both services belong to the account this endpoint answers for, so the sweep analyses
+    // both: every row below changes exactly one thing, which account owns one of them.
+    assert_eq!(
+        swept(&router, "both services of this account").await,
+        both,
+        "case \"both services of this account\": expected every service of this account to be \
+         analysed, got a different set"
+    );
+
+    for account_id in OTHER_ACCOUNTS {
+        own_service_in_account(&engine, cluster, "handedover", account_id);
+
+        let case = format!("a service owned by {account_id}");
+        assert_eq!(
+            swept(&router, &case).await,
+            kept,
+            "case {case:?}: a service another account owns is analysed for none of this \
+             account's requests"
+        );
+
+        // Asking for that account by name is refused, so the service is not reachable by
+        // naming its owner either.
+        let (status, body) = call(
+            &router,
+            "GetECSServiceRecommendations",
+            json!({ "accountIds": [account_id] }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected naming another account to be refused with 400, got \
+             {status}: {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidParameterValueException",
+            "case {case:?}: expected InvalidParameterValueException, got {body}"
+        );
+
+        // Naming this account explicitly reads exactly what the sweep read.
+        let (status, body) = call(
+            &router,
+            "GetECSServiceRecommendations",
+            json!({ "accountIds": [ACCOUNT] }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 for this account, got {status}: {body}"
+        );
+        let reported: Vec<String> = list(&body, "ecsServiceRecommendations", &case)
+            .iter()
+            .map(|found| found["serviceArn"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            reported, kept,
+            "case {case:?}: naming this account reads this account's services only, got {body}"
+        );
+    }
+
+    // Handed back, the service is analysed again — so the rows above left it out for the
+    // account that owned it, not because moving it damaged the record.
+    own_service_in_account(&engine, cluster, "handedover", ACCOUNT);
+    assert_eq!(
+        swept(&router, "handed back to this account").await,
+        both,
+        "case \"handed back to this account\": expected every service of this account to be \
+         analysed again, got a different set"
+    );
+}
+
+/// The `serviceArn`s one sweep (a request naming no ARN and no account) reports, in ARN
+/// order.
+async fn swept(router: &MultiServiceRouter, case: &str) -> Vec<String> {
+    let (status, body) = call(router, "GetECSServiceRecommendations", json!({})).await;
+    assert_eq!(status, 200, "case {case:?}: expected 200, got {status}: {body}");
+    let mut reported: Vec<String> = list(&body, "ecsServiceRecommendations", case)
+        .iter()
+        .map(|found| found["serviceArn"].as_str().unwrap_or_default().to_string())
+        .collect();
+    reported.sort();
+    reported
+}
+
+/// Record one Amazon ECS service of the inventory as owned by `account_id`, by the ARN its
+/// record carries.
+///
+/// No call of this endpoint can do it: an ARN names the account that owns the resource, and
+/// the ECS emulator mints every service ARN for the one account it serves — so the state a
+/// cross-account inventory would have is seeded here, the way the AWS-reserved utilization
+/// series is ([`publish`]), and read back over the wire like any client.
+fn own_service_in_account(
+    engine: &Arc<engine::InMemoryEngine>,
+    cluster: &str,
+    service: &str,
+    account_id: &str,
+) {
+    use service_com_amazonaws_ecs_amazonec2containerservicev20141113::state as ecs;
+
+    let inventory = engine.state::<ecs::ComAmazonawsEcsAmazonec2containerservicev20141113State>();
+    let mut inventory = inventory.lock();
+    let record = inventory
+        .services
+        .get_mut(&(cluster.to_string(), service.to_string()))
+        .unwrap_or_else(|| panic!("the ECS store holds the service {service} of {cluster}"));
+    record.arn = format!("arn:aws:ecs:{REGION}:{account_id}:service/{cluster}/{service}");
+}
+
 /// The ARN the ECS emulator mints for one service.
 fn service_arn(cluster: &str, service: &str) -> String {
     format!("arn:aws:ecs:{REGION}:{ACCOUNT}:service/{cluster}/{service}")
