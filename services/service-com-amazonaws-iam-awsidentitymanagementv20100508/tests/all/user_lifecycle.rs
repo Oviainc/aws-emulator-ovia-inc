@@ -239,8 +239,9 @@ pub(crate) const HARNESS_REGION: &str = "us-east-1";
 const AUTHORIZATION_DETAILS_PATH: &str = "#/authorization-details/";
 
 /// Assert that `actual` is the whole `AccessDenied` message AWS words for a refused IAM
-/// call made in [`HARNESS_REGION`]. See
-/// [`assert_access_denied_message_in_region`], which this is the common Region of.
+/// call, whose authorization-details URL names [`HARNESS_REGION`] — the Region IAM's
+/// global console lives in, and so the one every denial names. See
+/// [`assert_access_denied_message_in_region`], which takes that Region per call.
 pub(crate) fn assert_access_denied_message(
     case: &str,
     actual: &str,
@@ -265,6 +266,11 @@ pub(crate) fn assert_access_denied_message(
 /// made on, then `reason` (an explicit deny, or no policy allowing the action), then the
 /// sentence pointing the caller at that one denial's authorization details — in the IAM
 /// console for `region`, and through the `GetRequestAuthorizationDetails` API.
+///
+/// `region` is the Region the message must NAME, which is the one IAM's global console
+/// lives in rather than the Region the request was signed for — a suite that varies the
+/// signing Region passes the same value on every row
+/// (`tests/all/identity_policy_enforcement.rs`).
 ///
 /// The authorization id is minted per refused request, so it is not a value a case can
 /// predict: it is read back out of `actual` and asserted to be ONE id, spelled in the
