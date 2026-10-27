@@ -5710,6 +5710,38 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         Some(stored)
     }
 
+    /// Replace the configuration of the origin request policy `id` names, and report the
+    /// record as it now stands.
+    ///
+    /// `UpdateOriginRequestPolicy` replaces the configuration WHOLE — "When you update an
+    /// origin request policy configuration, all the fields are updated with the values
+    /// provided in the request. You cannot update some fields independent of others." — so
+    /// the stored configuration becomes the one submitted, down to the members the request
+    /// left out; `LastModifiedTime` becomes `now` ("the date and time when the origin
+    /// request policy was last modified"), and the version token is freshly minted, so the
+    /// token the caller matched on no longer satisfies an `If-Match` against this policy.
+    /// Nothing else about an origin request policy changes: the id is the one it was created
+    /// under, and a policy carries no status and no propagation deadline.
+    ///
+    /// `None` when the store holds no such policy, checked BEFORE the mint so a version
+    /// token is never spent on a policy that is not there.
+    pub fn apply_origin_request_policy_config(
+        &mut self,
+        id: &str,
+        config: OriginRequestPolicyConfig,
+        now: SystemTime,
+    ) -> Option<&StoredOriginRequestPolicy> {
+        if !self.origin_request_policies.contains_key(id) {
+            return None;
+        }
+        let etag = self.next_etag();
+        let stored = self.origin_request_policies.get_mut(id)?;
+        stored.config = config;
+        stored.last_modified_time = now;
+        stored.etag = etag;
+        Some(stored)
+    }
+
     /// Replace the configuration of the origin access control `id` names, and report the
     /// record as it now stands.
     ///

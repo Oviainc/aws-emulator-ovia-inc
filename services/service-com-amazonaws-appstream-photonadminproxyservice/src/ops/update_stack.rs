@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateStack
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateStack`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: applies the members the request supplies to the stored
+//! [`crate::state::StackRecord`], clears the stored field behind every `StackAttribute`
+//! the request's `AttributesToDelete` names, and returns the modelled `Stack` rendered
+//! FROM that record, so a later `DescribeStacks` answers with the same configuration.
+//! A cleared field is ABSENT from the rendered stack, not present-and-empty. An unknown
+//! `Name` answers `ResourceNotFoundException` (HTTP 404).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateStack::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Clearing an attribute only detaches what the stack referenced: dropping
+//! `ACCESS_ENDPOINTS` removes the stack's reference to the interface VPC endpoints and
+//! never touches those endpoints themselves, so the same endpoint can be attached again
+//! by a later request.
 //!
 //! ## Shape of an operation
 //!
@@ -192,20 +194,246 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateStack` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateStackErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateStack"))
+        // See `create_stack.rs` for why an engine without this service's store answers
+        // "not written for that engine" rather than a fabricated success.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::not_implemented("UpdateStack"))?;
+        let mut state = state.lock();
+
+        let attributes_to_delete = input.attributes_to_delete.clone().unwrap_or_default();
+        for attribute in &attributes_to_delete {
+            if !STACK_ATTRIBUTE_VALUES.contains(&attribute.as_str()) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "AttributesToDelete contains an unknown stack attribute: {attribute}"
+                )));
+            }
+            // Setting a field and deleting it in one request asks for two different
+            // outcomes for the same field, which is an incorrect combination of
+            // parameters.
+            if let Some(member) = supplied_member(&input, attribute) {
+                return Err(UpdateStackErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(format!(
+                            "{member} cannot be specified while AttributesToDelete \
+                             contains {attribute}"
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let record = state.stacks.get_mut(&input.name).ok_or_else(|| {
+            UpdateStackErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(format!("Stack not found: {}", input.name)),
+            })
+        })?;
+
+        // Computed (and refused) before anything is stored, so a request this operation
+        // rejects leaves the stack exactly as it was.
+        let agent_access_config = match &input.agent_access_config {
+            Some(update) => Some(merge_agent_access_config(
+                record.agent_access_config.as_ref(),
+                update,
+            )?),
+            None => None,
+        };
+
+        // Every member the request carries replaces the stored field; a member the
+        // request omits leaves that field alone.
+        if let Some(description) = input.description {
+            record.description = Some(description);
+        }
+        if let Some(display_name) = input.display_name {
+            record.display_name = Some(display_name);
+        }
+        if let Some(redirect_url) = input.redirect_url {
+            record.redirect_url = Some(redirect_url);
+        }
+        if let Some(feedback_url) = input.feedback_url {
+            record.feedback_url = Some(feedback_url);
+        }
+        if let Some(storage_connectors) = input.storage_connectors {
+            record.storage_connectors = storage_connectors;
+        }
+        if let Some(user_settings) = input.user_settings {
+            record.user_settings = user_settings;
+        }
+        if let Some(access_endpoints) = input.access_endpoints {
+            record.access_endpoints = access_endpoints;
+        }
+        if let Some(embed_host_domains) = input.embed_host_domains {
+            record.embed_host_domains = embed_host_domains;
+        }
+        if let Some(settings) = input.streaming_experience_settings {
+            record.streaming_experience_settings = Some(settings);
+        }
+        if let Some(content_redirection) = input.content_redirection {
+            record.content_redirection = Some(content_redirection);
+        }
+        if let Some(authentication) = input.storage_connector_authentication {
+            record.storage_connector_authentication = Some(authentication);
+        }
+        if let Some(settings) = input.application_settings {
+            // The request carries `ApplicationSettings`; the resource reports the
+            // `ApplicationSettingsResponse` form of that same configuration, as
+            // `CreateStack` does.
+            record.application_settings = Some(ApplicationSettingsResponse {
+                enabled: Some(settings.enabled),
+                settings_group: settings.settings_group,
+                s3_bucket_name: record
+                    .application_settings
+                    .as_ref()
+                    .and_then(|stored| stored.s3_bucket_name.clone()),
+            });
+        }
+        if let Some(config) = agent_access_config {
+            record.agent_access_config = Some(config);
+        }
+
+        // `DeleteStorageConnectors` is the deprecated member that deletes the storage
+        // connectors currently enabled for the stack — the same outcome as naming
+        // STORAGE_CONNECTORS in `AttributesToDelete`.
+        if input.delete_storage_connectors == Some(true) {
+            record.storage_connectors.clear();
+        }
+        for attribute in &attributes_to_delete {
+            delete_attribute(record, attribute);
+        }
+
+        Ok(UpdateStackOutput {
+            stack: Some(record.to_stack()),
+        })
     }
+}
+
+/// The `UpdateStack` member that SETS the stack field `attribute` clears, when this
+/// request carries it — so naming both can be refused rather than silently resolved one
+/// way.
+///
+/// The attribute values are `StackAttribute`'s
+/// (`smithy_query(query="shape", shape="StackAttribute")`, also kept as
+/// `STACK_ATTRIBUTE_VALUES` in `types/shared_types.rs`). An attribute whose field no
+/// `UpdateStack` member sets has no conflict to report.
+fn supplied_member(input: &UpdateStackInput, attribute: &str) -> Option<&'static str> {
+    let (member, supplied) = match attribute {
+        "STORAGE_CONNECTORS"
+        | "STORAGE_CONNECTOR_HOMEFOLDERS"
+        | "STORAGE_CONNECTOR_GOOGLE_DRIVE"
+        | "STORAGE_CONNECTOR_ONE_DRIVE" => {
+            ("StorageConnectors", input.storage_connectors.is_some())
+        }
+        "REDIRECT_URL" => ("RedirectURL", input.redirect_url.is_some()),
+        "FEEDBACK_URL" => ("FeedbackURL", input.feedback_url.is_some()),
+        "USER_SETTINGS" => ("UserSettings", input.user_settings.is_some()),
+        "EMBED_HOST_DOMAINS" => ("EmbedHostDomains", input.embed_host_domains.is_some()),
+        "ACCESS_ENDPOINTS" => ("AccessEndpoints", input.access_endpoints.is_some()),
+        "STREAMING_EXPERIENCE_SETTINGS" => (
+            "StreamingExperienceSettings",
+            input.streaming_experience_settings.is_some(),
+        ),
+        "CONTENT_REDIRECTION" => ("ContentRedirection", input.content_redirection.is_some()),
+        "AGENT_ACCESS_CONFIG" => ("AgentAccessConfig", input.agent_access_config.is_some()),
+        "STORAGE_CONNECTOR_AUTHENTICATION" => (
+            "StorageConnectorAuthentication",
+            input.storage_connector_authentication.is_some(),
+        ),
+        _ => return None,
+    };
+    supplied.then_some(member)
+}
+
+/// Clear the stored field `attribute` names, so the rendered stack no longer carries it.
+///
+/// A cleared collection is left with no entries, which is what makes the member absent
+/// from the rendered `Stack` (see `crate::state`); a cleared optional field becomes
+/// `None`. Clearing never follows a reference out of this service: the interface VPC
+/// endpoints `ACCESS_ENDPOINTS` names, and the storage the connectors point at, are
+/// other services' resources and keep their own lifecycle.
+fn delete_attribute(record: &mut crate::state::StackRecord, attribute: &str) {
+    match attribute {
+        "STORAGE_CONNECTORS" => record.storage_connectors.clear(),
+        // One connector type at a time: the attribute names the connector to drop and
+        // leaves the stack's other connectors enabled. The types are
+        // `StorageConnectorType`'s (`STORAGE_CONNECTOR_TYPE_VALUES`).
+        "STORAGE_CONNECTOR_HOMEFOLDERS" => record
+            .storage_connectors
+            .retain(|connector| connector.connector_type != "HOMEFOLDERS"),
+        "STORAGE_CONNECTOR_GOOGLE_DRIVE" => record
+            .storage_connectors
+            .retain(|connector| connector.connector_type != "GOOGLE_DRIVE"),
+        "STORAGE_CONNECTOR_ONE_DRIVE" => record
+            .storage_connectors
+            .retain(|connector| connector.connector_type != "ONE_DRIVE"),
+        "REDIRECT_URL" => record.redirect_url = None,
+        "FEEDBACK_URL" => record.feedback_url = None,
+        "USER_SETTINGS" => record.user_settings.clear(),
+        "EMBED_HOST_DOMAINS" => record.embed_host_domains.clear(),
+        "ACCESS_ENDPOINTS" => record.access_endpoints.clear(),
+        "STREAMING_EXPERIENCE_SETTINGS" => record.streaming_experience_settings = None,
+        "CONTENT_REDIRECTION" => record.content_redirection = None,
+        "AGENT_ACCESS_CONFIG" => record.agent_access_config = None,
+        "STORAGE_CONNECTOR_AUTHENTICATION" => record.storage_connector_authentication = None,
+        // THEME_NAME names the stack's theme, a resource of its own
+        // (`CreateThemeForStack` / `DeleteThemeForStack`), and IAM_ROLE_ARN names a
+        // field the `Stack` shape does not model — neither has a stored stack field
+        // this operation clears.
+        _ => {}
+    }
+}
+
+/// Merge an `AgentAccessConfigForUpdate` onto the stack's stored `AgentAccessConfig`.
+///
+/// The update shape "supports partial updates, so you only need to specify the fields
+/// you want to change" (`smithy_query(query="shape",
+/// shape="AgentAccessConfigForUpdate")`): each member it carries replaces the stored
+/// one and each member it omits keeps the stored value. A stack with no stored
+/// configuration has nothing to merge onto, so the members `AgentAccessConfig` requires
+/// must all be present; a missing one is refused as an incorrect combination of
+/// parameters rather than invented here.
+fn merge_agent_access_config(
+    stored: Option<&AgentAccessConfig>,
+    update: &AgentAccessConfigForUpdate,
+) -> Result<AgentAccessConfig, UpdateStackError> {
+    let missing = |member: &str| {
+        UpdateStackError::from(UpdateStackErrorModeled::InvalidParameterCombinationException(
+            InvalidParameterCombinationException {
+                message: Some(format!(
+                    "AgentAccessConfig.{member} is required to enable agent access on this \
+                     stack"
+                )),
+            },
+        ))
+    };
+
+    Ok(AgentAccessConfig {
+        settings: match (update.settings.clone(), stored) {
+            (Some(settings), _) => settings,
+            (None, Some(stored)) => stored.settings.clone(),
+            (None, None) => return Err(missing("Settings")),
+        },
+        screen_resolution: match (update.screen_resolution.clone(), stored) {
+            (Some(resolution), _) => resolution,
+            (None, Some(stored)) => stored.screen_resolution.clone(),
+            (None, None) => return Err(missing("ScreenResolution")),
+        },
+        screen_image_format: match (update.screen_image_format.clone(), stored) {
+            (Some(format), _) => format,
+            (None, Some(stored)) => stored.screen_image_format.clone(),
+            (None, None) => return Err(missing("ScreenImageFormat")),
+        },
+        s3_bucket_arn: update
+            .s3_bucket_arn
+            .clone()
+            .or_else(|| stored.and_then(|stored| stored.s3_bucket_arn.clone())),
+        screenshots_upload_enabled: update
+            .screenshots_upload_enabled
+            .or_else(|| stored.and_then(|stored| stored.screenshots_upload_enabled)),
+        user_control_mode: update
+            .user_control_mode
+            .clone()
+            .or_else(|| stored.and_then(|stored| stored.user_control_mode.clone())),
+    })
 }

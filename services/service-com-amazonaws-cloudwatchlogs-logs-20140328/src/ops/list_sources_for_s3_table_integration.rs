@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSourcesForS3TableIntegration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSourcesForS3TableIntegration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSourcesForS3TableIntegration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the data-source associations of the S3 Table Integration the
+//! request's `integrationArn` names — each with the data source the associate named, the
+//! status the clock has made due and the instant it was created — in the order they were
+//! associated, paged by `maxResults` through an opaque `nextToken`, and writes nothing. This
+//! is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -118,6 +114,48 @@ impl From<ListSourcesForS3TableIntegrationErrorModeled> for ListSourcesForS3Tabl
     }
 }
 
+/// The kind tag this operation's pagination cursor carries, so a token minted by
+/// another paginated operation is refused rather than misread.
+const CURSOR_KIND: &str = "ListSourcesForS3TableIntegration";
+
+/// The page size a request that names no `maxResults` gets. The member is "the maximum
+/// number of associations to return in a single call" and AWS states no default for it, so
+/// an unset maximum is this service's documented list page default — "up to 50 items",
+/// [`crate::state::DEFAULT_LIST_LIMIT`] — which is inside this member's own modelled range
+/// (`ListSourcesForS3TableIntegrationMaxResults`, `@range(min: 1, max: 100)`).
+const UNSET_MAX_RESULTS: i32 = crate::state::DEFAULT_LIST_LIMIT;
+
+/// Where the next page resumes: the identifier of the last association returned, plus the
+/// integration whose associations the scan it belongs to enumerates. A continuation that
+/// names a different integration is refused, because the token is only a position within
+/// one integration's enumeration.
+#[derive(Debug, Clone)]
+struct Cursor {
+    integration_arn: String,
+    after: String,
+}
+
+impl Cursor {
+    fn encode(&self) -> String {
+        crate::state::encode_token(&::serde_json::json!({
+            "kind": CURSOR_KIND,
+            "integrationArn": self.integration_arn,
+            "afterIdentifier": self.after,
+        }))
+    }
+
+    fn decode(token: &str) -> Option<Self> {
+        let value = crate::state::decode_token(token)?;
+        if value.get("kind")?.as_str()? != CURSOR_KIND {
+            return None;
+        }
+        Some(Self {
+            integration_arn: value.get("integrationArn")?.as_str()?.to_string(),
+            after: value.get("afterIdentifier")?.as_str()?.to_string(),
+        })
+    }
+}
+
 /// The `ListSourcesForS3TableIntegration` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -154,18 +192,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSourcesForS3TableIntegration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSourcesForS3TableIntegrationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSourcesForS3TableIntegration"))
+        // `ctx` carries only request metadata: the integration whose associations this
+        // reports is the one the request's own ARN names.
+        let _ = ctx;
+
+        let invalid = |message: String| {
+            ListSourcesForS3TableIntegrationError::from(
+                ListSourcesForS3TableIntegrationErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(message),
+                    },
+                ),
+            )
+        };
+
+        // "The Amazon Resource Name (ARN) of the S3 Table Integration to list associations
+        // for": the member is modelled as an `Arn`, so a value that is not an ARN at all
+        // names no integration and is refused with the validation-error template this
+        // service words an unparsable ARN with, naming the member.
+        if let Some(message) =
+            crate::state::unparsable_arn_message("integrationArn", &input.integration_arn)
+        {
+            return Err(invalid(message));
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListSourcesForS3TableIntegrationError::from(
+                ListSourcesForS3TableIntegrationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let mut store = state.lock();
+
+        // An association whose data the clock has finished deleting is gone, so what this
+        // reports is what the clock already decided — never an association dropped because
+        // something listed.
+        store.materialize_due_s3_table_integration_source_removals(crate::state::now_ms());
+
+        let cursor = match input.next_token.as_deref() {
+            Some(token) => {
+                let Some(cursor) = Cursor::decode(token) else {
+                    return Err(invalid("nextToken is not a valid token".to_string()));
+                };
+                if cursor.integration_arn != input.integration_arn {
+                    return Err(invalid(
+                        "nextToken was issued for a different ListSourcesForS3TableIntegration \
+                         request"
+                            .to_string(),
+                    ));
+                }
+                Some(cursor)
+            }
+            None => None,
+        };
+
+        // "A list of data source associations for a specified S3 Table Integration": the
+        // associations made against the ARN the request names, in the order their
+        // identifiers were minted, which is the order the page token is a position in. An
+        // integration nothing is associated with reports an EMPTY list rather than a missing
+        // resource: no operation of this service creates an S3 Table Integration, so an ARN
+        // naming one is not a resource this store could be asked to hold.
+        let matching = store.s3_table_integration_sources_of(&input.integration_arn);
+
+        let first = match &cursor {
+            Some(cursor) => matching
+                .partition_point(|association| association.identifier <= cursor.after),
+            None => 0,
+        };
+        // `maxResults` is modelled `range 1..100`, so the boundary validator has already
+        // refused a value outside it and only an unset maximum needs a page size of its own
+        // ([`UNSET_MAX_RESULTS`]).
+        let limit = usize::try_from(input.max_results.unwrap_or(UNSET_MAX_RESULTS))
+            .unwrap_or(0)
+            .max(1);
+        let last = first.saturating_add(limit).min(matching.len());
+        let page = &matching[first..last];
+
+        // A token only where a page follows this one: "The token for the next set of items
+        // to return."
+        let next_token = page
+            .last()
+            .filter(|_| last < matching.len())
+            .map(|association| {
+                Cursor {
+                    integration_arn: input.integration_arn.clone(),
+                    after: association.identifier.clone(),
+                }
+                .encode()
+            });
+
+        Ok(ListSourcesForS3TableIntegrationOutput {
+            sources: Some(
+                page.iter()
+                    .map(|association| association.source())
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }

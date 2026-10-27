@@ -18,9 +18,12 @@
 //! * a reserving function allocates its provisioned concurrency OUT OF its reservation, so
 //!   the total across its aliases and versions has to fit inside the reservation. That is
 //!   ONE rule violable from either side — by allocating more than the reservation admits,
-//!   or by shrinking the reservation below what is already allocated — and both sides are
-//!   refused with the single constant sentence that states it, with nothing of the request
-//!   interpolated.
+//!   or by shrinking the reservation below what is already allocated — and each side states
+//!   what THAT call asked for, because the remedies differ: the allocating side carries the
+//!   constant sentence naming the provisioned request, while the side that lowers the
+//!   reservation names the member it carried, the reservation it asked for and the total the
+//!   function already keeps initialised, so a caller can compute the smallest reservation
+//!   that would be admitted.
 //!
 //! And one conditional-requirement rule: `RuntimeVersionArn` is "only required if you're
 //! using the Manual runtime update mode", a condition the model cannot express as a
@@ -88,12 +91,24 @@ fn floor_sentence(floor: i64) -> String {
     )
 }
 
-/// The constant sentence that states the PER-FUNCTION rule, from whichever side it was
-/// violated. It has no slot: neither the reservation nor the requested amount appears in
-/// it.
+/// The constant sentence that states the PER-FUNCTION rule as the ALLOCATING side violated
+/// it: the capacity being allocated is larger than the function's reservation. It has no
+/// slot, so neither the reservation nor the requested amount appears in it.
 const FUNCTION_CAP_SENTENCE: &str =
     "Requested Provisioned Concurrency should not be greater than the \
      reservedConcurrentExecution for function";
+
+/// The sentence that states the same PER-FUNCTION rule as the RESERVING side violated it:
+/// the reservation asked for is below the provisioned concurrency the function already
+/// keeps initialised across its versions and aliases. Its variable parts are the request's
+/// own `ReservedConcurrentExecutions` and that total, so each row writes the pair it set up
+/// rather than a literal sentence.
+fn shrink_sentence(requested: i64, provisioned: i64) -> String {
+    format!(
+        " ReservedConcurrentExecutions  {requested} should not be lower than function's \
+         total provisioned concurrency [{provisioned}]."
+    )
+}
 
 /// The constant sentence `PutRuntimeManagementConfig` states for the manual mode without
 /// the runtime version ARN that mode requires.
@@ -390,6 +405,10 @@ struct FunctionCapCase {
     reserved: i64,
     /// What the subject allocates on its published version before the call, when it does.
     allocated: Option<i64>,
+    /// What the subject allocates on its ALIAS before the call, when it does — so the
+    /// total the reserving side is weighed against is a sum over qualifiers and not one
+    /// configuration's amount.
+    allocated_on_alias: Option<i64>,
     /// The allocation under test: the qualifier it addresses and the amount it asks for.
     allocate: Option<(Qualifier, i64)>,
     /// The reservation under test, for the rows that violate the rule from that side.
@@ -405,6 +424,7 @@ fn function_cap_cases() -> Vec<FunctionCapCase> {
             name: "one past a reservation of a single execution",
             reserved: 1,
             allocated: None,
+            allocated_on_alias: None,
             allocate: Some((Qualifier::Version, 2)),
             reserve: None,
         },
@@ -412,6 +432,7 @@ fn function_cap_cases() -> Vec<FunctionCapCase> {
             name: "one past a reservation of four, on an alias",
             reserved: 4,
             allocated: None,
+            allocated_on_alias: None,
             allocate: Some((Qualifier::Alias, 5)),
             reserve: None,
         },
@@ -419,6 +440,7 @@ fn function_cap_cases() -> Vec<FunctionCapCase> {
             name: "far past a mid-range reservation",
             reserved: 50,
             allocated: None,
+            allocated_on_alias: None,
             allocate: Some((Qualifier::Version, 550)),
             reserve: None,
         },
@@ -426,6 +448,7 @@ fn function_cap_cases() -> Vec<FunctionCapCase> {
             name: "one past the largest reservation the account admits",
             reserved: MAX_RESERVABLE,
             allocated: None,
+            allocated_on_alias: None,
             allocate: Some((Qualifier::Version, MAX_RESERVABLE + 1)),
             reserve: None,
         },
@@ -433,6 +456,7 @@ fn function_cap_cases() -> Vec<FunctionCapCase> {
             name: "a second qualifier taking the total past the reservation",
             reserved: 10,
             allocated: Some(6),
+            allocated_on_alias: None,
             allocate: Some((Qualifier::Alias, 5)),
             reserve: None,
         },
@@ -440,6 +464,7 @@ fn function_cap_cases() -> Vec<FunctionCapCase> {
             name: "a reservation one below what a qualifier already keeps initialised",
             reserved: 10,
             allocated: Some(10),
+            allocated_on_alias: None,
             allocate: None,
             reserve: Some(9),
         },
@@ -447,6 +472,31 @@ fn function_cap_cases() -> Vec<FunctionCapCase> {
             name: "a reservation of none below what a qualifier keeps initialised",
             reserved: 10,
             allocated: Some(4),
+            allocated_on_alias: None,
+            allocate: None,
+            reserve: Some(0),
+        },
+        FunctionCapCase {
+            name: "a reservation one below the total two qualifiers keep initialised",
+            reserved: 7,
+            allocated: Some(3),
+            allocated_on_alias: Some(4),
+            allocate: None,
+            reserve: Some(6),
+        },
+        FunctionCapCase {
+            name: "a reservation far below the total two qualifiers keep initialised",
+            reserved: MAX_RESERVABLE,
+            allocated: Some(500),
+            allocated_on_alias: Some(400),
+            allocate: None,
+            reserve: Some(1),
+        },
+        FunctionCapCase {
+            name: "a reservation one below a single allocated execution",
+            reserved: 2,
+            allocated: Some(1),
+            allocated_on_alias: None,
             allocate: None,
             reserve: Some(0),
         },
@@ -454,7 +504,7 @@ fn function_cap_cases() -> Vec<FunctionCapCase> {
 }
 
 #[tokio::test]
-async fn the_per_function_cap_states_one_sentence_from_either_side() {
+async fn the_per_function_cap_states_the_rule_from_the_side_it_was_violated_on() {
     for case in function_cap_cases() {
         let engine = Arc::new(engine::InMemoryEngine::new());
         let router = router_on(&engine);
@@ -477,6 +527,17 @@ async fn the_per_function_cap_states_one_sentence_from_either_side() {
                 202,
                 "case {label:?}: the allocation of {allocated} inside the reservation must \
                  succeed, got {} {}",
+                put.status,
+                put.text()
+            );
+        }
+        if let Some(allocated) = case.allocated_on_alias {
+            let put = put_provisioned(&router, SUBJECT, ALIAS, allocated).await;
+            assert_eq!(
+                put.status,
+                202,
+                "case {label:?}: the alias allocation of {allocated} inside the reservation \
+                 must succeed, got {} {}",
                 put.status,
                 put.text()
             );
@@ -514,8 +575,11 @@ async fn the_per_function_cap_states_one_sentence_from_either_side() {
         }
 
         if let Some(amount) = case.reserve {
+            // The total the reservation is weighed against is the sum over every qualifier
+            // that keeps capacity initialised, not one configuration's amount.
+            let total = case.allocated.unwrap_or(0) + case.allocated_on_alias.unwrap_or(0);
             let refused = put_concurrency(&router, SUBJECT, amount).await;
-            assert_refused_with(label, &refused, FUNCTION_CAP_SENTENCE);
+            assert_refused_with(label, &refused, &shrink_sentence(amount, total));
             // The refusal stored nothing: the function still reserves what it did.
             let held = get_concurrency(&router, SUBJECT).await;
             assert_eq!(
@@ -524,6 +588,154 @@ async fn the_per_function_cap_states_one_sentence_from_either_side() {
                 "case {label:?}: a refused reservation must leave {} reserved, got {}",
                 case.reserved,
                 held.text()
+            );
+        }
+    }
+}
+
+/// One row of the shrink-boundary table: the capacity the subject keeps initialised on its
+/// published version and on its alias, the reservation it is then asked to hold, and
+/// whether the rule admits it.
+#[derive(Debug)]
+struct ShrinkCase {
+    name: &'static str,
+    on_version: i64,
+    on_alias: i64,
+    reserve: i64,
+    admitted: bool,
+}
+
+/// The rows: the boundary of the rule from the reserving side — a reservation exactly at
+/// the total kept initialised is admitted and one unit below it is refused — over a total
+/// held on one qualifier and on two, at a single execution, in the middle, and at the
+/// largest the account admits, plus a function keeping nothing initialised at all.
+const SHRINK_CASES: &[ShrinkCase] = &[
+    ShrinkCase {
+        name: "a reservation exactly at what one qualifier keeps initialised",
+        on_version: 4,
+        on_alias: 0,
+        reserve: 4,
+        admitted: true,
+    },
+    ShrinkCase {
+        name: "one below what one qualifier keeps initialised",
+        on_version: 4,
+        on_alias: 0,
+        reserve: 3,
+        admitted: false,
+    },
+    ShrinkCase {
+        name: "a reservation exactly at the total two qualifiers keep initialised",
+        on_version: 2,
+        on_alias: 3,
+        reserve: 5,
+        admitted: true,
+    },
+    ShrinkCase {
+        name: "one below the total two qualifiers keep initialised",
+        on_version: 2,
+        on_alias: 3,
+        reserve: 4,
+        admitted: false,
+    },
+    ShrinkCase {
+        name: "a reservation of none on a function keeping nothing initialised",
+        on_version: 0,
+        on_alias: 0,
+        reserve: 0,
+        admitted: true,
+    },
+    ShrinkCase {
+        name: "a reservation exactly at the largest total the account admits",
+        on_version: MAX_RESERVABLE - 400,
+        on_alias: 400,
+        reserve: MAX_RESERVABLE,
+        admitted: true,
+    },
+    ShrinkCase {
+        name: "one below the largest total the account admits",
+        on_version: MAX_RESERVABLE - 400,
+        on_alias: 400,
+        reserve: MAX_RESERVABLE - 1,
+        admitted: false,
+    },
+    ShrinkCase {
+        name: "one below a single initialised execution",
+        on_version: 1,
+        on_alias: 0,
+        reserve: 0,
+        admitted: false,
+    },
+];
+
+#[tokio::test]
+async fn a_reservation_is_admitted_exactly_down_to_the_capacity_kept_initialised() {
+    for case in SHRINK_CASES {
+        let engine = Arc::new(engine::InMemoryEngine::new());
+        let router = router_on(&engine);
+        let label = case.name;
+
+        subject_with_qualifiers(&router, &engine, SUBJECT).await;
+        // The reservation every row starts from: the largest the account admits, so the
+        // capacity each row keeps initialised fits inside it and the only rule the call
+        // under test can violate is the per-function one.
+        let opened = put_concurrency(&router, SUBJECT, MAX_RESERVABLE).await;
+        assert_eq!(
+            opened.status,
+            200,
+            "case {label:?}: the opening reservation of {MAX_RESERVABLE} must succeed, got {} {}",
+            opened.status,
+            opened.text()
+        );
+        for (qualifier, amount) in [
+            (Qualifier::Version, case.on_version),
+            (Qualifier::Alias, case.on_alias),
+        ] {
+            if amount == 0 {
+                continue;
+            }
+            let put = put_provisioned(&router, SUBJECT, qualifier.label(), amount).await;
+            assert_eq!(
+                put.status,
+                202,
+                "case {label:?}: the allocation of {amount} on {qualifier:?} must succeed, got \
+                 {} {}",
+                put.status,
+                put.text()
+            );
+        }
+
+        let total = case.on_version + case.on_alias;
+        let answer = put_concurrency(&router, SUBJECT, case.reserve).await;
+        if case.admitted {
+            assert_eq!(
+                answer.status,
+                200,
+                "case {label:?}: a reservation of {} at or above the {total} kept initialised \
+                 must succeed, got {} {}",
+                case.reserve,
+                answer.status,
+                answer.text()
+            );
+            let held = get_concurrency(&router, SUBJECT).await.number(
+                "/ReservedConcurrentExecutions",
+            );
+            assert_eq!(
+                held,
+                Some(case.reserve),
+                "case {label:?}: an admitted reservation of {} must be stored, got {held:?}",
+                case.reserve
+            );
+        } else {
+            assert_refused_with(label, &answer, &shrink_sentence(case.reserve, total));
+            let held = get_concurrency(&router, SUBJECT).await.number(
+                "/ReservedConcurrentExecutions",
+            );
+            assert_eq!(
+                held,
+                Some(MAX_RESERVABLE),
+                "case {label:?}: a refused reservation must leave {MAX_RESERVABLE} reserved, \
+                 got {held:?}"
             );
         }
     }

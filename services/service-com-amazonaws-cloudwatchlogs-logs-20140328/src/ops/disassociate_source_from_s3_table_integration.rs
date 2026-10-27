@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateSourceFromS3TableIntegration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateSourceFromS3TableIntegration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateSourceFromS3TableIntegration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: takes the query access of the association the request's `identifier` names
+//! away and leaves its data deletion running, so the association is reported
+//! `DATA_SOURCE_DELETE_IN_PROGRESS` until the CLOCK has finished it, and hands back that
+//! identifier — or refuses an identifier no association of this account is stored under.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +145,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateSourceFromS3TableIntegration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateSourceFromS3TableIntegrationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateSourceFromS3TableIntegration"))
+        // `ctx` carries only request metadata: an association is identified by the
+        // identifier the request names and by nothing else.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DisassociateSourceFromS3TableIntegrationError::from(
+                DisassociateSourceFromS3TableIntegrationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let mut store = state.lock();
+
+        // An association whose data the clock has finished deleting is gone, so this call
+        // acts on the associations that are still there — and one already deleted is a
+        // missing resource, not a second disassociate.
+        let now_ms = crate::state::now_ms();
+        store.materialize_due_s3_table_integration_source_removals(now_ms);
+
+        let Some(association) = store
+            .s3_table_integration_sources
+            .get_mut(&input.identifier)
+        else {
+            return Err(
+                DisassociateSourceFromS3TableIntegrationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(
+                            crate::state::s3_table_integration_source_not_found_message(
+                                &input.identifier,
+                            ),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "Disassociates a data source from an S3 Table Integration, removing query access
+        // and deleting all associated data from the integration": the query access goes now
+        // and the data deletion is left running, which is the status the association is
+        // reported in until the clock has finished it. A second disassociate of the same
+        // association does not postpone that instant.
+        association.start_removal(now_ms);
+
+        // "The unique identifier of the association that was removed" — the one the request
+        // named, which is the association this call acted on.
+        Ok(DisassociateSourceFromS3TableIntegrationOutput {
+            identifier: Some(input.identifier),
+        })
     }
 }

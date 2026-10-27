@@ -105,6 +105,14 @@
 //! [`ComAmazonawsCloudwatchlogsLogs20140328State::integrations`], each one an
 //! [`IntegrationRecord`] carrying the instant the clock owes it its ACTIVE status.
 //!
+//! The data-source associations of the account's S3 Table Integrations — each the pairing
+//! `AssociateSourceToS3TableIntegration` creates and `ListSourcesForS3TableIntegration`
+//! reports — live in
+//! [`ComAmazonawsCloudwatchlogsLogs20140328State::s3_table_integration_sources`], each one
+//! an [`S3TableIntegrationSourceRecord`] carrying the instant the clock owes its deletion.
+//! An association names its integration by the ARN the associate was given rather than by a
+//! record of this store: no operation of this service creates an S3 Table Integration.
+//!
 //! The account's lookup tables — the reference data `CreateLookupTable` uploads and
 //! `GetLookupTable` reports — live in
 //! [`ComAmazonawsCloudwatchlogsLogs20140328State::lookup_tables`], each one a
@@ -844,6 +852,53 @@ pub const INTEGRATION_PROVISIONING_DELAY_MS: i64 = 500;
 /// ("Currently, only one integration can be created in an account").
 pub const MAX_INTEGRATIONS: usize = 1;
 
+/// The status a data-source association of an S3 Table Integration is in while it gives
+/// query access, from the model's `S3TableIntegrationSourceStatus` enum (`ACTIVE` |
+/// `UNHEALTHY` | `FAILED` | `DATA_SOURCE_DELETE_IN_PROGRESS`).
+///
+/// `AssociateSourceToS3TableIntegration` "enables querying log data using analytics
+/// engines that support Iceberg" and the enum holds no status for an association still
+/// being made, so an accepted associate stores one already in this status.
+pub const S3_TABLE_INTEGRATION_SOURCE_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// The status a data-source association carries once it has been disassociated, from the
+/// model's `S3TableIntegrationSourceStatus` enum.
+///
+/// `DisassociateSourceFromS3TableIntegration` is "removing query access and deleting all
+/// associated data from the integration": the deletion of that data is work the call leaves
+/// running, which is what this status reports while it runs.
+pub const S3_TABLE_INTEGRATION_SOURCE_STATUS_DELETE_IN_PROGRESS: &str =
+    "DATA_SOURCE_DELETE_IN_PROGRESS";
+
+/// How long after it is disassociated a data-source association takes to be gone — the
+/// span it is reported in [`S3_TABLE_INTEGRATION_SOURCE_STATUS_DELETE_IN_PROGRESS`] for.
+///
+/// AWS documents no duration for deleting the associated data, so the span is THE
+/// EMULATOR'S OWN CHOICE. It is deliberately not zero: the model carries a status for an
+/// association whose data is still being deleted, so a caller that lists the integration's
+/// sources straight after disassociating one still observes it in that status.
+pub const S3_TABLE_INTEGRATION_SOURCE_DELETION_DELAY_MS: i64 = 3_000;
+
+/// The most data-source associations of S3 Table Integrations this emulator will hold.
+///
+/// Emulator resource guard, NOT an AWS quota: CloudWatch Logs publishes no quota for the
+/// data sources an S3 Table Integration may have, and nothing in the request bounds how
+/// many a caller makes — the integration they are made against is named by an ARN rather
+/// than by a resource of this store, so no other cap dominates this one. An associate past
+/// it is refused with the only quota-shaped error the operation models
+/// (`ThrottlingException`, "The request was throttled because of quota limits") BEFORE a
+/// record is allocated, rather than retained.
+pub const MAX_S3_TABLE_INTEGRATION_SOURCES: usize = 500;
+
+/// The refusal an associate past [`MAX_S3_TABLE_INTEGRATION_SOURCES`] carries: the cap that
+/// refused it, so a caller can tell this guard from a request it could fix.
+pub fn s3_table_integration_sources_cap_message() -> String {
+    format!(
+        "the maximum of {MAX_S3_TABLE_INTEGRATION_SOURCES} data source association(s) has been \
+         reached"
+    )
+}
+
 /// An OpenSearch Service resource of an integration that is there, from the model's
 /// `OpenSearchResourceStatusType` enum (`ACTIVE` | `NOT_FOUND` | `ERROR`).
 pub const OPENSEARCH_RESOURCE_STATUS_ACTIVE: &str = "ACTIVE";
@@ -1044,6 +1099,24 @@ pub struct ComAmazonawsCloudwatchlogsLogs20140328State {
     /// `ListIntegrations` enumerates by is total and never reused — including after the
     /// integration holding a position has been deleted.
     pub next_integration_seq: u64,
+    /// Every data-source association of an S3 Table Integration — the one
+    /// `AssociateSourceToS3TableIntegration` creates,
+    /// `ListSourcesForS3TableIntegration` reports and
+    /// `DisassociateSourceFromS3TableIntegration` removes — keyed by the
+    /// `S3TableIntegrationSourceIdentifier` the associate minted for it, which is the one
+    /// member every other operation of the family identifies one by.
+    ///
+    /// An association is account-level rather than a log group's: it pairs a data source
+    /// with the integration named by an ARN, and no log group owns either. A `BTreeMap` so
+    /// one pass enumerates in identifier order — which is the order the identifiers were
+    /// minted in ([`mint_s3_table_integration_source_identifier`]) — without re-sorting,
+    /// which is also what makes `ListSourcesForS3TableIntegration`'s pagination cursor
+    /// stable.
+    pub s3_table_integration_sources: BTreeMap<String, S3TableIntegrationSourceRecord>,
+    /// Monotonic counter behind the `S3TableIntegrationSourceIdentifier`s an associate
+    /// mints, so every association gets an identifier no earlier one used — including after
+    /// the association holding an identifier has been disassociated.
+    pub next_s3_table_integration_source_seq: u64,
 }
 
 impl ComAmazonawsCloudwatchlogsLogs20140328State {
@@ -1092,6 +1165,65 @@ impl ComAmazonawsCloudwatchlogsLogs20140328State {
         let seq = self.next_integration_seq;
         self.next_integration_seq = self.next_integration_seq.saturating_add(1);
         seq
+    }
+
+    /// Take the next S3-Table-Integration source sequence number, advancing the counter.
+    pub fn take_s3_table_integration_source_seq(&mut self) -> u64 {
+        let seq = self.next_s3_table_integration_source_seq;
+        self.next_s3_table_integration_source_seq =
+            self.next_s3_table_integration_source_seq.saturating_add(1);
+        seq
+    }
+
+    /// Drop every data-source association whose deletion the clock has ALREADY made due, as
+    /// of `now_ms`.
+    ///
+    /// Disassociating one is "removing query access and deleting all associated data from
+    /// the integration", work that outlives the call: the association is left in
+    /// [`S3_TABLE_INTEGRATION_SOURCE_STATUS_DELETE_IN_PROGRESS`] with the instant its
+    /// deletion is due ([`S3TableIntegrationSourceRecord::removal_due_ms`]), and every
+    /// operation of the family calls this before it reads, so what it reports is what the
+    /// clock already decided — never a deletion finished because something looked.
+    pub fn materialize_due_s3_table_integration_source_removals(&mut self, now_ms: i64) {
+        self.s3_table_integration_sources
+            .retain(|_, source| !source.removal_due(now_ms));
+    }
+
+    /// The associations of ONE S3 Table Integration, in the order their identifiers were
+    /// minted, which is what `ListSourcesForS3TableIntegration` reports: "a list of data
+    /// source associations for a specified S3 Table Integration".
+    ///
+    /// Read AFTER [`Self::materialize_due_s3_table_integration_source_removals`], so an
+    /// association the clock has already deleted is not reported.
+    pub fn s3_table_integration_sources_of(
+        &self,
+        integration_arn: &str,
+    ) -> Vec<&S3TableIntegrationSourceRecord> {
+        self.s3_table_integration_sources
+            .values()
+            .filter(|source| source.integration_arn == integration_arn)
+            .collect()
+    }
+
+    /// The association that already gives `data_source` query access through the
+    /// integration `integration_arn`, if the account holds one.
+    ///
+    /// An association IS the pairing of one data source with one integration, so a second
+    /// associate of the same pair names the same association rather than a second one. An
+    /// association whose data is being deleted
+    /// ([`S3_TABLE_INTEGRATION_SOURCE_STATUS_DELETE_IN_PROGRESS`]) is not one of them: its
+    /// query access is already removed, so associating the pair again is a new association.
+    pub fn associated_s3_table_integration_source(
+        &self,
+        integration_arn: &str,
+        data_source: &crate::ops::types::DataSource,
+    ) -> Option<&S3TableIntegrationSourceRecord> {
+        self.s3_table_integration_sources.values().find(|source| {
+            source.integration_arn == integration_arn
+                && source.removal_due_ms.is_none()
+                && source.data_source.name == data_source.name
+                && source.data_source.source_type == data_source.r#type
+        })
     }
 
     /// Take the next query-definition sequence number, advancing the counter.
@@ -4101,6 +4233,117 @@ impl IntegrationRecord {
     }
 }
 
+/// One data-source association of an S3 Table Integration as it is stored: the model's
+/// `S3TableIntegrationSource` plus the integration it belongs to (the `integrationArn` the
+/// associate named, which only `ListSourcesForS3TableIntegration` reads back, as the
+/// integration it lists the sources of) and the instant its deletion is due.
+///
+/// The integration itself is NOT a resource this service holds: `PutIntegration`'s
+/// `integrationType` admits only `OPENSEARCH`, so no operation here creates an S3 Table
+/// Integration and the ARN the associate names is the only thing identifying one. An
+/// association is therefore stored against that ARN as the request gave it, and the
+/// family's reader lists the associations whose ARN matches.
+#[derive(Debug, Clone)]
+pub struct S3TableIntegrationSourceRecord {
+    /// `S3TableIntegrationSource$identifier` — "The unique identifier for this data source
+    /// association", minted by the associate
+    /// ([`mint_s3_table_integration_source_identifier`]) and the key this record is stored
+    /// under.
+    pub identifier: String,
+    /// The `integrationArn` the associate named: "The Amazon Resource Name (ARN) of the S3
+    /// Table Integration to associate the data source with", which is what
+    /// `ListSourcesForS3TableIntegration` selects an integration's associations by.
+    pub integration_arn: String,
+    /// `S3TableIntegrationSource$dataSource` — "The data source associated with the S3
+    /// Table Integration", exactly as the associate named it. Held as the
+    /// [`DataSourceRecord`] every data source of this service is held as; an association's
+    /// carries no format, because the request's `DataSource` has no such member.
+    pub data_source: DataSourceRecord,
+    /// `S3TableIntegrationSource$status` — "The current status of the data source
+    /// association", one of the model's `S3TableIntegrationSourceStatus` values.
+    pub status: String,
+    /// `S3TableIntegrationSource$createdTimeStamp` — "The timestamp when the data source
+    /// association was created", in epoch milliseconds.
+    pub created_time_stamp_ms: i64,
+    /// `S3TableIntegrationSource$parentSourceIdentifier` — "The identifier of the parent
+    /// data source for this association". `None` for an association a request made: the
+    /// associate names one data source and no parent, so nothing it creates has one.
+    pub parent_source_identifier: Option<String>,
+    /// The instant this association is due to be GONE, stored rather than waited for: a
+    /// reader drops it once the clock is past it
+    /// ([`ComAmazonawsCloudwatchlogsLogs20140328State::materialize_due_s3_table_integration_source_removals`]).
+    /// `None` while the association is still associated, which is also what tells an
+    /// associate of the same pair that it names this association rather than a new one.
+    pub removal_due_ms: Option<i64>,
+}
+
+impl S3TableIntegrationSourceRecord {
+    /// A brand-new association of `data_source` with the integration `integration_arn`,
+    /// giving query access as of `created_time_stamp_ms`
+    /// ([`S3_TABLE_INTEGRATION_SOURCE_STATUS_ACTIVE`]). This is what
+    /// `AssociateSourceToS3TableIntegration` stores.
+    pub fn new(
+        identifier: &str,
+        integration_arn: &str,
+        data_source: &crate::ops::types::DataSource,
+        created_time_stamp_ms: i64,
+    ) -> Self {
+        Self {
+            identifier: identifier.to_string(),
+            integration_arn: integration_arn.to_string(),
+            data_source: DataSourceRecord {
+                name: data_source.name.clone(),
+                source_type: data_source.r#type.clone(),
+                format: None,
+            },
+            status: S3_TABLE_INTEGRATION_SOURCE_STATUS_ACTIVE.to_string(),
+            created_time_stamp_ms,
+            parent_source_identifier: None,
+            removal_due_ms: None,
+        }
+    }
+
+    /// Take this association's query access away and leave its data deletion running, as of
+    /// `now_ms`: what `DisassociateSourceFromS3TableIntegration` does. An association whose
+    /// deletion is already running keeps the instant it was first due, so a second
+    /// disassociate does not postpone it.
+    pub fn start_removal(&mut self, now_ms: i64) {
+        if self.removal_due_ms.is_some() {
+            return;
+        }
+        self.status = S3_TABLE_INTEGRATION_SOURCE_STATUS_DELETE_IN_PROGRESS.to_string();
+        self.removal_due_ms =
+            Some(now_ms.saturating_add(S3_TABLE_INTEGRATION_SOURCE_DELETION_DELAY_MS));
+    }
+
+    /// Whether the clock has already finished deleting this association's data, so the
+    /// association itself is gone as of `now_ms`.
+    pub fn removal_due(&self, now_ms: i64) -> bool {
+        self.removal_due_ms.is_some_and(|due| due <= now_ms)
+    }
+
+    /// This association as the model's `S3TableIntegrationSource`, which is what
+    /// `ListSourcesForS3TableIntegration` reports, so one record renders the same way
+    /// through any reader.
+    ///
+    /// No `statusReason` is reported: the member is "additional information about the
+    /// status", and both statuses an association of this emulator reaches are already said
+    /// by the status itself.
+    pub fn source(&self) -> crate::ops::types::S3TableIntegrationSource {
+        crate::ops::types::S3TableIntegrationSource {
+            identifier: Some(self.identifier.clone()),
+            data_source: Some(crate::ops::types::DataSource {
+                name: self.data_source.name.clone(),
+                r#type: self.data_source.source_type.clone(),
+            }),
+            status: Some(self.status.clone()),
+            status_reason: None,
+            created_time_stamp: Some(self.created_time_stamp_ms),
+            parent_source_identifier: self.parent_source_identifier.clone(),
+        }
+    }
+}
+
 /// Whether an ARN names an IAM role — what `OpenSearchResourceConfig$dataSourceRoleArn`
 /// must be ("Specify the ARN of an IAM role that CloudWatch Logs will use to create the
 /// integration"). An IAM ARN's resource part is `role/<path><name>`.
@@ -5390,7 +5633,8 @@ pub struct SyslogConfigurationRecord {
 /// of the API surface rather than a shortcut: the model's `LogGroup` has no data-source
 /// member, no operation associates a data source WITH a log group (the one operation that
 /// names a `DataSource`, `AssociateSourceToS3TableIntegration`, attaches it to an S3
-/// Tables integration, and is a 501 stub), and the data sources AWS reports are the ones
+/// Tables integration — [`S3TableIntegrationSourceRecord`] — rather than to a log group),
+/// and the data sources AWS reports are the ones
 /// its own vended-log ingestion created. So the aggregate grouped by data-source
 /// characteristics counts nothing here — which is a 200 with an empty list, not a
 /// refusal — and both readers go through this field, so they report whatever a later
@@ -6633,6 +6877,18 @@ pub fn mint_query_id(seq: u64) -> String {
     mint_uuid_from_seq(seq)
 }
 
+/// The `S3TableIntegrationSourceIdentifier` `AssociateSourceToS3TableIntegration` hands
+/// back for the association it creates: "The unique identifier for the association between
+/// the data source and S3 Table Integration", minted from the store's monotonic association
+/// counter so it is unique for the life of the store and DERIVED FROM STORED STATE.
+///
+/// Minted through the shared [`mint_uuid_from_seq`] every id of this service AWS renders as
+/// a UUID comes from, which also makes the minting order the identifier order the
+/// associations are stored and enumerated in.
+pub fn mint_s3_table_integration_source_identifier(seq: u64) -> String {
+    mint_uuid_from_seq(seq)
+}
+
 /// The refusal CloudWatch Logs answers when the resource an operation names is not
 /// there. The service states the resource KIND that is missing, in the sentence form the
 /// model documents for `ResourceNotFoundException` — "The specified resource does not
@@ -6668,6 +6924,15 @@ pub const POLICY_REVISION_CONFLICT_MESSAGE: &str =
 /// per request value, so every name the account does not hold is refused identically.
 pub const DELIVERY_DESTINATION_NOT_FOUND_MESSAGE: &str =
     "Requested Delivery Destination does not exist in this account.";
+
+/// The refusal CloudWatch Logs builds from the request when the identifier a
+/// `DisassociateSourceFromS3TableIntegration` names is not an association of an S3 Table
+/// Integration this account holds. The message interpolates the requested identifier, so a
+/// caller disassociating sources in a loop can attribute the refusal to one identifier
+/// instead of guessing which of its requests failed.
+pub fn s3_table_integration_source_not_found_message(identifier: &str) -> String {
+    format!("Association not found for identifier: {identifier}")
+}
 
 /// The refusal CloudWatch Logs builds from the request when the resource policy the
 /// caller named is not there. The message interpolates the requested `policyName`, so a

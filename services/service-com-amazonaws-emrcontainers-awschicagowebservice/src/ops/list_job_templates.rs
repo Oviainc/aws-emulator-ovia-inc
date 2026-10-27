@@ -74,28 +74,18 @@ use super::types::*;
 /// Whether one stored template satisfies every filter the request carried. A filter the
 /// request omitted constrains nothing.
 ///
-/// `createdBefore` / `createdAfter` bound `createdAt` strictly, the same way
-/// `ListJobRuns` bounds a job run's, so the two together name an open interval and
-/// neither ever returns the template created exactly at a bound.
+/// `createdBefore` / `createdAfter` are the window every paginated listing in this service
+/// shares, so they are applied out of the one place that holds the rule
+/// ([`crate::state::within_created_bounds`]).
 fn matches_filters(
     record: &crate::state::JobTemplateRecord,
     input: &ListJobTemplatesInput,
 ) -> bool {
-    if input
-        .created_before
-        .as_ref()
-        .is_some_and(|bound| record.created_at_millis >= crate::state::millis_of(bound))
-    {
-        return false;
-    }
-    if input
-        .created_after
-        .as_ref()
-        .is_some_and(|bound| record.created_at_millis <= crate::state::millis_of(bound))
-    {
-        return false;
-    }
-    true
+    crate::state::within_created_bounds(
+        record.created_at_millis,
+        input.created_before.as_ref(),
+        input.created_after.as_ref(),
+    )
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative

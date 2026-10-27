@@ -69,6 +69,8 @@ mod list_ingest_configurations;
 mod list_participant_replicas_paging;
 #[path = "all/participant_events.rs"]
 mod participant_events;
+#[path = "all/participant_ingest_configuration.rs"]
+mod participant_ingest_configuration;
 #[path = "all/participant_replication.rs"]
 mod participant_replication;
 #[path = "all/participant_replication_stop.rs"]

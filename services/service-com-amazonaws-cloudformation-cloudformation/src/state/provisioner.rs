@@ -86,7 +86,10 @@
 //!   are not attributes lifted out (the name, the tag list and the data-protection policy,
 //!   each a `CreateTopic` member of its own), the inline `Subscription` list made by
 //!   `Subscribe` calls on the created topic, and `DeliveryStatusLogging` written as the
-//!   per-protocol feedback attributes SNS names;
+//!   per-protocol feedback attributes SNS names. A changed declaration reaches the topic
+//!   that exists through the one call that writes an attribute of a live one
+//!   ([`update_topic`]), its tags through that service's own tagging calls
+//!   ([`retag_topic`]);
 //! * `AWS::FIS::ExperimentTemplate`'s are the same members in lower camel case, but its
 //!   `Targets` and `Actions` are MAPS keyed by names the template chose (as are a target's
 //!   `ResourceTags` and `Parameters` and an action's `Parameters` and `Targets`), so its
@@ -1027,6 +1030,11 @@ impl Provisioner {
             // changed declaration of one is applied to the subscription the stack created
             // rather than dropped ([`update_subscription`]).
             Self::SnsSubscription => update_subscription(ctx, region, resource, declared).await,
+            // A topic's properties ARE its attributes, and SNS has one call that writes an
+            // attribute of a live topic, so a changed declaration is applied to the topic
+            // the stack created — under the ARN its `Ref` resolves to — rather than
+            // replacing it ([`update_topic`]).
+            Self::SnsTopic => update_topic(ctx, region, resource, declared).await.map(Some),
             // Every other type's in-place update is its own entry here, exactly as its
             // create and delete are: until one is written, nothing is asked of the owning
             // service and the deployment says so.
@@ -1075,6 +1083,10 @@ impl Provisioner {
             // A key's tags are KMS's own `TagResource`/`UntagResource`, which is why
             // [`update_kms_key`] does not carry them either.
             Self::KmsKey => retag_kms_key(ctx, region, resource, declared, propagated).await,
+            // A topic's tags are SNS's own `TagResource`/`UntagResource` — `Tags` is a
+            // member of `CreateTopic` and no attribute of a topic — which is why
+            // [`update_topic`] does not carry them.
+            Self::SnsTopic => retag_topic(ctx, region, resource, declared, propagated).await,
             // Every other type's re-tagging is its own entry here, for the same reason its
             // create, update and delete are: the tag set is the same for every type, but the
             // calls that apply it are each service's own.
@@ -5187,6 +5199,226 @@ async fn create_topic(
     let mut attributes = BTreeMap::new();
     attributes.insert("TopicArn".to_string(), arn);
     Ok(Created::attributes(attributes))
+}
+
+/// What a topic attribute goes back to when the declaration stops carrying it: the value
+/// Amazon SNS documents as that attribute's absent state.
+///
+/// A policy-valued attribute is REMOVED by an empty value, a topic comes off its KMS key the
+/// same way, the display name a topic was never given is the empty one, and the three
+/// switches go back to the defaults `SetTopicAttributes` documents for them ("By default
+/// TracingConfig is set to PassThrough", "By default SignatureVersion is set to 1", content
+/// based deduplication being off). An attribute with no documented absent value — a
+/// delivery-status feedback role or sample rate — is left as it is rather than written a
+/// value SNS does not define, exactly as a subscription's own
+/// [`SUBSCRIPTION_ATTRIBUTE_CLEARED`] leaves one.
+const TOPIC_ATTRIBUTE_CLEARED: &[(&str, &str)] = &[
+    ("ArchivePolicy", ""),
+    ("ContentBasedDeduplication", "false"),
+    ("DeliveryPolicy", ""),
+    ("DisplayName", ""),
+    ("KmsMasterKeyId", ""),
+    ("Policy", ""),
+    ("SignatureVersion", "1"),
+    ("TracingConfig", "PassThrough"),
+];
+
+/// The Amazon SNS call that writes ONE attribute of a topic that already exists.
+const SNS_SET_TOPIC_ATTRIBUTES: &str = "SetTopicAttributes";
+
+/// Apply a CHANGED `AWS::SNS::Topic` declaration to the topic that already exists.
+///
+/// A topic's configuration is its ATTRIBUTES ([`topic_attributes`]), and Amazon SNS has one
+/// call that writes an attribute of a live topic — "allows a topic owner to set an attribute
+/// of the topic to a new value" — so that is what this makes, once per attribute whose
+/// declared value moved; an attribute the declaration stopped carrying goes back to its
+/// documented absent value ([`TOPIC_ATTRIBUTE_CLEARED`]). An attribute neither revision
+/// changed is not sent at all, and nothing is called where nothing changed.
+///
+/// The topic keeps its name, so it keeps the ARN its `Ref` resolves to, its subscribers and
+/// everything else it holds: the change is applied to the topic the stack created rather
+/// than replacing it. The create reported the `TopicArn` attribute and the topic still
+/// answers to it, so this reports no attribute of its own.
+///
+/// The declaration's `DataProtectionPolicy` is no attribute: it is a member of the create
+/// and of the one call that writes it on a topic that exists, so a changed document travels
+/// through that call — and SNS's own answer to it is what the deployment reports.
+///
+/// The inline `Subscription` list is not a property of the topic either: each entry is a
+/// subscription of Amazon SNS's own, which `Subscribe` creates and `Unsubscribe` removes
+/// against the subscription ARN that answered — an identifier this type's record does not
+/// carry. A declaration that changes that list is therefore REFUSED rather than quietly
+/// dropped, so the stack never reports a topic whose subscribers differ from its
+/// declaration; `AWS::SNS::Subscription` is the type whose own resources this emulator
+/// reconciles.
+async fn update_topic(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+) -> Result<Created, Refusal> {
+    let arn = resource.physical_resource_id.clone();
+    if declared_subscriptions(declared) != declared_subscriptions(&resource.properties) {
+        return Err(Refusal {
+            code: NOT_IMPLEMENTED.to_string(),
+            message: format!(
+                "this emulator does not change the inline Subscription list of an existing \
+                 {SNS_TOPIC}; the resource was left as it is."
+            ),
+        });
+    }
+    let held = topic_attributes(&resource.properties);
+    let wanted = topic_attributes(declared);
+    for (name, value) in &wanted {
+        if held.get(name) != Some(value) {
+            set_topic_attribute(ctx, region, &arn, name, value).await?;
+        }
+    }
+    for name in held.keys() {
+        if wanted.contains_key(name) {
+            continue;
+        }
+        let Some((_, absent)) = TOPIC_ATTRIBUTE_CLEARED
+            .iter()
+            .find(|(attribute, _)| attribute == name)
+        else {
+            continue;
+        };
+        set_topic_attribute(ctx, region, &arn, name, absent).await?;
+    }
+    let policy = |properties: &Value| {
+        properties
+            .get("DataProtectionPolicy")
+            .map(attribute_text)
+            .unwrap_or_default()
+    };
+    if policy(declared) != policy(&resource.properties) {
+        call_query(
+            ctx,
+            SNS_SIGNING_NAME,
+            region,
+            SNS_API_VERSION,
+            "PutDataProtectionPolicy",
+            &[
+                ("ResourceArn".to_string(), arn.clone()),
+                ("DataProtectionPolicy".to_string(), policy(declared)),
+            ],
+        )
+        .await?;
+    }
+    Ok(Created::default())
+}
+
+/// Write one attribute of a topic that already exists, through the one Amazon SNS call that
+/// takes a single attribute and its value.
+async fn set_topic_attribute(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    topic_arn: &str,
+    name: &str,
+    value: &str,
+) -> Result<(), Refusal> {
+    call_query(
+        ctx,
+        SNS_SIGNING_NAME,
+        region,
+        SNS_API_VERSION,
+        SNS_SET_TOPIC_ATTRIBUTES,
+        &[
+            ("TopicArn".to_string(), topic_arn.to_string()),
+            ("AttributeName".to_string(), name.to_string()),
+            ("AttributeValue".to_string(), value.to_string()),
+        ],
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Bring the tags of the topic a resource record names to the ones this deployment gives
+/// it, through Amazon SNS's own `TagResource` and `UntagResource`.
+///
+/// The set is the declaration's own `Tags` beside the ones CloudFormation propagates
+/// ([`tags_of`]) — the same set the CREATE applied — so a key outside it is one this
+/// deployment no longer gives the resource and is removed, and one in it with another value
+/// is re-valued. Where the two sets already agree nothing is called at all, which is what
+/// makes this safe to ask on every deployment.
+///
+/// A topic SNS no longer has (`NotFound`) has no tags to reconcile.
+async fn retag_topic(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+    propagated: &[(String, String)],
+) -> Result<(), Refusal> {
+    let arn = resource.physical_resource_id.clone();
+    let listed = match call_query(
+        ctx,
+        SNS_SIGNING_NAME,
+        region,
+        SNS_API_VERSION,
+        "ListTagsForResource",
+        &[("ResourceArn".to_string(), arn.clone())],
+    )
+    .await
+    {
+        Ok(answered) => answered,
+        Err(refusal) if refusal.code == NOT_FOUND => return Ok(()),
+        Err(refusal) => return Err(refusal),
+    };
+    // Amazon SNS's `Tag` carries a `Key` and a `Value` on every entry of the list its tag
+    // read answers with, so the two members are read as parallel lists and paired. (Named
+    // through its module rather than imported, to keep this arm out of the import list every
+    // other arm shares.)
+    let held: Vec<(String, String)> = super::provisioning::xml_elements(&listed, "Key")
+        .into_iter()
+        .zip(super::provisioning::xml_elements(&listed, "Value"))
+        .collect();
+    let desired = tags_of(declared, propagated);
+    let added: Vec<(String, String)> = desired
+        .iter()
+        .filter(|(key, value)| {
+            held.iter()
+                .find(|(held_key, _)| held_key == key)
+                .is_none_or(|(_, held_value)| held_value != value)
+        })
+        .cloned()
+        .collect();
+    let removed: Vec<String> = held
+        .iter()
+        .filter(|(key, _)| !desired.iter().any(|(wanted, _)| wanted == key))
+        .map(|(key, _)| key.clone())
+        .collect();
+    if !added.is_empty() {
+        let mut parameters = vec![("ResourceArn".to_string(), arn.clone())];
+        push_tag_list(&mut parameters, "Tags", "member", &added);
+        call_query(
+            ctx,
+            SNS_SIGNING_NAME,
+            region,
+            SNS_API_VERSION,
+            "TagResource",
+            &parameters,
+        )
+        .await?;
+    }
+    if !removed.is_empty() {
+        let mut parameters = vec![("ResourceArn".to_string(), arn)];
+        for (index, key) in removed.iter().enumerate() {
+            let position = index + 1;
+            parameters.push((format!("TagKeys.member.{position}"), key.clone()));
+        }
+        call_query(
+            ctx,
+            SNS_SIGNING_NAME,
+            region,
+            SNS_API_VERSION,
+            "UntagResource",
+            &parameters,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// Delete the topic a stack created. A topic SNS no longer has (`NotFound`) is already in

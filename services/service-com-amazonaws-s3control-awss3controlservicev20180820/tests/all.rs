@@ -41,6 +41,8 @@ mod public_access_block;
 mod state_roundtrip;
 #[path = "all/storage_lens_configuration.rs"]
 mod storage_lens_configuration;
+#[path = "all/storage_lens_configuration_delete.rs"]
+mod storage_lens_configuration_delete;
 #[path = "all/storage_lens_configuration_list.rs"]
 mod storage_lens_configuration_list;
 #[path = "all/storage_lens_configuration_tagging_delete.rs"]
