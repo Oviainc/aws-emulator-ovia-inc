@@ -362,6 +362,76 @@ fn catalog_id(slug: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// List filters
+// ---------------------------------------------------------------------------
+
+/// One entry of a single-ARN resource filter: the structure a filtered list operation
+/// declares for the resource kind it narrows to, carrying that resource's ARN.
+///
+/// The service models one such structure per filtered kind, each with a single
+/// optional `Arn` member
+/// (`smithy_query(query="shape",shape="DomainResourceFilter,ObjectiveResourceFilter")`),
+/// so this trait is what lets the one rule below read either of them.
+pub trait ResourceFilterEntry {
+    /// The ARN the entry names, or `None` when the caller set no `Arn` on it.
+    fn filter_arn(&self) -> Option<&str>;
+}
+
+impl ResourceFilterEntry for crate::ops::types::DomainResourceFilter {
+    fn filter_arn(&self) -> Option<&str> {
+        self.arn.as_deref()
+    }
+}
+
+impl ResourceFilterEntry for crate::ops::types::ObjectiveResourceFilter {
+    fn filter_arn(&self) -> Option<&str> {
+        self.arn.as_deref()
+    }
+}
+
+/// The one resource ARN a single-ARN resource filter narrows to, or the sentence a
+/// filter this service does not accept is refused with.
+///
+/// Every list operation that takes a resource filter takes the same kind of filter,
+/// so the rule is this one function rather than one copy per operation: the filter
+/// list carries at most ONE entry (each filter member's documentation says the
+/// operation accepts one ARN at a time and that passing several is not supported) and
+/// that entry must name the resource to narrow to. Neither filter list declares a
+/// `@length` and `Arn` is optional on the entry, so the boundary validator admits
+/// both a longer list and an entry naming nothing, and this is where each is refused.
+///
+/// `Ok(None)` — narrow nothing — is the answer for a caller that sent no filter list
+/// at all and for one that sent an empty list, neither of which names a resource to
+/// narrow by. An accepted ARN is read through [`canonical_catalog_arn`] for `kind`
+/// before it is returned, so what it names is compared with the catalog by the
+/// resource's identity rather than by the partition the caller wrote it in.
+///
+/// The refusal is the service's one fixed invalid-filter sentence
+/// ([`crate::service::INVALID_FILTER_MESSAGE`]): it names neither the filter member
+/// at fault nor the number of entries sent, so there is nothing to word per cause or
+/// per operation and the sentence itself is the whole error. A handler lifts it into
+/// its own modeled `ValidationException` — the only part of the refusal that is
+/// per-operation.
+pub fn single_resource_filter_arn<Entry: ResourceFilterEntry>(
+    kind: &str,
+    entries: Option<&[Entry]>,
+) -> Result<Option<String>, String> {
+    let Some(entries) = entries else {
+        return Ok(None);
+    };
+    if entries.len() > 1 {
+        return Err(crate::service::INVALID_FILTER_MESSAGE.to_string());
+    }
+    let Some(entry) = entries.first() else {
+        return Ok(None);
+    };
+    let Some(arn) = entry.filter_arn() else {
+        return Err(crate::service::INVALID_FILTER_MESSAGE.to_string());
+    };
+    Ok(Some(canonical_catalog_arn(kind, arn)))
+}
+
+// ---------------------------------------------------------------------------
 // Pagination
 // ---------------------------------------------------------------------------
 

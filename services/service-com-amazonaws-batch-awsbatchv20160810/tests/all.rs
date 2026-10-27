@@ -47,6 +47,8 @@ mod jobs_by_consumable_resource;
 mod quota_share_listing;
 #[path = "all/quota_share_updates.rs"]
 mod quota_share_updates;
+#[path = "all/refusal_classification.rs"]
+mod refusal_classification;
 #[path = "all/refusal_contract.rs"]
 mod refusal_contract;
 #[path = "all/resource_tags.rs"]

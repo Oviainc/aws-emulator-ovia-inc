@@ -59,9 +59,9 @@ const ANYCAST_IP_LIST_NOT_FOUND: &str = "The specified Anycast IP list does not 
 /// `GetConnectionGroupByRoutingEndpoint` contract carries it.
 const CONNECTION_GROUP_NOT_FOUND: &str = "The specified connection group does not exist.";
 
-/// `EntityNotFound` from a read of a key value store: the condition, worded as this
-/// service words every other not-found condition.
-const KEY_VALUE_STORE_NOT_FOUND: &str = "The specified key value store does not exist.";
+/// `EntityNotFound` from a read of a key value store, as the recorded contract carries it:
+/// CloudFront names the resource by its modelled shape name in this sentence.
+const KEY_VALUE_STORE_NOT_FOUND: &str = "The specified KeyValueStore does not exist.";
 
 /// The sentence a distribution no store holds is reported with, whichever of the two codes
 /// the operation's model names for that condition.

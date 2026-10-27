@@ -187,10 +187,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .resource_type
             .unwrap_or_else(|| batch::RESOURCE_TYPE_REPLENISHABLE.to_string());
         if !batch::CONSUMABLE_RESOURCE_TYPES.contains(&resource_type.as_str()) {
+            // A value outside a closed set the SERVICE holds the member to is answered
+            // with that rule's own sentence, inside the frontend envelope AWS wraps a
+            // validation refusal in ([`batch::closed_set_detail`]).
             return Err(CreateConsumableResourceErrorModeled::ClientException(
-                batch::client_exception(format!(
-                    "resourceType {resource_type} is not one of {}",
-                    batch::CONSUMABLE_RESOURCE_TYPES.join(", ")
+                batch::client_exception_enveloped(batch::closed_set_detail(
+                    "resourceType",
+                    &batch::CONSUMABLE_RESOURCE_TYPES,
                 )),
             )
             .into());
