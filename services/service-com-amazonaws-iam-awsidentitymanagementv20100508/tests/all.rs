@@ -97,6 +97,8 @@ mod policy_version_creation;
 mod policy_version_listing;
 #[path = "all/principal_policy_context_keys.rs"]
 mod principal_policy_context_keys;
+#[path = "all/protected_role_refusals.rs"]
+mod protected_role_refusals;
 #[path = "all/range_refusal_wording.rs"]
 mod range_refusal_wording;
 #[path = "all/role_attached_policies.rs"]

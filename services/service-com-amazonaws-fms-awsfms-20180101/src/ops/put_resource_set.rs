@@ -24,6 +24,15 @@
 //! matching, absent makes it unconditional), and rotated by every successful
 //! write so the caller's copy goes stale.
 //!
+//! An update also answers to the administrative scope governing the resource set
+//! it names: a set reported `OUT_OF_ADMIN_SCOPE` is one the administrator "can
+//! view … but they can't edit or delete", so rewriting its document is refused
+//! with the modelled `InvalidOperationException`
+//! ([`crate::state::ComAmazonawsFmsAwsfms20180101State::resource_set_mutation_refusal`])
+//! and nothing is written. Creating a resource set out of scope is NOT that rule
+//! — the model's sentence is about an existing set — so a create stays a 200
+//! whatever status the new set is then reported with.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -233,6 +242,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                     .into());
                 };
+                // Rewriting a stored resource set is the administrator's to do
+                // only while the administrative scope governing it covers it: a
+                // set reported `OUT_OF_ADMIN_SCOPE` is one "the administrator
+                // can view … but they can't edit or delete"
+                // ([`crate::state::ComAmazonawsFmsAwsfms20180101State::resource_set_mutation_refusal`]),
+                // so the edit is refused before the name and the token are
+                // judged — a caller that may not edit this set at all learns
+                // that, rather than being invited to resend with a fresher token
+                // — and before anything is written, so the stored document and
+                // its token are left exactly as they were.
+                if let Some(refusal) = store.resource_set_mutation_refusal(existing) {
+                    return Err(
+                        PutResourceSetErrorModeled::InvalidOperationException(refusal).into(),
+                    );
+                }
                 // "You can't change the name of a resource set after you create
                 // it" — `ResourceSet$Name`'s own documentation.
                 if resource_set.name != existing.resource_set.name {

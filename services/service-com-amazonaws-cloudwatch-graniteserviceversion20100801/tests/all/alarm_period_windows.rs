@@ -188,7 +188,7 @@ const ROWS: &[Row] = &[
         data: &[placed(211.0, 1), placed(1.0, 0)],
         state: "OK",
         reason: "Threshold Crossed: 1 out of the last 1 datapoints {instants} was not greater \
-                 than the threshold (50.0) (minimum 1 datapoint for INSUFFICIENT_DATA -> OK \
+                 than the threshold (50.0) (minimum 1 datapoint for ALARM -> OK \
                  transition).",
         graded: &["1.0"],
     },
@@ -205,7 +205,7 @@ const ROWS: &[Row] = &[
         data: &[placed(211.0, 0), placed(1.0, 0)],
         state: "ALARM",
         reason: "Threshold Crossed: 1 out of the last 1 datapoints {instants} was greater than \
-                 the threshold (50.0) (minimum 1 datapoint for INSUFFICIENT_DATA -> ALARM \
+                 the threshold (50.0) (minimum 1 datapoint for OK -> ALARM \
                  transition).",
         graded: &["211.0"],
     },
@@ -220,7 +220,7 @@ const ROWS: &[Row] = &[
         data: &[placed(1.0, 1), placed(50.0, 0)],
         state: "OK",
         reason: "Threshold Crossed: 1 out of the last 1 datapoints {instants} was not less than \
-                 the threshold (10.0) (minimum 1 datapoint for INSUFFICIENT_DATA -> OK \
+                 the threshold (10.0) (minimum 1 datapoint for ALARM -> OK \
                  transition).",
         graded: &["50.0"],
     },
@@ -237,7 +237,7 @@ const ROWS: &[Row] = &[
         data: &[placed(10.0, 1), placed(150.0, 0)],
         state: "ALARM",
         reason: "Threshold Crossed: 1 out of the last 1 datapoints {instants} was greater than \
-                 or equal to the threshold (100.0) (minimum 1 datapoint for INSUFFICIENT_DATA \
+                 or equal to the threshold (100.0) (minimum 1 datapoint for OK \
                  -> ALARM transition).",
         graded: &["150.0"],
     },
@@ -252,7 +252,7 @@ const ROWS: &[Row] = &[
         data: &[placed(100.0, 1), placed(1.0, 0)],
         state: "ALARM",
         reason: "Threshold Crossed: 1 out of the last 1 datapoints {instants} was less than or \
-                 equal to the threshold (5.0) (minimum 1 datapoint for INSUFFICIENT_DATA -> \
+                 equal to the threshold (5.0) (minimum 1 datapoint for OK -> \
                  ALARM transition).",
         graded: &["1.0"],
     },
@@ -268,7 +268,7 @@ const ROWS: &[Row] = &[
         data: &[placed(211.0, 1), placed(1.0, 0)],
         state: "ALARM",
         reason: "Threshold Crossed: 1 out of the last 2 datapoints {instants} was greater than \
-                 the threshold (50.0) (minimum 1 datapoint for INSUFFICIENT_DATA -> ALARM \
+                 the threshold (50.0) (minimum 1 datapoint for OK -> ALARM \
                  transition).",
         graded: &["1.0", "211.0"],
     },
@@ -285,13 +285,15 @@ const ROWS: &[Row] = &[
         data: &[placed(211.0, 1), placed(212.0, 0)],
         state: "ALARM",
         reason: "Threshold Crossed: 2 out of the last 2 datapoints {instants} were greater than \
-                 the threshold (50.0) (minimum 2 datapoints for INSUFFICIENT_DATA -> ALARM \
+                 the threshold (50.0) (minimum 2 datapoints for OK -> ALARM \
                  transition).",
         graded: &["212.0", "211.0"],
     },
     Row {
         // Neither of two periods breaches: the sentence states the comparison negated and
-        // counts the datapoints that read that way.
+        // counts the datapoints that read that way. The minimum it names is the OK direction's
+        // — `EvaluationPeriods - DatapointsToAlarm + 1`, one clean datapoint here — not the two
+        // breaching ones the ALARM direction would have needed.
         case: "neither of two periods breaches",
         period: 10,
         statistic: "Maximum",
@@ -302,7 +304,7 @@ const ROWS: &[Row] = &[
         data: &[placed(3.0, 1), placed(4.0, 0)],
         state: "OK",
         reason: "Threshold Crossed: 2 out of the last 2 datapoints {instants} were not greater \
-                 than the threshold (50.0) (minimum 2 datapoints for INSUFFICIENT_DATA -> OK \
+                 than the threshold (50.0) (minimum 1 datapoint for ALARM -> OK \
                  transition).",
         graded: &["4.0", "3.0"],
     },

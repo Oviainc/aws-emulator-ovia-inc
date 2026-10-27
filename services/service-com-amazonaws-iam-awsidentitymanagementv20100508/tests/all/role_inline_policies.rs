@@ -557,8 +557,8 @@ async fn the_aggregate_role_policy_size_is_bounded() {
 
 /// A service-linked role is a protected resource: only the service that depends on
 /// it may change it, so embedding an inline policy in one is refused with the
-/// modelled `UnmodifiableEntityException`, whose message names that service, and
-/// nothing is embedded.
+/// modelled `UnmodifiableEntityException`, stated in the one sentence this service
+/// words that protection with, and nothing is embedded.
 #[tokio::test]
 async fn a_service_linked_role_may_not_be_given_an_inline_policy() {
     // Rows spanning two- and three-label service principals and a role created with
@@ -603,10 +603,14 @@ async fn a_service_linked_role_may_not_be_given_an_inline_policy() {
             "case {case:?}: expected the modelled awsQuery code, got {body}"
         );
         let message = element(&body, "Message");
-        assert!(
-            message.contains(principal),
-            "case {case:?}: the message must name the service the role is linked to, \
-             got {message:?}"
+        assert_eq!(
+            message,
+            format!(
+                "Cannot perform the operation on the protected role '{role_name}' - this \
+                 role is only modifiable by AWS"
+            ),
+            "case {case:?}: expected the service's one protected-role sentence, got \
+             {message:?}"
         );
 
         let (status, body) = get_policy(&router, &role_name, "Embedded").await;

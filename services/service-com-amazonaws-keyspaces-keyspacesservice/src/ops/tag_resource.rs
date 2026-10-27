@@ -164,6 +164,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // Whether a key carries the reserved `aws:` prefix is a property of the REQUEST
+        // alone ("Amazon Web Services-assigned tag names ... the user cannot assign",
+        // `Tag`), so it is decided here — before the Region, before `settle` and before
+        // the ARN is resolved — exactly as `UntagResource` decides it. A key the caller
+        // may not name is refused the same way whether or not the ARN names a resource
+        // this store holds, and nothing is stored for a refused call.
+        //
+        // It is decided before the service-managed check below, which is request-only
+        // too: of two faults in one request, the one that is wrong about the TAGS the
+        // request carries is the one the caller has to fix first — the resource it
+        // addresses would take no tag with that key either. `UntagResource` grades the
+        // two in the same order, so one request shape never gets two different messages
+        // depending on which sibling served it.
+        crate::state::reject_reserved_tag_keys(&input.tags).map_err(|rejection| {
+            TagResourceErrorModeled::ValidationException(ValidationException {
+                message: Some(rejection.message()),
+            })
+        })?;
+
         let region = crate::state::request_region(ctx);
         let mut store = state.lock();
         // The status transitions the clock already owed at this instant, so a table whose
@@ -194,10 +213,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // `merge_tags` upserts by key and refuses BEFORE storing anything, so a refused
-        // call leaves the resource's tags exactly as they were. The two refusals are the
-        // reserved `aws:` key prefix (400 `ValidationException`) and the per-resource tag
-        // quota (402 `ServiceQuotaExceededException`) — neither is expressible in the
-        // model, since the quota depends on the tags the resource already holds.
+        // call leaves the resource's tags exactly as they were. The reserved-key refusal
+        // was already decided above, on the request alone; what is left here is the
+        // per-resource tag quota (402 `ServiceQuotaExceededException`), which counts the
+        // tags the resource already holds and so cannot be decided before it is resolved
+        // — nor expressed in the model.
         crate::state::merge_tags(tags, &input.tags).map_err(|rejection| {
             let message = Some(rejection.message());
             match rejection.is_quota() {

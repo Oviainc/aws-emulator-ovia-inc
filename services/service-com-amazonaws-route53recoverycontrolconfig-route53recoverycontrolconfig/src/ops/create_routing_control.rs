@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRoutingControl
-//! Implemented: validates the cluster and (when named) the control panel are stored,
-//! mints a routing-control ARN under the owning control panel and persists it in
-//! [`crate::state`]; `DescribeRoutingControl` and `ListRoutingControls` project the same
-//! stored record, and the panel's `RoutingControlCount` counts it from that moment.
+//! Implemented: validates the cluster and (when named) the control panel are stored —
+//! an ARN holding neither is `ValidationException` (400), since the request only
+//! REFERENCES them — mints a routing-control ARN under the owning control panel and
+//! persists it in [`crate::state`]; `DescribeRoutingControl` and `ListRoutingControls`
+//! project the same stored record, and the panel's `RoutingControlCount` counts it from
+//! that moment.
 //!
 //! When the request names no `ControlPanelArn` the routing control is attached to the
 //! cluster's default control panel — the one `CreateCluster` created with the cluster.
@@ -207,11 +209,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::TokenOutcome::Fresh => {}
         }
 
+        // Both the cluster and the control panel are resources this request REFERENCES
+        // rather than addresses, so an ARN holding none makes the request's input wrong
+        // — a 400 — where a read addressing the same ARN answers the 404 of the read
+        // path.
         let Some(cluster) = guard.clusters.get(&input.cluster_arn) else {
-            return Err(CreateRoutingControlErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: crate::state::not_found_message(
-                        crate::state::CLUSTER_NOUN,
+            return Err(CreateRoutingControlErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::does_not_exist_message(
+                        crate::state::CLUSTER_RESOURCE,
                         &input.cluster_arn,
                     ),
                 },
@@ -226,10 +232,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let Some(panel) = guard.control_panels.get(&panel_arn) else {
-            return Err(CreateRoutingControlErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: crate::state::not_found_message(
-                        crate::state::CONTROL_PANEL_NOUN,
+            return Err(CreateRoutingControlErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::does_not_exist_message(
+                        crate::state::CONTROL_PANEL_RESOURCE,
                         &panel_arn,
                     ),
                 },
@@ -250,17 +256,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A routing control name identifies the control within its control panel.
+        // A routing control name identifies the control within its control panel. The
+        // loser of a race for one name is refused on its INPUT — the name is taken, and
+        // no retry of the same request can win it — not with a transient-collision
+        // class.
         if guard
             .ordered_routing_controls(&panel_arn)
             .iter()
             .any(|rc| rc.name == input.routing_control_name)
         {
-            return Err(CreateRoutingControlErrorModeled::ConflictException(
-                ConflictException {
-                    message: format!(
-                        "a routing control named \"{}\" already exists in {panel_arn}",
-                        input.routing_control_name
+            return Err(CreateRoutingControlErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::already_exists_message(
+                        crate::state::ROUTING_CONTROL_RESOURCE,
+                        &input.routing_control_name,
+                        crate::state::CONTROL_PANEL_RESOURCE,
+                        &panel_arn,
                     ),
                 },
             )

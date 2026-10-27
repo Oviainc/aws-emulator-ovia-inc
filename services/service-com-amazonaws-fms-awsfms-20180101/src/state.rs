@@ -1716,15 +1716,49 @@ impl ComAmazonawsFmsAwsfms20180101State {
         if self.policy_status(record) != POLICY_STATUS_OUT_OF_ADMIN_SCOPE {
             return None;
         }
-        Some(InvalidOperationException {
-            message: Some(format!(
-                "policy {} is {POLICY_STATUS_OUT_OF_ADMIN_SCOPE} for Firewall Manager \
-                 administrator {}: the administrator can view the policy, but they can't edit \
-                 or delete the policy",
-                record.policy_id,
-                ::engine::emulator_account_id()
-            )),
-        })
+        Some(out_of_admin_scope_refusal(
+            "policy",
+            &record.policy_id,
+            POLICY_STATUS_OUT_OF_ADMIN_SCOPE,
+        ))
+    }
+
+    /// Why the caller may not EDIT or DELETE this stored resource set, or `None`
+    /// when it may — the resource-set reading of the SAME rule
+    /// [`Self::policy_mutation_refusal`] applies to a policy, built from the
+    /// status [`Self::resource_set_status`] derives.
+    ///
+    /// `ResourceSet$ResourceSetStatus` says what the administrator governing a
+    /// resource set may DO with it, not merely what a reader is told:
+    /// [`RESOURCE_SET_STATUS_ACTIVE`] is "the administrator can manage and delete
+    /// the resource set", while [`RESOURCE_SET_STATUS_OUT_OF_ADMIN_SCOPE`] is
+    /// "the administrator can view the resource set, but they can't edit or
+    /// delete the resource set. Existing protections stay in place". So a
+    /// resource set reported out of the governing administrative scope is
+    /// readable but IMMUTABLE: rewriting its document, changing which resources
+    /// it holds and removing it are all refused, and what it already protects is
+    /// left exactly as it is.
+    ///
+    /// `InvalidOperationException` — "the operation failed because … the
+    /// operation wasn't possible" — is the modelled refusal, declared by every
+    /// operation that edits or deletes a resource set, so the refusal needs no
+    /// unmodelled shape.
+    ///
+    /// Judged per CALL, from the derived status rather than from a stored flag,
+    /// so widening the administrator's scope makes the resource set editable
+    /// again without the resource set being touched.
+    pub fn resource_set_mutation_refusal(
+        &self,
+        record: &ResourceSetRecord,
+    ) -> Option<InvalidOperationException> {
+        if self.resource_set_status(record) != RESOURCE_SET_STATUS_OUT_OF_ADMIN_SCOPE {
+            return None;
+        }
+        Some(out_of_admin_scope_refusal(
+            "resource set",
+            &record.id,
+            RESOURCE_SET_STATUS_OUT_OF_ADMIN_SCOPE,
+        ))
     }
 
     /// The violations recorded against ONE stored policy in ONE member account,
@@ -2138,6 +2172,36 @@ pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "The referenced item does not exist
 pub fn resource_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+    }
+}
+
+/// The modelled refusal of an edit or a delete of a resource that the
+/// administrative scope governing it does not cover, for a resource of the kind
+/// `resource` ("policy", "resource set") carrying the identifier `identifier`
+/// and reported with the out-of-scope `status` of its own modelled catalog.
+///
+/// `OUT_OF_ADMIN_SCOPE` is one rule for every kind of Firewall Manager resource
+/// whose status derives from an administrative scope: "the administrator can
+/// view the \<resource\>, but they can't edit or delete the \<resource\>". So
+/// the refusal is worded ONCE here and taken by every status-aware mutation
+/// ([`ComAmazonawsFmsAwsfms20180101State::policy_mutation_refusal`],
+/// [`ComAmazonawsFmsAwsfms20180101State::resource_set_mutation_refusal`]), which
+/// is what stops two kinds of resource refusing the same thing differently.
+///
+/// The message names the resource, the administrator whose scope does not cover
+/// it and the status that follows, which is what the caller needs to widen the
+/// scope (`PutAdminAccount`) and retry.
+fn out_of_admin_scope_refusal(
+    resource: &str,
+    identifier: &str,
+    status: &str,
+) -> InvalidOperationException {
+    InvalidOperationException {
+        message: Some(format!(
+            "{resource} {identifier} is {status} for Firewall Manager administrator {}: the \
+             administrator can view the {resource}, but they can't edit or delete the {resource}",
+            ::engine::emulator_account_id()
+        )),
     }
 }
 

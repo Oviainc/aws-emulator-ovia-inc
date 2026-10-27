@@ -96,71 +96,62 @@ const WIRE_PATH_SEGMENTS: &[&str] = &[emulator_server::ROOT_PATH_SEGMENT];
 /// client branches on the code, so it must stay the one it would have seen.
 const BOUND_REFUSAL_CODE: &str = "ValidationError";
 
-/// The member every paginated listing of this service takes its page size in, spelled the
-/// way a validation path spells it (lowerCamel, as
-/// `aws_smithy_schema_server::constraints::path::member` builds it).
+/// Whether `violation` is a value outside a BOUND the model declares for its member — a
+/// number outside its `@range`, or a string or collection outside its `@length`.
 ///
-/// It is one member name shared by the whole listing surface: `smithy_query(query=
-/// "operation", operation="ListInstanceProfiles,ListRoles,ListUsers")` shows each taking
-/// `MaxItems` against the same `maxItemsType` (range 1..1000).
-const PAGE_SIZE_MEMBER: &str = "MaxItems";
-
-/// Whether `violation` is a page size outside the `@range` [`PAGE_SIZE_MEMBER`] declares.
-///
-/// The member is matched on the LAST path segment, because that is the member the clause
-/// names however deeply the walk reached it.
-fn is_page_size_bound(violation: &Violation) -> bool {
-    let bound = matches!(
+/// The other classes the framework reports are not bounds: a string outside its
+/// `@pattern`, a value outside an enumerated set, a repeated element, an absent required
+/// member.
+fn is_declared_bound(violation: &Violation) -> bool {
+    matches!(
         violation.kind,
-        ViolationKind::MinValue(_) | ViolationKind::MaxValue(_)
-    );
-    bound
-        && violation
-            .path
-            .rsplit('.')
-            .next()
-            .is_some_and(|member| member.eq_ignore_ascii_case(PAGE_SIZE_MEMBER))
+        ViolationKind::MinValue(_)
+            | ViolationKind::MaxValue(_)
+            | ViolationKind::MinLength(_)
+            | ViolationKind::MaxLength(_)
+    )
 }
 
-/// A boundary refusal restated so a PAGE SIZE outside its declared range names the member
-/// and the bound it broke and nothing of the number itself, or `None` when the request
-/// broke no page-size bound and the framework's own wording stands.
+/// A boundary refusal restated so a value outside a DECLARED BOUND names the member and
+/// the bound it broke and nothing of the value itself, or `None` when the request broke no
+/// such bound and the framework's own wording stands.
 ///
-/// This service states that class of refusal without echoing the rejected number — the
-/// clause reads `Value at 'maxItems' failed to satisfy constraint: Member must have value
-/// less than or equal to <bound>` — while every other class (a string outside its
-/// `@pattern` or `@length`, another numeric member outside its own range, an absent
-/// required member) keeps the framework's sentence, value and all. Only the
-/// `Value '<the number>' at` opening is lifted out: the envelope, the member path and the
-/// requirement are the framework's, built from the same two fields the renderer
-/// interpolated, so the two cannot drift and the replacement matches the echo whatever the
-/// number is.
+/// This service states that class of refusal without echoing the rejected value — the
+/// clause reads `Value at '<member>' failed to satisfy constraint: Member must have
+/// {value,length} {greater,less} than or equal to <bound>` — while the other classes (a
+/// string outside its `@pattern`, a value outside an enumerated set, an absent required
+/// member) keep the framework's sentence, value and all. Only the `Value '<the value>' at`
+/// opening is lifted out: the envelope, the member path and the requirement are the
+/// framework's, built from the same two fields the renderer interpolated, so the two
+/// cannot drift and the replacement matches the echo whatever the value is. The ONE thing
+/// it couples to is the renderer's quoting of that opening
+/// (`vendor/smithy-schema-server/src/constraints.rs::Violation::message`, `Value
+/// '<shown>' at '<path>'`); the suite below asserts the whole message and that the value
+/// appears nowhere in it, so a renderer that quoted it differently would fail there rather
+/// than turn this into a silent no-op.
 ///
-/// The class is the one the service's recorded answers cover — the page size every
-/// paginated listing takes ([`PAGE_SIZE_MEMBER`]). The observed answer to a listing whose
-/// `MaxItems` was above the modelled maximum is `1 validation error detected: Value at
-/// 'maxItems' failed to satisfy constraint: Member must have value less than or equal to
-/// 1000`: the member, the bound the model declares and no number from the request. The
-/// rewording is deliberately no wider than that — a member with no observed answer is
-/// better left as the framework states it than reworded on a guess, which is why
-/// `MaxSessionDuration` and every other numeric member keep the framework's sentence
-/// (pinned, both ways, by `tests/all/range_refusal_wording.rs`).
+/// The rule covers every member with a bound, not one member: the bound and the member
+/// path both come from the model, so a page size, a session duration, a description's
+/// length and a tag list's size are one class of refusal and are worded alike
+/// (`tests/all/range_refusal_wording.rs` reads them back, over both bound directions and
+/// over the scalar and collection forms of a length). Two of those rows go beyond what
+/// this service's recorded answers show — a role name over its `@length` maximum and a tag
+/// list over its own — and follow the class rather than an observation of their own; a
+/// later recording that echoes the value for one of them would narrow the class here, not
+/// contradict the seam.
 ///
 /// A refusal carrying an ABSENT required member is declined whole: that one renders under
 /// a different code than a failed bound, and restating it under [`BOUND_REFUSAL_CODE`]
 /// would change what a client branches on.
-fn without_page_size_value_echo(violations: &[Violation]) -> Option<Refused> {
+fn without_bound_value_echo(violations: &[Violation]) -> Option<Refused> {
     let absent_member = violations
         .iter()
         .any(|violation| matches!(violation.kind, ViolationKind::MissingRequiredMember));
-    if absent_member || !violations.iter().any(is_page_size_bound) {
+    if absent_member || !violations.iter().any(is_declared_bound) {
         return None;
     }
     let mut message = envelope(violations)?;
-    for violation in violations
-        .iter()
-        .filter(|violation| is_page_size_bound(violation))
-    {
+    for violation in violations.iter().filter(|violation| is_declared_bound(violation)) {
         let Some(value) = violation.value.as_deref() else {
             continue;
         };
@@ -241,12 +232,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
         // service reword it. Returning `None` keeps the framework's default
-        // wording; the one class this service words differently is a page size
-        // outside its declared range, which it states without echoing the number
-        // (see [`without_page_size_value_echo`], which answers with the code the
+        // wording; the one class this service words differently is a value outside
+        // a bound its member declares, which it states without echoing the value
+        // (see [`without_bound_value_echo`], which answers with the code the
         // framework would have chosen).
         match refusal {
-            Refusal::Invalid(violations) => without_page_size_value_echo(violations),
+            Refusal::Invalid(violations) => without_bound_value_echo(violations),
             _ => None,
         }
     }

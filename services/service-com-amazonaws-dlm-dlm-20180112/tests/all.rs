@@ -19,6 +19,8 @@ mod default_policy_only_body_parameter_set;
 mod default_policy_only_parameters;
 #[path = "all/default_policy_resource_type.rs"]
 mod default_policy_resource_type;
+#[path = "all/effective_cadence_ordering.rs"]
+mod effective_cadence_ordering;
 #[path = "all/error_paths.rs"]
 mod error_paths;
 #[path = "all/execution_role_pass_role.rs"]

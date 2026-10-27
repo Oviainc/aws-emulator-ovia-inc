@@ -64,7 +64,9 @@
 //! ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::materialise_due_agent_recommendations`])
 //! and carrying the finding's content by reference into the catalog in
 //! [`recommendation_catalog`], so a recommendation's text is the same in every reading of
-//! it and only its status is a caller's to move. The record types and
+//! it and only its status and the feedback submitted on it are a caller's to move
+//! (`UpdateAgentRecommendationStatus`, `PutAgentRecommendationFeedback`). The record types
+//! and
 //! their projections live here rather than in a handler because several operations reach
 //! them.
 //!
@@ -5429,7 +5431,8 @@ pub const RECOMMENDATION_STATE_CLOSED: &str = "CLOSED";
 
 /// One optimization recommendation: the resource a COMPLETED recommendation generation
 /// produced, `ListAgentRecommendations` reports and `UpdateAgentRecommendationStatus`
-/// moves "through the implementation lifecycle".
+/// moves "through the implementation lifecycle", carrying the feedback
+/// `PutAgentRecommendationFeedback` has submitted on it.
 ///
 /// The record holds what the SERVICE owns — the ARN it minted, the generation the
 /// recommendation came out of, the finding's content and the identity and instant it is
@@ -5466,6 +5469,39 @@ pub struct AgentRecommendationRecord {
     pub created_at: SystemTime,
     pub last_modified_by: Option<String>,
     pub last_modified_at: Option<SystemTime>,
+    /// The feedback a caller has submitted on this recommendation
+    /// ([`AgentRecommendationFeedback`]), or nothing while none has been submitted.
+    pub feedback: Option<AgentRecommendationFeedback>,
+}
+
+/// The feedback submitted on one recommendation: what `PutAgentRecommendationFeedback`
+/// "submits … to help improve future optimization suggestions and track implementation
+/// outcomes".
+///
+/// A SUB-RESOURCE of the recommendation it judges — the operation addresses it as
+/// `…/{recommendationArn}/feedback` — so it is held on
+/// [`AgentRecommendationRecord::feedback`] and can neither be reached without the
+/// recommendation nor outlive it. The operation is `@idempotent` and puts the whole
+/// sub-resource, so a recommendation holds the feedback last submitted for it rather than
+/// a log of submissions: resubmitting the same feedback leaves it where it already was,
+/// and submitting different feedback replaces what stood, including by carrying none of
+/// an optional member the previous submission carried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRecommendationFeedback {
+    /// `type` — "the type of feedback being provided", a `RecommendationFeedbackType`
+    /// (`@required`, so every submission carries one).
+    pub feedback_type: String,
+    /// `feedbackCategory` — "optional category classifying the nature of the feedback", a
+    /// `FeedbackCategory`; absent when the submission classified none.
+    pub category: Option<String>,
+    /// `comments` — "optional comments providing additional context about the feedback";
+    /// absent when the submission carried none.
+    pub comments: Option<String>,
+    /// Who the submission is attributed to: every request this emulator serves is its one
+    /// account's, exactly as the recommendation's own `createdBy` is.
+    pub submitted_by: String,
+    /// The instant the submission was recorded.
+    pub submitted_at: SystemTime,
 }
 
 impl AgentRecommendationRecord {
@@ -6238,7 +6274,8 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     }
 
     /// [`Self::agent_recommendation`] for a caller that is about to write to the
-    /// recommendation — `UpdateAgentRecommendationStatus` is the one operation that does.
+    /// recommendation: `UpdateAgentRecommendationStatus`, which moves its status, and
+    /// `PutAgentRecommendationFeedback`, which puts its feedback sub-resource.
     pub fn agent_recommendation_mut(
         &mut self,
         arn: &str,
@@ -6335,6 +6372,9 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
                     created_at: completed_at,
                     last_modified_by: None,
                     last_modified_at: None,
+                    // Nobody has judged the finding yet: the feedback sub-resource exists
+                    // only once a caller submits one.
+                    feedback: None,
                 };
                 self.agent_recommendations
                     .entry(profile_arn.clone())

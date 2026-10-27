@@ -604,6 +604,16 @@ impl StoredRepository {
         Ok(())
     }
 
+    /// Drop the tags `keys` names from this repository, keyed by tag key.
+    ///
+    /// `UntagResource` "deletes specified tags from a resource": exactly the keys the
+    /// request names leave the repository and every other tag it carries stays, with the
+    /// value it had. A key the repository does not carry removes nothing, so asking for
+    /// one is not a failure and repeating the same removal is the same single removal.
+    pub fn remove_tags(&mut self, keys: &BTreeSet<String>) {
+        self.tags.retain(|key, _| !keys.contains(key));
+    }
+
     /// This repository's resource tags as the modelled `TagList`.
     ///
     /// The stored map is keyed by tag key, so the list comes out in key order: a stable
@@ -1374,6 +1384,28 @@ pub fn stored_tags(tags: Option<&Vec<Tag>>) -> Result<BTreeMap<String, String>, 
         stored.insert(key.to_string(), tag.value.clone().unwrap_or_default());
     }
     Ok(stored)
+}
+
+/// The tag keys a request asked to have removed, deduplicated, once every one of them
+/// names a tag a caller may change.
+///
+/// The rule is the one [`stored_tags`] applies to the keys a write supplies: a key in the
+/// namespace AWS keeps for its own tags ([`RESERVED_TAG_KEY_PREFIX`]) names a system tag,
+/// which an API caller may neither write nor delete ([`SYSTEM_TAG_KEY_MESSAGE`]). The
+/// modelled 1..128 length is already refused before a handler runs. A key named twice in
+/// one request is one key: removing a tag is settled by which keys were named, not by how
+/// many times each was.
+pub fn removed_tag_keys(tag_keys: &[String]) -> Result<BTreeSet<String>, TagProblem> {
+    let mut keys = BTreeSet::new();
+    for key in tag_keys {
+        if is_system_tag_key(key) {
+            return Err(TagProblem::InvalidTagParameter(
+                SYSTEM_TAG_KEY_MESSAGE.to_string(),
+            ));
+        }
+        keys.insert(key.clone());
+    }
+    Ok(keys)
 }
 
 /// Whether `key` names a system tag: one in the namespace AWS keeps for its own tags

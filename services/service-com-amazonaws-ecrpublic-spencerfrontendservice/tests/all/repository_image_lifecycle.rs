@@ -1497,37 +1497,28 @@ async fn the_store_refuses_to_grow_past_its_declared_caps() {
 }
 
 #[tokio::test]
-async fn the_operations_this_slice_does_not_cover_still_answer_501() {
+async fn the_operations_this_slice_does_not_cover_answer_from_state() {
     let router = service();
 
-    // The remaining operations are filed as their own gap issues; a stub must answer 501
-    // `NotImplemented`, never an empty 200 that a client cannot tell from a real answer.
-    // (`DescribeImageTags` left this list when it was implemented —
-    // `tests/all/image_tag_details.rs` drives it now; `TagResource` left it the same way —
-    // `tests/all/tag_resource.rs` drives it.)
-    for (operation, body) in [(
-        "UntagResource",
-        json!({"resourceArn": format!("{ARN_PREFIX}team/app"), "tagKeys": []}),
-    )] {
+    // This surface carries no scaffolded operation any longer, so a call naming a
+    // repository this registry does not hold is answered from state — the modelled client
+    // error — rather than the 501 `NotImplemented` that means "nobody has written it yet".
+    // (`DescribeImageTags` left the stub list when it was implemented —
+    // `tests/all/image_tag_details.rs` drives it now; `TagResource` left it the same way
+    // (`tests/all/tag_resource.rs`), and `UntagResource` last
+    // (`tests/all/untag_resource.rs`).)
+    for (operation, body) in [
+        (
+            "UntagResource",
+            json!({"resourceArn": format!("{ARN_PREFIX}team/app"), "tagKeys": ["env"]}),
+        ),
+        ("DescribeImageTags", json!({"repositoryName": "team/app"})),
+    ] {
         let (status, parsed) = call(&router, operation, body).await;
         assert_eq!(
-            status, 501,
-            "case {operation:?}: expected a scaffolded operation to answer 501, \
-             got {status} with {parsed}"
+            status, 400,
+            "case {operation:?}: expected an unknown repository to be reported as a \
+             modelled client error, got {status} with {parsed}"
         );
     }
-
-    // The operation this suite's sibling implements answers from state instead: an
-    // unknown repository is the modelled client error, never a 501.
-    let (status, parsed) = call(
-        &router,
-        "DescribeImageTags",
-        json!({"repositoryName": "team/app"}),
-    )
-    .await;
-    assert_eq!(
-        status, 400,
-        "expected DescribeImageTags to report an unknown repository as a modelled \
-         client error, got {status} with {parsed}"
-    );
 }
