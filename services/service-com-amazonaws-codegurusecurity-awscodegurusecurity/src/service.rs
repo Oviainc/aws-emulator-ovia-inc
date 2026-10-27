@@ -25,7 +25,9 @@
 //!   generated routing table. Return `Some(op)` to route one yourself.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//!   wording; this service states a constraint refusal the way AWS states it
+//!   (`service_common::aws_validation_refusal`) and words a malformed resource ARN
+//!   itself. See the inline note on that method.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -165,12 +167,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // `any`, not "every violation": the ARN parse runs first, so it decides the
         // answer even when the same request also breaks another rule.
         //
-        // Every OTHER refusal keeps the framework's default wording and the modelled
-        // `ValidationException` code: an absent required member, a value outside a
-        // declared bound (including a `resourceArn` that parses as an ARN but is
-        // longer than the shape's `@length` allows — a size limit, not a syntax
-        // failure) and an authentication refusal are all reported as this service's
-        // model declares them.
+        // Every OTHER refusal is stated by the workspace's ONE renderer of an AWS
+        // constraint refusal, `service_common::aws_validation_refusal`: it keeps the
+        // framework's envelope, its member paths, the modelled `ValidationException` code
+        // and every other requirement, and restates only the two renderings that are
+        // AWS's rather than the framework's — a `@pattern` quoted without the whole-value
+        // anchors a model wraps the service's expression in, and a collection's `@length`
+        // clause stated without a value half. So an absent required member, a value
+        // outside a declared bound (including a `resourceArn` that parses as an ARN but is
+        // longer than the shape's `@length` allows — a size limit, not a syntax failure)
+        // and an authentication refusal are all reported as this service's model declares
+        // them.
         match refusal {
             Refusal::Invalid(violations) if violations.iter().any(is_malformed_resource_arn) => {
                 Some(Refused {
@@ -178,7 +185,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
                     message: MALFORMED_ARN_MESSAGE.to_string(),
                 })
             }
-            _ => None,
+            _ => ::service_common::aws_validation_refusal(refusal),
         }
     }
 

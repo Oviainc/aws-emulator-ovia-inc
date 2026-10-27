@@ -317,12 +317,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }),
         };
 
-        // This Region's partition, created when this is its first registration.
+        // This Region's partition, created when this is its first registration. A
+        // registration refused below leaves it holding nothing, which is not a partition
+        // this store keeps ([`crate::state::ComAmazonawsSsmsapSsmsapState::settle`]
+        // reclaims it) and nothing a caller can observe.
         let region_state = state.region_entry(&region);
 
-        if let Some(tags) = input.tags.filter(|tags| !tags.is_empty()) {
-            // Keyed by ARN, so the tagging APIs join on the same place.
-            region_state.tags_by_arn.insert(arn, tags);
+        // The tags the registration carries are attached the ONE way this service
+        // attaches tags ([`crate::state::RegionState::apply_tags`]): keyed by ARN, so the
+        // tagging APIs join on the same place, merged into whatever is already held for
+        // that ARN, and refused with the `ValidationException` this operation models when
+        // the resource would be left holding more tags than the per-resource ceiling. A
+        // registration therefore cannot write a tag set the tagging APIs would then
+        // consider impossible. This is the FIRST write the handler makes, and a refused
+        // one writes nothing, so neither the application nor its operation record is
+        // stored for a registration refused here.
+        if let Some(tags) = input.tags.as_ref() {
+            region_state
+                .apply_tags(&arn, tags)
+                .map_err(RegisterApplicationErrorModeled::ValidationException)?;
         }
 
         let operation_id = region_state.record_operation(

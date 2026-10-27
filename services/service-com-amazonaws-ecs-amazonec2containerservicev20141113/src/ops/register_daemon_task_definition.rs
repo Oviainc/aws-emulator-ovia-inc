@@ -267,6 +267,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
+            // A container's `cpu`, `memory` and `memoryReservation` are COUNTS of a
+            // resource — CPU units reserved, MiB presented and MiB reserved — so each has
+            // to name a number its unit admits. A registration that carries one outside
+            // that range describes a reservation no container can be given, and is
+            // refused HERE, before the family's revision counter moves or any record is
+            // stored.
+            if let Some(message) = crate::state::container_reservation_violation(
+                name,
+                definition.cpu,
+                definition.memory,
+                definition.memory_reservation,
+            ) {
+                return Err(
+                    RegisterDaemonTaskDefinitionErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                );
+            }
             if !names.insert(name.to_string()) {
                 return Err(RegisterDaemonTaskDefinitionErrorModeled::ClientException(
                     ClientException {

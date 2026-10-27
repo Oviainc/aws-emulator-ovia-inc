@@ -88,6 +88,35 @@ impl TaggedKind {
             _ => return None,
         })
     }
+
+    /// How this front door NAMES the family when it reports that no resource of it
+    /// matched: the resource type as Amazon RDS writes it in prose, with the indefinite
+    /// article the sentence reads with, so one sentence serves every family and none of
+    /// them reads ungrammatically.
+    ///
+    /// It is the only part of [`not_found_message`] that varies by family, so the
+    /// sentence itself is written once.
+    pub fn resource_phrase(self) -> &'static str {
+        match self {
+            Self::DbInstance => "a DB Instance",
+            Self::DbCluster => "a DB Cluster",
+            Self::DbSnapshot => "a DB Snapshot",
+            Self::DbClusterSnapshot => "a DB Cluster Snapshot",
+            Self::DbParameterGroup => "a DB Parameter Group",
+            Self::DbClusterParameterGroup => "a DB Cluster Parameter Group",
+            Self::OptionGroup => "an Option Group",
+            Self::DbSubnetGroup => "a DB Subnet Group",
+            Self::DbSecurityGroup => "a DB Security Group",
+            Self::EventSubscription => "an Event Subscription",
+            Self::GlobalCluster => "a Global Cluster",
+            Self::DbShardGroup => "a DB Shard Group",
+            Self::BlueGreenDeployment => "a Blue Green Deployment",
+            Self::Integration => "an Integration",
+            Self::DbProxy => "a DB Proxy",
+            Self::TenantDatabase => "a Tenant Database",
+            Self::CustomDbEngineVersion => "a Custom Engine Version",
+        }
+    }
 }
 
 /// Every ARN resource type a tag operation of this service resolves, in the order
@@ -275,8 +304,6 @@ impl ComAmazonawsRdsAmazonrdsv19State {
                 "Invalid resource name: {resource_name}"
             )));
         };
-        let identifier = parsed.identifier.to_string();
-
         let found = match kind {
             TaggedKind::DbInstance => {
                 key_in(&self.db_instances, region, resource_name, |record| {
@@ -370,7 +397,7 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             Some(key) => Ok(TagTarget { kind, key }),
             None => Err(TagTargetMiss::NotFound(
                 kind,
-                not_found_message(kind, &identifier),
+                not_found_message(kind, resource_name),
             )),
         }
     }
@@ -475,33 +502,23 @@ impl ComAmazonawsRdsAmazonrdsv19State {
     }
 }
 
-/// What each family's not-found fault reports for `identifier` — the same wording the
-/// family's own describe and delete operations answer with, so one resource type reads the
-/// same whichever operation failed to find it.
-fn not_found_message(kind: TaggedKind, identifier: &str) -> String {
-    match kind {
-        TaggedKind::DbInstance => format!("DBInstance {identifier} not found."),
-        TaggedKind::DbCluster => format!("DBCluster {identifier} not found."),
-        TaggedKind::DbSnapshot => format!("DBSnapshot {identifier} not found."),
-        TaggedKind::DbClusterSnapshot => format!("DBClusterSnapshot not found: {identifier}"),
-        TaggedKind::DbParameterGroup => format!("DBParameterGroup not found: {identifier}"),
-        TaggedKind::DbClusterParameterGroup => {
-            format!("DBClusterParameterGroup not found: {identifier}")
-        }
-        TaggedKind::OptionGroup => format!("Specified OptionGroupName: {identifier} not found."),
-        TaggedKind::DbSubnetGroup => super::db_subnet_group_not_found_message(identifier),
-        TaggedKind::DbSecurityGroup => super::db_security_group_not_found_message(identifier),
-        TaggedKind::EventSubscription => format!("Event Subscription {identifier} not found."),
-        TaggedKind::GlobalCluster => format!("Global cluster '{identifier}' not found"),
-        TaggedKind::DbShardGroup => format!("DBShardGroup {identifier} not found."),
-        TaggedKind::BlueGreenDeployment => format!("BlueGreenDeployment {identifier} not found."),
-        TaggedKind::Integration => format!("Integration {identifier} not found."),
-        TaggedKind::DbProxy => format!("DBProxy {identifier} not found."),
-        TaggedKind::TenantDatabase => format!("TenantDatabase {identifier} not found."),
-        TaggedKind::CustomDbEngineVersion => {
-            format!("Custom engine version {identifier} not found")
-        }
-    }
+/// What a tag operation's not-found fault reports for a `ResourceName` that named no
+/// stored record.
+///
+/// These operations address their resource BY `ResourceName` — "This value is an Amazon
+/// Resource Name (ARN)" — so the fault names that value, the ARN the request carried,
+/// rather than the identifier segment parsed out of it: the ARN is the only handle the
+/// caller gave the resource here, and it is what a caller matching the refusal against
+/// what it sent looks for. The family it looked for the resource in is named by its own
+/// label ([`TaggedKind::resource_phrase`]), so one sentence serves every store this
+/// resolver reaches — the operation that failed to find it is a tag operation whichever
+/// family it was, which is why the wording is the tag family's own and not the resource
+/// family's describe wording.
+fn not_found_message(kind: TaggedKind, resource_name: &str) -> String {
+    format!(
+        "Could not find {} matching the resource name: {resource_name}",
+        kind.resource_phrase()
+    )
 }
 
 /// The refusal one of this service's tag operations answers a [`TagTargetMiss`] with, in

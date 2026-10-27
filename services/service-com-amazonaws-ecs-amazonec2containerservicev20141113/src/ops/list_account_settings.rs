@@ -190,8 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // only a value the caller really named is bounded.
         let requested_page = Some(input.max_results).filter(|max_results| *max_results != 0);
         if let Some(message) = requested_page.and_then(|max_results| {
-            crate::state::integer_bound_message(
-                "maxResults",
+            crate::state::page_size_violation(
                 max_results,
                 crate::state::MIN_LIST_PAGE_SIZE,
                 max_page,

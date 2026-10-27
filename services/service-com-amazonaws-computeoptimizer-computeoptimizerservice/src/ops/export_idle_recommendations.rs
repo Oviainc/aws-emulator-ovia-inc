@@ -216,6 +216,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 exportable_fields: EXPORTABLE_IDLE_FIELD_VALUES,
                 file_format: input.file_format,
                 one_job_in_progress: ONE_JOB_IN_PROGRESS,
+                // This surface's model declares no `recommendationPreferences`, so there is
+                // no preference for the export to be generated under.
+                recommendation_preferences: None,
             },
         )
         .map_err(refuse)?;

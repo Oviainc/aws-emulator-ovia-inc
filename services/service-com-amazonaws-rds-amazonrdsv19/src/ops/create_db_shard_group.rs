@@ -253,9 +253,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(cluster) = store.resolve_db_cluster(&region, &input.db_cluster_identifier) else {
             return Err(CreateDBShardGroupErrorModeled::DBClusterNotFoundFault(
                 DBClusterNotFoundFault {
-                    message: Some(format!(
-                        "DBCluster {} not found.",
-                        input.db_cluster_identifier
+                    message: Some(crate::state::db_cluster_not_found_message(
+                        &input.db_cluster_identifier,
                     )),
                 },
             )

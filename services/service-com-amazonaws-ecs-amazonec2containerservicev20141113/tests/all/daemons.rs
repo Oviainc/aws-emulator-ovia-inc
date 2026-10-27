@@ -518,7 +518,7 @@ async fn a_create_outside_a_documented_constraint_is_refused_and_stores_nothing(
         ),
         (
             "a daemonTaskDefinitionArn that is no reference at all",
-            "ClientException",
+            "InvalidParameterException",
             json!({ "daemonName": "malformeddefinition", "daemonTaskDefinitionArn": "not a reference" }),
         ),
         (

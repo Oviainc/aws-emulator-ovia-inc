@@ -26,6 +26,11 @@
 //! A fresh application carries no ACCESS SCOPES; `PutApplicationAccessScope` is what adds
 //! them to the record this create writes.
 //!
+//! An instance whose own creation has not finished serves only its describe and its delete
+//! (`DescribeInstance`: "While the instance is in the CREATE_IN_PROGRESS state, you can
+//! call only DescribeInstance and DeleteInstance operations"), so a create made inside that
+//! window is refused with the modelled `ConflictException` and stores nothing.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -234,6 +239,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let instance_arn = instance.instance_arn.clone();
         let identity_store_arn = instance.identity_store_arn.clone();
+
+        // An instance that is still being CREATED serves only its own describe and delete
+        // ("While the instance is in the CREATE_IN_PROGRESS state, you can call only
+        // DescribeInstance and DeleteInstance operations"), so nothing can be created
+        // under it until that creation finishes — the conflict with the `CreateInstance`
+        // still in flight.
+        if instance.creation_in_progress() {
+            return Err(CreateApplicationErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(crate::state::instance_creation_in_progress_message(
+                        &instance_arn,
+                    )),
+                },
+            )
+            .into());
+        }
 
         // "The ARN of the application provider under which the operation will run": an
         // application provider is AWS-owned, so the only ones that exist are the ones this

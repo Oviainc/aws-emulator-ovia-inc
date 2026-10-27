@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribePendingMaintenanceActions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribePendingMaintenanceActions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribePendingMaintenanceActions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the resources of this service that have at least one pending maintenance
+//! action, narrowed by `ResourceIdentifier` and by the `Filters` the member documents.
+//! Nothing in this service SCHEDULES a maintenance action — no operation writes one, which
+//! is why `ApplyPendingMaintenanceAction` reports an empty action list for a resource it
+//! resolves — so a stored resource carries none and the report holds only the resources
+//! that do: none of them. A selector naming a resource this service does not hold is not an
+//! error either; it selects no resource, which is an empty report rather than a refusal.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +158,160 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribePendingMaintenanceActions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribePendingMaintenanceActionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribePendingMaintenanceActions"))
+        let region = crate::state::request_region(ctx)
+            .map_err(DescribePendingMaintenanceActionsError::validation)?;
+        // "Default: 100 Constraints: Minimum 20, maximum 100" — the page size every paged
+        // report of this service is held to.
+        let page_size = crate::state::check_max_records(input.max_records)
+            .map_err(DescribePendingMaintenanceActionsError::invalid_parameter_value)?;
+        let filters = input.filters.unwrap_or_default();
+        check_filter_names(&filters)
+            .map_err(DescribePendingMaintenanceActionsError::invalid_parameter_value)?;
+        crate::state::check_filter_terms(&filters)
+            .map_err(DescribePendingMaintenanceActionsError::validation)?;
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated empty list.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // A report materialises the transitions the clock already made due: the ones owed
+        // at this instant whether or not anybody called.
+        store.settle_due_transitions(&region);
+
+        // The resources this report is ABOUT: the DB clusters and DB instances of the
+        // region the request was signed for, each with what it has pending. RDS is
+        // regional, and `ResourceIdentifier` is "the ARN of a resource", so a resource is
+        // selected by the ARN it reports for itself.
+        let resources: Vec<Resource> = store
+            .clusters_in(&region)
+            .into_iter()
+            .map(|cluster| Resource {
+                arn: cluster.arn(),
+                identifier: cluster.identifier.clone(),
+                kind: ResourceKind::DbCluster,
+            })
+            .chain(store.instances_in(&region).into_iter().map(|instance| {
+                Resource {
+                    arn: instance.arn(),
+                    identifier: instance.identifier.clone(),
+                    kind: ResourceKind::DbInstance,
+                }
+            }))
+            .collect();
+
+        let reported: Vec<(String, ResourcePendingMaintenanceActions)> = resources
+            .into_iter()
+            // The selectors narrow the resources the report is about. They are applied to
+            // what the store holds rather than trusted, so an unsupported filter name is
+            // refused above and a selector that names nothing selects nothing — and since
+            // no resource has an action pending (see [`Resource::pending_actions`]), the
+            // page they narrow is empty whichever of them a request carries.
+            .filter(|resource| {
+                input
+                    .resource_identifier
+                    .as_ref()
+                    .is_none_or(|named| resource.arn == *named)
+            })
+            .filter(|resource| filters.iter().all(|filter| resource.matches(filter)))
+            // "Returns a list of resources (for example, DB instances) that have AT LEAST
+            // ONE pending maintenance action": a resource with none is not in the report at
+            // all. Nothing in this service schedules one, so every resource's action list
+            // is empty and none of them is reported — the report says what is pending, and
+            // nothing is, rather than naming work nothing scheduled.
+            .filter(|resource| !resource.pending_actions().is_empty())
+            .map(|resource| {
+                (
+                    resource.arn.clone(),
+                    ResourcePendingMaintenanceActions {
+                        resource_identifier: Some(resource.arn.clone()),
+                        pending_maintenance_action_details: Some(resource.pending_actions()),
+                    },
+                )
+            })
+            .collect();
+
+        // A `Marker` no prior page issued is refused rather than resynchronised: see
+        // `crate::state::paginate`.
+        let page = crate::state::paginate(reported, input.marker.as_deref(), page_size)
+            .map_err(DescribePendingMaintenanceActionsError::invalid_parameter_value)?;
+        Ok(DescribePendingMaintenanceActionsOutput {
+            marker: page.next_marker,
+            pending_maintenance_actions: Some(page.items),
+        })
     }
+}
+
+/// Which family a [`Resource`] belongs to, which is what decides the `Filters` name that
+/// selects it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResourceKind {
+    /// Selected by `db-cluster-id`.
+    DbCluster,
+    /// Selected by `db-instance-id`.
+    DbInstance,
+}
+
+/// One resource this report can be about: how it is addressed (its ARN and its
+/// identifier) and which family it belongs to.
+#[derive(Debug, Clone)]
+struct Resource {
+    arn: String,
+    identifier: String,
+    kind: ResourceKind,
+}
+
+impl Resource {
+    /// What this resource has pending.
+    ///
+    /// EMPTY for every resource this service holds: a maintenance action is scheduled by
+    /// the service for a resource, and no operation of this emulator ever writes one — the
+    /// same reason `ApplyPendingMaintenanceAction` answers a resolved resource with an
+    /// empty action list. Reporting a detail here would describe maintenance nothing
+    /// scheduled and nothing will apply.
+    fn pending_actions(&self) -> Vec<PendingMaintenanceAction> {
+        Vec::new()
+    }
+
+    /// Whether this resource matches one filter: true when any of the filter's values
+    /// matches the member that filter names. "Filter values are case-sensitive."
+    fn matches(&self, filter: &Filter) -> bool {
+        let selects = match filter.name.as_str() {
+            // "db-cluster-id - Accepts DB cluster identifiers and DB cluster Amazon
+            // Resource Names (ARNs)", and `db-instance-id` the same for a DB instance, so
+            // a filter naming one family never selects a resource of the other.
+            "db-cluster-id" => self.kind == ResourceKind::DbCluster,
+            "db-instance-id" => self.kind == ResourceKind::DbInstance,
+            // Unreachable: `check_filter_names` refused every other name up front.
+            _ => false,
+        };
+        selects
+            && filter
+                .values
+                .iter()
+                .any(|value| self.identifier == *value || self.arn == *value)
+    }
+}
+
+/// The filter names this operation's `Filters` member documents: "`db-cluster-id` - Accepts
+/// DB cluster identifiers and DB cluster Amazon Resource Names (ARNs)" and
+/// "`db-instance-id` - Accepts DB instance identifiers and DB instance ARNs". RDS refuses
+/// any other name, and so does this operation — with a 400, because quietly ignoring a
+/// filter would report resources the caller excluded.
+const SUPPORTED_FILTER_NAMES: [&str; 2] = ["db-cluster-id", "db-instance-id"];
+
+/// Refuse a filter this operation does not support. "Filter names are case-sensitive."
+fn check_filter_names(filters: &[Filter]) -> Result<(), String> {
+    for filter in filters {
+        if !SUPPORTED_FILTER_NAMES.contains(&filter.name.as_str()) {
+            return Err(format!(
+                "unrecognized filter name: {}; supported filters are {}",
+                filter.name,
+                SUPPORTED_FILTER_NAMES.join(", ")
+            ));
+        }
+    }
+    Ok(())
 }

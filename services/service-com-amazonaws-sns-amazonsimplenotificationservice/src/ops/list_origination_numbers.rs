@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListOriginationNumbers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListOriginationNumbers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListOriginationNumbers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports one page of the dedicated origination numbers this account
+//! holds from persisted state, oldest first, and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -80,6 +74,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -148,23 +143,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::LIST_ORIGINATION_NUMBERS_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// One page of the dedicated origination numbers this account holds, oldest first.
+    ///
+    /// A pure REPORT of persisted state: every member of every entry comes from the
+    /// record the number's out-of-band provisioning wrote — the number, its status, its
+    /// country, its route and its capabilities — and nothing here writes, so an account
+    /// holding no dedicated number has an EMPTY list of them rather than an unknown one.
+    ///
+    /// Paginated on this operation's own members: `MaxResults` is the request's page
+    /// size, which the model bounds at 1..30 and the boundary validator has already
+    /// refused anything outside, so an absent value is the only case left to answer —
+    /// with [`state::ORIGINATION_NUMBERS_PAGE_SIZE`], the largest page this listing
+    /// serves. The token is opaque to the caller, so one this service never minted is a
+    /// parameter that does not comply with its constraints and is refused with the
+    /// modelled `InvalidParameterException`, as every paginated SNS listing refuses it.
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListOriginationNumbers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListOriginationNumbersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListOriginationNumbers"))
+        let Some(store) = state::service_state(&*self.engine) else {
+            return Err(ListOriginationNumbersErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the SNS store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let store = store.lock();
+
+        let all: Vec<PhoneNumberInformation> = store
+            .origination_numbers_in_order()
+            .into_iter()
+            .map(|number| PhoneNumberInformation {
+                created_at: Some(state::timestamp(number.created_at)),
+                phone_number: Some(number.phone_number.clone()),
+                status: Some(number.status.clone()),
+                iso2_country_code: Some(number.iso2_country_code.clone()),
+                route_type: Some(number.route_type.clone()),
+                number_capabilities: Some(number.number_capabilities.clone()),
+            })
+            .collect();
+
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(state::ORIGINATION_NUMBERS_PAGE_SIZE);
+
+        let Some((page, next_token)) =
+            state::paginate(all, input.next_token.as_deref(), page_size)
+        else {
+            return Err(ListOriginationNumbersErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(state::INVALID_NEXT_TOKEN_REFUSAL.to_string()),
+                },
+            )
+            .into());
+        };
+
+        Ok(ListOriginationNumbersOutput {
+            phone_numbers: Some(page),
+            next_token,
+        })
     }
 }

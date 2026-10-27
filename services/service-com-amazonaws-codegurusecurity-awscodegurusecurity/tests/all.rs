@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/account_configuration.rs"]
 mod account_configuration;
+#[path = "all/account_configuration_kms_key.rs"]
+mod account_configuration_kms_key;
 #[path = "all/batch_get_findings_classification.rs"]
 mod batch_get_findings_classification;
 #[path = "all/create_scan_idempotency.rs"]
