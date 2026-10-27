@@ -246,8 +246,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An account MANAGES an organization exactly when this service's store holds member
         // accounts for it: AWS Organizations is what records an account's membership (see
         // [`crate::state::OrganizationMemberStore`]), so an emulator that records no
-        // organization presents a standalone account.
-        if guard.organization_members.is_empty() {
+        // organization presents a standalone account. That role is the crate's one test
+        // ([`crate::state::ComAmazonawsComputeoptimizerComputeoptimizerserviceState::manages_an_organization`]),
+        // shared with every operation that takes the organization-wide
+        // `includeMemberAccounts`, so no two of them judge the caller differently.
+        if !guard.manages_an_organization() {
             return Err(not_a_management_account());
         }
         let selected: Vec<AccountEnrollmentStatus> = guard
