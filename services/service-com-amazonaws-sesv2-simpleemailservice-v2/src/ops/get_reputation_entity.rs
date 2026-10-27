@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetReputationEntity
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetReputationEntity`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetReputationEntity::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the one reputation entity the request names: the entity of the resource whose
+//! ARN the reference is, with its two status records, its aggregate sending status, its
+//! reputation management policy and its reputation impact. This is the ONLY file to touch
+//! for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +144,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetReputationEntity` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetReputationEntityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The engine is not the shared in-memory engine, so this service has no
+            // store to read. That is not a modelled SES state: answer the scaffold's
+            // 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetReputationEntity without the shared emulator state",
+            ));
+        };
+
+        // `ReputationEntityType` arrives as a plain string, so a value outside the enum
+        // is this handler's to refuse, with the `BadRequestException` the model binds for
+        // "the input you provided is invalid". The one type the model binds is the one
+        // every entity is of, so the checked value constrains nothing further.
+        crate::state::modelled_enum_value(
+            "ReputationEntityType",
+            input.reputation_entity_type,
+            &[crate::state::REPUTATION_ENTITY_TYPE_RESOURCE],
+        )
+        .map_err(bad_request)?;
+
+        let reference = input.reputation_entity_reference;
+        // The entity this call can reach is one of the account the request is
+        // authenticated for, in the Region its own credential scope names.
+        let scope = crate::state::CallerScope::of(ctx.parts());
+
+        // Reporting only: nothing here writes, so a read leaves every later caller
+        // seeing exactly what it saw.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetReputationEntity"))
+        // The entity is picked out of the same derivation a listing of this call reports
+        // over, so a read of one entity and a listing that includes it cannot disagree
+        // about any member of it — and a reference outside the call's scope reaches
+        // nothing, exactly as one naming no resource at all.
+        let found = {
+            let store = state.lock();
+            store
+                .reputation_entities(&scope)
+                .into_iter()
+                .find(|entity| entity.reputation_entity_reference.as_deref() == Some(&*reference))
+        };
+
+        let Some(entity) = found else {
+            // This operation does model "the resource you attempted to access doesn't
+            // exist", so a reference naming no entity this call reaches is reported with
+            // it rather than as invalid input — the wording is the one the reputation
+            // writes use, which model no such error.
+            return Err(GetReputationEntityErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::reputation_entity_not_found(&reference)),
+            })
+            .into());
+        };
+
+        Ok(GetReputationEntityOutput {
+            reputation_entity: Some(entity),
+        })
     }
+}
+
+/// Refuse the request with this operation's input error.
+fn bad_request(message: impl Into<String>) -> GetReputationEntityError {
+    GetReputationEntityErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
 }
