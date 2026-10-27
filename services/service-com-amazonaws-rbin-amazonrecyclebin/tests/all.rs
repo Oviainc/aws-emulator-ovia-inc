@@ -17,6 +17,8 @@ mod error_reason_fault_classes;
 mod error_response_bodies;
 #[path = "all/list_rules_page_order.rs"]
 mod list_rules_page_order;
+#[path = "all/list_rules_settled_lock_state.rs"]
+mod list_rules_settled_lock_state;
 #[path = "all/lockable_rule_invariant.rs"]
 mod lockable_rule_invariant;
 #[path = "all/not_found_error_body_members.rs"]

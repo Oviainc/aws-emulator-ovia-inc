@@ -199,7 +199,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let resource_tag_filter = input.resource_tags.unwrap_or_default();
         let exclude_resource_tag_filter = input.exclude_resource_tags.unwrap_or_default();
 
-        let store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A transition the clock has already made due — `pending` -> `available`, and an
+        // unlock delay that has run out — was owed at this instant whether or not anybody
+        // called, so this Region's rules are settled BEFORE any of them is matched against
+        // a filter or rendered: the page reports the state the clock reached, the
+        // `LockState` filter keys on that same state, and two reads of one record can
+        // never disagree.
+        store.settle_rules_in_region(&region, now);
         let mut rules = Vec::new();
         let mut last_reported: Option<&String> = None;
         let mut next_token = None;
