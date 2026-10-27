@@ -229,38 +229,13 @@ fn tag_value_matches(value: &str, term: &str) -> bool {
         term = rest;
     }
     let matches = if term.contains('*') {
-        wildcard_matches(&value.to_lowercase(), &term.to_lowercase())
+        // "Wildcard matching is case-insensitive", so both sides are folded before the one
+        // shared reading of the `*` wildcard answers the wildcard question.
+        crate::state::wildcard_matches(&value.to_lowercase(), &term.to_lowercase())
     } else {
         value == term
     };
     matches != negated
-}
-
-/// Whether `value` matches a term containing `*` wildcards, each standing for any run of
-/// characters (`prod*`, `*prod`, `a*b*c`). Both arguments arrive case-folded, because
-/// "Wildcard matching is case-insensitive".
-fn wildcard_matches(value: &str, term: &str) -> bool {
-    let mut literals = term.split('*');
-    // The run before the first `*` is anchored at the start, the run after the last `*`
-    // at the end, and every run between them is matched in order.
-    let Some(first) = literals.next() else {
-        return true;
-    };
-    let Some(mut rest) = value.strip_prefix(first) else {
-        return false;
-    };
-    let remaining: Vec<&str> = literals.collect();
-    let Some((last, middle)) = remaining.split_last() else {
-        // No `*` at all: the term is literal.
-        return rest.is_empty();
-    };
-    for literal in middle {
-        match rest.find(literal) {
-            Some(at) => rest = &rest[at + literal.len()..],
-            None => return false,
-        }
-    }
-    rest.ends_with(last)
 }
 
 /// Whether one log group's tags satisfy one `TagFilter`.

@@ -17,9 +17,8 @@
 //!   the existing queue instead of creating a new one. If you attempt to create a
 //!   queue with a name that already exists but with different attribute names or
 //!   values, the CreateQueue action will return an error." — the comparison that
-//!   decides which of the two happens is [`crate::state::recreate_refusal`], and the
-//!   attributes it leaves out of it are
-//!   [`crate::state::ATTRIBUTES_NOT_COMPARED_ON_RECREATE`].
+//!   decides which of the two happens is [`crate::state::recreate_refusal`], over every
+//!   settable attribute and over the tag set the request supplies.
 //! - "If you delete a queue, you must wait at least 60 seconds before creating a queue
 //!   with the same name" — a name whose deletion has not propagated yet (it is still in
 //!   the ledger [`crate::state::QUEUE_DELETED_RECENTLY_INTERVAL`] bounds) is answered

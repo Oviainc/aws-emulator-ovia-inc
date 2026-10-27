@@ -46,7 +46,7 @@
 //! documented intrinsic, `States.Hash`, is DECLINED for a different reason: the
 //! algorithms it names include MD5 and SHA-1, and this emulator does not take a
 //! dependency on broken hash functions to evaluate a payload template; it answers
-//! [`INTRINSIC_ERROR`], as any unknown intrinsic does.
+//! [`RUNTIME_ERROR`], as any unknown intrinsic does.
 //!
 //! ## What is validated
 //!
@@ -100,8 +100,11 @@
 //! runs an inline Map: the state's output is therefore computed from the items the
 //! definition selected. Each Distributed Map state the walk entered is reported as a
 //! [`StartedMapRun`], which the call that started the execution stores as a Map Run
-//! of its own. The child EXECUTION records a real Distributed Map also creates are
-//! not stored yet, and their own stub issues own that.
+//! of its own, and each of that state's items is reported as the child EXECUTION it
+//! started ([`StartedChildExecution`]): one per item, carrying the `ItemSelector`
+//! projection as its own input and the item's own result as its output, under an ARN
+//! of its own that the item's states read through `$$.Execution.Id`. An INLINE Map
+//! starts neither, exactly as the service starts neither for one.
 //!
 //! ## Time
 //!
@@ -122,6 +125,11 @@ use super::integration::{Failed, Tasks};
 /// The ASL predefined error name for a failure the interpreter itself raises
 /// ("States.Runtime — an execution failed due to some exception that could not be
 /// processed").
+///
+/// It is the name an INTRINSIC-function invocation that could not be evaluated
+/// carries too — a definition the walk could not run, exactly as the rest of this
+/// name's failures are — and it is TERMINAL: it is neither retried nor caught
+/// ([`errors_match`]), so a definition cannot recover from one.
 pub const RUNTIME_ERROR: &str = "States.Runtime";
 
 /// The ASL predefined error name for a payload that outgrew what a state may carry
@@ -135,10 +143,6 @@ pub const RESULT_PATH_ERROR: &str = "States.ResultPathMatchFailure";
 /// The ASL predefined error name for a `Parameters`/`ItemSelector` payload template
 /// whose path could not be resolved ("States.ParameterPathFailure").
 pub const PARAMETER_PATH_ERROR: &str = "States.ParameterPathFailure";
-
-/// The ASL predefined error name for an intrinsic function that could not be
-/// evaluated ("States.IntrinsicFailure").
-pub const INTRINSIC_ERROR: &str = "States.IntrinsicFailure";
 
 /// The ASL predefined error name for a `Choice` state no rule matched and that
 /// declares no `Default` ("States.NoChoiceMatched").
@@ -201,7 +205,7 @@ pub const MAX_NESTING_DEPTH: usize = 16;
 ///
 /// Emulator bound on a hand-written parser: the nesting lives inside ONE JSON string,
 /// so `serde_json`'s own recursion limit does not bound it. A deeper invocation is
-/// reported with [`INTRINSIC_ERROR`].
+/// reported with [`RUNTIME_ERROR`].
 pub const MAX_EXPRESSION_DEPTH: usize = 16;
 
 /// The most characters one intrinsic-function invocation may carry.
@@ -271,7 +275,7 @@ pub const MAX_ARRAY_RANGE_VALUES: usize = 10_000;
 /// which is bounded in BYTES and not in element COUNT, so an array of tiny elements
 /// can carry on the order of 10^5 of them. Every intrinsic that walks one is linear
 /// in the count, and this is the ceiling on that count, reported with
-/// [`INTRINSIC_ERROR`].
+/// [`RUNTIME_ERROR`].
 pub const MAX_ARRAY_ITEMS: usize = 10_000;
 
 /// The most levels of nested state machines (`ItemProcessor`, `Iterator`,
@@ -573,6 +577,47 @@ pub struct StartedMapRun {
     /// How each item the state iterated turned out, in the order the iterations
     /// finished: what the Map Run counts an item under, and from which offset.
     pub items: Vec<MapItemOutcome>,
+    /// The child execution each item of the state was run as, in the order the
+    /// iterations were started: what `ListExecutions` reports for this Map Run.
+    pub children: Vec<StartedChildExecution>,
+}
+
+/// One child workflow execution a Distributed Map state started: the execution ONE
+/// of its items ran as.
+///
+/// A Distributed Map "starts a child workflow execution for each item", so each item
+/// is an execution of its own — with its own ARN, which that item's states read
+/// through `$$.Execution.Id`, the `ItemSelector` projection as its own input and
+/// what its iteration produced as its own output. The offsets are into the RUN (the
+/// total of every `Wait` the walk passed), so the caller that stores this turns them
+/// into instants against the parent execution's own start — the walk never sleeps.
+#[derive(Debug, Clone)]
+pub struct StartedChildExecution {
+    /// The execution name, which the ARN below carries as its last field.
+    pub name: String,
+    /// The child's own execution ARN, under the state machine the Map Run runs and
+    /// the Map state's label.
+    pub arn: String,
+    /// "The string that contains the JSON input data" of this execution: the
+    /// `ItemSelector` projection of its item, or the item itself where the state
+    /// declares no selector.
+    pub input: String,
+    /// What its iteration produced, for a child that SUCCEEDED.
+    pub output: Option<String>,
+    /// The error and cause its iteration failed with, for one that did not.
+    pub error: Option<String>,
+    pub cause: Option<String>,
+    /// `SUCCEEDED` or `FAILED`, as its own iteration ended.
+    pub status: &'static str,
+    /// How far into the run its iteration started, and how far into the run it
+    /// finished.
+    pub started_at: Duration,
+    pub finished_at: Duration,
+    /// "The total number of items processed in a child workflow execution": one,
+    /// because every child this emulator starts is handed exactly one item of the
+    /// state's array (`ItemBatcher`, which batches several into one child, is not
+    /// interpreted — see the module docs).
+    pub item_count: i32,
 }
 
 /// What one walk of a definition produced.
@@ -811,6 +856,9 @@ struct Scope {
 /// A `Map` state's plan: everything resolved from its members before its items run.
 struct MapPlan<'a> {
     items: &'a [Value],
+    /// The state's `Label`, else its own name: the field the Map Run's ARN and its
+    /// children's own ARNs carry.
+    label: &'a str,
     /// The `ItemProcessor`'s (or legacy `Iterator`'s) own state list and entry point.
     states: &'a Map<String, Value>,
     start_at: &'a str,
@@ -2309,6 +2357,12 @@ fn interpret(
         map_runs: Vec::new(),
         reply,
         resumed: None,
+        // A child execution's ARN is minted in the state machine's OWN region, from
+        // the state machine's own ARN, so it agrees with the parent execution's
+        // however the request that started it was signed.
+        machine_name: context.state_machine_name.clone(),
+        region: super::arn_region(&context.state_machine_arn),
+        child_counter: 0,
     };
     let branch = interpreter.walk(
         states,
@@ -2336,6 +2390,10 @@ fn interpret(
             map_run.stopped_at = map_run.stopped_at.saturating_sub(resumed.at);
             for item in &mut map_run.items {
                 item.finished_at = item.finished_at.saturating_sub(resumed.at);
+            }
+            for child in &mut map_run.children {
+                child.started_at = child.started_at.saturating_sub(resumed.at);
+                child.finished_at = child.finished_at.saturating_sub(resumed.at);
             }
         }
         if let Some(waiting) = waiting.as_mut() {
@@ -2370,6 +2428,11 @@ fn interpret(
                     // timeout never finished: the execution ended first, so the Map
                     // Run never counted it.
                     map_run.items.retain(|item| item.finished_at <= remaining);
+                    // And the child execution that item ran as never finished
+                    // either, for the same reason.
+                    map_run
+                        .children
+                        .retain(|child| child.finished_at <= remaining);
                     map_run
                 })
                 .collect();
@@ -2650,6 +2713,15 @@ struct Interpreter<'tasks> {
     /// point already happened under an earlier call, so [`interpret`] reports only
     /// what follows it.
     resumed: Option<Resumed>,
+    /// The name of the state machine this walk runs, and the region its ARNs are
+    /// minted in: what the ARN of a child execution a Distributed Map state starts is
+    /// built from, together with that state's label.
+    machine_name: String,
+    region: String,
+    /// How many child executions this walk has already named, mixed into the next
+    /// one's drawn name so two mints in the same nanosecond differ — exactly as the
+    /// store's own counter does for an execution name it mints.
+    child_counter: u64,
 }
 
 /// Where a walk applied an [`ActivityReply`]: the step its own events begin at, and
@@ -2671,6 +2743,9 @@ struct MapTally {
     /// Each item that finished, with the offset it finished at, so what the Map Run
     /// reports can follow the items one by one rather than all at once.
     items: Vec<MapItemOutcome>,
+    /// The child execution each item of a DISTRIBUTED attempt ran as, in the order
+    /// the iterations were started; empty for an inline `Map`, which starts none.
+    children: Vec<StartedChildExecution>,
 }
 
 impl Interpreter<'_> {
@@ -3093,6 +3168,41 @@ impl Interpreter<'_> {
         context
     }
 
+    /// The context object (`$$`) the states of ONE child workflow execution read:
+    /// this walk's own, with the `Execution` members of the CHILD.
+    ///
+    /// A Distributed Map's item runs as an execution in its own right, so the states
+    /// inside it read that execution's identity — its ARN, its name, the input it was
+    /// started with and the instant it started — rather than the parent's. The state
+    /// machine stays the parent's: a child "runs the same state machine" the Map Run
+    /// reports, which is what `ListMapRuns` names in `stateMachineArn`. It has been
+    /// redriven no times, because it has just been started.
+    fn child_context(&self, arn: &str, name: &str, input: &Value, at: Duration) -> Value {
+        let mut context = self.base_context.clone();
+        if let Some(execution) = context.get_mut("Execution").and_then(Value::as_object_mut) {
+            execution.insert("Id".to_string(), json!(arn));
+            execution.insert("Name".to_string(), json!(name));
+            execution.insert("Input".to_string(), input.clone());
+            execution.insert("StartTime".to_string(), json!(iso(super::after(self.start, at))));
+            execution.insert("RedriveCount".to_string(), json!(0));
+        }
+        context
+    }
+
+    /// A fresh name for one child workflow execution.
+    ///
+    /// Step Functions names a child workflow execution it starts for an item, so the
+    /// name is drawn here, as a version-4 UUID — the same form, from the same
+    /// generator, as the name the store mints for a `StartExecution` that gave none.
+    /// The counter is what makes two draws in the same nanosecond differ.
+    fn fresh_child_name(&mut self) -> String {
+        self.child_counter = self.child_counter.wrapping_add(1);
+        let mut seed = super::now_nanos() ^ self.child_counter.rotate_left(29);
+        let high = super::splitmix64(&mut seed);
+        let low = super::splitmix64(&mut seed);
+        super::uuid_v4(high, low)
+    }
+
     fn push(&mut self, event_type: &'static str, state_name: &str, after: Duration) {
         self.steps.push(Step {
             event_type,
@@ -3483,8 +3593,17 @@ impl Interpreter<'_> {
         let (processor_states, processor_start) =
             states_of(processor, &format!("the 'ItemProcessor' of state '{name}'"))
                 .map_err(|failure| failure.at(at))?;
+        // "A user-defined or an auto-generated string that identifies a Map state":
+        // the field the Map Run's own ARN carries, and the field the ARN of every
+        // child execution it starts carries too, so one reading serves both.
+        let label = state
+            .get("Label")
+            .and_then(Value::as_str)
+            .unwrap_or(name)
+            .to_string();
         let plan = MapPlan {
             items: &items,
+            label: &label,
             states: processor_states,
             start_at: processor_start,
             selector: state.get("ItemSelector").or_else(|| state.get("Parameters")),
@@ -3524,11 +3643,7 @@ impl Interpreter<'_> {
             self.map_runs.insert(
                 slot,
                 StartedMapRun {
-                    label: state
-                        .get("Label")
-                        .and_then(Value::as_str)
-                        .unwrap_or(name)
-                        .to_string(),
+                    label: label.clone(),
                     status: if outcome.is_ok() {
                         super::MAP_RUN_STATUS_SUCCEEDED
                     } else {
@@ -3544,6 +3659,9 @@ impl Interpreter<'_> {
                     tolerated_failure_percentage: plan.tolerated_percentage as f32,
                     total_items: i64::try_from(plan.items.len()).unwrap_or(i64::MAX),
                     items: finished_items,
+                    // One child execution per item of the attempt the state ended
+                    // on, which is what `ListExecutions` reports for this Map Run.
+                    children: std::mem::take(&mut tally.children),
                 },
             );
         }
@@ -3669,6 +3787,30 @@ impl Interpreter<'_> {
                     },
                     None => item.clone(),
                 };
+                // A DISTRIBUTED Map "starts a child workflow execution for each
+                // item", so this item's iteration runs as an execution of its own:
+                // its ARN is minted HERE, before the iteration, because the item's
+                // states read it through `$$.Execution.Id` — and the context they
+                // read is the CHILD's, not the parent's. An inline Map starts no
+                // execution, so its iteration keeps the parent's context.
+                let child = plan.distributed.then(|| {
+                    let name = self.fresh_child_name();
+                    let arn = super::execution_arn(
+                        &self.region,
+                        &format!("{}/{}", self.machine_name, plan.label),
+                        &name,
+                    );
+                    (name, arn)
+                });
+                let enclosing_context = child.as_ref().map(|(name, arn)| {
+                    let child_context =
+                        self.child_context(arn, name, &item_input, batch_start);
+                    std::mem::replace(&mut self.base_context, child_context)
+                });
+                // The child's own `input` is the document this iteration was handed,
+                // kept before the walk takes it: "the string that contains the JSON
+                // input data" of that execution.
+                let child_input = child.as_ref().map(|_| item_input.to_string());
                 let branch = self.nested_walk(
                     plan.states,
                     plan.start_at,
@@ -3676,7 +3818,43 @@ impl Interpreter<'_> {
                     batch_start,
                     &scope,
                 );
+                if let Some(enclosing) = enclosing_context {
+                    self.base_context = enclosing;
+                }
                 batch_end = batch_end.max(branch.end);
+                if let Some((name, arn)) = child {
+                    // The child execution this item ran as, as it ended: an item that
+                    // produced a result is an execution that SUCCEEDED with that
+                    // result as its output, and one whose iteration failed is an
+                    // execution that FAILED with that failure's own error and cause.
+                    let (status, output, error, cause) = match &branch.outcome {
+                        Ok(value) => (
+                            super::EXECUTION_STATUS_SUCCEEDED,
+                            Some(value.to_string()),
+                            None,
+                            None,
+                        ),
+                        Err(failure) => (
+                            super::EXECUTION_STATUS_FAILED,
+                            None,
+                            failure.error.clone(),
+                            failure.cause.clone(),
+                        ),
+                    };
+                    tally.children.push(StartedChildExecution {
+                        name,
+                        arn,
+                        input: child_input.unwrap_or_default(),
+                        output,
+                        error,
+                        cause,
+                        status,
+                        started_at: batch_start,
+                        finished_at: branch.end,
+                        // One item per child: see [`StartedChildExecution::item_count`].
+                        item_count: 1,
+                    });
+                }
                 match branch.outcome {
                     Ok(value) => {
                         // The array the iterations are building is a document this
@@ -4983,7 +5161,7 @@ fn intrinsic(text: &str, input: &Value, context: &Value) -> Result<Value, Failur
 /// inside ONE JSON string, so `serde_json`'s own recursion limit does not bound it.
 /// Both the length of the invocation ([`MAX_EXPRESSION_CHARS`]) and how deeply it
 /// nests ([`MAX_EXPRESSION_DEPTH`]) are therefore bounded here, and an invocation
-/// past either is reported with [`INTRINSIC_ERROR`] rather than parsed.
+/// past either is reported with [`RUNTIME_ERROR`] rather than parsed.
 fn invoke_intrinsic(
     text: &str,
     input: &Value,
@@ -4992,39 +5170,29 @@ fn invoke_intrinsic(
 ) -> Result<Value, Failure> {
     let text = text.trim();
     if depth > MAX_EXPRESSION_DEPTH {
-        return Err(named(
-            INTRINSIC_ERROR,
-            format!(
-                "an intrinsic-function invocation nests more than the {MAX_EXPRESSION_DEPTH} \
-                 levels this service evaluates"
-            ),
-        ));
+        return Err(runtime(format!(
+            "an intrinsic-function invocation nests more than the {MAX_EXPRESSION_DEPTH} \
+             levels this service evaluates"
+        )));
     }
     if text.len() > MAX_EXPRESSION_CHARS {
-        return Err(named(
-            INTRINSIC_ERROR,
-            format!(
-                "an intrinsic-function invocation of {} bytes is longer than the \
-                 {MAX_EXPRESSION_CHARS} this service evaluates",
-                text.len()
-            ),
-        ));
+        return Err(runtime(format!(
+            "an intrinsic-function invocation of {} bytes is longer than the \
+             {MAX_EXPRESSION_CHARS} this service evaluates",
+            text.len()
+        )));
     }
-    let open = text.find('(').ok_or_else(|| {
-        named(
-            INTRINSIC_ERROR,
-            format!("'{text}' is not an intrinsic-function invocation"),
-        )
-    })?;
+    let open = text
+        .find('(')
+        .ok_or_else(|| runtime(format!("'{text}' is not an intrinsic-function invocation")))?;
     if !text.ends_with(')') {
-        return Err(named(
-            INTRINSIC_ERROR,
-            format!("the intrinsic invocation '{text}' is not closed"),
-        ));
+        return Err(runtime(format!(
+            "the intrinsic invocation '{text}' is not closed"
+        )));
     }
     let name = text[..open].trim();
     let arguments = split_arguments(&text[open + 1..text.len() - 1])
-        .map_err(|why| named(INTRINSIC_ERROR, format!("'{text}': {why}")))?;
+        .map_err(|why| runtime(format!("'{text}': {why}")))?;
     // Each argument may select a whole document, and an invocation may carry as many
     // arguments as its text has room for, so the arguments are measured as they are
     // evaluated and bounded together: the function below cannot be handed more than a
@@ -5035,18 +5203,15 @@ fn invoke_intrinsic(
         let value = argument_value(argument, input, context, depth)?;
         spent = spent.saturating_add(measure_payload(&value, "an intrinsic argument")?);
         if spent > MAX_PAYLOAD_BYTES {
-            return Err(named(
-                INTRINSIC_ERROR,
-                format!(
-                    "'{name}' was given at least {spent} bytes of arguments, more than the \
-                     {MAX_PAYLOAD_BYTES} a state's output may carry"
-                ),
-            ));
+            return Err(runtime(format!(
+                "'{name}' was given at least {spent} bytes of arguments, more than the \
+                 {MAX_PAYLOAD_BYTES} a state's output may carry"
+            )));
         }
         values.push(value);
     }
-    let result = apply_intrinsic(name, &values)
-        .map_err(|why| named(INTRINSIC_ERROR, format!("'{text}': {why}")))?;
+    let result =
+        apply_intrinsic(name, &values).map_err(|why| runtime(format!("'{text}': {why}")))?;
     // And what it built is bounded too, because a function may expand what it was
     // given.
     measure_payload(&result, "an intrinsic function")?;
@@ -5130,10 +5295,9 @@ fn argument_value(
         return Ok(Value::String(unescaped));
     }
     serde_json::from_str(text).map_err(|error| {
-        named(
-            INTRINSIC_ERROR,
-            format!("'{text}' is not a path, a quoted string or a JSON literal: {error}"),
-        )
+        runtime(format!(
+            "'{text}' is not a path, a quoted string or a JSON literal: {error}"
+        ))
     })
 }
 
@@ -5143,7 +5307,7 @@ fn argument_value(
 /// DECLINED: the algorithms it names include MD5 and SHA-1, and this emulator does
 /// not take a dependency on broken hash functions to evaluate a state's payload
 /// template. Like any other name this closed allow-list does not carry, it is
-/// reported with [`INTRINSIC_ERROR`] rather than approximated.
+/// reported with [`RUNTIME_ERROR`] rather than approximated.
 fn apply_intrinsic(name: &str, arguments: &[Value]) -> Result<Value, String> {
     let argument = |index: usize| -> Result<&Value, String> {
         arguments
@@ -5617,12 +5781,16 @@ pub fn test_state(test: &StateTest<'_>) -> Trial {
         tasks: &super::integration::Unserved,
         waiting: None,
         // `TestState` starts nothing: it reports what one state computes, and the
-        // Map Runs a Distributed Map starts belong to an execution.
+        // Map Runs a Distributed Map starts — and the child executions its items run
+        // as — belong to an execution.
         map_runs: Vec::new(),
         // `TestState` continues no execution: a state whose work is an invocation is
         // answered by the request's own `mock`, not by a worker's reply.
         reply: None,
         resumed: None,
+        machine_name: test.context.state_machine_name.clone(),
+        region: super::arn_region(&test.context.state_machine_arn),
+        child_counter: 0,
     };
     interpreter.trial(test, &raw, inspection)
 }

@@ -379,6 +379,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The restore holds the store's lock; the event it raises is published
+        // once that lock is released, because a publish is an in-process call
+        // into another service and must not run under it.
+        let (output, identifier, restored_from) = self.restore(&input, ctx)?;
+
+        // The cluster was built from a snapshot, which is the event this write
+        // raises — about the cluster it created, naming the snapshot it came
+        // from. Every subscription scoped to it is told, on its own topic.
+        crate::state::notifications::raise(
+            ctx,
+            &*self.engine,
+            crate::state::EVENT_ID_CLUSTER_RESTORED,
+            &identifier,
+            &[
+                (crate::state::notifications::CLUSTER_NAME, &identifier),
+                (
+                    crate::state::notifications::SNAPSHOT_NAME,
+                    &restored_from,
+                ),
+            ],
+        )
+        .await;
+
+        Ok(output)
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RestoreFromClusterSnapshot<Eng> {
+    /// The restore itself: the output it reports, the identifier of the cluster
+    /// it created — the source the event it raises is about — and the identifier
+    /// of the snapshot that cluster was built from.
+    ///
+    /// Everything that touches the store lives here, so the lock is held for the
+    /// write ALONE and nothing is awaited while it is.
+    fn restore(
+        &self,
+        input: &RestoreFromClusterSnapshotInput,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+    ) -> Result<(RestoreFromClusterSnapshotOutput, String, String), RestoreFromClusterSnapshotError>
+    {
         use crate::state as st;
 
         let Some(state) = st::service_state(&*self.engine) else {
@@ -1002,8 +1042,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             available_at: started + st::PROVISIONING_SPAN,
         });
 
-        Ok(RestoreFromClusterSnapshotOutput {
-            cluster: Some(cluster),
-        })
+        // The snapshot this cluster was built from, as the event naming it
+        // spells it: the stored record's own identifier.
+        let restored_from = snapshot
+            .snapshot_identifier
+            .clone()
+            .unwrap_or_else(|| snapshot_identifier.unwrap_or_default().to_string());
+
+        Ok((
+            RestoreFromClusterSnapshotOutput {
+                cluster: Some(cluster),
+            },
+            identifier,
+            restored_from,
+        ))
     }
 }

@@ -157,8 +157,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The modify holds the store's lock; the event it raises is published
+        // once that lock is released, because a publish is an in-process call
+        // into another service and must not run under it.
+        let (output, group_name) = self.modify(input)?;
+
+        // The group holds different values than it did, which is the event this
+        // write raises: every subscription scoped to it is told, on its own topic.
+        crate::state::notifications::raise(
+            ctx,
+            &*self.engine,
+            crate::state::EVENT_ID_PARAMETER_GROUP_UPDATED,
+            &group_name,
+            &[(
+                crate::state::notifications::PARAMETER_GROUP_NAME,
+                &group_name,
+            )],
+        )
+        .await;
+
+        Ok(output)
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ModifyClusterParameterGroup<Eng> {
+    /// The modify itself: the output it reports, and the stored name of the group
+    /// it changed — the source the event it raises is about.
+    ///
+    /// Everything that touches the store lives here, so the lock is held for the
+    /// write ALONE and nothing is awaited while it is.
+    fn modify(
+        &self,
+        input: ModifyClusterParameterGroupInput,
+    ) -> Result<(ModifyClusterParameterGroupOutput, String), ModifyClusterParameterGroupError> {
         use crate::state as st;
 
         let Some(state) = st::service_state(&*self.engine) else {
@@ -307,9 +340,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // AWS answers a parameter-group modify with the one sentence that names
         // both outcomes — a dynamic-only change is being applied to the
         // associated clusters now, a static one when they are next rebooted.
-        Ok(ModifyClusterParameterGroupOutput {
-            parameter_group_name: Some(group_name),
-            parameter_group_status: Some(st::PARAMETER_GROUP_STATUS_UPDATED.to_string()),
-        })
+        Ok((
+            ModifyClusterParameterGroupOutput {
+                parameter_group_name: Some(group_name.clone()),
+                parameter_group_status: Some(st::PARAMETER_GROUP_STATUS_UPDATED.to_string()),
+            },
+            group_name,
+        ))
     }
 }

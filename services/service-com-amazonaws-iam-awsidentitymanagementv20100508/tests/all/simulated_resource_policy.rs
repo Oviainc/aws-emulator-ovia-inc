@@ -31,12 +31,12 @@ use crate::user_lifecycle::{element, elements, router};
 /// The `Statement$SourcePolicyType` the simulator reports for an identity-based policy
 /// in force on the simulated principal, and for the resource-based policy the request
 /// supplied: the two kinds of document a simulation decides from.
-const IDENTITY_POLICY: &str = "IAM Policy";
-const RESOURCE_POLICY: &str = "Resource Policy";
+pub(crate) const IDENTITY_POLICY: &str = "IAM Policy";
+pub(crate) const RESOURCE_POLICY: &str = "Resource Policy";
 
 /// The `Statement$SourcePolicyId` the simulator reports for the request's own
 /// `ResourcePolicy` member.
-const RESOURCE_POLICY_ID: &str = "ResourcePolicy";
+pub(crate) const RESOURCE_POLICY_ID: &str = "ResourcePolicy";
 
 /// Resources the simulation is about. "You can simulate resources that don't exist in
 /// your account" (`SimulatePrincipalPolicy`), so these are never created anywhere; the
@@ -452,14 +452,14 @@ fn account_root(arn: &str) -> String {
 /// The response split into the evaluation result's OWN members and its per-resource
 /// ones: the serializer emits `ResourceSpecificResults` after the members of the result
 /// that carries it, so the two attributions are read apart.
-fn parts(body: &str) -> (&str, &str) {
+pub(crate) fn parts(body: &str) -> (&str, &str) {
     body.split_once("<ResourceSpecificResults>")
         .unwrap_or((body, ""))
 }
 
 /// The `(SourcePolicyId, SourcePolicyType)` pairs one part of the response reports, in
 /// document order.
-fn attribution(part: &str) -> Vec<(String, String)> {
+pub(crate) fn attribution(part: &str) -> Vec<(String, String)> {
     let ids = elements(part, "SourcePolicyId");
     let kinds = elements(part, "SourcePolicyType");
     assert_eq!(

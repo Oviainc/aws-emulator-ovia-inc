@@ -48,7 +48,10 @@ const PASS_DEFINITION: &str =
     r#"{"StartAt":"Only","States":{"Only":{"Type":"Pass","Result":{"ok":true},"End":true}}}"#;
 
 /// The events of one execution, as `GetExecutionHistory` answers them.
-async fn history(emulator: &Emulator, execution_arn: &str, extra: Value) -> Vec<Value> {
+///
+/// `pub(crate)`, not private: a sibling suite that asserts what an execution's own
+/// events show drives this one rather than carrying a second copy of it.
+pub(crate) async fn history(emulator: &Emulator, execution_arn: &str, extra: Value) -> Vec<Value> {
     let mut request = json!({ "executionArn": execution_arn });
     let members = request.as_object_mut().expect("the request is an object");
     for (member, value) in extra.as_object().expect("the extras are an object") {

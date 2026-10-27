@@ -31,6 +31,10 @@ mod catalog_mutations;
 mod catalog_projections;
 #[path = "all/classifiers.rs"]
 mod classifiers;
+#[path = "all/column_statistics_task_conflicts.rs"]
+mod column_statistics_task_conflicts;
+#[path = "all/column_statistics_task_run_history.rs"]
+mod column_statistics_task_run_history;
 #[path = "all/column_statistics_task_runs.rs"]
 mod column_statistics_task_runs;
 #[path = "all/column_statistics_task_settings.rs"]
@@ -123,6 +127,8 @@ mod table_versions;
 mod trigger_starts;
 #[path = "all/triggers.rs"]
 mod triggers;
+#[path = "all/unfiltered_metadata.rs"]
+mod unfiltered_metadata;
 #[path = "all/usage_profiles.rs"]
 mod usage_profiles;
 #[path = "all/wire.rs"]
