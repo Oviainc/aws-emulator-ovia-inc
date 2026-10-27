@@ -358,7 +358,7 @@ fn select_items(
     let resume = input
         .next_token
         .as_deref()
-        .map(crate::state::decode_cursor)
+        .map(|token| crate::state::decode_cursor(&input.statement, token))
         .transpose()
         .map_err(lift)?;
     let table = store.active_table(region, name, now).map_err(lift)?;
@@ -368,6 +368,16 @@ fn select_items(
     if let Some(index) = select.index.as_deref() {
         if !crate::state::declares_index(table, index) {
             return Err(lift(crate::state::unknown_index()));
+        }
+        // "Global secondary indexes support eventually consistent reads only, so do not
+        // specify ConsistentRead when querying a global secondary index"
+        // (`Query$ConsistentRead`). A LOCAL secondary index shares the table's
+        // partitions and does support one, so the refusal turns on WHICH KIND of index
+        // the statement's source qualifier names.
+        if input.consistent_read == Some(true) && crate::state::is_global_index(table, index) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "Strongly consistent read is not supported on Global Secondary Indexes",
+            ));
         }
     }
     // One partition's items are contiguous in the store, so a statement that pins the
@@ -508,7 +518,10 @@ fn select_items(
         })
         .collect();
     let (next_token, last_evaluated_key) = match (truncated, stopped_on) {
-        (true, Some((key, map))) => (Some(crate::state::encode_cursor(&key)), Some(map)),
+        (true, Some((key, map))) => (
+            Some(crate::state::encode_cursor(&input.statement, &key)),
+            Some(map),
+        ),
         _ => (None, None),
     };
     Ok(ExecuteStatementOutput {
@@ -633,7 +646,7 @@ fn update_item(
 
     let mut item = before.clone().unwrap_or_default();
     let touched = clauses.apply(&mut item).map_err(lift)?;
-    for attribute in &touched {
+    for attribute in touched.attributes() {
         if attribute.as_str() == partition_key.as_str()
             || Some(attribute.as_str()) == sort_key.as_deref()
         {

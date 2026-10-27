@@ -558,9 +558,10 @@ async fn unsubscribe_is_idempotent_in_a_well_formed_arn_and_refuses_one_that_is_
         deleted.status, deleted.body
     );
 
-    // Well-formed subscription ARNs, each answered 200 however many times it is sent:
-    // the live one, the one whose topic is gone, and ones that never existed (another
-    // partition, another region, another account, another topic).
+    // Well-formed subscription ARNs OF THIS REGION, each answered 200 however many times
+    // it is sent: the live one, the one whose topic is gone, and ones that never existed
+    // (an id nothing carries, another topic). An ARN naming another region is not one this
+    // endpoint's idempotence covers: it is refused below.
     let well_formed = [
         ("the live subscription", live.clone()),
         ("a subscription deleted with its topic", doomed.clone()),
@@ -572,18 +573,6 @@ async fn unsubscribe_is_idempotent_in_a_well_formed_arn_and_refuses_one_that_is_
             "a topic that does not exist",
             "arn:aws:sns:us-east-1:000000000000:absent-topic:\
              11111111-1111-4111-8111-111111111111"
-                .to_string(),
-        ),
-        (
-            "another region and account",
-            "arn:aws:sns:eu-west-1:123456789012:other-topic:\
-             22222222-2222-4222-8222-222222222222"
-                .to_string(),
-        ),
-        (
-            "another partition",
-            "arn:aws-us-gov:sns:us-gov-west-1:000000000000:gov-topic:\
-             33333333-3333-4333-8333-333333333333"
                 .to_string(),
         ),
     ];
@@ -608,8 +597,11 @@ async fn unsubscribe_is_idempotent_in_a_well_formed_arn_and_refuses_one_that_is_
         "every subscription must be gone, and no call may have invented one"
     );
 
-    // And the values that are not subscription ARNs: too few elements, a topic ARN
-    // (one element short of a subscription's), an empty element, another service.
+    // And the values that are not subscription ARNs THIS endpoint serves: too few
+    // elements, a topic ARN (one element short of a subscription's), an empty element,
+    // another service, and a well-formed subscription ARN of another region — which this
+    // endpoint does not reach, so the delete is refused rather than answered as the
+    // idempotent one.
     let malformed = [
         "not-an-arn-at-all",
         "arn:aws:sns",
@@ -619,6 +611,9 @@ async fn unsubscribe_is_idempotent_in_a_well_formed_arn_and_refuses_one_that_is_
         "arn:aws:sqs:us-east-1:000000000000:q:11111111",
         "arn:aws:sns:us-east-1:000000000000:two words:11111111",
         "arn:aws:sns:us-east-1:000000000000:topic:id:extra",
+        "arn:aws:sns:eu-west-1:123456789012:other-topic:22222222-2222-4222-8222-222222222222",
+        "arn:aws-us-gov:sns:us-gov-west-1:000000000000:gov-topic:\
+         33333333-3333-4333-8333-333333333333",
     ];
     for arn in malformed {
         let answer = sns.call("Unsubscribe", &[("SubscriptionArn", arn)]).await;

@@ -28,11 +28,13 @@
 use std::time::{Duration, SystemTime};
 
 use ec2::ops::delete_queued_reserved_instances::{
-    MAX_STORED_RESERVED_INSTANCES, RESERVED_INSTANCE_STATE_ACTIVE, RESERVED_INSTANCE_STATE_QUEUED,
-    RESERVED_INSTANCE_STATE_QUEUED_DELETED, RESERVED_INSTANCES_ID_INVALID,
-    RESERVED_INSTANCES_NOT_IN_QUEUED_STATE, ReservedInstancesSpec,
+    RESERVED_INSTANCES_ID_INVALID, RESERVED_INSTANCES_NOT_IN_QUEUED_STATE,
 };
-use ec2::state::ComAmazonawsEc2Amazonec2State as Ec2State;
+use ec2::state::{
+    ComAmazonawsEc2Amazonec2State as Ec2State, MAX_STORED_RESERVED_INSTANCES,
+    RESERVED_INSTANCE_STATE_ACTIVE, RESERVED_INSTANCE_STATE_QUEUED,
+    RESERVED_INSTANCE_STATE_QUEUED_DELETED, ReservedInstancesSpec,
+};
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 

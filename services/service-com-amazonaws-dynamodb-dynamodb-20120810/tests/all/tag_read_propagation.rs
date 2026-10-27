@@ -387,8 +387,8 @@ async fn a_write_is_applied_to_the_stored_set_even_before_the_reader_can_see_it(
     .await;
     assert_eq!(
         (status, error_code(&body).as_str()),
-        (400, "LimitExceededException"),
-        "case {case:?}: expected 400 LimitExceededException, got {status} with {body}"
+        (400, "ValidationException"),
+        "case {case:?}: expected 400 ValidationException, got {status} with {body}"
     );
 
     // And what finally becomes visible is the stored set, with the refused key absent.

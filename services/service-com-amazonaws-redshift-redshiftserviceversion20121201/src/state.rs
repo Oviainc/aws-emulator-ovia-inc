@@ -52,6 +52,10 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant, SystemTime};
 
+/// The event a control-plane write raises, and the notification every
+/// subscription scoped to it receives.
+pub mod notifications;
+
 /// How long after the call that starts it a provisioning transition falls due:
 /// a cluster or a snapshot reported `creating` becomes `available` this long
 /// after the `CreateCluster` / `CreateClusterSnapshot` / `DeleteCluster` call
@@ -1932,7 +1936,7 @@ pub const EVENT_CATALOG: &[CatalogEvent] = &[
     // changes applied to it, what it is observed doing, the access to it, and
     // the work Amazon Redshift still owes it.
     CatalogEvent {
-        event_id: "REDSHIFT-EVENT-1200",
+        event_id: EVENT_ID_CLUSTER_MODIFIED,
         source_type: EVENT_SOURCE_TYPE_CLUSTER,
         event_categories: &[EVENT_CATEGORY_CONFIGURATION],
         severity: EVENT_SEVERITY_INFO,
@@ -1941,21 +1945,21 @@ pub const EVENT_CATALOG: &[CatalogEvent] = &[
              The changes you requested are being applied.",
     },
     CatalogEvent {
-        event_id: "REDSHIFT-EVENT-2000",
+        event_id: EVENT_ID_CLUSTER_CREATED,
         source_type: EVENT_SOURCE_TYPE_CLUSTER,
         event_categories: &[EVENT_CATEGORY_MANAGEMENT],
         severity: EVENT_SEVERITY_INFO,
         event_description: "Your Amazon Redshift cluster [cluster name] was created at [time] UTC.",
     },
     CatalogEvent {
-        event_id: "REDSHIFT-EVENT-2001",
+        event_id: EVENT_ID_CLUSTER_DELETED,
         source_type: EVENT_SOURCE_TYPE_CLUSTER,
         event_categories: &[EVENT_CATEGORY_MANAGEMENT],
         severity: EVENT_SEVERITY_INFO,
         event_description: "Your Amazon Redshift cluster [cluster name] was deleted at [time] UTC.",
     },
     CatalogEvent {
-        event_id: "REDSHIFT-EVENT-2002",
+        event_id: EVENT_ID_CLUSTER_RENAMED,
         source_type: EVENT_SOURCE_TYPE_CLUSTER,
         event_categories: &[EVENT_CATEGORY_MANAGEMENT],
         severity: EVENT_SEVERITY_INFO,
@@ -1964,14 +1968,14 @@ pub const EVENT_CATALOG: &[CatalogEvent] = &[
              at [time] UTC.",
     },
     CatalogEvent {
-        event_id: "REDSHIFT-EVENT-3000",
+        event_id: EVENT_ID_CLUSTER_REBOOTED,
         source_type: EVENT_SOURCE_TYPE_CLUSTER,
         event_categories: &[EVENT_CATEGORY_MONITORING],
         severity: EVENT_SEVERITY_INFO,
         event_description: "Your Amazon Redshift cluster [cluster name] was rebooted at [time] UTC.",
     },
     CatalogEvent {
-        event_id: "REDSHIFT-EVENT-3001",
+        event_id: EVENT_ID_CLUSTER_RESTORED,
         source_type: EVENT_SOURCE_TYPE_CLUSTER,
         event_categories: &[EVENT_CATEGORY_MONITORING],
         severity: EVENT_SEVERITY_INFO,
@@ -1989,7 +1993,7 @@ pub const EVENT_CATALOG: &[CatalogEvent] = &[
              Amazon Redshift is working to make the cluster available again.",
     },
     CatalogEvent {
-        event_id: "REDSHIFT-EVENT-4000",
+        event_id: EVENT_ID_MASTER_PASSWORD_UPDATED,
         source_type: EVENT_SOURCE_TYPE_CLUSTER,
         event_categories: &[EVENT_CATEGORY_SECURITY],
         severity: EVENT_SEVERITY_INFO,
@@ -2010,7 +2014,7 @@ pub const EVENT_CATALOG: &[CatalogEvent] = &[
     // The cluster parameter group: the configuration a cluster is created from,
     // whose changes are what this source type publishes.
     CatalogEvent {
-        event_id: "REDSHIFT-EVENT-1000",
+        event_id: EVENT_ID_PARAMETER_GROUP_UPDATED,
         source_type: EVENT_SOURCE_TYPE_PARAMETER_GROUP,
         event_categories: &[EVENT_CATEGORY_CONFIGURATION],
         severity: EVENT_SEVERITY_INFO,
@@ -2029,7 +2033,7 @@ pub const EVENT_CATALOG: &[CatalogEvent] = &[
             "Cluster parameter group [parameter group name] was created at [time] UTC.",
     },
     CatalogEvent {
-        event_id: "REDSHIFT-EVENT-1004",
+        event_id: EVENT_ID_PARAMETER_GROUP_DELETED,
         source_type: EVENT_SOURCE_TYPE_PARAMETER_GROUP,
         event_categories: &[EVENT_CATEGORY_CONFIGURATION],
         severity: EVENT_SEVERITY_INFO,
@@ -2064,7 +2068,7 @@ pub const EVENT_CATALOG: &[CatalogEvent] = &[
     },
     // The cluster snapshot: the backups taken of a cluster.
     CatalogEvent {
-        event_id: "REDSHIFT-EVENT-3100",
+        event_id: EVENT_ID_SNAPSHOT_CREATED,
         source_type: EVENT_SOURCE_TYPE_SNAPSHOT,
         event_categories: &[EVENT_CATEGORY_MONITORING],
         severity: EVENT_SEVERITY_INFO,
@@ -2110,6 +2114,39 @@ pub const EVENT_CATALOG: &[CatalogEvent] = &[
 
 /// The identifier of the event a cluster parameter group's creation raises.
 pub const EVENT_ID_PARAMETER_GROUP_CREATED: &str = "REDSHIFT-EVENT-1003";
+
+/// The identifier of the event a change to a cluster parameter group's values
+/// raises — the write that `ModifyClusterParameterGroup` makes and the one
+/// `ResetClusterParameterGroup` makes, both of which leave the group holding
+/// different values than before.
+pub const EVENT_ID_PARAMETER_GROUP_UPDATED: &str = "REDSHIFT-EVENT-1000";
+
+/// The identifier of the event a cluster parameter group's deletion raises.
+pub const EVENT_ID_PARAMETER_GROUP_DELETED: &str = "REDSHIFT-EVENT-1004";
+
+/// The identifier of the event a change to a cluster's configuration raises.
+pub const EVENT_ID_CLUSTER_MODIFIED: &str = "REDSHIFT-EVENT-1200";
+
+/// The identifier of the event a cluster's creation raises.
+pub const EVENT_ID_CLUSTER_CREATED: &str = "REDSHIFT-EVENT-2000";
+
+/// The identifier of the event a cluster's deletion raises.
+pub const EVENT_ID_CLUSTER_DELETED: &str = "REDSHIFT-EVENT-2001";
+
+/// The identifier of the event a cluster's rename raises.
+pub const EVENT_ID_CLUSTER_RENAMED: &str = "REDSHIFT-EVENT-2002";
+
+/// The identifier of the event a cluster's restart raises.
+pub const EVENT_ID_CLUSTER_REBOOTED: &str = "REDSHIFT-EVENT-3000";
+
+/// The identifier of the event the creation of a cluster FROM a snapshot raises.
+pub const EVENT_ID_CLUSTER_RESTORED: &str = "REDSHIFT-EVENT-3001";
+
+/// The identifier of the event a change to a cluster's admin password raises.
+pub const EVENT_ID_MASTER_PASSWORD_UPDATED: &str = "REDSHIFT-EVENT-4000";
+
+/// The identifier of the event a cluster snapshot's creation raises.
+pub const EVENT_ID_SNAPSHOT_CREATED: &str = "REDSHIFT-EVENT-3100";
 
 /// The published catalog as `DescribeEventCategories` reports it: one entry per
 /// published source type, in the order the model's `SourceType` enum lists them,

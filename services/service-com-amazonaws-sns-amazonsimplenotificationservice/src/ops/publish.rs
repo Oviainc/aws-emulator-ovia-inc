@@ -296,6 +296,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // "You can publish messages only to topics and endpoints in the same Amazon Web
+        // Services Region" (`Publish` doc): a destination naming another region names
+        // nothing this endpoint publishes to, whichever member carried it — so it is
+        // refused as bad input rather than read out of another region's state.
+        let member = if input.topic_arn.is_some() {
+            "TopicArn"
+        } else {
+            "TargetArn"
+        };
+        let region = state::request_region(ctx.parts());
+        if let Some(message) = state::foreign_region_refusal(member, &destination, &region) {
+            return Err(invalid_parameter(message));
+        }
+
         // Every per-message rule, judged before any record is read — the same rules
         // `PublishBatch` applies to each of its entries.
         let request = MessageRequest {

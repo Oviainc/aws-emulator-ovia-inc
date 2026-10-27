@@ -465,8 +465,9 @@ async fn the_documented_tag_ceiling_is_enforced_and_a_refused_write_stores_nothi
         "overwriting a stored key at the ceiling"
     );
 
-    // One key past the ceiling is refused with the modelled limit error, and the stored
-    // set is unchanged.
+    // One key past the ceiling is refused as a parameter error — the count bounds the
+    // request's own members, so a call past it can never succeed as sent — and the
+    // stored set is unchanged.
     let (status, body) = call(
         &router,
         REGION,
@@ -476,8 +477,8 @@ async fn the_documented_tag_ceiling_is_enforced_and_a_refused_write_stores_nothi
     .await;
     assert_eq!(
         (status, error_code(&body).as_str()),
-        (400, "LimitExceededException"),
-        "case {:?}: expected 400 LimitExceededException, got {status} with {body}",
+        (400, "ValidationException"),
+        "case {:?}: expected 400 ValidationException, got {status} with {body}",
         "one tag past the ceiling"
     );
     let after = listed_tags(&router, REGION, &arn).await;
@@ -511,8 +512,8 @@ async fn the_documented_tag_ceiling_is_enforced_and_a_refused_write_stores_nothi
     .await;
     assert_eq!(
         (status, error_code(&body).as_str()),
-        (400, "LimitExceededException"),
-        "case {:?}: expected 400 LimitExceededException, got {status} with {body}",
+        (400, "ValidationException"),
+        "case {:?}: expected 400 ValidationException, got {status} with {body}",
         "a create one tag past the ceiling"
     );
     let (status, body) = call(

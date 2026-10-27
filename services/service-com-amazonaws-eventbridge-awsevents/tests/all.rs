@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/api_destination_delivery.rs"]
 mod api_destination_delivery;
+#[path = "all/api_destination_update.rs"]
+mod api_destination_update;
 #[path = "all/archive_and_api_destination.rs"]
 mod archive_and_api_destination;
 #[path = "all/archive_registry.rs"]

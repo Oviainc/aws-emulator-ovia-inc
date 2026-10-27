@@ -77,6 +77,9 @@ mod put_data_protection_policy;
 #[path = "all/refusal_sentences.rs"]
 mod refusal_sentences;
 
+#[path = "all/region_isolation.rs"]
+mod region_isolation;
+
 #[path = "all/request_derived_refusals.rs"]
 mod request_derived_refusals;
 

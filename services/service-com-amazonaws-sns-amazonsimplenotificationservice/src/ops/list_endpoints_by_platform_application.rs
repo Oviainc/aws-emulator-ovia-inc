@@ -163,11 +163,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        if let Some(message) =
-            state::arn_refusal("PlatformApplicationArn", &input.platform_application_arn)
-        {
+        let region = state::request_region(ctx.parts());
+        if let Some(message) = state::regional_arn_refusal(
+            "PlatformApplicationArn",
+            &input.platform_application_arn,
+            &region,
+        ) {
             return Err(
                 ListEndpointsByPlatformApplicationErrorModeled::InvalidParameterException(
                     InvalidParameterException {

@@ -203,7 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // walks it: a table may carry at most `MAX_TAGS_PER_TABLE` tags, so a list
         // longer than that cannot be stored whatever it holds.
         if input.tags.len() > crate::state::MAX_TAGS_PER_TABLE {
-            return Err(too_many_tags(input.tags.len()));
+            return Err(too_many_tags());
         }
         let incoming = crate::state::tag_set_from_request(&input.tags).map_err(lift)?;
 
@@ -228,9 +228,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // Merging overwrites a key the table already carries and adds only the new
         // ones, so re-tagging an existing key can never push the set past the limit.
-        let would_hold = table.tags.count_after_merging(&incoming);
-        if would_hold > crate::state::MAX_TAGS_PER_TABLE {
-            return Err(too_many_tags(would_hold));
+        if table.tags.count_after_merging(&incoming) > crate::state::MAX_TAGS_PER_TABLE {
+            return Err(too_many_tags());
         }
         // The merge lands on the resource now and becomes VISIBLE to
         // `ListTagsOfResource` one propagation span later: "TagResource is an
@@ -266,15 +265,18 @@ fn lift(error: crate::state::RequestError) -> TagResourceError {
     }
 }
 
-/// The modelled limit error for a tag set a resource may not hold: "You can add up to
-/// 50 tags to a single DynamoDB table" (the `Tag` doc).
-fn too_many_tags(would_hold: usize) -> TagResourceError {
-    TagResourceErrorModeled::LimitExceededException(LimitExceededException {
-        message: Some(format!(
-            "Subscriber limit exceeded: a resource may carry at most {} tags, and this \
-             request would leave it with {would_hold}",
-            crate::state::MAX_TAGS_PER_TABLE
-        )),
-    })
-    .into()
+/// The refusal for a tag set a resource may not hold: "You can add up to 50 tags to a
+/// single DynamoDB table" (the `Tag` doc).
+///
+/// Classified as a `ValidationException` (HTTP 400): the tag count is a bound on the
+/// REQUEST's own members, so a call past it can never succeed as sent — answering a
+/// limit code instead would have a client back off and retry an input that is wrong.
+///
+/// AWS's text for this bound is FIXED: it names the member the tags were counted for
+/// and nothing of the limit or the count, so it reads the same whether the request's own
+/// list is too long or the merge with the stored set would be.
+fn too_many_tags() -> TagResourceError {
+    crate::scaffolded::Scaffolded::validation(
+        "Number of Tags exceed the current limit for the provided ResourceArn",
+    )
 }

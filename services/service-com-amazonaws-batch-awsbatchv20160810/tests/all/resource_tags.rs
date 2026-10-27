@@ -21,10 +21,11 @@
 //! * `UntagResource` deletes only the keys `tagKeys` names, and a key the resource does
 //!   not hold is removed vacuously, so repeating an untag changes nothing;
 //! * an ARN this service holds no resource for — a name nothing was created under,
-//!   another region or account, or an unknown resource kind — is refused with the
-//!   modelled `ClientException` (HTTP 400) by all three operations, and stores nothing,
-//!   while a `resourceArn` that is not an ARN at all is refused one layer earlier, by the
-//!   tag frontend's own read of it, under that frontend's code and its one fixed detail;
+//!   another region or account, or an unknown resource kind — is refused by all three
+//!   operations as the tagging layer's MISSING resource (HTTP 404
+//!   `NotFoundException`), and stores nothing, while a `resourceArn` that is not an ARN at
+//!   all is refused one layer earlier, by that layer's own read of it, under its
+//!   bad-request code and its one fixed detail;
 //! * the bounds `TagrisTagsMap` declares hold: a key of 1..128 characters and a value of
 //!   0..256 are accepted at each bound and refused one past it, at most 50 tags travel in
 //!   one request, and a merge that would take one resource past 50 tags is refused rather
@@ -36,13 +37,16 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
-use service_com_amazonaws_batch_awsbatchv20160810::scaffolded::TAGGING_REFUSAL_CODE;
+use service_com_amazonaws_batch_awsbatchv20160810::scaffolded::{
+    TAGGING_NOT_FOUND_CODE, TAGGING_REFUSAL_CODE,
+};
 use service_com_amazonaws_batch_awsbatchv20160810::state::{self, limits};
 
 use crate::job_lifecycle::{
     arn, compute_environment, container_properties, error_code, error_message, job_definition,
     job_queue, Batch,
 };
+use crate::refusal_classification::TAG_SET_LIMIT_DETAIL;
 
 /// The wire error code a `batch` client reads off a tagging call whose `resourceArn` is
 /// not an ARN, and the detail that comes with it.
@@ -53,6 +57,13 @@ use crate::job_lifecycle::{
 /// which is what ties the wording a handler emits to the wording asserted here.
 const FRONTEND_REFUSAL_CODE: &str = "BadRequestException";
 const FRONTEND_REFUSAL_DETAIL: &str = "Invalid input resource arn: bad syntax";
+
+/// The wire error code and detail a `batch` client reads off a tagging call whose
+/// `resourceArn` is well formed and names no resource — the tag layer's OTHER
+/// classification, written out as the literals a client sees for the same reason as the
+/// pair above.
+const NOT_FOUND_REFUSAL_CODE: &str = "NotFoundException";
+const NOT_FOUND_REFUSAL_DETAIL: &str = "Resource was not found";
 
 /// The longest `TagKey` the model admits. Source: `com.amazonaws.batch#TagKey`
 /// (`smithy_query(query="shape", shape="TagrisTagsMap")`), `@length(min: 1, max: 128)`.
@@ -85,12 +96,12 @@ fn percent_encode(value: &str) -> String {
 
 /// `/v1/tags/{resourceArn}`: the ARN fills ONE path segment, so every character outside
 /// the unreserved set is percent-encoded, the way an SDK client encodes an `@httpLabel`.
-fn tags_uri(resource_arn: &str) -> String {
+pub(crate) fn tags_uri(resource_arn: &str) -> String {
     format!("/v1/tags/{}", percent_encode(resource_arn))
 }
 
 /// `TagResource`: `POST /v1/tags/{resourceArn}` with the `tags` map in the body.
-async fn tag(batch: &Batch, resource_arn: &str, tags: Value) -> (u16, Value) {
+pub(crate) async fn tag(batch: &Batch, resource_arn: &str, tags: Value) -> (u16, Value) {
     batch
         .send("POST", &tags_uri(resource_arn), Some(json!({"tags": tags})))
         .await
@@ -116,7 +127,11 @@ async fn untag(batch: &Batch, resource_arn: &str, keys: &[String]) -> (u16, Valu
 
 /// The tags `ListTagsForResource` reports for `resource_arn`, as an ordered map so an
 /// assertion reads them in one stable order.
-async fn listed(batch: &Batch, case: &str, resource_arn: &str) -> BTreeMap<String, String> {
+pub(crate) async fn listed(
+    batch: &Batch,
+    case: &str,
+    resource_arn: &str,
+) -> BTreeMap<String, String> {
     let (status, body) = list(batch, resource_arn).await;
     assert_eq!(
         status, 200,
@@ -188,7 +203,7 @@ fn tag_batches() -> Vec<TagBatch> {
 }
 
 /// A tag batch as the `tags` member of a request.
-fn tags_body(pairs: &[(String, String)]) -> Value {
+pub(crate) fn tags_body(pairs: &[(String, String)]) -> Value {
     let mut body = serde_json::Map::new();
     for (key, value) in pairs {
         body.insert(key.clone(), json!(value));
@@ -503,15 +518,15 @@ async fn the_tags_tagresource_writes_are_the_map_every_reader_reports() {
     }
 }
 
-/// A `resourceArn` no resource answers to is refused by all three operations with HTTP
-/// 400 — over the SET of ways a reference can name nothing — and the refusal stores
-/// nothing.
+/// A `resourceArn` no resource answers to is refused by all three operations — over the
+/// SET of ways a reference can name nothing — and the refusal stores nothing.
 ///
-/// WHICH 400 follows where the reference fails. A value that is not an ARN fails the tag
-/// frontend's own read of it, before anything is resolved, so it carries that frontend's
-/// code (`scaffolded::TAGGING_REFUSAL_CODE`) and its one fixed detail, which names nothing
-/// from the request. A well-formed ARN that simply names nothing reaches this service's
-/// lookup, so it carries the modelled `ClientException` naming the reference it was given.
+/// WHICH refusal follows where the reference fails, and the tagging layer classifies the
+/// two apart. A value that is not an ARN fails that layer's own read of it, before
+/// anything is resolved: HTTP 400 `scaffolded::TAGGING_REFUSAL_CODE` with its one fixed
+/// detail. A well-formed ARN that simply names nothing is a MISSING resource:
+/// `scaffolded::TAGGING_NOT_FOUND_CODE` with its own fixed detail. Neither detail echoes
+/// the request, so a client branches on the code, not on the text.
 #[tokio::test]
 async fn an_arn_naming_no_resource_is_refused_by_every_tagging_operation() {
     let batch = Batch::new();
@@ -598,35 +613,30 @@ async fn an_arn_naming_no_resource_is_refused_by_every_tagging_operation() {
                 "ListTagsForResource" => list(&batch, &reference).await,
                 _ => untag(&batch, &reference, &["team".to_string()]).await,
             };
-            assert_eq!(
-                status, 400,
-                "case {case:?} / {operation}: expected HTTP 400, got {status} {refused}"
-            );
             let code = error_code(&refused);
             let message = error_message(&refused);
-            if is_arn {
-                assert_eq!(
-                    code, "ClientException",
-                    "case {case:?} / {operation}: expected the modelled ClientException, got \
-                     {refused}"
-                );
-                assert!(
-                    message.contains(&reference),
-                    "case {case:?} / {operation}: expected the refusal to name the reference it \
-                     was given, got {message:?}"
-                );
+            // A reference that IS an ARN reaches the lookup and misses, which that layer
+            // reports as a missing resource; one that is not an ARN never gets there.
+            let (expected_status, expected_code, expected_detail) = if is_arn {
+                (404, NOT_FOUND_REFUSAL_CODE, NOT_FOUND_REFUSAL_DETAIL)
             } else {
-                assert_eq!(
-                    code, FRONTEND_REFUSAL_CODE,
-                    "case {case:?} / {operation}: a value that is no ARN is the tag frontend's \
-                     refusal, expected {FRONTEND_REFUSAL_CODE}, got {refused}"
-                );
-                assert_eq!(
-                    message, FRONTEND_REFUSAL_DETAIL,
-                    "case {case:?} / {operation}: expected the frontend's fixed detail \
-                     {FRONTEND_REFUSAL_DETAIL:?}, got {message:?}"
-                );
-            }
+                (400, FRONTEND_REFUSAL_CODE, FRONTEND_REFUSAL_DETAIL)
+            };
+            assert_eq!(
+                status, expected_status,
+                "case {case:?} / {operation}: expected HTTP {expected_status}, got {status} \
+                 {refused}"
+            );
+            assert_eq!(
+                code, expected_code,
+                "case {case:?} / {operation}: expected the tag layer's {expected_code}, got \
+                 {refused}"
+            );
+            assert_eq!(
+                message, expected_detail,
+                "case {case:?} / {operation}: expected the fixed detail \
+                 {expected_detail:?}, got {message:?}"
+            );
         }
     }
 
@@ -638,9 +648,20 @@ async fn an_arn_naming_no_resource_is_refused_by_every_tagging_operation() {
          {TAGGING_REFUSAL_CODE}"
     );
     assert_eq!(
+        TAGGING_NOT_FOUND_CODE, NOT_FOUND_REFUSAL_CODE,
+        "case the not-found code the handlers answer with: expected {NOT_FOUND_REFUSAL_CODE}, \
+         got {TAGGING_NOT_FOUND_CODE}"
+    );
+    assert_eq!(
         state::BAD_RESOURCE_ARN_MESSAGE, FRONTEND_REFUSAL_DETAIL,
         "case the detail the handlers answer with: expected {FRONTEND_REFUSAL_DETAIL:?}, got {:?}",
         state::BAD_RESOURCE_ARN_MESSAGE
+    );
+    assert_eq!(
+        state::RESOURCE_NOT_FOUND_MESSAGE, NOT_FOUND_REFUSAL_DETAIL,
+        "case the not-found detail the handlers answer with: expected \
+         {NOT_FOUND_REFUSAL_DETAIL:?}, got {:?}",
+        state::RESOURCE_NOT_FOUND_MESSAGE
     );
 
     // None of those refusals wrote anything to the resource that DOES exist.
@@ -750,8 +771,9 @@ async fn the_published_tag_bounds_are_honoured_at_the_bound_and_refused_past_it(
     }
 
     // The per-RESOURCE ceiling: 50 tags fit, and the tag that would be the 51st is
-    // refused with the modelled ClientException while the stored 50 stay exactly as they
-    // were.
+    // refused as the tag layer refuses a RESULTANT tag set past the ceiling — the same
+    // code and the same sentence as a single request carrying more than 50 — while the
+    // stored 50 stay exactly as they were.
     let queue = job_queue(&batch, "ceiling-queue", &environment).await;
     let full: Vec<(String, String)> = (0..limits::MAX_TAGS_PER_RESOURCE)
         .map(|index| (format!("key-{index}"), format!("value-{index}")))
@@ -777,8 +799,15 @@ async fn the_published_tag_bounds_are_honoured_at_the_bound_and_refused_past_it(
     );
     assert_eq!(
         error_code(&refused),
-        "ClientException",
-        "case one past the ceiling: expected the modelled ClientException, got {refused}"
+        FRONTEND_REFUSAL_CODE,
+        "case one past the ceiling: expected the tag layer's {FRONTEND_REFUSAL_CODE}, got \
+         {refused}"
+    );
+    assert_eq!(
+        error_message(&refused),
+        TAG_SET_LIMIT_DETAIL,
+        "case one past the ceiling: expected the tag-set sentence {TAG_SET_LIMIT_DETAIL:?}, got \
+         {refused}"
     );
     let after = listed(&batch, "one past the ceiling", &queue).await;
     assert_eq!(

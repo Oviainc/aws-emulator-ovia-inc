@@ -345,6 +345,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         let name = crate::state::resolve_table_name(&input.table_name).map_err(lift)?;
 
+        // A `FilterExpression` the request sends is VALIDATED whether or not the
+        // filtering itself is served, for the reason `Scan` gives: whether the
+        // expression is one this service's language accepts is a fact of the request.
+        if let Some(expression) = input.filter_expression.as_deref() {
+            crate::state::ParsedCondition::parse(
+                "FilterExpression",
+                expression,
+                crate::state::Substitutions::new(
+                    input.expression_attribute_names.as_ref(),
+                    input.expression_attribute_values.as_ref(),
+                ),
+            )
+            .map_err(lift)?;
+        }
+        // A `ProjectionExpression` the request sends is validated the same way, and for
+        // the same reason.
+        if let Some(expression) = input.projection_expression.as_deref() {
+            crate::state::projection_expression_attributes(
+                "ProjectionExpression",
+                expression,
+                crate::state::Substitutions::new(input.expression_attribute_names.as_ref(), None),
+            )
+            .map_err(lift)?;
+        }
         if let Some(member) = unsupported_member(&input) {
             return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
                 "Query with {member}"
@@ -585,7 +609,17 @@ impl KeyCondition {
         let sort_name = table.sort_key_name().map(ToString::to_string);
         let mut partition = None;
         let mut sort = None;
+        // A comparison on an attribute that is NOT a key attribute is held back: which
+        // key schema element the condition missed depends on what the rest of it
+        // constrained, so it can only be named once every comparison has been read.
+        let mut non_key = false;
         for comparison in comparisons {
+            let is_partition = comparison.attribute == partition_name;
+            let is_sort = Some(comparison.attribute.as_str()) == sort_name.as_deref();
+            if !is_partition && !is_sort {
+                non_key = true;
+                continue;
+            }
             if comparison.operands.len() != comparison.operator.operands() {
                 return Err(crate::state::RequestError::Validation(format!(
                     "Invalid key condition: {} on {} takes {} value(s), got {}",
@@ -600,13 +634,11 @@ impl KeyCondition {
                 .iter()
                 .map(|value| table.key_value(&comparison.attribute, value))
                 .collect::<Result<Vec<_>, _>>()?;
-            if comparison.attribute == partition_name {
+            if is_partition {
+                // "The partition key equality test is required": no other comparison
+                // selects the one partition a query reads.
                 if comparison.operator != Operator::Equal {
-                    return Err(crate::state::RequestError::Validation(format!(
-                        "Query key condition not supported: the partition key {partition_name} \
-                         must be compared with =, not {}",
-                        comparison.operator.as_str()
-                    )));
+                    return Err(unsupported_key_condition());
                 }
                 if partition.is_some() {
                     return Err(crate::state::RequestError::Validation(format!(
@@ -615,27 +647,46 @@ impl KeyCondition {
                     )));
                 }
                 partition = encoded.into_iter().next();
-            } else if Some(comparison.attribute.as_str()) == sort_name.as_deref() {
+            } else {
                 if sort.is_some() {
                     return Err(crate::state::RequestError::Validation(format!(
                         "Invalid key condition: the sort key {} is constrained more than once",
                         comparison.attribute
                     )));
                 }
+                // A PREFIX is only meaningful for a string or binary sort key, and
+                // which type the sort key has is a fact of the TABLE rather than of
+                // whatever happens to be stored under it — so the operand is refused
+                // here, before any item is read, rather than when one is compared.
+                if comparison.operator == Operator::BeginsWith {
+                    if let Some(operand) = encoded.first() {
+                        if !matches!(
+                            operand,
+                            crate::state::AttributeValueKey::S(_)
+                                | crate::state::AttributeValueKey::B(_)
+                        ) {
+                            return Err(begins_with_operand_type(operand));
+                        }
+                    }
+                }
                 sort = Some((comparison.operator, encoded));
-            } else {
-                return Err(crate::state::RequestError::Validation(format!(
-                    "Query key condition not supported: {} is not a key attribute of this table",
-                    comparison.attribute
-                )));
             }
         }
-        let partition = partition.ok_or_else(|| {
-            crate::state::RequestError::Validation(format!(
-                "Query key condition not supported: the partition key {partition_name} must be \
-                 constrained with ="
-            ))
-        })?;
+        if non_key {
+            // That comparison stood where a key schema element's comparison belongs, so
+            // the element it stood in for is the one the condition missed: the partition
+            // key when that is unconstrained, else the sort key.
+            let missed = if partition.is_none() {
+                Some(partition_name.clone())
+            } else {
+                sort_name.clone().filter(|_| sort.is_none())
+            };
+            return Err(match missed {
+                Some(element) => missed_key_schema_element(&element),
+                None => unsupported_key_condition(),
+            });
+        }
+        let partition = partition.ok_or_else(|| missed_key_schema_element(&partition_name))?;
         Ok(Self { partition, sort })
     }
 
@@ -675,11 +726,29 @@ fn begins_with(
         (crate::state::AttributeValueKey::B(value), crate::state::AttributeValueKey::B(prefix)) => {
             Ok(value.starts_with(prefix.as_slice()))
         }
-        _ => Err(crate::state::RequestError::Validation(
-            "Invalid operator used in KeyConditionExpression: begins_with requires a string or \
-             binary sort key"
-                .to_string(),
-        )),
+        _ => Err(begins_with_operand_type(actual)),
+    }
+}
+
+/// The refusal for a `begins_with` whose operand is of a type a prefix means nothing
+/// for: AWS names the function and the type of the operand it would not take.
+fn begins_with_operand_type(
+    operand: &crate::state::AttributeValueKey,
+) -> crate::state::RequestError {
+    crate::state::RequestError::Validation(format!(
+        "Invalid KeyConditionExpression: Incorrect operand type for operator or function; \
+         operator or function: begins_with, operand type: {}",
+        key_value_type(operand)
+    ))
+}
+
+/// The `AttributeValue` datatype name an encoded key value carries, which is how a
+/// refusal names the type of the operand it refused.
+fn key_value_type(value: &crate::state::AttributeValueKey) -> &'static str {
+    match value {
+        crate::state::AttributeValueKey::S(_) => "S",
+        crate::state::AttributeValueKey::N(_) => "N",
+        crate::state::AttributeValueKey::B(_) => "B",
     }
 }
 
@@ -692,8 +761,9 @@ fn key_comparisons(input: &QueryInput) -> Result<Vec<Comparison>, crate::state::
         .as_ref()
         .filter(|conditions| !conditions.is_empty());
     match (input.key_condition_expression.as_deref(), legacy) {
-        (Some(_), Some(_)) => Err(crate::state::RequestError::Validation(
-            "Can not use both KeyConditions and KeyConditionExpression in one request".to_string(),
+        (Some(_), Some(_)) => Err(crate::state::expression_conflict(
+            "KeyConditions",
+            "KeyConditionExpression",
         )),
         (Some(expression), None) => parse_key_condition_expression(
             expression,
@@ -800,6 +870,15 @@ fn tokenize(expression: &str) -> Result<Vec<Token>, crate::state::RequestError> 
                 at += 1;
             }
             '<' | '>' => {
+                // `<>` is a legal expression operator elsewhere and is NOT one a key
+                // condition takes: the comparisons a key condition states are
+                // `= < <= > >=`, `BETWEEN` and `begins_with`
+                // (`Query$KeyConditionExpression`). Refusing it as an unsupported
+                // OPERATOR rather than as a lexical error is what tells the caller
+                // which half of the expression to fix.
+                if character == '<' && bytes.get(at + 1) == Some(&'>') {
+                    return Err(invalid_key_condition_operator());
+                }
                 let followed_by_equals = bytes.get(at + 1) == Some(&'=');
                 let operator = match (character, followed_by_equals) {
                     ('<', false) => Operator::LessThan,
@@ -818,7 +897,11 @@ fn tokenize(expression: &str) -> Result<Vec<Token>, crate::state::RequestError> 
                 }
                 let text: String = bytes[start..at].iter().collect();
                 if text.len() < 2 {
-                    return Err(invalid_expression(expression));
+                    return Err(crate::state::lexical_syntax_error(
+                        KEY_CONDITION_MEMBER,
+                        &bytes,
+                        start,
+                    ));
                 }
                 tokens.push(if character == ':' {
                     Token::Value(text)
@@ -838,27 +921,108 @@ fn tokenize(expression: &str) -> Result<Vec<Token>, crate::state::RequestError> 
                     tokens.push(Token::Between);
                 } else if text.eq_ignore_ascii_case("begins_with") {
                     tokens.push(Token::BeginsWith);
+                } else if NON_KEY_CONDITION_OPERATORS
+                    .iter()
+                    .any(|operator| text.eq_ignore_ascii_case(operator))
+                {
+                    // A word the expression language uses as an operator and a key
+                    // condition does not take is refused as an unsupported OPERATOR
+                    // rather than read as an attribute name.
+                    return Err(invalid_key_condition_operator());
                 } else {
                     tokens.push(Token::Name(text));
                 }
             }
-            _ => return Err(invalid_expression(expression)),
+            _ => {
+                return Err(crate::state::lexical_syntax_error(
+                    KEY_CONDITION_MEMBER,
+                    &bytes,
+                    at,
+                ))
+            }
         }
     }
     if tokens.is_empty() {
-        return Err(invalid_expression(expression));
+        return Err(crate::state::lexical_syntax_error(
+            KEY_CONDITION_MEMBER,
+            &bytes,
+            bytes.len(),
+        ));
     }
     Ok(tokens)
+}
+
+/// The input member a key condition travels in, which is what its refusals name.
+const KEY_CONDITION_MEMBER: &str = "KeyConditionExpression";
+
+/// One key-condition token as the expression wrote it, which is what a syntax-error
+/// refusal quotes.
+fn token_text(token: &Token) -> String {
+    match token {
+        Token::Name(name) => name.clone(),
+        Token::Value(placeholder) => placeholder.clone(),
+        Token::Compare(operator) => operator.as_str().to_string(),
+        Token::And => "AND".to_string(),
+        Token::Between => "BETWEEN".to_string(),
+        Token::BeginsWith => "begins_with".to_string(),
+        Token::Open => "(".to_string(),
+        Token::Close => ")".to_string(),
+        Token::Comma => ",".to_string(),
+    }
 }
 
 fn is_identifier_char(character: char) -> bool {
     character.is_ascii_alphanumeric() || character == '_' || character == '.' || character == '-'
 }
 
-fn invalid_expression(expression: &str) -> crate::state::RequestError {
+/// The operator words a DynamoDB expression has that a KEY condition does not take.
+///
+/// A key condition's whole vocabulary is `AND`, the comparisons `= < <= > >=`, `BETWEEN`
+/// and `begins_with` (`Query$KeyConditionExpression`, which lists exactly those); every
+/// word below belongs to the condition and filter languages instead, so a key condition
+/// that uses one is naming an operator the member does not accept.
+const NON_KEY_CONDITION_OPERATORS: [&str; 7] = [
+    "OR",
+    "NOT",
+    "IN",
+    "contains",
+    "attribute_exists",
+    "attribute_not_exists",
+    "attribute_type",
+];
+
+/// The refusal for a key condition that constrains no comparison for one of the key
+/// schema elements it has to cover: AWS names the element the condition missed.
+fn missed_key_schema_element(element: &str) -> crate::state::RequestError {
     crate::state::RequestError::Validation(format!(
-        "Invalid KeyConditionExpression: syntax error; {expression}"
+        "Query condition missed key schema element: {element}"
     ))
+}
+
+/// AWS's fixed text for a key condition whose SHAPE the member does not take — a
+/// comparison on the partition key other than equality. It states that the condition is
+/// unsupported and nothing of which part of it was, so a client matching the sentence
+/// recognises the condition whichever unsupported shape it sent.
+fn unsupported_key_condition() -> crate::state::RequestError {
+    crate::state::RequestError::Validation("Query key condition not supported".to_string())
+}
+
+/// The refusal for a key condition this parser cannot read, as the parser words it.
+fn invalid_expression(parser: &Parser<'_>) -> crate::state::RequestError {
+    parser.syntax()
+}
+
+/// The refusal for a comparison a key condition does not take.
+///
+/// AWS's text for this condition is FIXED: it names the member and that the operator is
+/// not one the member accepts, and nothing of which operator it was — so a client
+/// matching the sentence recognises the condition whichever unsupported operator it
+/// sent.
+fn invalid_key_condition_operator() -> crate::state::RequestError {
+    crate::state::RequestError::Validation(
+        "Invalid KeyConditionExpression: Invalid operator used in KeyConditionExpression"
+            .to_string(),
+    )
 }
 
 /// Parse a `KeyConditionExpression` into its comparisons.
@@ -879,13 +1043,12 @@ fn parse_key_condition_expression(
         tokens: &tokens,
         at: 0,
         depth: 0,
-        expression,
         names,
         values,
     };
     let comparisons = parser.conjunction()?;
     if parser.at != tokens.len() {
-        return Err(invalid_expression(expression));
+        return Err(parser.syntax());
     }
     Ok(comparisons)
 }
@@ -900,12 +1063,32 @@ struct Parser<'a> {
     tokens: &'a [Token],
     at: usize,
     depth: usize,
-    expression: &'a str,
     names: Option<&'a std::collections::HashMap<String, String>>,
     values: Option<&'a std::collections::HashMap<String, AttributeValue>>,
 }
 
 impl Parser<'_> {
+    /// The refusal for a key condition this parser cannot read: the token it stopped at
+    /// and the tokens around it, worded the way every other expression member's syntax
+    /// error is, rather than echoing the whole expression back.
+    fn syntax(&self) -> crate::state::RequestError {
+        let token = self
+            .tokens
+            .get(self.at)
+            .map_or_else(
+                || crate::state::END_OF_EXPRESSION_TOKEN.to_string(),
+                token_text,
+            );
+        let before = self.at.checked_sub(1).and_then(|at| self.tokens.get(at));
+        let near = [before, self.tokens.get(self.at), self.tokens.get(self.at + 1)]
+            .into_iter()
+            .flatten()
+            .map(token_text)
+            .collect::<Vec<String>>()
+            .join(" ");
+        crate::state::expression_syntax_error_at(KEY_CONDITION_MEMBER, &token, &near)
+    }
+
     fn peek(&self) -> Option<&Token> {
         self.tokens.get(self.at)
     }
@@ -914,7 +1097,7 @@ impl Parser<'_> {
         let token = self
             .peek()
             .cloned()
-            .ok_or_else(|| invalid_expression(self.expression))?;
+            .ok_or_else(|| invalid_expression(self))?;
         self.at += 1;
         Ok(token)
     }
@@ -923,7 +1106,7 @@ impl Parser<'_> {
         if self.take()? == *expected {
             Ok(())
         } else {
-            Err(invalid_expression(self.expression))
+            Err(invalid_expression(self))
         }
     }
 
@@ -998,10 +1181,10 @@ impl Parser<'_> {
                             operands: vec![low, high],
                         })
                     }
-                    _ => Err(invalid_expression(self.expression)),
+                    _ => Err(invalid_expression(self)),
                 }
             }
-            _ => Err(invalid_expression(self.expression)),
+            _ => Err(invalid_expression(self)),
         }
     }
 
@@ -1009,7 +1192,7 @@ impl Parser<'_> {
     fn attribute(&mut self) -> Result<String, crate::state::RequestError> {
         match self.take()? {
             Token::Name(name) => self.resolve_name(&name),
-            _ => Err(invalid_expression(self.expression)),
+            _ => Err(invalid_expression(self)),
         }
     }
 
@@ -1025,7 +1208,7 @@ impl Parser<'_> {
                         "ExpressionAttributeValues contains no value for {placeholder}"
                     ))
                 }),
-            _ => Err(invalid_expression(self.expression)),
+            _ => Err(invalid_expression(self)),
         }
     }
 

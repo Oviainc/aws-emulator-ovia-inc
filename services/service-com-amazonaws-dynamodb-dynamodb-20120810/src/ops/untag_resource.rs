@@ -200,7 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // table carries at most `MAX_TAGS_PER_TABLE` tags, so a request naming more
         // keys than that names keys no resource can hold.
         if input.tag_keys.len() > crate::state::MAX_TAGS_PER_TABLE {
-            return Err(too_many_keys(input.tag_keys.len()));
+            return Err(too_many_keys());
         }
 
         let mut store = state.lock();
@@ -257,15 +257,15 @@ fn lift(error: crate::state::RequestError) -> UntagResourceError {
     }
 }
 
-/// The modelled limit error for a key list longer than any resource's tag set: "You
-/// can add up to 50 tags to a single DynamoDB table" (the `Tag` doc).
-fn too_many_keys(requested: usize) -> UntagResourceError {
-    UntagResourceErrorModeled::LimitExceededException(LimitExceededException {
-        message: Some(format!(
-            "Subscriber limit exceeded: a resource carries at most {} tags, so TagKeys may \
-             name at most that many keys, got {requested}",
-            crate::state::MAX_TAGS_PER_TABLE
-        )),
-    })
-    .into()
+/// The refusal for a key list longer than any resource's tag set: "You can add up to 50
+/// tags to a single DynamoDB table" (the `Tag` doc).
+///
+/// A `ValidationException`, for the same reason the two tagging writes answer one: the
+/// count bounds the REQUEST's own members, so a call past it is wrong rather than
+/// throttled. The sentence is the one `TagResource` states for the same bound, which
+/// names the member the keys were counted for and nothing of the limit.
+fn too_many_keys() -> UntagResourceError {
+    crate::scaffolded::Scaffolded::validation(
+        "Number of Tags exceed the current limit for the provided ResourceArn",
+    )
 }

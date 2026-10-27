@@ -172,7 +172,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // replay that write started owes are performed afterwards, because a delivery is
         // an in-process call into another service, which must not run under this store's
         // lock.
-        let replay = self.write_attribute(input)?;
+        let replay = self.write_attribute(input, &state::request_region(ctx.parts()))?;
         super::publish::deliver_to_queues(ctx, &replay).await;
         Ok(SetSubscriptionAttributesOutput)
     }
@@ -184,9 +184,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> SetSubscriptionAt
     ///
     /// The whole store-touching half of the operation, so the store's lock is taken and
     /// released here and the caller performs the deliveries with it released.
+    ///
+    /// `region` is the one the request is addressed to, which the ARN it names has to
+    /// belong to.
     fn write_attribute(
         &self,
         input: SetSubscriptionAttributesInput,
+        region: &str,
     ) -> Result<Vec<super::publish::QueueDelivery>, SetSubscriptionAttributesError> {
         let invalid_parameter = |message: String| -> SetSubscriptionAttributesError {
             SetSubscriptionAttributesErrorModeled::InvalidParameterException(
@@ -205,6 +209,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> SetSubscriptionAt
             return Err(invalid_parameter(format!(
                 "Invalid parameter: SubscriptionArn Reason: {reason}"
             )));
+        }
+        // A subscription belongs to the region of the topic it extends, which its own
+        // ARN carries: one naming another region names nothing this endpoint serves.
+        if let Some(message) =
+            state::foreign_region_refusal("SubscriptionArn", &input.subscription_arn, region)
+        {
+            return Err(invalid_parameter(message));
         }
         // SNS defines a closed set of subscription attribute names and refuses any
         // other, the computed ones (`SubscriptionArn`, `Protocol`, `Endpoint`, …)

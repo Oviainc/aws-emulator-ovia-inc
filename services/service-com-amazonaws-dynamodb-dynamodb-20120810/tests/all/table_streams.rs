@@ -14,10 +14,11 @@
 //! stream's ARN and label (`TableDescription$LatestStreamArn`: "the ARN that uniquely
 //! identifies the latest stream for this table", `$LatestStreamLabel`: "a timestamp,
 //! in ISO 8601 format, for this stream"). A table that has never enabled one has no
-//! stream and reports none. The two contradictions the model names are
-//! `ResourceInUseException`: "you try to enable a stream on a table that already has
-//! a stream, or ... disable a stream on a table that doesn't have a stream"
-//! (`UpdateTable$StreamSpecification`).
+//! stream and reports none. The contradictions a `StreamSpecification` can state —
+//! enabling a stream on a table that already has one, changing a stream's view type in
+//! place, and disabling a stream on a table that does not have one — are each a
+//! `ValidationException`: none is a state the table leaves on its own, so the request
+//! can never succeed as sent.
 //!
 //! Every table below spans the class the rule generalises over rather than one
 //! recorded example: each `StreamViewType` the model declares, tables with and
@@ -523,8 +524,8 @@ async fn update_table_turns_a_stream_on_and_off_and_refuses_the_contradictions()
             "case {case:?}: the enabled stream must be discoverable"
         );
 
-        // "You receive a ResourceInUseException if you try to enable a stream on a
-        // table that already has a stream."
+        // Enabling a stream on a table that already has one can never succeed as sent,
+        // so it is a parameter error rather than a transient resource conflict.
         let (status, body) = ddb(
             &router,
             "UpdateTable",
@@ -540,8 +541,8 @@ async fn update_table_turns_a_stream_on_and_off_and_refuses_the_contradictions()
         );
         assert_eq!(
             error_code(&body),
-            "ResourceInUseException",
-            "case {case:?}: expected ResourceInUseException, got {body}"
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {body}"
         );
 
         // Disabling turns the stream off; the table keeps reporting its LATEST
@@ -581,7 +582,8 @@ async fn update_table_turns_a_stream_on_and_off_and_refuses_the_contradictions()
         );
 
         // "... or if you try to disable a stream on a table that doesn't have a
-        // stream" — which is now the case, the stream having been turned off.
+        // stream" — which is now the case, the stream having been turned off. Refused
+        // as the same parameter error, for the same reason.
         let (status, body) = ddb(
             &router,
             "UpdateTable",
@@ -597,8 +599,8 @@ async fn update_table_turns_a_stream_on_and_off_and_refuses_the_contradictions()
         );
         assert_eq!(
             error_code(&body),
-            "ResourceInUseException",
-            "case {case:?}: expected ResourceInUseException, got {body}"
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {body}"
         );
 
         // Re-enabling mints a NEW stream: a stream's identity is its ARN, and the

@@ -15,22 +15,17 @@
 //! `reserved-instances-not-in-queued-state`) rather than failing the call. What DOES fail
 //! the call is a value that is not a Reserved Instances id at all: EC2 refuses a parameter
 //! it cannot read with `InvalidParameterValue` before it looks anything up, and a Reserved
-//! Instances id is a UUID ([`reserved_instances_id_is_well_formed`]).
+//! Instances id is a UUID ([`crate::state::reserved_instances_id_is_well_formed`]).
 //!
 //! The record is kept in `queued-deleted` rather than removed, because that is a member of
 //! the modelled `ReservedInstanceState` enum: a describe still reports the cancelled
 //! purchase, and a repeat of this call reports it as no longer queued, which makes the
 //! delete observable on the wire.
 //!
-//! The store's WRITE path
-//! ([`ComAmazonawsEc2Amazonec2State::insert_reserved_instances`] and the ceiling
-//! [`ComAmazonawsEc2Amazonec2State::has_reserved_instances_capacity`] gates it with) has no
-//! caller in `src/` yet: a Reserved Instance is bought by `PurchaseReservedInstancesOffering`,
-//! which is still a scaffold stub with an issue of its own. Until it lands, the only writer
-//! is this crate's own test, so a client of a running emulator sees every id reported as
-//! `reserved-instances-id-invalid` — what an account that has bought nothing holds. The
-//! write path lives here so that operation reuses it rather than deriving a second record
-//! of its own.
+//! The store itself, the form of a Reserved Instances id, the ceiling that bounds the store
+//! and its write path live in [`crate::state::reserved_instances`], the submodule every
+//! operation that reaches Reserved Instances shares; what stays here is this operation's own
+//! per-id error codes and its validation.
 //!
 //! ## Shape of an operation
 //!
@@ -91,52 +86,21 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use ::std::time::{Duration, SystemTime};
-
 use crate::scaffolded::Scaffolded;
 use crate::state::{
-    ComAmazonawsEc2Amazonec2State, DEFAULT_INSTANCE_TENANCY, availability_zones_in_region,
-    invalid_parameter_value, system_time_to_date_time,
+    RESERVED_INSTANCE_STATE_QUEUED, RESERVED_INSTANCE_STATE_QUEUED_DELETED,
+    invalid_reserved_instances_id, reserved_instances_id_is_well_formed,
 };
 
 // ---------------------------------------------------------------------------
-// The Reserved Instances this operation reads and writes
+// What only this operation reaches
 // ---------------------------------------------------------------------------
 //
 // The STORE itself is `crate::state::ComAmazonawsEc2Amazonec2State::reserved_instances`,
-// beside every other resource this service holds. What is here is what only this operation
-// reaches today: the modelled state and error-code members it names, the form of a Reserved
-// Instances id, the ceiling that bounds the store and the one way a record is written. A
-// second operation that needs them (`PurchaseReservedInstancesOffering`,
-// `DescribeReservedInstances`) moves them into `crate::state` rather than restating them.
-
-/// A Reserved Instance purchase the account has scheduled for a future date and that has
-/// not been paid for yet: the `ReservedInstanceState` enum's `queued` member
-/// (`smithy_query(query="shape",shape="ReservedInstanceState")`). It is the ONE state a
-/// queued purchase can be deleted from.
-pub const RESERVED_INSTANCE_STATE_QUEUED: &str = "queued";
-
-/// A queued purchase that has been deleted: the `ReservedInstanceState` enum's
-/// `queued-deleted` member. The enum carrying this value is why a delete moves the record
-/// rather than dropping it — the purchase is still reportable after it is cancelled.
-pub const RESERVED_INSTANCE_STATE_QUEUED_DELETED: &str = "queued-deleted";
-
-/// A Reserved Instance that is paid for and in effect: the `ReservedInstanceState` enum's
-/// `active` member.
-pub const RESERVED_INSTANCE_STATE_ACTIVE: &str = "active";
-
-/// The currency "specified using ISO 4217 standard currency codes. At this time, the only
-/// supported currency is `USD`" (`ReservedInstances$CurrencyCode`), which is also the one
-/// member of the modelled `CurrencyCodeValues` enum.
-pub const RESERVED_INSTANCE_CURRENCY_CODE: &str = "USD";
-
-/// The scope of a Reserved Instance bought in one Availability Zone: the `scope` enum's
-/// `Availability Zone` member (`smithy_query(query="shape",shape="scope")`).
-pub const RESERVED_INSTANCE_SCOPE_ZONE: &str = "Availability Zone";
-
-/// The scope of a Reserved Instance bought for a whole Region: the `scope` enum's `Region`
-/// member. Such a Reserved Instance names no Availability Zone.
-pub const RESERVED_INSTANCE_SCOPE_REGION: &str = "Region";
+// beside every other resource this service holds, and everything about a Reserved Instance
+// that more than one operation needs — the modelled states, the form of an id, the ceiling
+// and the write path — lives in `crate::state::reserved_instances`. What is here is the two
+// modelled per-item error codes this operation's own output channel carries.
 
 /// `DeleteQueuedReservedInstancesErrorCode`'s `reserved-instances-id-invalid`: the id is
 /// not one this account holds a Reserved Instance for, so there is no queued purchase to
@@ -145,211 +109,10 @@ pub const RESERVED_INSTANCE_SCOPE_REGION: &str = "Region";
 pub const RESERVED_INSTANCES_ID_INVALID: &str = "reserved-instances-id-invalid";
 
 /// `DeleteQueuedReservedInstancesErrorCode`'s `reserved-instances-not-in-queued-state`:
-/// the Reserved Instance exists, but its state is not [`RESERVED_INSTANCE_STATE_QUEUED`],
-/// so it carries no queued purchase to delete.
+/// the Reserved Instance exists, but its state is not
+/// [`crate::state::RESERVED_INSTANCE_STATE_QUEUED`], so it carries no queued purchase to
+/// delete.
 pub const RESERVED_INSTANCES_NOT_IN_QUEUED_STATE: &str = "reserved-instances-not-in-queued-state";
-
-/// How many characters the hyphenated form of a UUID has: `8-4-4-4-12` hexadecimal digits
-/// plus the four hyphens. With [`UUID_HYPHEN_POSITIONS`] it is the whole of that form, and
-/// so of [`reserved_instances_id_is_well_formed`].
-const UUID_HYPHENATED_CHARS: usize = 36;
-
-/// Where the four hyphens of the hyphenated UUID form sit, counting characters from the
-/// start: the `8-4-4-4-12` grouping of its 32 hexadecimal digits.
-const UUID_HYPHEN_POSITIONS: [usize; 4] = [8, 13, 18, 23];
-
-/// The first four fields of an id
-/// [`ComAmazonawsEc2Amazonec2State::mint_reserved_instances_id`] lays out, leaving the
-/// 48-bit node field for the store's own counter.
-///
-/// A UUID's version nibble is the first of its third field and its variant nibble the first
-/// of its fourth: `8` and `8` here, which is RFC 9562's version 8 — the version reserved
-/// for a UUID whose bits an implementation lays out itself — under the RFC 4122 variant. So
-/// a minted id is a canonical UUID that says how it was made, rather than claiming the
-/// randomness of a version 4 or the name hash of a version 5.
-const RESERVED_INSTANCES_ID_LAYOUT_PREFIX: &str = "ec200000-0000-8000-8000";
-
-/// How many Reserved Instances this emulator stores before a purchase is refused.
-///
-/// CHOSEN, like `crate::state::MAX_STORED_DEDICATED_HOSTS` and for the same reason:
-/// nothing in this emulator reclaims a stored Reserved Instance — a delete moves the record
-/// to [`RESERVED_INSTANCE_STATE_QUEUED_DELETED`] rather than dropping it, so a cancelled
-/// purchase still occupies the ceiling — so the store needs a ceiling that is not the
-/// process's memory. It is well above any published per-Region Reserved Instance quota a
-/// test would exercise.
-pub const MAX_STORED_RESERVED_INSTANCES: usize = 4096;
-
-/// What one Reserved Instance is stored with: the facts of the purchase itself, everything
-/// the service derives being left to
-/// [`ComAmazonawsEc2Amazonec2State::insert_reserved_instances`].
-#[derive(Debug, Clone)]
-pub struct ReservedInstancesSpec {
-    /// "The instance type on which the Reserved Instance can be used"
-    /// (`ReservedInstances$InstanceType`): one of `INSTANCE_TYPE_VALUES`.
-    pub instance_type: String,
-    /// "The Availability Zone in which the Reserved Instance can be used", for a zonal
-    /// purchase; `None` for one of Regional scope.
-    pub availability_zone: Option<String>,
-    /// The Region the purchase was made in, which is where its Availability Zone's id is
-    /// read from ([`availability_zones_in_region`]).
-    pub region: String,
-    /// "The number of reservations purchased" (`ReservedInstances$InstanceCount`).
-    pub instance_count: i32,
-    /// "The duration of the Reserved Instance, in seconds"
-    /// (`ReservedInstances$Duration`).
-    pub duration_seconds: i64,
-    /// "The offering class of the Reserved Instance": one of `OFFERING_CLASS_TYPE_VALUES`.
-    pub offering_class: String,
-    /// "The Reserved Instance offering type": one of `OFFERING_TYPE_VALUES_VALUES`.
-    pub offering_type: String,
-    /// "The Reserved Instance product platform description": one of
-    /// `R_I_PRODUCT_DESCRIPTION_VALUES`.
-    pub product_description: String,
-    /// "The state of the Reserved Instance purchase": one of
-    /// `RESERVED_INSTANCE_STATE_VALUES`, [`RESERVED_INSTANCE_STATE_QUEUED`] for a queued
-    /// purchase.
-    pub state: String,
-    /// "The date and time the Reserved Instance started" — for a queued purchase, the
-    /// future date the purchase is scheduled for.
-    pub start: SystemTime,
-    /// "The purchase price of the Reserved Instance" (`ReservedInstances$FixedPrice`).
-    pub fixed_price: f32,
-    /// "The usage price of the Reserved Instance, per hour"
-    /// (`ReservedInstances$UsagePrice`).
-    pub usage_price: f32,
-}
-
-impl ComAmazonawsEc2Amazonec2State {
-    /// Whether another `count` Reserved Instances fit inside the store's ceiling
-    /// ([`MAX_STORED_RESERVED_INSTANCES`]).
-    ///
-    /// A purchase must ask this BEFORE inserting anything and refuse with EC2's own
-    /// Reserved-Instances quota error when it answers `false`, the way an allocation asks
-    /// `has_dedicated_host_capacity`: one call can buy more than one, so the whole
-    /// purchase is gated rather than each record as it is written.
-    /// [`Self::insert_reserved_instances`] refuses on its own too, so no path can grow the
-    /// store past the ceiling even if it forgets to ask.
-    pub fn has_reserved_instances_capacity(&self, count: usize) -> bool {
-        self.reserved_instances.len().saturating_add(count) <= MAX_STORED_RESERVED_INSTANCES
-    }
-
-    /// A fresh, unused Reserved Instances id.
-    ///
-    /// A Reserved Instance's id is a UUID — the ids AWS's own Reserved Instance examples
-    /// carry read like `b847fa93-e282-4f55-b59a-1342f5bd7c02`, not like the
-    /// `<prefix>-<hex>` ids `next_id` mints — and the model's
-    /// `ReservedInstances$ReservedInstancesId` is a plain `String` that pins no pattern,
-    /// so the form is decided here, in the one place an id is minted.
-    ///
-    /// The 128 bits are laid out here rather than hashed or drawn from randomness: the
-    /// store's own monotonic counter fills the node field of
-    /// [`RESERVED_INSTANCES_ID_LAYOUT_PREFIX`], whose version nibble says exactly that (RFC
-    /// 9562's version 8). So the id is a canonical UUID, unique within a run, the same
-    /// across runs, and never taken from the request. The counter is `u64` and the node
-    /// field holds 48 bits, so the store's ceiling ([`MAX_STORED_RESERVED_INSTANCES`]) is
-    /// reached long before the layout could repeat an id.
-    pub fn mint_reserved_instances_id(&mut self) -> String {
-        self.id_counter = self.id_counter.saturating_add(1);
-        let node = self.id_counter & 0xffff_ffff_ffff;
-        format!("{RESERVED_INSTANCES_ID_LAYOUT_PREFIX}-{node:012x}")
-    }
-
-    /// Store a Reserved Instance, and answer the `ReservedInstancesId` it was given, or
-    /// `None` when the store is already at its ceiling
-    /// ([`Self::has_reserved_instances_capacity`]).
-    ///
-    /// Everything the service itself owns is derived here rather than taken from the
-    /// caller — the id, the currency, the tenancy, the scope (a Reserved Instance that
-    /// names an Availability Zone is zonal, one that names none is Regional), that zone's
-    /// id, and the instant the term ends, which is its start plus its duration — so two
-    /// writers cannot report the same Reserved Instance differently. Nothing on the record
-    /// is caller-chosen free text (a purchase names an offering, a count and a zone), so
-    /// there is nothing to charge against the store's byte budget the way `insert_address`
-    /// charges an address's tags; the count ceiling is what bounds the store, because
-    /// nothing reclaims a record.
-    pub fn insert_reserved_instances(&mut self, spec: ReservedInstancesSpec) -> Option<String> {
-        if !self.has_reserved_instances_capacity(1) {
-            return None;
-        }
-        let reserved_instances_id = self.mint_reserved_instances_id();
-        let availability_zone_id = spec.availability_zone.as_deref().and_then(|zone| {
-            availability_zones_in_region(&spec.region)
-                .into_iter()
-                .find(|known| known.zone_name == zone)
-                .map(|known| known.zone_id)
-        });
-        let scope = if spec.availability_zone.is_some() {
-            RESERVED_INSTANCE_SCOPE_ZONE
-        } else {
-            RESERVED_INSTANCE_SCOPE_REGION
-        };
-        let duration = spec.duration_seconds.max(0);
-        let end = spec
-            .start
-            .checked_add(Duration::from_secs(u64::try_from(duration).unwrap_or(0)))
-            .unwrap_or(spec.start);
-        let reserved_instances = ReservedInstances {
-            currency_code: Some(RESERVED_INSTANCE_CURRENCY_CODE.to_string()),
-            instance_tenancy: Some(DEFAULT_INSTANCE_TENANCY.to_string()),
-            offering_class: Some(spec.offering_class),
-            offering_type: Some(spec.offering_type),
-            // "The recurring charge tag assigned to the resource"
-            // (`ReservedInstances$RecurringCharges`): an upfront-priced term has none.
-            recurring_charges: Some(Vec::new()),
-            scope: Some(scope.to_string()),
-            tags: Some(Vec::new()),
-            availability_zone_id,
-            reserved_instances_id: Some(reserved_instances_id.clone()),
-            instance_type: Some(spec.instance_type),
-            availability_zone: spec.availability_zone,
-            start: Some(system_time_to_date_time(spec.start)),
-            end: Some(system_time_to_date_time(end)),
-            duration: Some(duration),
-            usage_price: Some(spec.usage_price),
-            fixed_price: Some(spec.fixed_price),
-            instance_count: Some(spec.instance_count),
-            product_description: Some(spec.product_description),
-            state: Some(spec.state),
-        };
-        self.reserved_instances
-            .insert(reserved_instances_id.clone(), reserved_instances);
-        Some(reserved_instances_id)
-    }
-}
-
-/// Whether `id` is a well-formed Reserved Instances id.
-///
-/// A Reserved Instance's id is the hyphenated form of a UUID (see
-/// [`ComAmazonawsEc2Amazonec2State::mint_reserved_instances_id`]), so anything else is a
-/// value EC2 cannot read as an id at all and refuses with `InvalidParameterValue` BEFORE
-/// it looks anything up — which is what leaves the modelled per-item
-/// [`RESERVED_INSTANCES_ID_INVALID`] channel for ids that ARE well formed and name nothing.
-///
-/// Reading a caller's value NEVER panics and never allocates: the hyphenated form is 36
-/// ASCII characters ([`UUID_HYPHENATED_CHARS`]) — a hyphen at each of
-/// [`UUID_HYPHEN_POSITIONS`] and a hexadecimal digit everywhere else — so the check walks
-/// the bytes once. Any UUID version passes, because an id a caller names may have been
-/// minted by AWS rather than by this store; only the FORM is this service's to read.
-pub fn reserved_instances_id_is_well_formed(id: &str) -> bool {
-    id.len() == UUID_HYPHENATED_CHARS
-        && id.bytes().enumerate().all(|(position, byte)| {
-            if UUID_HYPHEN_POSITIONS.contains(&position) {
-                byte == b'-'
-            } else {
-                byte.is_ascii_hexdigit()
-            }
-        })
-}
-
-/// Refuse a request that named something that is not a Reserved Instances id: HTTP 400
-/// `InvalidParameterValue`, naming the member and the value it could not read, the way
-/// EC2 words a value it rejects.
-pub fn invalid_reserved_instances_id<E>(reserved_instances_id: &str) -> Scaffolded<E> {
-    invalid_parameter_value(format!(
-        "Invalid value '{reserved_instances_id}' for reservedInstancesId. \
-         A Reserved Instances ID is a UUID"
-    ))
-}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the

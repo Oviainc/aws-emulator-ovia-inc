@@ -45,6 +45,12 @@ mod create_local_gateway_route_table_virtual_interface_group_association;
 // inserts its lines, and these two lost three serialized squash merges to exactly that.
 #[path = "all/client_vpn_routes.rs"]
 mod client_vpn_routes;
+// What `ModifyReservedInstances` records for the Reserved Instances it names, what the
+// clock's fulfilment of it replaces them with, and what it refuses. Declared beside the
+// suites above rather than in sorted position, for the reason this file's header note
+// gives: the sorted neighbourhood is where every new ec2 suite inserts its two lines.
+#[path = "all/reserved_instances_modifications.rs"]
+mod reserved_instances_modifications;
 // The virtual private gateway slice: create, read back, delete. Declared here rather than in
 // sorted position for the reason given above — the sorted neighbourhood is the contended
 // region of this file, and this suite lost several serialized squash merges to it.
