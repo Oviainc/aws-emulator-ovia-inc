@@ -16,12 +16,13 @@
 //!
 //! The refusal carries nothing of the request, because nothing a caller could change about
 //! the request would make the feature appear — which is exactly what the rows below span:
-//! the accelerator ids named (none, one, several, a value that is not an id of that kind),
-//! each filter the operation documents and one it does not, the page size at each published
-//! bound of its modelled range and between them, a continuation token, `DryRun` both ways,
-//! and every member at once; then the Region the call is signed for, and what the account
-//! holds when it is made. No single row is the specification, and the last two dimensions
-//! are what pin that the answer depends on neither the Region nor the store. One further
+//! the accelerator ids named (none, one, several, the same one twice, a value that is not an
+//! id of that kind), each filter the operation documents and one it does not, a filter
+//! carrying no value and one carrying several, the page size at each published bound of its
+//! modelled range and between them, a continuation token, `DryRun` both ways, and every
+//! member at once in either field order; then the Region the call is signed for, and what
+//! the account holds when it is made. No single row is the specification, and the last two
+//! dimensions pin that the answer depends on neither the Region nor the store. One further
 //! test reads the response's media type, the part of the envelope the recorded response for
 //! this operation also names.
 
@@ -167,6 +168,13 @@ fn request_rows() -> Vec<(String, Params)> {
             vec![p("ElasticGpuId.1", "")],
         ),
         (
+            "the same accelerator id named twice".to_string(),
+            vec![
+                p("ElasticGpuId.1", ELASTIC_GPU_ID),
+                p("ElasticGpuId.2", ELASTIC_GPU_ID),
+            ],
+        ),
+        (
             "a continuation token from a page nobody was served".to_string(),
             vec![p("NextToken", "AAAAAAAAAAE=")],
         ),
@@ -207,6 +215,19 @@ fn request_rows() -> Vec<(String, Params)> {
         "a filter this operation does not document".to_string(),
         filters(&[("tag:Name", &["graphics"])]),
     ));
+    // The number of values one filter carries is another thing a caller can vary: none, and
+    // several at once. Neither turns the absent feature into a result set to narrow.
+    rows.push((
+        "a documented filter carrying no value at all".to_string(),
+        filters(&[("elastic-gpu-state", &[])]),
+    ));
+    rows.push((
+        "a documented filter carrying several values".to_string(),
+        filters(&[(
+            "elastic-gpu-type",
+            &["eg1.medium", "eg1.large", "eg1.xlarge", "eg1.2xlarge"],
+        )]),
+    ));
     rows.push((
         "every documented filter at once".to_string(),
         filters(
@@ -226,7 +247,15 @@ fn request_rows() -> Vec<(String, Params)> {
         p("DryRun", "true"),
     ];
     everything.extend(filters(&[("elastic-gpu-state", &["ATTACHED"])]));
-    rows.push(("every member at once".to_string(), everything));
+    rows.push(("every member at once".to_string(), everything.clone()));
+
+    // The same members, sent in the reverse order: a form field's position is not part of
+    // the request either, so the answer cannot depend on the order they arrive in.
+    everything.reverse();
+    rows.push((
+        "every member at once, its fields in the reverse order".to_string(),
+        everything,
+    ));
 
     rows
 }
