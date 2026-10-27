@@ -40,9 +40,24 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 # Version-4 UUIDs: the form a KMS key id takes.
 uuid = { version = "1", features = ["v4"] }
+# `iam_authorization`: the shared evaluation of IAM policy documents against
+# (action, resource, principal), which decides a key policy and the caller's identity
+# policies here.
+service-common = { path = "../common" }
+# The IAM store holds the identity-based policies of the principal a request speaks for,
+# and the STS store resolves which principal that is: this service reads both services'
+# OWN state accessors rather than keeping a second copy of either fact.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
+
+[dev-dependencies]
+# The authorization suite makes the principals it calls as through IAM's and STS's own
+# operations, so the documents it asserts on are the ones those services wrote.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 
 [lints]
 workspace = true

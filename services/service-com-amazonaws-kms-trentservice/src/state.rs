@@ -42,6 +42,11 @@ use crate::ops::types::{
     CUSTOMER_MASTER_KEY_SPEC_VALUES, DATA_KEY_SPEC_VALUES,
 };
 
+/// Who a request speaks for, and whether the key policy, the caller's identity policies
+/// and the grants in force let it do what it asks — the one authorization decision this
+/// service's operations consult.
+pub mod authorization;
+
 /// The `ExpirationModelType` of imported key material that expires, which is the
 /// default: "the default is KEY_MATERIAL_EXPIRES"
 /// (`smithy_query(query="doc",shape="ImportKeyMaterialRequest",member="ExpirationModel")`).
@@ -163,6 +168,20 @@ pub const ROTATION_TYPE_ON_DEMAND: &str = "ON_DEMAND";
 /// rotation a maximum of 25 times per KMS key"
 /// (`smithy_query(query="doc",shape="RotateKeyOnDemand")`).
 pub const MAX_ON_DEMAND_ROTATIONS: usize = 25;
+
+/// How long an on-demand rotation takes to COMPLETE, which is the span
+/// `GetKeyRotationStatus` reports it as in progress for: "KMS uses a background process to
+/// perform rotations. As a result, there might be a slight delay between initiating
+/// on-demand key rotation and the rotation's completion. Once the on-demand rotation is
+/// complete, KMS removes this field from the response"
+/// (`smithy_query(query="doc",shape="GetKeyRotationStatusResponse",member="OnDemandRotationStartDate")`).
+///
+/// The documentation puts no number on that "slight delay", so the length of the span is
+/// this emulator's, like [`REPLICA_CREATING_SPAN`]. It is deliberately short, so no caller
+/// waits on it, and NON-ZERO, so a caller reading the status straight after the call still
+/// observes the rotation it started — and until it elapses the key goes on encrypting
+/// under the material it had, because that is what an in-progress rotation is.
+pub const ON_DEMAND_ROTATION_SPAN: Duration = Duration::from_millis(300);
 
 /// The rotation period an `EnableKeyRotation` that names none gets: "If no value is
 /// specified, the default value is 365 days"
@@ -923,7 +942,7 @@ fn parse_key_identifier(id: &str) -> Result<KeyIdentifier, IdentifierRefusal> {
 pub fn key_not_found_message(region: &str, requested: &str) -> String {
     if let Some(arn_region) = arn_region(requested) {
         if arn_region != region {
-            return format!("Invalid arn {arn_region}");
+            return not_a_key_arn_message(arn_region.as_str());
         }
     }
     match parse_key_identifier(requested) {
@@ -947,8 +966,37 @@ pub fn key_not_found_message(region: &str, requested: &str) -> String {
         // ARN to name, so the refusal names the ARN itself — the same "Invalid arn
         // <the part that is invalid>" wording the Region case above carries, where
         // the invalid part is the whole identifier rather than its Region.
-        Err(_) => format!("Invalid arn {requested}"),
+        Err(_) => not_a_key_arn_message(requested),
     }
+}
+
+/// How KMS reports an identifier it could not read as the ARN the request needed:
+/// "Invalid arn <the identifier>".
+///
+/// It is the wording [`key_not_found_message`] gives an ARN this endpoint cannot resolve,
+/// and the one `RetireGrant` reports a `KeyId` that is not a key ARN with — that member is
+/// "the key ARN KMS key associated with the grant"
+/// (`smithy_query(query="doc",shape="RetireGrantRequest",member="KeyId")`), so an
+/// identifier in any other form names no key for it. One function for the whole service,
+/// so no two operations word it differently.
+pub fn not_a_key_arn_message(requested: &str) -> String {
+    format!("Invalid arn {requested}")
+}
+
+/// Whether `identifier` is the KEY ARN of a KMS key:
+/// `arn:<partition>:kms:<region>:<account>:key/<key id>`.
+///
+/// Read through the tree's one ARN parse ([`::service_common::arn::parse`]) rather than a
+/// second grammar here. It is what an operation whose `KeyId` member documents the key ARN
+/// alone requires: a bare key id, an alias and an alias ARN each name no key for it.
+pub fn names_a_key_arn(identifier: &str) -> bool {
+    ::service_common::arn::parse(identifier).is_some_and(|arn| {
+        arn.vendor == ARN_SERVICE
+            && arn
+                .resource
+                .strip_prefix("key/")
+                .is_some_and(|key_id| !key_id.is_empty())
+    })
 }
 
 /// How a request that pins a ciphertext to a KMS key other than the one that sealed it
@@ -978,11 +1026,21 @@ pub const INCORRECT_KEY_MESSAGE: &str =
 /// no policy may allow or a policy may deny the action. One function for the whole
 /// service, so no two operations word it differently.
 pub fn unauthorized_account_message(operation: &str) -> String {
+    unauthorized_resource_message(&caller_identity_arn(), operation)
+}
+
+/// [`unauthorized_account_message`], naming the principal the request actually
+/// authenticated as ([`authorization::caller`]) rather than the identity this emulator
+/// publishes.
+///
+/// It is the SAME sentence, so the two cannot drift apart: a refusal that cannot report
+/// anything about the resource — whether it exists, whether a policy allows it, whether
+/// one denies it — says exactly that, whoever was refused.
+pub fn unauthorized_resource_message(principal: &str, operation: &str) -> String {
     format!(
-        "User: {} is not authorized to perform: {ARN_SERVICE}:{operation} on this resource \
-         because the resource does not exist in this Region, no resource-based policies \
-         allow access, or a resource-based policy explicitly denies access",
-        caller_identity_arn()
+        "User: {principal} is not authorized to perform: {ARN_SERVICE}:{operation} on this \
+         resource because the resource does not exist in this Region, no resource-based \
+         policies allow access, or a resource-based policy explicitly denies access"
     )
 }
 
@@ -1613,6 +1671,64 @@ pub struct Cmk {
     /// Key material a caller imported for an on-demand rotation that has not happened
     /// yet, or `None` while none is waiting — see [`PendingRotationMaterial`].
     pub pending_rotation_material: Option<PendingRotationMaterial>,
+    /// The on-demand rotation this key has STARTED whose completion the clock still
+    /// owes, or `None` when none is in progress — see [`OnDemandRotation`].
+    ///
+    /// `RotateKeyOnDemand` sets it and every reader derives the rotation's completion
+    /// from the instant it is due ([`ON_DEMAND_ROTATION_SPAN`]) rather than from a write,
+    /// so no reader has to wait for one and two readers cannot disagree about when it
+    /// landed.
+    pub on_demand_rotation: Option<OnDemandRotation>,
+}
+
+/// An on-demand rotation of a KMS key's key material that has been initiated and is
+/// still IN PROGRESS: "KMS uses a background process to perform rotations. As a result,
+/// there might be a slight delay between initiating on-demand key rotation and the
+/// rotation's completion"
+/// (`smithy_query(query="doc",shape="GetKeyRotationStatusResponse",member="OnDemandRotationStartDate")`),
+/// so the material it installs becomes current, and the rotation becomes one the key has
+/// had, only once the rotation completes — [`ON_DEMAND_ROTATION_SPAN`] after the call that
+/// started it. "You can use `GetKeyRotationStatus` to identify any in progress on-demand
+/// rotations. You can use `ListKeyRotations` to identify the date that completed on-demand
+/// rotations were performed" (`smithy_query(query="doc",shape="RotateKeyOnDemand")`) — the
+/// two readers report the two sides of this record.
+///
+/// `Debug` is written by hand rather than derived so the material is REDACTED.
+#[derive(Clone)]
+pub struct OnDemandRotation {
+    /// The material that becomes current when the rotation completes.
+    pub material: KeyMaterial,
+    /// When the rotation was initiated, which is what `GetKeyRotationStatus` reports as
+    /// its `OnDemandRotationStartDate` and the date the completed rotation is recorded
+    /// with, so the two cannot disagree.
+    pub started_at: SystemTime,
+    /// What the caller stated about the material, when it is material the caller
+    /// IMPORTED, and `None` when KMS generated it.
+    pub imported: Option<ImportedKeyMaterial>,
+}
+
+impl OnDemandRotation {
+    /// When this rotation completes.
+    pub fn completes_at(&self) -> SystemTime {
+        self.started_at + ON_DEMAND_ROTATION_SPAN
+    }
+
+    /// Whether the clock has completed this rotation by `now`.
+    pub fn is_complete(&self, now: SystemTime) -> bool {
+        now >= self.completes_at()
+    }
+}
+
+impl std::fmt::Debug for OnDemandRotation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OnDemandRotation")
+            // The material itself never appears; its id identifies it without
+            // disclosing it.
+            .field("key_material_id", &self.material.id())
+            .field("started_at", &self.started_at)
+            .field("imported", &self.imported)
+            .finish()
+    }
 }
 
 /// Key material a caller has imported for an on-demand rotation of a KMS key, before
@@ -1784,6 +1900,8 @@ impl Cmk {
             // Nothing has been imported for a rotation of a key that has just been
             // created.
             pending_rotation_material: None,
+            // A key that has just been created has had no rotation at all.
+            on_demand_rotation: None,
         }
     }
 
@@ -1880,6 +1998,9 @@ impl Cmk {
             // What is waiting for a rotation of the primary key is waiting there: the
             // same material has to be imported into this replica for the set to rotate.
             pending_rotation_material: None,
+            // A rotation in progress on the primary key is that key's: the replica is
+            // created from the material the set has now.
+            on_demand_rotation: None,
         }
     }
 
@@ -1950,6 +2071,12 @@ impl Cmk {
     pub fn retains_key_material(&self, key_material_id: &str) -> bool {
         self.superseded_material
             .iter()
+            // The version a rotation the clock has completed replaced is retained too,
+            // whether or not the record holds that rotation yet.
+            .chain(
+                self.completed_on_demand_rotation()
+                    .map(|_| &self.material),
+            )
             .any(|material| material.id().as_deref() == Some(key_material_id))
     }
 
@@ -1972,6 +2099,11 @@ impl Cmk {
                     .as_ref()
                     .map(|pending| &pending.material),
             )
+            .chain(
+                self.on_demand_rotation
+                    .as_ref()
+                    .map(|rotation| &rotation.material),
+            )
             .chain(self.superseded_material.iter())
             .any(|version| version.digest().as_deref() == Some(digest.as_str()))
     }
@@ -1979,7 +2111,7 @@ impl Cmk {
     /// Whether this key has key material at all: a key still waiting for its first
     /// material has none.
     pub fn has_key_material(&self) -> bool {
-        !matches!(self.material, KeyMaterial::AwaitingImport)
+        !matches!(self.effective_material(), KeyMaterial::AwaitingImport)
     }
 
     /// The PUBLIC half of this key's key pair, as a DER-encoded X.509
@@ -2044,23 +2176,18 @@ impl Cmk {
     }
 
     /// Complete the rotation the material waiting on this key was imported for: that
-    /// material becomes the current version, the version it replaces is retained, and
-    /// the rotation is recorded — exactly as [`Self::rotate_material`] does for material
-    /// KMS generated, except that the rotation also keeps what the caller stated about
-    /// the material it installed, which is what a reader reports for an imported version.
+    /// material becomes the current version once the rotation completes, the version it
+    /// replaces is retained, and the rotation is recorded — exactly as
+    /// [`Self::start_on_demand_rotation`] does for material KMS generated, except that
+    /// the rotation also keeps what the caller stated about the material it installed,
+    /// which is what a reader reports for an imported version.
     ///
     /// `false` means nothing was waiting, so no rotation happened and nothing changed.
-    pub fn rotate_to_pending_material(&mut self, rotation_type: &str) -> bool {
+    pub fn rotate_to_pending_material(&mut self) -> bool {
         let Some(pending) = self.pending_rotation_material.take() else {
             return false;
         };
-        self.rotate_material(pending.material, rotation_type);
-        if let Some(rotation) = self.rotations.last_mut() {
-            rotation.imported = Some(pending.imported.clone());
-        }
-        // What the caller stated about the material that is now current is what the
-        // metadata readers report from here on.
-        self.imported_material = Some(pending.imported);
+        self.start_on_demand_rotation(pending.material, Some(pending.imported));
         true
     }
 
@@ -2152,29 +2279,174 @@ impl Cmk {
     /// value of `smithy_query(shape="RotationType")`, e.g.
     /// [`ROTATION_TYPE_ON_DEMAND`].
     pub fn rotate_material(&mut self, material: KeyMaterial, rotation_type: &str) {
+        self.rotate_material_at(material, rotation_type, SystemTime::now(), None);
+    }
+
+    /// [`Self::rotate_material`], with the instant the rotation was INITIATED and what
+    /// the caller stated about the material, when the material is material the caller
+    /// imported.
+    ///
+    /// A rotation that takes a span to complete ([`OnDemandRotation`]) is recorded with
+    /// the instant it started, not the instant it landed, so the date a reader reports
+    /// for it is the one `GetKeyRotationStatus` reported while it was in progress.
+    fn rotate_material_at(
+        &mut self,
+        material: KeyMaterial,
+        rotation_type: &str,
+        at: SystemTime,
+        imported: Option<ImportedKeyMaterial>,
+    ) {
         let key_material_id = material.id();
         let superseded = std::mem::replace(&mut self.material, material);
         self.superseded_material.push(superseded);
         self.current_key_material_id = key_material_id.clone();
         self.rotations.push(KeyRotation {
             key_material_id,
-            rotation_date: SystemTime::now(),
+            rotation_date: at,
             rotation_type: rotation_type.to_string(),
-            // Material KMS generated is not imported material, so there is nothing a
-            // caller stated about it; [`Self::rotate_to_pending_material`] fills this in
-            // for a rotation onto material a caller supplied.
-            imported: None,
+            imported: imported.clone(),
         });
+        // What the caller stated about the material that is now current is what the
+        // metadata readers report from here on; material KMS generated is not imported
+        // material, so there is nothing stated about it.
+        if imported.is_some() {
+            self.imported_material = imported;
+        }
+    }
+
+    /// Start an on-demand rotation onto `material`, which becomes current when the
+    /// rotation completes ([`ON_DEMAND_ROTATION_SPAN`] later).
+    ///
+    /// `imported` is what the caller stated about the material, for a rotation onto
+    /// material the caller supplied, and `None` for material KMS generated.
+    ///
+    /// A rotation initiated while an earlier one is still in progress COMPLETES that
+    /// earlier one first, so the material it installed is retained rather than dropped
+    /// ("KMS retains all key material") and both rotations count against the quota.
+    pub fn start_on_demand_rotation(
+        &mut self,
+        material: KeyMaterial,
+        imported: Option<ImportedKeyMaterial>,
+    ) {
+        self.complete_on_demand_rotation();
+        self.on_demand_rotation = Some(OnDemandRotation {
+            material,
+            started_at: SystemTime::now(),
+            imported,
+        });
+    }
+
+    /// Materialise an on-demand rotation the CLOCK has already completed, so the record
+    /// holds what every reader already reports.
+    ///
+    /// A write the clock owed at that instant whether or not anybody called: no reader
+    /// needs it, because each one derives the completion from the rotation's own due
+    /// instant.
+    pub fn settle_on_demand_rotation(&mut self) {
+        if self.completed_on_demand_rotation().is_some() {
+            self.complete_on_demand_rotation();
+        }
+    }
+
+    /// Apply the on-demand rotation in progress, whether or not the clock has made it
+    /// due. `None` was in progress is a no-op.
+    fn complete_on_demand_rotation(&mut self) {
+        let Some(rotation) = self.on_demand_rotation.take() else {
+            return;
+        };
+        self.rotate_material_at(
+            rotation.material,
+            ROTATION_TYPE_ON_DEMAND,
+            rotation.started_at,
+            rotation.imported,
+        );
+    }
+
+    /// The on-demand rotation this key has started that the clock has already completed,
+    /// but whose completion the record does not hold yet.
+    fn completed_on_demand_rotation(&self) -> Option<&OnDemandRotation> {
+        self.on_demand_rotation
+            .as_ref()
+            .filter(|rotation| rotation.is_complete(SystemTime::now()))
+    }
+
+    /// The key material this key encrypts under NOW: the material of a rotation the
+    /// clock has completed, otherwise the material the record holds as current.
+    ///
+    /// Until a rotation completes the key goes on encrypting under the material it had,
+    /// which is what "an in progress on-demand rotation" means.
+    pub fn effective_material(&self) -> &KeyMaterial {
+        match self.completed_on_demand_rotation() {
+            Some(rotation) => &rotation.material,
+            None => &self.material,
+        }
+    }
+
+    /// The `KeyMaterialId` a reader reports as this key's current one, which is the id of
+    /// [`Self::effective_material`].
+    pub fn reported_key_material_id(&self) -> Option<String> {
+        match self.completed_on_demand_rotation() {
+            Some(rotation) => rotation.material.id(),
+            None => self.current_key_material_id.clone(),
+        }
+    }
+
+    /// Every version of this key's material a ciphertext may have been sealed under,
+    /// newest first — what `Decrypt` tries in order.
+    pub fn open_candidates(&self) -> Vec<&KeyMaterial> {
+        let mut candidates = Vec::with_capacity(self.superseded_material.len() + 2);
+        candidates.push(self.effective_material());
+        if self.completed_on_demand_rotation().is_some() {
+            // The version the completed rotation replaced, which is retained.
+            candidates.push(&self.material);
+        }
+        candidates.extend(self.superseded_material.iter().rev());
+        candidates
+    }
+
+    /// The rotations a reader reports for this key, oldest first: the ones the record
+    /// holds, plus one the clock has completed but the record does not hold yet.
+    pub fn reported_rotations(&self) -> Vec<KeyRotation> {
+        let mut reported = self.rotations.clone();
+        if let Some(rotation) = self.completed_on_demand_rotation() {
+            reported.push(KeyRotation {
+                key_material_id: rotation.material.id(),
+                rotation_date: rotation.started_at,
+                rotation_type: ROTATION_TYPE_ON_DEMAND.to_string(),
+                imported: rotation.imported.clone(),
+            });
+        }
+        reported
     }
 
     /// How many ON_DEMAND rotations this key has had, which is what
     /// [`MAX_ON_DEMAND_ROTATIONS`] bounds. An automatic rotation does not count
     /// against that quota: it is a quota on on-demand rotation alone.
+    ///
+    /// A rotation still in progress counts: it has been performed, so the quota is
+    /// charged for it at once rather than when it lands.
     pub fn on_demand_rotation_count(&self) -> usize {
         self.rotations
             .iter()
             .filter(|rotation| rotation.rotation_type == ROTATION_TYPE_ON_DEMAND)
             .count()
+            + usize::from(self.on_demand_rotation.is_some())
+    }
+
+    /// When the on-demand rotation that is IN PROGRESS was initiated, or `None` when
+    /// none is: "identifies the date and time that an in progress on-demand rotation
+    /// was initiated … once the on-demand rotation is complete, KMS removes this field
+    /// from the response"
+    /// (`smithy_query(query="doc",shape="GetKeyRotationStatusResponse",member="OnDemandRotationStartDate")`).
+    ///
+    /// The rotation completes on the CLOCK, at the same instant its material becomes the
+    /// one the key encrypts under ([`Self::effective_material`]), so a caller that sees
+    /// the material advance never sees a start date beside it.
+    pub fn on_demand_rotation_in_progress(&self) -> Option<SystemTime> {
+        self.on_demand_rotation
+            .as_ref()
+            .filter(|rotation| !rotation.is_complete(SystemTime::now()))
+            .map(|rotation| rotation.started_at)
     }
 
     /// Start or re-configure this key's automatic rotation schedule, from the
@@ -2340,8 +2612,7 @@ impl Cmk {
             mac_algorithms: self.algorithms_under(KEY_USAGE_GENERATE_VERIFY_MAC),
             xks_key_configuration: None,
             current_key_material_id: self
-                .current_key_material_id
-                .clone()
+                .reported_key_material_id()
                 .filter(|_| !self.key_material_expired()),
         }
     }
@@ -3761,7 +4032,7 @@ pub fn seal(
     plaintext: &[u8],
     context: Option<&HashMap<String, String>>,
 ) -> Option<Vec<u8>> {
-    let cipher = cipher(&key.material)?;
+    let cipher = cipher(key.effective_material())?;
     let mut nonce = [0u8; NONCE_LEN_BYTES];
     SystemRandom::new().fill(&mut nonce).ok()?;
     let aad = encryption_context_aad(context);
@@ -3836,8 +4107,8 @@ pub fn unseal(
     context: Option<&HashMap<String, String>>,
 ) -> Option<Opened> {
     let aad = encryption_context_aad(context);
-    std::iter::once(&key.material)
-        .chain(key.superseded_material.iter().rev())
+    key.open_candidates()
+        .into_iter()
         .find_map(|material| {
             let cipher = cipher(material)?;
             let mut body = envelope.body.clone();
@@ -4174,22 +4445,14 @@ pub fn grant_not_found_message(grant_id: &str) -> String {
 
 /// How a `RetireGrant` is refused when the grant it identified is not held.
 ///
-/// "Permission to retire a grant is determined primarily by the grant"
-/// (`smithy_query(query="doc",shape="RetireGrant")`), so with no such grant there is
-/// no permission to retire one, and the refusal names the grant the request gave.
-pub fn retire_grant_access_denied_message(grant_id: &str) -> String {
-    format!("No grant with the id {grant_id} authorizes kms:RetireGrant.")
-}
-
-/// How a request whose only permission would have come from a grant is refused when
-/// no grant it named gives that permission.
-///
-/// The message is built from the request — the operation asked for and the key it
-/// names — rather than from a caller identity, which this emulator does not have.
-///
-/// One function for the whole service, so no two operations word it differently.
-pub fn grant_access_denied_message(operation: &str, key_arn: &str) -> String {
-    format!("The grant tokens in the request do not authorize kms:{operation} on {key_arn}.")
+/// KMS will not confirm whether a grant exists to a caller that cannot retire it:
+/// "permission to retire a grant is determined primarily by the grant"
+/// (`smithy_query(query="doc",shape="RetireGrant")`), so with no such grant there is no
+/// permission to retire one — and the refusal is the authorization failure that reports
+/// nothing about the resource, naming the caller and the action alone
+/// ([`unauthorized_resource_message`]).
+pub fn retire_grant_access_denied_message(principal: &str, operation: &str) -> String {
+    unauthorized_resource_message(principal, operation)
 }
 
 /// A freshly minted grant id: the 64 lowercase hex characters KMS gives a grant,
@@ -4254,21 +4517,34 @@ pub fn decode_grant_token(token: &str) -> Option<String> {
 
 /// Whether `principal` is given the way KMS requires a grant principal to be: "use
 /// the Amazon Resource Name (ARN) of an Amazon Web Services principal"
-/// (`smithy_query(query="doc",shape="CreateGrantRequest",member="GranteePrincipal")`).
+/// (`smithy_query(query="doc",shape="CreateGrantRequest",member="GranteePrincipal")`),
+/// and the same for the retiring principal `ListRetirableGrants` and `CreateGrant` take:
+/// "valid principals include Amazon Web Services accounts, IAM users, IAM roles,
+/// federated users, and assumed role users"
+/// (`smithy_query(query="doc",shape="ListRetirableGrantsRequest",member="RetiringPrincipal")`).
 ///
-/// `PrincipalIdType`'s modelled pattern accepts any word-ish string, so the ARN form
-/// is what is left to check: `arn:<partition>:<service>:<region>:<account>:<resource>`
-/// with a non-empty partition, service, account and resource. The Region segment may
-/// be empty, because an IAM principal ARN carries none.
+/// `PrincipalIdType`'s modelled pattern accepts any word-ish string, so the IDENTITY form
+/// is what is left to check — and it is the same union of forms every other service reads
+/// a policy principal against, so it is the tree's one reading of it
+/// ([`::service_common::arn::is_iam_principal_arn`]) rather than a second grammar here: an
+/// ARN whose resource field names no IAM or STS identity (no resource type at all, or one
+/// that is not an identity's) denotes no principal, which is what the operations model
+/// `InvalidArnException` for.
 pub fn names_a_principal_arn(principal: &str) -> bool {
-    let Some(rest) = principal.strip_prefix("arn:") else {
-        return false;
-    };
-    let segments: Vec<&str> = rest.splitn(5, ':').collect();
-    let [partition, service, _region, account, resource] = segments.as_slice() else {
-        return false;
-    };
-    !partition.is_empty() && !service.is_empty() && !account.is_empty() && !resource.is_empty()
+    ::service_common::arn::is_iam_principal_arn(principal)
+}
+
+/// How a value that names no AWS principal is refused: `InvalidArnException`'s message
+/// names the value the request gave, since that string is the whole of what is wrong with
+/// it.
+///
+/// KMS words this refusal of a PRINCIPAL differently from the one it words for a key
+/// identifier ([`invalid_arn_message`]) — the recorded wording names the ARN with no
+/// sentence around it — so the two live side by side here rather than one being used for
+/// both. One function for every member that carries a principal, so no two operations
+/// word the same refusal differently.
+pub fn invalid_principal_arn_message(requested: &str) -> String {
+    format!("ARN is not valid: {requested}")
 }
 
 /// What one `GrantOperation` needs of the KMS key it is granted on.
@@ -4544,6 +4820,22 @@ pub fn encode_retirable_grant_marker(grant_id: &str) -> String {
 /// [`decode_marker`], for the retirable-grant list.
 pub fn decode_retirable_grant_marker(marker: &str) -> Option<String> {
     decode_marker_for(RETIRABLE_GRANT_MARKER_PREFIX, marker)
+}
+
+/// How KMS words `InvalidMarkerException`, "the marker that specifies where pagination
+/// should next begin is not valid".
+///
+/// KMS refuses a marker it never issued with the error CODE alone — the refusal is
+/// recorded on the wire with no `Message` member at all — so no explanatory text is
+/// manufactured for it. What was wrong with the marker is stated in a comment at the
+/// check that refuses it, not on the wire.
+///
+/// One function for every paginated operation of this service, so no two of them answer
+/// the same refusal with different members — which is why it is a function returning
+/// `None` rather than `None` written out at each of the seven call sites.
+#[must_use]
+pub fn invalid_marker_message() -> Option<String> {
+    None
 }
 
 /// [`MARKER_PREFIX`], for the custom key store list, which pages over custom key
