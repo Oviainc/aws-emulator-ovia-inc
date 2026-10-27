@@ -267,12 +267,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
             // The argument names "an imported certificate to replace"
             // (`ImportCertificateRequest$CertificateArn` doc): a certificate ACM issued
-            // is not one, and a revoked certificate has nothing left to replace —
-            // "revoking a certificate is permanent" (`RevokeCertificate` doc).
+            // is not one. What this argument addresses is the IMPORTED certificate at
+            // that ARN, and there is none — which is what `ResourceNotFoundException`
+            // reports, even though the ARN itself resolves to a certificate every read
+            // operation serves. A revoked import has nothing left to replace either —
+            // "revoking a certificate is permanent" (`RevokeCertificate` doc) — but it
+            // IS an imported certificate, so that is a refusal of the request's own
+            // parameter.
             if !existing.is_imported() {
-                return Err(invalid_parameter(format!(
-                    "the certificate {target} was not imported, so an import cannot replace it"
-                )));
+                return Err(ImportCertificateErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::not_an_imported_certificate_message(target)),
+                    },
+                )
+                .into());
             }
             if existing.is_revoked() {
                 return Err(invalid_parameter(format!(
@@ -381,8 +389,8 @@ struct ImportedCertificate {
     /// The issuer distinguished name — "the name of the certificate authority that
     /// issued and signed the certificate" (`CertificateDetail$Issuer` doc).
     issuer: String,
-    /// The X.509 serial number, lowercase hex of its big-endian bytes (the form the
-    /// sibling Private CA service reports a serial in).
+    /// The X.509 serial number, rendered as ACM reports a serial
+    /// (`crate::state::serial_number`).
     serial: String,
     /// A `KeyAlgorithm` value, decided by the public key's own algorithm and size.
     key_algorithm: String,
@@ -392,8 +400,9 @@ struct ImportedCertificate {
     signature_algorithm: Option<String>,
     /// The `KeyUsageName` values of the certificate's Key Usage extension.
     key_usages: Vec<String>,
-    /// The `ExtendedKeyUsageName` values of its Extended Key Usage extension.
-    extended_key_usages: Vec<String>,
+    /// The key purposes of its Extended Key Usage extension, each as the name and the
+    /// object identifier ACM publishes it as.
+    extended_key_usages: Vec<crate::state::ExtendedKeyUsageRecord>,
     not_before: ::std::time::SystemTime,
     not_after: ::std::time::SystemTime,
     /// The PEM text the request carried, held as it arrived apart from its line
@@ -412,8 +421,8 @@ impl ImportedCertificate {
     /// An imported certificate is already signed, so there is nothing for ACM to
     /// validate and nothing the clock owes it: it is stored `ISSUED`, with no
     /// validation record and no validation method, and "ACM does not provide managed
-    /// renewal for certificates that you import" (`ImportCertificate` doc) so it is
-    /// never eligible for renewal.
+    /// renewal for certificates that you import" (`ImportCertificate` doc) so no
+    /// renewal is ever started for it.
     fn record(
         self,
         arn: String,
@@ -438,7 +447,9 @@ impl ImportedCertificate {
             options: None,
             certificate_authority_arn: None,
             managed_by: None,
-            renewal_eligibility: crate::state::RENEWAL_INELIGIBLE.to_string(),
+            // "ACM does not provide managed renewal for certificates that you import"
+            // (`ImportCertificate` doc), so no renewal is ever owed one.
+            renewal: None,
             failure_reason: None,
             pending_validation: None,
             in_use_by: Vec::new(),
@@ -567,11 +578,11 @@ fn imported_certificate(
         subject_alternative_names: names,
         subject: distinguished_name(&tbs.subject),
         issuer: distinguished_name(&tbs.issuer),
-        serial: ::hex::encode(tbs.serial_number.as_bytes()),
+        serial: crate::state::serial_number(tbs.serial_number.as_bytes()),
         key_algorithm: public_key.key_algorithm,
         signature_algorithm: signature_algorithm(&certificate.signature_algorithm.oid),
         key_usages: key_usage_names(&certificate),
-        extended_key_usages: extended_key_usage_names(&certificate),
+        extended_key_usages: extended_key_usages(&certificate),
         not_before,
         not_after,
     })
@@ -817,47 +828,21 @@ fn key_usage_names(certificate: &X509Certificate) -> Vec<String> {
     .collect()
 }
 
-/// The `ExtendedKeyUsageName` values of a certificate's Extended Key Usage extension,
-/// in the order the extension lists them. A purpose outside the ones the model names
-/// is reported as `CUSTOM`, the value that enum declares for exactly that.
-fn extended_key_usage_names(certificate: &X509Certificate) -> Vec<String> {
+/// The key purposes of a certificate's Extended Key Usage extension, in the order the
+/// extension lists them, each as the name and identifier pair ACM publishes it as
+/// (`crate::state::extended_key_usage`). A certificate carrying no such extension
+/// asserts no purpose, which is the empty list.
+fn extended_key_usages(
+    certificate: &X509Certificate,
+) -> Vec<crate::state::ExtendedKeyUsageRecord> {
     let Some(usage) = extension::<pkix::ExtendedKeyUsage>(certificate) else {
         return Vec::new();
     };
     usage
         .0
         .iter()
-        .map(|purpose| extended_key_usage_name(purpose).to_string())
+        .map(|purpose| crate::state::extended_key_usage(&purpose.to_string()))
         .collect()
-}
-
-/// One extended key purpose as the `ExtendedKeyUsageName` the model spells it with
-/// (`smithy_query(query="shape", shape="com.amazonaws.acm#ExtendedKeyUsageName")`),
-/// from the key-purpose identifiers RFC 5280 section 4.2.1.12 defines.
-fn extended_key_usage_name(purpose: &ObjectIdentifier) -> &'static str {
-    if *purpose == oid::ANY_EXTENDED_KEY_USAGE {
-        "ANY"
-    } else if *purpose == oid::ID_KP_SERVER_AUTH {
-        "TLS_WEB_SERVER_AUTHENTICATION"
-    } else if *purpose == oid::ID_KP_CLIENT_AUTH {
-        "TLS_WEB_CLIENT_AUTHENTICATION"
-    } else if *purpose == oid::ID_KP_CODE_SIGNING {
-        "CODE_SIGNING"
-    } else if *purpose == oid::ID_KP_EMAIL_PROTECTION {
-        "EMAIL_PROTECTION"
-    } else if *purpose == oid::ID_KP_TIME_STAMPING {
-        "TIME_STAMPING"
-    } else if *purpose == oid::ID_KP_OCSP_SIGNING {
-        "OCSP_SIGNING"
-    } else if *purpose == oid::ID_KP_IPSEC_END_SYSTEM {
-        "IPSEC_END_SYSTEM"
-    } else if *purpose == oid::ID_KP_IPSEC_TUNNEL {
-        "IPSEC_TUNNEL"
-    } else if *purpose == oid::ID_KP_IPSEC_USER {
-        "IPSEC_USER"
-    } else {
-        "CUSTOM"
-    }
 }
 
 /// The certificate extension of type `T`, decoded, or `None` when the certificate
@@ -942,9 +927,11 @@ fn directory_string(value: &Any) -> Option<String> {
 /// * RSA keys and RSA signatures: RFC 8017 appendix C (`1.2.840.113549.1.1.*`);
 /// * elliptic-curve keys, their named curves and the ECDSA signatures: RFC 5480
 ///   sections 2.1.1 and 2.1.1.1 and RFC 5758 section 3.2 (`1.2.840.10045.*`,
-///   `1.3.132.0.*`);
-/// * the extended key purposes: RFC 5280 section 4.2.1.12 (`1.3.6.1.5.5.7.3.*`) and
-///   `anyExtendedKeyUsage` (`2.5.29.37.0`).
+///   `1.3.132.0.*`).
+///
+/// The extended key purposes are named by their dotted-decimal identifiers instead
+/// (`crate::state::EXTENDED_KEY_USAGE_OIDS`), so the catalogue that pairs each with the
+/// name ACM reports it under is the only place either appears.
 mod oid {
     use super::ObjectIdentifier;
 
@@ -972,25 +959,4 @@ mod oid {
         ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.3");
     pub const ECDSA_WITH_SHA512: ObjectIdentifier =
         ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.4");
-
-    pub const ANY_EXTENDED_KEY_USAGE: ObjectIdentifier =
-        ObjectIdentifier::new_unwrap("2.5.29.37.0");
-    pub const ID_KP_SERVER_AUTH: ObjectIdentifier =
-        ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.1");
-    pub const ID_KP_CLIENT_AUTH: ObjectIdentifier =
-        ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.2");
-    pub const ID_KP_CODE_SIGNING: ObjectIdentifier =
-        ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.3");
-    pub const ID_KP_EMAIL_PROTECTION: ObjectIdentifier =
-        ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.4");
-    pub const ID_KP_IPSEC_END_SYSTEM: ObjectIdentifier =
-        ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.5");
-    pub const ID_KP_IPSEC_TUNNEL: ObjectIdentifier =
-        ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.6");
-    pub const ID_KP_IPSEC_USER: ObjectIdentifier =
-        ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.7");
-    pub const ID_KP_TIME_STAMPING: ObjectIdentifier =
-        ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.8");
-    pub const ID_KP_OCSP_SIGNING: ObjectIdentifier =
-        ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.9");
 }

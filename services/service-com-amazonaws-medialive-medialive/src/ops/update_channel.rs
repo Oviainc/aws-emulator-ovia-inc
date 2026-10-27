@@ -255,22 +255,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // This operation models no `NotFoundException`, so the request itself is
         // what cannot be served: the modelled 400. The message tells the two
         // apart; the status and the code do not.
-        let channel = state
-            .mutable_channel(&input.channel_id)
-            .map_err(|dead| bad_request(&dead.message))?;
+        {
+            let channel = state
+                .mutable_channel(&input.channel_id)
+                .map_err(|dead| bad_request(&dead.message))?;
 
-        // A channel that has not stopped is encoding through exactly the
-        // configuration this call would replace, so the edit waits until it has
-        // stopped — the same notion `UpdateInput` applies to the channels that
-        // attach the input it is asked to edit.
-        if !channel.has_stopped() {
-            return Err(UpdateChannelErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Channel {} is in state {} and must have stopped before it can be updated",
-                    channel.id, channel.state
-                )),
-            })
-            .into());
+            // A channel that has not stopped is encoding through exactly the
+            // configuration this call would replace, so the edit waits until it
+            // has stopped — the same notion `UpdateInput` applies to the
+            // channels that attach the input it is asked to edit.
+            if !channel.has_stopped() {
+                return Err(UpdateChannelErrorModeled::ConflictException(ConflictException {
+                    message: Some(format!(
+                        "Channel {} is in state {} and must have stopped before it can be updated",
+                        channel.id, channel.state
+                    )),
+                })
+                .into());
+            }
+        }
+
+        // The configuration this update WOULD leave on the channel — the members
+        // its request names, over the ones the channel already had — is checked
+        // by the rule `CreateChannel` validates a new channel's configuration
+        // against, before anything is written: an update that would leave a
+        // channel this service could not run is refused with the operation's
+        // modelled 422, one `ValidationErrors` entry per problem, and the channel
+        // keeps exactly the configuration it had.
+        let stored = state.channels.get(&input.channel_id).ok_or_else(unavailable)?;
+        let problems = state.channel_configuration_problems(&crate::state::ChannelConfiguration {
+            encoder_settings: input
+                .encoder_settings
+                .as_ref()
+                .or(stored.encoder_settings.as_ref()),
+            input_attachments: input
+                .input_attachments
+                .as_deref()
+                .unwrap_or(&stored.input_attachments),
+        });
+        if !problems.is_empty() {
+            return Err(unprocessable(problems));
         }
 
         // Every refusal this update could earn has now been answered, so a
@@ -280,6 +304,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if dry_run {
             return Ok(UpdateChannelOutput { channel: None });
         }
+
+        // The channel the writes below apply to, resolved again now that the
+        // read-only validation above has ended its borrow of the store. The
+        // lookup is the same guard the refusals went through.
+        let channel = state
+            .mutable_channel(&input.channel_id)
+            .map_err(|dead| bad_request(&dead.message))?;
 
         // Each member the request named is stored; each one it omitted keeps the
         // value the channel already had.
@@ -380,6 +411,20 @@ fn apply_maintenance(stored: &mut Option<MaintenanceStatus>, patch: MaintenanceU
     if patch.maintenance_scheduled_date.is_some() {
         stored.maintenance_scheduled_date = patch.maintenance_scheduled_date;
     }
+}
+
+/// The refusal an update that would leave a configuration this service could not
+/// run earns: the operation's modelled `UnprocessableEntityException` (422),
+/// carrying one `ValidationErrors` entry per problem — "A collection of
+/// validation error responses", each naming the element path the problem was
+/// found at — beside the message that says what the refusal is about. Nothing is
+/// written for it, so the channel keeps the configuration it had.
+fn unprocessable(problems: Vec<ValidationError>) -> UpdateChannelError {
+    UpdateChannelErrorModeled::UnprocessableEntityException(UnprocessableEntityException {
+        message: Some(crate::state::CHANNEL_CONTAINS_ERRORS_MESSAGE.to_string()),
+        validation_errors: Some(problems),
+    })
+    .into()
 }
 
 /// A request this operation cannot serve, as its modelled `BadRequestException`

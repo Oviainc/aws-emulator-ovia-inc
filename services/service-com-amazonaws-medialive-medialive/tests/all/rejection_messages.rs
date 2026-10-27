@@ -70,6 +70,7 @@ async fn create_input(router: &MultiServiceRouter, case: &str, body: Value) -> V
 
 /// One `CreateChannel`, answering the created channel.
 async fn create_channel(router: &MultiServiceRouter, case: &str, body: Value) -> Value {
+    let body = crate::support::resolved_channel_body(router, body).await;
     let (status, response) = call(router, "POST", "/prod/channels", Some(body)).await;
     assert_eq!(
         status, 201,

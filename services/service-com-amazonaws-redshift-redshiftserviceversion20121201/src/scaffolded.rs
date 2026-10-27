@@ -208,6 +208,37 @@ pub static INVALID_PARAMETER_VALUE_SCHEMA: Schema = Schema::new_struct(
     &[&INVALID_PARAMETER_VALUE_MESSAGE],
 );
 
+/// The `message` member of the synthetic `InvalidParameterCombination` error shape.
+static INVALID_PARAMETER_COMBINATION_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#InvalidParameterCombination$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for the synthetic `InvalidParameterCombination` error shape.
+///
+/// In the `smithy.framework` namespace for the same reason as the shapes above: it is
+/// in no service model, so it must not collide with a modeled shape. It exists because
+/// `InvalidParameterCombination` — not `InvalidParameterValue` — is the error code
+/// Amazon Redshift answers a request whose parameters are each acceptable but cannot
+/// stand TOGETHER with, a request that omits every member the operation needs one of
+/// among them, and the error code is what a client branches on.
+pub static INVALID_PARAMETER_COMBINATION_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#InvalidParameterCombination",
+        "smithy.framework",
+        "InvalidParameterCombination",
+    ),
+    ShapeType::Structure,
+    &[&INVALID_PARAMETER_COMBINATION_MESSAGE],
+);
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -233,6 +264,13 @@ pub enum Scaffolded<E> {
     /// the same single `message` member; only the wire code differs from
     /// [`Scaffolded::ValidationException`].
     InvalidParameterValue(ValidationException),
+    /// The request's parameters cannot stand together — each value is acceptable on
+    /// its own, but the combination is not, or none of the members the operation needs
+    /// one of was named at all. HTTP 400 with the error code
+    /// `InvalidParameterCombination`, the code Amazon Redshift itself answers such a
+    /// request with. The payload is the same single `message` member; only the wire
+    /// code differs from [`Scaffolded::InvalidParameterValue`].
+    InvalidParameterCombination(ValidationException),
 }
 
 impl<E> Scaffolded<E> {
@@ -270,6 +308,17 @@ impl<E> Scaffolded<E> {
     pub fn invalid_parameter_value(message: impl Into<String>) -> Self {
         Self::InvalidParameterValue(ValidationException::new(message))
     }
+
+    /// Refuse the request with HTTP 400 `InvalidParameterCombination`.
+    ///
+    /// This is the refusal Amazon Redshift answers a request whose parameters it
+    /// cannot honour TOGETHER with — two that contradict each other, or none of the
+    /// members an operation needs one of — and it is decided on the request alone,
+    /// before any lookup. Say which members may stand together, because the caller has
+    /// to fix the request from this text alone.
+    pub fn invalid_parameter_combination(message: impl Into<String>) -> Self {
+        Self::InvalidParameterCombination(ValidationException::new(message))
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -279,6 +328,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::Modeled(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
             Self::InvalidParameterValue(e) => write!(f, "{e}"),
+            Self::InvalidParameterCombination(e) => write!(f, "{e}"),
         }
     }
 }
@@ -292,6 +342,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::Modeled(e) => e.source(),
             Self::ValidationException(e) => e.source(),
             Self::InvalidParameterValue(e) => e.source(),
+            Self::InvalidParameterCombination(e) => e.source(),
         }
     }
 }
@@ -307,6 +358,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.as_serializable(),
             Self::ValidationException(e) => e,
             Self::InvalidParameterValue(e) => e,
+            Self::InvalidParameterCombination(e) => e,
         }
     }
 
@@ -316,6 +368,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.variant_schema(),
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
             Self::InvalidParameterValue(_) => &INVALID_PARAMETER_VALUE_SCHEMA,
+            Self::InvalidParameterCombination(_) => &INVALID_PARAMETER_COMBINATION_SCHEMA,
         }
     }
 
@@ -329,6 +382,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.shape_name(),
             Self::ValidationException(_) => "ValidationException",
             Self::InvalidParameterValue(_) => "InvalidParameterValue",
+            Self::InvalidParameterCombination(_) => "InvalidParameterCombination",
         }
     }
 
@@ -342,6 +396,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.http_status(),
             Self::ValidationException(_) => 400,
             Self::InvalidParameterValue(_) => 400,
+            Self::InvalidParameterCombination(_) => 400,
         }
     }
 
@@ -357,6 +412,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // Same reason again; `<Code>InvalidParameterValue</Code>` comes from
             // `shape_name` above, which is already the code AWS answers with.
             Self::InvalidParameterValue(_) => None,
+            // Same reason again; `<Code>InvalidParameterCombination</Code>` comes from
+            // `shape_name` above, which is already the code AWS answers with.
+            Self::InvalidParameterCombination(_) => None,
         }
     }
 }

@@ -191,7 +191,7 @@ use crate::ops::types::{
     Smpte2110ReceiverGroupSettings, SignalMapSummary, SpecialRouterSettings,
     SrtCallerDecryption, SrtCallerSource, SrtListenerDecryption, SrtListenerSettings,
     SrtSettings, SrtSettingsRequest, SuccessfulMonitorDeployment,
-    VpcOutputSettings, VpcOutputSettingsDescription,
+    ValidationError, VpcOutputSettings, VpcOutputSettingsDescription,
 };
 
 /// The cloudwatch alarm template group slice: its record, its bounds, its
@@ -208,6 +208,14 @@ pub mod alarm_template_groups;
 /// Its store is the `schedule` member of [`ChannelRecord`] below, so a schedule
 /// goes away with the channel that owns it.
 pub mod schedules;
+
+/// The channel CONFIGURATION slice: the one rule the operations that WRITE a
+/// channel's configuration (`CreateChannel`, `UpdateChannel`) validate it
+/// against before anything is stored, and the per-element problems a
+/// configuration this service could not run is refused with.
+pub mod channel_configurations;
+
+pub use channel_configurations::ChannelConfiguration;
 
 /// The channel ALERT slice: one channel's alert log, the state an alert is in,
 /// the `StateFilter` a read narrows it with and the set-time order a read
@@ -874,6 +882,18 @@ const FIRST_INPUT_SECURITY_GROUP_ID: u64 = 3_000_000;
 /// models `TooManyRequestsException`, which is the refusal once the store is
 /// full.
 pub const MAX_INPUT_SECURITY_GROUPS: usize = 100;
+
+/// The most `WhitelistRules` entries this emulator accepts on one input security
+/// group.
+///
+/// The same ceiling as [`MAX_NETWORK_CIDR_ENTRIES`] and for the same reason: the
+/// list is caller-chosen and the model targets it at a plain list with no length
+/// constraint, so nothing else bounds it, and every entry costs heap on a stored
+/// record that outlives the request plus a member in every response that reports
+/// the group. Both operations that write a whitelist model
+/// `BadRequestException`, which is the refusal for a longer list — the request is
+/// what is out of bounds.
+pub const MAX_WHITELIST_RULES: usize = MAX_NETWORK_CIDR_ENTRIES;
 
 /// The id the first input of a process gets. AWS input ids are numeric strings,
 /// so they are minted from a counter at a fixed seven-digit width, which keeps
@@ -1614,6 +1634,14 @@ pub fn is_ipv4_cidr(cidr: &str) -> bool {
 /// the message.
 pub const INVALID_WHITELIST_CIDR_MESSAGE: &str = "Every whitelist needs to have a valid IPv4 CIDR.";
 
+/// The message a request carrying more whitelist rules than this emulator keeps
+/// on one group is refused with: the ceiling and the member as the wire spells
+/// it, worded as the network lists' own ceiling is
+/// ([`too_many_network_entries_message`]).
+pub fn too_many_whitelist_rules_message() -> String {
+    format!("An input security group takes at most {MAX_WHITELIST_RULES} whitelistRules entries.")
+}
+
 /// The `WhitelistRules` a request asks for, validated into the CIDR strings the
 /// store keeps, or the message a list carrying anything that is not a valid IPv4
 /// CIDR is refused with.
@@ -1628,11 +1656,21 @@ pub const INVALID_WHITELIST_CIDR_MESSAGE: &str = "Every whitelist needs to have 
 /// A rule that names no CIDR at all fails the same rule and so carries the same
 /// message: every whitelist needs a valid IPv4 CIDR, and a missing one is not a
 /// valid one.
+///
+/// The list's LENGTH is bounded here too ([`MAX_WHITELIST_RULES`]), for the same
+/// reason the network lists are: every accepted entry is kept on a record that
+/// outlives the request, so a longer list is refused before any of it is stored
+/// rather than growing the store by whatever one request chose.
 pub fn whitelist_rules_from_request(
     requested: Vec<InputWhitelistRuleCidr>,
 ) -> Result<Vec<String>, String> {
-    let mut cidrs: Vec<String> = Vec::with_capacity(requested.len());
+    // Not sized from the request: the capacity a caller asks for is not an
+    // allocation this emulator makes before it has accepted the entries.
+    let mut cidrs: Vec<String> = Vec::new();
     for rule in requested {
+        if cidrs.len() >= MAX_WHITELIST_RULES {
+            return Err(too_many_whitelist_rules_message());
+        }
         let cidr = rule.cidr.filter(|cidr| is_ipv4_cidr(cidr));
         let Some(cidr) = cidr else {
             return Err(INVALID_WHITELIST_CIDR_MESSAGE.to_string());
@@ -5106,6 +5144,33 @@ pub fn unknown_reference_message(member: &str, resource_type: &str, identifier: 
 /// at all carries: the member as the wire spells it.
 pub fn missing_reference_id_message(member: &str) -> String {
     format!("every entry of {member} must name the id of a resource this account holds")
+}
+
+/// The message a channel-configuration write refused for a member the
+/// configuration does not declare at all carries: the member as the wire spells
+/// it. One helper, so `CreateChannel` and `UpdateChannel` cannot word the same
+/// omission two ways.
+pub fn required_channel_configuration_message(member: &str) -> String {
+    format!("a channel configuration must declare {member}")
+}
+
+/// The `message` a channel-configuration refusal carries beside its
+/// `ValidationErrors` entries: the entries say WHERE each problem is and what it
+/// is, and this says what the refusal as a whole is about.
+pub const CHANNEL_CONTAINS_ERRORS_MESSAGE: &str = "Channel contains errors.";
+
+/// One entry of `UnprocessableEntityException$ValidationErrors`: where the
+/// problem is (`ElementPath` is "Path to the source of the error") and what it
+/// is.
+///
+/// The one constructor for every per-element problem this service reports, so
+/// the schedule slice and the channel-configuration rule report a problem in the
+/// same shape.
+pub fn validation_problem(element_path: &str, error_message: &str) -> ValidationError {
+    ValidationError {
+        element_path: Some(element_path.to_string()),
+        error_message: Some(error_message.to_string()),
+    }
 }
 
 /// The message a write refused because the configuration leaves out the ingest

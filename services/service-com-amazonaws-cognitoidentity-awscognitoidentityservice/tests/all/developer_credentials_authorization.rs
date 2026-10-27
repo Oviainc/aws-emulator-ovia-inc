@@ -435,15 +435,14 @@ struct OperationRow {
 /// satisfies its modelled input and the resource it addresses.
 ///
 /// `pool_id` is a pool of this account the row may read, write or destroy: each row gets
-/// its own, so a row that deletes it does not disturb the next one. The stubs this service
-/// still answers 501 for (`DeleteIdentities`, `MergeDeveloperIdentities`) are left out:
-/// they decide nothing yet, and the `@optionalAuth` identity flow is covered by its own
-/// test below. `DescribeIdentity` is left out for a different reason: every row here is
-/// driven with a POOL id, and that operation addresses an IDENTITY, so the resource its
-/// decision is made against is the pool of an identity a row would first have to mint —
-/// which is why it has a case of its own
-/// ([`describe_identity_is_authorized_on_the_pool_its_identity_belongs_to`]) rather than a
-/// row here.
+/// its own, so a row that deletes it does not disturb the next one. The stub this service
+/// still answers 501 for (`DeleteIdentities`) is left out: it decides nothing yet, and the
+/// `@optionalAuth` identity flow is covered by its own test below. `DescribeIdentity` is
+/// left out for a different reason: every row here is driven with a POOL id, and that
+/// operation addresses an IDENTITY, so the resource its decision is made against is the
+/// pool of an identity a row would first have to mint — which is why it has a case of its
+/// own ([`describe_identity_is_authorized_on_the_pool_its_identity_belongs_to`]) rather
+/// than a row here.
 fn operation_rows(pool_id: &str) -> Vec<OperationRow> {
     let pool_arn = identity_pool_arn(pool_id);
     let named = |operation: &'static str, request: Value| OperationRow {
@@ -513,6 +512,15 @@ fn operation_rows(pool_id: &str) -> Vec<OperationRow> {
             json!({
                 "IdentityPoolId": pool_id,
                 "Logins": { "login.probe": "probe-user" },
+            }),
+        ),
+        named(
+            "MergeDeveloperIdentities",
+            json!({
+                "IdentityPoolId": pool_id,
+                "DeveloperProviderName": "login.probe",
+                "SourceUserIdentifier": "probe-source-user",
+                "DestinationUserIdentifier": "probe-destination-user",
             }),
         ),
         OperationRow {

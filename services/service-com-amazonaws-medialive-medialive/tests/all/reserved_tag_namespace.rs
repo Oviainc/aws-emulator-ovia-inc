@@ -65,7 +65,14 @@ const ALLOWED_KEYS: [(&str, &str); 6] = [
 /// model.
 fn creates() -> Vec<(&'static str, &'static str, Value)> {
     vec![
-        ("channel", "/prod/channels", json!({ "name": "reserved-tag" })),
+        (
+            "channel",
+            "/prod/channels",
+            json!({
+                "name": "reserved-tag",
+                "encoderSettings": crate::support::channel_encoder_settings(),
+            }),
+        ),
         (
             "input",
             "/prod/inputs",
@@ -303,7 +310,10 @@ async fn a_create_refuses_the_reserved_namespace() {
     // A refused create stores nothing: the channel collection is still empty
     // afterwards.
     let router = medialive();
-    let mut request = json!({ "name": "refused" });
+    let mut request = json!({
+        "name": "refused",
+        "encoderSettings": crate::support::channel_encoder_settings(),
+    });
     request["tags"] = tags(&[("aws:foo", "bar")]);
     let (status, response) = call(&router, "POST", "/prod/channels", Some(request)).await;
     assert_refused("a refused create stores nothing", "aws:foo", status, &response);

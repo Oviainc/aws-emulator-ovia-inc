@@ -303,7 +303,10 @@ async fn a_stop_touches_only_the_multiplex_it_names() {
         &router,
         "POST",
         "/prod/channels",
-        Some(json!({ "name": "not-a-multiplex" })),
+        Some(json!({
+            "name": "not-a-multiplex",
+            "encoderSettings": crate::support::channel_encoder_settings(),
+        })),
     )
     .await;
     assert_eq!(
