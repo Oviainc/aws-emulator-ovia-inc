@@ -1781,7 +1781,15 @@ pub const MALWARE_PROTECTION_PLAN_ID_MEMBER: &str = "malwareProtectionPlanId";
 
 /// The wire name of `CreateMalwareProtectionPlan`'s `Role` member
 /// (`smithy_query(operation="CreateMalwareProtectionPlan")` renders it `role`).
+/// `UpdateMalwareProtectionPlan` carries the same member under the same wire name.
 pub const ROLE_MEMBER: &str = "role";
+
+/// The wire path of the `Role` a malware-scan start carries inside its
+/// `ScanConfiguration` (`smithy_query(shape="StartMalwareScanConfiguration")`
+/// renders the member `role`, under the request's `scanConfiguration`). Dotted the
+/// way this service names a nested member in a rejection, as
+/// [`DESTINATION_ARN_MEMBER`] is.
+pub const SCAN_CONFIGURATION_ROLE_MEMBER: &str = "scanConfiguration.role";
 
 /// The wire name of the `ProtectedResource` member, for the same reason.
 pub const PROTECTED_RESOURCE_MEMBER: &str = "protectedResource";
@@ -1900,6 +1908,11 @@ pub fn malware_protection_plan_not_found_message() -> String {
 /// permissions to scan and add tags to the associated protected resource"
 /// (`smithy_query(operation="CreateMalwareProtectionPlan")`), and the model
 /// constrains it no further than `String`, so the form is checked here:
+/// ONE reader for every request member that carries an IAM role ARN — the plan
+/// create and update, and a malware scan's `ScanConfiguration.Role`, "the IAM role
+/// that is used for scanning the resource"
+/// (`smithy_query(shape="StartMalwareScanConfiguration")`) — so the form cannot
+/// drift between the paths that take one:
 /// `arn:<partition>:iam::<account>:role/<name>`. IAM is global, so a role ARN's
 /// Region segment is empty. Form only — the role need not exist, and its account
 /// need not be the caller's.

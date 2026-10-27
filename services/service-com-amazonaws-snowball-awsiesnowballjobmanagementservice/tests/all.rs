@@ -37,6 +37,8 @@ mod cluster_node_job_members;
 mod cluster_node_job_updates;
 #[path = "all/cluster_node_updates.rs"]
 mod cluster_node_updates;
+#[path = "all/cluster_order_members.rs"]
+mod cluster_order_members;
 #[path = "all/cluster_provisioning.rs"]
 mod cluster_provisioning;
 #[path = "all/cluster_updates.rs"]

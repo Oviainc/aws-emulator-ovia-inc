@@ -2706,7 +2706,15 @@ impl ResolverQueryLogConfigRecord {
             QueryLogConfigFilterKey::AssociationCount => {
                 values.contains(&self.association_count().to_string())
             }
-            QueryLogConfigFilterKey::CreationTime => values.contains(self.creation_time.as_str()),
+            // `Filter$Name`'s `CreationTime` entry spells this member's values
+            // "in Unix time format and Coordinated Universal Time (UTC)", while
+            // every read reports the modelled RFC 3339 string, so a filter value
+            // in either spelling selects the configuration: the whole-second
+            // Unix form names the second the configuration was created in.
+            QueryLogConfigFilterKey::CreationTime => {
+                values.contains(self.creation_time.as_str())
+                    || values.contains(&rfc3339_unix_seconds(&self.creation_time))
+            }
             QueryLogConfigFilterKey::CreatorRequestId => {
                 values.contains(self.creator_request_id.as_str())
             }
@@ -2921,6 +2929,14 @@ fn rfc3339_epoch_nanos(raw: &str) -> i128 {
     aws_smithy_types::DateTime::from_str(raw, aws_smithy_types::date_time::Format::DateTime)
         .map(|at| i128::from(at.secs()) * 1_000_000_000 + i128::from(at.subsec_nanos()))
         .unwrap_or_default()
+}
+
+/// A stored `Rfc3339TimeString` as the whole Unix seconds it names, the spelling
+/// `Filter$Name` documents for a `CreationTime` filter's values. Rendered from
+/// the same parse as [`rfc3339_epoch_nanos`], so the two readings of one stored
+/// timestamp cannot disagree.
+fn rfc3339_unix_seconds(raw: &str) -> String {
+    (rfc3339_epoch_nanos(raw) / 1_000_000_000).to_string()
 }
 
 /// Mint the `Id` of a query logging configuration from the id sequence. AWS names

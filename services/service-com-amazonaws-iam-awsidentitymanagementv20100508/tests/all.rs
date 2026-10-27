@@ -33,6 +33,8 @@ mod aws_managed_policy_attachability;
 mod aws_managed_policy_catalog;
 #[path = "all/custom_policy_context_keys.rs"]
 mod custom_policy_context_keys;
+#[path = "all/delegation_request_reads.rs"]
+mod delegation_request_reads;
 #[path = "all/entities_for_policy.rs"]
 mod entities_for_policy;
 #[path = "all/enum_refusal_wording.rs"]

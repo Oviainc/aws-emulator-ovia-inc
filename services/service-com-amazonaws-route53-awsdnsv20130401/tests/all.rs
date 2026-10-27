@@ -91,6 +91,8 @@ mod traffic_policy_comment_updates;
 mod traffic_policy_instances;
 #[path = "all/traffic_policy_listing.rs"]
 mod traffic_policy_listing;
+#[path = "all/traffic_policy_version_listing.rs"]
+mod traffic_policy_version_listing;
 #[path = "all/traffic_policy_versions.rs"]
 mod traffic_policy_versions;
 #[path = "all/vpc_association_authorizations.rs"]

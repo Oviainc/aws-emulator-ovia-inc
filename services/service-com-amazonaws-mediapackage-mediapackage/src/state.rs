@@ -2102,7 +2102,7 @@ impl ComAmazonawsMediapackageMediapackageState {
     /// channel returns exactly these values. The URL embeds the endpoint id, so it stays
     /// valid for exactly that endpoint.
     pub fn mint_ingest_endpoints(&mut self, region: &str, channel_id: &str) -> Vec<IngestEndpoint> {
-        let account_label = stable_label(&[::emulator_server::emulator_account_id(), region]);
+        let hostname = media_hostname(region);
         let channel_label = stable_label(&[channel_id, region]);
         (0..INGEST_ENDPOINT_COUNT)
             .map(|_| {
@@ -2110,7 +2110,7 @@ impl ComAmazonawsMediapackageMediapackageState {
                 let (username, password) = self.mint_ingest_credentials();
                 IngestEndpoint {
                     url: Some(format!(
-                        "https://{account_label}.mediapackage.{region}.amazonaws.com/in/v2/{channel_label}/{id}/channel"
+                        "https://{hostname}/in/v2/{channel_label}/{id}/channel"
                     )),
                     id: Some(id),
                     username: Some(username),
@@ -2577,9 +2577,32 @@ pub fn packaging_refusal(supplied: &[&str]) -> ServiceError {
     )
 }
 
-/// The playback URL for an OriginEndpoint: the egress hostname for this account and
-/// region, then the endpoint's own path label, then the manifest its packaging type
-/// serves under `manifest_name`.
+/// The host MediaPackage serves this account in `region` on: the account's own stable
+/// label, then the regional service domain.
+///
+/// The single statement of that rule: every URL this service hands a caller — the ingest
+/// URLs of a Channel and the playback URLs of an OriginEndpoint and its child manifests —
+/// names this host, so they cannot come to name different ones.
+pub fn media_hostname(region: &str) -> String {
+    let account_label = stable_label(&[::emulator_server::emulator_account_id(), region]);
+    format!("{account_label}.mediapackage.{region}.amazonaws.com")
+}
+
+/// The playback path every URL of ONE OriginEndpoint sits under: the egress host for this
+/// account and Region, the egress path, then the endpoint's own path label.
+///
+/// The single statement of that rule. The endpoint's own `url` and the `url` of each child
+/// manifest inside its CMAF package are this prefix plus their own tail, so they always
+/// sit under one playback path.
+pub fn playback_url_prefix(region: &str, channel_id: &str, endpoint_id: &str) -> String {
+    let hostname = media_hostname(region);
+    let endpoint_label = stable_label(&[channel_id, endpoint_id, region]);
+    format!("https://{hostname}/out/v1/{endpoint_label}")
+}
+
+/// The playback URL for an OriginEndpoint: the endpoint's own playback path
+/// ([`playback_url_prefix`]), then the manifest its packaging type serves under
+/// `manifest_name`.
 pub fn playback_url(
     region: &str,
     channel_id: &str,
@@ -2587,16 +2610,13 @@ pub fn playback_url(
     manifest_name: &str,
     kind: PackagingKind,
 ) -> String {
-    let account_label = stable_label(&[::emulator_server::emulator_account_id(), region]);
-    let endpoint_label = stable_label(&[channel_id, endpoint_id, region]);
+    let prefix = playback_url_prefix(region, channel_id, endpoint_id);
     let manifest = kind.manifest_path(manifest_name);
-    format!(
-        "https://{account_label}.mediapackage.{region}.amazonaws.com/out/v1/{endpoint_label}/{manifest}"
-    )
+    format!("{prefix}/{manifest}")
 }
 
 /// The playback URL of one HLS manifest inside a CMAF package: the endpoint's own
-/// playback path, then that child manifest's own label and name.
+/// playback path ([`playback_url_prefix`]), then that child manifest's own label and name.
 pub fn cmaf_manifest_url(
     region: &str,
     channel_id: &str,
@@ -2604,12 +2624,9 @@ pub fn cmaf_manifest_url(
     manifest_id: &str,
     manifest_name: &str,
 ) -> String {
-    let account_label = stable_label(&[::emulator_server::emulator_account_id(), region]);
-    let endpoint_label = stable_label(&[channel_id, endpoint_id, region]);
+    let prefix = playback_url_prefix(region, channel_id, endpoint_id);
     let manifest_label = stable_label(&[channel_id, endpoint_id, manifest_id, region]);
-    format!(
-        "https://{account_label}.mediapackage.{region}.amazonaws.com/out/v1/{endpoint_label}/{manifest_label}/{manifest_name}/index.m3u8"
-    )
+    format!("{prefix}/{manifest_label}/{manifest_name}/index.m3u8")
 }
 
 /// The `CmafPackage` to store for the `CmafPackageCreateOrUpdateParameters` an input

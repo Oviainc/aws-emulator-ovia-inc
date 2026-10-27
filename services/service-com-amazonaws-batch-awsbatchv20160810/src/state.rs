@@ -3360,16 +3360,51 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
         self.record_job_state_change(id, at);
     }
 
-    /// The key a job is ordered by in its queue's `RUNNABLE` ordering: its submission
-    /// instant, then its id so two jobs submitted in the same millisecond still have one
-    /// order. `GetJobQueueSnapshot`'s `frontOfQueue` doc: "For first-in-first-out (FIFO)
-    /// job queues, jobs are ordered based on their submission time."
-    fn queue_order_key(job: &Job) -> (i64, &str) {
-        (job.created_at, job.job_id.as_str())
+    /// Whether the queue `arn` dispatches its `RUNNABLE` jobs by job priority before
+    /// submission time, i.e. whether a FAIR-SHARE scheduling policy is attached to it.
+    ///
+    /// `JobDetail$schedulingPriority`: "This only affects jobs in job queues with a
+    /// fair-share policy. Jobs with a higher scheduling priority are scheduled before jobs
+    /// with a lower scheduling priority." A scheduling policy carries a fair-share policy
+    /// or a quota-share policy and never both ([`SchedulingPolicy`]), and a quota share's
+    /// only documented `idleResourceAssignmentStrategy` is `FIFO`, so priority orders the
+    /// queues whose attached policy is NOT a quota-share one; a queue with no policy
+    /// attached at all is first-in-first-out.
+    fn queue_orders_by_priority(&self, arn: &str) -> bool {
+        self.job_queue(arn)
+            .and_then(|queue| queue.scheduling_policy_arn.as_deref())
+            .and_then(|policy_arn| self.scheduling_policy(policy_arn))
+            .is_some_and(|policy| policy.quota_share_policy.is_none())
+    }
+
+    /// The key a job is ordered by in its queue's `RUNNABLE` ordering: the job's own
+    /// priority, NEGATED so the higher priority dispatches first, and nothing else.
+    ///
+    /// Submission order is what decides between the jobs of ONE priority — and so between
+    /// the jobs of one share, which carry one priority unless a submit overrode it — and
+    /// that order needs no key at all: [`Self::jobs_by_queue`] holds a queue's jobs in
+    /// submission order and the sort below is stable, so equal keys come out as submitted,
+    /// whatever resolution the clock reports. `GetJobQueueSnapshot`'s `frontOfQueue` doc:
+    /// "For first-in-first-out (FIFO) job queues, jobs are ordered based on their
+    /// submission time."
+    ///
+    /// The priority is read only for a queue that dispatches by it
+    /// ([`Self::queue_orders_by_priority`]); every other queue is first-in-first-out. A job
+    /// that names no `schedulingPriority` is ordered at the lowest the member documents
+    /// ("The minimum supported value is 0", [`MIN_SCHEDULING_PRIORITY`]).
+    fn queue_order_key(job: &Job, by_priority: bool) -> i32 {
+        if by_priority {
+            job.scheduling_priority
+                .unwrap_or(MIN_SCHEDULING_PRIORITY)
+                .saturating_neg()
+        } else {
+            0
+        }
     }
 
     /// The `RUNNABLE` jobs of the queue `arn`, in the order the queue dispatches them.
     pub fn runnable_jobs_of_queue(&self, arn: &str) -> Vec<&Job> {
+        let by_priority = self.queue_orders_by_priority(arn);
         let mut queued: Vec<&Job> = self
             .jobs_by_queue
             .get(arn)
@@ -3378,23 +3413,28 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
             .filter_map(|id| self.jobs.get(id))
             .filter(|job| job.status == JOB_RUNNABLE)
             .collect();
-        queued.sort_by_key(|job| Self::queue_order_key(job));
+        // STABLE, so the submission order `jobs_by_queue` is kept in survives every tie.
+        queued.sort_by_key(|job| Self::queue_order_key(job, by_priority));
         queued
     }
 
     /// Move every `RUNNABLE` job BEHIND `departed` in its queue to its new position at
     /// `at`: a job leaving the ordering is the only thing that advances the jobs after it,
     /// and each of those is now at a position it reached at this instant.
+    ///
+    /// "Behind" is read off the queue's own dispatch ordering, whatever decides it, so the
+    /// jobs that move forward are the same ones the next snapshot reports after `departed`.
     fn advance_queue_positions(&mut self, departed: &str, at: i64) {
         let Some(gone) = self.jobs.get(departed) else {
             return;
         };
         let queue_arn = gone.job_queue_arn.clone();
-        let gone_key = (gone.created_at, gone.job_id.clone());
-        let behind: Vec<String> = self
-            .runnable_jobs_of_queue(&queue_arn)
-            .into_iter()
-            .filter(|job| (job.created_at, job.job_id.clone()) > gone_key)
+        let ordered = self.runnable_jobs_of_queue(&queue_arn);
+        let Some(position) = ordered.iter().position(|job| job.job_id == departed) else {
+            return;
+        };
+        let behind: Vec<String> = ordered[position + 1..]
+            .iter()
             .map(|job| job.job_id.clone())
             .collect();
         for id in behind {

@@ -236,17 +236,21 @@
 //!   association Amazon EKS refuses leaves no half-configured entry behind, because the
 //!   entry this arm just created is removed before the refusal is reported.
 //!
-//! * the three `AWS::ApiGatewayV2::*` types' properties are their creates' own members with
-//!   the initial letter lower-cased, all the way down ([`apigatewayv2_request`]), with the
-//!   declared tags sent as those calls' tag MAP. An api's and a mapping's identity is API
-//!   Gateway v2's OWN — `Ref` returns the `ApiId` and the `ApiMappingId` those creates mint,
-//!   and neither takes an identifier — so the stack reports what the create answered, and
-//!   an api's `ApiEndpoint` attribute is the endpoint that service really serves it on. A
-//!   custom domain name is keyed by the name the template states, and a mapping by the PAIR
-//!   of that domain and the minted id ([`apigatewayv2_api_mapping_uri`]), so its delete and
-//!   its drift read carry both. An api declared with an OpenAPI definition
-//!   ([`APIGATEWAYV2_IMPORT_PROPERTIES`]) is a different call on a different URI and is
-//!   REFUSED rather than created without it.
+//! * the `AWS::ApiGatewayV2::*` types' properties are their creates' own members with the
+//!   initial letter lower-cased, all the way down ([`apigatewayv2_request`],
+//!   [`apigatewayv2_child_request`]), with the declared tags sent as those calls' tag MAP
+//!   where the type publishes any. The identity of an api, a mapping, an integration, a
+//!   route, a deployment and an authorizer is API Gateway v2's OWN — `Ref` returns the id
+//!   each create mints, and none of them takes one — so the stack reports what the create
+//!   answered, and an api's `ApiEndpoint` attribute is the endpoint that service really
+//!   serves it on. A custom domain name is keyed by the name the template states and a
+//!   stage by the stage name it states; a mapping is keyed by the PAIR of its domain and the
+//!   minted id ([`apigatewayv2_api_mapping_uri`]) and every resource that lives inside an
+//!   api by the pair of that api and its own identifier ([`apigatewayv2_child_uri`]), so
+//!   their deletes and drift reads carry both. An api declared with an inline OpenAPI
+//!   definition is IMPORTED from it ([`import_apigatewayv2_api`]), which is a different call
+//!   on a different binding; one declared with a definition held in Amazon S3 is refused
+//!   rather than created without it.
 //!
 //! * `AWS::SES::ConfigurationSet`'s one property that reaches a call of this service is
 //!   `TrackingOptions`: a configuration set's own create takes nothing but the name
@@ -331,7 +335,9 @@ use super::provisioning::{
 };
 use super::template::{
     ACM_ACME_ENDPOINT, ACM_CERTIFICATE, AOSS_COLLECTION, AOSS_SECURITY_POLICY, APIGATEWAYV2_API,
-    APIGATEWAYV2_API_MAPPING, APIGATEWAYV2_DOMAIN_NAME, BATCH_COMPUTE_ENVIRONMENT,
+    APIGATEWAYV2_API_MAPPING, APIGATEWAYV2_AUTHORIZER, APIGATEWAYV2_DEPLOYMENT,
+    APIGATEWAYV2_DOMAIN_NAME, APIGATEWAYV2_INTEGRATION, APIGATEWAYV2_ROUTE,
+    APIGATEWAYV2_STAGE, BATCH_COMPUTE_ENVIRONMENT,
     BATCH_JOB_QUEUE, BATCH_SERVICE_ENVIRONMENT, CLOUDWATCH_DASHBOARD,
     CLOUDWATCH_METRIC_STREAM, CODECOMMIT_REPOSITORY, CODEDEPLOY_APPLICATION,
     CODEDEPLOY_DEPLOYMENT_CONFIG, CODEDEPLOY_DEPLOYMENT_GROUP,
@@ -464,6 +470,11 @@ pub(super) enum Provisioner {
     ApiGatewayV2Api,
     ApiGatewayV2DomainName,
     ApiGatewayV2ApiMapping,
+    ApiGatewayV2Integration,
+    ApiGatewayV2Route,
+    ApiGatewayV2Stage,
+    ApiGatewayV2Deployment,
+    ApiGatewayV2Authorizer,
     CodeCommitRepository,
     SesConfigurationSet,
 }
@@ -535,6 +546,11 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         APIGATEWAYV2_API => Some(Provisioner::ApiGatewayV2Api),
         APIGATEWAYV2_DOMAIN_NAME => Some(Provisioner::ApiGatewayV2DomainName),
         APIGATEWAYV2_API_MAPPING => Some(Provisioner::ApiGatewayV2ApiMapping),
+        APIGATEWAYV2_INTEGRATION => Some(Provisioner::ApiGatewayV2Integration),
+        APIGATEWAYV2_ROUTE => Some(Provisioner::ApiGatewayV2Route),
+        APIGATEWAYV2_STAGE => Some(Provisioner::ApiGatewayV2Stage),
+        APIGATEWAYV2_DEPLOYMENT => Some(Provisioner::ApiGatewayV2Deployment),
+        APIGATEWAYV2_AUTHORIZER => Some(Provisioner::ApiGatewayV2Authorizer),
         CODECOMMIT_REPOSITORY => Some(Provisioner::CodeCommitRepository),
         SES_CONFIGURATION_SET => Some(Provisioner::SesConfigurationSet),
         _ => None,
@@ -764,6 +780,48 @@ impl Provisioner {
             // are propagated to a mapping.
             Self::ApiGatewayV2ApiMapping => {
                 create_apigatewayv2_api_mapping(ctx, region, resource).await
+            }
+            // The five types whose resources live INSIDE an api, each created in the
+            // collection its api holds ([`ApiGatewayV2Child`]). Only the stage's own
+            // property set publishes `Tags`, and the table is what says so, so the tags
+            // CloudFormation gives the resource reach the one create that takes them.
+            Self::ApiGatewayV2Integration => {
+                create_apigatewayv2_child(
+                    ctx,
+                    region,
+                    resource,
+                    propagated,
+                    &APIGATEWAYV2_INTEGRATION_CHILD,
+                )
+                .await
+            }
+            Self::ApiGatewayV2Route => {
+                create_apigatewayv2_child(ctx, region, resource, propagated, &APIGATEWAYV2_ROUTE_CHILD)
+                    .await
+            }
+            Self::ApiGatewayV2Stage => {
+                create_apigatewayv2_child(ctx, region, resource, propagated, &APIGATEWAYV2_STAGE_CHILD)
+                    .await
+            }
+            Self::ApiGatewayV2Deployment => {
+                create_apigatewayv2_child(
+                    ctx,
+                    region,
+                    resource,
+                    propagated,
+                    &APIGATEWAYV2_DEPLOYMENT_CHILD,
+                )
+                .await
+            }
+            Self::ApiGatewayV2Authorizer => {
+                create_apigatewayv2_child(
+                    ctx,
+                    region,
+                    resource,
+                    propagated,
+                    &APIGATEWAYV2_AUTHORIZER_CHILD,
+                )
+                .await
             }
             Self::CodeCommitRepository => {
                 create_codecommit_repository(ctx, region, resource, propagated).await
@@ -1207,6 +1265,26 @@ impl Provisioner {
             Self::ApiGatewayV2ApiMapping => {
                 delete_apigatewayv2_api_mapping(ctx, region, resource).await
             }
+            // Each addressed by the api that holds it and its own identifier, both of
+            // which the resource's record carries.
+            Self::ApiGatewayV2Integration => {
+                delete_apigatewayv2_child(ctx, region, resource, &APIGATEWAYV2_INTEGRATION_CHILD)
+                    .await
+            }
+            Self::ApiGatewayV2Route => {
+                delete_apigatewayv2_child(ctx, region, resource, &APIGATEWAYV2_ROUTE_CHILD).await
+            }
+            Self::ApiGatewayV2Stage => {
+                delete_apigatewayv2_child(ctx, region, resource, &APIGATEWAYV2_STAGE_CHILD).await
+            }
+            Self::ApiGatewayV2Deployment => {
+                delete_apigatewayv2_child(ctx, region, resource, &APIGATEWAYV2_DEPLOYMENT_CHILD)
+                    .await
+            }
+            Self::ApiGatewayV2Authorizer => {
+                delete_apigatewayv2_child(ctx, region, resource, &APIGATEWAYV2_AUTHORIZER_CHILD)
+                    .await
+            }
             Self::CodeCommitRepository => {
                 delete_codecommit_repository(ctx, region, physical_resource_id).await
             }
@@ -1427,6 +1505,25 @@ impl Provisioner {
             // Read back by the same domain-and-id pair the delete uses.
             Self::ApiGatewayV2ApiMapping => {
                 describe_apigatewayv2_api_mapping(ctx, region, resource).await
+            }
+            // Read back by the same api-and-identifier pair each delete uses.
+            Self::ApiGatewayV2Integration => {
+                describe_apigatewayv2_child(ctx, region, resource, &APIGATEWAYV2_INTEGRATION_CHILD)
+                    .await
+            }
+            Self::ApiGatewayV2Route => {
+                describe_apigatewayv2_child(ctx, region, resource, &APIGATEWAYV2_ROUTE_CHILD).await
+            }
+            Self::ApiGatewayV2Stage => {
+                describe_apigatewayv2_child(ctx, region, resource, &APIGATEWAYV2_STAGE_CHILD).await
+            }
+            Self::ApiGatewayV2Deployment => {
+                describe_apigatewayv2_child(ctx, region, resource, &APIGATEWAYV2_DEPLOYMENT_CHILD)
+                    .await
+            }
+            Self::ApiGatewayV2Authorizer => {
+                describe_apigatewayv2_child(ctx, region, resource, &APIGATEWAYV2_AUTHORIZER_CHILD)
+                    .await
             }
             Self::CodeCommitRepository => {
                 describe_codecommit_repository(ctx, region, physical_resource_id).await
@@ -4579,8 +4676,13 @@ fn queue_attributes(properties: &Value) -> Map<String, Value> {
         .collect()
 }
 
-/// One attribute value as the wire carries it: a string stays itself, every other JSON
-/// value is its own compact JSON (`30`, `true`, `{"maxReceiveCount":3}`).
+/// One value as the wire carries it: a string stays itself, every other JSON value is its
+/// own compact JSON (`30`, `true`, `{"maxReceiveCount":3}`).
+///
+/// The ONE spelling of that, shared by the queue attributes it was written for and by every
+/// other member whose value a template may declare as a document while the called operation
+/// takes its TEXT — an api's inline OpenAPI definition among them
+/// ([`import_apigatewayv2_api`]).
 fn attribute_text(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
@@ -12808,9 +12910,13 @@ fn access_policy_request(resource: &StoredResource, declared: &Value) -> Result<
 const APIGATEWAYV2_SIGNING_NAME: &str = "apigateway";
 
 /// The URIs the API Gateway v2 operations a stack makes are bound to, as that model's
-/// `@http` traits declare them: `POST /v2/apis`, `DELETE|GET /v2/apis/{ApiId}`,
+/// `@http` traits declare them: `POST|PUT /v2/apis`, `DELETE|GET /v2/apis/{ApiId}`,
+/// `POST /v2/apis/{ApiId}/{integrations|routes|stages|deployments|authorizers}`,
 /// `POST /v2/domainnames`, `DELETE|GET /v2/domainnames/{DomainName}` and
-/// `POST /v2/domainnames/{DomainName}/apimappings`.
+/// `POST /v2/domainnames/{DomainName}/apimappings`. Every operation of this model is bound
+/// below [`APIGATEWAYV2_URI_PREFIX`], which is what separates it from the Amazon API
+/// Gateway control plane it shares its signing name with.
+const APIGATEWAYV2_URI_PREFIX: &str = "/v2";
 const APIGATEWAYV2_APIS_URI: &str = "/v2/apis";
 const APIGATEWAYV2_DOMAIN_NAMES_URI: &str = "/v2/domainnames";
 const APIGATEWAYV2_API_MAPPINGS_SEGMENT: &str = "apimappings";
@@ -12823,11 +12929,41 @@ const APIGATEWAYV2_NOT_FOUND: &str = "NotFoundException";
 ///
 /// They are `ImportApi`'s: that operation takes an OpenAPI definition as its payload
 /// (`Body`/`BodyS3Location`, with `BasePath` and `FailOnWarnings` governing how it is
-/// read), which is a different call on a different URI from the one this arm makes. A
-/// declaration carrying one is REFUSED rather than created without it, so no stack
-/// completes reporting an api configured differently from its declaration.
-const APIGATEWAYV2_IMPORT_PROPERTIES: &[&str] =
-    &["Body", "BodyS3Location", "BasePath", "FailOnWarnings"];
+/// read), which is a different call on a different URI from the one [`create_apigatewayv2_api`]
+/// makes — so a declaration carrying a definition is made with THAT call
+/// ([`import_apigatewayv2_api`]) instead.
+const APIGATEWAYV2_IMPORT_PROPERTIES: &[&str] = &[
+    APIGATEWAYV2_BODY,
+    APIGATEWAYV2_BODY_S3_LOCATION,
+    APIGATEWAYV2_BASE_PATH,
+    APIGATEWAYV2_FAIL_ON_WARNINGS,
+];
+
+/// The property that carries the OpenAPI definition an api is IMPORTED from, inline: "the
+/// OpenAPI definition. Supported only for HTTP APIs" (`AWS::ApiGatewayV2::Api.Body`), and
+/// "to import an HTTP API, you must specify a Body or BodyS3Location".
+const APIGATEWAYV2_BODY: &str = "Body";
+
+/// The property that carries that definition as an Amazon S3 OBJECT instead. The object has
+/// to be FETCHED from S3 before any api can be imported from it, which nothing here does, so
+/// a declaration stating it is still refused rather than created without its definition.
+const APIGATEWAYV2_BODY_S3_LOCATION: &str = "BodyS3Location";
+
+/// The two properties that govern how a definition is READ, which are `ImportApi`'s own
+/// query parameters (`basepath`, `failOnWarnings`).
+const APIGATEWAYV2_BASE_PATH: &str = "BasePath";
+const APIGATEWAYV2_FAIL_ON_WARNINGS: &str = "FailOnWarnings";
+
+/// The `ImportApi` query parameters [`APIGATEWAYV2_BASE_PATH`] and
+/// [`APIGATEWAYV2_FAIL_ON_WARNINGS`] are sent as, as that operation's `@httpQuery` traits
+/// name them.
+const APIGATEWAYV2_IMPORT_QUERY: &[(&str, &str)] = &[
+    (APIGATEWAYV2_BASE_PATH, "basepath"),
+    (APIGATEWAYV2_FAIL_ON_WARNINGS, "failOnWarnings"),
+];
+
+/// The `ImportApi` member the definition itself travels as.
+const APIGATEWAYV2_BODY_MEMBER: &str = "body";
 
 /// Create the api an `AWS::ApiGatewayV2::Api` declares, so a client that deployed the
 /// stack and then calls `apigatewayv2 GetApi` with the id the stack publishes reads the
@@ -12845,12 +12981,18 @@ const APIGATEWAYV2_IMPORT_PROPERTIES: &[&str] =
 /// "Ref returns the API ID", which only that service produces, so the `ApiId` it answers
 /// replaces the stand-in the naming rules computed, and the `ApiEndpoint` it reports is
 /// the attribute the type publishes — the endpoint a client really invokes the api on.
+///
+/// A declaration that carries a DEFINITION is a different call: see
+/// [`import_apigatewayv2_api`].
 async fn create_apigatewayv2_api(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     resource: &StoredResource,
     propagated: &[(String, String)],
 ) -> Result<Created, Refusal> {
+    if let Some(definition) = resource.properties.get(APIGATEWAYV2_BODY) {
+        return import_apigatewayv2_api(ctx, region, resource, definition).await;
+    }
     let request = apigatewayv2_request(resource, propagated, APIGATEWAYV2_IMPORT_PROPERTIES)?;
     let answered = call_rest_json(
         ctx,
@@ -12861,7 +13003,94 @@ async fn create_apigatewayv2_api(
         Some(&request),
     )
     .await?;
-    let api_id = apigatewayv2_answered(&answered, "apiId", "CreateApi")?;
+    apigatewayv2_api_created(&answered, "CreateApi")
+}
+
+/// Import the api an `AWS::ApiGatewayV2::Api` declares a DEFINITION for, so a client that
+/// deployed such a stack reads the api back — with the routes and the integration behind
+/// each of them that its definition declares — rather than a `NotFoundException` for an api
+/// nothing created.
+///
+/// "To import an HTTP API, you must specify a Body or BodyS3Location", and the call that
+/// reads a definition is `ImportApi` (`PUT /v2/apis`), not `CreateApi`: the definition IS
+/// the api — its name, its protocol, its routes and their integrations all come out of the
+/// document — so the declared `Body` travels as that operation's own `Body` member, with
+/// `BasePath` and `FailOnWarnings` on its query ([`APIGATEWAYV2_IMPORT_QUERY`]). An inline
+/// definition is declared as the JSON object it is and sent as the text that operation
+/// reads.
+///
+/// Every remaining property of the type is one only `CreateApi` takes, and this type's own
+/// rule is that a declaration carrying a definition states none of them ("If you specify a
+/// Body or BodyS3Location, don't specify CorsConfiguration, CredentialsArn,
+/// DisableExecuteApiEndpoint, Name, ProtocolType, RouteKey, RouteSelectionExpression, Tags,
+/// Target, or Version"), so one that does is REFUSED rather than imported with that property
+/// silently dropped — including `BodyS3Location`, whose object nothing here fetches.
+///
+/// The api's identity is that service's exactly as it is for a create: `ImportApi` answers
+/// the `ApiId` it assigned and the `ApiEndpoint` it serves the api on.
+async fn import_apigatewayv2_api(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    definition: &Value,
+) -> Result<Created, Refusal> {
+    let mut query: Vec<String> = Vec::new();
+    for (property, parameter) in APIGATEWAYV2_IMPORT_QUERY {
+        if let Some(value) = resource.properties.get(*property) {
+            query.push(format!(
+                "{parameter}={}",
+                percent_encoded(&attribute_text(value))
+            ));
+        }
+    }
+    if let Some(properties) = resource.properties.as_object() {
+        for property in properties.keys() {
+            if property == APIGATEWAYV2_BODY
+                || APIGATEWAYV2_IMPORT_QUERY
+                    .iter()
+                    .any(|(declared, _)| declared == property)
+            {
+                continue;
+            }
+            return Err(Refusal {
+                code: MISSING_PROPERTY_CODE.to_string(),
+                message: format!(
+                    "{} declares a {APIGATEWAYV2_BODY}, so the api is imported from that \
+                     definition, and {property} is no member of that import; the resource was \
+                     not created.",
+                    resource.resource_type
+                ),
+            });
+        }
+    }
+    let mut payload = Map::new();
+    payload.insert(
+        APIGATEWAYV2_BODY_MEMBER.to_string(),
+        Value::String(attribute_text(definition)),
+    );
+    let payload = Value::Object(payload);
+    let uri = if query.is_empty() {
+        APIGATEWAYV2_APIS_URI.to_string()
+    } else {
+        format!("{APIGATEWAYV2_APIS_URI}?{}", query.join("&"))
+    };
+    let answered = call_rest_json(
+        ctx,
+        APIGATEWAYV2_SIGNING_NAME,
+        region,
+        "PUT",
+        &uri,
+        Some(&payload),
+    )
+    .await?;
+    apigatewayv2_api_created(&answered, "ImportApi")
+}
+
+/// The api an answered create or import reports: the `ApiId` that service assigned, which
+/// is this resource's identity, and the `ApiEndpoint` it serves the api on, which is the
+/// attribute the type publishes. One spelling for both calls, which answer the same api.
+fn apigatewayv2_api_created(answered: &Value, operation: &str) -> Result<Created, Refusal> {
+    let api_id = apigatewayv2_answered(answered, "apiId", operation)?;
     let mut attributes = BTreeMap::new();
     if let Some(endpoint) = answered.get("apiEndpoint").and_then(Value::as_str) {
         attributes.insert("ApiEndpoint".to_string(), endpoint.to_string());
@@ -13146,6 +13375,352 @@ fn apigatewayv2_api_mapping_uri(resource: &StoredResource) -> Result<String, Ref
         apigatewayv2_api_mappings_uri(&domain_name),
         percent_encoded(&resource.physical_resource_id)
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Amazon API Gateway v2: the resource types that live INSIDE an api
+// ---------------------------------------------------------------------------
+
+/// One API Gateway v2 resource type whose resources live inside an api — an integration, a
+/// route, a stage, a deployment, an authorizer — as the three calls a stack makes about one
+/// of them.
+///
+/// Every one of these types is in the SAME shape, which is why they are a table rather than
+/// an arm apiece: the resource is created in a collection addressed by the api that holds
+/// it (`POST /v2/apis/{ApiId}/<collection>`), every property of the type other than the ones
+/// that address that collection is a member of the create under the same name with its
+/// initial letter lower-cased, the create answers the identifier API Gateway v2 ASSIGNED,
+/// and the read and the delete address the resource as that collection plus that identifier.
+///
+/// Without these, a stack that declared an api and the integration, route and stage that
+/// make it serve created only the api: the rest were recorded as declared and nothing in
+/// API Gateway v2 existed for them, so the api a completed stack published answered nothing.
+struct ApiGatewayV2Child {
+    /// The properties that address the collection the resource lives in, each with the URI
+    /// segment it is written under, outermost first — `("ApiId", "apis")` for a child of an
+    /// api, with the parent's own identifier beside it for a child of one of those children.
+    path: &'static [(&'static str, &'static str)],
+    /// The last segment of the collection's URI, as that create's `@http` uri spells it.
+    collection: &'static str,
+    /// The member of the create's answer carrying the identifier API Gateway v2 ASSIGNED,
+    /// with the operation's name for the failure a create that answered WITHOUT it is
+    /// reported as. `None` for a type created under a name CloudFormation decides, whose
+    /// physical id is that name rather than anything that service minted.
+    assigned_id: Option<(&'static str, &'static str)>,
+    /// The property the resource is created UNDER where CloudFormation decides its name (a
+    /// stage's `StageName`): the create is sent this resource's physical id for it, which is
+    /// the name the declaration asked for where it asked for one.
+    named_by: Option<&'static str>,
+    /// The properties that are MAPS whose keys are the caller's own data rather than
+    /// modelled member names — a stage's route settings are keyed by route key (`GET
+    /// /items`), an integration's request parameters and templates by parameter name and
+    /// content type. Those keys travel EXACTLY as declared, while the values under them are
+    /// re-cased like every other member ([`lower_camel_members`]).
+    data_keys: &'static [&'static str],
+    /// Whether the create takes the tags CloudFormation gives the resource: true only where
+    /// the type's own property set publishes `Tags`, because CloudFormation propagates no
+    /// tags to a resource type that is not taggable.
+    taggable: bool,
+    /// The properties of the type the owning service's own READ reports, which is what
+    /// drift is judged on. Each is read off the member that answer spells it with — the
+    /// property with its initial letter lower-cased, like every member here.
+    reported: &'static [&'static str],
+}
+
+/// `AWS::ApiGatewayV2::Integration`: `POST /v2/apis/{ApiId}/integrations`, whose answer
+/// carries the `IntegrationId` that service assigned ("Ref returns the integration ID").
+const APIGATEWAYV2_INTEGRATION_CHILD: ApiGatewayV2Child = ApiGatewayV2Child {
+    path: APIGATEWAYV2_API_PATH,
+    collection: "integrations",
+    assigned_id: Some(("integrationId", "CreateIntegration")),
+    named_by: None,
+    data_keys: &["RequestParameters", "RequestTemplates", "ResponseParameters"],
+    taggable: false,
+    reported: &[
+        "ConnectionId",
+        "ConnectionType",
+        "ContentHandlingStrategy",
+        "CredentialsArn",
+        "Description",
+        "IntegrationMethod",
+        "IntegrationSubtype",
+        "IntegrationType",
+        "IntegrationUri",
+        "PassthroughBehavior",
+        "PayloadFormatVersion",
+        "RequestParameters",
+        "RequestTemplates",
+        "ResponseParameters",
+        "TemplateSelectionExpression",
+        "TimeoutInMillis",
+        "TlsConfig",
+    ],
+};
+
+/// `AWS::ApiGatewayV2::Route`: `POST /v2/apis/{ApiId}/routes`, whose answer carries the
+/// `RouteId` that service assigned ("Ref returns the route ID"). A route's `Target` names
+/// the integration it is wired to as `integrations/<IntegrationId>`, so the identifier that
+/// service minted for the integration has to have reached this declaration before the route
+/// is created ([`super::provisioning::repoint_references`]).
+const APIGATEWAYV2_ROUTE_CHILD: ApiGatewayV2Child = ApiGatewayV2Child {
+    path: APIGATEWAYV2_API_PATH,
+    collection: "routes",
+    assigned_id: Some(("routeId", "CreateRoute")),
+    named_by: None,
+    data_keys: &["RequestModels", "RequestParameters"],
+    taggable: false,
+    reported: &[
+        "ApiKeyRequired",
+        "AuthorizationScopes",
+        "AuthorizationType",
+        "AuthorizerId",
+        "ModelSelectionExpression",
+        "OperationName",
+        "RequestModels",
+        "RequestParameters",
+        "RouteKey",
+        "RouteResponseSelectionExpression",
+        "Target",
+    ],
+};
+
+/// `AWS::ApiGatewayV2::Stage`: `POST /v2/apis/{ApiId}/stages`. "Ref returns the stage name",
+/// which is the name the declaration states and the physical id the naming rules already
+/// computed, so nothing that service answers replaces it — and the stage is created UNDER
+/// that name. The type publishes `Tags`, so the stage carries the tags CloudFormation gives
+/// it as `CreateStage`'s own tag map.
+const APIGATEWAYV2_STAGE_CHILD: ApiGatewayV2Child = ApiGatewayV2Child {
+    path: APIGATEWAYV2_API_PATH,
+    collection: "stages",
+    assigned_id: None,
+    named_by: Some("StageName"),
+    data_keys: &["RouteSettings", "StageVariables"],
+    taggable: true,
+    reported: &[
+        "AccessLogSettings",
+        "AutoDeploy",
+        "ClientCertificateId",
+        "DefaultRouteSettings",
+        "DeploymentId",
+        "Description",
+        "RouteSettings",
+        "StageVariables",
+    ],
+};
+
+/// `AWS::ApiGatewayV2::Deployment`: `POST /v2/apis/{ApiId}/deployments`, whose answer
+/// carries the `DeploymentId` that service assigned ("Ref returns the deployment ID").
+const APIGATEWAYV2_DEPLOYMENT_CHILD: ApiGatewayV2Child = ApiGatewayV2Child {
+    path: APIGATEWAYV2_API_PATH,
+    collection: "deployments",
+    assigned_id: Some(("deploymentId", "CreateDeployment")),
+    named_by: None,
+    data_keys: &[],
+    taggable: false,
+    // `GetDeployment` reports the deployment's own record — its description and the status
+    // of the release — and not the stage a create released it to.
+    reported: &["Description"],
+};
+
+/// `AWS::ApiGatewayV2::Authorizer`: `POST /v2/apis/{ApiId}/authorizers`, whose answer
+/// carries the `AuthorizerId` that service assigned ("Ref returns the authorizer ID") — the
+/// id a route's `AuthorizerId` names it by, which the `Name` the declaration states is not.
+const APIGATEWAYV2_AUTHORIZER_CHILD: ApiGatewayV2Child = ApiGatewayV2Child {
+    path: APIGATEWAYV2_API_PATH,
+    collection: "authorizers",
+    assigned_id: Some(("authorizerId", "CreateAuthorizer")),
+    named_by: None,
+    data_keys: &[],
+    taggable: false,
+    reported: &[
+        "AuthorizerCredentialsArn",
+        "AuthorizerPayloadFormatVersion",
+        "AuthorizerResultTtlInSeconds",
+        "AuthorizerType",
+        "AuthorizerUri",
+        "EnableSimpleResponses",
+        "IdentitySource",
+        "IdentityValidationExpression",
+        "JwtConfiguration",
+        "Name",
+    ],
+};
+
+/// The collection path of a resource that lives directly inside an api: the `ApiId` its
+/// declaration states, under the `apis` segment every operation of that api is bound below.
+const APIGATEWAYV2_API_PATH: &[(&str, &str)] = &[("ApiId", "apis")];
+
+/// The URI of the collection one of these resources lives in, built from the properties
+/// that address it — the api the resource belongs to, which its own declaration states.
+fn apigatewayv2_collection_uri(
+    resource: &StoredResource,
+    child: &ApiGatewayV2Child,
+) -> Result<String, Refusal> {
+    let mut uri = APIGATEWAYV2_URI_PREFIX.to_string();
+    for (property, segment) in child.path {
+        let value = required_property(resource, property)?;
+        uri.push('/');
+        uri.push_str(segment);
+        uri.push('/');
+        uri.push_str(&percent_encoded(&value));
+    }
+    uri.push('/');
+    uri.push_str(child.collection);
+    Ok(uri)
+}
+
+/// The URI that addresses ONE of these resources: its collection plus the identifier the
+/// resource carries as its physical id — the one that service assigned where it assigns
+/// one, and otherwise the name it was created under.
+fn apigatewayv2_child_uri(
+    resource: &StoredResource,
+    child: &ApiGatewayV2Child,
+) -> Result<String, Refusal> {
+    Ok(format!(
+        "{}/{}",
+        apigatewayv2_collection_uri(resource, child)?,
+        percent_encoded(&resource.physical_resource_id)
+    ))
+}
+
+/// Create one resource that lives inside an api, so a client that deployed the stack reads
+/// it back through that service's own read — and, for the integration, route and stage an
+/// api needs to serve at all, so the api the stack published answers requests.
+///
+/// The properties that address the collection are the URI; every other property is a member
+/// of the create ([`apigatewayv2_child_request`]). Where that service ASSIGNS the
+/// resource's identifier, the id it answers is this resource's physical id — what `Ref`
+/// resolves to and what the stack publishes — exactly as it is for the api itself.
+async fn create_apigatewayv2_child(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+    child: &ApiGatewayV2Child,
+) -> Result<Created, Refusal> {
+    let uri = apigatewayv2_collection_uri(resource, child)?;
+    let request = apigatewayv2_child_request(resource, propagated, child)?;
+    let answered = call_rest_json(
+        ctx,
+        APIGATEWAYV2_SIGNING_NAME,
+        region,
+        "POST",
+        &uri,
+        Some(&request),
+    )
+    .await?;
+    let Some((member, operation)) = child.assigned_id else {
+        // Created under the name CloudFormation decided, which the resource already
+        // carries as its physical id.
+        return Ok(Created::attributes(BTreeMap::new()));
+    };
+    Ok(Created {
+        physical_resource_id: Some(apigatewayv2_answered(&answered, member, operation)?),
+        attributes: BTreeMap::new(),
+    })
+}
+
+/// One declared child resource as the request that creates it: every property that is a
+/// member of that create, under the member name the model spells it with.
+///
+/// The properties that address the collection are left out — they are the URI — and so is
+/// the name property where CloudFormation decides the name, which is sent as the physical id
+/// the naming rules computed instead. A property named in [`ApiGatewayV2Child::data_keys`]
+/// is a map of the caller's own keys and keeps them; everything else is re-cased all the way
+/// down.
+fn apigatewayv2_child_request(
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+    child: &ApiGatewayV2Child,
+) -> Result<Value, Refusal> {
+    let mut request = Map::new();
+    if let Some(properties) = resource.properties.as_object() {
+        for (property, value) in properties {
+            let addresses_the_collection = child
+                .path
+                .iter()
+                .any(|(parent, _)| parent == &property.as_str());
+            if property == "Tags"
+                || addresses_the_collection
+                || child.named_by == Some(property.as_str())
+            {
+                continue;
+            }
+            let member = lower_initial(property);
+            if child.data_keys.contains(&property.as_str()) {
+                request.insert(member, apigatewayv2_data_keyed_map(value)?);
+            } else {
+                request.insert(member, lower_camel_members(value, 0)?);
+            }
+        }
+    }
+    if let Some(named_by) = child.named_by {
+        request.insert(
+            lower_initial(named_by),
+            Value::String(resource.physical_resource_id.clone()),
+        );
+    }
+    if child.taggable {
+        let tags = tags_as_map(&tags_of(&resource.properties, propagated));
+        if !tags.is_empty() {
+            request.insert("tags".to_string(), Value::Object(tags));
+        }
+    }
+    Ok(Value::Object(request))
+}
+
+/// One declared MAP whose KEYS are the caller's own data: each key travels exactly as the
+/// declaration spells it — a route key (`GET /items`) or a content type is not a member name
+/// to re-case — while the value under it is re-cased like any other member.
+fn apigatewayv2_data_keyed_map(value: &Value) -> Result<Value, Refusal> {
+    let Some(entries) = value.as_object() else {
+        return lower_camel_members(value, 0);
+    };
+    let mut mapped = Map::new();
+    for (key, entry) in entries {
+        mapped.insert(key.clone(), lower_camel_members(entry, 1)?);
+    }
+    Ok(Value::Object(mapped))
+}
+
+/// Delete one resource a stack created inside an api, addressed exactly as its own read is.
+/// One that service no longer holds (`NotFoundException`, judged on the CODE) is already in
+/// the state the delete asks for — which is also what deleting the API that held it leaves
+/// behind, since an api owns its integrations, routes, stages and deployments.
+async fn delete_apigatewayv2_child(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    child: &ApiGatewayV2Child,
+) -> Result<(), Refusal> {
+    let uri = apigatewayv2_child_uri(resource, child)?;
+    apigatewayv2_deleted(ctx, region, &uri).await
+}
+
+/// The configuration one of these resources has as API Gateway v2 reports it, for drift
+/// detection: that resource's own read, under the type's property names
+/// ([`ApiGatewayV2Child::reported`]). One that service no longer holds
+/// (`NotFoundException`) was deleted.
+async fn describe_apigatewayv2_child(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    child: &ApiGatewayV2Child,
+) -> Result<Option<Value>, Refusal> {
+    let uri = apigatewayv2_child_uri(resource, child)?;
+    match call_rest_json(ctx, APIGATEWAYV2_SIGNING_NAME, region, "GET", &uri, None).await {
+        Ok(answer) => {
+            let mut reported = Map::new();
+            for property in child.reported {
+                if let Some(value) = answer.get(lower_initial(property)) {
+                    reported.insert((*property).to_string(), value.clone());
+                }
+            }
+            Ok(Some(Value::Object(reported)))
+        }
+        Err(refusal) if refusal.code == APIGATEWAYV2_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
 }
 
 /// One declared API Gateway v2 resource as the request that creates it: every property
