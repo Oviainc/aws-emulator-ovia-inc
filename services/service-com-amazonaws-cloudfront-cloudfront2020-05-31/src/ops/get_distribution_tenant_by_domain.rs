@@ -9,7 +9,11 @@
 //! * `Domain` is "a domain name associated with the target distribution tenant", so the
 //!   lookup is over the `Domains` each stored tenant claims, case-insensitively as every
 //!   DNS name comparison in this service is;
-//! * a domain no stored tenant claims names no entity, which is `EntityNotFound` — the
+//! * what it resolves is the HOST-to-tenant map a viewer's request is routed through, so a
+//!   domain still waiting for the tenant's CloudFront managed certificate to be validated
+//!   is not in it yet — CloudFront cannot serve the domain until the certificate is issued
+//!   ([`crate::state::StoredDistributionTenant::serves_domain`]);
+//! * a domain no stored tenant serves names no entity, which is `EntityNotFound` — the
 //!   same sentence every other read of a tenant answers an unknown one with.
 //!
 //! ## Shape of an operation
@@ -151,7 +155,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle(SystemTime::now());
 
         // "A domain name associated with the target distribution tenant" — a domain no
-        // stored tenant claims names no entity.
+        // stored tenant serves (one no tenant claims, or one still waiting for the
+        // tenant's managed certificate) names no entity.
         let Some(stored) = store.distribution_tenant_by_domain(&input.domain) else {
             return Err(GetDistributionTenantByDomainErrorModeled::EntityNotFound(
                 crate::state::distribution_tenant_not_found(),

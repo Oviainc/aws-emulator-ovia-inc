@@ -2382,6 +2382,31 @@ impl StoredDistributionTenant {
         self.domains.iter().any(|held| same_domain(held, domain))
     }
 
+    /// Whether `domain` is still waiting for this tenant's CloudFront managed certificate to
+    /// be validated.
+    ///
+    /// A managed certificate is minted [`CERTIFICATE_STATUS_PENDING_VALIDATION`] over the
+    /// domains it covers (one validation token each), and until it is issued CloudFront
+    /// cannot serve those domains — so a domain it covers is not yet reachable at the edge.
+    /// A tenant that asked for no managed certificate waits for nothing, and neither does a
+    /// domain the certificate does not cover.
+    pub fn domain_pending_validation(&self, domain: &str) -> bool {
+        self.managed_certificate.as_ref().is_some_and(|certificate| {
+            certificate.status == CERTIFICATE_STATUS_PENDING_VALIDATION
+                && certificate
+                    .validation_tokens
+                    .iter()
+                    .any(|token| same_domain(&token.domain, domain))
+        })
+    }
+
+    /// Whether a viewer asking for `domain` is routed to this tenant: the tenant holds the
+    /// domain AND the domain is not still waiting for a managed certificate
+    /// ([`Self::domain_pending_validation`]).
+    pub fn serves_domain(&self, domain: &str) -> bool {
+        self.holds_domain(domain) && !self.domain_pending_validation(domain)
+    }
+
     /// The `Tags` projection a tag read returns, built from the one stored tag set.
     pub fn to_tags(&self) -> Tags {
         tags_projection(&self.tags)
@@ -4146,6 +4171,32 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         self.continuous_deployment_policies.get(id)
     }
 
+    /// The distribution that attaches the continuous deployment policy `id`, or `None` when
+    /// no stored distribution does.
+    ///
+    /// `ContinuousDeploymentPolicyInUse` is documented as "You cannot delete a continuous
+    /// deployment policy that is associated with a primary distribution", and a distribution
+    /// attaches one through its `ContinuousDeploymentPolicyId` — so what makes a policy in
+    /// use is a stored distribution naming it. The SAME rule
+    /// [`ComAmazonawsCloudfrontCloudfront20200531State::distribution_using_cache_policy`]
+    /// states for the policies a cache behaviour attaches: the scan reads the STORED
+    /// configurations rather than a second index beside them, so it cannot drift out of step
+    /// with what a read of those distributions reports, and the collection is bounded
+    /// ([`MAX_DISTRIBUTIONS`]). A distribution that attaches no policy carries the empty
+    /// string rather than an id, so an id matches only a distribution that really names it.
+    pub fn distribution_using_continuous_deployment_policy(
+        &self,
+        id: &str,
+    ) -> Option<&StoredDistribution> {
+        self.distributions.values().find(|distribution| {
+            distribution
+                .config
+                .continuous_deployment_policy_id
+                .as_deref()
+                .is_some_and(|attached| attached == id)
+        })
+    }
+
     /// The policy that already routes traffic to one of `dns_names`, or `None` when no
     /// stored policy names any of them.
     ///
@@ -4202,18 +4253,27 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             .find(|tenant| tenant.arn == identifier || tenant.name == identifier)
     }
 
-    /// The distribution tenant `domain` is associated with, or `None` when no tenant this
-    /// store holds claims it.
+    /// The distribution tenant `domain` routes to, or `None` when no tenant this store
+    /// holds serves it.
     ///
     /// "A domain name associated with the target distribution tenant": the association is
     /// the tenant's own `Domains`, and a domain routes to at most one CloudFront resource
     /// ([`ComAmazonawsCloudfrontCloudfront20200531State::domain_in_use`]), so at most one
     /// tenant answers. DNS names are case-insensitive, so the lookup is too
-    /// ([`StoredDistributionTenant::holds_domain`]).
+    /// ([`StoredDistributionTenant::serves_domain`]).
+    ///
+    /// This is the HOST-to-tenant map a viewer's request is resolved through, so it holds a
+    /// domain only once CloudFront can serve it: a domain still waiting for the tenant's
+    /// CloudFront managed certificate to be validated is not in it yet
+    /// ([`StoredDistributionTenant::domain_pending_validation`]), which is why a by-domain
+    /// read of it answers "no such entity" while the certificate is pending. Whether the
+    /// domain is CLAIMED is the separate question
+    /// ([`ComAmazonawsCloudfrontCloudfront20200531State::domain_in_use`]) a second claim on
+    /// it is refused by: a pending domain is claimed from the moment the tenant is created.
     pub fn distribution_tenant_by_domain(&self, domain: &str) -> Option<&StoredDistributionTenant> {
         self.distribution_tenants
             .values()
-            .find(|tenant| tenant.holds_domain(domain))
+            .find(|tenant| tenant.serves_domain(domain))
     }
 
     /// Whether `domain` is already associated with a CloudFront resource this store holds:
@@ -5938,6 +5998,35 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         Some(stored)
     }
 
+    /// Replace the configuration of the public key `id` names, and report the record as it
+    /// now stands.
+    ///
+    /// `UpdatePublicKey` submits a whole `PublicKeyConfig` as its payload, so the stored
+    /// configuration becomes the submitted one and the version token is freshly minted, so
+    /// the token the caller matched on no longer satisfies an `If-Match` against this key.
+    /// Nothing else about a key changes: the id it was uploaded under and the instant it was
+    /// uploaded are fixed for its whole life, and a key carries neither a status nor a
+    /// propagation deadline, so the clock owes it nothing. WHICH members an update may move
+    /// is the separate rule [`immutable_public_key_change`] states, decided by the caller
+    /// before it reaches here.
+    ///
+    /// `None` when the store holds no such key, checked BEFORE the mint so a version token
+    /// is never spent on a key that is not there.
+    pub fn apply_public_key_config(
+        &mut self,
+        id: &str,
+        config: PublicKeyConfig,
+    ) -> Option<&StoredPublicKey> {
+        if !self.public_keys.contains_key(id) {
+            return None;
+        }
+        let etag = self.next_etag();
+        let stored = self.public_keys.get_mut(id)?;
+        stored.config = config;
+        stored.etag = etag;
+        Some(stored)
+    }
+
     /// Replace the configuration of the continuous deployment policy `id` names, and
     /// report the record as it now stands.
     ///
@@ -6592,14 +6681,13 @@ pub fn resource_policy_resource(arn: &str) -> Option<&str> {
     (!id.is_empty()).then_some(id)
 }
 
-/// The sentence the resource-policy surface refuses a `ResourceArn` naming anything but a
-/// VPC origin with: the whole text is fixed, so nothing of the request — neither the ARN
-/// nor the type it names — reaches it. Recorded behaviour, and the same text answers every
-/// operation of the surface, which all take the one `ResourceArn`.
+/// The sentence a resource-policy WRITE refuses a `ResourceArn` naming anything but a VPC
+/// origin with: the whole text is fixed, so nothing of the request — neither the ARN nor the
+/// type it names — reaches it. Recorded behaviour.
 pub const INVALID_RESOURCE_POLICY_RESOURCE_TYPE_MESSAGE: &str =
     "The specified resource type isn't valid. Specify a VPC origin and try again.";
 
-/// The modelled `InvalidArgument` (HTTP 400) a resource-policy call naming a resource the
+/// The modelled `InvalidArgument` (HTTP 400) a resource-policy WRITE naming a resource the
 /// surface does not attach policies to is refused with — "An argument is invalid."
 ///
 /// Decided BEFORE any policy lookup: a `ResourceArn` the surface cannot attach a policy to
@@ -6610,6 +6698,81 @@ pub fn invalid_resource_policy_resource_type() -> crate::ops::types::InvalidArgu
     crate::ops::types::InvalidArgument {
         message: Some(INVALID_RESOURCE_POLICY_RESOURCE_TYPE_MESSAGE.to_string()),
     }
+}
+
+/// The sentence a resource-policy READ refuses a `ResourceArn` naming anything but a VPC
+/// origin with.
+///
+/// The CONDITION the two operations of the surface refuse is one
+/// ([`resource_policy_arn_refusal`]); the sentence each puts on the wire for it is the
+/// service's own, and the read words it as a demand for a usable ARN rather than naming the
+/// resource type the write asks for. Recorded behaviour; the whole text is fixed, so nothing
+/// of the request reaches it.
+pub const INVALID_RESOURCE_POLICY_ARN_MESSAGE: &str =
+    "The ResourceArn parameter is required. Specify a valid ARN and try again.";
+
+/// The modelled `InvalidArgument` (HTTP 400) a resource-policy READ naming a resource the
+/// surface does not attach policies to is refused with.
+pub fn invalid_resource_policy_arn() -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(INVALID_RESOURCE_POLICY_ARN_MESSAGE.to_string()),
+    }
+}
+
+/// What every ARN opens with, whatever partition, service or resource follows it.
+///
+/// A value that does not open with it is no ARN at all, which is the one condition
+/// [`MALFORMED_ARN_MESSAGE`] states.
+pub const ARN_PREFIX: &str = "arn:";
+
+/// The sentence an operation taking an ARN refuses a value that is no ARN AT ALL with: the
+/// whole text is fixed, and it states the FORM the parameter has to take rather than the
+/// value it was given. Recorded behaviour.
+pub const MALFORMED_ARN_MESSAGE: &str = "ARNs must start with 'arn:'";
+
+/// The modelled `InvalidArgument` (HTTP 400) for a parameter that is no ARN at all —
+/// "An argument is invalid."
+///
+/// A value that does not open with [`ARN_PREFIX`] cannot be READ as an ARN, so the refusal
+/// is about its form and nothing of the value reaches the sentence.
+pub fn malformed_arn() -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(MALFORMED_ARN_MESSAGE.to_string()),
+    }
+}
+
+/// Why the resource-policy surface refuses `arn`, or `None` when it names a resource the
+/// surface attaches policies to.
+///
+/// TWO conditions, in the order the service decides them, and both are about the PARAMETER
+/// rather than about the store:
+///
+/// * [`ResourceArnRefusal::Malformed`] — a value that is no ARN at all cannot be read as
+///   one, so it is refused on its FORM;
+/// * [`ResourceArnRefusal::WrongType`] — an ARN naming any resource other than
+///   [`RESOURCE_POLICY_RESOURCE_TYPE`] is refused on the resource TYPE it names.
+///
+/// ONE rule for every operation of the surface, which all take the one `ResourceArn`, so no
+/// two of them can disagree about which values they accept. The SENTENCE each puts on the
+/// wire is the service's own per operation: see [`malformed_arn`],
+/// [`invalid_resource_policy_resource_type`] and [`invalid_resource_policy_arn`].
+pub fn resource_policy_arn_refusal(arn: &str) -> Option<ResourceArnRefusal> {
+    if !arn.starts_with(ARN_PREFIX) {
+        return Some(ResourceArnRefusal::Malformed);
+    }
+    resource_policy_resource(arn)
+        .is_none()
+        .then_some(ResourceArnRefusal::WrongType)
+}
+
+/// Why a `ResourceArn` names no resource the resource-policy surface attaches policies to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceArnRefusal {
+    /// The value is no ARN at all: it does not open with [`ARN_PREFIX`].
+    Malformed,
+    /// The value is an ARN, but it names a resource other than
+    /// [`RESOURCE_POLICY_RESOURCE_TYPE`].
+    WrongType,
 }
 
 /// The modelled `InvalidArgument` (HTTP 400) a resource-policy write that would grow the
@@ -7084,21 +7247,38 @@ pub enum IfMatch {
     Stale,
 }
 
+/// The version token an `If-Match` header carries, or `None` when the header is absent or
+/// carries something that is not a version token at all.
+///
+/// The FORM of the header, decided against nothing but the header itself: a mutation can
+/// therefore tell "missing or not valid" ([`invalid_if_match_version`]) from "not the
+/// current version" without looking a resource up, which is what lets an operation refuse a
+/// header no version could make valid BEFORE it decides whether the resource exists.
+///
+/// The value may be quoted, as HTTP entity tags normally are, or bare, as CloudFront's own
+/// `ETag` header reports it, and may carry the weak-comparison prefix.
+pub fn if_match_version(if_match: Option<&str>) -> Option<&str> {
+    let value = if_match?.trim().trim_start_matches("W/").trim_matches('"');
+    is_version_token(value).then_some(value)
+}
+
 /// Compare an `If-Match` header against a distribution's current version.
 ///
 /// `InvalidIfMatchVersion` is documented as "the `If-Match` version is missing or not
 /// valid", so an absent header and a value that is not a version token answer the same
-/// way; a well-formed token that is not the current one is a failed precondition
-/// instead. The value may be quoted, as HTTP entity tags normally are, or bare, as
-/// CloudFront's own `ETag` header reports it.
+/// way ([`if_match_version`]); a well-formed token that is not the current one is a failed
+/// precondition instead.
+///
+/// That split is what every mutation of this service answers with EXCEPT
+/// `DeleteContinuousDeploymentPolicy`, whose recorded behaviour refuses a well-formed token
+/// that is not the policy's with `InvalidIfMatchVersion` as well — "missing or not valid"
+/// read as "not valid FOR THIS RESOURCE". That operation therefore compares the token itself
+/// (see its handler) rather than calling this, and the difference is deliberate: do not
+/// "correct" either side into the other.
 pub fn check_if_match(current: &str, if_match: Option<&str>) -> IfMatch {
-    let Some(raw) = if_match else {
+    let Some(value) = if_match_version(if_match) else {
         return IfMatch::Invalid;
     };
-    let value = raw.trim().trim_start_matches("W/").trim_matches('"');
-    if !is_version_token(value) {
-        return IfMatch::Invalid;
-    }
     if value == current {
         IfMatch::Current
     } else {
@@ -7251,6 +7431,50 @@ pub fn same_origin_access_identity_config(
 /// request document's whitespace and member order.
 pub fn same_public_key_config(left: &PublicKeyConfig, right: &PublicKeyConfig) -> bool {
     format!("{left:?}") == format!("{right:?}")
+}
+
+/// The member of a public key's configuration an update would CHANGE, out of the members
+/// that are fixed for the key's life, or `None` when it changes none of them.
+///
+/// "Update public key information. Note that the only value you can change is the comment."
+/// — so `CallerReference`, `Name` and `EncodedKey` are fixed once the key is uploaded, and a
+/// request submitting a different value for any one of them asks for a change the key does
+/// not take ([`cannot_change_immutable_public_key_fields`]). The comparison is against the
+/// STORED configuration, so what decides it is the record rather than the request alone, and
+/// a request that resubmits the stored values unchanged beside a new comment is no change to
+/// an immutable member at all.
+///
+/// The member's name is reported for the caller that needs to know WHICH value it may not
+/// move; the modelled refusal's own sentence states the condition.
+pub fn immutable_public_key_change(
+    stored: &PublicKeyConfig,
+    submitted: &PublicKeyConfig,
+) -> Option<&'static str> {
+    [
+        (
+            "CallerReference",
+            &stored.caller_reference,
+            &submitted.caller_reference,
+        ),
+        ("Name", &stored.name, &submitted.name),
+        ("EncodedKey", &stored.encoded_key, &submitted.encoded_key),
+    ]
+    .into_iter()
+    .find_map(|(member, held, asked)| (held != asked).then_some(member))
+}
+
+/// `CannotChangeImmutablePublicKeyFields`'s message: the sentence the model states on the
+/// shape itself, which carries nothing from the request.
+pub const CANNOT_CHANGE_IMMUTABLE_PUBLIC_KEY_FIELDS_MESSAGE: &str =
+    "You can't change the value of a public key.";
+
+/// The modelled `CannotChangeImmutablePublicKeyFields` (HTTP 400) for an update that would
+/// move a member fixed for the key's life ([`immutable_public_key_change`]).
+pub fn cannot_change_immutable_public_key_fields()
+-> crate::ops::types::CannotChangeImmutablePublicKeyFields {
+    crate::ops::types::CannotChangeImmutablePublicKeyFields {
+        message: Some(CANNOT_CHANGE_IMMUTABLE_PUBLIC_KEY_FIELDS_MESSAGE.to_string()),
+    }
 }
 
 /// Whether two field-level encryption profile configurations ask for the same thing, which
@@ -8415,10 +8639,18 @@ pub fn policy_config_invalid_argument(
     ))
 }
 
-/// `NoSuchContinuousDeploymentPolicy`'s message: the sentence the model states on the
-/// shape itself, "The continuous deployment policy doesn't exist."
+/// `NoSuchContinuousDeploymentPolicy`'s message for an id no stored policy answers to, on
+/// the wire.
+///
+/// The WIRE text — what the recorded service answers this code with, in the form this
+/// service states that condition in for every other named resource
+/// ([`NO_SUCH_CACHE_POLICY_MESSAGE`], [`NO_SUCH_DISTRIBUTION_MESSAGE`],
+/// [`NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE`]): "The specified <resource> does not exist."
+/// It differs from the sentence the MODEL's documentation of the error shape uses for the
+/// same rule ("The continuous deployment policy doesn't exist."), which documents the
+/// condition rather than stating what is served, so do not "correct" this constant to it.
 pub const NO_SUCH_CONTINUOUS_DEPLOYMENT_POLICY_MESSAGE: &str =
-    "The continuous deployment policy doesn't exist.";
+    "The specified continuous deployment policy does not exist.";
 
 /// The modelled `NoSuchContinuousDeploymentPolicy` for a policy id the store does not
 /// hold. Fixed service text, for the same reason [`no_such_distribution`] is.
@@ -8426,6 +8658,27 @@ pub fn no_such_continuous_deployment_policy() -> crate::ops::types::NoSuchContin
 {
     crate::ops::types::NoSuchContinuousDeploymentPolicy {
         message: Some(NO_SUCH_CONTINUOUS_DEPLOYMENT_POLICY_MESSAGE.to_string()),
+    }
+}
+
+/// `ContinuousDeploymentPolicyInUse`'s message: the sentence the model states on the shape
+/// itself, worded as the operation documents the condition — the policy is attached to a
+/// primary distribution, and the caller is told to detach it first.
+///
+/// A property of the CONDITION rather than of the request, so nothing from the request or
+/// from the store belongs in it and every refusal of it reads the same, exactly as
+/// [`CACHE_POLICY_IN_USE_MESSAGE`] words the same condition for a cache policy.
+pub const CONTINUOUS_DEPLOYMENT_POLICY_IN_USE_MESSAGE: &str =
+    "You cannot delete a continuous deployment policy that is associated with a primary \
+     distribution. First update your distribution to remove the continuous deployment \
+     policy, then you can delete the policy.";
+
+/// The modelled `ContinuousDeploymentPolicyInUse` (HTTP 409) for a delete of a policy a
+/// stored distribution still attaches.
+pub fn continuous_deployment_policy_in_use()
+-> crate::ops::types::ContinuousDeploymentPolicyInUse {
+    crate::ops::types::ContinuousDeploymentPolicyInUse {
+        message: Some(CONTINUOUS_DEPLOYMENT_POLICY_IN_USE_MESSAGE.to_string()),
     }
 }
 
@@ -8686,6 +8939,25 @@ pub fn distribution_not_found() -> EntityNotFound {
 pub fn distribution_tenant_not_found() -> EntityNotFound {
     EntityNotFound {
         message: Some("The specified distribution tenant doesn't exist.".to_string()),
+    }
+}
+
+/// `ResourceNotDisabled`'s message: the sentence the model states on the shape itself —
+/// "The specified CloudFront resource hasn't been disabled yet." — worded as this service
+/// words the same condition for a distribution ([`DISTRIBUTION_NOT_DISABLED_MESSAGE`]).
+///
+/// A property of the resource's own state rather than of the request, so nothing from the
+/// request belongs in it and every refusal of it reads the same.
+pub const DISTRIBUTION_TENANT_NOT_DISABLED_MESSAGE: &str =
+    "The specified distribution tenant is not disabled. You must disable the distribution \
+     tenant before you can delete it.";
+
+/// The modelled `ResourceNotDisabled` (HTTP 409) for a delete of a distribution tenant that
+/// is still enabled: "To delete a distribution tenant, you must first disable the
+/// distribution tenant by using the UpdateDistributionTenant API operation."
+pub fn distribution_tenant_not_disabled() -> crate::ops::types::ResourceNotDisabled {
+    crate::ops::types::ResourceNotDisabled {
+        message: Some(DISTRIBUTION_TENANT_NOT_DISABLED_MESSAGE.to_string()),
     }
 }
 
