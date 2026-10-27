@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateIntegrationTableProperties
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateIntegrationTableProperties`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Writes the override properties of ONE replicated table on one leg of an integration
+//! into this account's per-pair namespace
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::integration_table_properties`]), keyed by
+//! the `ResourceArn` the request named and the `TableName` it carried. One call states the
+//! configuration of the ONE leg its `ResourceArn` names, so a call stating both sides is
+//! refused; a create for a pair that already has a record writes THAT record, leaving the
+//! side it does not state as stored. `GetIntegrationTableProperties` reads the record back
+//! through the ARN of an integration LEG, so a record this call writes against a replicated
+//! table's own ARN — a value the create takes — is not readable through that ARN.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateIntegrationTableProperties::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A `SourceTableConfig` stating a member the service does not process yet
+//! ([`crate::state::states_unsupported_source_table_properties`]) is refused rather than
+//! stored.
 //!
 //! ## Shape of an operation
 //!
@@ -156,20 +160,147 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateIntegrationTableProperties` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateIntegrationTablePropertiesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateIntegrationTableProperties"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on.
+            return Err(
+                CreateIntegrationTablePropertiesErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some(
+                            "the Glue integration table property store is unavailable".into(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // One call carries the configuration of the ONE leg its `ResourceArn` names, so a
+        // request stating both sides addresses two legs at once and is refused before
+        // anything is written. The model marks both members optional individually, so this
+        // rule is the service's rather than the request layer's.
+        if input.source_table_config.is_some() && input.target_table_config.is_some() {
+            return Err(
+                CreateIntegrationTablePropertiesErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            crate::state::messages::INTEGRATION_TABLE_CONFIG_SIDES_EXCLUSIVE
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Three `SourceTableConfig` members are documented as not yet supported by the
+        // service, so a request that states any of them asks for processing the source leg
+        // cannot do, and is refused before anything is written.
+        if input
+            .source_table_config
+            .as_ref()
+            .is_some_and(crate::state::states_unsupported_source_table_properties)
+        {
+            return Err(
+                CreateIntegrationTablePropertiesErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            crate::state::messages::UNSUPPORTED_SOURCE_TABLE_PROPERTIES.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The properties belong to the resource the ARN names — the Glue connection of the
+        // source, the Glue database of the target, or the replicated table itself — so a
+        // value that names none of them addresses nothing this call could configure.
+        let resource = match crate::state::integration_table_reference(&input.resource_arn) {
+            Ok(resource) => resource,
+            Err(message) => {
+                return Err(
+                    CreateIntegrationTablePropertiesErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(message),
+                            from_federation_source: None,
+                        },
+                    )
+                    .into(),
+                )
+            }
+        };
+
+        let mut store = state.lock();
+        // The named resource has to exist: an ARN of a connection, a database or a table
+        // this endpoint does not hold — including one of another account — names nothing
+        // here. The `TableName` is "the table to be replicated" and is NOT required to
+        // exist in the catalog: the replication these properties configure is what writes
+        // it.
+        if !store.holds_integration_table_resource(&resource) {
+            return Err(
+                CreateIntegrationTablePropertiesErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(
+                            crate::state::messages::integration_table_target_resource_not_found(
+                                &input.resource_arn,
+                            ),
+                        ),
+                        from_federation_source: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // One record per (resource, table) pair: a create for a pair that already has one
+        // is that record's next write and adds no second record, so nothing here refuses it
+        // as a duplicate.
+        let key = (input.resource_arn.clone(), input.table_name.clone());
+        let stored_already = store.integration_table_properties.contains_key(&key);
+        if !stored_already && !store.can_store_integration_table_properties() {
+            // The store is resident memory and this create is reachable by any caller, so
+            // the number of records one process will hold is bounded. This operation models
+            // no limit error, so the refusal is the closest client error it does model.
+            return Err(
+                CreateIntegrationTablePropertiesErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(format!(
+                            "This account already holds the maximum of {} integration table \
+                             properties",
+                            crate::state::MAX_INTEGRATION_TABLE_PROPERTIES
+                        )),
+                        from_federation_source: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let stored = store
+            .integration_table_properties
+            .entry(key)
+            .or_insert_with(|| {
+                crate::state::IntegrationTablePropertiesEntry::from_create_input(&input)
+            });
+        if stored_already {
+            stored.apply_create(&input);
+        }
+
+        ::tracing::info!(
+            operation = "CreateIntegrationTableProperties",
+            resource = %stored.resource_arn,
+            table = %stored.table_name,
+            stored_already,
+            "wrote the integration table properties of a replicated table"
+        );
+
+        // `CreateIntegrationTablePropertiesResponse` models no member at all, so what this
+        // create reports is the 200 itself; `GetIntegrationTableProperties` serves the
+        // record that is now stored.
+        Ok(CreateIntegrationTablePropertiesOutput {})
     }
 }
+

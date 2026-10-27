@@ -258,6 +258,21 @@ async fn configs_are_filtered_on_every_documented_member() {
         .filter(|config| string_member(config, "CreationTime") == first_created)
         .map(|config| string_member(config, "Id"))
         .collect();
+    // The Unix-time spelling `Filter$Name` documents for `CreationTime` names a
+    // whole second, so it selects every configuration created inside that
+    // second — read off the unfiltered page for the same reason as the set
+    // above.
+    let unix_second = |stamp: &str| -> String {
+        parse_time("CreationTime", "CreationTime", stamp)
+            .secs()
+            .to_string()
+    };
+    let first_created_unix = unix_second(&first_created);
+    let created_in_the_same_second: Vec<String> = listed(&unfiltered)
+        .iter()
+        .filter(|config| unix_second(&string_member(config, "CreationTime")) == first_created_unix)
+        .map(|config| string_member(config, "Id"))
+        .collect();
 
     let cases: Vec<(&str, Value, Vec<String>)> = vec![
         (
@@ -402,8 +417,18 @@ async fn configs_are_filtered_on_every_documented_member() {
             created_together.clone(),
         ),
         (
+            "CreationTime, the documented Unix-time spelling",
+            json!([{ "Name": "CreationTime", "Values": [first_created_unix.clone()] }]),
+            created_in_the_same_second.clone(),
+        ),
+        (
             "CREATION_TIME, an instant no configuration was created at",
             json!([{ "Name": "CREATION_TIME", "Values": ["1999-12-31T23:59:59Z"] }]),
+            vec![],
+        ),
+        (
+            "CreationTime, a Unix second no configuration was created in",
+            json!([{ "Name": "CreationTime", "Values": ["946684799"] }]),
             vec![],
         ),
         (

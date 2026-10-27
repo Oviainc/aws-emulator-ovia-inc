@@ -74,12 +74,12 @@ fn reported_names(case: &str, body: &Value) -> BTreeSet<String> {
 
 /// The clause this service states for a member that is null, as
 /// `tests/all/validation_messages.rs` pins the wording.
-fn null_clause(path: &str) -> String {
+pub(crate) fn null_clause(path: &str) -> String {
     format!("Value null at '{path}' failed to satisfy constraint: Member must not be null")
 }
 
 /// The clause for a `values` list that is present but names no value.
-fn empty_clause(path: &str) -> String {
+pub(crate) fn empty_clause(path: &str) -> String {
     format!(
         "Value at '{path}' failed to satisfy constraint: Member must have length greater than \
          or equal to 1"
@@ -88,7 +88,7 @@ fn empty_clause(path: &str) -> String {
 
 /// The whole report `clauses` compose, in this service's refusal wording: how many
 /// members failed, then one clause each.
-fn report(clauses: &[String]) -> String {
+pub(crate) fn report(clauses: &[String]) -> String {
     let noun = if clauses.len() == 1 { "error" } else { "errors" };
     format!(
         "{} validation {noun} detected: {}",

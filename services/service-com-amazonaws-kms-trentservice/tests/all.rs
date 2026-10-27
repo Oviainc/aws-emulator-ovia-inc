@@ -71,6 +71,8 @@ mod list_resource_tags_reads;
 mod multi_region_primary;
 #[path = "all/public_key.rs"]
 mod public_key;
+#[path = "all/random_bytes.rs"]
+mod random_bytes;
 #[path = "all/re_encrypt.rs"]
 mod re_encrypt;
 #[path = "all/refusal_and_rotation_contracts.rs"]

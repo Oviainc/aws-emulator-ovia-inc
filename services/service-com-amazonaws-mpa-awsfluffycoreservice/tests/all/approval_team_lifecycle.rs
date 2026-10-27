@@ -261,14 +261,47 @@ impl Harness {
         self.call("POST", &uri, None).await
     }
 
-    /// Force a stored team's pending deletion window to have already elapsed, so the
-    /// clock-owed removal is due on the next call. Only the DUE INSTANT is moved; the
-    /// removal itself is the service's own.
-    fn expire_deletion_window(&self, arn: &str) {
+    /// Edit the DELETION a stored team was asked for, which is the record
+    /// `StartActiveApprovalTeamDeletion` writes and the only thing that can make the clock
+    /// remove the team. The suites that arrange a deletion handshake move the due instants
+    /// on it ([`Harness::expire_deletion_window`],
+    /// `active_team_deletion_approval.rs`); every transition stays the service's own.
+    pub(crate) fn with_pending_deletion(
+        &self,
+        arn: &str,
+        edit: impl FnOnce(&mut state::PendingTeamDeletion),
+    ) {
         let store = state::service_state(&*self.engine).expect("the service store");
         let mut guard = store.lock();
-        let team = guard.team_mut(arn).expect("a stored team to expire");
-        team.deletion_completion_time = Some(SystemTime::now() - Duration::from_secs(1));
+        let team = guard.team_mut(arn).expect("a stored team to arrange");
+        let deletion = team
+            .pending_deletion
+            .as_mut()
+            .expect("a requested deletion to arrange");
+        edit(deletion);
+    }
+
+    /// Force a stored team's requested deletion to have been approved and its pending
+    /// window to have elapsed, so the clock-owed removal is due on the next call. Only the
+    /// DUE INSTANTS are moved; the approval and the removal themselves are the service's
+    /// own.
+    pub(crate) fn expire_deletion_window(&self, arn: &str) {
+        let elapsed = SystemTime::now() - Duration::from_secs(1);
+        self.with_pending_deletion(arn, |deletion| {
+            if deletion.approval_time.is_none() {
+                deletion.approval_due = Some(elapsed);
+            }
+            deletion.completion_time = elapsed;
+        });
+    }
+
+    /// Push the instant a requested deletion's approval comes due well past the end of a
+    /// test, so the deletion stays waiting on the team's approvers for as long as the test
+    /// needs it to. Only the DUE INSTANT is moved.
+    pub(crate) fn postpone_deletion_approval(&self, arn: &str) {
+        self.with_pending_deletion(arn, |deletion| {
+            deletion.approval_due = Some(SystemTime::now() + Duration::from_secs(3600));
+        });
     }
 
     /// The tags recorded for a stored team, read straight out of the store. The wire
@@ -1083,7 +1116,9 @@ async fn update_applies_the_supplied_fields_and_records_a_new_version() {
 }
 
 /// `StartActiveApprovalTeamDeletion` records the pending window on the stored team, and
-/// once the window elapses the team is gone from both readers.
+/// once the team has approved the deletion and the window elapses the team is gone from
+/// both readers. The window's own start is `active_team_deletion_approval.rs`' subject;
+/// here the table is about the LENGTH `PendingWindowDays` names.
 #[tokio::test]
 async fn deletion_records_the_pending_window_then_the_clock_removes_the_team() {
     // `PendingWindowDays` has no modelled range; it is a count of days, so the rule is
@@ -1136,13 +1171,21 @@ async fn deletion_records_the_pending_window_then_the_clock_removes_the_team() {
         let body = requested.map(|days| json!({ "PendingWindowDays": days }));
         let (status, deletion) = harness.start_deletion(&arn, body.clone()).await;
         assert_eq!(status, 200, "case {label}: start deletion returned {deletion:?}");
+        // The team's approvers must not answer while this row reads the state in between.
+        harness.postpone_deletion_approval(&arn);
         let start = instant(&deletion, "DeletionStartTime");
         let completion = instant(&deletion, "DeletionCompletionTime");
-        let expected_seconds = (expected_days * 24 * 60 * 60) as f64;
+        // The window runs from the team's APPROVAL of the request, which the clock owes
+        // `state::DELETION_APPROVAL_DELAY` after the request, so that is what separates
+        // the two instants the request is answered with. That the window really starts at
+        // the approval the session records is asserted in
+        // `active_team_deletion_approval.rs`.
+        let expected_seconds = (expected_days * 24 * 60 * 60) as f64
+            + state::DELETION_APPROVAL_DELAY.as_secs_f64();
         assert!(
-            (completion - start - expected_seconds).abs() < 1.0,
-            "case {label}: the window must be {expected_days} days ({expected_seconds}s), \
-             got {}s",
+            (completion - start - expected_seconds).abs() < 0.05,
+            "case {label}: the window must be {expected_days} days after the approval \
+             ({expected_seconds}s after the request), got {}s",
             completion - start
         );
 
@@ -1177,7 +1220,8 @@ async fn deletion_records_the_pending_window_then_the_clock_removes_the_team() {
             "case {label}: updating a DELETING team must conflict, got {conflict:?}"
         );
 
-        // Once the window has elapsed the team is gone from BOTH readers.
+        // Once the team has approved the deletion and the window has elapsed, the team is
+        // gone from BOTH readers.
         harness.expire_deletion_window(&arn);
         let (status, gone) = harness.get(&arn).await;
         assert_eq!(
@@ -1373,8 +1417,7 @@ async fn the_store_refuses_to_grow_past_its_team_quota() {
                 status_message: None,
                 creation_time: SystemTime::now(),
                 last_update_time: None,
-                deletion_start_time: None,
-                deletion_completion_time: None,
+                pending_deletion: None,
                 pending_update: None,
                 tags: std::collections::BTreeMap::new(),
                 seq,

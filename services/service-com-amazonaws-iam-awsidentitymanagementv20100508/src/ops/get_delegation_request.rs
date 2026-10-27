@@ -1,15 +1,32 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDelegationRequest
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDelegationRequest`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDelegationRequest::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation answers on the wire
+//!
+//! A read addressed by `DelegationRequestId`: it reports the delegation request the
+//! account holds under that identifier, exactly as the account holds it, and — when the
+//! request asks for a permission check — what the caller's own identity-based policies
+//! say about the permissions that request asks to have delegated.
+//!
+//! The model names the error SHAPES but not their codes or wording:
+//!
+//! * an identifier the account holds no delegation request under "referenced a resource
+//!   entity that does not exist", so it is `404` `<Code>NoSuchEntity</Code>` with the
+//!   delegation-request family's own message
+//!   ([`crate::state::delegation_request_not_found_message`]), taken from the request.
+//! * a caller whose identity-based policies do not permit the call is refused before the
+//!   lookup answers, `403` `<Code>AccessDenied</Code>`
+//!   ([`crate::state::authorization::authorize_named`]), so a caller that may not read
+//!   this request learns that it may not rather than whether the request exists.
+//!
+//! Who may call this is stated in the operation's own documentation as PERMISSION — an
+//! unowned request "can be called by any account", an owned one by "identities within
+//! that owner account", and a fully owned one carries "a default permission" for its
+//! owner. This emulator serves ONE account (`engine::emulator_account_id`), so every
+//! caller is an identity within it and what is left to decide is what that identity's own
+//! policies allow, which is the decision above and the only place this crate decides a
+//! call.
 //!
 //! ## Shape of an operation
 //!
@@ -100,6 +117,20 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The `PermissionCheckStatus` a response carrying a permission check reports:
+/// "COMPLETED: The permission check process has completed. The PermissionCheckResult
+/// will include the result" (`GetDelegationRequestResponse$PermissionCheckStatus`), as
+/// the enum spells that state. One of the three values `permissionCheckStatusType`
+/// declares, which [`super::types::PERMISSION_CHECK_STATUS_TYPE_VALUES`] records.
+///
+/// It is the state every check this emulator performs is in by the time the response is
+/// written: the check is a decision over the policy documents in force at the instant of
+/// the call ([`crate::state::authorization::delegation_permission_check`]), so it has
+/// already answered — there is no process still running to report `IN_PROGRESS` for, and
+/// none that failed to report `FAILED` for. The result it reached travels beside it, as
+/// that state's documentation says it does.
+const PERMISSION_CHECK_STATUS_COMPLETE: &str = "COMPLETE";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -169,18 +200,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDelegationRequest` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDelegationRequestErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDelegationRequest"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetDelegationRequestErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // A read: it reports the delegation request the account holds and writes
+        // nothing — including the permission check, which is a decision over the
+        // documents in force rather than a process left behind for a later caller to
+        // observe.
+        let store = state.lock();
+
+        // IAM decides a call against the caller's policies before it reads the
+        // resource, so the decision is made first and on the ARN the identifier names
+        // — the same ARN whether or not the account holds a request under it, since a
+        // delegation request carries no path. A refusal names the request as the
+        // request named it.
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::GET_DELEGATION_REQUEST,
+            &crate::state::delegation_request_arn(&input.delegation_request_id),
+            &format!("delegation request {}", input.delegation_request_id),
+        )?;
+
+        // The identifier is the handle `CreateDelegationRequest` filed the request
+        // under, held verbatim, so it is looked up verbatim: `delegationRequestIdType`
+        // is a minted identifier rather than a friendly name, which is why it is not
+        // case-folded the way an IAM entity name is.
+        let Some(held) = store.delegation_requests.get(&input.delegation_request_id) else {
+            return Err(
+                GetDelegationRequestErrorModeled::NoSuchEntityException(NoSuchEntityException {
+                    message: Some(crate::state::delegation_request_not_found_message(
+                        &input.delegation_request_id,
+                    )),
+                })
+                .into(),
+            );
+        };
+
+        // "Specifies whether to perform a permission check for the delegation request":
+        // a check is performed only for a request that asks for one, so a request that
+        // does not — the member's default — is answered with neither of the two members
+        // that report one.
+        let checked = input
+            .delegation_permission_check
+            .then(|| crate::state::authorization::delegation_permission_check(&store, ctx, held));
+
+        Ok(GetDelegationRequestOutput {
+            // "The delegation request object containing all details about the request":
+            // every member of the stored record, which this read withholds none of.
+            delegation_request: Some(held.clone()),
+            permission_check_status: checked
+                .map(|_| PERMISSION_CHECK_STATUS_COMPLETE.to_string()),
+            permission_check_result: checked.map(ToString::to_string),
+        })
     }
 }

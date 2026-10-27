@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetIntegrationTableProperties
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetIntegrationTableProperties`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetIntegrationTableProperties::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reads back the integration table property record this account holds for one
+//! `ResourceArn` and `TableName` pair
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::integration_table_properties`]), the
+//! record `CreateIntegrationTableProperties` writes. Reporting only: it writes nothing, so
+//! what a later caller sees is unchanged by a read.
 //!
 //! ## Shape of an operation
 //!
@@ -163,20 +159,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetIntegrationTableProperties` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetIntegrationTablePropertiesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetIntegrationTableProperties"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on.
+            return Err(
+                GetIntegrationTablePropertiesErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some(
+                            "the Glue integration table property store is unavailable".into(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The same resolution of `ResourceArn` the create goes through, so a value that
+        // names no resource at all is answered as a bad parameter here too rather than as a
+        // record this account happens not to hold.
+        let resource = match crate::state::integration_table_reference(&input.resource_arn) {
+            Ok(resource) => resource,
+            Err(message) => {
+                return Err(
+                    GetIntegrationTablePropertiesErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(message),
+                            from_federation_source: None,
+                        },
+                    )
+                    .into(),
+                )
+            }
+        };
+
+        // Reporting only: the record is read and nothing is written, so what a later caller
+        // sees is unchanged by this read.
+        let store = state.lock();
+        // A read addresses the record through the LEG of the integration it belongs to: a
+        // record written against a replicated table's OWN ARN, which the create takes, is
+        // not reachable through that ARN, and earns the same refusal as a pair this account
+        // never wrote a record for.
+        let stored = resource
+            .is_integration_leg()
+            .then(|| store.integration_table_properties(&input.resource_arn, &input.table_name))
+            .flatten();
+        let Some(stored) = stored else {
+            return Err(
+                GetIntegrationTablePropertiesErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(
+                            crate::state::messages::integration_table_properties_not_found(
+                                &input.resource_arn,
+                                &input.table_name,
+                            ),
+                        ),
+                        from_federation_source: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(GetIntegrationTablePropertiesOutput {
+            resource_arn: Some(stored.resource_arn.clone()),
+            table_name: Some(stored.table_name.clone()),
+            source_table_config: stored.source_table_config.clone(),
+            target_table_config: stored.target_table_config.clone(),
+        })
     }
 }

@@ -338,6 +338,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The Region this request is served in: the job is started in — and only in —
         // the Region the caller signed for.
         let region = crate::state::request_region(ctx.parts());
+
+        // "To make a StartMedicalScribeJob request, you must first upload your media
+        // file into an Amazon S3 bucket; you can then specify the Amazon S3 location of
+        // the file using the Media parameter": the location is resolved against this
+        // emulator's own Amazon S3 before anything is stored, so a start pointed at an
+        // object that store says is not there is refused and no job record exists for a
+        // media file nobody uploaded (see [`crate::state::resolve_media_objects`], which
+        // also states why an answer that is not S3 reporting an absent object
+        // refuses nothing).
+        if crate::state::resolve_media_objects(
+            ctx,
+            &region,
+            &[input.media.media_file_uri.as_deref().unwrap_or_default()],
+        )
+        .await
+            == crate::state::MediaVerdict::NoSuchObject
+        {
+            return Err(bad_request(crate::state::MEDIA_URI_NAMES_NO_OBJECT));
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 

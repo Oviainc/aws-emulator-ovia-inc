@@ -75,6 +75,21 @@ struct Case {
 const START_JOB_BODY: &str = r#"{"TranscriptionJobName":"routing-check-job",
     "LanguageCode":"en-US","Media":{"MediaFileUri":"s3://routing-check/audio.mp3"}}"#;
 
+/// The bucket and key [`START_JOB_BODY`] points its media at. The control plane
+/// resolves a start's `Media` location against the emulator's own Amazon S3 before it
+/// stores a job, so the row that pins a SERVED 200 needs that object to be there: this
+/// suite is about which service claims a request, not about a media file nobody
+/// uploaded.
+const MEDIA_BUCKET: &str = "routing-check";
+/// See [`MEDIA_BUCKET`].
+const MEDIA_KEY: &str = "audio.mp3";
+
+/// A SigV4 credential scope naming `s3`, which is what claims a request for the
+/// emulator's own object store.
+const S3_AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
+     Credential=AKIDEXAMPLE/20260101/us-east-1/s3/aws4_request, \
+     SignedHeaders=host, Signature=0123456789abcdef";
+
 /// The rows differ along what the rule generalises over: which service owns the path,
 /// the protocol envelope (awsJson1_1 `POST /` with a target vs restJson1 method+URI),
 /// the routing tier the key comes from (credential scope vs `X-Amz-Target`), the
@@ -301,6 +316,35 @@ fn transcribe_and_transcribe_streaming_are_each_claimed_by_exactly_one_service()
                 // Signature verification belongs to the emulator, not to this check:
                 // these cases are about which service claims a request.
                 router.set_request_authentication(false);
+
+                // Stage the media object the start row names, through the assembled
+                // router's own Amazon S3 front door (path-style `PUT /<bucket>` then
+                // `PUT /<bucket>/<key>`): the control plane refuses a start whose media
+                // its companion object store does not hold.
+                for (what, path, payload) in [
+                    ("the media bucket", format!("/{MEDIA_BUCKET}"), &b""[..]),
+                    (
+                        "the media object",
+                        format!("/{MEDIA_BUCKET}/{MEDIA_KEY}"),
+                        &b"ID3 routing-check media object"[..],
+                    ),
+                ] {
+                    let request = http::Request::builder()
+                        .method("PUT")
+                        .uri(format!("https://s3.us-east-1.amazonaws.com{path}"))
+                        .header("host", "s3.us-east-1.amazonaws.com")
+                        .header("authorization", S3_AUTHORIZATION)
+                        .body(bytes::Bytes::copy_from_slice(payload))
+                        .expect("the request is well formed");
+                    let response = router.dispatch(request).await;
+                    assert_eq!(
+                        response.status().as_u16(),
+                        200,
+                        "{what} must be stored first, got {} {}",
+                        response.status(),
+                        String::from_utf8_lossy(response.body().as_ref())
+                    );
+                }
 
                 for case in CASES {
                     let mut builder = http::Request::builder()

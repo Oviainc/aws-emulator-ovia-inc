@@ -113,6 +113,8 @@ mod cloudformation_updates_iam_roles;
 // At the head for the same reason as the entry above: the `c…` span of the sorted list is
 // where the cloudformation suites land, and the appended tail is where every concurrent
 // suite does.
+#[path = "all/cloudformation_apigatewayv2_api_children.rs"]
+mod cloudformation_apigatewayv2_api_children;
 #[path = "all/cloudformation_apigatewayv2_resources.rs"]
 mod cloudformation_apigatewayv2_resources;
 #[path = "all/amplifybackend_app_registration.rs"]

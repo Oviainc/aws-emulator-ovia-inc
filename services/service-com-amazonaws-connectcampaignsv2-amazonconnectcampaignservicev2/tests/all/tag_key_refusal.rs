@@ -28,7 +28,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 // One harness per crate: the routing header, the router under test and the
 // request/response plumbing live in `tests/all/common.rs`.
-use super::common::{call, error_code, router};
+use super::common::{call, error_code, router, Harness};
 
 /// The region every case here signs for, and the one its ARNs are rooted in.
 const REGION: &str = "ap-southeast-2";
@@ -41,7 +41,10 @@ const MEMBER: &str = "tags";
 
 /// Onboard [`INSTANCE`] and wait out the span the clock owes its onboarding job, so
 /// the instance is a campaign target by the time this returns.
-async fn onboard(router: &MultiServiceRouter) {
+async fn onboard(router: &Harness) {
+    // Onboarding resolves the `connectInstanceId` against the account's Connect
+    // instance registry, so the instance is registered there first.
+    router.register_connect_instance(REGION, INSTANCE);
     let (status, body) = call(
         router,
         REGION,

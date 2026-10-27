@@ -12,7 +12,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-/// The region every request is signed for; each minted ARN and endpoint must carry it.
+/// The region every request is signed for; each minted ARN must carry it.
 pub(crate) const REGION: &str = "us-west-2";
 
 /// The canonical emulator account id (`engine::EMULATOR_ACCOUNT_ID`).
@@ -61,13 +61,22 @@ const ECHOED_IMAGE_MEMBERS: &[&str] = &[
 
 /// A fresh emulator holding only this service, over one shared engine.
 pub(crate) fn emulator() -> MultiServiceRouter {
+    emulator_with_engine().0
+}
+
+/// The same emulator as [`emulator`], with the shared engine kept as well — so a suite
+/// that needs the store the handlers reach (the MicroVM endpoint suite) gets the one
+/// engine rather than building a second harness.
+pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(
-        service_com_amazonaws_lambdamicrovms_lambdamicrovms::EmulatedService::new(engine),
+        service_com_amazonaws_lambdamicrovms_lambdamicrovms::EmulatedService::new(Arc::clone(
+            &engine,
+        )),
     );
-    router
+    (router, engine)
 }
 
 /// One request against the emulator; the SigV4 credential scope is what routes it to
@@ -521,10 +530,14 @@ async fn running_a_microvm_persists_it_and_get_returns_the_stored_record() {
             "case {case:?}: a MicroVM starts PENDING, got {:?}",
             run["state"]
         );
-        assert_eq!(
-            run["endpoint"].as_str(),
-            Some(format!("https://{microvm_id}.microvm.lambda.{REGION}.amazonaws.com").as_str()),
-            "case {case:?}: expected the MicroVM's HTTPS endpoint, got {:?}",
+        let endpoint = run["endpoint"].as_str().unwrap_or_default();
+        // The endpoint is the address this emulator publishes the MicroVM on: its own
+        // HTTPS listener, with the MicroVM named in the path. What that address answers
+        // is pinned in `microvm_endpoint_data_plane`.
+        assert!(
+            endpoint.starts_with("https://")
+                && endpoint.ends_with(&format!("/microvms/{microvm_id}")),
+            "case {case:?}: expected an HTTPS endpoint naming this MicroVM, got {:?}",
             run["endpoint"]
         );
         assert_eq!(

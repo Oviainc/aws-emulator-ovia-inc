@@ -446,6 +446,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
+
+        // "To make a StartTranscriptionJob request, you must first upload your media
+        // file into an Amazon S3 bucket; you can then specify the Amazon S3 location of
+        // the file using the Media parameter": the location is resolved against this
+        // emulator's own Amazon S3 before anything is stored, so a start pointed at an
+        // object that store says is not there is refused and no job record exists for a
+        // media file nobody uploaded (see [`crate::state::resolve_media_objects`], which
+        // also states why an answer that is not S3 reporting an absent object
+        // refuses nothing). `Media$RedactedMediaFileUri` is not read here: it "is only
+        // supported for Call Analytics (StartCallAnalyticsJob) transcription requests"
+        // (model doc), so this family's input audio is `MediaFileUri` alone.
+        let media_verdict = crate::state::resolve_media_objects(
+            ctx,
+            &region,
+            &[input.media.media_file_uri.as_deref().unwrap_or_default()],
+        )
+        .await;
+        if media_verdict == crate::state::MediaVerdict::NoSuchObject {
+            return Err(bad_request(crate::state::MEDIA_URI_NAMES_NO_OBJECT));
+        }
+        // What the clock owes this job instead of a transcript, judged once here from
+        // the media the request pointed at: a job the service found nothing wrong with
+        // completes (see [`crate::state::TranscriptionJobRecord::advance_clock`]).
+        let failure_due = crate::state::media_failure_reason(
+            media_verdict,
+            input.media_format.as_deref(),
+            &input.media,
+        );
+
         let mut store = state.lock();
 
         // A job may only apply a custom vocabulary, custom vocabulary filter or custom
@@ -596,6 +625,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }),
             transcript: None,
             failure_reason: None,
+            failure_due,
             creation_time: now,
             start_time: lifecycle.start_time,
             completion_time: None,
