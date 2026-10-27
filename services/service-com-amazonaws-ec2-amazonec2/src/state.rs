@@ -705,6 +705,35 @@
 //! maps one start's `ClientToken` to the analysis it started, so a replay of the same
 //! request answers that analysis instead of starting a second one.
 //!
+//! ## Reachability Analyzer paths and the analyses started on them
+//!
+//! [`ComAmazonawsEc2Amazonec2State::network_insights_paths`] holds the account's paths as
+//! the modelled [`NetworkInsightsPath`] shape itself, keyed by `NetworkInsightsPathId` in a
+//! [`BTreeMap`] so every reader of it reports one stable order: it is where
+//! `StartNetworkInsightsAnalysis` resolves the path a caller asks to analyze, so a path the
+//! account does not hold is refused with [`invalid_network_insights_path_id_not_found`]
+//! rather than analyzed. [`ComAmazonawsEc2Amazonec2State::insert_network_insights_path`] is
+//! its one writer, so every member a path reports is derived there rather than by each
+//! caller.
+//!
+//! [`ComAmazonawsEc2Amazonec2State::network_insights_analyses`] holds the analyses started
+//! on those paths, keyed by `NetworkInsightsAnalysisId`, as
+//! [`NetworkInsightsAnalysisRecord`]s: the modelled [`NetworkInsightsAnalysis`] every
+//! operation that reports one answers with, plus the move the clock owes it. An analysis AWS
+//! hands back is `running`, a non-terminal `AnalysisStatus`, so its end is owed to the clock
+//! on the same [`TRANSITION_DELAY`] as every other transition this module records, and
+//! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] applies it.
+//!
+//! That end is `failed`, carrying [`PATH_ANALYSIS_UNSUPPORTED_STATUS_MESSAGE`]: a path
+//! analysis is a reachability computation over the account's real network, which this
+//! emulator does not perform, so the analysis ends in the `AnalysisStatus` catalog's own
+//! failure member with a message saying why, and never reports a `NetworkPathFound`, a path
+//! component or an explanation that nothing computed.
+//!
+//! [`ComAmazonawsEc2Amazonec2State::network_insights_analysis_client_tokens`] maps one
+//! start's `ClientToken` to the analysis it started, so a replay of the same request answers
+//! that analysis instead of starting a second one.
+//!
 //! ## VPC Block Public Access exclusions
 //!
 //! [`ComAmazonawsEc2Amazonec2State::vpc_block_public_access_exclusions`] holds the
@@ -1347,9 +1376,10 @@ use crate::ops::types::{
     InstanceState, InstanceTypeOffering, InterruptionInfo, IpPermission, IpRange, Ipv6Range,
     LOCATION_TYPE_VALUES,
     LaunchTemplate, MacHost, Monitoring, NatGateway, NetworkInsightsAccessScope,
-    NetworkInsightsAccessScopeAnalysis, NetworkInterface, NetworkInterfacePermission,
+    NetworkInsightsAccessScopeAnalysis, NetworkInsightsAnalysis, NetworkInsightsPath,
+    NetworkInterface, NetworkInterfacePermission,
     NetworkInterfacePermissionState, NetworkInterfacePrivateIpAddress,
-    OperatorResponse, PeeringAttachmentStatus, Placement,
+    OperatorResponse, PathFilter, PeeringAttachmentStatus, Placement,
     PlacementGroup, PrefixListId, PtrUpdateStatus,
     PrivateDnsDetails, PrivateDnsNameOptionsOnLaunch, ReferencedSecurityGroup,
     SecurityGroupRule,
@@ -2659,6 +2689,24 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// ensure the idempotency of the request"
     /// (`StartNetworkInsightsAccessScopeAnalysisRequest$ClientToken`).
     pub network_insights_access_scope_analysis_client_tokens: HashMap<String, String>,
+    /// Every Reachability Analyzer path the account holds, by `NetworkInsightsPathId`, as
+    /// the modelled [`NetworkInsightsPath`] shape itself — so a member a writer sets
+    /// round-trips through every reader without a field-by-field copy. Ordered by id, the
+    /// stable order every reader of it reports in.
+    ///
+    /// `StartNetworkInsightsAnalysis` resolves the path it is asked to analyze here;
+    /// [`Self::insert_network_insights_path`] is its one writer. See the module docs.
+    pub network_insights_paths: BTreeMap<String, NetworkInsightsPath>,
+    /// Every path analysis the account has started, by `NetworkInsightsAnalysisId` — see the
+    /// module docs. Ordered by id, which is the order `DescribeNetworkInsightsAnalyses`
+    /// reports and pages over.
+    pub network_insights_analyses: BTreeMap<String, NetworkInsightsAnalysisRecord>,
+    /// A `StartNetworkInsightsAnalysis` `ClientToken` and the analysis id that request
+    /// started, so a repeat of the same request answers with that analysis instead of
+    /// starting a second one: "Unique, case-sensitive identifier that you provide to ensure
+    /// the idempotency of the request"
+    /// (`StartNetworkInsightsAnalysisRequest$ClientToken`).
+    pub network_insights_analysis_client_tokens: HashMap<String, String>,
     /// Every subnet the account holds, by `SubnetId`, as the modelled [`Subnet`] shape
     /// itself — so a member a writer sets round-trips through `DescribeSubnets` without a
     /// field-by-field copy. Ordered by id, which is the order the describe reports and
@@ -3608,6 +3656,11 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             network_insights_access_scope_client_tokens: HashMap::new(),
             network_insights_access_scope_analyses: BTreeMap::new(),
             network_insights_access_scope_analysis_client_tokens: HashMap::new(),
+            // A fresh account has asked for no reachability analysis, so it holds neither a
+            // path to analyze nor an analysis of one.
+            network_insights_paths: BTreeMap::new(),
+            network_insights_analyses: BTreeMap::new(),
+            network_insights_analysis_client_tokens: HashMap::new(),
             images: BTreeMap::new(),
             images_in_recycle_bin: BTreeMap::new(),
             security_groups: BTreeMap::new(),
@@ -5541,9 +5594,14 @@ pub fn security_group_rules_charge(permissions: &[IpPermission], tags: &[Tag]) -
             charge = charge.saturating_add(security_group_rule_charge(
                 0,
                 text(&pair.description),
-                text(&pair.group_id)
-                    .saturating_add(text(&pair.user_id))
-                    .saturating_add(text(&pair.group_name)),
+                text(&pair.group_name)
+                    .saturating_add(referenced_group_bytes(
+                        &pair.group_id,
+                        &pair.user_id,
+                        &pair.vpc_id,
+                        &pair.vpc_peering_connection_id,
+                        &pair.peering_status,
+                    )),
                 tag_bytes,
             ));
         }
@@ -5551,10 +5609,37 @@ pub fn security_group_rules_charge(permissions: &[IpPermission], tags: &[Tag]) -
     charge
 }
 
+/// The caller-chosen bytes a rule's REFERENCED GROUP retains, as every member of
+/// [`ReferencedSecurityGroup`] the store keeps.
+///
+/// The ONE definition of that term, taken by the members rather than by either shape, because
+/// the two sites that need it hold the same facts in different shapes: a request's
+/// `UserIdGroupPair` before any rule exists ([`security_group_rules_charge`]) and the stored
+/// `ReferencedSecurityGroup` afterwards ([`security_group_rule_payload_bytes`]). Counting
+/// them here is what keeps the charge a request is admitted under equal to the charge its
+/// record is given and the delete gives back — every member the record retains, so a member
+/// added to the shape is added to both charges at once. The name a grant referenced its group
+/// by is not one of them: it is not a member of that shape, and each caller adds it from where
+/// it keeps it.
+fn referenced_group_bytes(
+    group_id: &Option<String>,
+    user_id: &Option<String>,
+    vpc_id: &Option<String>,
+    vpc_peering_connection_id: &Option<String>,
+    peering_status: &Option<String>,
+) -> usize {
+    let text = |value: &Option<String>| value.as_deref().map_or(0, str::len);
+    text(group_id)
+        .saturating_add(text(user_id))
+        .saturating_add(text(vpc_id))
+        .saturating_add(text(vpc_peering_connection_id))
+        .saturating_add(text(peering_status))
+}
+
 /// What ONE stored security group rule costs the store: the fixed per-record overhead plus
 /// the caller-chosen bytes it retains, grouped as the destination it names, its description,
-/// the group it references (that group's id, the account owning it and the name the grant
-/// named it by) and its tags.
+/// the group it references (every member of that reference, counted by
+/// [`referenced_group_bytes`], plus the name the grant named it by) and its tags.
 ///
 /// The ONE definition of a rule's charge, shared by [`security_group_rule_payload_bytes`],
 /// which weighs a record that exists, and by [`security_group_rules_charge`], which weighs
@@ -5575,7 +5660,8 @@ fn security_group_rule_charge(
 
 /// The bytes one stored security group rule holds: the fixed
 /// [`STORED_RECORD_OVERHEAD_BYTES`] every stored record costs, plus every string the record
-/// retains — the grant it names, its description, the group it references and its tags.
+/// retains — the grant it names, its description, every member of the group it references
+/// ([`referenced_group_bytes`]) and its tags.
 ///
 /// The fixed overhead is charged here for the same reason every other store of this module
 /// charges it ([`host_payload_bytes`]'s caller, the launch-template and IPAM-pool inserts):
@@ -5595,10 +5681,19 @@ pub fn security_group_rule_payload_bytes(record: &SecurityGroupRuleRecord) -> us
     let text = |value: &Option<String>| value.as_deref().map_or(0, str::len);
     let referenced = rule.referenced_group_info.as_ref();
     security_group_rule_charge(
-        text(&rule.cidr_ipv4) + text(&rule.cidr_ipv6) + text(&rule.prefix_list_id),
+        text(&rule.cidr_ipv4)
+            .saturating_add(text(&rule.cidr_ipv6))
+            .saturating_add(text(&rule.prefix_list_id)),
         text(&rule.description),
-        text(&record.referenced_group_name)
-            + referenced.map_or(0, |group| text(&group.group_id) + text(&group.user_id)),
+        text(&record.referenced_group_name).saturating_add(referenced.map_or(0, |group| {
+            referenced_group_bytes(
+                &group.group_id,
+                &group.user_id,
+                &group.vpc_id,
+                &group.vpc_peering_connection_id,
+                &group.peering_status,
+            )
+        })),
         tag_list_bytes(rule.tags.as_deref().unwrap_or_default()),
     )
 }
@@ -6742,6 +6837,29 @@ impl ComAmazonawsEc2Amazonec2State {
             record.view.findings_found = Some(FINDINGS_FOUND_UNKNOWN.to_string());
             record.pending = None;
         }
+        // The end of a path analysis `StartNetworkInsightsAnalysis` answered as `running`,
+        // on the same contract as the access scope analysis above: at its due instant the
+        // analysis reaches the terminal `AnalysisStatus` the start recorded for it, whether
+        // or not anybody called again.
+        for record in self.network_insights_analyses.values_mut() {
+            let Some(pending) = record
+                .pending
+                .as_ref()
+                .filter(|pending| now >= pending.due_at)
+                .cloned()
+            else {
+                continue;
+            };
+            record.view.status = Some(pending.to.to_string());
+            record.view.status_message =
+                Some(PATH_ANALYSIS_UNSUPPORTED_STATUS_MESSAGE.to_string());
+            // "Indicates whether the destination is reachable from the source"
+            // (`NetworkInsightsAnalysis$NetworkPathFound`): nothing traced this path, so
+            // whether it is reachable was never determined, and a boolean either way would
+            // be a result no engine produced. It stays absent, as do the path components,
+            // the explanations and the hints that only a trace could fill in.
+            record.pending = None;
+        }
         // Each IPAM whose `create-complete` has fallen due, with the scopes, resource
         // discovery and association the same `CreateIpam` call created. The due ids are
         // collected first because completing one borrows the other IPAM stores.
@@ -7820,6 +7938,8 @@ impl ComAmazonawsEc2Amazonec2State {
             nat_gateways,
             network_insights_access_scope_analyses => view,
             network_insights_access_scopes,
+            network_insights_analyses => view,
+            network_insights_paths,
             placement_groups,
             replace_root_volume_tasks => view,
             reserved_instances,
@@ -33295,6 +33415,334 @@ impl ComAmazonawsEc2Amazonec2State {
             },
         );
         self.network_insights_access_scope_analysis_client_tokens
+            .insert(spec.client_token, analysis_id);
+        Some(stored)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reachability Analyzer paths and the analyses started on them
+// ---------------------------------------------------------------------------
+
+/// The id prefix of a Reachability Analyzer path, as AWS mints one: `nip-<hex>` (the AWS CLI
+/// reference for `ec2 create-network-insights-path` reports ids of that form).
+///
+/// [`ComAmazonawsEc2Amazonec2State::next_id`] appends the 17 lowercase hexadecimal digits
+/// every EC2 resource id of the long form carries.
+pub const NETWORK_INSIGHTS_PATH_ID_PREFIX: &str = "nip";
+
+/// The id prefix of a path ANALYSIS, as AWS mints one: `nia-<hex>` (the AWS CLI reference for
+/// `ec2 start-network-insights-analysis` reports ids of that form), with the same
+/// 17-hex-digit suffix as every other long EC2 id.
+pub const NETWORK_INSIGHTS_ANALYSIS_ID_PREFIX: &str = "nia";
+
+/// The `ResourceType` enum's `network-insights-path` member, which a path's own ARN names.
+pub const RESOURCE_TYPE_NETWORK_INSIGHTS_PATH: &str = "network-insights-path";
+
+/// The `ResourceType` a `StartNetworkInsightsAnalysis` tag specification may name: the
+/// analysis it starts (the modelled `ResourceType` enum's `network-insights-analysis`
+/// member), which is also what the analysis's own ARN names.
+pub const RESOURCE_TYPE_NETWORK_INSIGHTS_ANALYSIS: &str = "network-insights-analysis";
+
+/// "The status message, if the status is `failed`"
+/// (`NetworkInsightsAnalysis$StatusMessage`) of an analysis this emulator could not run.
+///
+/// A path analysis traces the account's real network from the source to the destination;
+/// this emulator runs no such trace, so the analysis ends in [`ANALYSIS_STATUS_FAILED`]
+/// carrying this reason rather than reporting a reachability verdict, path components or
+/// explanations that nothing computed.
+pub const PATH_ANALYSIS_UNSUPPORTED_STATUS_MESSAGE: &str =
+    "This emulator does not perform Reachability Analyzer path tracing, so no reachability \
+     result was produced for this path.";
+
+/// The code EC2 answers for a path id the account holds no path under.
+///
+/// The same `Invalid<Resource>Id.NotFound` convention as
+/// [`INVALID_NETWORK_INSIGHTS_ACCESS_SCOPE_ID_NOT_FOUND`].
+pub const INVALID_NETWORK_INSIGHTS_PATH_ID_NOT_FOUND: &str = "InvalidNetworkInsightsPathId.NotFound";
+
+/// The code EC2 answers for a path-analysis id the account holds no analysis under (see
+/// [`INVALID_NETWORK_INSIGHTS_PATH_ID_NOT_FOUND`] for the convention).
+pub const INVALID_NETWORK_INSIGHTS_ANALYSIS_ID_NOT_FOUND: &str =
+    "InvalidNetworkInsightsAnalysisId.NotFound";
+
+/// The largest number of path analyses this in-memory store holds.
+///
+/// The crate's one store ceiling, [`MAX_STORED_RECORDS_PER_STORE`], named here for the
+/// resource the way [`MAX_NETWORK_INSIGHTS_ACCESS_SCOPE_ANALYSES`] is: a capacity bound on
+/// this process's memory rather than an AWS quota, asked by
+/// [`ComAmazonawsEc2Amazonec2State::has_network_insights_analysis_capacity`] before a start
+/// inserts.
+pub const MAX_NETWORK_INSIGHTS_ANALYSES: usize = MAX_STORED_RECORDS_PER_STORE;
+
+/// The most entries one scoping list of a `StartNetworkInsightsAnalysis` request may carry —
+/// its `AdditionalAccounts`, its `FilterInArns` or its `FilterOutArns`.
+///
+/// Each entry is a caller-chosen string kept for the life of the stored analysis and
+/// reported back by every reader of it, and the model bounds none of these lists, so the
+/// count is capped before any work proportional to it is done. Like
+/// [`MAX_ACCESS_SCOPE_PATHS`] it is a capacity bound on this process's memory rather than an
+/// AWS quota; what the entries THEMSELVES hold is bounded by the byte budget every store of
+/// this crate shares ([`MAX_STORED_BYTES`]), charged through
+/// [`network_insights_analysis_payload_bytes`].
+pub const MAX_ANALYSIS_SCOPING_ENTRIES: usize = 100;
+
+/// One path analysis: the modelled [`NetworkInsightsAnalysis`] every operation that reports
+/// one answers with, plus the move the clock owes it.
+///
+/// `StartNetworkInsightsAnalysis` and `DescribeNetworkInsightsAnalyses` answer with that one
+/// shape, so the one stored view is what both report and they cannot describe one analysis
+/// differently.
+#[derive(Debug, Clone)]
+pub struct NetworkInsightsAnalysisRecord {
+    /// The analysis as the model shapes it, carrying the status reached so far.
+    pub view: NetworkInsightsAnalysis,
+    /// The move the clock owes this analysis, while one is owed.
+    pub pending: Option<AnalysisTransition>,
+}
+
+/// What a writer must say to store a Reachability Analyzer path; everything the service owns
+/// — the id, the ARN and the creation date — is derived by
+/// [`ComAmazonawsEc2Amazonec2State::insert_network_insights_path`].
+#[derive(Debug, Clone, Default)]
+pub struct NetworkInsightsPathSpec {
+    /// "The ID of the source" (`NetworkInsightsPath$Source`).
+    pub source: Option<String>,
+    /// "The ID of the destination" (`NetworkInsightsPath$Destination`).
+    pub destination: Option<String>,
+    /// "The IP address of the source" (`NetworkInsightsPath$SourceIp`).
+    pub source_ip: Option<String>,
+    /// "The IP address of the destination" (`NetworkInsightsPath$DestinationIp`).
+    pub destination_ip: Option<String>,
+    /// "The protocol" (`NetworkInsightsPath$Protocol`), a member of the modelled `Protocol`
+    /// catalog.
+    pub protocol: Option<String>,
+    /// "The destination port" (`NetworkInsightsPath$DestinationPort`).
+    pub destination_port: Option<i32>,
+    /// "Scopes the analysis to network paths that match specific filters at the source"
+    /// (`NetworkInsightsPath$FilterAtSource`).
+    pub filter_at_source: Option<PathFilter>,
+    /// The same, at the destination (`NetworkInsightsPath$FilterAtDestination`).
+    pub filter_at_destination: Option<PathFilter>,
+    /// The Region the request was signed for, which the path's ARN names.
+    pub region: String,
+    /// "The tags associated with the path" (`NetworkInsightsPath$Tags`).
+    pub tags: Vec<Tag>,
+}
+
+/// What a writer must say to store a path analysis; everything else about the record is
+/// derived by [`ComAmazonawsEc2Amazonec2State::insert_network_insights_analysis`].
+#[derive(Debug, Clone)]
+pub struct NetworkInsightsAnalysisSpec {
+    /// "The ID of the path" (`StartNetworkInsightsAnalysisRequest$NetworkInsightsPathId`),
+    /// as resolved against [`ComAmazonawsEc2Amazonec2State::network_insights_paths`].
+    pub network_insights_path_id: String,
+    /// "The member accounts that contain resources that the path can traverse"
+    /// (`AdditionalAccounts`), as the request gave them.
+    pub additional_accounts: Vec<String>,
+    /// "The Amazon Resource Names (ARN) of the resources that the path must traverse"
+    /// (`FilterInArns`).
+    pub filter_in_arns: Vec<String>,
+    /// "The Amazon Resource Names (ARN) of the resources that the path must ignore"
+    /// (`FilterOutArns`).
+    pub filter_out_arns: Vec<String>,
+    /// The Region the request was signed for, which the analysis's ARN names.
+    pub region: String,
+    /// The tags the request's `TagSpecifications` assign to the analysis.
+    pub tags: Vec<Tag>,
+    /// The request's `ClientToken`, which names this analysis from now on.
+    pub client_token: String,
+}
+
+/// The caller-chosen bytes one stored path holds: its tags, the source and destination it
+/// names and the filters scoping it, on top of the record's own fixed overhead
+/// ([`STORED_RECORD_OVERHEAD_BYTES`]), so a path with none of them is not free against
+/// [`MAX_STORED_BYTES`]. Everything else on the record is derived by this module (the id, the
+/// ARN, the creation date) or bounded by the model, so it is fixed-size.
+///
+/// The ONE definition of that charge, so a writer cannot ask one number and charge another.
+/// A filter is a nested structure this module reads no member of, so it is charged by the
+/// length of its rendered form — never less than the bytes of the strings it holds — the way
+/// [`network_insights_access_scope_payload_bytes`] charges a scope's paths.
+pub fn network_insights_path_payload_bytes(spec: &NetworkInsightsPathSpec) -> usize {
+    let text = |value: &Option<String>| value.as_deref().unwrap_or_default().len();
+    tag_list_bytes(&spec.tags)
+        .saturating_add(text(&spec.source))
+        .saturating_add(text(&spec.destination))
+        .saturating_add(text(&spec.source_ip))
+        .saturating_add(text(&spec.destination_ip))
+        .saturating_add(text(&spec.protocol))
+        .saturating_add(format!("{:?}", spec.filter_at_source).len())
+        .saturating_add(format!("{:?}", spec.filter_at_destination).len())
+        .saturating_add(STORED_RECORD_OVERHEAD_BYTES)
+}
+
+/// The caller-chosen bytes one stored path analysis holds: its tags, the client token that
+/// names it and the accounts and ARNs scoping it, on top of the record's own fixed overhead
+/// ([`STORED_RECORD_OVERHEAD_BYTES`]), so an analysis carrying none of them is not free
+/// against [`MAX_STORED_BYTES`]. Everything else on the record — the ids, the ARN, the
+/// status, the start date — is derived by this module, so it is fixed-size, which is what
+/// that overhead stands for.
+///
+/// The ONE definition of that charge, so a writer cannot ask one number and charge another.
+pub fn network_insights_analysis_payload_bytes(spec: &NetworkInsightsAnalysisSpec) -> usize {
+    let entries = |values: &[String]| values.iter().map(String::len).sum::<usize>();
+    tag_list_bytes(&spec.tags)
+        .saturating_add(spec.client_token.len())
+        .saturating_add(entries(&spec.additional_accounts))
+        .saturating_add(entries(&spec.filter_in_arns))
+        .saturating_add(entries(&spec.filter_out_arns))
+        .saturating_add(STORED_RECORD_OVERHEAD_BYTES)
+}
+
+/// Refuse a path id a request named that the account holds no path under: HTTP 400
+/// [`INVALID_NETWORK_INSIGHTS_PATH_ID_NOT_FOUND`].
+pub fn invalid_network_insights_path_id_not_found<E>(path_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_NETWORK_INSIGHTS_PATH_ID_NOT_FOUND,
+        400,
+        format!("The network insights path ID '{path_id}' does not exist"),
+    )
+}
+
+/// Refuse an analysis id a request named that the account holds no analysis under: HTTP 400
+/// [`INVALID_NETWORK_INSIGHTS_ANALYSIS_ID_NOT_FOUND`].
+pub fn invalid_network_insights_analysis_id_not_found<E>(analysis_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_NETWORK_INSIGHTS_ANALYSIS_ID_NOT_FOUND,
+        400,
+        format!("The network insights analysis ID '{analysis_id}' does not exist"),
+    )
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another path analysis fits inside the store's ceiling
+    /// ([`MAX_NETWORK_INSIGHTS_ANALYSES`]).
+    ///
+    /// The same contract as [`Self::has_network_insights_access_scope_analysis_capacity`]:
+    /// the start path asks first and refuses with EC2's own quota code when it answers
+    /// `false`, and [`Self::insert_network_insights_analysis`] asks it again for itself, so
+    /// no path can get past the ceiling by forgetting to.
+    pub fn has_network_insights_analysis_capacity(&self) -> bool {
+        self.network_insights_analyses.len() < MAX_NETWORK_INSIGHTS_ANALYSES
+    }
+
+    /// Whether another Reachability Analyzer path fits inside the store's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]).
+    pub fn has_network_insights_path_capacity(&self) -> bool {
+        self.network_insights_paths.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
+    /// Store one Reachability Analyzer path and answer the `NetworkInsightsPathId` it was
+    /// given — or `None` when the store is at [`MAX_STORED_RECORDS_PER_STORE`] and NOTHING
+    /// was stored.
+    ///
+    /// The ONE path a path enters the store by, reached from the operation that creates one
+    /// and from the suites that seed one, so the id it carries, the ARN it reports, the
+    /// creation date it shows and the bytes it charges cannot be built two ways. Everything
+    /// the service owns is derived here rather than taken from the caller; what the caller
+    /// chose — the source, the destination, the protocol, the port and the filters — is
+    /// stored as it was given, since that is what a path IS.
+    ///
+    /// A path AWS hands back is ready, so it has no clock-owed move: only the analyses
+    /// started on it do.
+    pub fn insert_network_insights_path(&mut self, spec: NetworkInsightsPathSpec) -> Option<String> {
+        if !self.has_network_insights_path_capacity() {
+            return None;
+        }
+        let path_id = self.next_id(NETWORK_INSIGHTS_PATH_ID_PREFIX);
+        self.add_stored_bytes(network_insights_path_payload_bytes(&spec));
+        let path = NetworkInsightsPath {
+            network_insights_path_id: Some(path_id.clone()),
+            network_insights_path_arn: Some(::engine::emulator_arn(
+                "ec2",
+                &spec.region,
+                &format!("{RESOURCE_TYPE_NETWORK_INSIGHTS_PATH}/{path_id}"),
+            )),
+            // "The time stamp when the path was created" (`CreatedDate`).
+            created_date: Some(system_time_to_date_time(SystemTime::now())),
+            source: spec.source,
+            destination: spec.destination,
+            // "The Amazon Resource Name (ARN) of the source" / "of the destination": the ARN
+            // of a resource this emulator was not given one for is not invented here — a
+            // writer that resolved one passes it as the `Source`/`Destination` it stores.
+            source_arn: None,
+            destination_arn: None,
+            source_ip: spec.source_ip,
+            destination_ip: spec.destination_ip,
+            protocol: spec.protocol,
+            destination_port: spec.destination_port,
+            tags: Some(spec.tags),
+            filter_at_source: spec.filter_at_source,
+            filter_at_destination: spec.filter_at_destination,
+        };
+        self.network_insights_paths.insert(path_id.clone(), path);
+        Some(path_id)
+    }
+
+    /// Start one path analysis and answer it as it was stored — or `None` when the store is
+    /// at [`MAX_NETWORK_INSIGHTS_ANALYSES`] and NOTHING was stored.
+    ///
+    /// The one way a path analysis is stored, so the id it carries, the ARN it reports, the
+    /// status it starts in, the move the clock owes it, the token that names it and the
+    /// bytes it charges cannot be built two ways. An analysis is answered in the
+    /// non-terminal `running` status, so the clock owes it its terminal
+    /// [`ANALYSIS_STATUS_FAILED`] one [`TRANSITION_DELAY`] later (the module docs say why
+    /// that is the terminal status this emulator can honestly reach).
+    ///
+    /// What comes back is the stored view itself, so a start answers exactly what a later
+    /// `DescribeNetworkInsightsAnalyses` will report.
+    pub fn insert_network_insights_analysis(
+        &mut self,
+        spec: NetworkInsightsAnalysisSpec,
+    ) -> Option<NetworkInsightsAnalysis> {
+        if !self.has_network_insights_analysis_capacity() {
+            return None;
+        }
+        let analysis_id = self.next_id(NETWORK_INSIGHTS_ANALYSIS_ID_PREFIX);
+        self.add_stored_bytes(network_insights_analysis_payload_bytes(&spec));
+        let view = NetworkInsightsAnalysis {
+            network_insights_analysis_id: Some(analysis_id.clone()),
+            network_insights_analysis_arn: Some(::engine::emulator_arn(
+                "ec2",
+                &spec.region,
+                &format!("{RESOURCE_TYPE_NETWORK_INSIGHTS_ANALYSIS}/{analysis_id}"),
+            )),
+            network_insights_path_id: Some(spec.network_insights_path_id),
+            // A list the request named nothing in is reported as absent rather than as an
+            // empty set: there is no account and no ARN to report.
+            additional_accounts: (!spec.additional_accounts.is_empty())
+                .then_some(spec.additional_accounts),
+            filter_in_arns: (!spec.filter_in_arns.is_empty()).then_some(spec.filter_in_arns),
+            filter_out_arns: (!spec.filter_out_arns.is_empty()).then_some(spec.filter_out_arns),
+            // "The time the analysis started" (`StartDate`) is now.
+            start_date: Some(system_time_to_date_time(SystemTime::now())),
+            status: Some(ANALYSIS_STATUS_RUNNING.to_string()),
+            // "The status message, if the status is `failed`" and "The warning message":
+            // nothing to report while the analysis is still running.
+            status_message: None,
+            warning_message: None,
+            // Whether the destination is reachable, the components of the path, the
+            // explanations, the hints and the accounts they would suggest are all results of
+            // a trace: none of them is claimed by this call, and the clock-owed end leaves
+            // them absent too, because nothing traced the path.
+            network_path_found: None,
+            forward_path_components: None,
+            return_path_components: None,
+            explanations: None,
+            alternate_path_hints: None,
+            suggested_accounts: None,
+            tags: Some(spec.tags),
+        };
+        let stored = view.clone();
+        self.network_insights_analyses.insert(
+            analysis_id.clone(),
+            NetworkInsightsAnalysisRecord {
+                view,
+                pending: Some(AnalysisTransition::starting_now(ANALYSIS_STATUS_FAILED)),
+            },
+        );
+        self.network_insights_analysis_client_tokens
             .insert(spec.client_token, analysis_id);
         Some(stored)
     }

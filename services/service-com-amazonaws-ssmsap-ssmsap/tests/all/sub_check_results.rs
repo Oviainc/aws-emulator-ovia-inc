@@ -634,7 +634,11 @@ async fn an_operation_id_that_names_no_run_is_refused() {
         );
     }
 
-    // And a run of THIS Region does not resolve at another regional endpoint.
+    // And a run of THIS Region does not resolve at another regional endpoint. The start
+    // above left a change owed to the application, and no check may be started while work
+    // is under way on it (`tests/all/configuration_checks_in_flight.rs`), so the clock is
+    // waited out first.
+    settle().await;
     let here = emulator
         .one_check("HDB-REFUSE", CONFIGURATION_CHECK_TYPE_VALUES[0])
         .await;

@@ -55,6 +55,8 @@ mod application_create;
 mod application_create_providers;
 #[path = "all/application_describe.rs"]
 mod application_describe;
+#[path = "all/application_grant_independence.rs"]
+mod application_grant_independence;
 #[path = "all/application_grants.rs"]
 mod application_grants;
 #[path = "all/application_grants_list.rs"]

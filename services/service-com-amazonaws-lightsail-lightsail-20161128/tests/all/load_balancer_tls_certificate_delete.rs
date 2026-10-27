@@ -27,12 +27,11 @@
 //! ways.
 //!
 //! One branch of the handler is deliberately not exercised here: a certificate
-//! that is ATTACHED is refused without `force`, and nothing reachable over the
-//! wire attaches one yet — `AttachLoadBalancerTlsCertificate` is still a
-//! scaffold stub answering 501, and `CreateLoadBalancer` stores the certificate
-//! it was asked for unattached on purpose. When that operation lands, its own
-//! suite is where the `force` refusal and the forced deletion of an attached
-//! certificate get pinned.
+//! that is ATTACHED is refused without `force`. `CreateLoadBalancer` stores the
+//! certificate it was asked for unattached on purpose, so attaching one takes
+//! `AttachLoadBalancerTlsCertificate` — and that operation's own suite
+//! (`load_balancer_tls_certificate_attach.rs`) is where the `force` refusal and
+//! the forced deletion of an attached certificate are pinned.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

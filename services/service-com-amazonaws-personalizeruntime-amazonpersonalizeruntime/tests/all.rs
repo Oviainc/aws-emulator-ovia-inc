@@ -25,6 +25,8 @@ mod score_denominator;
 mod state_roundtrip;
 #[path = "all/support.rs"]
 mod support;
+#[path = "all/tie_break_order.rs"]
+mod tie_break_order;
 #[path = "all/unbound_filter_values.rs"]
 mod unbound_filter_values;
 #[path = "all/unresolved_resource_arns.rs"]

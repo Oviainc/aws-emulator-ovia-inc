@@ -9,8 +9,10 @@
 //! `multiRegionProperties` configuration, whose peering is not established on
 //! both sides yet — and the `tags` / `kmsEncryptionKey` / `multiRegionProperties`
 //! / `policy` the caller supplied. A repeated `clientToken` with the same
-//! parameters returns the cluster the first call minted rather than minting a
-//! second one; the same token with different parameters is refused as a conflict.
+//! parameters mints no second cluster and answers with the RESULT the first call
+//! produced — the status it reported and the configuration it reported, not the
+//! ones the clock and a later `UpdateCluster` have left on the cluster since;
+//! the same token with different parameters is refused as a conflict.
 //! A `multiRegionProperties.witnessRegion` naming the request's OWN Region — the
 //! Region the minted cluster belongs to — is refused with `ValidationException`
 //! (400) and nothing is created, as is a `multiRegionProperties.clusters` naming
@@ -297,16 +299,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             {
                 crate::state::TokenVerdict::Replay(recorded) => {
                     if let Some(existing) = state.clusters.get(&recorded.resource) {
-                        let mut answer = created_cluster_output(existing);
-                        // Every other member of the answer is a field of the
-                        // cluster this call minted and cannot change, but its
-                        // status can have moved on since — through the clock or
-                        // a later `UpdateCluster` — and that is not what this
-                        // request answered, so the recorded status stands.
-                        if let Some(status) = recorded.answered(crate::state::STATUS_MEMBER) {
-                            answer.status = status.to_string();
-                        }
-                        return Ok(answer);
+                        // The members a later call can write again — the status
+                        // the clock moves on, and the configuration
+                        // `UpdateCluster` replaces — are not read off the live
+                        // cluster: they are what the FIRST call answered, kept
+                        // with the token. Only the cluster's minted identity is
+                        // rendered from its stored record.
+                        let Some(answered) =
+                            crate::state::RecordedClusterCreation::from_record(&recorded)
+                        else {
+                            // A served create always keeps what it answered, so
+                            // there is nothing to serve here and nothing this
+                            // request may mint in its place.
+                            return Err(CreateClusterErrorModeled::InternalServerException(
+                                InternalServerException {
+                                    message: "the recorded result of this request is unavailable"
+                                        .to_string(),
+                                    retry_after_seconds: None,
+                                },
+                            )
+                            .into());
+                        };
+                        return Ok(replayed_cluster_output(existing, answered));
                     }
                 }
                 crate::state::TokenVerdict::Mismatch => {
@@ -383,14 +397,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let created = created_cluster_output(&cluster);
         state.clusters.insert(identifier.clone(), cluster);
         if let Some(token) = input.client_token {
+            let answered = crate::state::RecordedClusterCreation {
+                status: created.status.clone(),
+                deletion_protection_enabled: created.deletion_protection_enabled,
+                encryption_details: created.encryption_details.clone(),
+                multi_region_properties: created.multi_region_properties.clone(),
+            };
             state
                 .tokens(crate::state::TokenScope::CreateCluster)
-                .record(
-                    token,
-                    fingerprint,
-                    crate::state::RecordedCall::new(&identifier)
-                        .answering(crate::state::STATUS_MEMBER, &created.status),
-                );
+                .record(token, fingerprint, answered.into_record(&identifier));
         }
         Ok(created)
     }
@@ -410,9 +425,8 @@ fn create_fingerprint(input: &CreateClusterInput) -> String {
     ])
 }
 
-/// `CreateClusterOutput` read off a persisted cluster: every member of the output
-/// is a field of the stored record, so a repeat of an idempotent call renders the
-/// same answer from the same state.
+/// `CreateClusterOutput` for the call that MINTS the cluster, read off the
+/// record it just persisted.
 fn created_cluster_output(cluster: &crate::state::Cluster) -> CreateClusterOutput {
     CreateClusterOutput {
         identifier: cluster.identifier.clone(),
@@ -423,5 +437,31 @@ fn created_cluster_output(cluster: &crate::state::Cluster) -> CreateClusterOutpu
         encryption_details: cluster.encryption_details.clone(),
         deletion_protection_enabled: cluster.deletion_protection_enabled,
         endpoint: cluster.endpoint.clone(),
+    }
+}
+
+/// `CreateClusterOutput` for a RETRY the ledger recognised: the result the
+/// original call produced.
+///
+/// The cluster's minted identity — `identifier`, `arn`, `creationTime` and the
+/// `endpoint` derived from the identifier — is fixed for its whole life, so it
+/// is rendered from the stored record; every member a later call can write again
+/// comes from what the original call answered
+/// ([`crate::state::RecordedClusterCreation`]), because the live cluster's
+/// configuration is not that result once an `UpdateCluster` or the clock has
+/// changed it.
+fn replayed_cluster_output(
+    cluster: &crate::state::Cluster,
+    answered: crate::state::RecordedClusterCreation,
+) -> CreateClusterOutput {
+    CreateClusterOutput {
+        identifier: cluster.identifier.clone(),
+        arn: cluster.arn.clone(),
+        creation_time: ::aws_smithy_types::DateTime::from(cluster.creation_time),
+        endpoint: cluster.endpoint.clone(),
+        status: answered.status,
+        multi_region_properties: answered.multi_region_properties,
+        encryption_details: answered.encryption_details,
+        deletion_protection_enabled: answered.deletion_protection_enabled,
     }
 }

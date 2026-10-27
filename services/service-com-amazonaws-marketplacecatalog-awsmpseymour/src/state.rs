@@ -208,6 +208,57 @@ pub const ENTITY_TYPES: &[&str] = &[
     "SaaSProduct",
 ];
 
+/// The change types this catalog performs — what a `Change$ChangeType` is
+/// checked against, beyond the characters `ChangeType`'s `@pattern` admits.
+///
+/// `ChangeType` is "single string values that describe your intention for the
+/// change. Each change type is unique for each `EntityType` provided in the
+/// change's scope", and the model constrains only their syntax
+/// (`^[A-Z][\w]*$`, `smithy_query(query="shape", shape="Change")`), pointing at
+/// the reference pages for each kind of entity ("Working with single-AMI
+/// products", "Working with container products", and the offer and resale
+/// authorization pages beside them) for the values themselves. Those pages are
+/// where the catalogue below is read off.
+///
+/// It is read as ONE set — the change types this catalog performs — rather than
+/// as a change type per entity type: the pages publish a set per PRODUCT and
+/// name none at all for several of the types this catalog serves
+/// ([`ENTITY_TYPES`] has nine), so a per-type pairing is nowhere this service
+/// states it. What it does state either way is that a change type is the name of
+/// an intention the catalog can carry out, so a value naming none of them asks
+/// for no change this catalog can make, and is refused rather than stored as a
+/// change nothing could apply.
+pub const CHANGE_TYPES: &[&str] = &[
+    "AddDeliveryOptions",
+    "AddDimensions",
+    "AddInstanceTypes",
+    "AddRevisions",
+    "ChangeVisibility",
+    "CreateOffer",
+    "CreateProduct",
+    "CreateResaleAuthorization",
+    "ReleaseOffer",
+    "ReleaseProduct",
+    "ReleaseResaleAuthorization",
+    "RestrictDeliveryOptions",
+    "RestrictDimensions",
+    "RestrictInstanceTypes",
+    "RestrictOffer",
+    "RestrictProduct",
+    "RestrictResaleAuthorization",
+    "RestrictRevisions",
+    "UpdateAvailability",
+    "UpdateDeliveryOptions",
+    "UpdateDimensions",
+    "UpdateInformation",
+    "UpdateLegalTerms",
+    "UpdatePricingTerms",
+    "UpdateRenewalTerms",
+    "UpdateSupportTerms",
+    "UpdateTargeting",
+    "UpdateValidityTerms",
+];
+
 /// The resource type segment a CHANGE SET's ARN carries, as
 /// [`change_set_arn`] writes it. An entity's ARN carries its `EntityType`
 /// there instead, which is how one resource ARN form names both.
@@ -397,6 +448,17 @@ pub const DELIVERY_OPTION_ID_PREFIX: &str = "do-";
 /// the same way whether it carries its work as changes or as delivery options. A
 /// change past it is refused ([`too_many_delivery_options`]) rather than stored.
 pub const MAX_DELIVERY_OPTIONS_PER_CHANGE: usize = 20;
+
+/// How many changes one change set carries: `RequestedChangeList` is
+/// `@length(min: 1, max: 20)`.
+///
+/// The modelled bound, re-stated here because `StartChangeSet` re-reads it
+/// before it allocates or scans from the submitted count: that count is what
+/// sizes the scan for a repeated change pair and the records the call leaves in
+/// the store, so the work and the state one request leaves behind stay bounded
+/// by this constant and not by the list the request sent. A request past it is
+/// refused ([`too_many_changes`]).
+pub const MAX_CHANGES_PER_CHANGE_SET: usize = 20;
 
 /// How many assessments the store holds.
 ///
@@ -1846,6 +1908,18 @@ pub fn delivery_option_count(details: &Value) -> Option<usize> {
     )
 }
 
+/// The modelled `ValidationException` payload for a change set carrying more
+/// changes than [`MAX_CHANGES_PER_CHANGE_SET`] — built from the request: the
+/// count it carried and the bound it passed.
+pub fn too_many_changes(count: usize) -> ValidationException {
+    validation(
+        "ChangeSet",
+        format!(
+            "a change set carries at most {MAX_CHANGES_PER_CHANGE_SET} changes, not {count}"
+        ),
+    )
+}
+
 /// The modelled `ValidationException` payload for a change submitting more
 /// delivery options than [`MAX_DELIVERY_OPTIONS_PER_CHANGE`] — built from the
 /// request: the count it carried and the bound it passed.
@@ -2898,6 +2972,23 @@ pub fn is_entity_type(value: &str) -> bool {
 /// tell the caller to satisfy — the set in [`ENTITY_TYPES`] is what it failed.
 pub fn invalid_entity_type(entity_type: &str) -> ValidationException {
     validation_message(format!("Requested entity type '{entity_type}' is invalid."))
+}
+
+/// Whether `value` names one of the change types this catalog performs
+/// ([`CHANGE_TYPES`]).
+pub fn is_change_type(value: &str) -> bool {
+    CHANGE_TYPES.contains(&value)
+}
+
+/// The modelled `ValidationException` payload for a `Change$ChangeType` this
+/// catalog performs no such change for.
+///
+/// Stated like [`invalid_entity_type`], and for the same reason: the value may
+/// well satisfy `ChangeType`'s `@pattern` and still name no change, so there is
+/// no syntax to tell the caller to satisfy — the set in [`CHANGE_TYPES`] is what
+/// it failed.
+pub fn invalid_change_type(change_type: &str) -> ValidationException {
+    validation_message(format!("Requested change type '{change_type}' is invalid."))
 }
 
 /// The entity type a `Change$Entity$Type` names: everything before the optional

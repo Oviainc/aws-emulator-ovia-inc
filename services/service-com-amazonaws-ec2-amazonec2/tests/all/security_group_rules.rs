@@ -1273,6 +1273,141 @@ async fn a_rule_a_request_named_is_charged_and_the_delete_gives_it_back() {
     );
 }
 
+/// A rule that REFERENCES another group is charged for every member of that reference the
+/// record retains — not only the group's id and owner, but the VPC, the peering connection
+/// and the peering status a grant may name — and the delete gives all of it back.
+///
+/// The rows differ in which of those members the grant carries and in how long they are, so
+/// no one shape of reference is the specification: a member counted by the stored record but
+/// not by the charge would let a caller grow the store past
+/// [`ec2::state::MAX_STORED_BYTES`] while the accounted total barely moved.
+#[tokio::test]
+async fn a_rule_referencing_a_group_is_charged_for_every_member_it_retains() {
+    let (router, engine) = super::ec2_query::emulator();
+    let budget = || engine.state::<Ec2State>().lock().stored_bytes();
+    let vpc_id = engine
+        .state::<Ec2State>()
+        .lock()
+        .vpcs
+        .values()
+        .find(|vpc| vpc.is_default == Some(true))
+        .and_then(|vpc| vpc.vpc_id.clone())
+        .expect("a fresh account has its default VPC");
+
+    let before_all = budget();
+    let (status, body) = super::ec2_query::call(
+        &router,
+        REGION,
+        "CreateSecurityGroup",
+        &[
+            param("GroupName", "charged-references"),
+            param("GroupDescription", "the group the referencing rules belong to"),
+            param("VpcId", &vpc_id),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the create must succeed, got {status} with body {body}"
+    );
+    let group_id =
+        element(&body, "groupId").expect("CreateSecurityGroup reports the group it minted");
+
+    // (case, the grant the permission names)
+    let cases: Vec<(&str, UserIdGroupPair)> = vec![
+        (
+            "the group's id and owner only",
+            UserIdGroupPair {
+                group_id: Some("sg-0123456789abcdef0".to_string()),
+                user_id: Some(account_id()),
+                group_name: None,
+                description: None,
+                vpc_id: None,
+                vpc_peering_connection_id: None,
+                peering_status: None,
+            },
+        ),
+        (
+            "a reference naming the VPC and a name",
+            UserIdGroupPair {
+                group_id: Some("sg-0123456789abcdef1".to_string()),
+                user_id: Some(account_id()),
+                group_name: Some("the-referenced-group".to_string()),
+                description: Some("an audited peer".to_string()),
+                vpc_id: Some(vpc_id.clone()),
+                vpc_peering_connection_id: None,
+                peering_status: None,
+            },
+        ),
+        (
+            "a peered reference naming every member",
+            UserIdGroupPair {
+                group_id: Some("sg-0123456789abcdef2".to_string()),
+                user_id: Some(account_id()),
+                group_name: Some("x".repeat(200)),
+                description: Some("y".repeat(180)),
+                vpc_id: Some(vpc_id.clone()),
+                vpc_peering_connection_id: Some(format!("pcx-{}", "0".repeat(400))),
+                peering_status: Some("active".to_string()),
+            },
+        ),
+    ];
+
+    for (index, (case, pair)) in cases.into_iter().enumerate() {
+        let text = |value: &Option<String>| value.as_deref().map_or(0, str::len);
+        let expected = text(&pair.group_id)
+            + text(&pair.user_id)
+            + text(&pair.group_name)
+            + text(&pair.description)
+            + text(&pair.vpc_id)
+            + text(&pair.vpc_peering_connection_id)
+            + text(&pair.peering_status)
+            + STORED_RECORD_OVERHEAD_BYTES;
+        let permission = IpPermission {
+            ip_protocol: Some("tcp".to_string()),
+            from_port: Some(7000 + index as i32),
+            to_port: Some(7000 + index as i32),
+            user_id_group_pairs: Some(vec![pair]),
+            ..empty_permission()
+        };
+        let before = budget();
+        let minted = {
+            let store = engine.state::<Ec2State>();
+            let mut guard = store.lock();
+            guard.insert_security_group_rules(&group_id, false, &permission, &[], true, REGION)
+        };
+        assert_eq!(
+            minted.len(),
+            1,
+            "case {case:?}: one referenced group is one rule, got {minted:?}"
+        );
+        let charged = budget() - before;
+        assert_eq!(
+            charged, expected,
+            "case {case:?}: expected the store to charge {expected} bytes for every member the \
+             rule retains, it charged {charged}"
+        );
+    }
+
+    let (status, body) = super::ec2_query::call(
+        &router,
+        REGION,
+        "DeleteSecurityGroup",
+        &[param("GroupId", &group_id)],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the delete must succeed, got {status} with body {body}"
+    );
+    let after_delete = budget();
+    assert_eq!(
+        after_delete, before_all,
+        "expected the delete to give back exactly what the create and the inserts charged, \
+         the budget went from {before_all} to {after_delete}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Pagination, tokens and DryRun
 // ---------------------------------------------------------------------------
