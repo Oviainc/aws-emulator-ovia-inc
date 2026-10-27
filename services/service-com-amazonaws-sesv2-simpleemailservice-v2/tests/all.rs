@@ -57,6 +57,8 @@ mod email_identity_mail_from_attributes;
 mod email_identity_policies;
 #[path = "all/email_templates.rs"]
 mod email_templates;
+#[path = "all/export_jobs.rs"]
+mod export_jobs;
 #[path = "all/list_tenants.rs"]
 mod list_tenants;
 #[path = "all/message_insights.rs"]

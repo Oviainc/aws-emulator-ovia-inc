@@ -6,7 +6,8 @@
 //! below: the email-identity table, the contact-list table, the email-template
 //! table, the configuration-set
 //! table, the suppression-list table, the multi-region-endpoint table, the
-//! dedicated-IP table, the outbound-message log, the per-account send counters and
+//! dedicated-IP table, the export-job table, the outbound-message log, the
+//! per-account send counters and
 //! the account-level attributes. Nothing here is per-request scratch — the whole
 //! struct lives in the one shared engine (see [`service_state`]).
 
@@ -68,6 +69,27 @@ const EASY_DKIM_TOKEN_COUNT: usize = 3;
 
 /// Length of one Easy DKIM token, in characters.
 const EASY_DKIM_TOKEN_LEN: usize = 32;
+
+/// How long after an export job is created its `CREATED` -> `PROCESSING`
+/// transition becomes due.
+///
+/// "Export jobs run asynchronously. This operation returns a JobId. Call
+/// GetExportJob with that ID until JobStatus is COMPLETED, FAILED, or CANCELLED":
+/// real SES picks the run up and finishes it on its own schedule, which nothing here
+/// can observe, so the span is CHOSEN, not documented. It is the emulator's
+/// convention for a transition the clock owes, long enough that a caller which reads
+/// straight back still sees the job in the status it was created in. The due instant
+/// is stored on the record; nothing ever sleeps for it.
+pub const EXPORT_JOB_PROCESSING_SETTLE: Duration = Duration::from_secs(3);
+
+/// How long after an export job starts processing its `PROCESSING` -> `COMPLETED`
+/// transition becomes due, counted from the instant processing fell due — so a run
+/// is complete [`EXPORT_JOB_PROCESSING_SETTLE`] plus this after the job was created.
+///
+/// CHOSEN for the same reason as [`EXPORT_JOB_PROCESSING_SETTLE`], and deliberately
+/// not zero: a caller that reads straight after the run started still sees it
+/// processing. The due instant is stored on the record; nothing ever sleeps for it.
+pub const EXPORT_JOB_COMPLETION_SETTLE: Duration = Duration::from_secs(3);
 
 /// The window the account's sending quota is measured over: SES states the quota
 /// as `Max24HourSend`, "the maximum number of emails you can send in a 24-hour
@@ -698,6 +720,12 @@ pub struct ComAmazonawsSesv2SimpleemailserviceV2State {
     /// the only identity a dedicated IP has. Ordered, so `GetDedicatedIps`
     /// enumerates and pages deterministically.
     pub dedicated_ips: BTreeMap<String, DedicatedIpRecord>,
+    /// Export jobs, keyed by the `JobId` minted for them — the only name an export
+    /// job has, and the one every export-job operation addresses it by. Ordered, so
+    /// the table enumerates deterministically whatever order the jobs were created
+    /// in; the order a listing reports them in is
+    /// [`ExportJobRecord::listing_key`]'s.
+    pub export_jobs: BTreeMap<String, ExportJobRecord>,
     /// The outbound-message log, oldest first: one entry per accepted `SendEmail`.
     pub sent_messages: Vec<SentMessage>,
     /// Per-account send counters, bumped by `SendEmail`.
@@ -717,8 +745,8 @@ pub struct ComAmazonawsSesv2SimpleemailserviceV2State {
 
 impl ComAmazonawsSesv2SimpleemailserviceV2State {
     /// Materialise every transition the clock already owes at `now`: an identity's
-    /// verification, an endpoint's provisioning and the completion of an endpoint's
-    /// deletion.
+    /// verification, an endpoint's provisioning, the completion of an endpoint's
+    /// deletion and the progress of an export job's run.
     ///
     /// A reporting operation may call this: the transition was due at `now` whether
     /// or not anybody called, so applying it changes nothing a later caller would
@@ -729,6 +757,9 @@ impl ComAmazonawsSesv2SimpleemailserviceV2State {
         }
         for endpoint in self.multi_region_endpoints.values_mut() {
             endpoint.settle(now);
+        }
+        for job in self.export_jobs.values_mut() {
+            job.settle(now);
         }
         // A deletion that was due at `now` has completed, whether or not anybody
         // called, so the endpoint it was tearing down — and its name — are gone.
@@ -2919,6 +2950,123 @@ pub fn message_not_found(message_id: &str) -> String {
     format!("Message {message_id} does not exist.")
 }
 
+/// The status of an export job's run, from the model's `JobStatus` enum.
+///
+/// The enum also carries `FAILED` ("an error occurred during processing") and
+/// `CANCELLED`, neither of which anything here reaches: running an emulated export
+/// is bookkeeping and cannot fail, and a job only becomes `CANCELLED` when
+/// `CancelExportJob` cancels it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportJobStatus {
+    /// `CREATED`: "job has just been created".
+    Created,
+    /// `PROCESSING`: "job is processing".
+    Processing,
+    /// `COMPLETED`: "job has completed processing successfully".
+    Completed,
+}
+
+impl ExportJobStatus {
+    /// The modelled `JobStatus` value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "CREATED",
+            Self::Processing => "PROCESSING",
+            Self::Completed => "COMPLETED",
+        }
+    }
+}
+
+/// One export job: the kind of data the export draws on, how far its run has got,
+/// and when the job was created and completed.
+#[derive(Debug, Clone)]
+pub struct ExportJobRecord {
+    /// The `JobId` this record is keyed by, minted when the job was created and
+    /// stable for the life of the job.
+    pub job_id: String,
+    /// The `ExportSourceType` the job's data source is of, which is the source type
+    /// every read of the job reports (see `crate::ops::types::EXPORT_SOURCE_TYPE_VALUES`).
+    pub source_type: String,
+    /// How far the run has got.
+    pub status: ExportJobStatus,
+    /// When the job was created.
+    pub created_at: SystemTime,
+    /// When the `CREATED` -> `PROCESSING` transition falls due.
+    pub processing_due_at: SystemTime,
+    /// When the `PROCESSING` -> `COMPLETED` transition falls due.
+    pub completion_due_at: SystemTime,
+    /// When the run completed, once it has.
+    pub completed_at: Option<SystemTime>,
+}
+
+impl ExportJobRecord {
+    /// A job as a create stores it: just created, with both transitions of its run
+    /// already due at known instants.
+    pub fn new(job_id: String, source_type: &str, now: SystemTime) -> Self {
+        let processing_due_at = now.checked_add(EXPORT_JOB_PROCESSING_SETTLE).unwrap_or(now);
+        Self {
+            job_id,
+            source_type: source_type.to_string(),
+            status: ExportJobStatus::Created,
+            created_at: now,
+            processing_due_at,
+            completion_due_at: processing_due_at
+                .checked_add(EXPORT_JOB_COMPLETION_SETTLE)
+                .unwrap_or(processing_due_at),
+            completed_at: None,
+        }
+    }
+
+    /// Apply whichever transitions of the run are due at `now`.
+    ///
+    /// Both are owed by the clock, so applying them changes nothing a later caller
+    /// would otherwise have seen — and a run whose whole span has already elapsed
+    /// settles straight to `COMPLETED` rather than one status per call.
+    pub fn settle(&mut self, now: SystemTime) {
+        if self.status == ExportJobStatus::Created && now >= self.processing_due_at {
+            self.status = ExportJobStatus::Processing;
+        }
+        if self.status == ExportJobStatus::Processing && now >= self.completion_due_at {
+            self.status = ExportJobStatus::Completed;
+            // The run finished when it fell due, not when somebody first looked.
+            self.completed_at = Some(self.completion_due_at);
+        }
+    }
+
+    /// This job's position in a listing of the account's export jobs: the instant it
+    /// was created, then its id.
+    ///
+    /// The instant leads, so the listing is in creation order; the id breaks the tie,
+    /// so the order is total even for two jobs created in the same millisecond. The
+    /// key is a position rather than a record, which is what keeps a page token valid
+    /// when the job it names is no longer there.
+    pub fn listing_key(&self) -> String {
+        let millis = self
+            .created_at
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        // Fixed-width hexadecimal, so comparing two keys as text orders them the way
+        // comparing the instants they carry would.
+        format!("{millis:032x}:{}", self.job_id)
+    }
+
+    /// The modelled `ExportJobSummary` view of this record, as `ListExportJobs`
+    /// reports it.
+    pub fn summary(&self) -> crate::ops::types::ExportJobSummary {
+        crate::ops::types::ExportJobSummary {
+            job_id: Some(self.job_id.clone()),
+            export_source_type: Some(self.source_type.clone()),
+            job_status: Some(self.status.as_str().to_string()),
+            created_timestamp: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            // "The timestamp of when the export job was completed": a run that has
+            // not completed has no such instant, so the member is absent until it
+            // does.
+            completed_timestamp: self.completed_at.map(::aws_smithy_types::DateTime::from),
+        }
+    }
+}
+
 /// One accepted outbound message.
 #[derive(Debug, Clone)]
 pub struct SentMessage {
@@ -3448,6 +3596,9 @@ pub const TENANTS_PAGE_TOKEN_TAG: &str = "sesv2:tenants:";
 
 /// The tag `ListDedicatedIpPools`'s own tokens carry.
 pub const DEDICATED_IP_POOLS_PAGE_TOKEN_TAG: &str = "sesv2:dedicated-ip-pools:";
+
+/// The tag `ListExportJobs`'s own tokens carry.
+pub const EXPORT_JOBS_PAGE_TOKEN_TAG: &str = "sesv2:export-jobs:";
 
 /// Encode a `NextToken` that resumes the listing tagged `tag` after `last_returned`.
 ///
