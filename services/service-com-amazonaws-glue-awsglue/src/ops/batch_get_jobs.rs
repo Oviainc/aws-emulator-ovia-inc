@@ -10,6 +10,11 @@
 //! name no job holds is NOT an error: this operation answers 200 whatever the batch
 //! holds. A read only reads.
 //!
+//! Every name is resolved in the REGION this request is served in and in no other
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::job`]): a job definition exists only in
+//! the Region its create was served in, so a name some OTHER Region holds a job of is
+//! reported in `JobsNotFound` exactly like a name no Region holds one of.
+//!
 //! A batch carrying more names than [`MAX_BATCH_JOB_NAMES`] is refused with the modelled
 //! `InvalidInputException` before any name is looked up.
 //!
