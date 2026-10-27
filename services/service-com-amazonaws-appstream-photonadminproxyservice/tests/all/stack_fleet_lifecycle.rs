@@ -29,17 +29,20 @@ const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// One emulator: a shared engine, one mounted AppStream service, no signature checking
 /// (the tests assert service behaviour, not SigV4).
-struct Emulator {
+///
+/// Shared with the other suites in this target (`tests/all/update_stack.rs`), so every
+/// AppStream test drives the same front door.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
     region: String,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::in_region("us-east-1")
     }
 
-    fn in_region(region: &str) -> Self {
+    pub(crate) fn in_region(region: &str) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -53,7 +56,7 @@ impl Emulator {
     }
 
     /// Send one operation and return `(status, body)`.
-    async fn call(&self, operation: &str, body: Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, operation: &str, body: Value) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
@@ -89,7 +92,7 @@ impl Emulator {
     }
 
     /// Send an operation that must succeed, returning its body.
-    async fn ok(&self, case: &str, operation: &str, body: Value) -> Value {
+    pub(crate) async fn ok(&self, case: &str, operation: &str, body: Value) -> Value {
         let (status, payload) = self.call(operation, body).await;
         assert_eq!(
             status, 200,
@@ -100,7 +103,7 @@ impl Emulator {
 }
 
 /// The wire error code of a failure body (`__type`, possibly namespace-qualified).
-fn error_code(payload: &Value) -> String {
+pub(crate) fn error_code(payload: &Value) -> String {
     payload
         .get("__type")
         .and_then(Value::as_str)
@@ -112,7 +115,7 @@ fn error_code(payload: &Value) -> String {
 }
 
 /// Assert an operation failed with `status` and the wire error code `code`.
-async fn assert_error(
+pub(crate) async fn assert_error(
     emulator: &Emulator,
     case: &str,
     operation: &str,
