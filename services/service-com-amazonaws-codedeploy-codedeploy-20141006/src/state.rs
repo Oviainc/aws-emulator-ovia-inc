@@ -458,6 +458,10 @@ pub fn too_many_tags_message(projected: usize) -> String {
     )
 }
 
+/// `InvalidTagsToAddException` (HTTP 400): the shape every entry of a tag-KEY
+/// list has to have; see [`tag_key`] for the rule.
+pub const TAG_KEY_MALFORMED: &str = "A tag key cannot be an empty string";
+
 /// `InstanceNotRegisteredException` (HTTP 400) as the single-instance READER
 /// answers it: the host the request asked about, after the delimiter.
 ///
@@ -1007,6 +1011,16 @@ pub fn tag_key_value(tag: &Tag) -> Option<(&str, &str)> {
     (!key.is_empty()).then_some((key, value))
 }
 
+/// `key` when it is a tag key CodeDeploy accepts, `None` otherwise.
+///
+/// A list of tag KEYS carries the same keys a list of tags carries, so the rule
+/// [`tag_key_value`] applies to a tag's key applies to each entry of such a
+/// list: a key cannot be an empty string. An empty entry therefore identifies no
+/// tag of any resource, and is refused rather than silently skipped.
+pub fn tag_key(key: &str) -> Option<&str> {
+    (!key.is_empty()).then_some(key)
+}
+
 /// How many on-premises instance records the store keeps.
 ///
 /// CodeDeploy publishes no quota for registered on-premises instances, so this
@@ -1459,6 +1473,23 @@ pub fn set_tag(tags: &mut Vec<Tag>, key: &str, value: &str) {
             value: Some(value.to_string()),
         }),
     }
+}
+
+/// Drop the tag `key` from `tags`, whatever value it holds, answering whether
+/// the record carried it.
+///
+/// A tag of a resource is identified here by its KEY ALONE — "The Tag objects
+/// identified by the keys are disassociated from the resource"
+/// (`smithy_query(query="doc",shape="UntagResourceInput",member="TagKeys")`) —
+/// which is what distinguishes this from [`OnPremisesInstance::remove_tag`],
+/// where the caller names the key-value PAIR to remove. A key the record does
+/// not carry names no tag of it, so it removes nothing; the removal is
+/// therefore idempotent and matching is over the stored bytes, so a key outside
+/// ASCII is removed by the same rule as any other.
+pub fn remove_tag_key(tags: &mut Vec<Tag>, key: &str) -> bool {
+    let before = tags.len();
+    tags.retain(|tag| tag.key.as_deref() != Some(key));
+    tags.len() != before
 }
 
 /// Per-service state for com-amazonaws-codedeploy-codedeploy-20141006. A handler reaches it through [`with_state`].

@@ -79,6 +79,8 @@ mod read_response_collections;
 mod refusal_request_derived_identifiers;
 #[path = "all/refusal_sentence_templates.rs"]
 mod refusal_sentence_templates;
+#[path = "all/resource_tag_removal.rs"]
+mod resource_tag_removal;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
