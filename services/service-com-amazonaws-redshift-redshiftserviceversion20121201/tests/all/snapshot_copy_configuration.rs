@@ -45,16 +45,19 @@ struct EnableCase {
 
 /// The four members of a cluster's `ClusterSnapshotCopyStatus`, as a response
 /// carries them.
+///
+/// `pub(crate)` so a sibling suite about the SAME record reads it through this
+/// one reader rather than writing a second copy of it.
 #[derive(Debug, PartialEq, Eq)]
-struct CopyStatus {
-    destination_region: Option<String>,
-    retention_period: Option<String>,
-    manual_snapshot_retention_period: Option<String>,
-    snapshot_copy_grant_name: Option<String>,
+pub(crate) struct CopyStatus {
+    pub(crate) destination_region: Option<String>,
+    pub(crate) retention_period: Option<String>,
+    pub(crate) manual_snapshot_retention_period: Option<String>,
+    pub(crate) snapshot_copy_grant_name: Option<String>,
 }
 
 /// The grant every row that names one is configured with.
-const GRANT: &str = "copies-under-this-grant";
+pub(crate) const GRANT: &str = "copies-under-this-grant";
 
 /// The `<ClusterSnapshotCopyStatus>` a body carries, or `None` when it carries
 /// none.
@@ -62,7 +65,7 @@ const GRANT: &str = "copies-under-this-grant";
 /// The element is sliced out before its members are read because a `Cluster`
 /// carries a `ManualSnapshotRetentionPeriod` of its own: only the children of
 /// this element are the copy configuration.
-fn copy_status(body: &str) -> Option<CopyStatus> {
+pub(crate) fn copy_status(body: &str) -> Option<CopyStatus> {
     let open = "<ClusterSnapshotCopyStatus>";
     let close = "</ClusterSnapshotCopyStatus>";
     let start = body.find(open)? + open.len();
@@ -78,7 +81,7 @@ fn copy_status(body: &str) -> Option<CopyStatus> {
 }
 
 /// `EnableSnapshotCopy` with the members one row carries.
-async fn enable(
+pub(crate) async fn enable(
     emulator: &Emulator,
     cluster: &str,
     destination: &str,
@@ -108,7 +111,7 @@ fn optional_params(row: &EnableCase) -> Vec<(&'static str, &'static str)> {
 }
 
 /// `DescribeClusters` for one cluster.
-async fn describe(emulator: &Emulator, cluster: &str) -> Answer {
+pub(crate) async fn describe(emulator: &Emulator, cluster: &str) -> Answer {
     emulator
         .call("DescribeClusters", &[("ClusterIdentifier", cluster)])
         .await
@@ -116,13 +119,13 @@ async fn describe(emulator: &Emulator, cluster: &str) -> Answer {
 
 /// Create one cluster and wait out the clock-owed `creating` -> `available`
 /// transition, which is the state a configuration change needs it in.
-async fn available_cluster(emulator: &Emulator, identifier: &str) {
+pub(crate) async fn available_cluster(emulator: &Emulator, identifier: &str) {
     available_clusters(emulator, std::slice::from_ref(&identifier.to_string())).await;
 }
 
 /// Create every cluster a table's rows need, then wait the provisioning span
 /// out ONCE: the span is owed from each create, and the last one started it.
-async fn available_clusters(emulator: &Emulator, identifiers: &[String]) {
+pub(crate) async fn available_clusters(emulator: &Emulator, identifiers: &[String]) {
     for identifier in identifiers {
         let created = emulator.create_minimal(identifier).await;
         assert_eq!(
@@ -135,7 +138,7 @@ async fn available_clusters(emulator: &Emulator, identifiers: &[String]) {
 }
 
 /// Create the grant the rows that name one are configured with.
-async fn create_grant(emulator: &Emulator, name: &str) {
+pub(crate) async fn create_grant(emulator: &Emulator, name: &str) {
     let created = emulator
         .call("CreateSnapshotCopyGrant", &[("SnapshotCopyGrantName", name)])
         .await;
@@ -147,7 +150,7 @@ async fn create_grant(emulator: &Emulator, name: &str) {
 }
 
 /// Assert one refusal row: the answer's status and `<Code>`.
-fn assert_refused(case: &str, answer: &Answer, status: u16, code: &str) {
+pub(crate) fn assert_refused(case: &str, answer: &Answer, status: u16, code: &str) {
     assert_eq!(
         answer.status, status,
         "case {case}: expected status {status}, got {} with body {}",

@@ -205,6 +205,39 @@ async fn wait_for_state(emulator: &Emulator, region: &str, name: &str, want: &st
     }
 }
 
+/// One signed call to this service, which is all the shared certificate
+/// stand-up needs of this suite's harness.
+impl crate::distribution_certificate_attachment::SignedCall for Emulator {
+    async fn call_signed(
+        &self,
+        region: Option<&str>,
+        operation: &str,
+        body: Value,
+    ) -> (u16, Value) {
+        self.call(region, operation, body).await
+    }
+}
+
+/// Stand up every certificate `row`'s public domain names are keyed by, issued.
+///
+/// A container service's `publicDomainNames` is keyed by the name of the SSL/TLS
+/// certificate that secures the domains listed under it, and "You must create and
+/// validate an SSL/TLS certificate before you can use public domain names with
+/// your container service" — so a create naming one has to hold an issued
+/// certificate of that name first. The stand-up and the issuance wait are the ONE
+/// pair this test target holds (`distribution_certificate_attachment`), and the
+/// certificate it requests covers exactly the domains the row keys by it.
+async fn issue_row_certificates(emulator: &Emulator, row: &Row) {
+    for (certificate, domains) in row.public_domain_names {
+        crate::distribution_certificate_attachment::issue_certificate(
+            emulator,
+            certificate,
+            domains,
+        )
+        .await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The create/read table
 // ---------------------------------------------------------------------------
@@ -807,6 +840,7 @@ async fn a_container_service_reads_back_as_it_was_created() {
 
     for row in ROWS {
         let case = row.case;
+        issue_row_certificates(&emulator, row).await;
         let created = emulator.create(Some(row.region), create_body(row)).await;
         let token = assert_static_members(case, row, &created);
 

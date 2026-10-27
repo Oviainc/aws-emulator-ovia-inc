@@ -446,6 +446,112 @@ async fn an_unmodelled_sort_order_is_refused_in_codebuilds_own_words() {
     );
 }
 
+/// RULE: a request that addresses the webhook of a project carrying none is refused with
+/// 400 `ResourceNotFoundException` worded `Webhook does not exist for this project` —
+/// wholly fixed text that names neither the project nor its ARN, so the sentence is the
+/// same on every operation that resolves a project's webhook and for every way a project
+/// came to have none.
+///
+/// The table spans every source type a project can carry a webhook on — the providers
+/// that send repository events (`state::WEBHOOK_SOURCE_TYPES`) plus the runner webhook's
+/// own source type (`state::RUNNER_WEBHOOK_SOURCE_TYPE`) — each in both forms of absence
+/// (never connected, and connected then disconnected) and on both operations that
+/// address an existing webhook.
+#[tokio::test]
+async fn an_absent_webhook_is_refused_in_codebuilds_own_words() {
+    let router = emulator();
+
+    // Acting on the provider's half of a webhook needs an access token for it, which is
+    // its own refusal class (see `tests/all/webhook_access_token.rs`): hold one for every
+    // `ServerType` so every row below is decided by the absent webhook under test.
+    for server_type in state::WEBHOOK_SOURCE_TYPES {
+        let (status, body) = call(
+            &router,
+            "ImportSourceCredentials",
+            json!({
+                "serverType": server_type,
+                "authType": "PERSONAL_ACCESS_TOKEN",
+                "token": "an-access-token",
+                "shouldOverwrite": true,
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "ImportSourceCredentials ({server_type}): expected 200, got {status} with {body}"
+        );
+    }
+
+    let mut source_types: Vec<&str> = state::WEBHOOK_SOURCE_TYPES.to_vec();
+    source_types.push(state::RUNNER_WEBHOOK_SOURCE_TYPE);
+
+    for source_type in source_types {
+        // The only webhook a runner project takes is a runner one; every other source
+        // type takes the default, repository-event webhook.
+        let build_type = (source_type == state::RUNNER_WEBHOOK_SOURCE_TYPE)
+            .then_some(state::RUNNER_WEBHOOK_BUILD_TYPE);
+
+        for (form, connect_first) in [("never connected", false), ("disconnected", true)] {
+            let project = format!("hook-gone-{}-{form}", source_type.to_lowercase()).replace(' ', "-");
+            create_project_with_source(
+                &router,
+                &project,
+                json!({"type": source_type, "buildspec": "version: 0.2"}),
+            )
+            .await;
+
+            if connect_first {
+                let mut request = json!({"projectName": project});
+                if let (Value::Object(members), Some(build_type)) = (&mut request, build_type) {
+                    members.insert("buildType".to_string(), json!(build_type));
+                }
+                let (status, body) = call(&router, "CreateWebhook", request).await;
+                assert_eq!(
+                    status, 200,
+                    "CreateWebhook on a {source_type} project: expected 200, got {status} \
+                     with {body}"
+                );
+                let (status, body) =
+                    call(&router, "DeleteWebhook", json!({"projectName": project})).await;
+                assert_eq!(
+                    status, 200,
+                    "DeleteWebhook on a {source_type} project: expected 200, got {status} \
+                     with {body}"
+                );
+            }
+
+            // (operation, the request that addresses the project's webhook)
+            let requests: [(&str, Value); 2] = [
+                ("DeleteWebhook", json!({"projectName": project})),
+                (
+                    "UpdateWebhook",
+                    json!({"projectName": project, "rotateSecret": true}),
+                ),
+            ];
+            for (operation, body) in requests {
+                let case = format!("{operation} on a {source_type} project, {form}");
+                let stated = refusal(
+                    &router,
+                    &case,
+                    operation,
+                    body,
+                    "ResourceNotFoundException",
+                )
+                .await;
+                assert_eq!(
+                    stated, state::WEBHOOK_NOT_FOUND_MESSAGE,
+                    "case {case:?}: expected CodeBuild's absent-webhook sentence, got {stated:?}"
+                );
+                assert!(
+                    !stated.contains("arn:") && !stated.contains(&project),
+                    "case {case:?}: the sentence must name neither the project nor its ARN, \
+                     got {stated:?}"
+                );
+            }
+        }
+    }
+}
+
 /// RULE: a `sandboxId` that resolves to no sandbox of this account is refused with 400
 /// `ResourceNotFoundException` worded `Sandbox does not exist` — wholly fixed text that
 /// names no identifier, so no ARN for a resource that does not exist is disclosed and

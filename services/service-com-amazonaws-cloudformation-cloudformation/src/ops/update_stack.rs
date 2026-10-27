@@ -827,10 +827,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     None
                 }
                 Some(failure) => {
-                    // A resource an owning service refused: the update does not reach
-                    // UPDATE_COMPLETE, and the stack reports the summary of what failed
-                    // ([`crate::state::resource_failure_summary`]) — that service's own
-                    // refusal is on the failing resource's event.
+                    // The deployment could not be carried out: the update does not reach
+                    // UPDATE_COMPLETE, and the stack reports what failed
+                    // ([`crate::state::provisioning::Materialised::failure`]) — the
+                    // summary of the resources an owning service refused, whose own
+                    // refusals are on those resources' events, or CloudFormation's own
+                    // diagnostic where it refused the deployment before asking anybody.
                     let failed_at = ::std::time::SystemTime::now();
                     stack.fail_transition(failed_at, status::UPDATE_FAILED, failure.clone());
                     // Nothing to put back, or a caller that asked for the failed state to be

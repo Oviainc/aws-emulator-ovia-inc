@@ -254,6 +254,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut recommendation_summaries: Vec<RecommendationSummary> = Vec::new();
         let mut next_token = None;
+        // The catalog rows a caller can read, grouped by resource type: a caller sees them
+        // only once the analysis its enrollment started is due
+        // ([`crate::state::ComAmazonawsComputeoptimizerComputeoptimizerserviceState::visible_analysed_resources`]),
+        // so a just-enrolled account is summarised over no rows rather than over an analysis
+        // nothing has produced yet — the same gate the per-resource readers apply.
         for (resource_type, resources) in guard.analysed_resources_by_type(&account_id) {
             // A resource type this service names no `Finding` vocabulary for is not
             // summarised, rather than summarised with an invented one.

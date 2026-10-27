@@ -158,7 +158,7 @@ pub const MAX_POLICIES_PER_ACCOUNT: usize = 1_500;
 /// "IAM and STS character quotas" page gives "Managed policy size: 6,144
 /// characters" and states that IAM "doesn't count whitespace when calculating the
 /// size of a policy against this limitation", so the measure
-/// ([`managed_policy_characters`]) skips whitespace too.
+/// ([`policy_document_characters`]) skips whitespace too.
 pub const MAX_MANAGED_POLICY_CHARACTERS: usize = 6_144;
 
 /// How many versions one managed policy may carry. `CreatePolicyVersion`'s
@@ -210,23 +210,41 @@ pub const MAX_ACCESS_KEYS_PER_USER: usize = 2;
 /// "the error message describes the limit exceeded".
 pub const MAX_SIGNING_CERTIFICATES_PER_USER: usize = 2;
 
-/// The aggregate size, in characters, of all inline policies embedded in one IAM
-/// user. AWS's "IAM and STS quotas" page gives the quota "User policy size cannot
-/// exceed 2,048 characters"; a put that would carry the user past it is refused
-/// with `LimitExceededException`.
+/// The aggregate size, in non-whitespace characters, of all inline policies
+/// embedded in one IAM user. AWS's "IAM and STS quotas" page gives the quota "User
+/// policy size cannot exceed 2,048 characters" and states that IAM "doesn't count
+/// whitespace when calculating the size of a policy against this limitation", so
+/// the measure ([`policy_document_characters`]) skips whitespace; a put that would
+/// carry the user past the quota is refused with `LimitExceededException`.
 pub const MAX_USER_INLINE_POLICY_CHARACTERS: usize = 2_048;
 
-/// The aggregate size, in characters, of all inline policies embedded in one IAM
-/// role. AWS's "IAM and STS quotas" page gives the quota "Role policy size cannot
-/// exceed 10,240 characters"; a put that would carry the role past it is refused
-/// with `LimitExceededException`.
+/// The aggregate size, in non-whitespace characters, of all inline policies
+/// embedded in one IAM role. AWS's "IAM and STS quotas" page gives the quota "Role
+/// policy size cannot exceed 10,240 characters", measured the same way the other
+/// policy-size quotas are ([`policy_document_characters`]); a put that would carry
+/// the role past it is refused with `LimitExceededException`.
 pub const MAX_ROLE_INLINE_POLICY_CHARACTERS: usize = 10_240;
 
-/// The aggregate size, in characters, of all inline policies embedded in one IAM
-/// group. AWS's "IAM and STS quotas" page gives the quota "Group policy size
-/// cannot exceed 5,120 characters"; a put that would carry the group past it is
-/// refused with `LimitExceededException`.
+/// The aggregate size, in non-whitespace characters, of all inline policies
+/// embedded in one IAM group. AWS's "IAM and STS quotas" page gives the quota
+/// "Group policy size cannot exceed 5,120 characters", measured the same way the
+/// other policy-size quotas are ([`policy_document_characters`]); a put that would
+/// carry the group past it is refused with `LimitExceededException`.
 pub const MAX_GROUP_INLINE_POLICY_CHARACTERS: usize = 5_120;
+
+/// The aggregate RAW size, in characters, of the inline-policy documents this
+/// emulator retains for one entity.
+///
+/// The quotas above are measured with whitespace left out, so they do not bound the
+/// TEXT an entity's inline policies carry: a document that fits its quota may be
+/// formatted with any amount of whitespace, and every document is held verbatim so
+/// a read reports it exactly as it was embedded. This is the ceiling on that text,
+/// set to `policyDocumentType`'s own published maximum (`@length 1..131072`,
+/// `smithy_query(query="shape", shape="policyDocumentType")`) — the longest single
+/// document the service accepts at all — so one entity never retains more policy
+/// text than one document may carry, and a put that would carry it past this
+/// ceiling is refused with `LimitExceededException` instead of stored.
+pub const MAX_INLINE_POLICY_TEXT_CHARACTERS: usize = 131_072;
 
 /// How many sets of service-specific credentials one IAM user may hold for one
 /// supported service. `CreateServiceSpecificCredential`'s documentation: "You can
@@ -1864,27 +1882,28 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
         Some(collected)
     }
 
-    /// The aggregate size, in characters, of the inline policies embedded in the
-    /// user keyed by `user_key`, counting every policy except the one keyed by
-    /// `replacing` (a put of an existing name replaces that document rather than
-    /// adding to it).
+    /// What the inline policies embedded in the user keyed by `user_key` take up,
+    /// counting every policy except the one keyed by `replacing` (a put of an
+    /// existing name replaces that document rather than adding to it).
     ///
-    /// This is the measure IAM's user policy size quota
+    /// [`InlinePolicySize::measured`] is what IAM's user policy size quota
     /// ([`MAX_USER_INLINE_POLICY_CHARACTERS`]) is taken against.
-    pub fn user_inline_policy_characters(&self, user_key: &str, replacing: &str) -> usize {
-        inline_policy_characters(&self.user_inline_policies, user_key, replacing)
+    pub fn user_inline_policy_size(&self, user_key: &str, replacing: &str) -> InlinePolicySize {
+        inline_policy_size(&self.user_inline_policies, user_key, replacing)
     }
 
-    /// The same measure for the role keyed by `role_key`, the one IAM's role policy
-    /// size quota ([`MAX_ROLE_INLINE_POLICY_CHARACTERS`]) is taken against.
-    pub fn role_inline_policy_characters(&self, role_key: &str, replacing: &str) -> usize {
-        inline_policy_characters(&self.role_inline_policies, role_key, replacing)
+    /// The same, for the role keyed by `role_key`, whose measured size is what IAM's
+    /// role policy size quota ([`MAX_ROLE_INLINE_POLICY_CHARACTERS`]) is taken
+    /// against.
+    pub fn role_inline_policy_size(&self, role_key: &str, replacing: &str) -> InlinePolicySize {
+        inline_policy_size(&self.role_inline_policies, role_key, replacing)
     }
 
-    /// The same measure for the group keyed by `group_key`, the one IAM's group
-    /// policy size quota ([`MAX_GROUP_INLINE_POLICY_CHARACTERS`]) is taken against.
-    pub fn group_inline_policy_characters(&self, group_key: &str, replacing: &str) -> usize {
-        inline_policy_characters(&self.group_inline_policies, group_key, replacing)
+    /// The same, for the group keyed by `group_key`, whose measured size is what
+    /// IAM's group policy size quota ([`MAX_GROUP_INLINE_POLICY_CHARACTERS`]) is
+    /// taken against.
+    pub fn group_inline_policy_size(&self, group_key: &str, replacing: &str) -> InlinePolicySize {
+        inline_policy_size(&self.group_inline_policies, group_key, replacing)
     }
 
     /// The instance profile keyed by `profile_key` as a reader must report it: the
@@ -1943,29 +1962,39 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
     }
 }
 
-/// The aggregate size, in characters, of the inline policies `policies` holds for
-/// the entity keyed by `entity_key`, counting every policy except the one keyed by
-/// `replacing`.
+/// What a set of inline policies takes up: the size the policy-size quota is
+/// measured against, and the raw text the store retains for it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InlinePolicySize {
+    /// Non-whitespace characters, the measure IAM's policy-size quotas are taken
+    /// against ([`policy_document_characters`]).
+    pub measured: usize,
+    /// Raw characters, whitespace included: what the store holds, bounded by
+    /// [`MAX_INLINE_POLICY_TEXT_CHARACTERS`].
+    pub retained: usize,
+}
+
+/// What the inline policies `policies` holds for the entity keyed by `entity_key`
+/// take up, counting every policy except the one keyed by `replacing`.
 ///
 /// A put of an existing policy name REPLACES that document rather than adding to
-/// it, so the document being replaced does not count toward the quota the new one
-/// has to fit inside. One definition, shared by every entity kind that embeds
-/// inline policies.
-fn inline_policy_characters(
+/// it, so the document being replaced counts toward neither sum the new one has to
+/// fit inside. One definition, shared by every entity kind that embeds inline
+/// policies.
+fn inline_policy_size(
     policies: &BTreeMap<String, BTreeMap<String, InlinePolicy>>,
     entity_key: &str,
     replacing: &str,
-) -> usize {
-    policies
-        .get(entity_key)
-        .map(|policies| {
-            policies
-                .iter()
-                .filter(|(key, _)| key.as_str() != replacing)
-                .map(|(_, policy)| policy.policy_document.chars().count())
-                .sum()
-        })
-        .unwrap_or(0)
+) -> InlinePolicySize {
+    let mut size = InlinePolicySize::default();
+    let Some(policies) = policies.get(entity_key) else {
+        return size;
+    };
+    for (_, policy) in policies.iter().filter(|(key, _)| key.as_str() != replacing) {
+        size.measured += policy_document_characters(&policy.policy_document);
+        size.retained += policy.policy_document.chars().count();
+    }
+    size
 }
 
 /// The case-folded form of an IAM entity name, used as its key.
@@ -3812,11 +3841,14 @@ fn parse_xs_date_time(text: &str) -> Option<::aws_smithy_types::DateTime> {
     ))
 }
 
-/// The size a managed policy document is measured at against
-/// [`MAX_MANAGED_POLICY_CHARACTERS`]: its characters except whitespace, because
-/// AWS "doesn't count whitespace when calculating the size of a policy against
-/// this limitation".
-pub fn managed_policy_characters(document: &str) -> usize {
+/// The size a policy document is measured at against the policy-size quota of
+/// whatever it is embedded in or held as ([`MAX_MANAGED_POLICY_CHARACTERS`],
+/// [`MAX_USER_INLINE_POLICY_CHARACTERS`], [`MAX_ROLE_INLINE_POLICY_CHARACTERS`],
+/// [`MAX_GROUP_INLINE_POLICY_CHARACTERS`]): its characters except whitespace,
+/// because AWS "doesn't count whitespace when calculating the size of a policy
+/// against this limitation" — one measure, so a document that fits a quota fits it
+/// whichever operation stores it and however it is formatted.
+pub fn policy_document_characters(document: &str) -> usize {
     document.chars().filter(|c| !c.is_whitespace()).count()
 }
 

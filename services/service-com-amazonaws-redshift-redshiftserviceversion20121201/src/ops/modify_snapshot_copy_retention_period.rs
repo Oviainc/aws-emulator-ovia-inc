@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifySnapshotCopyRetentionPeriod
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifySnapshotCopyRetentionPeriod`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifySnapshotCopyRetentionPeriod::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Changes how long a cross-Region snapshot copy configuration keeps the copies
+//! it makes, and reports the cluster back. The configuration lives ON the
+//! cluster as its `ClusterSnapshotCopyStatus` (written by `EnableSnapshotCopy`),
+//! so this call rewrites exactly ONE of that record's two retention periods —
+//! the automated one by default, the manual one when the request sets the manual
+//! option — and leaves every other member of the configuration, and of the
+//! cluster, exactly as it stood. Every later read of the cluster reports the new
+//! period.
+//!
+//! Changing a standing instruction is not work done to the cluster, so the
+//! cluster stays [`crate::state::STATUS_AVAILABLE`]: this call owes the clock no
+//! transition, and the new period is in effect for whoever reads the cluster
+//! next.
+//!
+//! The preconditions are the ones the model states: the request must name an
+//! existing cluster, in the state that admits a configuration change, that HAS
+//! cross-region snapshot copy enabled; and the period must be inside the
+//! published range for the kind of snapshot it retains — the automated range
+//! ([`crate::state::snapshot_copy_retention_admitted`]) by default, the manual
+//! one ([`crate::state::manual_retention_admitted`]), which also admits the
+//! "retained indefinitely" sentinel, under the manual option.
 //!
 //! ## Shape of an operation
 //!
@@ -108,7 +121,10 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `ModifySnapshotCopyRetentionPeriodError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#ModifySnapshotCopyRetentionPeriod")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#ModifySnapshotCopyRetentionPeriod",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum ModifySnapshotCopyRetentionPeriodErrorModeled {
     ClusterNotFoundFault(ClusterNotFoundFault),
@@ -116,6 +132,7 @@ pub enum ModifySnapshotCopyRetentionPeriodErrorModeled {
     InvalidRetentionPeriodFault(InvalidRetentionPeriodFault),
     SnapshotCopyDisabledFault(SnapshotCopyDisabledFault),
     UnauthorizedOperation(UnauthorizedOperation),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -167,20 +184,134 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifySnapshotCopyRetentionPeriod` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifySnapshotCopyRetentionPeriodErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifySnapshotCopyRetentionPeriod"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                ModifySnapshotCopyRetentionPeriodErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+        store.settle(::std::time::Instant::now());
+
+        // The retention period is a member of a configuration held ON a cluster,
+        // so the cluster has to be there, and it has to be in the state that
+        // admits a configuration change.
+        let Some(position) = store.cluster_position(&input.cluster_identifier) else {
+            return Err(
+                ModifySnapshotCopyRetentionPeriodErrorModeled::ClusterNotFoundFault(
+                    ClusterNotFoundFault {
+                        message: Some(format!("Cluster {} not found.", input.cluster_identifier)),
+                    },
+                )
+                .into(),
+            );
+        };
+        let cluster_status = store.clusters[position]
+            .cluster
+            .cluster_status
+            .clone()
+            .unwrap_or_default();
+        if cluster_status != st::STATUS_AVAILABLE {
+            return Err(
+                ModifySnapshotCopyRetentionPeriodErrorModeled::InvalidClusterStateFault(
+                    InvalidClusterStateFault {
+                        message: Some(format!(
+                            "Cluster {} is in state {cluster_status}; it must be {} to change \
+                             the retention period of its cross-region snapshot copy.",
+                            input.cluster_identifier,
+                            st::STATUS_AVAILABLE
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "Must be the valid name of an existing cluster that has cross-region
+        // snapshot copy enabled": there is no retention period to change until
+        // the cluster carries a copy configuration, which is what
+        // `EnableSnapshotCopy` writes.
+        if store.clusters[position]
+            .cluster
+            .cluster_snapshot_copy_status
+            .is_none()
+        {
+            return Err(
+                ModifySnapshotCopyRetentionPeriodErrorModeled::SnapshotCopyDisabledFault(
+                    SnapshotCopyDisabledFault {
+                        message: Some(format!(
+                            "Cross-region snapshot copy is not enabled on cluster {}.",
+                            input.cluster_identifier
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Which kind of copied snapshot the period retains decides which range
+        // it has to be inside: the automated range by default, and under the
+        // manual option the manual range, whose only value below a day is the
+        // "retained indefinitely" sentinel.
+        let manual = input.manual.unwrap_or(false);
+        let period = input.retention_period;
+        let admitted = if manual {
+            st::manual_retention_admitted(period)
+        } else {
+            st::snapshot_copy_retention_admitted(period)
+        };
+        if !admitted {
+            let message = if manual {
+                format!(
+                    "Invalid value for RetentionPeriod: {period}. It must be either {} or an \
+                     integer between {} and {}.",
+                    st::MANUAL_RETENTION_INDEFINITE,
+                    st::MANUAL_RETENTION_BOUNDS.0,
+                    st::MANUAL_RETENTION_BOUNDS.1
+                )
+            } else {
+                format!(
+                    "Invalid value for RetentionPeriod: {period}. It must be a value from {} \
+                     to {}.",
+                    st::SNAPSHOT_COPY_RETENTION_BOUNDS.0, st::SNAPSHOT_COPY_RETENTION_BOUNDS.1
+                )
+            };
+            return Err(
+                ModifySnapshotCopyRetentionPeriodErrorModeled::InvalidRetentionPeriodFault(
+                    InvalidRetentionPeriodFault {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Exactly one period changes — "by default, this operation only changes
+        // the retention period of copied automated snapshots", and the manual
+        // option "change[s] only the retention periods of copied manual
+        // snapshots" — so the destination Region, the grant the copies are
+        // encrypted under and the OTHER period stand as they stood. Nothing the
+        // cluster DERIVES from its own configuration changes either.
+        let stored = &mut store.clusters[position];
+        if let Some(copy_status) = stored.cluster.cluster_snapshot_copy_status.as_mut() {
+            if manual {
+                copy_status.manual_snapshot_retention_period = Some(period);
+            } else {
+                copy_status.retention_period = Some(i64::from(period));
+            }
+        }
+
+        Ok(ModifySnapshotCopyRetentionPeriodOutput {
+            cluster: Some(stored.cluster.clone()),
+        })
     }
 }

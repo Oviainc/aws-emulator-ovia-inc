@@ -382,6 +382,134 @@ async fn a_refused_retention_change_leaves_the_window_as_it_was() {
     }
 }
 
+/// One row of the wording table: the window the stream carries when the call arrives, the
+/// direction and hour count the call asks for, and the sentence it must be refused with.
+struct Wording {
+    case: &'static str,
+    /// The window the stream carries when the call arrives — lengthened off the default
+    /// first when it differs from it.
+    carried: i32,
+    direction: Direction,
+    hours: i32,
+    says: &'static str,
+}
+
+/// The sentence a refused retention change carries is the service's own, fixed text and all.
+///
+/// Spelled out here in full rather than built from the same helper the handler uses, so a
+/// reworded refusal fails this test instead of agreeing with itself. The variable parts — the
+/// stream, the window asked for, the window carried and the published bound — are the row's,
+/// which is what makes the rows differ: both directions, both bounds, and the window the
+/// stream already carries.
+#[tokio::test]
+async fn a_refused_retention_change_is_worded_as_the_service_words_it() {
+    let rows: Vec<Wording> = vec![
+        Wording {
+            case: "wording-increase-that-shortens",
+            carried: 48,
+            direction: Direction::Increase,
+            hours: 36,
+            says: "Requested retention period (36 hours) for stream \
+                   wording-increase-that-shortens can not be shorter than existing retention \
+                   period (48 hours). Use DecreaseRetentionPeriod API.",
+        },
+        Wording {
+            case: "wording-increase-to-the-window-it-has",
+            carried: DEFAULT_RETENTION_PERIOD_HOURS,
+            direction: Direction::Increase,
+            hours: DEFAULT_RETENTION_PERIOD_HOURS,
+            says: "Requested retention period (24 hours) for stream \
+                   wording-increase-to-the-window-it-has can not be shorter than existing \
+                   retention period (24 hours). Use DecreaseRetentionPeriod API.",
+        },
+        Wording {
+            case: "wording-decrease-that-lengthens",
+            carried: 48,
+            direction: Direction::Decrease,
+            hours: 72,
+            says: "Requested retention period (72 hours) for stream \
+                   wording-decrease-that-lengthens can not be longer than existing retention \
+                   period (48 hours). Use IncreaseRetentionPeriod API.",
+        },
+        Wording {
+            case: "wording-decrease-to-the-window-it-has",
+            carried: DEFAULT_RETENTION_PERIOD_HOURS,
+            direction: Direction::Decrease,
+            hours: DEFAULT_RETENTION_PERIOD_HOURS,
+            says: "Requested retention period (24 hours) for stream \
+                   wording-decrease-to-the-window-it-has can not be longer than existing \
+                   retention period (24 hours). Use IncreaseRetentionPeriod API.",
+        },
+        Wording {
+            case: "wording-past-the-ceiling",
+            carried: DEFAULT_RETENTION_PERIOD_HOURS,
+            direction: Direction::Increase,
+            hours: MAX_RETENTION_PERIOD_HOURS + 1,
+            says: "Maximum allowed retention period is 8760 hours. Requested retention \
+                   period (8761 hours) is too long.",
+        },
+        Wording {
+            case: "wording-below-the-floor",
+            carried: 48,
+            direction: Direction::Decrease,
+            hours: MIN_RETENTION_PERIOD_HOURS - 1,
+            says: "Minimum allowed retention period is 24 hours. Requested retention period \
+                   (23 hours) is too short.",
+        },
+    ];
+
+    let emulator = Emulator::new();
+    for row in &rows {
+        emulator
+            .ok(
+                row.case,
+                "CreateStream",
+                &json!({ "StreamName": row.case, "ShardCount": 1 }),
+            )
+            .await;
+    }
+    tokio::time::sleep(past_activation()).await;
+
+    for row in &rows {
+        let case = row.case;
+        if row.carried != DEFAULT_RETENTION_PERIOD_HOURS {
+            emulator
+                .ok(
+                    case,
+                    "IncreaseStreamRetentionPeriod",
+                    &json!({ "StreamName": case, "RetentionPeriodHours": row.carried }),
+                )
+                .await;
+        }
+
+        let (status, response) = emulator
+            .call(
+                row.direction.operation(),
+                &json!({ "StreamName": case, "RetentionPeriodHours": row.hours }),
+            )
+            .await;
+        assert_eq!(
+            (status, error_code(&response).as_str()),
+            (400, "InvalidArgumentException"),
+            "case {case}: expected the modelled client error, got {status} with body \
+             {response}"
+        );
+        let message = error_message(&response);
+        assert_eq!(
+            message, row.says,
+            "case {case}: expected the sentence {:?}, got {message:?}",
+            row.says
+        );
+        let after = reported_retention(&emulator, case, case).await;
+        assert_eq!(
+            after,
+            i64::from(row.carried),
+            "case {case}: a refused change leaves the window at {}, got {after}",
+            row.carried
+        );
+    }
+}
+
 /// A request naming no stream at all is refused by the rule every stream operation applies,
 /// before any window is read or written.
 #[tokio::test]

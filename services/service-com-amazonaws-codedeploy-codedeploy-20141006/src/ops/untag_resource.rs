@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Disassociates tags from the CodeDeploy resource a `ResourceArn` names.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The ARN is read as the resource it identifies before anything is written, by
+//! the same rule the tag-writing and tag-reading operations read it: a value
+//! that is not in the ARN format is the modelled `InvalidArnException`, an ARN
+//! naming something these operations do not act on is
+//! `ArnNotSupportedException`, and an ARN whose resource the store does not hold
+//! is that resource kind's own DoesNotExist error. Each `TagKeys` entry
+//! identifies a tag of that resource by its KEY alone, so the tag goes whatever
+//! value it holds, and a key the resource does not carry removes nothing —
+//! disassociating a tag is idempotent. What is left is the list
+//! `ListTagsForResource` reports.
 //!
 //! ## Shape of an operation
 //!
@@ -120,6 +123,61 @@ impl From<UntagResourceErrorModeled> for UntagResourceError {
     }
 }
 
+/// The modelled refusal of a `ResourceArn` this service cannot read as one of
+/// the resources it tags; see [`crate::state::parse_tagged_resource_arn`].
+fn arn_refused(resource_arn: &str, refusal: crate::state::ArnRefusal) -> UntagResourceErrorModeled {
+    match refusal {
+        crate::state::ArnRefusal::Malformed => {
+            UntagResourceErrorModeled::InvalidArnException(InvalidArnException {
+                message: Some(crate::state::malformed_resource_arn_message(resource_arn)),
+            })
+        }
+        crate::state::ArnRefusal::Unsupported => {
+            UntagResourceErrorModeled::ArnNotSupportedException(ArnNotSupportedException {
+                message: Some(crate::state::resource_arn_not_supported_message(
+                    resource_arn,
+                )),
+            })
+        }
+    }
+}
+
+/// The modelled refusal for a resource the ARN named and the store does not
+/// hold: the error this operation declares for THAT resource kind.
+fn resource_missing(missing: crate::state::MissingResource) -> UntagResourceErrorModeled {
+    match missing {
+        crate::state::MissingResource::Application(name) => {
+            UntagResourceErrorModeled::ApplicationDoesNotExistException(
+                ApplicationDoesNotExistException {
+                    message: Some(crate::state::application_not_found(&name)),
+                },
+            )
+        }
+        crate::state::MissingResource::DeploymentGroup(name) => {
+            UntagResourceErrorModeled::DeploymentGroupDoesNotExistException(
+                DeploymentGroupDoesNotExistException {
+                    message: Some(crate::state::deployment_group_not_found(&name)),
+                },
+            )
+        }
+        crate::state::MissingResource::DeploymentConfig(name) => {
+            UntagResourceErrorModeled::DeploymentConfigDoesNotExistException(
+                DeploymentConfigDoesNotExistException {
+                    message: Some(crate::state::deployment_config_not_found(&name)),
+                },
+            )
+        }
+    }
+}
+
+/// `InvalidTagsToAddException` carrying `message`: the one error this operation
+/// models for a `TagKeys` list it will not act on.
+fn invalid_tags(message: String) -> UntagResourceErrorModeled {
+    UntagResourceErrorModeled::InvalidTagsToAddException(InvalidTagsToAddException {
+        message: Some(message),
+    })
+}
+
 /// The `UntagResource` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -156,18 +214,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let _ = ctx;
+        // `ResourceArn` is @required with a modelled length, so the boundary has
+        // already refused an absent or empty one in
+        // `ResourceArnRequiredException`'s words. What the ARN NAMES is this
+        // handler's to resolve, by the same rule the tag-writing and the
+        // tag-reading operations resolve it.
+        let resource_arn = input.resource_arn;
+        let resource = crate::state::parse_tagged_resource_arn(&resource_arn)
+            .map_err(|refusal| arn_refused(&resource_arn, refusal))?;
+
+        // `TagKeys` is modelled required but carries no `@length`, so an EMPTY
+        // list reaches here: it names no tag to disassociate, which is this
+        // service's `TagRequiredException`.
+        if input.tag_keys.is_empty() {
+            return Err(UntagResourceErrorModeled::TagRequiredException(TagRequiredException {
+                message: Some(crate::state::TAG_MISSING.to_string()),
+            })
+            .into());
+        }
+        // The per-resource tag bound is NOT a bound on this list: naming a key
+        // the resource does not carry removes nothing, so a list longer than
+        // what any resource holds is served rather than refused.
+        let mut keys: Vec<&str> = Vec::with_capacity(input.tag_keys.len());
+        for key in &input.tag_keys {
+            let Some(key) = crate::state::tag_key(key) else {
+                return Err(invalid_tags(crate::state::TAG_KEY_MALFORMED.to_string()).into());
+            };
+            keys.push(key);
+        }
+
+        crate::state::with_state(&*self.engine, |state| -> Result<(), UntagResourceErrorModeled> {
+            // Resolve the resource BEFORE removing anything, so a call refused
+            // for a resource the account does not hold untags nothing.
+            let stored = state.tags_of_mut(&resource).map_err(resource_missing)?;
+            for key in &keys {
+                // A key the resource does not carry names no tag of it, so it
+                // removes nothing and the call still succeeds: disassociating a
+                // tag is idempotent.
+                crate::state::remove_tag_key(stored, key);
+            }
+            Ok(())
+        })
+        .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE))??;
+
+        Ok(UntagResourceOutput {})
     }
 }
+

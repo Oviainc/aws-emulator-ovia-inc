@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! "Adds tags to a resource": the tags `TagsToAdd` carries are MERGED into the tag set
+//! of the resource `ResourceArn` names, held on THAT resource's own record in
+//! [`crate::state::ComAmazonawsGlueAwsglueState`] — a key the resource does not hold yet
+//! is added, a key it already holds takes the value this write sends, and every key the
+//! write does not name keeps the value it had. The merged set is what every later read
+//! reports (`GetTags`), so this write and that read address one record.
+//!
+//! The ARN is resolved through [`crate::state::parse_tagged_resource`] plus
+//! [`crate::state::ComAmazonawsGlueAwsglueState::resource_tags_mut`], the mutable half
+//! of the one resolution every tag read in this emulator goes through, so a write and a
+//! read of one ARN reach the same tag set. An ARN that names no taggable Glue resource at
+//! all earns the modelled client-input refusal, as does one naming another Region than the
+//! endpoint serving the request; one of a known kind this store holds no resource for
+//! earns the modelled `EntityNotFoundException`, as does one naming another account's
+//! estate. A refused write stores nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +151,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue Data Catalog store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // A `ResourceArn` this service tags NO resource of is a bad parameter, not a
+        // miss: the modelled constraint admits any Glue ARN, so the resource type it
+        // carries is what is checked here.
+        let Some(resource) = crate::state::parse_tagged_resource(&input.resource_arn) else {
+            return Err(TagResourceErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::invalid_resource_arn_message(
+                        &input.resource_arn,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+        let not_found = || {
+            TagResourceErrorModeled::EntityNotFoundException(EntityNotFoundException {
+                message: Some(crate::state::tagged_resource_not_found_message(
+                    &resource,
+                    &input.resource_arn,
+                )),
+                from_federation_source: None,
+            })
+        };
+
+        // A Glue resource belongs to the Region its ARN names, and this endpoint serves
+        // exactly one, so an ARN of another Region is a bad parameter rather than a
+        // reference to the same-named local resource — refused before the store is
+        // consulted at all.
+        if resource.region != crate::state::request_region(ctx.parts()) {
+            return Err(TagResourceErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::messages::ARN_WRONG_REGION.to_string()),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        let Some(tags) = store.resource_tags_mut(&resource) else {
+            return Err(not_found().into());
+        };
+
+        // A tag set holds at most one value per key, so what the merge would leave is
+        // the keys the resource already holds that this write does not name, plus the
+        // keys the write carries. Past the bound the WHOLE write is refused: a tag set
+        // the read that serves it could not report is not stored.
+        let kept = tags
+            .keys()
+            .filter(|key| !input.tags_to_add.contains_key(*key))
+            .count();
+        let would_hold = kept + input.tags_to_add.len();
+        if would_hold > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::tag_limit_exceeded_message(would_hold)),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+
+        for (key, value) in &input.tags_to_add {
+            tags.insert(key.clone(), value.clone());
+        }
+        ::tracing::info!(
+            operation = "TagResource",
+            resource_arn = %input.resource_arn,
+            added = input.tags_to_add.len(),
+            "added tags to a Glue resource"
+        );
+
+        // The response models no member: the merged tag set is what `GetTags` reports.
+        Ok(TagResourceOutput {})
     }
 }

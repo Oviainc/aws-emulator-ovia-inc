@@ -9660,6 +9660,11 @@ fn health_check_from_request(
 
 /// The public domain names `requested` carries, or a refusal when it carries more
 /// than [`MAX_PUBLIC_DOMAIN_NAMES`] of them.
+///
+/// This is the half of the rule the REQUEST decides on its own. Whether the
+/// certificate each group of names is keyed by is one the account holds and the
+/// certificate authority has issued is decided by the store — see
+/// [`ComAmazonawsLightsailLightsail20161128State::unusable_public_domain_certificate`].
 pub fn public_domain_names_from_request(
     requested: Option<&HashMap<String, Vec<String>>>,
 ) -> Result<BTreeMap<String, Vec<String>>, String> {
@@ -11201,25 +11206,52 @@ pub fn certificate_serial_number(id: &str) -> String {
         .join(":")
 }
 
-/// Why the certificate a request named is not one a distribution may serve
-/// HTTPS traffic with.
+/// Why the certificate a request named is not one the account may secure
+/// traffic with.
 ///
-/// The rule is the same whichever operation records the attachment — the create
-/// that names a certificate on a new distribution, or the attach that sets one
-/// later — so it is owned here, and each handler only renders the refusal in its
-/// own error channel. See
-/// [`ComAmazonawsLightsailLightsail20161128State::attachable_certificate`].
+/// The rule is the same whichever operation records the reference — the create
+/// that names a certificate on a new distribution, the attach that sets one
+/// later, or the container service that keys its public domain names by one — so
+/// it is owned here, and each handler only renders the refusal in its own error
+/// channel. See
+/// [`ComAmazonawsLightsailLightsail20161128State::issued_certificate`].
 #[derive(Debug, Clone)]
-pub enum CertificateNotAttachable {
+pub enum CertificateNotUsable {
     /// This account holds no certificate of that name: Lightsail's
     /// `DoesNotExist` envelope, built through
     /// [`crate::scaffolded::Scaffolded::resource_does_not_exist`] with
     /// [`RESOURCE_TYPE_CERTIFICATE`].
     DoesNotExist,
     /// The certificate exists but the certificate authority has not issued it,
-    /// so it secures nothing: the modelled `OperationFailureException`, whose
-    /// message this variant carries.
-    NotIssued(String),
+    /// so it secures nothing. The variant carries the `CertificateStatus` the
+    /// record is in, which is what the refusing operation's message names — see
+    /// [`certificate_not_issued_for_distribution`] and
+    /// [`certificate_not_issued_for_public_domain_names`].
+    NotIssued { status: &'static str },
+}
+
+/// Lightsail's message for a request that would make a certificate the
+/// certificate authority has not issued the one a distribution serves HTTPS
+/// traffic with: "Only certificates with a status of ISSUED can be attached to a
+/// distribution" (the modelled
+/// `AttachCertificateToDistribution$certificateName` documentation).
+pub fn certificate_not_issued_for_distribution(name: &str, status: &str) -> String {
+    format!(
+        "The certificate {name} is {status}: only certificates with a status of \
+         {CERTIFICATE_STATUS_ISSUED} can be attached to a distribution."
+    )
+}
+
+/// Lightsail's message for a request that would key a container service's public
+/// domain names by a certificate the certificate authority has not issued: "You
+/// must create and validate an SSL/TLS certificate before you can use public
+/// domain names with your container service" (the modelled
+/// `CreateContainerServiceRequest$publicDomainNames` documentation).
+pub fn certificate_not_issued_for_public_domain_names(name: &str, status: &str) -> String {
+    format!(
+        "The certificate {name} is {status}: you must create and validate an SSL/TLS \
+         certificate before you can use public domain names with your container service."
+    )
 }
 
 /// One stored SSL/TLS certificate: the request the caller made, the members the
@@ -13349,32 +13381,57 @@ impl ComAmazonawsLightsailLightsail20161128State {
         self.certificates.get(name)
     }
 
-    /// The certificate `name` names, when it is one a distribution may serve
-    /// HTTPS traffic with — the ONE owner of that rule.
+    /// The certificate `name` names, when it is one this account may secure
+    /// traffic with — the ONE owner of that rule.
     ///
-    /// A distribution's certificate has to be a certificate this account holds,
-    /// addressed by its exact name, and one the certificate authority has
-    /// already issued: "Only certificates with a status of ISSUED can be
-    /// attached to a distribution." Every operation that records a certificate
-    /// on a distribution asks here FIRST, so a request naming a certificate
-    /// this account does not hold, or one still being validated, is refused
-    /// before anything is written and no distribution record is left naming a
+    /// A certificate a resource of this account references has to be a
+    /// certificate this account holds, addressed by its exact name, and one the
+    /// certificate authority has already issued: "Only certificates with a
+    /// status of ISSUED can be attached to a distribution", and "You must create
+    /// and validate an SSL/TLS certificate before you can use public domain
+    /// names with your container service." Every operation that records a
+    /// certificate reference — on a distribution, or as the key of a container
+    /// service's public domain names — asks here FIRST, so a request naming a
+    /// certificate this account does not hold, or one still being validated, is
+    /// refused before anything is written and no record is left naming a
     /// certificate that secures nothing.
-    pub fn attachable_certificate(
+    pub fn issued_certificate(
         &self,
         name: &str,
-    ) -> Result<&StoredCertificate, CertificateNotAttachable> {
+    ) -> Result<&StoredCertificate, CertificateNotUsable> {
         let certificate = self
             .certificate(name)
-            .ok_or(CertificateNotAttachable::DoesNotExist)?;
+            .ok_or(CertificateNotUsable::DoesNotExist)?;
         if !certificate.is_issued() {
-            return Err(CertificateNotAttachable::NotIssued(format!(
-                "The certificate {name} is {}: only certificates with a status of {} can be \
-                 attached to a distribution.",
-                certificate.status, CERTIFICATE_STATUS_ISSUED
-            )));
+            return Err(CertificateNotUsable::NotIssued {
+                status: certificate.status,
+            });
         }
         Ok(certificate)
+    }
+
+    /// Why the public domain names `names` carries are not ones a container
+    /// service may serve, or `None` when every certificate they are keyed by is
+    /// one this account holds and the certificate authority has issued.
+    ///
+    /// A container service's `publicDomainNames` is keyed by the NAME of the
+    /// SSL/TLS certificate that secures the domains listed under it, so the
+    /// certificate that key names answers the same exists-and-issued rule a
+    /// distribution's certificate does — asked of the store's one owner of it,
+    /// [`Self::issued_certificate`]. Whichever operation records those names
+    /// asks here BEFORE its first write, so a refused request leaves no
+    /// container service reporting a domain under a certificate that secures
+    /// nothing. The map is ordered, so the certificate the refusal names is the
+    /// same one on every run.
+    pub fn unusable_public_domain_certificate(
+        &self,
+        names: &BTreeMap<String, Vec<String>>,
+    ) -> Option<(String, CertificateNotUsable)> {
+        names.keys().find_map(|certificate_name| {
+            self.issued_certificate(certificate_name)
+                .err()
+                .map(|refusal| (certificate_name.clone(), refusal))
+        })
     }
 
     /// Store a newly requested certificate.

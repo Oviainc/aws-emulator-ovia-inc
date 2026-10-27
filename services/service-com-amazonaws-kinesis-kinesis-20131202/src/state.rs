@@ -1575,8 +1575,8 @@ pub fn retention_period_too_short_message(requested_hours: i32) -> String {
 /// already carries: its member is "the new retention period of the stream, in hours. Must
 /// be more than the current retention period"
 /// (`IncreaseStreamRetentionPeriodInput$RetentionPeriodHours`), and shortening a window is
-/// the other operation's to serve. Built FROM the request and the stored record, so the
-/// window at fault and the one the stream carries both name it.
+/// the other operation's to serve, which the sentence names. Built FROM the request and the
+/// stored record, so the window at fault and the one the stream carries both name it.
 pub fn retention_period_not_longer_message(
     stream_identifier: &str,
     requested_hours: i32,
@@ -1584,8 +1584,8 @@ pub fn retention_period_not_longer_message(
 ) -> String {
     format!(
         "Requested retention period ({requested_hours} hours) for stream {stream_identifier} \
-         can not be shorter than existing value ({current_hours} hours). Use \
-         DecreaseStreamRetentionPeriod API."
+         can not be shorter than existing retention period ({current_hours} hours). Use \
+         DecreaseRetentionPeriod API."
     )
 }
 
@@ -1593,7 +1593,9 @@ pub fn retention_period_not_longer_message(
 /// already carries: its member is "the new retention period of the stream, in hours. Must
 /// be less than the current retention period"
 /// (`DecreaseStreamRetentionPeriodInput$RetentionPeriodHours`), and lengthening a window is
-/// the other operation's to serve.
+/// the other operation's to serve. The same sentence as
+/// [`retention_period_not_longer_message`] with the direction and the operation it names
+/// turned around: ONE wording for the one rule, in both directions.
 pub fn retention_period_not_shorter_message(
     stream_identifier: &str,
     requested_hours: i32,
@@ -1601,8 +1603,8 @@ pub fn retention_period_not_shorter_message(
 ) -> String {
     format!(
         "Requested retention period ({requested_hours} hours) for stream {stream_identifier} \
-         can not be longer than existing value ({current_hours} hours). Use \
-         IncreaseStreamRetentionPeriod API."
+         can not be longer than existing retention period ({current_hours} hours). Use \
+         IncreaseRetentionPeriod API."
     )
 }
 

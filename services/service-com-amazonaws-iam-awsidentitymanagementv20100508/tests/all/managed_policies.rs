@@ -66,7 +66,7 @@ fn document_of_size(nonspace: usize, whitespace: usize) -> String {
         " ".repeat(whitespace)
     );
     assert_eq!(
-        state::managed_policy_characters(&document),
+        state::policy_document_characters(&document),
         nonspace,
         "the fixture must measure exactly {nonspace} characters against the quota"
     );

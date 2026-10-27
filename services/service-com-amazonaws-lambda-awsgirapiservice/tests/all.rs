@@ -51,6 +51,8 @@ mod code_signing_config_update;
 mod code_signing_configs;
 #[path = "all/concurrency_quota_refusal_rules.rs"]
 mod concurrency_quota_refusal_rules;
+#[path = "all/durable_execution_bound.rs"]
+mod durable_execution_bound;
 #[path = "all/durable_execution_listing.rs"]
 mod durable_execution_listing;
 #[path = "all/event_source_mapping_deletion.rs"]
@@ -95,6 +97,8 @@ mod function_url_update;
 mod function_version_listing;
 #[path = "all/function_versions_by_capacity_provider.rs"]
 mod function_versions_by_capacity_provider;
+#[path = "all/functions_by_code_signing_config.rs"]
+mod functions_by_code_signing_config;
 #[path = "all/layer_listing.rs"]
 mod layer_listing;
 #[path = "all/layer_version_by_arn.rs"]
