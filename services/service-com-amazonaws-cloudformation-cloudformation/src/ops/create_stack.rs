@@ -732,8 +732,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => None,
                 Some(failure) => {
                     // A resource an owning service refused to create: the stack never
-                    // reaches CREATE_COMPLETE, and the reason reported is the one that
-                    // service gave.
+                    // reaches CREATE_COMPLETE, and it reports the summary of what failed
+                    // ([`crate::state::resource_failure_summary`]) — that service's own
+                    // refusal is on the failing resource's event.
                     let failed_at = ::std::time::SystemTime::now();
                     stack.fail_transition(failed_at, status::CREATE_FAILED, failure.clone());
                     // "ROLLBACK — Roll back the stack creation. This is the default": the

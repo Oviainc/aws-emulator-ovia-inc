@@ -397,6 +397,12 @@ mod sts_web_identity_federation;
 mod transcribe_signing_name_routing;
 #[path = "all/transfer_user_with_iam_role.rs"]
 mod transfer_user_with_iam_role;
+// Declared HERE, in this quiet span rather than at the head of this file, in its appended
+// tail or in the `b…` span of its own name: all three are where concurrently landing
+// suites put their line, so a declaration in any of them loses a squash merge to every
+// one of them, while these neighbouring lines are stable.
+#[path = "all/batch_job_state_change_reaches_matching_rules.rs"]
+mod batch_job_state_change_reaches_matching_rules;
 // Declared HERE, in sorted position in this quiet span, rather than at the head of this
 // file or in its appended tail: both of those are where every concurrently landing suite
 // puts its line, so a declaration there conflicts with all of them.

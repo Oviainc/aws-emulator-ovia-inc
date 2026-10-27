@@ -122,8 +122,12 @@ fn label(value: &str) -> String {
 }
 
 /// One definition naming `type_`, carrying `version` only when the case supplies one.
+/// Its parameters name somewhere to deploy to, which every accepted definition must.
 fn definition(type_: &str, version: Option<&str>) -> Value {
-    let mut definition = json!({ "Type": type_, "Parameters": { "TargetRegions": REGION } });
+    let mut definition = json!({
+        "Type": type_,
+        "Parameters": { "TargetOrganizationalUnits": "ou-1", "TargetRegions": REGION },
+    });
     if let Some(version) = version {
         definition["TypeVersion"] = json!(version);
     }

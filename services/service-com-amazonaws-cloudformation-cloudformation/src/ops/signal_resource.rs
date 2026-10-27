@@ -283,13 +283,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     } else {
                         // "A failure signal causes CloudFormation to immediately fail the
                         // stack creation or update": the operation does not reach the
-                        // terminal status it was headed for, and the reason names the
-                        // resource that failed and the signal that failed it.
-                        let reason = format!(
-                            "The following resource(s) failed to {}: [{}]. {}",
-                            if updating { "update" } else { "create" },
-                            input.logical_resource_id,
-                            signal_received(&input.status, &input.unique_id)
+                        // terminal status it was headed for, and the stack's reason is the
+                        // summary naming the resource that failed it — the signal itself is
+                        // what that resource's own event above reports.
+                        let reason = crate::state::resource_failure_summary(
+                            if updating {
+                                crate::state::failed_action::UPDATE
+                            } else {
+                                crate::state::failed_action::CREATE
+                            },
+                            [input.logical_resource_id.as_str()],
                         );
                         let failed_status = if updating {
                             status::UPDATE_FAILED

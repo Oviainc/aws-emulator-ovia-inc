@@ -2440,13 +2440,21 @@ impl PeeringRecord {
 
     /// The modelled `Peering` envelope of this record, as of `now`.
     pub fn to_peering(&self, now: SystemTime) -> Peering {
+        self.to_peering_with_state(self.state_at(now))
+    }
+
+    /// The modelled `Peering` envelope of this record in `state`: what a DELETE reports for
+    /// the record it has just removed, which is no longer stored and so has no state the
+    /// clock could compute. The same envelope every other read of a peering answers, so a
+    /// delete reports the peering it removed in full rather than a shell carrying only an id.
+    pub fn to_peering_with_state(&self, state: &str) -> Peering {
         Peering {
             core_network_id: Some(self.core_network_id.clone()),
             core_network_arn: Some(self.core_network_arn.clone()),
             peering_id: Some(self.id.clone()),
             owner_account_id: Some(::engine::emulator_account_id().to_string()),
             peering_type: Some(self.peering_type.to_string()),
-            state: Some(self.state_at(now).to_string()),
+            state: Some(state.to_string()),
             edge_location: Some(self.edge_location.clone()),
             resource_arn: Some(self.resource_arn.clone()),
             tags: Some(self.tags.clone()),
@@ -4007,6 +4015,29 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
                 | AttachmentDetail::SiteToSiteVpn
                 | AttachmentDetail::DirectConnectGateway { .. }
                 | AttachmentDetail::TransitGatewayRouteTable { .. } => false,
+            })
+            .count()
+    }
+
+    /// How many attachments are created over the peering `peering_id`, for the peering
+    /// delete refusal.
+    ///
+    /// A transit gateway route table attachment takes its core network and its edge location
+    /// from the peering it is created over
+    /// ([`AttachmentDetail::TransitGatewayRouteTable::peering_id`]) rather than from a
+    /// resource of its own, so that peering is a dependent of exactly the kind every other
+    /// delete of this service refuses to orphan.
+    pub fn attachment_count_over_peering(&self, peering_id: &str) -> usize {
+        self.attachments
+            .values()
+            .filter(|attachment| match &attachment.detail {
+                AttachmentDetail::TransitGatewayRouteTable {
+                    peering_id: over, ..
+                } => over == peering_id,
+                AttachmentDetail::Connect { .. }
+                | AttachmentDetail::Vpc { .. }
+                | AttachmentDetail::SiteToSiteVpn
+                | AttachmentDetail::DirectConnectGateway { .. } => false,
             })
             .count()
     }

@@ -270,6 +270,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(crate::state::resolve_encryption(Some(supplied)).map_err(invalid)?)
             }
         };
+        // "Tags" are among the settings a restore takes from the source table and this
+        // request can overwrite: a supplied `tagsOverride` replaces them, under the same
+        // per-resource tag rules `CreateTable` and `TagResource` apply. A supplied override
+        // is the WHOLE tag set of a table being created, so both of those rules — the
+        // reserved key prefix and the per-resource quota — are decided by the request
+        // alone, and so are decided here, before the store is reached: a tag the caller may
+        // not supply is refused the same way whether or not the source table exists.
+        let tags_override = match input.tags_override.as_deref() {
+            None => None,
+            Some(supplied) => Some(
+                crate::state::new_tag_set(Some(supplied)).map_err(|rejection| {
+                    let message = Some(rejection.message());
+                    match rejection.is_quota() {
+                        true => RestoreTableErrorModeled::ServiceQuotaExceededException(
+                            ServiceQuotaExceededException { message },
+                        ),
+                        false => RestoreTableErrorModeled::ValidationException(
+                            ValidationException { message },
+                        ),
+                    }
+                })?,
+            ),
+        };
 
         // The restore point. `restoreTimestamp` is an optional member, and a request that
         // names none asks for the most recent restorable point, which is this instant.
@@ -407,23 +430,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // table holds now. Which of them the restored table keeps depends on the TARGET
         // keyspace's replication group, resolved once that keyspace is known.
         let source_replica_specifications = source.replica_specifications.clone();
-        // "Tags" are among the settings a restore takes from the source table and this
-        // request can overwrite: a supplied `tagsOverride` replaces them, under the same
-        // per-resource tag rules `CreateTable` and `TagResource` apply.
-        let tags = match input.tags_override.as_deref() {
-            None => source.tags.clone(),
-            Some(supplied) => crate::state::new_tag_set(Some(supplied)).map_err(|rejection| {
-                let message = Some(rejection.message());
-                match rejection.is_quota() {
-                    true => RestoreTableErrorModeled::ServiceQuotaExceededException(
-                        ServiceQuotaExceededException { message },
-                    ),
-                    false => RestoreTableErrorModeled::ValidationException(ValidationException {
-                        message,
-                    }),
-                }
-            })?,
-        };
+        // The tags the restored table lands with: the ones this request supplied, already
+        // checked above, or — where it supplied none — the source table's own as they
+        // stand.
+        let tags = tags_override.unwrap_or_else(|| source.tags.clone());
 
         // "Any number of users can execute up to 4 concurrent restores (any type of
         // restore) in a given account": past that the account is out of the quota this

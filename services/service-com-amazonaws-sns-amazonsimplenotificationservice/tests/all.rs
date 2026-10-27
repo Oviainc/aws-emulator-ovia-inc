@@ -38,6 +38,9 @@ mod fifo_message_deduplication;
 #[path = "all/fifo_topic_deduplication_attribute.rs"]
 mod fifo_topic_deduplication_attribute;
 
+#[path = "all/filter_policy_delivery.rs"]
+mod filter_policy_delivery;
+
 #[path = "all/filter_policy_parse_diagnostic.rs"]
 mod filter_policy_parse_diagnostic;
 

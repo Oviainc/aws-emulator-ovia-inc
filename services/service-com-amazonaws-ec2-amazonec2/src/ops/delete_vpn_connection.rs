@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteVpnConnection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteVpnConnection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteVpnConnection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts the deletion of a Site-to-Site VPN connection this account holds: the connection
+//! reaches the non-terminal `deleting` state the clock then owes `deleted`, through
+//! [`crate::state::VpnConnectionRecord::begin_deletion`], so what a later
+//! `DescribeVpnConnections` reports is this write itself.
+//!
+//! An id the account holds no connection for is refused rather than answered as a no-op, and
+//! nothing is written: the connection the account DOES hold is untouched.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +158,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteVpnConnection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteVpnConnectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteVpnConnection"))
+        // `ctx` carries request metadata only; this operation reads none of it — a VPN
+        // connection is named by id. The store is reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // "The ID of the VPN connection" (`DeleteVpnConnectionRequest$VpnConnectionId`) is
+        // `@required` AND `@clientOptional`, so a request that sends the field empty reaches
+        // this handler rather than the boundary's refusal. EC2 answers that with
+        // `MissingParameter`, which is a different claim from "no such connection".
+        if input.vpn_connection_id.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter vpnConnectionId",
+            ));
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+
+        // The clock first: a connection whose owed move has fallen due is already in the
+        // state it was owed, so what this call does is decided from the state the connection
+        // is ACTUALLY in rather than from the one the last writer left it in. The move was
+        // due at that instant whether or not anybody called.
+        store.materialize_due_transitions();
+
+        // "Deletes the specified VPN connection" (`DeleteVpnConnection`): an id this account
+        // holds no connection for is a refusal, not a no-op — resolved through the one place
+        // this crate resolves the connection an operation acts on.
+        let record = store.require_vpn_connection_mut(&input.vpn_connection_id)?;
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation"
+        // (`DeleteVpnConnectionRequest$DryRun`). Nothing has been written yet, and nothing
+        // is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The write itself: `deleting` now, with the clock owing `deleted`. A connection
+        // already on its way out is left exactly as it is, including the instant its move
+        // falls due at.
+        record.begin_deletion();
+
+        // The operation's modelled output shape is `Unit`, so a success carries nothing
+        // beyond the status.
+        Ok(DeleteVpnConnectionOutput)
     }
 }

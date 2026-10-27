@@ -33,7 +33,10 @@ use smithy_server_runtime::MultiServiceRouter;
 // The awsQuery encoder and the XML/Outputs readers this suite needs already exist in the
 // test binary's shared modules; they are shared rather than copied.
 use crate::cloudformation_provisions_stack_resources::{outputs_of, xml_text};
-use crate::query_wire::form_encode;
+use crate::query_wire::{elements, form_encode};
+use service_com_amazonaws_cloudformation_cloudformation::state::{
+    failed_action, resource_failure_summary,
+};
 
 /// The region every request here is signed for, and so the region the stack's resources
 /// and their ARNs belong to.
@@ -506,11 +509,23 @@ async fn a_group_the_owning_service_refuses_fails_the_stack() {
             Some("ROLLBACK_COMPLETE"),
             "case {case:?}: expected the failed create to be rolled back, got {body}"
         );
+        // The STACK's reason summarises which resource failed; the service's own refusal
+        // is reported on that resource's event.
         let reason = xml_text(&body, "StackStatusReason").unwrap_or_default();
+        assert_eq!(
+            reason,
+            resource_failure_summary(failed_action::CREATE, ["Registry"]),
+            "case {case:?}: expected the stack reason to summarise what failed, got \
+             {reason:?}"
+        );
+        let (_, events) =
+            cloudformation(&router, "DescribeStackEvents", &[("StackName", &stack_name)]).await;
         assert!(
-            reason.contains("Registry") && reason.contains("ValidationException"),
-            "case {case:?}: expected the reason to name the resource and the service's \
-             refusal, got {reason:?}"
+            elements(&events, "ResourceStatusReason")
+                .iter()
+                .any(|reported| reported.contains("Resource handler returned message:")),
+            "case {case:?}: expected the failing resource's event to carry the service's \
+             refusal, got {events}"
         );
 
         // The stack created nothing, so its deletion deletes nothing: the group the client
