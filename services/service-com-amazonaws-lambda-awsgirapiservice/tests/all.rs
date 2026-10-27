@@ -77,6 +77,12 @@ mod event_source_mapping_update;
 mod event_source_mapping_update_omitted_members;
 #[path = "all/event_source_mappings.rs"]
 mod event_source_mappings;
+// Declared in this span of the sorted list rather than at the head of this file or in its
+// appended tail: both of those are where concurrently landing suites put their line, so a
+// declaration there loses a squash merge to every one of them, while these neighbouring
+// lines are stable.
+#[path = "all/execution_role_resolution.rs"]
+mod execution_role_resolution;
 #[path = "all/function_aliases.rs"]
 mod function_aliases;
 #[path = "all/function_code_signing_association.rs"]

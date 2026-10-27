@@ -748,6 +748,46 @@ pub fn resolve_package_code(
     }
 }
 
+/// The service principal a function's execution role has to let assume it.
+///
+/// "The execution role grants the function permission to use Amazon Web Services
+/// services": the function RUNS AS that role, and it is this service that assumes it on
+/// the function's behalf, so the role's trust policy has to name this principal.
+pub const EXECUTION_ROLE_PRINCIPAL: &str = "lambda.amazonaws.com";
+
+/// Why a request naming an execution role this service cannot assume is refused.
+pub const ROLE_NOT_ASSUMABLE_MESSAGE: &str =
+    "The role defined for the function cannot be assumed by Lambda.";
+
+/// Whether IAM ANSWERED that `role_arn` is an execution role this service could not
+/// assume — this account's IAM holds no such role, or the trust policy the role carries
+/// does not let [`EXECUTION_ROLE_PRINCIPAL`] assume it.
+///
+/// A function RUNS AS the role the caller names, so every operation that STORES a
+/// function's execution role resolves it before it writes, and a request naming one this
+/// service cannot assume is refused with the operation's modelled 400 with nothing
+/// persisted. IAM is reached the way any emulated service reaches another: through the
+/// in-process callback ([`smithy_server_runtime::OperationContext::callback`]), so this
+/// crate names no other service crate.
+///
+/// `false` — do not refuse — for every case where nothing is KNOWN about the role: a value
+/// that names no IAM role of this account (another account's IAM is not this emulator's to
+/// ask), or an emulator with no IAM mounted to ask at all. A refusal has to be grounded in
+/// what IAM answered, never assumed.
+pub async fn execution_role_is_unassumable(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    role_arn: &str,
+) -> bool {
+    // The whole question — which role of this account the value names, what IAM answers
+    // about it, and whether the trust policy it carries admits a service principal — is
+    // the ONE reading every service that resolves a caller-supplied execution role shares
+    // (`service_common::iam_role::role_is_unassumable`), so this crate states only WHICH
+    // principal has to be admitted and WHICH operations ask.
+    ::service_common::iam_role::role_is_unassumable(ctx, region, role_arn, EXECUTION_ROLE_PRINCIPAL)
+        .await
+}
+
 /// One layer a function's execution environment holds.
 ///
 /// `FunctionConfiguration$Layers` reports "The function's layers" as the layer version's
