@@ -261,7 +261,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         // A session's status is derived from the statements that ran in it, so
-        // the transitions the clock already owes are materialised first.
+        // the outcomes their executions already reported are materialised first.
         store.materialise_due_transitions();
 
         let mut page: Vec<SessionData> = Vec::new();

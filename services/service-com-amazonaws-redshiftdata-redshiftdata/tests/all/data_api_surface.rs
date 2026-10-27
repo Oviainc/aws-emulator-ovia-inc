@@ -29,7 +29,8 @@ use serde_json::{json, Value};
 
 // The harness every suite in this crate drives the emulator through.
 use super::emulator::{
-    error_code, id_of, list, number, Emulator, LONGER_THAN_COMPLETION_SPAN, WAIT_SECONDS,
+    error_code, id_of, list, number, Emulator, LONGER_THAN_A_QUICK_STATEMENT, SLOW_SQL,
+    WAIT_SECONDS,
 };
 
 /// The connection every statement in this suite runs through unless it names
@@ -806,14 +807,15 @@ async fn a_statement_naming_only_a_session_runs_on_that_session_s_connection() {
 /// ran in it: BUSY while a statement of the session has not reached its
 /// terminal status, AVAILABLE once it has, and CLOSED once the session's
 /// `SessionTtl` has passed — at which point it can no longer run SQL.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_session_s_status_follows_its_statements_and_its_ttl() {
     let emulator = Emulator::new();
 
-    // Submitted without waiting, so the statement is still running when the
-    // session is listed: the session reports BUSY and names the statement.
+    // Submitted without waiting, and slow enough that it is really still
+    // running when the session is listed: the session reports BUSY and names
+    // the statement.
     let mut request = cluster();
-    request["Sql"] = json!("SELECT 1");
+    request["Sql"] = json!(SLOW_SQL);
     request["SessionKeepAliveSeconds"] = json!(300);
     let submitted = emulator.ok("ExecuteStatement", &request).await;
     let session = submitted["SessionId"]
@@ -836,9 +838,17 @@ async fn a_session_s_status_follows_its_statements_and_its_ttl() {
         "a BUSY session names the statement it is running, got {busy}"
     );
 
-    // Once the clock owes the statement its terminal status, the session is
-    // ready for the next one and names no statement.
-    tokio::time::sleep(LONGER_THAN_COMPLETION_SPAN).await;
+    // Once the statement's execution has finished, the session is ready for the
+    // next one and names no statement.
+    for _ in 0..50 {
+        let page = emulator
+            .ok("ListSessions", &json!({"SessionId": session}))
+            .await;
+        if list(&page, "Sessions")[0]["Status"] == "AVAILABLE" {
+            break;
+        }
+        tokio::time::sleep(LONGER_THAN_A_QUICK_STATEMENT).await;
+    }
     let available = emulator
         .ok("ListSessions", &json!({"SessionId": session}))
         .await;

@@ -4,7 +4,7 @@
 //! Enumerates the statements held in [`crate::state`], newest submission first,
 //! honouring the request's filters and paging with an opaque `NextToken` that names
 //! the submission the previous page stopped at. A reporting operation, so the only
-//! thing it writes is the status transition the clock has already made due.
+//! thing it writes is the outcome a statement's execution already reported.
 //!
 //! ## Shape of an operation
 //!
