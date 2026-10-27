@@ -197,6 +197,8 @@ mod state_roundtrip;
 mod user_attached_policies;
 #[path = "all/user_attached_policy_listing.rs"]
 mod user_attached_policy_listing;
+#[path = "all/user_group_listing.rs"]
+mod user_group_listing;
 #[path = "all/user_lifecycle.rs"]
 mod user_lifecycle;
 #[path = "all/user_permissions_boundary.rs"]

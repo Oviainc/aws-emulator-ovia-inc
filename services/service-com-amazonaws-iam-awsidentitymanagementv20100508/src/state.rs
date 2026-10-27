@@ -480,6 +480,14 @@ pub const MARKER_SCOPE_GROUPS: &str = "groups";
 /// the account's group collection: see [`group_members_marker_scope`].
 pub const MARKER_SCOPE_GROUP_MEMBERS: &str = "group-members";
 
+/// The marker scope of the groups ONE user belongs to, which `ListGroupsForUser`
+/// pages over. The user's key follows it, so a marker issued while paging one
+/// user's memberships names no position in another user's — and it is its OWN
+/// scope, the other way round from [`MARKER_SCOPE_GROUP_MEMBERS`], so a token
+/// issued while paging a group's members is not read as a position among a user's
+/// groups: see [`user_groups_marker_scope`].
+pub const MARKER_SCOPE_USER_GROUPS: &str = "user-groups";
+
 /// The marker scope of the account's instance profile collection, which
 /// `ListInstanceProfiles` pages over. It is its OWN scope, exactly as the user and
 /// role collections are, so a marker issued while paging another collection is not
@@ -2484,6 +2492,12 @@ pub fn role_attached_policies_marker_scope(role_key: &str) -> String {
 /// See [`MARKER_SCOPE_GROUP_MEMBERS`].
 pub fn group_members_marker_scope(group_key: &str) -> String {
     format!("{MARKER_SCOPE_GROUP_MEMBERS}:{group_key}")
+}
+
+/// The marker scope of the groups the user keyed by `user_key` belongs to.
+/// See [`MARKER_SCOPE_USER_GROUPS`].
+pub fn user_groups_marker_scope(user_key: &str) -> String {
+    format!("{MARKER_SCOPE_USER_GROUPS}:{user_key}")
 }
 
 /// The marker scope of the attachment set of the user keyed by `user_key`.

@@ -117,6 +117,9 @@ pub const DELETE_GROUP: &str = "iam:DeleteGroup";
 /// `iam:GetGroup`.
 pub const GET_GROUP: &str = "iam:GetGroup";
 
+/// `iam:ListGroupsForUser`.
+pub const LIST_GROUPS_FOR_USER: &str = "iam:ListGroupsForUser";
+
 /// `iam:ListUserTags`.
 pub const LIST_USER_TAGS: &str = "iam:ListUserTags";
 
