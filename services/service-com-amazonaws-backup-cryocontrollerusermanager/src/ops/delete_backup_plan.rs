@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteBackupPlan
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteBackupPlan`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteBackupPlan::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records the deletion of the plan the request names and answers with the
+//! identifiers of the version it deleted and the instant it recorded.
+//!
+//! "A backup plan can only be deleted after all associated selections of
+//! resources have been deleted" (the model's own doc, below), so a plan that
+//! still holds selections is refused with `InvalidRequestException` and nothing
+//! is recorded. The deleted plan stays READABLE — `GetBackupPlan` reports the
+//! `DeletionDate` recorded here, and `ListBackupPlans` takes an `IncludeDeleted`
+//! of its own — while the account stops holding it: its name is free again, and
+//! a second delete of the same plan answers `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +160,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteBackupPlan` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteBackupPlanErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteBackupPlan"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteBackupPlanErrorModeled::ServiceUnavailableException(ServiceUnavailableException {
+                message: Some("the backup vault store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        // A plan this account does not hold, and one whose deletion is already
+        // recorded, are the same condition: there is no live plan of that id to
+        // delete.
+        if store.live_backup_plan(&input.backup_plan_id).is_none() {
+            return Err(DeleteBackupPlanErrorModeled::ResourceNotFoundException(
+                crate::state::backup_plan_not_found(),
+            )
+            .into());
+        }
+        // "A backup plan can only be deleted after all associated selections of
+        // resources have been deleted": the plan still assigns resources, so the
+        // refusal is the one its STATE makes rather than an absent resource, and
+        // it tells the caller what to delete first.
+        let selections = store.backup_selections_of(&input.backup_plan_id).len();
+        if selections > 0 {
+            return Err(DeleteBackupPlanErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "Backup plan {} still holds {selections} resource selection(s); \
+                         all associated selections of resources must be deleted before \
+                         the backup plan can be deleted",
+                        input.backup_plan_id
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        let Some(plan) = store.backup_plans.get_mut(&input.backup_plan_id) else {
+            // Unreachable: the lookup above resolved the plan under this same
+            // lock. Answered as the absent resource it would be rather than
+            // reporting a deletion of a plan nothing holds.
+            return Err(DeleteBackupPlanErrorModeled::ResourceNotFoundException(
+                crate::state::backup_plan_not_found(),
+            )
+            .into());
+        };
+        plan.deletion_date = Some(now);
+        Ok(DeleteBackupPlanOutput {
+            backup_plan_id: Some(plan.plan_id.clone()),
+            backup_plan_arn: Some(plan.arn.clone()),
+            deletion_date: Some(::aws_smithy_types::DateTime::from(now)),
+            version_id: Some(plan.version_id.clone()),
+        })
     }
 }

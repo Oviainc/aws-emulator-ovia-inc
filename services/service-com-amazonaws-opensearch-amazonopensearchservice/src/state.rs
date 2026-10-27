@@ -1481,17 +1481,6 @@ pub fn attachment_outcome(active_at: Option<SystemTime>) -> (String, Option<Owed
     }
 }
 
-/// The `ResourceNotFoundException` payload for a `dataSourceArn` this account holds no
-/// data source under.
-///
-/// "The data source must be an Amazon OpenSearch Service domain", so an ARN naming no
-/// domain of this account names nothing that can be attached.
-pub fn data_source_not_found(data_source_arn: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: Some(format!("Data source not found: {data_source_arn}")),
-    }
-}
-
 /// The `ResourceNotFoundException` payload for an application and data source pair this
 /// account holds no attachment record for.
 pub fn attachment_not_found(id: &str, data_source_arn: &str) -> ResourceNotFoundException {

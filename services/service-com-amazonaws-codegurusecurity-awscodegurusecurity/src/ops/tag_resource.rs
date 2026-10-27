@@ -14,7 +14,9 @@
 //! A `resourceArn` label that is not a scan ARN never reaches here — the boundary
 //! validator refuses it against the `ScanNameArn` `@pattern`, and `crate::service`
 //! answers that refusal with HTTP 400 `BadRequestException`, the ARN parser's own code
-//! (see `crate::service::MALFORMED_ARN_MESSAGE`).
+//! (see `crate::service::MALFORMED_ARN_MESSAGE`). A label that IS a scan ARN but names
+//! no scan is answered by [`crate::state::scan_arn_lookup_fault`], the one composition
+//! this ARN-addressed surface words that outcome with.
 //!
 //! ## Shape of an operation
 //!
@@ -185,19 +187,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
+        // A well-formed scan ARN that names no scan is not reported as absent: the scan
+        // lookup behind this surface fails, so the call earns the retryable server fault
+        // ([`crate::state::scan_arn_lookup_fault`]).
         let Some(scan) = store.scan_by_arn_mut(&input.resource_arn) else {
-            return Err(TagResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    error_code: "ResourceNotFoundException".to_string(),
-                    message: format!(
-                        "no scan of this account is identified by {}",
-                        input.resource_arn
-                    ),
-                    resource_id: input.resource_arn.clone(),
-                    resource_type: "scan".to_string(),
-                },
-            )
-            .into());
+            return Err(crate::state::scan_arn_lookup_fault());
         };
 
         // The tags this call would leave on the scan: the keys it adds, plus the keys

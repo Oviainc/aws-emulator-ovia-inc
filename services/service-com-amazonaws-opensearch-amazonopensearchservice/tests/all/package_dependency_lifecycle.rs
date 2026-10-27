@@ -75,7 +75,12 @@ async fn dissociate(emulator: &Emulator, domain: &str, package_id: &str) -> Answ
 /// The `DomainPackageDetails` `ListPackagesForDomain` reports for `package_id`, or
 /// `None` where the listing no longer reports that package at all — read through the
 /// sibling suite's listing helper, so there is one copy of that read path.
-async fn listed(emulator: &Emulator, domain: &str, package_id: &str, case: &str) -> Option<Value> {
+pub(crate) async fn listed(
+    emulator: &Emulator,
+    domain: &str,
+    package_id: &str,
+    case: &str,
+) -> Option<Value> {
     packages_of_domain(emulator, domain, case)
         .await
         .into_iter()
@@ -101,7 +106,7 @@ fn reference_path(emulator: &Emulator, package_id: &str, case: &str) -> String {
 
 /// A domain and one AVAILABLE `TXT-DICTIONARY` package, with no association between
 /// them yet. Answers the `PackageID` the create minted.
-async fn domain_and_package(emulator: &Emulator, domain: &str, package: &str) -> String {
+pub(crate) async fn domain_and_package(emulator: &Emulator, domain: &str, package: &str) -> String {
     let package_id = create_package(emulator, package, PACKAGE_TYPE_TXT_DICTIONARY).await;
     create_baseline(emulator, domain).await;
     // The copy span `CreatePackage` leaves the package in `COPYING` for, and the
@@ -112,7 +117,12 @@ async fn domain_and_package(emulator: &Emulator, domain: &str, package: &str) ->
 
 /// Associate `package_id` with `domain` and wait for the association to be in place,
 /// answering the `ReferencePath` the call reported for it.
-async fn associated(emulator: &Emulator, domain: &str, package_id: &str, case: &str) -> String {
+pub(crate) async fn associated(
+    emulator: &Emulator,
+    domain: &str,
+    package_id: &str,
+    case: &str,
+) -> String {
     let answer = associate(emulator, domain, package_id).await;
     assert_eq!(
         answer.status, 200,
@@ -143,20 +153,20 @@ async fn associated(emulator: &Emulator, domain: &str, package_id: &str, case: &
 /// the setting's name, the component it sits in, how deep the analysis section is and
 /// whether the path names the package's directory or a file inside it — not along one
 /// recorded setting.
-struct UseRow {
-    case: &'static str,
-    index: &'static str,
+pub(crate) struct UseRow {
+    pub(crate) case: &'static str,
+    pub(crate) index: &'static str,
     /// The sentence the service answers when the file this row's path setting names
     /// cannot be read, pinned per row as the engine words it — the setting the schema
     /// carried, followed by the suffix the engine appends to whatever setting it was
     /// handed. It names that setting, so the row's setting is stated here rather than a
     /// second time beside it.
-    message: &'static str,
-    schema: fn(&str) -> Value,
+    pub(crate) message: &'static str,
+    pub(crate) schema: fn(&str) -> Value,
 }
 
 /// The table every case about a resolved package reference runs over.
-fn use_rows() -> Vec<UseRow> {
+pub(crate) fn use_rows() -> Vec<UseRow> {
     vec![
         UseRow {
             case: "a synonym filter naming the package's directory",

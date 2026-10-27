@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateReviewTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateReviewTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateReviewTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: revises the review template the `TemplateArn` names in
+//! [`crate::state::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::review_templates`]
+//! — the members the request carries, and the lenses it applies or unapplies — and reports
+//! the template as stored, so a later `GetReviewTemplate`, `ListReviewTemplates` or
+//! `CreateWorkload` that applies the template all see the revision.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +156,254 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateReviewTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateReviewTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateReviewTemplate"))
+        // The template is named by the ARN the request carries, and nothing here is minted
+        // or Region-scoped, so no request metadata is read.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateReviewTemplateErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool review template store is unavailable"
+                    .to_string(),
+            })
+        })?;
+
+        // The instant this request is served at: what the revision records as the template's
+        // `UpdatedAt` and what a lens applied here pins its review's version as of, read
+        // once so the record carries one reading of the clock.
+        let now = std::time::SystemTime::now();
+
+        // The lenses the request applies, each kept once and in the order it first named
+        // them, AS SENT: a lens is one lens however it is spelled
+        // (`crate::state::lens_alias` resolves an alias and an ARN to the same lens), so a
+        // list naming one twice asks for ONE review. The name as sent is what is recorded,
+        // because that is the `LensAlias` every read of the template reports. The walk is
+        // over a list `ReviewTemplateLensAliases` bounds at ten entries, so it costs a
+        // constant number of lookups.
+        let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        let mut to_associate: Vec<String> = Vec::new();
+        for lens in input.lenses_to_associate.iter().flatten() {
+            if seen.insert(crate::state::lens_alias(lens)) {
+                to_associate.push(lens.clone());
+            }
+        }
+        let to_disassociate: &[String] = input
+            .lenses_to_disassociate
+            .as_deref()
+            .unwrap_or_default();
+
+        let mut store = state.lock();
+        // The resource is resolved BEFORE the request's values are judged, so a request
+        // naming a template that does not exist is answered with that 404 whatever else it
+        // carries. Read immutably here; the write below takes the mutable borrow once every
+        // refusal has been decided.
+        let template = store
+            .review_templates
+            .get(&input.template_arn)
+            .ok_or_else(|| {
+                UpdateReviewTemplateErrorModeled::ResourceNotFoundException(
+                    crate::state::review_template_not_found(&input.template_arn),
+                )
+            })?;
+
+        // "The wellarchitected lens cannot be unapplied" (`LensesToDisassociate` doc): the
+        // service serves no review template that lost the Well-Architected Framework lens,
+        // so a request naming it is refused whole — however the name is spelled, and whether
+        // or not this template applies it, because neither changes what the request asks
+        // for. What "names it" is the crate's one lens identity rule
+        // ([`crate::state::lens_alias`]), the same rule the reviews below are resolved by,
+        // so no name that would reach the framework lens's review gets past this.
+        if to_disassociate
+            .iter()
+            .any(|lens| crate::state::lens_alias(lens) == crate::state::FRAMEWORK_LENS_ALIAS)
+        {
+            return Err(
+                UpdateReviewTemplateErrorModeled::ValidationException(framework_lens_refusal())
+                    .into(),
+            );
+        }
+
+        // A lens review of a template exists only while that lens is applied to it, so a
+        // lens the template does not apply has no review to unapply, whatever the lens
+        // catalog says about the name. Every named lens is resolved against the template's
+        // OWN lenses before the first review is dropped, so a request naming one lens the
+        // template applies and one it does not changes nothing: a half-applied revision
+        // would leave the caller unable to tell which half landed.
+        if let Some(unapplied) = to_disassociate
+            .iter()
+            .find(|lens| !template.applies_lens(lens))
+        {
+            return Err(UpdateReviewTemplateErrorModeled::ResourceNotFoundException(
+                crate::state::review_template_lens_review_not_found(
+                    &input.template_arn,
+                    unapplied,
+                ),
+            )
+            .into());
+        }
+
+        // What the template would end up applying: the lenses it applies now, less the ones
+        // this request unapplies, plus the ones it applies that are not already there. A
+        // lens is one lens however it is spelled, so both the remaining set and the fresh
+        // list are over DISTINCT lenses, which is what a read of the template's lens reviews
+        // reports.
+        let (applied, fresh) = {
+            let remaining: std::collections::BTreeSet<&str> = template
+                .lenses
+                .iter()
+                .map(|lens| crate::state::lens_alias(lens))
+                .filter(|alias| {
+                    !to_disassociate
+                        .iter()
+                        .any(|lens| crate::state::lens_alias(lens) == *alias)
+                })
+                .collect();
+            let fresh: Vec<String> = to_associate
+                .iter()
+                .filter(|lens| !remaining.contains(crate::state::lens_alias(lens)))
+                .cloned()
+                .collect();
+            (remaining.len(), fresh)
+        };
+
+        // Every lens the request applies is resolved against the lens catalog BEFORE the
+        // first review is recorded, through the one place that rule lives — the same
+        // resolution the create that minted this template ran — so this operation cannot
+        // record a lens another operation would then report a review of and find nothing
+        // for. It runs over the whole list the request named rather than only the fresh
+        // ones, so a name that resolves to nothing is refused whether or not the template
+        // already applies that lens.
+        match store.unapplicable_lenses_refusal(&to_associate, LENSES_TO_ASSOCIATE_MEMBER, now) {
+            Some(crate::state::LensesRefusal::NotFound(exception)) => {
+                return Err(
+                    UpdateReviewTemplateErrorModeled::ResourceNotFoundException(exception).into(),
+                );
+            }
+            Some(crate::state::LensesRefusal::Unapplicable(exception)) => {
+                return Err(UpdateReviewTemplateErrorModeled::ValidationException(exception).into());
+            }
+            None => {}
+        }
+
+        // A review template carries at most `MAX_LENSES_PER_REVIEW_TEMPLATE` lenses — the
+        // quota this emulator sets, which is what bounds a STORED template's lens list and
+        // the work of applying that template to a workload. This operation models no quota
+        // error, so a revision that would carry the template past the ceiling is answered
+        // with the modelled `ConflictException` — "the resource … is too large" — rather
+        // than telling the caller the model refused a list the model allows.
+        if applied + fresh.len() > crate::state::MAX_LENSES_PER_REVIEW_TEMPLATE {
+            return Err(UpdateReviewTemplateErrorModeled::ConflictException(
+                crate::state::conflict(
+                    crate::state::REVIEW_TEMPLATE_RESOURCE_TYPE,
+                    input.template_arn.clone(),
+                    &format!(
+                        "Review template with ARN {} cannot apply more than {} lenses.",
+                        input.template_arn,
+                        crate::state::MAX_LENSES_PER_REVIEW_TEMPLATE
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        // A lens review is a review against ONE version of the lens, so applying a lens pins
+        // the version its content is published as right now — the same pin the create that
+        // minted this template recorded, resolved from the one place that rule lives and
+        // BEFORE the template is taken for writing.
+        let reviews = store.applied_lens_reviews(&fresh, now);
+
+        let template = store
+            .review_templates
+            .get_mut(&input.template_arn)
+            .ok_or_else(|| {
+                UpdateReviewTemplateErrorModeled::ResourceNotFoundException(
+                    crate::state::review_template_not_found(&input.template_arn),
+                )
+            })?;
+
+        // Whether this request revises the template at all: a member it leaves out, a lens
+        // it applies that the template already applies, or a value it carries that the
+        // template already holds all ask for no change, and a request that asks for none
+        // moves neither the stored template nor its `UpdatedAt`.
+        let mut revised = !to_disassociate.is_empty() || !fresh.is_empty();
+        // Every lens named here was resolved against the template's own lenses above, so
+        // each one drops a review the template really holds — and with it the answers and
+        // notes recorded under that lens, which exist only while the lens is applied.
+        for lens in to_disassociate {
+            template.disassociate_lens(lens);
+        }
+        for (alias, record) in reviews {
+            // A lens applied for the first time gets the review this revision pins; one the
+            // template already applies was filtered out above, so no pin is overwritten and
+            // no review the template holds is reset.
+            template.lens_reviews.insert(alias, record);
+        }
+        template.lenses.extend(fresh);
+
+        // Every writable member is optional, so one the request leaves out asks for no
+        // change to it and the stored value stands; one it carries is the new value of that
+        // member rather than an addition to it.
+        if let Some(template_name) = input.template_name {
+            revised |= template_name != template.template_name;
+            template.template_name = template_name;
+        }
+        if let Some(description) = input.description {
+            revised |= description != template.description;
+            template.description = description;
+        }
+        if let Some(notes) = input.notes {
+            revised |= template.notes.as_deref() != Some(notes.as_str());
+            template.notes = Some(notes);
+        }
+        if revised {
+            // "The date and time when the review template was last updated": the revision
+            // above is that write, and every projection of the template reports it.
+            template.updated_at = now;
+        }
+
+        // Re-resolved immutably so the projection below can read the lens catalog beside the
+        // template: the write above left the template in place, so this resolves.
+        let template = store
+            .review_templates
+            .get(&input.template_arn)
+            .ok_or_else(|| {
+                UpdateReviewTemplateErrorModeled::ResourceNotFoundException(
+                    crate::state::review_template_not_found(&input.template_arn),
+                )
+            })?;
+        Ok(UpdateReviewTemplateOutput {
+            // The template as STORED, through the one projection every read of a review
+            // template is built by, so this answer cannot disagree with a later
+            // `GetReviewTemplate` of the same template.
+            review_template: Some(template.to_review_template(
+                store.review_template_update_status(template),
+                // The content of the lenses the template applies AFTER this revision,
+                // resolved from the whole lens catalog: the question roll-up counts a custom
+                // lens's imported questions exactly as it counts an official lens's.
+                &store.reviewed_lens_content(&template.reviewed_lens_versions()),
+            )),
+        })
     }
+}
+
+/// The member a refused `LensesToAssociate` value is reported under: the lens resolution
+/// this operation shares with every other that applies lenses names the member that carried
+/// them, so a caller is told WHICH list to fix.
+const LENSES_TO_ASSOCIATE_MEMBER: &str = "LensesToAssociate";
+
+/// The member a refused `LensesToDisassociate` value is reported under.
+const LENSES_TO_DISASSOCIATE_MEMBER: &str = "LensesToDisassociate";
+
+/// The refusal for a request that asks for the Well-Architected Framework lens to be
+/// unapplied from a review template: the modelled 400 naming the member that carried the
+/// aliases. Built through the one place a member-constraint failure is worded, so it reads
+/// like the constraint refusals the request boundary itself raises — and like the refusal
+/// the sibling disassociation raises for a workload.
+fn framework_lens_refusal() -> ValidationException {
+    crate::state::member_constraint_exception(
+        LENSES_TO_DISASSOCIATE_MEMBER,
+        &format!(
+            "must not name the Well-Architected Framework lens ({}), which cannot be \
+             unapplied from a review template",
+            crate::state::FRAMEWORK_LENS_ALIAS
+        ),
+    )
 }

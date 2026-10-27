@@ -3711,6 +3711,28 @@ impl User {
         }
         deliveries
     }
+
+    /// Write `plan` ([`plan_attribute_deletion`]) onto this user.
+    ///
+    /// The plan was decided against this user as it stood, so applying it never
+    /// refuses anything: a request is judged in full BEFORE any of it is
+    /// written, and only a plan reaches here.
+    pub fn apply_attribute_deletion(&mut self, plan: &AttributeDeletionPlan, now: SystemTime) {
+        // Naming an attribute the user holds no value of removes nothing, so it
+        // is the values that WERE held that make this call a modification.
+        let mut removed = false;
+        for name in &plan.deletions {
+            removed |= self.attributes.remove(name).is_some();
+            // A value asked for but not confirmed yet is a value of the same
+            // attribute, so it goes with the attribute rather than outliving it.
+            removed |= self.pending_attributes.remove(name).is_some();
+        }
+        // A call that removed nothing changed nothing, so the user's
+        // last-modified instant stands.
+        if removed {
+            self.user_last_modified_date = now;
+        }
+    }
 }
 
 /// One stored link from an external IdP identity to a local profile: what the
@@ -5565,6 +5587,98 @@ pub fn plan_attribute_update(
         username: user.username.clone(),
         updates,
         verifications,
+    })
+}
+
+/// The whole deletion: which stored user it applies to and which of that
+/// user's attributes it removes ([`plan_attribute_deletion`]).
+#[derive(Debug)]
+pub struct AttributeDeletionPlan {
+    /// The pool holding the user this plan applies to.
+    pub user_pool_id: String,
+    /// The STORED username of that user, however the request named it.
+    pub username: String,
+    /// Every attribute name to remove, each once: the names the request asked
+    /// for, plus the verified flag of each, which has nothing left to vouch for
+    /// once the value it describes is gone.
+    pub deletions: BTreeSet<String>,
+}
+
+/// Decide what deleting `requested` does to `user` of `pool`, or the message of
+/// the `InvalidParameterException` the request earns — which the asking
+/// operation carries in the modelled error IT declares.
+///
+/// A pure read of the stored pool and user: it returns the plan rather than
+/// applying it ([`User::apply_attribute_deletion`]), so a request refused
+/// halfway through leaves nothing written.
+///
+/// The rules, each from this service's model:
+///
+/// * `AttributeNameListType` is a list of attribute NAMES and a user holds one
+///   value per attribute, so naming an attribute twice asks for the same single
+///   removal, and a list of more distinct names than the schema declares names
+///   more attributes than any user of the pool can hold.
+/// * An attribute the pool's schema does not declare cannot hold a value, so it
+///   is not one a user can be asked to give up.
+/// * An attribute the schema declares immutable (`SchemaAttributeType.Mutable`)
+///   cannot change, and taking its value away changes it; one the schema marks
+///   required has to keep a value, so neither is one this operation may remove.
+/// * A deleted `email` or `phone_number` leaves its verified flag
+///   ([`verified_flag`]) vouching for a value the user no longer holds, so the
+///   flag goes with it.
+///
+/// Every per-attribute step below is bounded by the POOL's schema rather than
+/// by the length of the submitted list: the names are reduced to the distinct
+/// ones and their count is capped before any per-attribute work, so one request
+/// cannot drive work the caller chose the size of.
+pub fn plan_attribute_deletion(
+    pool: &UserPool,
+    user: &User,
+    requested: &[String],
+) -> Result<AttributeDeletionPlan, String> {
+    let names: Vec<String> = requested
+        .iter()
+        .collect::<BTreeSet<&String>>()
+        .into_iter()
+        .cloned()
+        .collect();
+    // Checked FIRST, so nothing further is proportional to a list length the
+    // caller chose.
+    if names.len() > pool.schema.len() {
+        return Err(format!(
+            "Invalid attributes given, at most {} attributes of this user pool can be deleted in one request",
+            pool.schema.len()
+        ));
+    }
+    if let Some(unknown) = pool.unknown_attribute(&names) {
+        return Err(format!(
+            "Invalid attributes given, {unknown} is not a valid attribute of this user pool"
+        ));
+    }
+
+    let mut deletions = BTreeSet::new();
+    for name in names {
+        if !pool.attribute_mutable(&name) {
+            return Err(format!(
+                "Attribute {name} cannot be deleted: this user pool's schema declares it immutable"
+            ));
+        }
+        if pool.attribute_required(&name) {
+            return Err(format!(
+                "Attribute {name} cannot be deleted: this user pool's schema declares it required"
+            ));
+        }
+        // Exactly as a blank value submitted to an attribute update takes it.
+        if let Some(flag) = verified_flag(&name) {
+            deletions.insert(flag.to_string());
+        }
+        deletions.insert(name);
+    }
+
+    Ok(AttributeDeletionPlan {
+        user_pool_id: pool.id.clone(),
+        username: user.username.clone(),
+        deletions,
     })
 }
 

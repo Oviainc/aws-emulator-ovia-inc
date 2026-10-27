@@ -32,7 +32,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
     AdvancedBackupSetting, AlreadyExistsException, BackupPlan, BackupRule, BackupRuleInput,
-    InvalidParameterValueException, Lifecycle, ResourceNotFoundException, ScanSetting,
+    BackupSelection, InvalidParameterValueException, Lifecycle, ResourceNotFoundException,
+    ScanSetting,
 };
 
 /// The ARN namespace this service stamps into every ARN it mints
@@ -125,6 +126,18 @@ pub const MAX_WINDOW_MINUTES: i64 = 52_560_000;
 /// errors").
 pub const MIN_START_WINDOW_MINUTES: i64 = 60;
 
+/// The `StartWindowMinutes` a plan rule is created with when the request states
+/// none: AWS Backup's own default backup window of 8 hours, which is the window
+/// the jobs that rule schedules really get. Both members are optional in the
+/// request and the service fills each with its default, so a read of the plan
+/// reports the window in force rather than nothing.
+pub const DEFAULT_START_WINDOW_MINUTES: i64 = 8 * 60;
+
+/// The `CompletionWindowMinutes` a plan rule is created with when the request
+/// states none: AWS Backup's own default completion window of 7 days, the
+/// sibling default of [`DEFAULT_START_WINDOW_MINUTES`].
+pub const DEFAULT_COMPLETION_WINDOW_MINUTES: i64 = 7 * 24 * 60;
+
 /// The most backup vaults this emulator keeps.
 ///
 /// An EMULATOR-CHOSEN ceiling, not an AWS quota: the store is in memory and
@@ -153,6 +166,12 @@ pub const MAX_BACKUP_PLANS: usize = 500;
 /// the request, so it is capped before the plan is stored. AWS caps the rules a
 /// plan may hold too, and answers `LimitExceededException` for a plan past it.
 pub const MAX_RULES_PER_PLAN: usize = 100;
+
+/// The most resource selections this emulator keeps in ONE backup plan. An
+/// EMULATOR-CHOSEN ceiling, for the reason given on [`MAX_VAULTS`]; AWS caps the
+/// selections a plan may hold too, and answers `LimitExceededException` for a
+/// create past it.
+pub const MAX_SELECTIONS_PER_PLAN: usize = 100;
 
 /// The most `IdempotencyToken` records this emulator keeps. An EMULATOR-CHOSEN
 /// ceiling: the key is a string the CALLER picks, so this is one of the two
@@ -365,10 +384,23 @@ pub const MESSAGE_VAULT_ALREADY_EXISTS: &str = "Backup vault with the same name 
 /// No `Code`: this condition has no observed token.
 pub const MESSAGE_BACKUP_PLAN_NOT_FOUND: &str = "Cannot find Backup plan";
 
+/// The sentence AWS states for "the backup selection asked about is not one the
+/// named plan holds" — fixed, and worded as this service words the same
+/// condition for a backup plan ([`MESSAGE_BACKUP_PLAN_NOT_FOUND`]): it names no
+/// part of the request. No `Code`: this condition has no observed token.
+pub const MESSAGE_BACKUP_SELECTION_NOT_FOUND: &str = "Cannot find Backup selection";
+
 /// The sentence AWS states for "a backup plan of this name already exists",
 /// worded as this service words the same condition for a vault
 /// ([`MESSAGE_VAULT_ALREADY_EXISTS`]) — fixed, and with no observed `Code`.
 pub const MESSAGE_PLAN_ALREADY_EXISTS: &str = "Backup plan with the same name already exists";
+
+/// The sentence AWS states for "a resource selection of this name already
+/// exists in the named plan", worded as this service words the same condition
+/// for a plan ([`MESSAGE_PLAN_ALREADY_EXISTS`]) — fixed, and with no observed
+/// `Code`.
+pub const MESSAGE_SELECTION_ALREADY_EXISTS: &str =
+    "Backup selection with the same name already exists";
 
 /// `Code` for "`MaxResults` is outside the range the model declares".
 pub const ERROR_CODE_MAX_RESULTS_INVALID: &str = "ERROR_3607";
@@ -412,6 +444,17 @@ pub fn backup_plan_not_found() -> ResourceNotFoundException {
     }
 }
 
+/// The modelled refusal for a selection id the named plan does not hold — and
+/// for a plan id no plan of this account answers to, which is the same condition
+/// as far as a selection read is concerned: the resource asked about is not
+/// there, and the refusal does not say which half of the pair was wrong.
+pub fn backup_selection_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(MESSAGE_BACKUP_SELECTION_NOT_FOUND.to_string()),
+        ..Default::default()
+    }
+}
+
 /// The modelled refusal for a create naming a plan that already exists.
 ///
 /// `Arn` and `CreatorRequestId` are left UNSET for the reason given on
@@ -419,6 +462,17 @@ pub fn backup_plan_not_found() -> ResourceNotFoundException {
 pub fn plan_already_exists() -> AlreadyExistsException {
     AlreadyExistsException {
         message: Some(MESSAGE_PLAN_ALREADY_EXISTS.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The modelled refusal for a create naming a selection the plan already holds.
+///
+/// `Arn` and `CreatorRequestId` are left UNSET for the reason given on
+/// [`vault_already_exists`].
+pub fn selection_already_exists() -> AlreadyExistsException {
+    AlreadyExistsException {
+        message: Some(MESSAGE_SELECTION_ALREADY_EXISTS.to_string()),
         ..Default::default()
     }
 }
@@ -864,7 +918,10 @@ impl BackupPlanRecord {
 /// One rule of a plan as it is STORED: the rule the caller configured, plus the
 /// `RuleId` this service minted for it ("RuleId: Uniquely identifies a rule that
 /// is used to schedule the backup of a selection of resources", a member only
-/// the service fills).
+/// the service fills) and the backup windows the service fills in where the
+/// request stated none ([`DEFAULT_START_WINDOW_MINUTES`],
+/// [`DEFAULT_COMPLETION_WINDOW_MINUTES`]) — a stored rule carries the windows
+/// its jobs are really scheduled with, so every read of the plan reports them.
 pub fn stored_backup_rule(rule: BackupRuleInput, rule_id: String) -> BackupRule {
     BackupRule {
         rule_name: rule.rule_name,
@@ -872,8 +929,14 @@ pub fn stored_backup_rule(rule: BackupRuleInput, rule_id: String) -> BackupRule 
         target_logically_air_gapped_backup_vault_arn: rule
             .target_logically_air_gapped_backup_vault_arn,
         schedule_expression: rule.schedule_expression,
-        start_window_minutes: rule.start_window_minutes,
-        completion_window_minutes: rule.completion_window_minutes,
+        start_window_minutes: Some(
+            rule.start_window_minutes
+                .unwrap_or(DEFAULT_START_WINDOW_MINUTES),
+        ),
+        completion_window_minutes: Some(
+            rule.completion_window_minutes
+                .unwrap_or(DEFAULT_COMPLETION_WINDOW_MINUTES),
+        ),
         lifecycle: rule.lifecycle,
         recovery_point_tags: rule.recovery_point_tags,
         rule_id: Some(rule_id),
@@ -883,6 +946,25 @@ pub fn stored_backup_rule(rule: BackupRuleInput, rule_id: String) -> BackupRule 
         index_actions: rule.index_actions,
         scan_actions: rule.scan_actions,
     }
+}
+
+/// One resource selection of a backup plan as `CreateBackupSelection` stored it:
+/// the selection body the caller gave, plus the `SelectionId` this service minted
+/// for it.
+///
+/// A selection belongs to exactly one plan — every operation on one addresses it
+/// by the PAIR (`BackupPlanId`, `SelectionId`), both `@httpLabel`s of
+/// `GetBackupSelection` and `DeleteBackupSelection` — so that pair is the key
+/// this record is stored under.
+#[derive(Debug, Clone)]
+pub struct BackupSelectionRecord {
+    pub selection_id: String,
+    pub plan_id: String,
+    /// The body the create was given, kept verbatim: a selection has no member
+    /// the service fills, so a read reports what was stored.
+    pub selection: BackupSelection,
+    pub creator_request_id: Option<String>,
+    pub creation_date: SystemTime,
 }
 
 /// Per-service state for com-amazonaws-backup-cryocontrollerusermanager. A handler reaches it through [`service_state`].
@@ -900,6 +982,11 @@ pub struct ComAmazonawsBackupCryocontrollerusermanagerState {
     pub backup_jobs: BTreeMap<String, BackupJob>,
     /// Backup plans by `BackupPlanId`. Bounded by [`MAX_BACKUP_PLANS`].
     pub backup_plans: BTreeMap<String, BackupPlanRecord>,
+    /// Resource selections by the (`BackupPlanId`, `SelectionId`) pair AWS Backup
+    /// addresses one by. Keyed plan-first, so one plan's selections are
+    /// contiguous and a read of them is a range of this one map rather than a
+    /// second index beside it. Bounded by [`MAX_SELECTIONS_PER_PLAN`] per plan.
+    pub backup_selections: BTreeMap<(String, String), BackupSelectionRecord>,
     /// `StartBackupJob`'s `IdempotencyToken` -> what it replays. Bounded by
     /// [`MAX_IDEMPOTENCY_TOKENS`] and [`IDEMPOTENCY_TOKEN_TTL`].
     pub idempotency_tokens: BTreeMap<String, IdempotencyRecord>,
@@ -970,9 +1057,73 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
             .find(|plan| plan.creator_request_id.as_deref() == Some(creator_request_id))
     }
 
-    /// Whether this account already holds a backup plan of this name.
+    /// Whether this account already holds a LIVE backup plan of this name. A
+    /// plan whose deletion was recorded no longer holds its name: the account
+    /// may create another plan under it, exactly as it may after a plan it never
+    /// created.
     pub fn holds_backup_plan_named(&self, name: &str) -> bool {
-        self.backup_plans.values().any(|plan| plan.name == name)
+        self.backup_plans
+            .values()
+            .any(|plan| plan.name == name && plan.deletion_date.is_none())
+    }
+
+    /// The plan a mutating call must find: one this account holds whose deletion
+    /// has not been recorded. A deleted plan is still READABLE (it reports its
+    /// `DeletionDate`), but nothing is added to it and nothing deletes it twice.
+    pub fn live_backup_plan(&self, plan_id: &str) -> Option<&BackupPlanRecord> {
+        self.backup_plans
+            .get(plan_id)
+            .filter(|plan| plan.deletion_date.is_none())
+    }
+
+    /// Resolve one resource selection for a read, by the pair AWS Backup
+    /// addresses one by.
+    ///
+    /// A plan id this account does not hold and a selection id the plan it does
+    /// hold does not are ONE condition: the resource asked about is not there, so
+    /// both answer the same modelled refusal and neither tells the caller which
+    /// half of the pair was wrong.
+    pub fn backup_selection(
+        &self,
+        plan_id: &str,
+        selection_id: &str,
+    ) -> Result<&BackupSelectionRecord, ResourceNotFoundException> {
+        self.backup_selections
+            .get(&(plan_id.to_string(), selection_id.to_string()))
+            .ok_or_else(backup_selection_not_found)
+    }
+
+    /// Every selection the named plan holds, in `SelectionId` order — the range
+    /// of the one selection map this plan owns, so a read of them cannot disagree
+    /// with what a create inserted.
+    pub fn backup_selections_of(&self, plan_id: &str) -> Vec<&BackupSelectionRecord> {
+        self.backup_selections
+            .range((plan_id.to_string(), String::new())..)
+            .take_while(|((plan, _), _)| plan == plan_id)
+            .map(|(_, selection)| selection)
+            .collect()
+    }
+
+    /// The selection of this plan a `CreatorRequestId` names, if the plan holds
+    /// one: a create that repeats a token answers with the selection it already
+    /// made rather than making a second one.
+    pub fn backup_selection_by_creator_request_id(
+        &self,
+        plan_id: &str,
+        creator_request_id: &str,
+    ) -> Option<&BackupSelectionRecord> {
+        self.backup_selections_of(plan_id)
+            .into_iter()
+            .find(|selection| selection.creator_request_id.as_deref() == Some(creator_request_id))
+    }
+
+    /// Whether the named plan already holds a selection of this display name. A
+    /// selection is displayed by its `SelectionName` within its plan, so two
+    /// selections of one plan cannot share one.
+    pub fn holds_backup_selection_named(&self, plan_id: &str, name: &str) -> bool {
+        self.backup_selections_of(plan_id)
+            .into_iter()
+            .any(|selection| selection.selection.selection_name == name)
     }
 
     /// Materialise the transition the clock has already made due, for ONE

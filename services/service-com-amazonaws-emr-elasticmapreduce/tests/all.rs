@@ -45,6 +45,8 @@ mod release_label_catalog;
 mod release_labels;
 #[path = "all/resource_not_found_code.rs"]
 mod resource_not_found_code;
+#[path = "all/resource_tag_removal.rs"]
+mod resource_tag_removal;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/security_configurations.rs"]

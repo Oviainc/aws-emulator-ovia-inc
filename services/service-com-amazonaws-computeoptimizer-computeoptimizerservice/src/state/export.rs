@@ -32,8 +32,8 @@
 //!   is built from the recommendation the reader reports rather than from that catalog row, so
 //!   the one rule serves both.
 //! * the metadata file — what the export job itself was: its id, the resource type and
-//!   account(s) it covers, the file format and columns of the export file, how many rows it
-//!   holds and where both objects were written.
+//!   account(s) it covers, the recommendation preferences it was asked for, the file format and
+//!   columns of the export file, how many rows it holds and where both objects were written.
 //!
 //! AWS publishes no column layout, row order or metadata schema for either file, so both are
 //! the emulator's own; every value in them is nevertheless derived from the stored analysis
@@ -64,8 +64,8 @@ use std::sync::Arc;
 use ::service_com_amazonaws_s3_amazons3 as s3;
 
 use super::{
-    look_back_period_in_days, parse_resource_arn, percentage_of, round_hundredths,
-    AnalysedResource, AnalyzedAutoScalingGroup,
+    architecture_admitted, look_back_period_in_days, parse_instance_arn, parse_resource_arn,
+    percentage_of, round_hundredths, stated_architectures, AnalysedResource, AnalyzedAutoScalingGroup,
     ComAmazonawsComputeoptimizerComputeoptimizerserviceState, EffectivePreferences, ExportJob,
     GroupConfiguration, IdleResourceAnalysis, ObservedLicensedInstance, CURRENCY_USD,
     RESOURCE_TYPE_AUTO_SCALING_GROUP, RESOURCE_TYPE_EBS_VOLUME, RESOURCE_TYPE_EC2_INSTANCE,
@@ -175,6 +175,12 @@ pub struct ExportPlan {
     /// filter that exports a more specific set of ... recommendations" — which select which
     /// recommendations the export file holds ([`row_matches_filters`]).
     pub filters: Vec<(String, Vec<String>)>,
+    /// The `cpuVendorArchitectures` of the `recommendationPreferences` the request named: the
+    /// architectures the exported recommendations are generated under, which select which
+    /// recommendation options the export file holds and which architectures its rows state.
+    /// Empty for a request that asked for none — and for a surface whose model declares no
+    /// such member — which restricts nothing.
+    pub cpu_vendor_architectures: Vec<String>,
 }
 
 /// The two objects an export job has computed but not yet written: the export file and its
@@ -312,6 +318,14 @@ pub struct ExportRequest<'a, F: ExportFilter> {
     /// The one-job-in-progress sentence this operation documents, which the refusal of a
     /// second in-progress export of this resource type opens with.
     pub one_job_in_progress: &'a str,
+    /// The `recommendationPreferences` the request carries, for the export surfaces whose
+    /// model declares that member, and `None` for the surfaces that declare none. It
+    /// "describes the recommendation preferences to return in the response of a
+    /// GetAutoScalingGroupRecommendations, GetEC2InstanceRecommendations … and
+    /// GetRDSDatabaseRecommendations request", so an EXPORT of those same recommendations is
+    /// of the recommendations the preferences settle — resolved here by the rule the surface's
+    /// own READER resolves it by, so the file and the response cannot disagree.
+    pub recommendation_preferences: Option<crate::ops::types::RecommendationPreferences>,
 }
 
 /// Why one export call cannot create its job, as the modelled error the calling operation
@@ -487,6 +501,15 @@ pub fn create_export_job<Eng: Send + Sync + 'static, F: ExportFilter>(
         )));
     }
 
+    // `recommendationPreferences$cpuVendorArchitectures` is a list of the modelled
+    // `CpuVendorArchitecture` enum, so the request boundary has already refused any value
+    // outside it and what reaches here is a list of architectures — the ones the exported
+    // recommendations are generated under.
+    let cpu_vendor_architectures = request
+        .recommendation_preferences
+        .and_then(|preferences| preferences.cpu_vendor_architectures)
+        .unwrap_or_default();
+
     let job_id = guard.export_jobs.mint_job_id();
     let (key, metadata_key) = super::export_destination_keys(
         request.destination.key_prefix.as_deref(),
@@ -510,6 +533,7 @@ pub fn create_export_job<Eng: Send + Sync + 'static, F: ExportFilter>(
         account_ids,
         include_member_accounts: request.include_member_accounts,
         filters: filter_pairs(&filters),
+        cpu_vendor_architectures,
     };
     // The destination this call answers is the job's own, so it names exactly the objects
     // `DescribeRecommendationExportJobs` reports for the job and exactly the objects the
@@ -563,7 +587,7 @@ pub fn export_csv(columns: &[String], rows: &[ExportRow]) -> String {
 /// The metadata file of the export `plan` describes, holding `rows` recommendation rows and
 /// created at `created_at`: what the export job was, and where its two objects were written.
 fn export_metadata(plan: &ExportPlan, rows: usize, created_at: f64) -> String {
-    let metadata = ::serde_json::json!({
+    let mut metadata = ::serde_json::json!({
         "jobId": plan.job_id,
         "region": plan.region,
         "resourceType": plan.resource_type,
@@ -585,6 +609,14 @@ fn export_metadata(plan: &ExportPlan, rows: usize, created_at: f64) -> String {
             "metadataKey": plan.metadata_key,
         },
     });
+    // The recommendation preferences the export was asked for, stated only where the request
+    // named any: a surface whose model declares no such member, and a request that asked for
+    // no architecture, states no preference rather than an empty one.
+    if !plan.cpu_vendor_architectures.is_empty() {
+        metadata["recommendationPreferences"] = ::serde_json::json!({
+            "cpuVendorArchitectures": plan.cpu_vendor_architectures,
+        });
+    }
     ::serde_json::to_string_pretty(&metadata).unwrap_or_else(|_| metadata.to_string())
 }
 
@@ -845,40 +877,59 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
             .last_analysis_refresh()
             .map(|generated| generated.as_secs_f64());
         let mut rows = match plan.resource_type.as_str() {
-            RESOURCE_TYPE_AUTO_SCALING_GROUP => self.auto_scaling_group_export_rows(last_refresh),
+            RESOURCE_TYPE_AUTO_SCALING_GROUP => {
+                self.auto_scaling_group_export_rows(&plan.cpu_vendor_architectures, last_refresh)
+            }
             RESOURCE_TYPE_IDLE => self.idle_export_rows(&plan.region, last_refresh),
             RESOURCE_TYPE_LICENSE => self.license_export_rows(&plan.region, last_refresh),
-            RESOURCE_TYPE_RDS_DB_INSTANCE => {
-                self.rds_database_export_rows(&plan.region, last_refresh)
-            }
-            resource_type => {
-                self.analysed_resource_export_rows(resource_type, &plan.region, last_refresh)
-            }
+            RESOURCE_TYPE_RDS_DB_INSTANCE => self.rds_database_export_rows(
+                &plan.region,
+                &plan.cpu_vendor_architectures,
+                last_refresh,
+            ),
+            resource_type => self.analysed_resource_export_rows(
+                resource_type,
+                &plan.region,
+                &plan.cpu_vendor_architectures,
+                last_refresh,
+            ),
         };
         rows.retain(|row| row_matches_filters(row, &plan.resource_type, &plan.filters));
         rows
     }
 
     /// The export rows of the Auto Scaling group analysis: one per recommendation option of
-    /// every analysed group, since each `RecommendationOptions*` field names ONE option's
-    /// value — and one row carrying the group's own columns for a group the analysis found no
-    /// candidate for.
-    fn auto_scaling_group_export_rows(&self, last_refresh: Option<f64>) -> Vec<ExportRow> {
+    /// every analysed group that the request's CPU vendor architecture preference admits, since
+    /// each `RecommendationOptions*` field names ONE option's value — and one row carrying the
+    /// group's own columns for a group the preference leaves no candidate of.
+    fn auto_scaling_group_export_rows(
+        &self,
+        requested_architectures: &[String],
+        last_refresh: Option<f64>,
+    ) -> Vec<ExportRow> {
         let mut rows: Vec<ExportRow> = Vec::new();
         for group in self.visible_auto_scaling_group_analyses() {
             let Some(parsed) = parse_resource_arn(&group.arn) else {
                 continue;
             };
             let preferences = self.effective_preferences(&group.arn, parsed);
-            // "Describes the CPU vendor and architecture for an instance or Auto Scaling group
-            // recommendations": the architectures the reported options consist of.
-            let mut architectures: Vec<String> = Vec::new();
-            for candidate in &group.candidates {
-                if !architectures.contains(&candidate.architecture) {
-                    architectures.push(candidate.architecture.clone());
-                }
-            }
-            if group.candidates.is_empty() {
+            // The candidates the preference admits, and "the CPU vendor and architecture for an
+            // instance or Auto Scaling group recommendations" the exported options then consist
+            // of: the crate's one rule for both ([`architecture_admitted`]), which is what the
+            // reader of these recommendations applies — "when you specify AWS_ARM64 with an
+            // ExportAutoScalingGroupRecommendations request, Compute Optimizer exports
+            // recommendations that consist of Graviton instance types only".
+            let options: Vec<&GroupConfiguration> = group
+                .candidates
+                .iter()
+                .filter(|candidate| {
+                    architecture_admitted(requested_architectures, &candidate.architecture)
+                })
+                .collect();
+            let architectures = stated_architectures(
+                options.iter().map(|option| option.architecture.as_str()),
+            );
+            if options.is_empty() {
                 rows.push(auto_scaling_group_row(
                     group,
                     &preferences,
@@ -888,11 +939,11 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
                 ));
                 continue;
             }
-            for candidate in &group.candidates {
+            for option in options {
                 rows.push(auto_scaling_group_row(
                     group,
                     &preferences,
-                    Some(candidate),
+                    Some(option),
                     &architectures,
                     last_refresh,
                 ));
@@ -903,11 +954,13 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
 
     /// The export rows of the findings catalog, for a resource type whose recommendation is
     /// reported from it: one row per analysed resource, carrying the columns the catalog row
-    /// records ([`analysed_resource_row`]).
+    /// records ([`analysed_resource_row`]) and the CPU vendor architectures the resource's own
+    /// admitted options consist of ([`Self::exported_architectures`]).
     fn analysed_resource_export_rows(
         &self,
         resource_type: &str,
         region: &str,
+        requested_architectures: &[String],
         last_refresh: Option<f64>,
     ) -> Vec<ExportRow> {
         let account_id = ::engine::emulator_account_id();
@@ -921,17 +974,61 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
                         let arn = resource.arn_in(region);
                         let preferences =
                             self.effective_preferences_for(&arn, resource_type, account_id);
+                        let architectures = self.exported_architectures(
+                            resource_type,
+                            &arn,
+                            requested_architectures,
+                        );
                         analysed_resource_row(
                             resource,
                             resource_type,
                             &arn,
                             &preferences,
+                            &architectures,
                             last_refresh,
                         )
                     })
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// The `cpuVendorArchitectures` the export file states for the analysed resource `arn`
+    /// names, under the architectures the export request asked for: the architectures of the
+    /// recommendation options the preference admits, by the rule that surface's READER applies
+    /// ([`architecture_admitted`]).
+    ///
+    /// An instance recommendation is the one reported from the findings catalog whose options
+    /// carry an architecture, and the analysis that records them is the observed inventory the
+    /// catalog row is projected from ([`super::ObservedInstance`]) — so the architectures are
+    /// taken from there rather than from the catalog row, which records none. Every other
+    /// resource type's recommendation reports no option of its own CPU architecture, so it
+    /// states none, and the cell is empty.
+    fn exported_architectures(
+        &self,
+        resource_type: &str,
+        arn: &str,
+        requested_architectures: &[String],
+    ) -> Vec<String> {
+        if resource_type != RESOURCE_TYPE_EC2_INSTANCE {
+            return Vec::new();
+        }
+        let instance = parse_instance_arn(arn).and_then(|parsed| {
+            self.visible_instances()
+                .find(|instance| instance.instance_id == parsed.instance_id)
+        });
+        let Some(instance) = instance else {
+            return Vec::new();
+        };
+        stated_architectures(
+            instance
+                .candidates
+                .iter()
+                .filter(|candidate| {
+                    architecture_admitted(requested_architectures, &candidate.architecture)
+                })
+                .map(|candidate| candidate.architecture.as_str()),
+        )
     }
 
     /// The export rows of the Amazon Aurora and RDS database analysis: one per analysed
@@ -943,7 +1040,12 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     /// analysis would move it to — none of which is a column of the findings-catalog row every
     /// other findings reader shares, so this surface builds its rows from the recommendation
     /// itself rather than from that row.
-    fn rds_database_export_rows(&self, region: &str, last_refresh: Option<f64>) -> Vec<ExportRow> {
+    fn rds_database_export_rows(
+        &self,
+        region: &str,
+        requested_architectures: &[String],
+        last_refresh: Option<f64>,
+    ) -> Vec<ExportRow> {
         let account_id = ::engine::emulator_account_id();
         let by_type = self.analysed_resources_by_type(account_id);
         by_type
@@ -952,13 +1054,16 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
                 resources
                     .iter()
                     .map(|resource| {
-                        // `cpuVendorArchitectures` is what the reader reports when a REQUEST
-                        // asks for an architecture, and the shared export plan does not carry
-                        // the export request's `recommendationPreferences`, so no architecture
-                        // is stated here and that column is empty — the file states the
-                        // preferences the analysis resolved for the database, which the
-                        // recommendation's other preference members carry.
-                        let recommendation = self.rds_recommendation(resource, region, None);
+                        // The recommendation is built under the CPU vendor architectures the
+                        // EXPORT request asked for, exactly as the reader builds it under the
+                        // ones a read asks for, so the file's
+                        // `EffectiveRecommendationPreferences*` columns state the preferences
+                        // the exported recommendation was generated under.
+                        let recommendation = self.rds_recommendation(
+                            resource,
+                            region,
+                            Some(requested_architectures),
+                        );
                         rds_database_row(&recommendation, last_refresh)
                     })
                     .collect()
@@ -1183,12 +1288,15 @@ fn put_configuration(row: &mut ExportRow, prefix: &str, configuration: &GroupCon
 ///
 /// A column whose value an effective recommendation preference switches off is left empty for
 /// as long as that preference is off, the way the recommendation readers of the same analysis
-/// leave the member unreported.
+/// leave the member unreported. `architectures` are the CPU vendor architectures the resource's
+/// exported recommendation options consist of, which is none for a resource type whose
+/// recommendation reports no option carrying one.
 fn analysed_resource_row(
     resource: &AnalysedResource,
     resource_type: &str,
     arn: &str,
     preferences: &EffectivePreferences,
+    architectures: &[String],
     last_refresh: Option<f64>,
 ) -> ExportRow {
     let mut row = ExportRow::new();
@@ -1232,6 +1340,14 @@ fn analysed_resource_row(
         );
     }
     put_preferences(&mut row, preferences);
+    // "Describes the CPU vendor and architecture for an instance or Auto Scaling group
+    // recommendations": the architectures the resource's exported options consist of, which is
+    // none for a resource type whose recommendation reports no option carrying one.
+    put_list(
+        &mut row,
+        "EffectiveRecommendationPreferencesCpuVendorArchitectures",
+        architectures,
+    );
     if let Some(at) = last_refresh {
         put(&mut row, "LastRefreshTimestamp", timestamp(at));
     }

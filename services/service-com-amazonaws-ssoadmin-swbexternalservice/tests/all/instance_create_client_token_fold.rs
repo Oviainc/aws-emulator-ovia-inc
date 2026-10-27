@@ -416,7 +416,11 @@ async fn a_reused_client_token_replays_only_the_same_name_and_tag_multiset() {
 /// instance carries now: a `TagResource` in between changes neither answer.
 #[tokio::test]
 async fn a_replay_is_judged_by_the_request_not_by_the_tags_the_instance_holds_now() {
-    let router = empty_account_router();
+    // The ENGINE behind the router too: the tagging call below is a write, and a write is
+    // served only once the instance's creation has finished, so this row moves the
+    // activation instant the create fixed into the past — the clock's business, not the
+    // wire's, exactly as the shared `account_instance_router` does.
+    let (router, engine) = crate::instance_create::empty_account_router();
     let token = "d1e2f3a4-b5c6-4071-8899-aabbccddeeff";
     let first = request("Idempotent", &[("Owner", "platform"), ("Tier", "test")]);
 
@@ -429,6 +433,10 @@ async fn a_replay_is_judged_by_the_request_not_by_the_tags_the_instance_holds_no
         .as_str()
         .unwrap_or_else(|| panic!("the create minted no ARN: {created}"))
         .to_string();
+    crate::instance_create::hold_activation(
+        &engine,
+        std::time::SystemTime::now() - std::time::Duration::from_secs(60),
+    );
 
     // Tag the instance after the fact: one key re-valued, one added. The instance now
     // carries a tag set NO `CreateInstance` request ever sent.

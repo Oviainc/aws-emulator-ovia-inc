@@ -763,6 +763,23 @@ pub fn integer_bound_message(member: &str, value: i32, min: i32, max: i32) -> Op
     }
 }
 
+/// `InvalidParameterException$message` for a `maxResults` outside the inclusive page-size
+/// range its own doc states ("This value can be between 1 and 100"). Amazon ECS states the
+/// RANGE the page size has to fall in — not the one bound the value crossed — and echoes
+/// neither the value the request carried nor the member's spelling on the wire.
+pub fn page_size_range_message(min: i32, max: i32) -> String {
+    format!("MaxResults must be a positive number between {min}-{max}.")
+}
+
+/// The refusal a `maxResults` earns when it falls outside the inclusive page-size range
+/// `min..=max` its own doc states, or `None` when it is inside it.
+///
+/// Spelled once for every operation in this crate that pages, so the refusal cannot drift
+/// between the lists — each with its own documented range.
+pub fn page_size_violation(max_results: i32, min: i32, max: i32) -> Option<String> {
+    (max_results < min || max_results > max).then(|| page_size_range_message(min, max))
+}
+
 /// The launch type a task takes when the request names neither a `launchType` nor a
 /// `capacityProviderStrategy` and the cluster has no default strategy: ECS runs the
 /// task on the EC2 capacity registered to the cluster.
@@ -1651,6 +1668,57 @@ pub const DESIRED_COUNT_NEGATIVE_MESSAGE: &str = "DesiredCount can not be lesser
 pub const DUPLICATE_CONTAINER_NAME_MESSAGE: &str =
     "Container names must be unique within a task definition.";
 
+/// The smallest number of CPU units a container definition may reserve. `cpu` is "The
+/// number of `cpu` units reserved for the container", a COUNT of units, and its own doc
+/// describes what the agent does with "CPU values below 2 (including null)" and with "Null
+/// and zero CPU values" — so reserving none is a value the member takes, while a count
+/// below none names no number of units at all.
+pub const MIN_CONTAINER_CPU_UNITS: i32 = 0;
+
+/// The smallest amount of memory, in MiB, a container definition may name. `memory` is
+/// "The amount (in MiB) of memory to present to the container" and `memoryReservation`
+/// "The soft limit (in MiB) of memory to reserve for the container": an amount that is
+/// presented to or reserved for a running container is at least one MiB of it, so neither
+/// member names an amount at or below none.
+pub const MIN_CONTAINER_MEMORY_MIB: i32 = 1;
+
+/// `InvalidParameterException$message`/`ClientException$message` for a container
+/// definition whose numeric reservation names a value its unit does not admit. Amazon ECS
+/// names the offending MEMBER and the container the request gave it on, and carries
+/// neither the value nor the bound.
+pub fn invalid_container_setting_message(member: &str, container_name: &str) -> String {
+    format!("Invalid '{member}' setting for container '{container_name}'.")
+}
+
+/// The first of ONE container definition's numeric resource reservations that names a
+/// value outside the range its unit admits, stated as
+/// [`invalid_container_setting_message`] states it, or `None` when every one of them is in
+/// range.
+///
+/// The members are examined in a FIXED order — the CPU count, then the hard memory amount,
+/// then the soft one — so the refusal a definition earns never depends on anything but its
+/// values. Spelled once for every registration that carries container definitions, so the
+/// refusal cannot drift between the plain and the daemon task definition.
+pub fn container_reservation_violation(
+    container_name: &str,
+    cpu: i32,
+    memory: Option<i32>,
+    memory_reservation: Option<i32>,
+) -> Option<String> {
+    if cpu < MIN_CONTAINER_CPU_UNITS {
+        return Some(invalid_container_setting_message("cpu", container_name));
+    }
+    for (member, amount) in [
+        ("memory", memory),
+        ("memoryReservation", memory_reservation),
+    ] {
+        if amount.is_some_and(|mib| mib < MIN_CONTAINER_MEMORY_MIB) {
+            return Some(invalid_container_setting_message(member, container_name));
+        }
+    }
+    None
+}
+
 /// `InvalidParameterException$message` for an `UpdateService` that would change the
 /// service's deployment controller while the service has no `PRIMARY` task set: the
 /// controller that is taking the service over has to have one to take over, so the refusal
@@ -1682,6 +1750,42 @@ pub fn daemon_task_definition_reference_message(reference: &str) -> String {
         DAEMON_TASK_DEFINITION_RESOURCE_TYPE,
         reference,
     )
+}
+
+/// `InvalidParameterException$message` for a `DeleteDaemonTaskDefinition` whose
+/// `daemonTaskDefinition` identifies no daemon task definition at all. A fixed sentence
+/// about the identifier the call acts on, carrying none of the request's values.
+pub const DAEMON_TASK_DEFINITION_INVALID_MESSAGE: &str = "The Daemon Task Definition is invalid";
+
+/// `InvalidParameterException$message` for a reference to a daemon task definition whose
+/// FAMILY part is not a family name at all. A fixed sentence: it names the part of the
+/// reference that is wrong and the pattern that part has to match — the character set
+/// [`is_valid_name`] accepts, over one or more characters — and carries none of the
+/// request's values.
+pub const DAEMON_TASK_DEFINITION_FAMILY_PATTERN_MESSAGE: &str =
+    r"Invalid daemon task definition: family must match ^[a-zA-Z0-9\-_]+$";
+
+/// The refusal a reference to a daemon task definition earns when the FAMILY it names is
+/// not a family name, or `None` when the family part is well-formed.
+///
+/// A reference is "The family for the latest ACTIVE revision, family and revision
+/// (family:revision) for a specific revision in the family, or full Amazon Resource Name
+/// (ARN) of the daemon task definition" — every form carries a FAMILY, and a family is "Up
+/// to 255 letters (uppercase and lowercase), numbers, underscores, and hyphens". A value
+/// whose family part is outside that set names no family, so it is refused as invalid
+/// input stating the pattern a family has to match, BEFORE the store is consulted for a
+/// revision.
+///
+/// `None` is also the answer for a value that is an ARN of some OTHER resource: its family
+/// part is not what is wrong with it, so it earns the refusal for a reference that names
+/// no daemon task definition ([`daemon_task_definition_reference_message`]).
+pub fn daemon_task_definition_family_violation(reference: &str) -> Option<&'static str> {
+    match split_revision_reference(reference, DAEMON_TASK_DEFINITION_RESOURCE_TYPE) {
+        Some((family, _)) if !is_valid_name(family) => {
+            Some(DAEMON_TASK_DEFINITION_FAMILY_PATTERN_MESSAGE)
+        }
+        _ => None,
+    }
 }
 
 /// `ClientException$message` for a `taskDefinition` that names a whole FAMILY where the
@@ -6014,6 +6118,57 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         self.active_cluster(cluster_name).is_some()
     }
 
+    /// The Cloud Map namespace `service`'s tasks are registered in through Service
+    /// Connect, or `None` for a service that is not in one.
+    ///
+    /// `ServiceConnectConfiguration$enabled`: "Specifies whether to use Service Connect
+    /// with this service" — a service that does not use it joins no namespace. The
+    /// namespace is the one the service's own configuration names, and otherwise the
+    /// cluster's Service Connect default ("the namespace name ... for use with Service
+    /// Connect"), which is what a cluster holds the default FOR.
+    pub fn service_namespace(&self, service: &ServiceRecord) -> Option<String> {
+        let configuration = service.service_connect_configuration.as_ref()?;
+        if !configuration.enabled {
+            return None;
+        }
+        let named = configuration
+            .namespace
+            .as_deref()
+            .filter(|namespace| !namespace.is_empty());
+        match named {
+            Some(namespace) => Some(namespace.to_string()),
+            None => self
+                .active_cluster(&service.cluster_name)
+                .and_then(|cluster| cluster.service_connect_defaults.as_ref())
+                .and_then(|defaults| defaults.namespace.clone()),
+        }
+    }
+
+    /// Whether this store holds a record that names the namespace `reference` refers to.
+    ///
+    /// A Cloud Map namespace is not an Amazon ECS resource: what this service knows of one
+    /// is the Service Connect configuration that names it — a service's own, or a
+    /// cluster's default. A reference no such record names is a namespace this account has
+    /// nothing in.
+    pub fn knows_namespace(&self, reference: &str) -> bool {
+        let key = namespace_key(reference);
+        let on_a_cluster = self.clusters.values().any(|cluster| {
+            cluster
+                .service_connect_defaults
+                .as_ref()
+                .and_then(|defaults| defaults.namespace.as_deref())
+                .is_some_and(|namespace| namespace_key(namespace) == key)
+        });
+        on_a_cluster
+            || self.services.values().any(|service| {
+                service
+                    .service_connect_configuration
+                    .as_ref()
+                    .and_then(|configuration| configuration.namespace.as_deref())
+                    .is_some_and(|namespace| namespace_key(namespace) == key)
+            })
+    }
+
     /// Whether `cluster_name` still holds an `ACTIVE` service — one the caller has NOT
     /// deleted yet, and so one of the cluster's `activeServicesCount`.
     ///
@@ -7574,6 +7729,87 @@ pub fn service_connect_defaults(namespace: &str) -> Option<ClusterServiceConnect
     }
 }
 
+/// The longest a Cloud Map namespace reference may be, from the pattern the refusal of a
+/// malformed one states.
+pub const MAX_NAMESPACE_LENGTH: usize = 1024;
+
+/// The pattern a `namespace` reference must match, as the refusal of one that does not
+/// quotes it: between one and [`MAX_NAMESPACE_LENGTH`] printable ASCII characters, none of
+/// them one of the four the class excludes.
+pub const NAMESPACE_PATTERN: &str = r#"^[!-~&&[^<>/"]]{1,1024}$"#;
+
+/// Whether `namespace` is a value [`NAMESPACE_PATTERN`] accepts: printable ASCII (`!`
+/// through `~`, so no space and no control character) less `<`, `>`, `/` and `"`, and
+/// between one and [`MAX_NAMESPACE_LENGTH`] of them.
+pub fn is_namespace_reference(namespace: &str) -> bool {
+    let length = namespace.chars().count();
+    (1..=MAX_NAMESPACE_LENGTH).contains(&length)
+        && namespace
+            .chars()
+            .all(|letter| matches!(letter, '!'..='~') && !matches!(letter, '<' | '>' | '/' | '"'))
+}
+
+/// `InvalidParameterException$message` for a `namespace` outside
+/// [`NAMESPACE_PATTERN`]. DERIVED from the request: Amazon ECS names the member, the value
+/// it was given and the pattern that value has to match.
+pub fn namespace_pattern_message(namespace: &str) -> String {
+    format!("Namespace ({namespace}) must match {NAMESPACE_PATTERN}.")
+}
+
+/// `NamespaceNotFoundException$message`: the sentence the shape documents for a namespace
+/// this account has nothing in ("The specified namespace wasn't found"), as a refusal
+/// states it.
+pub const NAMESPACE_NOT_FOUND_MESSAGE: &str = "The specified namespace wasn't found.";
+
+/// The KEY two Cloud Map namespace references are the same namespace by: the name itself
+/// when the reference is a name, and the last segment of a namespace ARN when it is one —
+/// every `namespace` member's doc, "The namespace name or full Amazon Resource Name (ARN)
+/// of the Cloud Map namespace". Naming one namespace either way is naming the same one, so
+/// a listing cannot miss a service that spelled it the other way.
+pub fn namespace_key(reference: &str) -> &str {
+    reference.rsplit('/').next().unwrap_or(reference)
+}
+
+/// The DNS suffix the Region-scoped hosts of this service live under.
+const ENDPOINT_DNS_SUFFIX: &str = "amazonaws.com";
+
+/// One Region-scoped host of this service, as `<host>.<region>.<suffix>` served over
+/// HTTPS: the form every endpoint this service hands an agent takes.
+fn regional_endpoint_url(host: &str, region: &str) -> String {
+    format!("https://{host}.{region}.{ENDPOINT_DNS_SUFFIX}/")
+}
+
+/// The host of the agent-communication service, whose endpoint the agent polls for the
+/// work assigned to its container instance — this service's endpoint prefix, `-a-`, and
+/// the shard the account's instances are served from.
+const AGENT_POLL_HOST: &str = "ecs-a-1";
+
+/// The host of the agent-telemetry service, whose endpoint the agent reports its
+/// containers' metrics to — the same prefix with `-t-` for telemetry.
+const AGENT_TELEMETRY_HOST: &str = "ecs-t-1";
+
+/// The host of the Service Connect configuration service, whose endpoint the agent polls
+/// for "Service Connect configuration" (`DiscoverPollEndpoint$serviceConnectEndpoint`).
+const AGENT_SERVICE_CONNECT_HOST: &str = "ecs-sc";
+
+/// "The endpoint for the Amazon ECS agent to poll", in the Region the request was signed
+/// for.
+pub fn agent_poll_endpoint(region: &str) -> String {
+    regional_endpoint_url(AGENT_POLL_HOST, region)
+}
+
+/// "The telemetry endpoint for the Amazon ECS agent", in the Region the request was signed
+/// for.
+pub fn agent_telemetry_endpoint(region: &str) -> String {
+    regional_endpoint_url(AGENT_TELEMETRY_HOST, region)
+}
+
+/// "The endpoint for the Amazon ECS agent to poll for Service Connect configuration", in
+/// the Region the request was signed for.
+pub fn agent_service_connect_endpoint(region: &str) -> String {
+    regional_endpoint_url(AGENT_SERVICE_CONNECT_HOST, region)
+}
+
 /// The cluster NAME a `cluster` request member refers to: the short name as given, or
 /// the last segment of a cluster ARN. Every `cluster` member's doc: "The short name or
 /// full Amazon Resource Name (ARN) of the cluster".
@@ -8936,14 +9172,7 @@ fn parse_revision_reference(
     reference: &str,
     resource_type: &str,
 ) -> Option<(String, Option<i32>)> {
-    let tail = match reference.strip_prefix("arn:") {
-        Some(_) => reference.rsplit_once(&format!(":{resource_type}/"))?.1,
-        None => reference,
-    };
-    let (family, revision) = match tail.rsplit_once(':') {
-        Some((family, revision)) => (family, Some(revision)),
-        None => (tail, None),
-    };
+    let (family, revision) = split_revision_reference(reference, resource_type)?;
     if !is_valid_name(family) {
         return None;
     }
@@ -8958,6 +9187,25 @@ fn parse_revision_reference(
             .filter(|revision| *revision > 0)
             .map(|revision| (family.to_string(), Some(revision))),
     }
+}
+
+/// The FAMILY part of a reference to a revision of `resource_type`, and the revision text
+/// beside it when the reference spells one — both BEFORE either is checked against the
+/// rule it follows. The parts come from the ARN's last segment when the value is an ARN of
+/// that resource, and from the value itself when it is not an ARN at all; `None` for an
+/// ARN that names some other resource, which carries no family of this one.
+fn split_revision_reference<'a>(
+    reference: &'a str,
+    resource_type: &str,
+) -> Option<(&'a str, Option<&'a str>)> {
+    let tail = match reference.strip_prefix("arn:") {
+        Some(_) => reference.rsplit_once(&format!(":{resource_type}/"))?.1,
+        None => reference,
+    };
+    Some(match tail.rsplit_once(':') {
+        Some((family, revision)) => (family, Some(revision)),
+        None => (tail, None),
+    })
 }
 
 /// The region this request was signed for, defaulting to [`DEFAULT_REGION`] when the

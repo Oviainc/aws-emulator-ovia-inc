@@ -2,9 +2,10 @@
 
 //! @op DeleteAutoScalingGroup
 //!
-//! Removes a stored group and its instances. A group that still holds instances
-//! or capacity is `ResourceInUseFault` unless `ForceDelete` is set, and a group
-//! whose deletion protection forbids the delete is refused.
+//! Removes a stored group and its instances, terminating the account's own Amazon EC2
+//! instances the group was holding ([`crate::state::ec2_instances`]). A group that
+//! still holds instances or capacity is `ResourceInUseFault` unless `ForceDelete` is
+//! set, and a group whose deletion protection forbids the delete is refused.
 //!
 //! ## Shape of an operation
 //!
@@ -184,7 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let force_delete = input.force_delete.unwrap_or(false);
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();
-        state.materialize_due(now);
+        state.materialize_due(&*self.engine, now);
 
         let Some(group) = state.groups.get(&name) else {
             crate::state::audit(
@@ -199,6 +200,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let arn = group.arn.clone();
         let instance_count = group.instances.len();
+        let instance_ids: Vec<String> = group
+            .instances
+            .iter()
+            .map(|instance| instance.instance_id.clone())
+            .collect();
         let desired_capacity = group.desired_capacity;
         let protection = group.deletion_protection.clone().unwrap_or_default();
 
@@ -231,16 +237,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
             return Err(DeleteAutoScalingGroupErrorModeled::ResourceInUseFault(
                 ResourceInUseFault {
-                    message: Some(format!(
+                    // The sentence Amazon EC2 Auto Scaling states for this error class,
+                    // which has no variable part: it names neither the group nor any
+                    // instance of it.
+                    message: Some(
                         "You cannot delete an AutoScalingGroup while there are instances or \
-                         pending Spot instance request(s) still in the group: {name}"
-                    )),
+                         pending Spot instance request(s) still in the group."
+                            .to_string(),
+                    ),
                 },
             )
             .into());
         }
 
         state.groups.remove(&name);
+        // A forced delete specifies "that the group is to be deleted along with all
+        // instances associated with the group" (`ForceDelete`), so the instances it was
+        // holding are terminated where they live: in the account's own Amazon EC2
+        // state, which is where this group launched them. (Without `ForceDelete` a group
+        // that still holds instances was refused above, so there is nothing to
+        // terminate on that path.)
+        crate::state::ec2_instances::terminate(&*self.engine, &instance_ids);
         state.record_activity(
             &name,
             &arn,

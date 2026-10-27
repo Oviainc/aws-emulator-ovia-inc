@@ -224,7 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let include_instances = input.include_instances.unwrap_or(true);
 
         let mut state = state.lock();
-        state.materialize_due(::std::time::SystemTime::now());
+        state.materialize_due(&*self.engine, ::std::time::SystemTime::now());
 
         let matching: Vec<AutoScalingGroup> = state
             .groups
