@@ -1,15 +1,70 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetConsoleScreenshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetConsoleScreenshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports a JPG-format screenshot of the console screen of one instance of
+//! the calling account, base64-encoded, beside the instance's own id.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetConsoleScreenshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! ## What the screen shows, and why it is not a captured framebuffer
+//!
+//! "Retrieve a JPG-format screenshot of a running instance … The returned content is
+//! Base64-encoded" (`GetConsoleScreenshot`), so what goes on the wire has to be base64 of
+//! real JPEG bytes — a client decodes it and expects an image. This emulator runs no guest
+//! operating system, so there is no guest framebuffer to capture and nothing here could
+//! honestly report one: inventing boot messages or a desktop would be a picture of a
+//! machine that never ran. What it reports instead is the console screen of the instance
+//! AS THIS SERVICE HOLDS IT — the stored record's own facts, one per text line, drawn into
+//! the screen with [`render_console_screen`] and encoded as a baseline JPEG. Every pixel is
+//! therefore derived from persisted state: two instances in different states produce
+//! different images, and the same instance read twice produces identical bytes.
+//!
+//! The screen's geometry ([`SCREEN_COLUMNS`] x [`SCREEN_ROWS`] text cells of the font's
+//! [`CELL_PIXELS`]-pixel box) is CHOSEN: AWS publishes no dimensions for the screenshot it
+//! serves, and a client is given the image's own size in its JPEG header.
+//!
+//! `WakeUp` — "acts as keystroke input and wakes up an instance that's in standby or
+//! 'sleep' mode" — has nothing to wake here: the six states `InstanceStateName` models
+//! carry no standby or sleep (`smithy_query(query="shape",shape="InstanceStateName")`), so
+//! no instance this service holds is ever in one. The flag is accepted and moves nothing,
+//! which is also what it does on a real instance that is not asleep.
+//!
+//! Reporting a screenshot is a READ: this handler writes nothing of its own, and touches
+//! the store only to let a clock-owed state transition fall due before the screen reports
+//! which state the instance is in — the same move `DescribeInstances` materialises, owed at
+//! that instant whether or not anybody called. The screen is drawn and encoded AFTER the
+//! store guard is dropped, so one caller's encode never holds the lock another caller's
+//! request needs.
+//!
+//! ## Any state this service holds is screenshotted
+//!
+//! The doc below says "a screenshot of a running instance", but what that sentence describes
+//! is the troubleshooting case rather than an admission rule, and EC2 publishes no error for
+//! asking about an instance in another state — this operation models no error shape at all,
+//! and the recorded contract for it covers only the `DryRun` probe and an id it cannot
+//! resolve. So every instance this service holds is screenshotted, in whichever state it is
+//! in, and the state is one of the facts the screen reports: a client sees `stopped` on the
+//! screen rather than a refusal this emulator cannot source. A DELIBERATE choice, stated
+//! here beside the `DryRun` and `WakeUp` gaps: were a state-based refusal ever recorded for
+//! this operation, its gate belongs immediately after the instance is resolved, before the
+//! screen is drawn.
+//!
+//! ## Which refusal comes first
+//!
+//! The `DryRun` probe is answered BEFORE the instance store is read: "Checks whether you
+//! have the required permissions for the operation, without actually making the request"
+//! (`$DryRun`) — the probe is a question about the caller's permissions, and the recorded
+//! contract for this operation answers `DryRunOperation` for an instance id the account
+//! cannot resolve at all. So the probe never depends on the store and can never write to
+//! it. Without the flag, EVERY instance id this operation cannot resolve is
+//! `InvalidInstanceID.Malformed`, in one of the two wordings that code carries — see
+//! [`require_screenshotted_instance`] for why this operation's validator is the strict one
+//! that reports no not-found for a well-formed id, and where each wording goes.
+//!
+//! A KNOWN FIDELITY GAP, shared with every `DryRun` in this crate: the probe always answers
+//! `DryRunOperation`, never the `UnauthorizedOperation` of "otherwise, it is
+//! UnauthorizedOperation". This emulator has no principal or policy model, so a passing dry
+//! run means "this request is well formed", not "this caller is authorised".
 //!
 //! ## Shape of an operation
 //!
@@ -70,6 +125,9 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use ::base64::Engine as _;
+
+use crate::state::{InstanceRecord, iso8601_utc};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -138,18 +196,227 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetConsoleScreenshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetConsoleScreenshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetConsoleScreenshot"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::require_service_state;
+
+        // Nothing about this answer depends on the request's Region or headers: an
+        // instance's console screen is a fact of that instance.
+        let _ = ctx;
+
+        // "Checks whether you have the required permissions for the operation, WITHOUT
+        // ACTUALLY MAKING THE REQUEST … the error response is DryRunOperation"
+        // (`$DryRun`). The probe is a question about the caller's permissions, so it is
+        // answered here — before the instance store is read, which is what the recorded
+        // contract for this operation observes: a `DryRun` call naming an id the account
+        // cannot resolve is answered `DryRunOperation`, not a refusal about the id. The
+        // store is not even reached, so a probe cannot write anything.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        let state_handle = require_service_state(&*self.engine)?;
+        // The guard is held only for as long as the record is read: the id and the lines of
+        // the screen are taken out of the store, and the drawing and encoding below happen
+        // without it, so a screenshot never holds the lock while it rasterises.
+        let (instance_id, lines) = {
+            let mut store = state_handle.lock();
+            // Which state the screen reports is a question about the CURRENT state, so a
+            // transition the clock already owed is materialised before it is read: an
+            // instance whose launch settled a moment ago is `running`, and that move was
+            // due at that instant whether or not anybody called. This is the only write a
+            // screenshot can cause, and it is the clock's, not this operation's.
+            store.materialize_due_transitions();
+
+            // Every id this operation cannot resolve is malformed; see the resolver's doc.
+            let instance = require_screenshotted_instance(&store, &input.instance_id)?;
+            // The id read back off the stored record rather than echoed from the request,
+            // so the response names the instance the service resolved.
+            (instance.instance_id.clone(), console_lines(instance))
+        };
+        let screen = render_console_screen(&lines).map_err(Scaffolded::internal_error)?;
+
+        Ok(GetConsoleScreenshotOutput {
+            // "The returned content is Base64-encoded" (`GetConsoleScreenshot`): base64
+            // of the JPEG the screen was encoded to, so a client that decodes the text
+            // holds an image.
+            image_data: Some(::base64::engine::general_purpose::STANDARD.encode(screen)),
+            instance_id: Some(instance_id),
+        })
     }
+}
+
+/// Resolve the instance `GetConsoleScreenshot` is asked for the console screen of, or
+/// refuse the id: HTTP 400 `InvalidInstanceID.Malformed`, in one of the two wordings that
+/// code carries.
+///
+/// EC2's per-operation validators do NOT agree about an instance id they cannot resolve,
+/// and this operation's is the strict one: a WELL-FORMED id that names no instance of the
+/// account is answered `InvalidInstanceID.Malformed` — the instance ID is malformed — rather
+/// than reported as not found.
+///
+/// The evidence is this operation's OWN recorded unit: the second task of
+/// `ec2-get-console-screenshot-dry-run-and-malformed-instance-error` probes an instance id
+/// the account does not hold, inside the long form
+/// [`crate::state::instance_id_is_well_formed`] accepts, and the recorded response is
+/// `InvalidInstanceID.Malformed`, "The instance ID '<id>' is malformed" — so the shared
+/// helper's not-found half diverged on it until this resolver replaced it.
+/// `crate::ops::create_replace_root_volume_task` and `crate::ops::create_snapshots` are
+/// recorded making the same answer, while `CreateInstanceExportTask` answers such an id
+/// "does not exist": the choice belongs to the OPERATION rather than to the id, which is why
+/// this lives here and not in [`crate::state::require_known_instance`] — the shared helper
+/// that the operations which DO draw the distinction keep using.
+///
+/// A value that is not an instance id AT ALL is refused one step earlier, by the id space
+/// itself, with the echoed-value message
+/// [`crate::scaffolded::Scaffolded::invalid_instance_id_malformed`] carries — the same order
+/// and the same two wordings `CreateSnapshots` uses, so one code is worded one way per half
+/// across the crate rather than per operation.
+///
+/// The resolved record is handed back, so the handler reads the instance ONCE rather than
+/// looking it up again behind an unreachable branch.
+fn require_screenshotted_instance<'store, E>(
+    store: &'store crate::state::ComAmazonawsEc2Amazonec2State,
+    instance_id: &str,
+) -> Result<&'store InstanceRecord, crate::scaffolded::Scaffolded<E>> {
+    // A value that is not an instance id at all never reaches the store: it is refused by
+    // the id space itself, with the echoed-value message every EC2 id space answers for one.
+    if !crate::state::instance_id_is_well_formed(instance_id) {
+        return Err(crate::scaffolded::Scaffolded::invalid_instance_id_malformed(
+            instance_id,
+        ));
+    }
+    store
+        .instances
+        .get(instance_id)
+        .ok_or_else(|| crate::scaffolded::Scaffolded::instance_id_is_malformed(instance_id))
+}
+
+/// How many characters of text the console screen is wide.
+///
+/// 80 columns by [`SCREEN_ROWS`] rows is the classic text-console geometry. AWS publishes
+/// no dimensions for the screenshot it serves, so the size is CHOSEN; a client reads the
+/// image's real size out of its JPEG header rather than from the API.
+pub const SCREEN_COLUMNS: usize = 80;
+
+/// How many lines of text the console screen is tall — see [`SCREEN_COLUMNS`].
+pub const SCREEN_ROWS: usize = 25;
+
+/// The side of one character cell in pixels: the `font8x8` glyph box is 8x8.
+pub const CELL_PIXELS: usize = 8;
+
+/// The console screen's width in pixels.
+pub const SCREEN_WIDTH: usize = SCREEN_COLUMNS * CELL_PIXELS;
+
+/// The console screen's height in pixels.
+pub const SCREEN_HEIGHT: usize = SCREEN_ROWS * CELL_PIXELS;
+
+/// The unlit screen behind the text, as RGB8.
+const BACKGROUND: [u8; 3] = [0x0c, 0x0c, 0x0c];
+
+/// The colour the screen's text is drawn in, as RGB8.
+const FOREGROUND: [u8; 3] = [0xd0, 0xd0, 0xd0];
+
+/// The quality the screen is encoded at. A fixed value, so one screen always encodes to
+/// the same bytes — two screenshots of an instance nothing has moved are identical — and
+/// high enough that 8x8 text survives the encoder's chroma subsampling.
+const JPEG_QUALITY: u8 = 90;
+
+/// How wide the label column of a screen line is, in characters.
+const LABEL_WIDTH: usize = 20;
+
+/// The lines of text one instance's console screen shows: the facts this service holds
+/// about that instance, one per line, labelled.
+///
+/// A fact the record does not carry gets no line at all, rather than a line with a
+/// placeholder in it: an instance with no public address has nothing to report there.
+fn console_lines(instance: &InstanceRecord) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut line = |label: &str, value: &str| {
+        lines.push(format!("{label:<width$}{value}", width = LABEL_WIDTH));
+    };
+    line("instance-id", &instance.instance_id);
+    line("instance-state", instance.state.as_str());
+    line("instance-type", &instance.instance_type);
+    if let Some(image_id) = &instance.image_id {
+        line("image-id", image_id);
+    }
+    line("availability-zone", &instance.placement_az);
+    line("private-ip-address", &instance.private_ip);
+    line("private-dns-name", &instance.private_dns_name);
+    if let Some(public_ip) = &instance.public_ip {
+        line("public-ip-address", public_ip);
+    }
+    line("launch-time", &iso8601_utc(instance.launch_time));
+    lines
+}
+
+/// Draw `lines` into the console screen and encode it as a baseline JPEG, or say why the
+/// screen could not be encoded.
+///
+/// Text past the screen's last column or last row is not drawn, exactly as a console drops
+/// what does not fit on its screen.
+fn render_console_screen(lines: &[String]) -> Result<Vec<u8>, String> {
+    // One background row built once and repeated: the screen is 128000 pixels, so filling
+    // it pixel by pixel would be that many appends for the same bytes.
+    let background_row: Vec<u8> = BACKGROUND.repeat(SCREEN_WIDTH);
+    let mut pixels: Vec<u8> = Vec::with_capacity(background_row.len() * SCREEN_HEIGHT);
+    for _ in 0..SCREEN_HEIGHT {
+        pixels.extend_from_slice(&background_row);
+    }
+    for (row, line) in lines.iter().take(SCREEN_ROWS).enumerate() {
+        for (column, character) in line.chars().take(SCREEN_COLUMNS).enumerate() {
+            draw_character(&mut pixels, column, row, character);
+        }
+    }
+    encode_jpeg(&pixels)
+}
+
+/// Draw one character into the cell at `(column, row)` of an RGB8 screen.
+///
+/// A character the font carries no glyph for leaves its cell empty, which is what a console
+/// renderer does with a codepoint its font does not cover. A cell outside `pixels` is left
+/// alone too, so the screen's size stays this function's caller's business and no call can
+/// index past the buffer it was given.
+fn draw_character(pixels: &mut [u8], column: usize, row: usize, character: char) {
+    // `get`, not an index: the table holds 128 entries and a line may carry any `char`, so
+    // a non-ASCII one leaves its cell empty rather than panicking.
+    let Some(glyph) = ::font8x8::legacy::BASIC_LEGACY.get(character as usize) else {
+        return;
+    };
+    for (y, bits) in glyph.iter().enumerate() {
+        for x in 0..CELL_PIXELS {
+            // `font8x8` packs a glyph row least-significant bit first, so bit 0 is the
+            // LEFTMOST pixel of that row.
+            if (*bits >> x) & 1 == 0 {
+                continue;
+            }
+            let at = ((row * CELL_PIXELS + y) * SCREEN_WIDTH + column * CELL_PIXELS + x) * 3;
+            if let Some(pixel) = pixels.get_mut(at..at + 3) {
+                pixel.copy_from_slice(&FOREGROUND);
+            }
+        }
+    }
+}
+
+/// Encode an RGB8 screen of [`SCREEN_WIDTH`] x [`SCREEN_HEIGHT`] as a baseline JPEG.
+///
+/// The encoder's refusals are reported rather than unwrapped: nothing a request carries
+/// reaches this, so neither can happen — the sink is a `Vec` (which never fails to write),
+/// both dimensions are non-zero constants that fit the `u16` a JPEG header carries, and
+/// `pixels` is kept at exactly `SCREEN_WIDTH * SCREEN_HEIGHT * 3` bytes — but a handler
+/// serving an untrusted caller has no business panicking for a condition it can report.
+fn encode_jpeg(pixels: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    let encoder = ::jpeg_encoder::Encoder::new(&mut out, JPEG_QUALITY);
+    let (Ok(width), Ok(height)) = (u16::try_from(SCREEN_WIDTH), u16::try_from(SCREEN_HEIGHT))
+    else {
+        return Err(format!(
+            "a console screen of {SCREEN_WIDTH}x{SCREEN_HEIGHT} pixels does not fit a JPEG \
+             header"
+        ));
+    };
+    encoder
+        .encode(pixels, width, height, ::jpeg_encoder::ColorType::Rgb)
+        .map_err(|error| format!("the console screen could not be encoded as a JPEG: {error}"))?;
+    Ok(out)
 }

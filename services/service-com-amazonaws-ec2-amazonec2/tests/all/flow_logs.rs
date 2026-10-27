@@ -15,6 +15,10 @@
 //! * A flow log created with no `LogFormat` carries the DEFAULT record format, and one
 //!   created with an explicit `LogFormat` carries exactly that string — so the two differ.
 //!   The rows differ in the format asked for, including none at all.
+//! * A flow log's DESTINATION ARN is only ever the one the request carried: the member is
+//!   reported verbatim for a request that gave one and is ABSENT from a flow log whose
+//!   CloudWatch Logs destination was named by log group name. The rows differ in the
+//!   destination type and in which member named the destination.
 //! * `DescribeFlowLogs` is a FILTER over the store, not a point lookup: an id or filter
 //!   value nothing matches selects nothing and the call succeeds with an empty list. The
 //!   rows differ in which ids and which documented filter narrow it.
@@ -379,16 +383,6 @@ async fn a_created_flow_log_round_trips_through_describe_flow_logs() {
                 DELIVER_LOGS_ROLE_ARN.to_string(),
             ),
             ("maxAggregationInterval", expected_interval),
-            (
-                // The two members name ONE destination, so a log group given by name is
-                // reported as its ARN too.
-                "logDestination",
-                format!(
-                    "arn:aws:logs:{REGION}:{account}:log-group:{group}",
-                    account = engine::emulator_account_id(),
-                    group = case.log_group_name,
-                ),
-            ),
         ];
         for (key, value) in &case.tags {
             expected.push(("key", (*key).to_string()));
@@ -401,6 +395,14 @@ async fn a_created_flow_log_round_trips_through_describe_flow_logs() {
                 case = case.name,
             );
         }
+        // Every row named its destination by log group NAME, so there is no destination ARN
+        // to report; `destination_arn_reports_only_what_the_request_gave` is the table that
+        // covers the member across the destination types.
+        assert!(
+            !reported.contains("<logDestination>"),
+            "case {case:?}: expected no logDestination member, got {reported}",
+            case = case.name,
+        );
         // "The date and time the flow log was created" (`FlowLog$CreationTime`) is a real
         // timestamp, not an empty member.
         let creation_time = element(&reported, "creationTime").unwrap_or_default();
@@ -1379,6 +1381,156 @@ async fn an_s3_flow_log_keeps_its_destination_arn_and_options() {
         !reported.contains("<logGroupName>"),
         "an S3 destination: expected no logGroupName, got {reported}"
     );
+}
+
+/// How one row of [`destination_arn_reports_only_what_the_request_gave`] names its
+/// destination, and what the flow log it creates must then report.
+#[derive(Debug)]
+struct DestinationCase {
+    name: &'static str,
+    /// The `LogDestinationType` the request carries, or none at all — "Default:
+    /// cloud-watch-logs" (`CreateFlowLogsRequest$LogDestinationType`).
+    log_destination_type: Option<&'static str>,
+    /// The `LogGroupName` the request carries, if any.
+    log_group_name: Option<&'static str>,
+    /// The `LogDestination` the request carries, if any.
+    log_destination: Option<&'static str>,
+    /// The `logDestination` the describe must report, or `None` when it must carry no such
+    /// member at all.
+    reported_log_destination: Option<&'static str>,
+    /// The `logGroupName` the describe must report, or `None` for none.
+    reported_log_group_name: Option<&'static str>,
+}
+
+/// A flow log reports as its destination ARN exactly the `LogDestination` the request
+/// carried, and NO such member when the request carried none — the destination named by
+/// `LogGroupName` is a log group name, and an ARN for it could only be composed from a
+/// Region and an account the request never gave. So `logDestination` is the member that
+/// tells a client the destination really was given as an ARN.
+///
+/// The rows differ in the destination TYPE (the three the model admits, including the one
+/// left to its default), in WHICH member named the destination (the group name, a group ARN,
+/// a group ARN carrying the log-stream wildcard, or both members at once), and so in whether
+/// each of the two members is reported at all.
+#[tokio::test]
+async fn destination_arn_reports_only_what_the_request_gave() {
+    let (router, _engine) = super::ec2_query::emulator();
+    let vpc_id = create_vpc(&router, "10.226.0.0/16").await;
+
+    // The ARNs below are the forms `CreateFlowLogsRequest$LogDestination` documents: a
+    // CloudWatch Logs log group ("arn:aws:logs:region:account_id:log-group:my_group"), an S3
+    // bucket with an optional subfolder ("arn:aws:s3:::my_bucket/my_subfolder/") and a
+    // Kinesis Data Firehose delivery stream
+    // ("arn:aws:firehose:region:account_id:deliverystream:my_stream"). Their Regions and
+    // account ids are deliberately NOT the emulator's own, so a reported ARN can only have
+    // come from the request.
+    const GROUP_ARN: &str = "arn:aws:logs:eu-west-1:111122223333:log-group:arn-named-group";
+    const WILDCARD_GROUP_ARN: &str =
+        "arn:aws:logs:ap-south-1:444455556666:log-group:wildcard-group:*";
+    const OTHER_GROUP_ARN: &str = "arn:aws:logs:sa-east-1:777788889999:log-group:other-group";
+    const BUCKET_ARN: &str = "arn:aws:s3:::flow-log-bucket/vpc-flow-logs/";
+    const STREAM_ARN: &str = "arn:aws:firehose:eu-central-1:111122223333:deliverystream:flow-logs";
+
+    let cases = [
+        DestinationCase {
+            name: "cloud-watch-logs named by LogGroupName",
+            log_destination_type: Some(LOG_DESTINATION_TYPE_CLOUD_WATCH_LOGS),
+            log_group_name: Some("named-group"),
+            log_destination: None,
+            reported_log_destination: None,
+            reported_log_group_name: Some("named-group"),
+        },
+        DestinationCase {
+            name: "the default destination type named by LogGroupName",
+            log_destination_type: None,
+            log_group_name: Some("/aws/vpc/flow-logs"),
+            log_destination: None,
+            reported_log_destination: None,
+            reported_log_group_name: Some("/aws/vpc/flow-logs"),
+        },
+        DestinationCase {
+            name: "cloud-watch-logs named by a log group ARN",
+            log_destination_type: Some(LOG_DESTINATION_TYPE_CLOUD_WATCH_LOGS),
+            log_group_name: None,
+            log_destination: Some(GROUP_ARN),
+            reported_log_destination: Some(GROUP_ARN),
+            reported_log_group_name: Some("arn-named-group"),
+        },
+        DestinationCase {
+            name: "cloud-watch-logs named by a log group ARN with the log-stream wildcard",
+            log_destination_type: Some(LOG_DESTINATION_TYPE_CLOUD_WATCH_LOGS),
+            log_group_name: None,
+            log_destination: Some(WILDCARD_GROUP_ARN),
+            reported_log_destination: Some(WILDCARD_GROUP_ARN),
+            reported_log_group_name: Some("wildcard-group"),
+        },
+        DestinationCase {
+            name: "cloud-watch-logs named by both members at once",
+            log_destination_type: Some(LOG_DESTINATION_TYPE_CLOUD_WATCH_LOGS),
+            log_group_name: Some("both-ways-group"),
+            log_destination: Some(OTHER_GROUP_ARN),
+            reported_log_destination: Some(OTHER_GROUP_ARN),
+            reported_log_group_name: Some("both-ways-group"),
+        },
+        DestinationCase {
+            name: "s3 named by a bucket ARN",
+            log_destination_type: Some("s3"),
+            log_group_name: None,
+            log_destination: Some(BUCKET_ARN),
+            reported_log_destination: Some(BUCKET_ARN),
+            reported_log_group_name: None,
+        },
+        DestinationCase {
+            name: "kinesis-data-firehose named by a delivery stream ARN",
+            log_destination_type: Some("kinesis-data-firehose"),
+            log_group_name: None,
+            log_destination: Some(STREAM_ARN),
+            reported_log_destination: Some(STREAM_ARN),
+            reported_log_group_name: None,
+        },
+    ];
+
+    for case in &cases {
+        let mut params = vec![
+            param("ResourceType", "VPC"),
+            param("ResourceId.1", &vpc_id),
+            param("TrafficType", "ALL"),
+        ];
+        if let Some(destination_type) = case.log_destination_type {
+            params.push(param("LogDestinationType", destination_type));
+        }
+        if let Some(group) = case.log_group_name {
+            params.push(param("LogGroupName", group));
+        }
+        if let Some(destination) = case.log_destination {
+            params.push(param("LogDestination", destination));
+        }
+        // "This parameter is required if the destination type is cloud-watch-logs"
+        // (`CreateFlowLogsRequest$DeliverLogsPermissionArn`).
+        if case
+            .log_destination_type
+            .unwrap_or(LOG_DESTINATION_TYPE_CLOUD_WATCH_LOGS)
+            == LOG_DESTINATION_TYPE_CLOUD_WATCH_LOGS
+        {
+            params.push(param("DeliverLogsPermissionArn", DELIVER_LOGS_ROLE_ARN));
+        }
+
+        let (status, body) = create_flow_logs(&router, &params).await;
+        let flow_log_id = created_id(case.name, status, &body);
+        let reported = describe_one(&router, case.name, &flow_log_id).await;
+
+        for (member, expected) in [
+            ("logDestination", case.reported_log_destination),
+            ("logGroupName", case.reported_log_group_name),
+        ] {
+            let actual = element(&reported, member);
+            assert_eq!(
+                actual.as_deref(),
+                expected,
+                "case {case:?}: expected {member} {expected:?}, got {actual:?} in {reported}"
+            );
+        }
+    }
 }
 
 /// A `ClientToken` makes the create idempotent: a repeat answers the flow logs the first

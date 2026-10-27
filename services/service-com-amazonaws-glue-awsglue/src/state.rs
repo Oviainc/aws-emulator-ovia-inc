@@ -189,7 +189,8 @@ use std::time::{Duration, SystemTime};
 use self::catalog_encryption::ObjectEncryption;
 
 use crate::ops::types::{
-    Action, AssetTypeFormReference, Classifier,
+    Action, AssetTypeFormReference, CatalogInput, CatalogProperties, CatalogPropertiesOutput,
+    Classifier,
     CodeGenConfigurationNode, Column, ColumnStatisticsTaskRun, ColumnStatisticsTaskSettings,
     ConfigurationObject,
     Connection, ConnectionInput,
@@ -201,10 +202,12 @@ use crate::ops::types::{
     CreateSecurityConfigurationInput, CreateTriggerInput, CreateWorkflowInput, CustomEntityType,
     DataCatalogEncryptionSettings, DataLakePrincipal,
     DataQualityRuleRecommendationRunAdditionalRunOptions,
+    DataLakeAccessPropertiesOutput,
     DataSource, Database, DatabaseIdentifier, DatabaseInput,
     Edge, EncryptionAtRest, EncryptionConfiguration, ErrorDetail, EventBatchingCondition,
-    ExecutionAttempt, ExecutionProperty, FederatedDatabase,
-    FederatedTable, GlueTable, GrokClassifier, Job, JsonClassifier, MLTransform,
+    ExecutionAttempt, ExecutionProperty, FederatedCatalog, FederatedDatabase,
+    FederatedTable, GlueTable, GrokClassifier, IcebergOptimizationPropertiesOutput, Job,
+    JsonClassifier, MLTransform,
     CreateUsageProfileInput,
     JobCommand, JobRun, JobUpdate, LakeFormationConfiguration, LineageConfiguration,
     Node, NotificationProperty, Partition, PartitionInput, Predicate, PrincipalPermissions,
@@ -216,7 +219,7 @@ use crate::ops::types::{
     StartColumnStatisticsTaskRunInput,
     StartDataQualityRuleRecommendationRunInput,
     StartJobRunInput, StorageDescriptor, Table, TableIdentifier, TableInput,
-    TableVersion,
+    TableVersion, TargetRedshiftCatalog,
     TransformEncryption, TransformFilterCriteria, TransformParameters, TransformSortCriteria,
     Trigger, TriggerNodeDetails,
     Tag, TargetProcessingProperties,
@@ -1304,6 +1307,22 @@ impl ComAmazonawsGlueAwsglueState {
         Some(self.catalogs.entry(catalog_id.to_string()).or_default())
     }
 
+    /// The catalog RESOURCE a `CreateCatalog` registered under `reference`, or `None`
+    /// when this store holds no catalog of that name in that account.
+    ///
+    /// A catalog is keyed by its folded name ([`fold_name`]), so a read reaches it under
+    /// any casing. The account's own Data Catalog is not one of these records — it is a
+    /// container nothing created ([`Catalog::definition`]) — so an id naming it resolves
+    /// to nothing here.
+    pub fn catalog_definition(&self, reference: &CatalogReference) -> Option<&CatalogDefinition> {
+        self.catalogs
+            .get(&child_catalog_id(
+                &reference.account_id,
+                &fold_name(&reference.name),
+            ))
+            .and_then(|catalog| catalog.definition.as_ref())
+    }
+
     /// The Data Catalog encryption settings `catalog_id` REPORTS: the record a
     /// `PutDataCatalogEncryptionSettings` stored for it, with each setting the stored
     /// record left unset filled in with that setting's default
@@ -2053,6 +2072,16 @@ pub struct Catalog {
     /// than merging into it. What a read reports from it, defaults included, is
     /// [`ComAmazonawsGlueAwsglueState::data_catalog_encryption_settings`].
     pub encryption_settings: Option<DataCatalogEncryptionSettings>,
+    /// The catalog RESOURCE record a `CreateCatalog` wrote for this catalog id, or
+    /// `None` for a catalog that is only a container — the account's own Data Catalog,
+    /// which no create brought into existence and which therefore has no name,
+    /// description or federation of its own.
+    ///
+    /// It sits on the container rather than in a map of its own so that one catalog is
+    /// ONE record: the databases and connections stored under a catalog id and the
+    /// metadata of the catalog resource under that same id are read and written through
+    /// the same entry.
+    pub definition: Option<CatalogDefinition>,
 }
 
 impl Catalog {
@@ -2075,6 +2104,172 @@ impl Catalog {
     /// [`MAX_CONNECTIONS_PER_CATALOG`].
     pub fn can_store_connection(&self) -> bool {
         self.connections.len() < MAX_CONNECTIONS_PER_CATALOG
+    }
+}
+
+/// The catalog RESOURCE a `CreateCatalog` registered: "a logical grouping of databases in
+/// the Glue Data Catalog or a federated source" (`Catalog`), stored under the catalog id
+/// it answers to.
+///
+/// Every member of the modelled `CatalogInput` is held, so a later read reports the
+/// definition the client wrote and nothing the server invented, plus the three members
+/// the SERVER sets: the two instants the write stamped and the id the catalog is
+/// addressed by. The create's `Tags` are held too, as `CatalogInput` does not carry them.
+#[derive(Debug, Clone)]
+pub struct CatalogDefinition {
+    /// `Catalog$Name`: "the name of the catalog", exactly as the create spelled it. The
+    /// catalog is KEYED by the folded name ([`fold_name`]), so a read reaches it under
+    /// any casing ("This should be all lowercase" — `GetCatalog`), while the reported
+    /// name is the one the client chose.
+    pub name: String,
+    /// `Catalog$CatalogId`: "the ID of the catalog" — the id every other operation
+    /// addresses this catalog by, which for a catalog created inside an account's own
+    /// Data Catalog is that account's id and the catalog's name
+    /// ([`child_catalog_id`]).
+    pub catalog_id: String,
+    /// `CatalogInput$Description`, stored as sent.
+    pub description: Option<String>,
+    /// `CatalogInput$Parameters`: "a map array of key-value pairs that define the
+    /// parameters and properties of the catalog", stored as sent — an absent map and an
+    /// empty one are different definitions, so the absence is kept.
+    pub parameters: Option<HashMap<String, String>>,
+    /// `CatalogInput$FederatedCatalog`: the entity outside the Glue Data Catalog this
+    /// catalog points at, stored as sent.
+    pub federated_catalog: Option<FederatedCatalog>,
+    /// `CatalogInput$TargetRedshiftCatalog`: the catalog this one links its resources
+    /// from, stored as sent.
+    pub target_redshift_catalog: Option<TargetRedshiftCatalog>,
+    /// `CatalogInput$CatalogProperties`, stored as sent. A read reports it through the
+    /// OUTPUT shape of the same properties ([`Self::to_catalog`]).
+    pub catalog_properties: Option<CatalogProperties>,
+    /// `CatalogInput$CreateTableDefaultPermissions`, stored as sent: an empty list is the
+    /// governance decision the doc calls for ("Typically should be explicitly set as an
+    /// empty list"), so it is kept apart from a create that named no list at all.
+    pub create_table_default_permissions: Option<Vec<PrincipalPermissions>>,
+    /// `CatalogInput$CreateDatabaseDefaultPermissions`, stored as sent, for the same
+    /// reason as [`Self::create_table_default_permissions`].
+    pub create_database_default_permissions: Option<Vec<PrincipalPermissions>>,
+    /// `CatalogInput$AllowFullTableExternalDataAccess`, stored as sent.
+    pub allow_full_table_external_data_access: Option<String>,
+    /// `Catalog$CreateTime`: "the time at which the catalog was created", the instant the
+    /// create was served, so every later read reports the same timestamp.
+    pub create_time: SystemTime,
+    /// `Catalog$UpdateTime`: "the time at which the catalog was last updated" — the
+    /// create's own instant until a write changes the definition.
+    pub update_time: SystemTime,
+    /// The create's `Tags`, which the `Catalog` shape does not carry.
+    ///
+    /// Kept so the create does not discard what the client sent, but not yet reachable
+    /// through the tagging operations: [`TaggedResourceKind`] carries no catalog variant,
+    /// and that table is what every tag lookup resolves an ARN against.
+    pub tags: HashMap<String, String>,
+}
+
+impl CatalogDefinition {
+    /// Build a stored catalog from a `CreateCatalog` request served at `now`: `name` as
+    /// the client spelled it, `catalog_id` the id the catalog answers to, the definition
+    /// from `input`, and both instants from the clock.
+    pub fn from_create_input(
+        name: &str,
+        catalog_id: String,
+        input: &CatalogInput,
+        tags: Option<&HashMap<String, String>>,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            name: name.to_string(),
+            catalog_id,
+            description: input.description.clone(),
+            parameters: input.parameters.clone(),
+            federated_catalog: input.federated_catalog.clone(),
+            target_redshift_catalog: input.target_redshift_catalog.clone(),
+            catalog_properties: input.catalog_properties.clone(),
+            create_table_default_permissions: input.create_table_default_permissions.clone(),
+            create_database_default_permissions: input.create_database_default_permissions.clone(),
+            allow_full_table_external_data_access: input
+                .allow_full_table_external_data_access
+                .clone(),
+            create_time: now,
+            update_time: now,
+            tags: tags.cloned().unwrap_or_default(),
+        }
+    }
+
+    /// Rebuild the modelled `Catalog` shape from what is stored, as served in `region`.
+    ///
+    /// `ResourceArn` is minted per request rather than stored, like every other ARN this
+    /// crate reports: a Glue record carries no Region of its own, so the ARN names the
+    /// Region the read was served in ([`catalog_resource_arn`]).
+    pub fn to_catalog(&self, region: &str) -> crate::ops::types::Catalog {
+        crate::ops::types::Catalog {
+            catalog_id: Some(self.catalog_id.clone()),
+            name: self.name.clone(),
+            resource_arn: Some(catalog_resource_arn(
+                region,
+                &parse_catalog_reference(&self.catalog_id).account_id,
+                &self.name,
+            )),
+            description: self.description.clone(),
+            parameters: self.parameters.clone(),
+            create_time: Some(to_date_time(self.create_time)),
+            update_time: Some(to_date_time(self.update_time)),
+            target_redshift_catalog: self.target_redshift_catalog.clone(),
+            federated_catalog: self.federated_catalog.clone(),
+            catalog_properties: self
+                .catalog_properties
+                .as_ref()
+                .map(|properties| to_catalog_properties_output(properties, self.update_time)),
+            create_table_default_permissions: self
+                .create_table_default_permissions
+                .as_ref()
+                .map(|grants| grants.iter().map(tagged_principal_permissions).collect()),
+            create_database_default_permissions: self
+                .create_database_default_permissions
+                .as_ref()
+                .map(|grants| grants.iter().map(tagged_principal_permissions).collect()),
+            allow_full_table_external_data_access: self
+                .allow_full_table_external_data_access
+                .clone(),
+        }
+    }
+}
+
+/// The stored `CatalogProperties` as a read REPORTS them, in the output shape of the same
+/// properties: every member the write carried, plus the members only the server can fill.
+///
+/// `IcebergOptimizationPropertiesOutput$LastUpdatedTime` is one of those: it is the
+/// instant the stored properties were last written, which is the catalog's own update
+/// instant. The `DataLakeAccessPropertiesOutput` members that report a MANAGED Redshift
+/// Serverless compute ("The managed Redshift Serverless compute name that is created for
+/// your catalog resource") stay unset, because this emulator provisions no such compute —
+/// reporting a name or a status for one would describe something that does not exist.
+pub fn to_catalog_properties_output(
+    stored: &CatalogProperties,
+    updated: SystemTime,
+) -> CatalogPropertiesOutput {
+    CatalogPropertiesOutput {
+        data_lake_access_properties: stored.data_lake_access_properties.as_ref().map(
+            |properties| DataLakeAccessPropertiesOutput {
+                data_lake_access: properties.data_lake_access,
+                data_transfer_role: properties.data_transfer_role.clone(),
+                kms_key: properties.kms_key.clone(),
+                catalog_type: properties.catalog_type.clone(),
+                managed_workgroup_name: None,
+                managed_workgroup_status: None,
+                redshift_database_name: None,
+                status_message: None,
+            },
+        ),
+        iceberg_optimization_properties: stored.iceberg_optimization_properties.as_ref().map(
+            |properties| IcebergOptimizationPropertiesOutput {
+                role_arn: properties.role_arn.clone(),
+                compaction: properties.compaction.clone(),
+                retention: properties.retention.clone(),
+                orphan_file_deletion: properties.orphan_file_deletion.clone(),
+                last_updated_time: Some(to_date_time(updated)),
+            },
+        ),
+        custom_properties: stored.custom_properties.clone(),
     }
 }
 
@@ -6894,6 +7089,47 @@ pub mod messages {
     /// deliberately withheld.
     pub const DATABASE_ALREADY_EXISTS: &str = "Database already exists.";
 
+    /// A read that addresses ONE catalog resource by its `CatalogId` (`GetCatalog`) for a
+    /// name the addressed account's Data Catalog holds no catalog under. NOT recorded:
+    /// the sentence follows the per-resource template of [`database_not_found`], built
+    /// from the name the request addressed, which is the whole address of a catalog.
+    pub fn catalog_not_found(name: &str) -> String {
+        format!("Catalog {name} not found.")
+    }
+
+    /// `CreateCatalog` for a `Name` the account already holds a catalog under. NOT
+    /// recorded: inferred from the recorded `CreateDatabase` duplicate, like
+    /// [`CRAWLER_ALREADY_EXISTS`] — 400, `AlreadyExistsException`, and no disclosure of
+    /// the requested name.
+    pub const CATALOG_ALREADY_EXISTS: &str = "Catalog already exists.";
+
+    /// `CreateCatalog` whose `Name` is the account's own id. Stated by the model: the
+    /// catalog's name "Cannot be the same as the account ID" (`Catalog$Name`), because
+    /// that id already addresses the account's own Data Catalog. The sentence is that
+    /// requirement; what is pinned is the behaviour — 400 with the operation's modelled
+    /// `InvalidInputException`.
+    pub const CATALOG_NAME_IS_ACCOUNT_ID: &str =
+        "Catalog name cannot be the same as the account ID.";
+
+    /// `CreateCatalog` whose `Name` is outside the `@pattern` its modelled type declares
+    /// ([`super::is_catalog_name`]).
+    ///
+    /// A value outside a MODELLED constraint is refused at request validation, before the
+    /// operation runs, in the clause shape that renderer uses (`N validation error(s)
+    /// detected: Value '…' at '<path>' failed to satisfy constraint: <requirement>` —
+    /// [`::aws_smithy_schema_server::Violation::message`]). This pattern reaches the
+    /// handler only because the framework's regex engine cannot compile a negative
+    /// look-ahead, so the refusal states the same two facts: the member path and the
+    /// pattern the model declares.
+    pub fn malformed_catalog_name(name: &str) -> String {
+        let path = ::aws_smithy_schema_server::constraints::path::member("Name");
+        format!(
+            "1 validation error detected: Value '{name}' at '{path}' failed to satisfy \
+             constraint: Member must satisfy regular expression pattern: {}",
+            super::CATALOG_NAME_PATTERN
+        )
+    }
+
     /// A READ that addresses ONE connection definition by name (`GetConnection`) for a
     /// name the addressed Data Catalog holds none under. Recorded template: it names the
     /// connection the request addressed and the account whose catalog was searched, both
@@ -7276,6 +7512,23 @@ pub fn fold_name(name: &str) -> String {
     name.to_ascii_lowercase()
 }
 
+/// The `@pattern` a catalog's `Name` must satisfy: `^(?!(.*[.\/\\]|aws:)).*$`
+/// (`CatalogNameString`, `smithy_query shape=CatalogNameString`) — a name carrying none
+/// of the three path separators anywhere in it, and not opening with the `aws:` prefix
+/// AWS reserves for its own resources.
+pub const CATALOG_NAME_PATTERN: &str = r"^(?!(.*[.\/\\]|aws:)).*$";
+
+/// Whether `name` satisfies [`CATALOG_NAME_PATTERN`].
+///
+/// Checked here rather than left to the boundary validator because that pattern uses a
+/// negative look-ahead, which the framework's regex engine cannot compile, and a
+/// `@pattern` it cannot compile is treated as matching every value — which would let a
+/// name the model forbids through to the store. The `@length(1, 64)` half of the
+/// constraint IS enforced upstream, so it is not repeated here.
+pub fn is_catalog_name(name: &str) -> bool {
+    !name.contains(['.', '/', '\\']) && !name.starts_with("aws:")
+}
+
 /// Ceiling on the size of the matcher one name pattern compiles to, in bytes.
 ///
 /// A pattern is request text and every stored name is matched against it, so the work it
@@ -7369,16 +7622,88 @@ pub fn resolve_catalog_id(catalog_id: Option<&String>) -> String {
     }
 }
 
-/// Whether `catalog_id` names a Data Catalog this emulator holds.
+/// Whether `catalog_id` names the ACCOUNT-level Data Catalog this emulator holds.
 ///
-/// It holds exactly one: the one for its own account, which is the catalog the model
-/// documents as the default. A catalog under any other id belongs to another account
-/// (reachable on the real service only through a Data Catalog resource policy) or
-/// would have to be created with `CreateCatalog`, which is not implemented — so no
-/// other id can name a catalog here, and a request that names one is answered as a
-/// miss rather than quietly given a new, empty catalog.
+/// It holds exactly one of those: the one for its own account, which is the catalog the
+/// model documents as the default. A catalog id of any other account belongs to that
+/// account's estate, reachable on the real service only through a Data Catalog resource
+/// policy, so a request that names one is refused rather than quietly given a new, empty
+/// catalog. The catalog RESOURCES a `CreateCatalog` registers inside this account carry
+/// their own ids ([`child_catalog_id`]) and are addressed through the catalog operations
+/// that take one ([`ComAmazonawsGlueAwsglueState::catalog_definition`]); the databases of
+/// such a catalog are not served through the account-level operations yet.
 pub fn is_known_catalog(catalog_id: &str) -> bool {
     catalog_id == ::engine::emulator_account_id()
+}
+
+/// The `CatalogId` of the catalog `name` inside the Data Catalog of `account_id`: the
+/// account the catalog was created in, then the catalog's own name.
+///
+/// A `CreateCatalog` carries no parent id — it creates the catalog in the Data Catalog of
+/// the account it is served for — and the catalog it created is then addressed by this
+/// id, which is what [`parse_catalog_reference`] reads back apart.
+pub fn child_catalog_id(account_id: &str, name: &str) -> String {
+    format!("{account_id}:{name}")
+}
+
+/// A `CatalogId` naming one catalog RESOURCE, split into the account whose Data Catalog
+/// holds it and the catalog's own name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogReference {
+    /// The account the catalog was created in: the part before the separator, or this
+    /// emulator's own account for an id that is a bare catalog name, which names a
+    /// catalog of the account the request is served for.
+    pub account_id: String,
+    /// The catalog's name, as the request spelled it.
+    pub name: String,
+}
+
+/// The catalog resource `catalog_id` names ([`child_catalog_id`] read back apart), for
+/// every operation that addresses one.
+///
+/// A bare name is a catalog of the account this endpoint serves, which is the default the
+/// model documents for a `CatalogId` ("If none is provided, the Amazon Web Services
+/// Account Number is used by default") — so `GetCatalog` reaches a catalog of its own
+/// account by name alone, and a catalog of another account only by naming that account.
+///
+/// The account prefix is told apart from a catalog name that itself carries a colon by
+/// what an account prefix IS: an Amazon Web Services account number
+/// ([`ACCOUNT_ID_DIGITS`]). An id that is such a number and nothing else names that
+/// account's own Data Catalog, which HOLDS catalogs but is not one of them, so it is
+/// resolved into that account and a name no catalog can carry — the account's id, which
+/// `Catalog$Name` cannot be.
+pub fn parse_catalog_reference(catalog_id: &str) -> CatalogReference {
+    if let Some((account_id, name)) = catalog_id
+        .split_once(':')
+        .filter(|(prefix, _)| is_account_id(prefix))
+    {
+        return CatalogReference {
+            account_id: account_id.to_string(),
+            name: name.to_string(),
+        };
+    }
+    if is_account_id(catalog_id) {
+        return CatalogReference {
+            account_id: catalog_id.to_string(),
+            name: catalog_id.to_string(),
+        };
+    }
+    CatalogReference {
+        account_id: ::engine::emulator_account_id().to_string(),
+        name: catalog_id.to_string(),
+    }
+}
+
+/// How many digits an Amazon Web Services account number carries. It is what tells a
+/// `CatalogId`'s optional account prefix from a catalog name, and so from a name that
+/// carries a colon of its own (`CatalogNameString`'s pattern forbids the three path
+/// separators and the `aws:` prefix, not a colon).
+const ACCOUNT_ID_DIGITS: usize = 12;
+
+/// Whether `value` is spelled as an Amazon Web Services account number: twelve decimal
+/// digits ([`ACCOUNT_ID_DIGITS`]).
+fn is_account_id(value: &str) -> bool {
+    value.len() == ACCOUNT_ID_DIGITS && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// The resource portion of a Data Catalog's ARN: the catalog itself, which is the
@@ -7397,11 +7722,32 @@ pub const IAM_ACTION_PREFIX: &str = "glue:";
 /// request may address the catalog of another account and that account is what such an
 /// ARN names.
 pub fn catalog_arn(region: &str, catalog_id: &str) -> String {
-    let canonical = ::engine::emulator_arn(ARN_NAMESPACE, region, CATALOG_ARN_RESOURCE);
+    glue_arn_for_account(region, catalog_id, CATALOG_ARN_RESOURCE)
+}
+
+/// `Catalog$ResourceArn`: "the Amazon Resource Name (ARN) assigned to the catalog
+/// resource" — the ARN of the catalog `name` created in the Data Catalog of `account_id`,
+/// as addressed in `region`.
+///
+/// The catalog itself is the resource TYPE ([`CATALOG_ARN_RESOURCE`]) and the catalog's
+/// name the resource, which is the layout every other Glue resource ARN follows
+/// ([`TaggedResourceKind::arn`]).
+pub fn catalog_resource_arn(region: &str, account_id: &str, name: &str) -> String {
+    glue_arn_for_account(region, account_id, &format!("{CATALOG_ARN_RESOURCE}/{name}"))
+}
+
+/// A Glue ARN for `resource` in the estate of `account_id`, as addressed in `region`.
+///
+/// The canonical layout and partition come from the shared minter, so this ARN matches
+/// every other ARN this emulator emits; only the ACCOUNT field is replaced, because a
+/// request may address a catalog of another account and that account is what such an ARN
+/// names.
+fn glue_arn_for_account(region: &str, account_id: &str, resource: &str) -> String {
+    let canonical = ::engine::emulator_arn(ARN_NAMESPACE, region, resource);
     let mut fields: Vec<&str> = canonical.split(':').collect();
     // Field 5 of an ARN is the account; the canonical form always has it.
     if let Some(account) = fields.get_mut(4) {
-        *account = catalog_id;
+        *account = account_id;
     }
     fields.join(":")
 }

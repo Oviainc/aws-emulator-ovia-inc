@@ -8601,14 +8601,18 @@ dependencies = [
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
+ "base64 0.22.1",
  "bytes",
+ "font8x8",
  "hex",
  "http",
+ "jpeg-encoder",
  "roxmltree",
  "serde_json",
  "sha2 0.10.9",
  "tokio",
  "tracing",
+ "zune-jpeg 0.4.21",
 ]
 
 [[package]]

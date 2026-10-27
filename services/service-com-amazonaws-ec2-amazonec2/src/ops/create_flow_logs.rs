@@ -192,14 +192,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state;
         use std::time::SystemTime;
-
-        // The Region the request was signed for: a CloudWatch Logs destination given by
-        // NAME is reported as an ARN as well, and that ARN names a Region.
-        let region = state::request_region(ctx.parts());
 
         // "The IDs of the resources to monitor" (`$ResourceIds`) is `@required`, which the
         // boundary validator enforces as "present" — an EMPTY list is still present, and
@@ -272,9 +268,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Where the records go. For CloudWatch Logs the destination is ONE log group named
         // either way — "specify the ARN of a CloudWatch Logs log group … Alternatively, use
-        // the LogGroupName parameter" (`$LogDestination`) — so whichever member the request
-        // used, the flow log reports both; for the other destination types only the ARN
-        // exists.
+        // the LogGroupName parameter" (`$LogDestination`) — and each member of the created
+        // flow log holds what the REQUEST carried for it. The group's NAME is in the request
+        // either way (given outright, or as the segment of the ARN that names it), but an
+        // ARN is NOT: it also takes a Region and an account id that only this service would
+        // pick. So a request that named its group by name leaves the destination ARN member
+        // unset rather than being reported with a destination it never asked for. For the
+        // other destination types only the ARN exists.
         let (log_group_name, log_destination) = if publishes_to_log_group {
             let named = input.log_group_name.clone();
             let in_arn = input
@@ -300,11 +300,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ))
                 }
             };
-            let destination = input
-                .log_destination
-                .clone()
-                .unwrap_or_else(|| state::flow_log_group_arn(&region, &name));
-            (Some(name), Some(destination))
+            (Some(name), input.log_destination.clone())
         } else {
             let Some(destination) = input.log_destination.clone() else {
                 return Err(state::missing_parameter(

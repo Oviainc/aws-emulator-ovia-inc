@@ -289,6 +289,12 @@ mod fpga_image_tasks_and_volume_io;
 mod create_restore_image_task;
 #[path = "all/get_password_data.rs"]
 mod get_password_data;
+// The JPG-format console screenshot `GetConsoleScreenshot` reports for one instance, what it
+// refuses, and what `DryRun` and `WakeUp` do to it. Declared beside the suite above rather
+// than in sorted position, for the reason this file's header note gives: the sorted
+// neighbourhood and the tail of this list are where every new ec2 suite inserts its lines.
+#[path = "all/get_console_screenshot.rs"]
+mod get_console_screenshot;
 // Which ONE attribute of a stored AMI `DescribeImageAttribute` reports, and what it
 // refuses. Declared HERE rather than in sorted position or at the tail, for the reason the
 // header note gives: both the sorted `image_*` neighbourhood and the tail of this list are

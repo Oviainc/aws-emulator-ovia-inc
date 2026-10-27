@@ -384,15 +384,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The managed session policies a mint may name are capped by the operation's
-        // documentation, not by the model's list shape.
+        // documentation, not by the model's list shape — so the refusal is STS's own
+        // sentence about that cap (`policy_arns_over_limit_message`) rather than the
+        // generic member-constraint rendering, which would also echo the ARN list back.
         let named_policy_arns = crate::state::policy_arns(input.policy_arns.as_deref());
         if named_policy_arns.len() > MAX_MANAGED_SESSION_POLICIES {
-            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                "1 validation error detected: Value '[{}]' at 'policyArns' failed to satisfy \
-                 constraint: Member must have length less than or equal to \
-                 {MAX_MANAGED_SESSION_POLICIES}",
-                named_policy_arns.join(", ")
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::policy_arns_over_limit_message(),
+            ));
         }
 
         // The size the session policies and session tags pack into, measured in bytes,
@@ -421,7 +420,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The role's own id, the one IAM issued when the role was created, is read from
         // the IAM store below together with the trust policy this assume is decided by.
 
-        let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
+        let access_key_id = ::service_common::request_access_key_id(ctx.parts());
         // The IAM store is read FIRST, and only the two facts this decision needs are
         // copied out, so this handler never holds the IAM lock and the session lock at
         // once. A router without IAM mounted holds no role at all, which is the same
@@ -503,6 +502,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 transitive_tag_keys.push(key);
             }
         }
+        // "The source identity value persists across chained role sessions"
+        // (`AssumeRoleRequest$SourceIdentity`), and a value already set on the calling
+        // session is not replaceable by a chained mint: a request naming a DIFFERENT one
+        // is refused rather than silently continuing the chain under a new identity,
+        // which is what makes the value attributable to one original identity. Naming the
+        // SAME value again is not a change, so it is served.
+        if let (Some(named), Some(carried)) =
+            (input.source_identity.as_deref(), caller.source_identity.as_deref())
+        {
+            if named != carried {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::SOURCE_IDENTITY_ALREADY_SET_MESSAGE,
+                ));
+            }
+        }
         let source_identity = input
             .source_identity
             .clone()
@@ -542,6 +556,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &tags,
             &transitive_tag_keys,
         );
+        // The condition keys this mint ANSWERS for, which is what makes a clause over a
+        // tag key the request does not carry decide rather than stay undecided; see
+        // `assume_role_published_condition_keys`.
+        let published = crate::state::assume_role_published_condition_keys(&caller);
         let refused = |action: &str| -> Self::Error {
             crate::scaffolded::Scaffolded::access_denied(not_authorized_message(
                 &caller.identity.arn,
@@ -552,7 +570,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(role) = role else {
             return Err(refused(ASSUME_ROLE_ACTION));
         };
-        if !role.trust_policy_allows(ASSUME_ROLE_ACTION, &principals, &condition_context) {
+        if !role.trust_policy_admits(
+            ASSUME_ROLE_ACTION,
+            &principals,
+            &condition_context,
+            &published,
+        ) {
             return Err(refused(ASSUME_ROLE_ACTION));
         }
 
@@ -565,7 +588,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refused. Naming a transitive tag KEY is part of the same act, so it needs the
         // grant too even when the request names no tag of its own.
         if (!tags.is_empty() || !transitive_tag_keys.is_empty())
-            && !role.trust_policy_allows(TAG_SESSION_ACTION, &principals, &condition_context)
+            && !role.trust_policy_admits(
+                TAG_SESSION_ACTION,
+                &principals,
+                &condition_context,
+                &published,
+            )
         {
             return Err(refused(TAG_SESSION_ACTION));
         }
@@ -577,14 +605,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it creates. The recorded behaviour of that leg is explicit — an assume made from
         // a session that already carries a source identity, against a role whose trust
         // policy does not allow `sts:SetSourceIdentity`, is refused.
+        //
+        // The refusal names the action the CALLER asked to perform. A request that names
+        // `SourceIdentity` asked to set one, so its refusal names
+        // `sts:SetSourceIdentity`; a chained request that names none asked only to assume
+        // the role — STS is what carries the calling session's value forward — so its
+        // refusal names `sts:AssumeRole`, the action the caller is not authorized for.
         if source_identity.is_some()
-            && !role.trust_policy_allows(
+            && !role.trust_policy_admits(
                 SET_SOURCE_IDENTITY_ACTION,
                 &principals,
                 &condition_context,
+                &published,
             )
         {
-            return Err(refused(SET_SOURCE_IDENTITY_ACTION));
+            return Err(refused(if input.source_identity.is_some() {
+                SET_SOURCE_IDENTITY_ACTION
+            } else {
+                ASSUME_ROLE_ACTION
+            }));
         }
 
         // SerialNumber and TokenCode name the caller's MFA device. A trust policy's MFA

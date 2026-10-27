@@ -29,6 +29,8 @@ mod catalog_identity;
 mod catalog_mutations;
 #[path = "all/catalog_projections.rs"]
 mod catalog_projections;
+#[path = "all/catalog_resources.rs"]
+mod catalog_resources;
 #[path = "all/classifiers.rs"]
 mod classifiers;
 #[path = "all/column_statistics_task_conflicts.rs"]

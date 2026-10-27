@@ -45,6 +45,8 @@ mod release_label_catalog;
 mod release_labels;
 #[path = "all/resource_not_found_code.rs"]
 mod resource_not_found_code;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/security_configurations.rs"]
 mod security_configurations;
 #[path = "all/state_roundtrip.rs"]

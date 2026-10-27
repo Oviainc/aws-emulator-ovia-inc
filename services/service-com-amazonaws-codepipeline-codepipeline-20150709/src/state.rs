@@ -78,16 +78,6 @@ pub const ARN_SERVICE: &str = "codepipeline";
 /// `ThirdParty`); named here because two state rules turn on this one value.
 pub const ACTION_OWNER_THIRD_PARTY: &str = "ThirdParty";
 
-/// The `ActionTypeId$provider` of the third-party source whose webhooks this service
-/// registers with the tool that owns them.
-///
-/// `RegisterWebhookWithThirdParty` and `DeregisterWebhookWithThirdParty` are both
-/// "currently supported only for webhooks that target an action type of GitHub", so
-/// the two operations resolve their webhook's target action against this provider. It
-/// is the provider of the `ThirdParty`-owned source action type the catalog carries
-/// ([`BUILT_IN_ACTION_TYPES`]).
-pub const PROVIDER_GITHUB: &str = "GitHub";
-
 /// The `PipelineType` values the model declares
 /// (`smithy_query query="shape" shape="PipelineType"` -> `V1`, `V2`).
 pub const PIPELINE_TYPES: [&str; 2] = ["V1", "V2"];
@@ -99,6 +89,10 @@ pub const EXECUTION_MODES: [&str; 3] = ["QUEUED", "SUPERSEDED", "PARALLEL"];
 
 /// `PipelineDeclaration$executionMode` documents "The default mode is SUPERSEDED".
 pub const DEFAULT_EXECUTION_MODE: &str = "SUPERSEDED";
+
+/// The `ExecutionMode` in which every execution of the pipeline runs on its own,
+/// rather than one at a time.
+pub const EXECUTION_MODE_PARALLEL: &str = EXECUTION_MODES[2];
 
 /// The `PipelineExecutionStatus` value an execution carries while it has neither
 /// completed nor been stopped, from the model's enum
@@ -303,29 +297,21 @@ pub const MAX_PIPELINES_PER_ACCOUNT: usize = 1000;
 /// revision a way for an execution to begin).
 pub const TRIGGER_TYPE_PUT_ACTION_REVISION: &str = "PutActionRevision";
 
-/// How many executions a pipeline in `SUPERSEDED` mode runs at once.
-///
-/// `SUPERSEDED` is the mode in which a newer execution takes the place of the one
-/// already running — `PipelineDeclaration$executionMode` documents it as "the method
-/// that the pipeline will use to handle multiple executions" and names this the
-/// default — so such a pipeline is running exactly one execution at any instant.
-/// Superseding the running execution is not something this emulator can do: it does
-/// not run a pipeline's stages, so nothing here could tell how far the running
-/// execution has got or move it to `Superseded` without reporting a transition for
-/// work nothing ran. A trigger that would start a second concurrent execution is
-/// therefore refused with the error the model declares for exactly this condition,
-/// `ConcurrentPipelineExecutionsLimitExceededException` ("The pipeline has reached
-/// the limit for concurrent pipeline executions").
-pub const MAX_CONCURRENT_EXECUTIONS_SUPERSEDED: usize = 1;
-
-/// How many executions a pipeline in `QUEUED` or `PARALLEL` mode runs at once.
-///
-/// Those two modes exist to hold more than one execution, so the bound is not 1; AWS
-/// publishes the figure as an adjustable per-account quota rather than as part of the
-/// API, so the value here is this emulator's bound. A bound is required all the same:
-/// every accepted trigger adds a non-terminal execution and this slice runs no stage
-/// that would ever complete one.
-pub const MAX_CONCURRENT_EXECUTIONS_PARALLEL: usize = 50;
+/// What the pipeline's concurrent-execution accounting answers a call that is about
+/// to start one more execution of it
+/// ([`ComAmazonawsCodepipelineCodepipeline20150709State::admit_execution`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionAdmission {
+    /// The execution runs from the moment it is recorded.
+    Started,
+    /// The execution WAITS for the one already running, as `QUEUED` and `SUPERSEDED`
+    /// hold one execution at a time; the driver admits it when that one finishes.
+    Queued,
+    /// The pipeline already carries every execution it may, so the call that asked is
+    /// refused with `ConcurrentPipelineExecutionsLimitExceededException`
+    /// ([`CONCURRENT_EXECUTION_LIMIT_MESSAGE`]).
+    AtLimit,
+}
 
 /// The most action types this emulator registers for the account before another
 /// registration is refused.
@@ -531,10 +517,12 @@ pub struct ComAmazonawsCodepipelineCodepipeline20150709State {
     /// which takes a definition only while the map holds fewer than
     /// [`MAX_ACTION_TYPE_DEFINITIONS`] definitions in total — the Region half of the
     /// key is CALLER-SUPPLIED, so a per-Region bound alone would not bound this map.
-    /// Whether an identity EXISTS to be defined is the request's question rather than
-    /// the store's, so `UpdateActionType` asks
-    /// [`ComAmazonawsCodepipelineCodepipeline20150709State::action_type_available_in`]
-    /// and answers `ActionTypeNotFoundException` itself. Read this map through
+    /// Whether an identity may be defined at all is the request's question rather than
+    /// the store's: the definition belongs to the action type's PROVIDER, so
+    /// `UpdateActionType` asks
+    /// [`ComAmazonawsCodepipelineCodepipeline20150709State::third_party_partner`]
+    /// whether the caller is it and answers `ActionTypeNotFoundException` itself. Read
+    /// this map through
     /// [`ComAmazonawsCodepipelineCodepipeline20150709State::declared_action_type`].
     action_type_declarations: BTreeMap<(String, ActionTypeKey), ActionTypeDeclaration>,
     /// The partner integrations registered with this service: the identity of a
@@ -1004,45 +992,104 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
             .last()
     }
 
-    /// How many of the pipeline's retained executions are still in a non-terminal
-    /// status ([`NON_TERMINAL_STATUSES`]), i.e. how many concurrent execution slots
-    /// the pipeline currently occupies.
-    pub fn concurrent_execution_count(&self, pipeline_name: &str) -> usize {
+    /// The `(pipelineExecutionId, queued)` of every execution of `pipeline_name` that
+    /// has not reached a terminal status, oldest first — the executions occupying the
+    /// pipeline's concurrent-execution slots.
+    ///
+    /// The ONE scan of that set: [`Self::concurrent_execution_count`] counts it and
+    /// [`Self::admit_execution`] reads which of them is the one running, so the two
+    /// cannot drift apart over what "in flight" means.
+    fn in_flight_executions(&self, pipeline_name: &str) -> Vec<(String, bool)> {
         self.executions_by_pipeline
             .get(pipeline_name)
             .map(|ids| {
                 ids.iter()
                     .filter_map(|id| self.executions.get(id))
-                    .filter(|record| {
-                        NON_TERMINAL_STATUSES.contains(&record.status.as_str())
-                    })
-                    .count()
+                    .filter(|record| NON_TERMINAL_STATUSES.contains(&record.status.as_str()))
+                    .map(|record| (record.pipeline_execution_id.clone(), record.queued))
+                    .collect()
             })
             .unwrap_or_default()
     }
 
-    /// Whether `definition`'s target action is the third-party source this service
-    /// registers a webhook with.
+    /// How many of the pipeline's retained executions are still in a non-terminal
+    /// status ([`NON_TERMINAL_STATUSES`]), i.e. how many concurrent execution slots
+    /// the pipeline currently occupies.
+    pub fn concurrent_execution_count(&self, pipeline_name: &str) -> usize {
+        self.in_flight_executions(pipeline_name).len()
+    }
+
+    /// Admit one more execution of `pipeline_name`, running the pipeline's
+    /// `execution_mode`: the one place the two calls that START an execution of a
+    /// pipeline — `StartPipelineExecution` and a new revision reported through
+    /// `PutActionRevision` — learn whether they may, and the only place the mode's
+    /// effect on the executions already in flight is applied. (`RollbackStage` re-runs
+    /// a stage of an execution that already ran rather than starting a new run of the
+    /// pipeline, and answers its own modelled error at the ceiling.)
     ///
-    /// `RegisterWebhookWithThirdParty` takes "an existing webhook created with
-    /// PutWebhook to register with a supported third party", and
-    /// `DeregisterWebhookWithThirdParty` is "currently supported only for webhooks
-    /// that target an action type of GitHub": both resolve the webhook's
-    /// `targetPipeline` and `targetAction` to the action the pipeline declares and ask
-    /// whether its provider is that third party ([`PROVIDER_GITHUB`]). ONE rule, so
-    /// the two operations cannot disagree about which webhooks they serve.
-    pub fn webhook_targets_third_party(&self, definition: &WebhookDefinition) -> bool {
-        self.pipelines
-            .get(&definition.target_pipeline)
-            .and_then(|pipeline| {
-                pipeline
-                    .declaration
-                    .stages
-                    .iter()
-                    .flat_map(|stage| &stage.actions)
-                    .find(|action| action.name == definition.target_action)
-            })
-            .is_some_and(|action| action.action_type_id.provider == PROVIDER_GITHUB)
+    /// Three rules, so the two callers cannot disagree about them:
+    ///
+    /// * a pipeline carries at most [`MAX_CONCURRENT_EXECUTIONS_PER_PIPELINE`]
+    ///   executions that have not reached a terminal status, whatever its mode, and the
+    ///   call that would start one past that is answered
+    ///   [`ExecutionAdmission::AtLimit`] — which is the condition
+    ///   `ConcurrentPipelineExecutionsLimitExceededException` states;
+    /// * `PipelineDeclaration$executionMode` documents `PARALLEL` as the mode in which
+    ///   every execution runs on its own, while `QUEUED` and `SUPERSEDED` "handle
+    ///   multiple executions" one at a time — so in those two an execution admitted
+    ///   while another is RUNNING waits ([`ExecutionAdmission::Queued`]);
+    /// * in `SUPERSEDED` mode — the default — the execution that is waiting is
+    ///   superseded by this one, which is what that mode means.
+    ///
+    /// Only the second and third rule write, and they write only to the executions the
+    /// mode supersedes: a call answered `AtLimit` changes nothing, so the caller may
+    /// refuse the request after asking.
+    pub fn admit_execution(
+        &mut self,
+        pipeline_name: &str,
+        execution_mode: &str,
+        now: SystemTime,
+    ) -> ExecutionAdmission {
+        // How many slots are occupied, and whether any of them is the one running.
+        let in_flight = self.in_flight_executions(pipeline_name);
+        if in_flight.len() >= MAX_CONCURRENT_EXECUTIONS_PER_PIPELINE {
+            return ExecutionAdmission::AtLimit;
+        }
+
+        let running = in_flight.iter().any(|(_, queued)| !queued);
+        if execution_mode == EXECUTION_MODE_PARALLEL || !running {
+            return ExecutionAdmission::Started;
+        }
+        if execution_mode == DEFAULT_EXECUTION_MODE {
+            let waiting: Vec<String> = in_flight
+                .iter()
+                .filter(|(_, queued)| *queued)
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in waiting {
+                if let Some(record) = self.executions.get_mut(&id) {
+                    record.status = STATUS_SUPERSEDED.to_string();
+                    record.status_summary =
+                        Some("superseded by a later execution of the pipeline".to_string());
+                    record.last_update_time = now;
+                }
+            }
+        }
+        ExecutionAdmission::Queued
+    }
+
+    /// The `WebhookDefinition$authentication` the webhook stored under `name` carries,
+    /// or `None` when the account holds no webhook of that name.
+    ///
+    /// The one question both third-party webhook operations put to the store: the
+    /// connection they make and break is a GitHub HMAC one, so what decides whether
+    /// either serves a webhook is the authentication it was configured with
+    /// ([`webhook_authentication_unsupported_message`]), and the name resolution and
+    /// that authentication are read from ONE snapshot of the store.
+    pub fn webhook_authentication(&self, name: &str) -> Option<&str> {
+        self.webhooks
+            .get(name)
+            .map(|webhook| webhook.definition.authentication.as_str())
     }
 
     /// Record one evaluation of one stage condition's rule against `pipeline_name`.
@@ -1298,24 +1345,6 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
         catalog
     }
 
-    /// Whether the account holds an action type with the identity `key` that a caller
-    /// in `region` can use — the existence question every operation addressing an
-    /// action type by its id has to answer.
-    ///
-    /// Reads exactly what [`Self::action_type_catalog`] would report, without
-    /// building it: a registration under that id answers for it (and shadows a
-    /// built-in of the same id, so a registration made in another Region hides it the
-    /// same way the listing does), otherwise the catalog the service provides itself
-    /// does.
-    pub fn action_type_available_in(&self, key: &ActionTypeKey, region: &str) -> bool {
-        if let Some(record) = self.action_types.get(key) {
-            return record.available_in(region);
-        }
-        BUILT_IN_ACTION_TYPES
-            .iter()
-            .any(|entry| &entry.key() == key && entry.record().available_in(region))
-    }
-
     /// Store `declaration` as the definition the Region `region` holds for the action
     /// type `key`, replacing whatever definition that identity carried there, and
     /// answer whether the store took it.
@@ -1326,9 +1355,9 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
     /// holds is always accepted: it grows nothing. `UpdateActionType` "provide[s] the
     /// full structure", so a stored definition is replaced whole rather than merged.
     ///
-    /// This gate enforces the store's own cap only; whether an action type with that
-    /// identity EXISTS to be defined is the request's question, which the caller
-    /// settles with [`Self::action_type_available_in`] before calling.
+    /// This gate enforces the store's own cap only; whether the caller may define this
+    /// action type at all is the request's question, which it settles with
+    /// [`Self::third_party_partner`] before calling.
     pub fn declare_action_type(
         &mut self,
         region: &str,
@@ -3758,20 +3787,15 @@ pub fn reported_declaration(declaration: &PipelineDeclaration) -> PipelineDeclar
     reported
 }
 
-/// How many executions a pipeline whose `executionMode` is `execution_mode` runs
-/// concurrently: one in `SUPERSEDED` mode, [`MAX_CONCURRENT_EXECUTIONS_PARALLEL`] in
-/// the modes that hold several (`QUEUED`, `PARALLEL`).
+/// The message `ConcurrentPipelineExecutionsLimitExceededException` carries, for every
+/// call that would start one execution too many.
 ///
-/// An unrecognised value cannot reach here through the wire — `ExecutionMode` is a
-/// modelled enum and the boundary validator refuses anything else — and is treated as
-/// the default mode, which is what a declaration carrying no mode resolves to.
-pub fn max_concurrent_executions(execution_mode: &str) -> usize {
-    if execution_mode == EXECUTION_MODES[0] || execution_mode == EXECUTION_MODES[2] {
-        MAX_CONCURRENT_EXECUTIONS_PARALLEL
-    } else {
-        MAX_CONCURRENT_EXECUTIONS_SUPERSEDED
-    }
-}
+/// The sentence the service states this condition with, which is what the model
+/// documents the error as: "The pipeline has reached the limit for concurrent pipeline
+/// executions." It carries no variable part — the pipeline is the one the request
+/// named — so it is a constant, stated once here rather than worded per handler.
+pub const CONCURRENT_EXECUTION_LIMIT_MESSAGE: &str =
+    "The pipeline has reached the limit for concurrent pipeline executions.";
 
 /// The variables an execution of `declaration` runs with: every variable the
 /// declaration declares takes `overrides`'s value for it when there is one, else its
@@ -3975,6 +3999,24 @@ pub fn action_not_found_message(
     format!(
         "Stage '{stage_name}' of pipeline '{pipeline_name}' does not have an action with name \
          '{action_name}'"
+    )
+}
+
+/// The message `ValidationException` carries for a webhook the third-party webhook
+/// operations cannot serve: one whose stored authentication is not the GitHub HMAC
+/// one.
+///
+/// `RegisterWebhookWithThirdParty` connects a stored webhook to the external tool and
+/// `DeregisterWebhookWithThirdParty` breaks that connection, and the connection is
+/// made with the shared secret the GitHub HMAC authentication carries, so a webhook
+/// configured with any other `WebhookAuthenticationType` is refused. The requirement
+/// is what the refusal states, over the webhook the request named and the
+/// authentication type the store holds for it — the only place the caller learns WHICH
+/// authentication blocked the call — so the two operations state one rule one way.
+pub fn webhook_authentication_unsupported_message(name: &str, authentication: &str) -> String {
+    format!(
+        "Webhook {name} must be configured with {AUTHENTICATION_GITHUB_HMAC} authentication \
+         type. Type is {authentication}."
     )
 }
 

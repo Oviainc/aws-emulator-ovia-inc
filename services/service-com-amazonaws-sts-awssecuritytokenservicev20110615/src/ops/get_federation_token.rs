@@ -294,14 +294,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::validation_error(violated));
         }
 
+        // The managed session policies a mint may name are capped by the operation's
+        // documentation, not by the model's list shape, so the refusal is STS's own
+        // sentence about that cap rather than the generic member-constraint rendering.
         let named_policy_arns = crate::state::policy_arns(input.policy_arns.as_deref());
         if named_policy_arns.len() > MAX_MANAGED_SESSION_POLICIES {
-            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                "1 validation error detected: Value '[{}]' at 'policyArns' failed to satisfy \
-                 constraint: Member must have length less than or equal to \
-                 {MAX_MANAGED_SESSION_POLICIES}",
-                named_policy_arns.join(", ")
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::policy_arns_over_limit_message(),
+            ));
         }
 
         // The same packed-token rule this service applies to every mint: the measured
@@ -327,7 +327,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
+        let access_key_id = ::service_common::request_access_key_id(ctx.parts());
         // The identity a long-term key speaks for comes from the IAM store, read before
         // the session lock is taken so the two are never held at once.
         let long_term = {

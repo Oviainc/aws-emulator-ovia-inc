@@ -49,7 +49,11 @@ const OPERATION: &str = "CreateInstanceSnapshot";
 
 /// One tag a request carries: a key and the value the modelled `Tag` shape
 /// leaves optional.
-type TagPair = (String, Option<String>);
+///
+/// `pub(crate)` with the four helpers below: nothing about them is specific to
+/// an INSTANCE snapshot, so a sibling create suite drives its own operation
+/// through them rather than keeping a second copy.
+pub(crate) type TagPair = (String, Option<String>);
 
 /// The `tags` member a request carries, in the modelled `TagList` form — a tag
 /// with no value carries its key alone, since `Tag$value` is optional.
@@ -57,7 +61,7 @@ type TagPair = (String, Option<String>);
 /// The sibling `resource_tags::tag_list` builds the same JSON but over
 /// `&'static str` rows, so it cannot carry the tags a case GENERATES at run time
 /// to drive the list bound; this takes owned pairs instead.
-fn tag_list(tags: &[TagPair]) -> Value {
+pub(crate) fn tag_list(tags: &[TagPair]) -> Value {
     Value::Array(
         tags.iter()
             .map(|(key, value)| match value {
@@ -70,7 +74,7 @@ fn tag_list(tags: &[TagPair]) -> Value {
 
 /// `count` distinct tags, the first of them carrying its key alone: the form of
 /// a tag is not what the bound is about, so one generator serves every count.
-fn generated_tags(count: usize) -> Vec<TagPair> {
+pub(crate) fn generated_tags(count: usize) -> Vec<TagPair> {
     (0..count)
         .map(|index| {
             let key = format!("key-{index:02}");
@@ -132,7 +136,7 @@ async fn snapshot_names(emulator: &Emulator) -> Vec<String> {
 
 /// The ONE operation-log entry a create answered, which is the only entry a
 /// create of one snapshot may answer.
-fn single_operation(case: &str, answered: &Value) -> Value {
+pub(crate) fn single_operation(case: &str, answered: &Value) -> Value {
     let operations = answered["operations"]
         .as_array()
         .unwrap_or_else(|| panic!("case {case}: expected an operations array, got {answered:?}"))
@@ -149,7 +153,7 @@ fn single_operation(case: &str, answered: &Value) -> Value {
 ///
 /// The terminal status is owed by the CLOCK, not by the poll: it arrives without
 /// anyone asking more than once.
-async fn wait_for_terminal_operation(emulator: &Emulator, id: &str) -> Value {
+pub(crate) async fn wait_for_terminal_operation(emulator: &Emulator, id: &str) -> Value {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let operation = emulator

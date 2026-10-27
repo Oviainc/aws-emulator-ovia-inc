@@ -180,20 +180,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the request alone, and the modelled constraints the framework checks ahead of
         // this handler are refused the same way, so a malformed request is answered as
         // malformed whether or not its target exists.
-        let size = crate::state::attributes_size(&attributes);
-        if size > crate::state::MAX_ATTRIBUTES_BYTES {
-            return Err(crate::state::validation_failed(
-                CreateParticipantTokenErrorModeled::ValidationException,
-                // Worded in the construction this service states every constraint refusal
-                // with (`crate::state::violation_clause`): the operation, the member and
-                // the bound it violated, with what the request actually sent.
-                format!(
-                    "{}.attributes is required to have a maximum size of {} bytes, found {size}",
-                    Self::NAME,
-                    crate::state::MAX_ATTRIBUTES_BYTES,
-                ),
-            ));
-        }
+        crate::state::check_attributes_size(Self::NAME, "attributes", &attributes).map_err(
+            |message| {
+                crate::state::validation_failed(
+                    CreateParticipantTokenErrorModeled::ValidationException,
+                    message,
+                )
+            },
+        )?;
 
         let mut store = state.lock();
         // The stage is resolved in this request's own region's view of the account: a

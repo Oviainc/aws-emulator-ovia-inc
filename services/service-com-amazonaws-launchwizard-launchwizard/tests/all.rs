@@ -31,6 +31,8 @@ mod deployment_update;
 mod deployment_update_in_flight;
 #[path = "all/dry_run_preflight.rs"]
 mod dry_run_preflight;
+#[path = "all/empty_collection_members.rs"]
+mod empty_collection_members;
 #[path = "all/harness.rs"]
 mod harness;
 #[path = "all/list_deployments_filter_pairs.rs"]

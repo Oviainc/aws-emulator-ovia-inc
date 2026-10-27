@@ -43,8 +43,12 @@ mod acme_external_account_binding_revocation;
 mod acme_surface_wire_values;
 #[path = "all/certificate_detail_projection.rs"]
 mod certificate_detail_projection;
+#[path = "all/certificate_distinguished_names.rs"]
+mod certificate_distinguished_names;
 #[path = "all/certificate_domain_validations.rs"]
 mod certificate_domain_validations;
+#[path = "all/certificate_export.rs"]
+mod certificate_export;
 #[path = "all/certificate_idempotency_expiry.rs"]
 mod certificate_idempotency_expiry;
 #[path = "all/certificate_import.rs"]
