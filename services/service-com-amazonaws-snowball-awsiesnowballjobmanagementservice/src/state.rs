@@ -10,6 +10,12 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// Resolving the AWS resources an order NAMES — the buckets it transfers, the role it
+/// transfers them under, the key it is encrypted with, the images and functions it carries,
+/// the topics it notifies — against the services that hold them. Shared by every operation
+/// that places or updates an order, so one rule covers all of them.
+pub mod named_resources;
+
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
