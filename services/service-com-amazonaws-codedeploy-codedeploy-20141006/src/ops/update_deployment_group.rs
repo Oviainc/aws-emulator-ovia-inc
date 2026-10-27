@@ -329,11 +329,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
         // The alarm rules live in `crate::state` so that every operation
-        // accepting an alarm configuration refuses the same requests.
+        // accepting an alarm configuration refuses the same malformed requests.
+        // How MANY alarms the configuration carries is judged differently here:
+        // the documented deployment-group figure bounds the group's alarm
+        // monitoring, not an update of its configuration, so an update naming
+        // more than that is accepted and stored in full rather than refused —
+        // up to what one group KEEPS, which is the bound this gate applies; see
+        // `crate::state::AlarmQuota`.
         if let Some(configuration) = input.alarm_configuration.as_ref() {
             match crate::state::validate_alarm_configuration(
                 configuration,
-                crate::state::AlarmQuota::DeploymentGroup,
+                crate::state::AlarmQuota::DeploymentGroupUpdate,
             ) {
                 Ok(()) => {}
                 Err(crate::state::AlarmConfigurationRejection::TooManyAlarms(message)) => {

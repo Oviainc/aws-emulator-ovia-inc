@@ -120,6 +120,15 @@
 //! — `GetResourcePolicyRequest$ResourceArn`), which is therefore keyed by the Data
 //! Catalog's own ARN ([`catalog_arn`]).
 //!
+//! INTEGRATION RESOURCE PROPERTIES — the processing properties
+//! `CreateIntegrationResourceProperty` sets on the Glue connection an integration reads
+//! from, or on the Glue database it writes into — sit in such a per-account namespace too,
+//! keyed by that resource's ARN
+//! ([`ComAmazonawsGlueAwsglueState::integration_resource_properties`]), for the reason a
+//! resource policy is: every operation that addresses one record names it by `ResourceArn`
+//! alone. One record per resource, so a second create for a resource that already has one
+//! writes THAT record rather than adding a second.
+//!
 //! WORKFLOWS — the containers for the dependent jobs and crawlers `CreateWorkflow`
 //! registers — sit beside that tree in a per-account namespace keyed by workflow name
 //! ([`ComAmazonawsGlueAwsglueState::workflows`]): "The name to be assigned to the
@@ -186,7 +195,8 @@ use crate::ops::types::{
     Connection, ConnectionInput,
     ConnectionPasswordEncryption, ConnectionsList, Crawler, CrawlerTargets, CreateClassifierInput,
     CreateColumnStatisticsTaskSettingsInput, CreateCrawlerInput,
-    CreateCustomEntityTypeInput, CreateGlossaryInput, CreateGlossaryTermInput, CreateJobInput,
+    CreateCustomEntityTypeInput, CreateGlossaryInput, CreateGlossaryTermInput,
+    CreateIntegrationResourcePropertyInput, CreateJobInput,
     CreateMLTransformInput, CsvClassifier,
     CreateSecurityConfigurationInput, CreateTriggerInput, CreateWorkflowInput, CustomEntityType,
     DataCatalogEncryptionSettings, DataLakePrincipal,
@@ -202,12 +212,14 @@ use crate::ops::types::{
     RLSProperties,
     RecrawlPolicy, RegistryId, Schedule,
     SchemaChangePolicy, SchemaColumn, SchemaId, SecurityConfiguration, SourceControlDetails,
+    SourceProcessingProperties,
     StartColumnStatisticsTaskRunInput,
     StartDataQualityRuleRecommendationRunInput,
     StartJobRunInput, StorageDescriptor, Table, TableIdentifier, TableInput,
     TableVersion,
     TransformEncryption, TransformFilterCriteria, TransformParameters, TransformSortCriteria,
     Trigger, TriggerNodeDetails,
+    Tag, TargetProcessingProperties,
     UpdateClassifierInput, UpdateCrawlerInput, UpdateMLTransformInput, Workflow, WorkflowGraph,
     WorkflowRun,
     WorkflowRunStatistics, XMLClassifier,
@@ -406,6 +418,14 @@ pub const MAX_ML_TRANSFORMS: usize = 1_000;
 /// stored; `PutResourcePolicy` models no limit error, so the refusal is the closest
 /// client error it does model (`InvalidInputException`).
 pub const MAX_RESOURCE_POLICIES: usize = 1_000;
+
+/// Ceiling on the integration resource property records this emulator will hold, for the
+/// same reason as [`MAX_CRAWLERS`]: `CreateIntegrationResourceProperty` writes a record any
+/// caller can reach, each one carrying the processing properties of one resource, so the
+/// number of records one process will hold is bounded here. A create that would add one
+/// past the ceiling is refused rather than stored; that operation models no limit error, so
+/// the refusal is the closest client error it does model (`InvalidInputException`).
+pub const MAX_INTEGRATION_RESOURCE_PROPERTIES: usize = 1_000;
 
 /// The `ExistCondition` a `PutResourcePolicy` carries to require that a policy is already
 /// attached ("A value of MUST_EXIST is used to update a policy"). One of the modelled
@@ -879,6 +899,18 @@ pub struct ComAmazonawsGlueAwsglueState {
     /// name ONE record. Ordered, so `GetResourcePolicies` has one deterministic order to
     /// page over, and bounded by [`MAX_RESOURCE_POLICIES`].
     pub resource_policies: BTreeMap<String, ResourcePolicyEntry>,
+    /// Every integration resource property record this emulator holds, keyed by the ARN of
+    /// the resource whose properties it carries, in ARN order.
+    ///
+    /// A record lives BESIDE the catalog tree, like a resource policy, because every
+    /// operation that addresses one (`CreateIntegrationResourceProperty`,
+    /// `GetIntegrationResourceProperty`, `UpdateIntegrationResourceProperty`,
+    /// `DeleteIntegrationResourceProperty`) addresses it by `ResourceArn` alone, with no
+    /// `CatalogId` member — so the namespace is per account and the resource a record
+    /// belongs to is the key. The key is the ARN exactly as sent: the model documents no
+    /// fold for it. Ordered, so `ListIntegrationResourceProperties` has one deterministic
+    /// order to page over, and bounded by [`MAX_INTEGRATION_RESOURCE_PROPERTIES`].
+    pub integration_resource_properties: BTreeMap<String, IntegrationResourcePropertyEntry>,
     /// Every workflow this emulator holds, keyed by its name.
     ///
     /// Per account and beside the catalog tree, like crawlers and custom entity types:
@@ -1625,6 +1657,25 @@ impl ComAmazonawsGlueAwsglueState {
     /// [`MAX_CUSTOM_ENTITY_TYPES`].
     pub fn can_store_custom_entity_type(&self) -> bool {
         self.custom_entity_types.len() < MAX_CUSTOM_ENTITY_TYPES
+    }
+
+    /// The integration resource property record stored for `resource_arn`, if this account
+    /// holds one.
+    ///
+    /// The ONE resolution every read of such a record goes through, so an ARN names the
+    /// same record whichever operation resolved it. The ARN is matched exactly as sent: the
+    /// model documents no fold for `ResourceArn`.
+    pub fn integration_resource_property(
+        &self,
+        resource_arn: &str,
+    ) -> Option<&IntegrationResourcePropertyEntry> {
+        self.integration_resource_properties.get(resource_arn)
+    }
+
+    /// Whether the store can hold another integration resource property record, i.e. is
+    /// below [`MAX_INTEGRATION_RESOURCE_PROPERTIES`].
+    pub fn can_store_integration_resource_property(&self) -> bool {
+        self.integration_resource_properties.len() < MAX_INTEGRATION_RESOURCE_PROPERTIES
     }
 
     /// Whether this store has room for another classifier, bounded by
@@ -3715,6 +3766,141 @@ impl CustomEntityTypeEntry {
             regex_string: self.regex_string.clone(),
             context_words: self.context_words.clone(),
         }
+    }
+}
+
+/// How many integration resource property ids this process has minted.
+///
+/// Not catalog state — the id itself is what gets stored, on the
+/// [`IntegrationResourcePropertyEntry`]. This is only a nonce source for
+/// [`new_integration_resource_property_id`], so that two creates landing in the same
+/// nanosecond are still given different input to mint from.
+static MINTED_INTEGRATION_RESOURCE_PROPERTY_IDS: AtomicU64 = AtomicU64::new(0);
+
+/// A fresh id for an integration resource property record: the name its own ARN carries.
+///
+/// 32 lowercase hexadecimal characters from [`mint_hex_id`], the width every other id this
+/// crate mints has. It is minted ONCE, when the first create for a resource stores its
+/// record, and kept on that record — so every later read, and every later create for the
+/// same resource, reports the same `ResourcePropertyArn`, and two resources never share one.
+///
+/// This names a RESOURCE, not a credential: a credential would come from the credential
+/// store, never from here.
+pub fn new_integration_resource_property_id() -> String {
+    mint_hex_id(&MINTED_INTEGRATION_RESOURCE_PROPERTY_IDS, CATALOG_ID_WORDS)
+}
+
+/// The ARN resource-type segment of an integration resource property record, the way the
+/// model spells it: "The format is something like arn:aws:glue:::integrationresourceproperty/*"
+/// (`CreateIntegrationResourcePropertyResponse$ResourcePropertyArn`).
+pub const INTEGRATION_RESOURCE_PROPERTY_ARN_SEGMENT: &str = "integrationresourceproperty";
+
+/// The ARN of the integration resource property record `property_id`, as served in
+/// `region`.
+pub fn integration_resource_property_arn(region: &str, property_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("{INTEGRATION_RESOURCE_PROPERTY_ARN_SEGMENT}/{property_id}"),
+    )
+}
+
+/// The Glue resource an integration resource property call's `ResourceArn` names, or
+/// `Err` with the message a refusal carries when the value cannot name one.
+///
+/// `ResourceArn` is documented as "The connection ARN of the source, or the database ARN of
+/// the target", so a value that is not the ARN of a Glue connection or a Glue database
+/// names neither and is a bad parameter. The ONE resolution of that member, so the create
+/// and every read of a record agree on which values address a resource at all.
+///
+/// Only the KIND and the identity fields are read here; whether this store holds the
+/// resource is [`ComAmazonawsGlueAwsglueState::resource_tags`]'s answer, exactly as for a
+/// tagging call's `ResourceArn`.
+pub fn integration_resource_reference(resource_arn: &str) -> Result<TaggedResource, String> {
+    match parse_tagged_resource(resource_arn) {
+        Some(resource)
+            if matches!(
+                resource.kind,
+                TaggedResourceKind::Connection | TaggedResourceKind::Database
+            ) =>
+        {
+            Ok(resource)
+        }
+        _ => Err(format!(
+            "ResourceArn {resource_arn:?} is not the ARN of a Glue connection or a Glue database"
+        )),
+    }
+}
+
+/// The processing properties one resource of an integration carries: the record
+/// `CreateIntegrationResourceProperty` writes for a Glue connection (the source) or a Glue
+/// database (the target).
+///
+/// Every member of the modelled `IntegrationResourceProperty` shape is held here, plus the
+/// create's `Tags`, which that shape does not carry. The id is the one server-set member:
+/// it is minted when the first create for a resource stores its record and never changes,
+/// so the `ResourcePropertyArn` a client reads is stable across reads and across a later
+/// create for the same resource.
+#[derive(Debug, Clone)]
+pub struct IntegrationResourcePropertyEntry {
+    /// The ARN of the resource these properties belong to, which is also this record's key
+    /// in [`ComAmazonawsGlueAwsglueState::integration_resource_properties`].
+    pub resource_arn: String,
+    /// The name this record's own ARN carries ([`integration_resource_property_arn`]),
+    /// minted once by [`new_integration_resource_property_id`].
+    pub property_id: String,
+    /// "The resource properties associated with the integration source", as the last write
+    /// that stated them sent them, or `None` while no write has.
+    pub source_processing_properties: Option<SourceProcessingProperties>,
+    /// "The resource properties associated with the integration target", held the same way.
+    pub target_processing_properties: Option<TargetProcessingProperties>,
+    /// The create's `Tags`, which the `IntegrationResourceProperty` shape has no member for.
+    ///
+    /// Kept so the create does not discard what the client sent, but NOT yet reachable
+    /// through the tagging operations, for the reason [`CustomEntityTypeEntry::tags`] gives:
+    /// [`TaggedResourceKind`] carries no integration resource property variant.
+    pub tags: Vec<Tag>,
+}
+
+impl IntegrationResourcePropertyEntry {
+    /// The record a first `CreateIntegrationResourceProperty` for `resource_arn` stores:
+    /// the properties the request carried, under a freshly minted id.
+    pub fn from_create_input(input: &CreateIntegrationResourcePropertyInput) -> Self {
+        Self {
+            resource_arn: input.resource_arn.clone(),
+            property_id: new_integration_resource_property_id(),
+            source_processing_properties: input.source_processing_properties.clone(),
+            target_processing_properties: input.target_processing_properties.clone(),
+            tags: input.tags.clone().unwrap_or_default(),
+        }
+    }
+
+    /// Apply a create for a resource this store ALREADY holds a record for: each member the
+    /// request states replaces the stored one, and a member it does not state is left as
+    /// stored.
+    ///
+    /// The source and the target properties of one integration are written by separate
+    /// calls — "To set both source and target properties the same API needs to be invoked
+    /// with the Glue connection ARN as ResourceArn with SourceProcessingProperties and the
+    /// Glue database ARN as ResourceArn with TargetProcessingProperties respectively" — so a
+    /// write that states one side says nothing about the other and must not erase it. The id
+    /// is not touched: the record is the same resource's, so its ARN stays what the first
+    /// create minted.
+    pub fn apply_create(&mut self, input: &CreateIntegrationResourcePropertyInput) {
+        if input.source_processing_properties.is_some() {
+            self.source_processing_properties = input.source_processing_properties.clone();
+        }
+        if input.target_processing_properties.is_some() {
+            self.target_processing_properties = input.target_processing_properties.clone();
+        }
+        if let Some(tags) = input.tags.clone() {
+            self.tags = tags;
+        }
+    }
+
+    /// This record's own ARN, as served in `region`.
+    pub fn arn(&self, region: &str) -> String {
+        integration_resource_property_arn(region, &self.property_id)
     }
 }
 
@@ -6744,6 +6930,15 @@ pub mod messages {
     /// registry name alone, like [`database_not_found`].
     pub fn registry_not_found(name: &str) -> String {
         format!("Registry {name} not found.")
+    }
+
+    /// An operation that addresses ONE integration resource property record
+    /// (`GetIntegrationResourceProperty`) for a `ResourceArn` this account holds no record
+    /// for. NOT recorded: the wording follows [`database_not_found`], this crate's template
+    /// for a reference that resolves to nothing, and carries the ARN the request addressed;
+    /// what is pinned is the behaviour — `EntityNotFoundException`.
+    pub fn integration_resource_property_not_found(resource_arn: &str) -> String {
+        format!("Integration resource property for {resource_arn} not found.")
     }
 
     /// Any schema-registry operation whose `SchemaId` resolves to a schema set this

@@ -31,10 +31,14 @@ mod delete_deployment_config;
 mod deployment_configs;
 #[path = "all/delete_deployment_group.rs"]
 mod delete_deployment_group;
+#[path = "all/deployment_group_alarm_counts.rs"]
+mod deployment_group_alarm_counts;
 #[path = "all/deployment_group_defaults.rs"]
 mod deployment_group_defaults;
 #[path = "all/deployment_group_update.rs"]
 mod deployment_group_update;
+#[path = "all/deployment_target_record_readability.rs"]
+mod deployment_target_record_readability;
 #[path = "all/deployment_targets.rs"]
 mod deployment_targets;
 #[path = "all/get_deployment_instance.rs"]
