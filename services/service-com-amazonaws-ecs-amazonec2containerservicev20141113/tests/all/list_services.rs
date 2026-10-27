@@ -523,6 +523,175 @@ async fn list_services_pages_in_a_stable_order_at_max_results() {
     );
 }
 
+/// One resumption row: the page size the walk starts with, and which mutations land on
+/// the cluster BEFORE the token while the walk is suspended.
+struct ResumeRow {
+    case: &'static str,
+    page_size: i64,
+    create_earlier: bool,
+    delete_earlier: bool,
+}
+
+#[tokio::test]
+async fn a_next_token_resumes_where_its_page_stopped_whatever_changed_before_it() {
+    // `ListServices$nextToken`: "The nextToken value returned from a ListServices request
+    // indicating that more results are available to fulfill the request ... This token
+    // should be treated as an opaque identifier that is only used to retrieve the next
+    // items in a list" — so resuming with a token reports the services from where the page
+    // stopped onwards, and what changed EARLIER in the order cannot shift that page: a
+    // resumed walk neither repeats an entry it already reported nor skips one it had not.
+    //
+    // The rows differ along the page size the walk uses and along the kind of mutation that
+    // lands before the token while the walk is suspended (a service created there, one
+    // deleted there, both).
+    let rows: [ResumeRow; 4] = [
+        ResumeRow {
+            case: "one entry per page, nothing changes",
+            page_size: 1,
+            create_earlier: false,
+            delete_earlier: false,
+        },
+        ResumeRow {
+            case: "a service created before the token",
+            page_size: 2,
+            create_earlier: true,
+            delete_earlier: false,
+        },
+        ResumeRow {
+            case: "a service deleted before the token",
+            page_size: 2,
+            create_earlier: false,
+            delete_earlier: true,
+        },
+        ResumeRow {
+            case: "both, at a page size that does not divide the set",
+            page_size: 4,
+            create_earlier: true,
+            delete_earlier: true,
+        },
+    ];
+
+    for row in &rows {
+        let case = row.case;
+        let router = service();
+        let cluster = "resuming";
+        create_cluster(&router, cluster, case).await;
+        register_definition(&router, "resumingfamily", case).await;
+
+        // Six services whose names — and therefore whose ARNs — already sort the way the
+        // listing walks them.
+        let names: Vec<String> = (1..=6).map(|index| format!("svc-{index:02}")).collect();
+        for name in &names {
+            ok(
+                &router,
+                "CreateService",
+                json!({
+                    "cluster": cluster,
+                    "serviceName": name,
+                    "taskDefinition": "resumingfamily",
+                    "desiredCount": 0,
+                    "launchType": "EC2",
+                }),
+                case,
+            )
+            .await;
+        }
+        let ordered: Vec<String> = names
+            .iter()
+            .map(|name| service_arn(cluster, name))
+            .collect();
+
+        let size = usize::try_from(row.page_size).expect("a positive page size");
+        let (first, token) = page(
+            &router,
+            json!({ "cluster": cluster, "maxResults": row.page_size }),
+            case,
+        )
+        .await;
+        assert_eq!(
+            first,
+            ordered[..size].to_vec(),
+            "case {case:?}: expected the first page to be the first {size} ARNs, got {first:?}"
+        );
+        let token = token.unwrap_or_else(|| {
+            panic!("case {case:?}: expected a nextToken while {} remain", ordered.len() - size)
+        });
+
+        // The mutations land strictly BEFORE the token: `aaa-added` sorts ahead of every
+        // `svc-*` name, and the deleted service is one the first page already reported.
+        if row.create_earlier {
+            ok(
+                &router,
+                "CreateService",
+                json!({
+                    "cluster": cluster,
+                    "serviceName": "aaa-added",
+                    "taskDefinition": "resumingfamily",
+                    "desiredCount": 0,
+                    "launchType": "EC2",
+                }),
+                case,
+            )
+            .await;
+        }
+        if row.delete_earlier {
+            ok(
+                &router,
+                "DeleteService",
+                json!({ "cluster": cluster, "service": names[0].as_str() }),
+                case,
+            )
+            .await;
+        }
+
+        // Resume: the rest of the walk is exactly the entries from the token onwards.
+        let mut resumed: Vec<String> = Vec::new();
+        let mut token = Some(token);
+        let mut pages = 0_usize;
+        while let Some(current) = token {
+            let (arns, next) = page(
+                &router,
+                json!({
+                    "cluster": cluster,
+                    "maxResults": row.page_size,
+                    "nextToken": current,
+                }),
+                case,
+            )
+            .await;
+            resumed.extend(arns);
+            token = next;
+            pages += 1;
+            assert!(
+                pages < MAX_PAGES,
+                "case {case:?}: the resumed walk never ran out of pages"
+            );
+        }
+        assert_eq!(
+            resumed,
+            ordered[size..].to_vec(),
+            "case {case:?}: expected the resumed walk to report {:?}, got {resumed:?}",
+            &ordered[size..]
+        );
+
+        // A walk that starts over DOES see both mutations: the listing is computed from the
+        // services stored right now, not from a snapshot the first walk froze.
+        let listed = all_pages(&router, json!({ "cluster": cluster }), case).await;
+        let mut expected: Vec<String> = ordered.clone();
+        if row.delete_earlier {
+            expected.retain(|arn| arn != &ordered[0]);
+        }
+        if row.create_earlier {
+            expected.push(service_arn(cluster, "aaa-added"));
+        }
+        expected.sort();
+        assert_eq!(
+            listed, expected,
+            "case {case:?}: expected a fresh walk to report {expected:?}, got {listed:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn list_services_refuses_an_out_of_range_page_size_and_an_unknown_cluster() {
     let router = service();
