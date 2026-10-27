@@ -150,21 +150,15 @@ impl<Eng> ListFindingsMetrics<Eng> {
 pub const MAX_PAGE_SIZE: i32 = 1_000;
 
 /// One stored finding reduced to what the per-day metrics need: which severity bucket it
-/// is counted under, when it was created, when it was closed, and whether it is open.
+/// is counted under, and how it is placed in time.
 #[derive(Debug)]
 struct CountedFinding {
     /// The `FindingMetricsValuePerSeverity` member this finding is counted under.
     severity: &'static str,
-    /// The finding's `createdAt`, when it records one.
-    created_at_millis: Option<i64>,
-    /// The instant this finding was closed: `Some` only for a finding whose status is
-    /// `Closed` AND which records an `updatedAt`, since a closed finding's last change is
-    /// the change that closed it. A `Closed` finding recording no `updatedAt` records no
-    /// close, so it is counted in no day's `closedFindings` and no day's `openFindings`.
-    closed_at_millis: Option<i64>,
-    /// Whether the finding's CURRENT status is `Open` — the only status the store keeps,
-    /// so an open finding has been open since it was created.
-    open_now: bool,
+    /// When the finding was created and when it was closed, read the one way every
+    /// as-of-an-instant metric of this service reads a stored finding
+    /// (`crate::state::FindingLifetime`).
+    lifetime: crate::state::FindingLifetime,
 }
 
 impl CountedFinding {
@@ -172,20 +166,9 @@ impl CountedFinding {
     /// `Severity`: every member of `AccountFindingsMetric` is a value PER SEVERITY, so a
     /// finding of no severity is counted in none of them.
     fn of(finding: &Finding) -> Option<Self> {
-        let severity = crate::state::severity_bucket(finding.severity.as_deref())?;
-        let status = finding.status.as_deref();
         Some(Self {
-            severity,
-            created_at_millis: finding
-                .created_at
-                .as_ref()
-                .map(crate::state::from_timestamp),
-            closed_at_millis: if status == Some(crate::state::STATUS_CLOSED) {
-                finding.updated_at.as_ref().map(crate::state::from_timestamp)
-            } else {
-                None
-            },
-            open_now: status == Some(crate::state::STATUS_OPEN),
+            severity: crate::state::severity_bucket(finding.severity.as_deref())?,
+            lifetime: crate::state::FindingLifetime::of(finding),
         })
     }
 
@@ -193,37 +176,28 @@ impl CountedFinding {
     /// of new findings of each severity ON the specified date"
     /// (`AccountFindingsMetric$newFindings`), so a finding is new on exactly one day.
     fn created_within(&self, day_start: i64, day_end: i64) -> bool {
-        self.created_at_millis
-            .is_some_and(|created| created >= day_start && created <= day_end)
+        self.lifetime.created_within(day_start, day_end)
     }
 
     /// Whether this finding was closed within the day `day_start..=day_end`: "The number
     /// of closed findings of each severity ON the specified date"
     /// (`AccountFindingsMetric$closedFindings`).
     fn closed_within(&self, day_start: i64, day_end: i64) -> bool {
-        self.closed_at_millis
-            .is_some_and(|closed| closed >= day_start && closed <= day_end)
+        self.lifetime.closed_within(day_start, day_end)
     }
 
     /// Whether this finding was open AS OF `day_end`: "The number of open findings of
-    /// each severity AS OF the specified date" (`AccountFindingsMetric$openFindings`) — it
-    /// existed by then and had not been closed by then. A finding that records no
-    /// creation instant cannot be placed after the date, so it is not excluded by it (the
-    /// same reading `GetMetricsSummary` takes).
+    /// each severity AS OF the specified date" (`AccountFindingsMetric$openFindings`) —
+    /// the same reading the one-day summary takes (`GetMetricsSummary`).
     fn open_as_of(&self, day_end: i64) -> bool {
-        if self.created_at_millis.is_some_and(|created| created > day_end) {
-            return false;
-        }
-        self.open_now || self.closed_at_millis.is_some_and(|closed| closed > day_end)
+        self.lifetime.open_as_of(day_end)
     }
 
     /// How long this finding took to close, IN DAYS, when it had been closed by `day_end`
     /// and records both the instant it was created and the instant it was closed; `None`
     /// otherwise, since there is no duration to average in.
     fn days_to_close(&self, day_end: i64) -> Option<f64> {
-        let created = self.created_at_millis?;
-        let closed = self.closed_at_millis.filter(|closed| *closed <= day_end)?;
-        Some(closed.saturating_sub(created).max(0) as f64 / crate::state::MILLIS_PER_DAY as f64)
+        self.lifetime.days_to_close(day_end)
     }
 }
 

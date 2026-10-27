@@ -7,6 +7,12 @@
 //! apart from materialising the run-state transitions the clock already owes
 //! (`state::settle_due_runs`), exactly as the other readers of this store do.
 //!
+//! The summary reports the account AS OF the end of the requested day, so each stored
+//! finding is placed in time by the instants it records rather than by its status now
+//! (`state::FindingLifetime`): a finding created after that day is counted nowhere, and
+//! one closed only after that day is still counted among the day's open findings — the
+//! same reading the per-day metrics of an interval take (`ListFindingsMetrics`).
+//!
 //! `date` carries no constraint trait in the model, so every parseable instant it can
 //! name is answered with the summary of the UTC day that instant falls in — however old
 //! or however far ahead that day is. The member's prose ("The date must be within the
@@ -246,18 +252,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut metrics = OpenFindingMetrics::default();
         for ((scan_name, _finding_id), finding) in &store.findings {
-            // A finding created after the day asked about did not exist as of that
-            // date, so it is not in this summary. A finding that records no creation
-            // instant cannot be placed after the date, so it counts.
-            let created_at_millis = finding.created_at.as_ref().map(crate::state::from_timestamp);
-            if created_at_millis.is_some_and(|created| created > as_of_millis) {
-                continue;
-            }
             // "The number of open findings of each severity"
-            // (`MetricsSummary$openFindings`) — a closed finding is in none of these
-            // metrics. Only a finding's current status is stored, so that is the status
-            // the summary reads.
-            if finding.status.as_deref() != Some(crate::state::STATUS_OPEN) {
+            // (`MetricsSummary$openFindings`), of a summary that reports the account "as
+            // of a specified date" (`MetricsSummary`): a finding belongs in these metrics
+            // when it was open AS OF the end of that day — it existed by then and had not
+            // been closed by then — whatever its status is NOW. So a finding created after
+            // that day is counted nowhere, and a finding closed only after that day is
+            // still counted, exactly as the per-day metrics of an interval count it
+            // (`crate::state::FindingLifetime`).
+            if !crate::state::FindingLifetime::of(finding).open_as_of(as_of_millis) {
                 continue;
             }
 

@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetReportGroupTrend
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetReportGroupTrend`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetReportGroupTrend::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Accumulates the trend a report group's recent report runs describe for one modelled
+//! summary value: this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -149,23 +142,197 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::GET_REPORT_GROUP_TREND_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Report one data point per analysed report run of the report group the request
+    /// addresses, plus the accumulation of those points.
+    ///
+    /// The points are the value of the modelled report-summary member `trendField`
+    /// names, taken from the group's most recent `numOfReports` runs, and `stats` is the
+    /// smallest, the largest and the mean of them. A report group this account does not
+    /// hold has no trend, so that call is refused with the modelled not-found error.
+    ///
+    /// Purely reporting: a report run is minted by a build whose buildspec declares one,
+    /// never by this call, so nothing in the store changes and a later caller sees
+    /// exactly what this one saw.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetReportGroupTrend` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetReportGroupTrendErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetReportGroupTrend"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable through the router, which always builds the shared
+            // `InMemoryEngine`: this operation models no server fault, and 501 is the
+            // only honest answer for "this emulator cannot serve the call at all".
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetReportGroupTrend (this engine carries no CodeBuild state)",
+            ));
+        };
+        let _ = ctx;
+
+        // `reportGroupArn` is typed `NonEmptyString`, so any non-empty text reaches this
+        // handler. A value that is not a report group ARN of this service addresses no
+        // report group at all — there is no account, region or store in which it could
+        // name one — so the call is refused with the operation's own input error rather
+        // than reported as a group that merely is not held, which is what the not-found
+        // error below means. This is the split `crate::ops::batch_get_reports` makes for
+        // the other resource a report operation addresses by ARN alone.
+        if crate::state::report_group_name_from_arn(&input.report_group_arn).is_none() {
+            return Err(GetReportGroupTrendErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::INVALID_REPORT_GROUP_ARN_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // "The number of reports to analyze. This operation always retrieves the most
+        // recent reports. If this parameter is omitted, the most recent 100 reports are
+        // analyzed." `numOfReports` targets `PageSize` (`@range(min: 1, max: 100)`), so
+        // the framework has already refused every value outside that band before this
+        // handler runs, and the conversion cannot narrow a value a request could send.
+        let analysed_at_most =
+            usize::try_from(input.num_of_reports.unwrap_or(DEFAULT_NUM_OF_REPORTS)).unwrap_or(0);
+
+        let guard = state.lock();
+        // The ARN is the group's whole identity, so a group this account does not hold —
+        // including one an ARN of another partition, region, account or resource type
+        // names — has no trend to report.
+        if guard.report_group_by_arn(&input.report_group_arn).is_none() {
+            drop(guard);
+            return Err(GetReportGroupTrendErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::REPORT_GROUP_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+        // The group's runs, newest first, cut to the number asked for, each paired with
+        // the value the requested field reads off it. A run the field does not apply to
+        // contributes no point — see [`trend_data`].
+        let analysed: Vec<(String, f64)> = guard
+            .reports_of_report_group(&input.report_group_arn)
+            .into_iter()
+            .take(analysed_at_most)
+            .filter_map(|report| {
+                Some((report.arn.clone()?, trend_data(report, &input.trend_field)?))
+            })
+            .collect();
+        // Dropped before the answer is rendered: nothing below reads the store.
+        drop(guard);
+
+        let points: Vec<f64> = analysed.iter().map(|&(_, data)| data).collect();
+        Ok(GetReportGroupTrendOutput {
+            stats: Some(accumulate(&points)),
+            // Serialized whether or not the group holds runs the field applies to, `[]`
+            // when it holds none: a caller plotting a trend must read a list either way,
+            // and an empty one is this group's whole answer rather than a missing member.
+            raw_data: Some(
+                analysed
+                    .iter()
+                    .map(|(arn, data)| ReportWithRawData {
+                        report_arn: Some(arn.clone()),
+                        data: Some(render(*data)),
+                    })
+                    .collect(),
+            ),
+        })
     }
+}
+
+/// How many of a report group's runs are analysed when the request names no number, from
+/// `GetReportGroupTrendInput$numOfReports`: "If this parameter is omitted, the most recent
+/// 100 reports are analyzed."
+const DEFAULT_NUM_OF_REPORTS: i32 = 100;
+
+/// The `statusCounts` key whose entry counts the test cases that PASSED, which is what a
+/// pass rate is the share of. `TestCase$status` documents the statuses a test case
+/// reports — "Valid statuses are SUCCEEDED, FAILED, ERROR, SKIPPED, and UNKNOWN" — of
+/// which this is the one that passed.
+const PASSED_TEST_CASE_STATUS: &str = "SUCCEEDED";
+
+/// The data point `report` contributes to a trend on `trend_field`, or `None` when the
+/// report carries no value for that field.
+///
+/// Every field but one is a modelled summary member of that name, reported in that
+/// member's own unit: the test fields read `Report$testSummary` (`TOTAL` -> `total`,
+/// `DURATION` -> `durationInNanoSeconds`) and the coverage fields read
+/// `Report$codeCoverageSummary` (`LINE_COVERAGE` -> `lineCoveragePercentage`,
+/// `LINES_COVERED` -> `linesCovered`, `LINES_MISSED` -> `linesMissed`, `BRANCH_COVERAGE`
+/// -> `branchCoveragePercentage`, `BRANCHES_COVERED` -> `branchesCovered`,
+/// `BRANCHES_MISSED` -> `branchesMissed`). `PASS_RATE` is the one no member carries: it is
+/// "the percentage of tests that passed", so it is the summary's count of passed test
+/// cases over its `total`, as a percentage.
+///
+/// A run that carries no summary for the field asked about contributes NOTHING rather
+/// than a zero it never measured: a test report has no code coverage summary and a
+/// coverage report no test summary, and a test report with no test cases at all has no
+/// share of them that passed.
+fn trend_data(report: &Report, trend_field: &str) -> Option<f64> {
+    let test = report.test_summary.as_ref();
+    let coverage = report.code_coverage_summary.as_ref();
+    // `trendField` targets the `ReportGroupTrendFieldType` enum
+    // (`crate::ops::types::REPORT_GROUP_TREND_FIELD_TYPE_VALUES`), so the framework has
+    // already refused any value outside this catalogue before this handler runs.
+    match trend_field {
+        "TOTAL" => test.map(|summary| f64::from(summary.total)),
+        "DURATION" => test.map(|summary| summary.duration_in_nano_seconds as f64),
+        "PASS_RATE" => test.and_then(|summary| {
+            if summary.total <= 0 {
+                return None;
+            }
+            let passed = summary
+                .status_counts
+                .get(PASSED_TEST_CASE_STATUS)
+                .copied()
+                .unwrap_or_default();
+            Some(f64::from(passed) / f64::from(summary.total) * 100.0)
+        }),
+        "LINE_COVERAGE" => coverage.and_then(|summary| summary.line_coverage_percentage),
+        "LINES_COVERED" => coverage
+            .and_then(|summary| summary.lines_covered)
+            .map(f64::from),
+        "LINES_MISSED" => coverage
+            .and_then(|summary| summary.lines_missed)
+            .map(f64::from),
+        "BRANCH_COVERAGE" => coverage.and_then(|summary| summary.branch_coverage_percentage),
+        "BRANCHES_COVERED" => coverage
+            .and_then(|summary| summary.branches_covered)
+            .map(f64::from),
+        "BRANCHES_MISSED" => coverage
+            .and_then(|summary| summary.branches_missed)
+            .map(f64::from),
+        _ => None,
+    }
+}
+
+/// The accumulation of the analysed `points`: the smallest, the largest and the mean,
+/// each rendered the way one point is.
+///
+/// Every member is the EMPTY STRING when nothing was analysed — recorded behaviour: a
+/// report group holding no run the field applies to has no minimum, maximum or mean, and
+/// CodeBuild states that as empty text rather than as a zero it never measured. The
+/// members are still stated, so a caller reads all three whatever was analysed.
+fn accumulate(points: &[f64]) -> ReportGroupTrendStats {
+    if points.is_empty() {
+        return ReportGroupTrendStats {
+            average: Some(String::new()),
+            max: Some(String::new()),
+            min: Some(String::new()),
+        };
+    }
+    let total: f64 = points.iter().sum();
+    ReportGroupTrendStats {
+        average: Some(render(total / points.len() as f64)),
+        max: Some(render(points.iter().copied().fold(f64::NEG_INFINITY, f64::max))),
+        min: Some(render(points.iter().copied().fold(f64::INFINITY, f64::min))),
+    }
+}
+
+/// One accumulated value as the trend states it.
+///
+/// `ReportWithRawData$data` and every member of `ReportGroupTrendStats` are modelled as
+/// strings, so a value is rendered as the shortest decimal text that reads back as the
+/// same number — with no fractional part when the value is integral, so a count of tests
+/// or of lines is stated as that count.
+fn render(value: f64) -> String {
+    value.to_string()
 }
