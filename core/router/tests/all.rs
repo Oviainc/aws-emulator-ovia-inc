@@ -52,6 +52,11 @@ mod ses_family_signing_name_routing;
 // add their line to.
 #[path = "all/ses_event_destination_setup_across_services.rs"]
 mod ses_event_destination_setup_across_services;
+// Declared beside the suites above, at the head, for the same reason: the appended tail and
+// the sorted `c…` span (where every cloudformation suite lands) are both regions concurrent
+// suites add their line to.
+#[path = "all/cloudformation_provisions_ses_configuration_sets.rs"]
+mod cloudformation_provisions_ses_configuration_sets;
 // At the head for the same reason, and moved here out of the `c…` span of the sorted
 // list: that span is where the cloudformation/cloudtrail suites land, so a line beside
 // them lost repeated squash merges to branches that touched it in the same window.

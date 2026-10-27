@@ -1098,27 +1098,47 @@ pub fn web_identity_principals(issuer: &str) -> Vec<String> {
 
 /// The condition keys an identity provider publishes about ONE of its tokens, for a trust
 /// policy's `Condition` to be decided against: `<provider>:aud` — "the intended audience
-/// (also known as client ID) of the web identity token" — and `<provider>:sub`, the
-/// identity the token names. Both are prefixed with the provider the token came from, as
-/// AWS names them, so a clause written for one provider never decides another's token.
+/// (also known as client ID) of the web identity token" — `<provider>:sub`, the identity the
+/// token names, and one `<provider>:amr` pair per authentication method the issuance
+/// recorded, the multi-valued key a policy decides under one of IAM's set qualifiers. All of
+/// them are prefixed with the provider the token came from, as AWS names them, so a clause
+/// written for one provider never decides another's token.
 #[must_use]
 pub fn web_identity_condition_context(
     identity: &::service_common::web_identity_tokens::IssuedWebIdentity,
 ) -> Vec<(String, String)> {
     let provider = web_identity_provider_name(&identity.issuer);
-    vec![
+    let mut context = vec![
         (format!("{provider}:aud"), identity.audience.clone()),
         (format!("{provider}:sub"), identity.subject.clone()),
-    ]
+    ];
+    context.extend(
+        identity
+            .authentication_methods
+            .iter()
+            .map(|method| (format!("{provider}:amr"), method.clone())),
+    );
+    context
 }
 
 /// The keys [`web_identity_condition_context`] publishes, as the policy evaluator needs
 /// them: the keys whose absence means the token carried no such claim rather than this
 /// emulator not knowing the key.
+///
+/// `<provider>:amr` is among them only for an issuance that recorded authentication methods
+/// at all: an issuer that publishes no such claim publishes no such key either, so a clause
+/// written over it stays undecided and withholds the grant rather than reading as "the token
+/// carried none".
 #[must_use]
-pub fn web_identity_published_condition_keys(issuer: &str) -> Vec<String> {
-    let provider = web_identity_provider_name(issuer);
-    vec![format!("{provider}:aud"), format!("{provider}:sub")]
+pub fn web_identity_published_condition_keys(
+    identity: &::service_common::web_identity_tokens::IssuedWebIdentity,
+) -> Vec<String> {
+    let provider = web_identity_provider_name(&identity.issuer);
+    let mut keys = vec![format!("{provider}:aud"), format!("{provider}:sub")];
+    if !identity.authentication_methods.is_empty() {
+        keys.push(format!("{provider}:amr"));
+    }
+    keys
 }
 
 /// The modelled character class a session tag's key and value must satisfy

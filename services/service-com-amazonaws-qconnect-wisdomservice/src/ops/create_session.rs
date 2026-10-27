@@ -407,16 +407,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // The tags the create persists, read once from the request: the same map goes
+        // into the fingerprint below and onto the stored record.
+        let tags = input.tags.clone().unwrap_or_default();
+
+        // What this create's `@idempotencyToken` identifies: every member the record
+        // below is built from. `aiAgentConfiguration` is a MAP, so it is fingerprinted in
+        // key order rather than through a rendering whose order a map does not fix.
+        let mut ai_agent_parts: Vec<String> = input
+            .ai_agent_configuration
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(agent_type, binding)| format!("{agent_type}={binding:?}"))
+            .collect();
+        ai_agent_parts.sort();
+        let fingerprint = crate::state::request_fingerprint(&[
+            input.name.clone(),
+            input.description.clone().unwrap_or_default(),
+            format!("{:?}", input.tag_filter),
+            format!("{:?}", input.orchestrator_configuration_list),
+            input.contact_arn.clone().unwrap_or_default(),
+            crate::state::request_fingerprint(&ai_agent_parts),
+            crate::state::tags_fingerprint(&tags),
+        ]);
+
         // A replayed `@idempotencyToken` answers with the session it already created
-        // under THIS assistant rather than creating a second one. The token is scoped to
-        // this operation and this parent, so the same token on another create is another
-        // resource.
-        let replay_key = input.client_token.as_deref().map(|token| {
-            crate::state::idempotency_key(&format!("CreateSession/{assistant_id}"), token)
-        });
-        let replayed = replay_key
-            .as_ref()
-            .and_then(|key| store.idempotency.get(key).cloned());
+        // under THIS assistant rather than creating a second one, while the same token
+        // carrying a DIFFERENT request is the modelled idempotency conflict rather than a
+        // record the caller did not ask for. The token is scoped to this operation and
+        // this parent, so the same token on another create is another resource.
+        let token_scope = format!("{}/{assistant_id}", Self::NAME);
+        let replayed = match store.replayed_create(
+            &token_scope,
+            input.client_token.as_deref(),
+            &fingerprint,
+        ) {
+            crate::state::Replay::Conflict => {
+                return Err(CreateSessionErrorModeled::ConflictException(ConflictException {
+                    message: Some(crate::state::MESSAGE_IDEMPOTENCY_CONFLICT.to_string()),
+                })
+                .into())
+            }
+            crate::state::Replay::Retry(created) => Some(created),
+            crate::state::Replay::Fresh => None,
+        };
         // Taken before the parent is borrowed for mutation: every mint owns its own
         // block of id candidates.
         let seq = store.next_seq();
@@ -473,7 +508,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             assistant_id: assistant_id.clone(),
             name: input.name.clone(),
             description: input.description.clone(),
-            tags: input.tags.clone().unwrap_or_default(),
+            tags: tags.clone(),
             tag_filter: input.tag_filter.clone(),
             ai_agent_configuration,
             topic_integration_arn,
@@ -500,9 +535,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let output = CreateSessionOutput {
             session: Some(stored.to_session_data()),
         };
-        if let Some(key) = replay_key {
-            store.idempotency.insert(key, session_id);
-        }
+        store.remember_create(
+            &token_scope,
+            input.client_token.as_deref(),
+            &fingerprint,
+            &session_id,
+        );
         Ok(output)
     }
 }

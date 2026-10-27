@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end cover for `CreateSubnetCidrReservation` and `GetSubnetCidrReservations`,
+//! End-to-end cover for `CreateSubnetCidrReservation`, `GetSubnetCidrReservations` and
+//! `DeleteSubnetCidrReservation`,
 //! driven over the wire the service actually speaks: `ec2Query` — an
 //! `application/x-www-form-urlencoded` POST whose body carries
 //! `Action=CreateSubnetCidrReservation`, answered with XML (README.md / OPERATIONS.md "Wire
@@ -13,7 +14,10 @@
 //! of the same family and must not overlap a reservation the subnet already has, the
 //! service mints the `scr-` id and the owning account, and the reservation reads back
 //! unchanged through `GetSubnetCidrReservations` — which reports the reservations of ONE
-//! subnet, narrowed by the filters it documents and cut into `MaxResults`-sized pages.
+//! subnet, narrowed by the filters it documents and cut into `MaxResults`-sized pages — until
+//! `DeleteSubnetCidrReservation` takes the reservation its id names back out of the store,
+//! answering the record as it was stored, leaving every other reservation where it was and
+//! the range reservable again.
 //!
 //! Every table row is a distinct input along what that generalises over — the reserved
 //! block's size and position, whether the request names it canonically, the reservation type
@@ -32,7 +36,7 @@ use ec2::state::ComAmazonawsEc2Amazonec2State as Ec2State;
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::ec2_query::{error_code, filters};
+use super::ec2_query::{error_code, error_message, filters};
 use super::wire::{child, child_text, document, is_long_id, param, set_items, Param};
 
 /// The Region every call here is signed for.
@@ -1285,5 +1289,304 @@ async fn dry_run_reports_whether_the_request_would_have_succeeded() {
         stored_count(&engine),
         1,
         "DryRun=false: the reservation must be stored"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Delete, and what the get reports afterwards
+// ---------------------------------------------------------------------------
+
+/// One `DeleteSubnetCidrReservation` call for `reservation_id`, carrying `params`.
+async fn delete(
+    router: &MultiServiceRouter,
+    reservation_id: &str,
+    params: &[Param],
+) -> (u16, String) {
+    let mut fields = vec![param("SubnetCidrReservationId", reservation_id)];
+    fields.extend_from_slice(params);
+    call(router, "DeleteSubnetCidrReservation", &fields).await
+}
+
+/// `DeleteSubnetCidrReservation` requiring success, and the reservation it answered with.
+async fn delete_ok(case: &str, router: &MultiServiceRouter, reservation_id: &str) -> Reservation {
+    let (status, body) = delete(router, reservation_id, &[]).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from DeleteSubnetCidrReservation, got {status} \
+         with body {body}"
+    );
+    one_reservation(case, &body)
+}
+
+/// Every reservation the get reports for `subnet_id`, both families together.
+async fn reported_reservations(
+    case: &str,
+    router: &MultiServiceRouter,
+    subnet_id: &str,
+) -> Vec<Reservation> {
+    let body = get_ok(case, router, subnet_id, &[]).await;
+    let mut reported = ipv4_reservations(case, &body);
+    reported.extend(ipv6_reservations(case, &body));
+    reported
+}
+
+/// One row of the delete table: the case, the subnet's own CIDR block, an IPv6 block to
+/// associate with that subnet (for a row whose range is an IPv6 one), the range to reserve,
+/// its reservation type, the description the create carries, and the tags it assigns.
+type DeleteCase = (
+    &'static str,
+    &'static str,
+    Option<&'static str>,
+    &'static str,
+    &'static str,
+    Option<&'static str>,
+    Vec<(&'static str, &'static str)>,
+);
+
+/// Deleting a reservation answers the record as it was stored, takes it out of the store, and
+/// leaves the get reporting the subnet's remaining reservations and nothing else.
+#[tokio::test]
+async fn every_deleted_reservation_is_answered_as_stored_and_leaves_the_store() {
+    let (router, engine) = emulator();
+    let vpc = create_vpc("seed", &router, "10.0.0.0/16").await;
+
+    // Rows along what the rule generalises over: the reserved block's size and position, the
+    // reservation type, whether the reservation carries a description, how many tags it
+    // carries, and the address family of its range.
+    let cases: Vec<DeleteCase> = vec![
+        (
+            "a /28 of a /24, no description, no tags",
+            "10.0.0.0/24",
+            None,
+            "10.0.0.0/28",
+            "prefix",
+            None,
+            Vec::new(),
+        ),
+        (
+            "a single address, described",
+            "10.0.1.0/24",
+            None,
+            "10.0.1.7/32",
+            "explicit",
+            Some("one address"),
+            Vec::new(),
+        ),
+        (
+            "a /26 in the middle, described and tagged twice",
+            "10.0.2.0/24",
+            None,
+            "10.0.2.64/26",
+            "prefix",
+            Some("probe reservation"),
+            vec![("Name", "probe"), ("Owner", "TeamA")],
+        ),
+        (
+            "the subnet's whole range, tagged once",
+            "10.0.3.0/28",
+            None,
+            "10.0.3.0/28",
+            "explicit",
+            None,
+            vec![("Stage", "test")],
+        ),
+        (
+            "an IPv6 /80",
+            "10.0.4.0/24",
+            Some("2600:1f00:1234:5600::/64"),
+            "2600:1f00:1234:5600:1::/80",
+            "prefix",
+            Some("an IPv6 prefix"),
+            Vec::new(),
+        ),
+    ];
+
+    for (index, (case, subnet_cidr, ipv6_block, cidr, reservation_type, description, tags)) in
+        cases.into_iter().enumerate()
+    {
+        let subnet = create_subnet(case, &router, &vpc, subnet_cidr).await;
+        if let Some(block) = ipv6_block {
+            associate_ipv6_block(&engine, &subnet, block);
+        }
+        // A reservation of ANOTHER subnet, which this row must leave alone: a delete names
+        // ONE reservation. Each row gets its own subnet for it, so no two rows ask this VPC
+        // for the same range.
+        let neighbour_subnet_cidr = format!("10.0.{}.0/24", 100 + index);
+        let neighbour_cidr = if ipv6_block.is_some() {
+            "2600:1f00:1234:5600:9::/80".to_string()
+        } else {
+            format!("10.0.{}.0/28", 100 + index)
+        };
+        let neighbour_subnet = create_subnet(case, &router, &vpc, &neighbour_subnet_cidr).await;
+        if let Some(block) = ipv6_block {
+            associate_ipv6_block(&engine, &neighbour_subnet, block);
+        }
+        let neighbour =
+            reserve_ok(case, &router, &neighbour_subnet, &neighbour_cidr, "prefix").await;
+
+        let mut extra = tag_fields(&tags);
+        if let Some(text) = description {
+            extra.push(param("Description", text));
+        }
+        let body = ok(
+            case,
+            &router,
+            "CreateSubnetCidrReservation",
+            &reserve_params(&subnet, cidr, reservation_type, &extra),
+        )
+        .await;
+        let created = one_reservation(case, &body);
+        let id = created.id(case);
+        let held = stored_count(&engine);
+
+        let deleted = delete_ok(case, &router, &id).await;
+        assert_eq!(
+            deleted, created,
+            "case {case:?}: expected the deleted reservation reported as it was stored, \
+             got {deleted:?}"
+        );
+        assert_eq!(
+            stored_count(&engine),
+            held - 1,
+            "case {case:?}: exactly the deleted reservation must leave the store"
+        );
+
+        let remaining = reported_reservations(case, &router, &subnet).await;
+        assert!(
+            remaining.is_empty(),
+            "case {case:?}: the deleted reservation must not be reported any more, \
+             got {remaining:?}"
+        );
+        let untouched = reported_reservations(case, &router, &neighbour_subnet).await;
+        assert_eq!(
+            untouched,
+            vec![neighbour.clone()],
+            "case {case:?}: a delete must leave every other reservation where it was, \
+             got {untouched:?}"
+        );
+
+        // The range is free again: what the delete gave back can be reserved anew.
+        let again = reserve_ok(case, &router, &subnet, cidr, reservation_type).await;
+        assert_eq!(
+            again.required(case, "cidr"),
+            created.required(case, "cidr"),
+            "case {case:?}: expected the freed range reservable again, got {again:?}"
+        );
+        assert_ne!(
+            again.id(case),
+            id,
+            "case {case:?}: a new reservation gets a new id, got {again:?}"
+        );
+    }
+}
+
+/// A `SubnetCidrReservationId` this account holds no reservation for is refused with EC2's
+/// own not-found code, whatever form the value takes — and a second delete of a reservation
+/// already deleted is that same refusal rather than a silent success.
+#[tokio::test]
+async fn an_unknown_reservation_id_is_refused_and_a_second_delete_too() {
+    let (router, engine) = emulator();
+    let vpc = create_vpc("seed", &router, "10.0.0.0/16").await;
+    let subnet = create_subnet("seed", &router, &vpc, "10.0.0.0/24").await;
+    let created = reserve_ok("seed", &router, &subnet, "10.0.0.0/28", "prefix").await;
+    let deleted_id = created.id("seed");
+    delete_ok("seed", &router, &deleted_id).await;
+
+    // Rows: a well-formed long id nothing has, the short id form, a value that is not a
+    // reservation id at all, another resource's id, and the id of a reservation that was
+    // deleted a moment ago.
+    let cases = [
+        "scr-0ffffffffffffffff".to_string(),
+        "scr-0fffffff".to_string(),
+        "not-a-reservation-id".to_string(),
+        subnet.clone(),
+        deleted_id.clone(),
+    ];
+    for case in cases {
+        let (status, body) = delete(&router, &case, &[]).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidSubnetCidrReservationID.NotFound",
+            "case {case:?}: expected the not-found code, got {body}"
+        );
+        // The sentence EC2 answers a resource named by one id with, naming the reservation's
+        // own `ResourceType` and the id the REQUEST carried.
+        assert_eq!(
+            error_message(&body),
+            format!("The subnet-cidr-reservation ID '{case}' does not exist"),
+            "case {case:?}: expected the refusal to name the id the request carried, got {body}"
+        );
+        assert_eq!(
+            stored_count(&engine),
+            0,
+            "case {case:?}: a refused delete must change nothing"
+        );
+    }
+}
+
+/// `DryRun` on a delete reports whether the request would have succeeded and removes nothing;
+/// a request that would have been refused anyway keeps its own reason.
+#[tokio::test]
+async fn a_dry_run_delete_removes_nothing() {
+    let (router, engine) = emulator();
+    let vpc = create_vpc("seed", &router, "10.0.0.0/16").await;
+    let subnet = create_subnet("seed", &router, &vpc, "10.0.0.0/24").await;
+    let created = reserve_ok("seed", &router, &subnet, "10.0.0.0/28", "prefix").await;
+    let id = created.id("seed");
+
+    let (status, body) = delete(&router, &id, &[param("DryRun", "true")]).await;
+    assert_eq!(
+        status, 412,
+        "a delete that would have succeeded: expected HTTP 412, got {status} with body {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "DryRunOperation",
+        "a delete that would have succeeded: expected DryRunOperation, got {body}"
+    );
+    assert_eq!(
+        stored_count(&engine),
+        1,
+        "a dry run must remove nothing"
+    );
+    let still_there = reported_reservations("after the dry run", &router, &subnet).await;
+    assert_eq!(
+        still_there,
+        vec![created.clone()],
+        "a dry run must leave the reservation readable, got {still_there:?}"
+    );
+
+    // A delete that would have been refused keeps that reason instead of reporting the dry
+    // run, the same order the create and the get answer the flag in.
+    let (status, body) = delete(
+        &router,
+        "scr-0ffffffffffffffff",
+        &[param("DryRun", "true")],
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "a delete that would have been refused: expected HTTP 400, got {status} with body {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "InvalidSubnetCidrReservationID.NotFound",
+        "a delete that would have been refused: expected its own reason, got {body}"
+    );
+
+    // `DryRun=false` is an ordinary call, which removes the reservation.
+    let (status, body) = delete(&router, &id, &[param("DryRun", "false")]).await;
+    assert_eq!(
+        status, 200,
+        "DryRun=false: expected HTTP 200, got {status} with body {body}"
+    );
+    assert_eq!(
+        stored_count(&engine),
+        0,
+        "DryRun=false: the reservation must be removed"
     );
 }

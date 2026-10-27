@@ -1,22 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDistributionTenant
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDistributionTenant`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Updates a distribution tenant, and PERSISTS what it changed: the record this handler
+//! rewrites is what every later read of the tenant answers from.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDistributionTenant::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation decides
 //!
-//! ## Shape of an operation
+//! * every member the update submits is optional, and each is documented as what the
+//!   tenant is updated TO, so a member the request states REPLACES what the record held
+//!   and one it leaves out leaves that value exactly as it was — the tenant's identity (its
+//!   id, its ARN, its name and its creation time) is submitted by no member and so never
+//!   changes;
+//! * the tenant's current version is the precondition the update runs under: a value that
+//!   is no version token is "the If-Match version is missing or not valid", and a
+//!   well-formed token that is not the stored one is a failed precondition;
+//! * `Domains` is where the tenant's viewers reach it, so a stated domain list is checked
+//!   for shape, for a conflict with any domain or alias another CloudFront resource in this
+//!   emulator already claims, against the documented per-tenant domain quota, and — for
+//!   every domain the tenant does not hold ALREADY — for a proof that the account controls
+//!   it, exactly as the create that first bound a domain to this tenant checked;
+//! * the parameter values the tenant ends up with have to satisfy the multi-tenant
+//!   distribution it ends up under, and every caller-chosen list the request carries is
+//!   count-bounded BEFORE the store lock is taken, so no request's length decides how long
+//!   the store is held or how large the stored record is;
+//! * the configuration this update lands has to reach the edge locations, so the tenant
+//!   re-enters the transient status and the CLOCK owes it the terminal one again.
 //!
-//! Each operation is a struct that owns the shared engine and implements
-//! [`smithy_server_runtime::Operation`]. The framework constructs one per service via
-//! `UpdateDistributionTenant::new(engine)` and drives it through the centralized request walk:
-//! deserialize → validate → `handle` → serialize. You write ONLY the `handle` body.
+//! Every refusal is decided BEFORE anything is written, so a refused update leaves the
+//! store — and the tenant's version — exactly as they were.
 //!
 //! ## Reaching this service's state
 //!
@@ -99,6 +110,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
+use crate::state::{DistributionTenantUpdate, IfMatch};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -139,6 +154,16 @@ impl From<UpdateDistributionTenantErrorModeled> for UpdateDistributionTenantErro
     }
 }
 
+/// This operation's modelled refusal for a request whose arguments describe no usable
+/// change to a distribution tenant — "An argument is invalid." — carrying the reason the
+/// argument was unusable.
+fn invalid_argument(reason: String) -> UpdateDistributionTenantError {
+    UpdateDistributionTenantErrorModeled::InvalidArgument(InvalidArgument {
+        message: Some(format!("An argument is invalid: {reason}")),
+    })
+    .into()
+}
+
 /// The `UpdateDistributionTenant` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -175,18 +200,237 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDistributionTenant` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDistributionTenantErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+
+        // ---- Request shape, decided BEFORE the store lock is taken ----------------
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDistributionTenant"))
+        // Everything below is a property of the request alone, and every list the request
+        // carries is bounded here: a caller-chosen length never drives work while the
+        // single store lock is held, and never reaches the record that is stored.
+        let stated_domains: Option<Vec<String>> = input
+            .domains
+            .as_ref()
+            .map(|domains| domains.iter().map(|item| item.domain.clone()).collect());
+        if let Some(reason) = stated_domains
+            .as_deref()
+            .and_then(crate::state::tenant_domains_refusal)
+        {
+            // "The domains to update for the distribution tenant … You must specify at least
+            // one domain", at most the documented per-tenant quota, each a domain name and
+            // none named twice: the ONE rule every call that binds a tenant's domains runs,
+            // counted BEFORE anything walks the list.
+            return Err(invalid_argument(reason));
+        }
+
+        // The parameter values and the customizations are both caller-chosen lists that END
+        // UP IN THE STORED RECORD, so each is count-bounded before anything walks it: one
+        // bound on how many values a tenant may carry, one on the locations a geographic
+        // restriction may name.
+        if let Some(reason) = input
+            .parameters
+            .as_deref()
+            .and_then(crate::state::tenant_parameter_count_refusal)
+        {
+            return Err(invalid_argument(reason));
+        }
+        if let Some(reason) = input
+            .customizations
+            .as_ref()
+            .and_then(crate::state::customizations_refusal)
+        {
+            return Err(invalid_argument(reason));
+        }
+
+        // ---- The store ------------------------------------------------------------
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        // Materialise whatever the clock already owes this service's state before the call
+        // reads it, so the version this precondition is evaluated against is the one a read
+        // at this instant reports.
+        store.settle(now);
+
+        // The update rewrites ONE stored tenant, so the record has to be there:
+        // `EntityNotFound` is the error this operation models for an entity it cannot find.
+        // `Id` is "the ID of the distribution tenant", so the id is what resolves it.
+        let Some(tenant) = store.distribution_tenants.get(&input.id) else {
+            return Err(UpdateDistributionTenantErrorModeled::EntityNotFound(
+                crate::state::distribution_tenant_not_found(),
+            )
+            .into());
+        };
+        let current_etag = tenant.etag.clone();
+        let held_domains = tenant.domains.clone();
+        let current_distribution_id = tenant.distribution_id.clone();
+        let current_parameters = tenant.parameters.clone();
+
+        // "The value of the ETag header that you received when retrieving the distribution
+        // tenant to update": the version the update runs under. A value that is no version
+        // token at all is "the `If-Match` version is missing or not valid", while a
+        // well-formed token that is not the stored one is a failed precondition. The member
+        // is `@required`, so a request stating no `If-Match` is refused at the request
+        // boundary and never reaches here.
+        match crate::state::check_if_match(&current_etag, Some(input.if_match.as_str())) {
+            IfMatch::Current => {}
+            IfMatch::Invalid => {
+                return Err(UpdateDistributionTenantErrorModeled::InvalidIfMatchVersion(
+                    crate::state::invalid_if_match_version(),
+                )
+                .into());
+            }
+            IfMatch::Stale => {
+                return Err(UpdateDistributionTenantErrorModeled::PreconditionFailed(
+                    crate::state::precondition_failed(),
+                )
+                .into());
+            }
+        }
+
+        // What the tenant will hold once this update lands: the stated value where the
+        // request states one, the stored value where it does not. Every rule below is
+        // evaluated against THAT state, because it is the state the tenant has to be
+        // admissible in — not against the fragment the request happens to carry.
+        let effective_domains = stated_domains.clone().unwrap_or_else(|| held_domains.clone());
+        let effective_distribution_id = input
+            .distribution_id
+            .clone()
+            .unwrap_or(current_distribution_id);
+        let effective_parameters = input.parameters.clone().unwrap_or(current_parameters);
+
+        // "The ID for the multi-tenant distribution": the distribution the tenant ends up
+        // under has to exist, and it has to be one that HAS tenants — a standard
+        // distribution serves its own traffic and no tenant can be associated with it,
+        // which is what `InvalidAssociation` ("The specified CloudFront resource can't be
+        // associated") says. "A valid parameter value must exist for any parameter that is
+        // marked as required in the multi-tenant distribution" is checked against the
+        // definitions that distribution really carries, so the rule follows the stored
+        // record rather than the request.
+        let parameters_refusal = {
+            let Some(distribution) = store.distribution(&effective_distribution_id) else {
+                return Err(UpdateDistributionTenantErrorModeled::EntityNotFound(
+                    crate::state::distribution_not_found(),
+                )
+                .into());
+            };
+            if !crate::state::is_multi_tenant(&distribution.config) {
+                return Err(UpdateDistributionTenantErrorModeled::InvalidAssociation(
+                    InvalidAssociation {
+                        message: Some(format!(
+                            "The distribution {effective_distribution_id} is not a multi-tenant \
+                             distribution, so it has no distribution tenants"
+                        )),
+                    },
+                )
+                .into());
+            }
+            let definitions = distribution
+                .config
+                .tenant_config
+                .as_ref()
+                .and_then(|config| config.parameter_definitions.as_deref())
+                .unwrap_or_default();
+            crate::state::parameter_refusal(definitions, &effective_parameters)
+        };
+        if let Some(reason) = parameters_refusal {
+            return Err(invalid_argument(reason));
+        }
+
+        // "The ID of the target connection group": a connection group this emulator does
+        // not hold is no entity.
+        if let Some(connection_group_id) = &input.connection_group_id {
+            if !store.holds_connection_group(connection_group_id) {
+                return Err(UpdateDistributionTenantErrorModeled::EntityNotFound(
+                    crate::state::connection_group_not_found(),
+                )
+                .into());
+            }
+        }
+
+        // "The CNAME specified is already defined for CloudFront": a domain routes to at
+        // most one CloudFront resource, across tenants and distribution aliases alike. The
+        // tenant being rewritten is excluded — its own domains are no conflict with itself.
+        for domain in &effective_domains {
+            if store.domain_in_use(domain, Some(&input.id)) {
+                return Err(UpdateDistributionTenantErrorModeled::CNAMEAlreadyExists(
+                    crate::state::cname_already_exists(domain),
+                )
+                .into());
+            }
+        }
+
+        // A domain is BOUND to a tenant by the call that associates it, and CloudFront binds
+        // one only to a domain the account's control of which it can see proven: either the
+        // call asks CloudFront to validate it (a `ManagedCertificateRequest`) or the domain
+        // already resolves to a CloudFront resource in this account. A domain this tenant
+        // ALREADY holds was admitted when it was bound and stays bound, so the proof is
+        // demanded of the domains this update newly binds.
+        let newly_bound: Vec<&str> = effective_domains
+            .iter()
+            .map(String::as_str)
+            .filter(|domain| {
+                !held_domains
+                    .iter()
+                    .any(|held| held.eq_ignore_ascii_case(domain))
+            })
+            .collect();
+        if input.managed_certificate_request.is_none()
+            && store
+                .unproven_domain(newly_bound.iter().copied())
+                .is_some()
+        {
+            return Err(UpdateDistributionTenantErrorModeled::InvalidArgument(
+                crate::state::invalid_domain_name(),
+            )
+            .into());
+        }
+
+        // "An object that contains the CloudFront managed ACM certificate request": a
+        // request that asks CLOUDFRONT to serve the HTTP validation token can only be
+        // satisfied once the domain resolves to a CloudFront resource, so every domain the
+        // certificate would cover is checked against this service's DNS view HERE —
+        // synchronously, before anything is written. The other validation-token host leaves
+        // the token to the caller's own infrastructure and so demands nothing of DNS.
+        if let Some(request) = &input.managed_certificate_request {
+            if store
+                .unverifiable_certificate_domain(request, &effective_domains)
+                .is_some()
+            {
+                return Err(UpdateDistributionTenantErrorModeled::InvalidArgument(
+                    crate::state::domain_ownership_unverified(),
+                )
+                .into());
+            }
+        }
+
+        // Nothing is written until here, so every refusal above left the tenant at the
+        // version the caller matched on. The record was read above under this same held
+        // lock, so the store still holds it; the `None` arm answers the modelled not-found
+        // rather than panicking if it ever does not.
+        let update = DistributionTenantUpdate {
+            distribution_id: input.distribution_id,
+            domains: stated_domains,
+            customizations: input.customizations,
+            parameters: input.parameters,
+            connection_group_id: input.connection_group_id,
+            enabled: input.enabled,
+            managed_certificate_request: input.managed_certificate_request,
+        };
+        let Some(tenant) = store.apply_distribution_tenant_update(&input.id, update, now) else {
+            return Err(UpdateDistributionTenantErrorModeled::EntityNotFound(
+                crate::state::distribution_tenant_not_found(),
+            )
+            .into());
+        };
+
+        Ok(UpdateDistributionTenantOutput {
+            // "The distribution tenant that you're updating" — read from the record just
+            // written, so the answer and every later read are the same document.
+            distribution_tenant: Some(tenant.to_distribution_tenant()),
+            // "The current version of the distribution tenant": the token this mutation just
+            // minted, so the version from before it no longer satisfies an `If-Match`.
+            e_tag: Some(tenant.etag.clone()),
+        })
     }
 }
