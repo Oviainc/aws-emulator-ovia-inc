@@ -348,6 +348,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         threads_per_core: group.threads_per_core,
                         launch_time: now,
                         running_at: now + crate::state::TRANSIENT_STATE_SETTLES_AFTER,
+                        // Nothing has asked for this node's hardware to be replaced.
+                        replacement_due_at: None,
                         volume_attachments: ::std::collections::BTreeMap::new(),
                     },
                 );

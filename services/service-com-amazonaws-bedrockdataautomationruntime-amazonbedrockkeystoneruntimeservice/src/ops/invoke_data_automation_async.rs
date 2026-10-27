@@ -11,13 +11,19 @@
 //!
 //! Caller-identity authorization is deliberately NOT emulated by this service. The
 //! emulator verifies every request signature centrally and holds no
-//! principal-to-resource policy, and the `dataAutomationProfileArn` /
-//! `dataAutomationProjectArn` a submission names belong to the data-automation CONTROL
-//! plane, which is a different service and is not emulated here — so they are checked
-//! against the modelled `@pattern`/`@length` by the framework walk and then recorded,
-//! not resolved. The modelled `AccessDeniedException` is therefore unreachable from this
-//! handler: a submission that succeeds here is evidence that the request was well formed
-//! and was persisted, NOT that AWS IAM would have allowed it.
+//! principal-to-resource policy, so the modelled `AccessDeniedException` is unreachable
+//! from this handler: a submission that succeeds here is evidence that the request was
+//! well formed and was persisted, NOT that AWS IAM would have allowed it.
+//!
+//! The resources a submission REFERENCES are a different matter. The data-automation
+//! project and the blueprints it names belong to the build-time service, which IS
+//! emulated in this workspace, and a job cannot start without reading them — so they are
+//! RESOLVED against that service's store (`crate::state::unresolved_reference_refusal`)
+//! and a reference that resolves to nothing is refused with the modelled
+//! `ValidationException`. The `dataAutomationProfileArn` is the one referenced ARN that
+//! stays recorded rather than resolved: no emulated service owns a data-automation
+//! profile, so there is no store to resolve it against, and the framework walk's
+//! `@pattern`/`@length` check is the whole check on it.
 //!
 //! ## Shape of an operation
 //!
@@ -217,6 +223,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(InvokeDataAutomationAsyncErrorModeled::ValidationException(
                 ValidationException {
                     message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // What to extract is named by REFERENCE: a data-automation project, or inline
+        // blueprints, that the build-time service owns. The job's work IS that project's
+        // output configuration (or that blueprint's schema), so a reference resolving to
+        // nothing describes no job: it is refused with this operation's own modelled
+        // `ValidationException` (HTTP 400) — the model gives it no
+        // `ResourceNotFoundException` — before anything is minted. See
+        // `crate::state::unresolved_reference_refusal`, which the synchronous
+        // `InvokeDataAutomation` calls too.
+        if let Some(message) = crate::state::unresolved_reference_refusal(
+            &*self.engine,
+            input.data_automation_configuration.as_ref(),
+            input.blueprints.as_deref(),
+        ) {
+            return Err(InvokeDataAutomationAsyncErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message.to_string()),
                 },
             )
             .into());

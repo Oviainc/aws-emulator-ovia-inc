@@ -21,9 +21,9 @@
 //! ([`crate::state::check_account_policy_criteria_overlap`]). The string itself is still
 //! stored and reported verbatim.
 //!
-//! What a policy DOES to ingested log events — masking, transformation, suppressing EMF
-//! metric creation — is not this operation's: nothing here reads a policy back out at
-//! ingestion time yet.
+//! What a policy DOES to ingested log events is not decided here: the ingestion path reads
+//! the stored policies back out, which is how a metric extraction policy suppresses the EMF
+//! metric creation of the log groups it selects ([`crate::state::emf`]).
 //!
 //! ## Shape of an operation
 //!

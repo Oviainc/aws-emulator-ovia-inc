@@ -31,8 +31,7 @@ use service_com_amazonaws_servicequotas_servicequotasv20190624::ops::types::{
     OPT_IN_LEVEL_VALUES, OPT_IN_STATUS_VALUES, OPT_IN_TYPE_VALUES,
 };
 use service_com_amazonaws_servicequotas_servicequotasv20190624::state::{
-    self, AutoManagementConfig, AVAILABLE_OPT_IN_TYPES, OPT_IN_STATUS_DISABLED,
-    OPT_IN_STATUS_ENABLED,
+    self, AutoManagementConfig, OPT_IN_STATUS_DISABLED, OPT_IN_STATUS_ENABLED,
 };
 
 use crate::quota_workflow::{client, emulator, Client, ACCOUNT};
@@ -41,11 +40,10 @@ use crate::quota_workflow::{client, emulator, Client, ACCOUNT};
 /// list rather than spelled again here.
 const ACCOUNT_LEVEL: &str = OPT_IN_LEVEL_VALUES[0];
 
-/// The `OptInType` member `name`, checked against the model's own value list AND
-/// against the members Automatic Management currently offers, so a stored row cannot
-/// name a type the model does not declare, nor one an opt-in would refuse to record.
+/// The `OptInType` member `name`, checked against the model's own value list, so a
+/// stored row cannot name a type the model does not declare.
 fn opt_in_type(name: &str) -> &'static str {
-    let member = OPT_IN_TYPE_VALUES
+    OPT_IN_TYPE_VALUES
         .iter()
         .copied()
         .find(|member| *member == name)
@@ -54,13 +52,7 @@ fn opt_in_type(name: &str) -> &'static str {
                 "case {name}: not an OptInType member; the model declares \
                  {OPT_IN_TYPE_VALUES:?}"
             )
-        });
-    assert!(
-        AVAILABLE_OPT_IN_TYPES.contains(&member),
-        "case {name}: not an opt-in type the service offers yet; the available ones are \
-         {AVAILABLE_OPT_IN_TYPES:?}"
-    );
-    member
+        })
 }
 
 /// The operation under test.
@@ -194,14 +186,12 @@ async fn an_account_that_never_opted_in_reads_as_disabled_and_the_read_stores_no
 #[tokio::test]
 async fn every_storable_opt_in_combination_reads_back_as_stored() {
     // The members come from the model's own enum value lists
-    // (`ops::types::OPT_IN_LEVEL_VALUES` / `OPT_IN_STATUS_VALUES`, generated from
-    // `OptInLevel` and `OptInStatus`) and, for the opt-in type, from the subset of
-    // `OptInType` the service currently offers (`state::AVAILABLE_OPT_IN_TYPES`) —
-    // which is all a configuration can hold, since an opt-in refuses any other — so a
-    // member the model gains, or one that becomes available, is covered without editing
-    // this table.
+    // (`ops::types::OPT_IN_LEVEL_VALUES` / `OPT_IN_TYPE_VALUES` /
+    // `OPT_IN_STATUS_VALUES`, generated from `OptInLevel`, `OptInType` and
+    // `OptInStatus`), which is every combination a configuration can hold, so a member
+    // the model gains is covered without editing this table.
     for opt_in_level in OPT_IN_LEVEL_VALUES {
-        for opt_in_type in AVAILABLE_OPT_IN_TYPES {
+        for opt_in_type in OPT_IN_TYPE_VALUES {
             for opt_in_status in OPT_IN_STATUS_VALUES {
                 let case = format!("{opt_in_level}/{opt_in_type}/{opt_in_status}");
                 let engine = emulator();

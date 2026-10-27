@@ -993,10 +993,37 @@ async fn a_guardrail_created_through_the_router_reads_back_through_it() {
 const PROFILE_ARN: &str =
     "arn:aws:bedrock:us-east-1:aws:data-automation-profile/us.data-automation-v1";
 
-/// A legal `dataAutomationConfiguration.dataAutomationProjectArn` (`smithy_query` shape
-/// `DataAutomationArn`).
-const PROJECT_ARN: &str =
-    "arn:aws:bedrock:us-east-1:000000000000:data-automation-project/invoices";
+/// `CreateDataAutomationProject` on the build-time member, answering with the
+/// `projectArn` it minted.
+///
+/// A submission's `dataAutomationConfiguration.dataAutomationProjectArn` is RESOLVED
+/// against that member's store, so the project an accepted submission names has to be
+/// created through the router first — which is also what makes the accepted row evidence
+/// that the two members of the family share one engine.
+async fn create_project(router: &MultiServiceRouter, name: &str) -> String {
+    let answer = dispatch(
+        router,
+        "PUT",
+        "/data-automation-projects/",
+        &[],
+        &format!(r#"{{"projectName":"{name}","standardOutputConfiguration":{{}}}}"#),
+    )
+    .await;
+    assert_eq!(
+        (answer.status, answer.error_code.as_str()),
+        (201, ""),
+        "CreateDataAutomationProject({name:?}) must answer its modelled 201, got {}",
+        answer.raw_body
+    );
+    answer
+        .body
+        .get("projectArn")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            panic!("CreateDataAutomationProject({name:?}) returned no projectArn: {}", answer.raw_body)
+        })
+        .to_string()
+}
 
 /// A well-formed `InvocationArn` / `TaggableResourceArn` that names nothing this emulator
 /// minted.
@@ -1016,11 +1043,14 @@ async fn every_operation_of_the_awsjson_member_answers_its_own_contract() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let router = build_router(&engine);
 
+    // The accepted row names a project created through the build-time member of the same
+    // family, because the runtime member resolves that reference against its store.
+    let project_arn = create_project(&router, "routing-contract-project").await;
     let submission = format!(
         r#"{{"inputConfiguration":{{"s3Uri":"s3://in-bucket/assets/doc.pdf"}},
              "outputConfiguration":{{"s3Uri":"s3://out-bucket/routing/"}},
              "dataAutomationProfileArn":"{PROFILE_ARN}",
-             "dataAutomationConfiguration":{{"dataAutomationProjectArn":"{PROJECT_ARN}"}}}}"#
+             "dataAutomationConfiguration":{{"dataAutomationProjectArn":"{project_arn}"}}}}"#
     );
     let no_extraction_target = format!(
         r#"{{"inputConfiguration":{{"s3Uri":"s3://in-bucket/assets/doc.pdf"}},
