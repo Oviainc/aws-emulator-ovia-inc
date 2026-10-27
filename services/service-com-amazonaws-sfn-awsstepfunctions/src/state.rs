@@ -485,6 +485,13 @@ pub const EVENT_EXECUTION_FAILED: &str = "ExecutionFailed";
 /// The history event an execution that reached its end ends on.
 pub const EVENT_EXECUTION_SUCCEEDED: &str = "ExecutionSucceeded";
 
+/// The history event a STOPPED execution ends on.
+pub const EVENT_EXECUTION_ABORTED: &str = "ExecutionAborted";
+
+/// The history event an execution that ran past its definition's `TimeoutSeconds`
+/// ends on.
+pub const EVENT_EXECUTION_TIMED_OUT: &str = "ExecutionTimedOut";
+
 // ---------------------------------------------------------------------------
 // Store bounds
 //
@@ -598,16 +605,17 @@ pub const MAX_HISTORY_EVENTS: usize = 2 * asl::MAX_STATE_TRANSITIONS + 2;
 
 /// What [`Execution::measure`] reserves for a stop that has not happened yet.
 ///
-/// `StopExecution` writes the caller's `error` and `cause` and one event onto a
-/// running execution. Reserving their maxima (the modelled `SensitiveError` and
-/// `SensitiveCause` lengths, plus one event) while the execution is still running
+/// `StopExecution` writes the caller's `error` and `cause` onto a running execution
+/// TWICE — as the record's own terminal values, and on the `ExecutionAborted` event,
+/// which keeps what the stop reported however a later attempt moves the record — plus
+/// that event itself. Reserving BOTH copies of their maxima (the modelled
+/// `SensitiveError` and `SensitiveCause` lengths) while the execution is still running
 /// means a re-measurement after the stop can only shrink the store's total, so
 /// admission is the ONLY place the store grows and [`MAX_STORE_BYTES`] bounds what
 /// is retained at every instant.
-pub const STOP_RESERVE_BYTES: usize = asl::MAX_ERROR_BYTES
-    + asl::MAX_CAUSE_BYTES
+pub const STOP_RESERVE_BYTES: usize = 2 * (asl::MAX_ERROR_BYTES + asl::MAX_CAUSE_BYTES)
     + std::mem::size_of::<HistoryEvent>()
-    + "ExecutionAborted".len();
+    + EVENT_EXECUTION_ABORTED.len();
 
 /// Page size used when `maxResults` is absent or `0`.
 ///
@@ -1221,6 +1229,11 @@ pub struct EventDetails {
     /// The bounds the scheduling state declared for it.
     pub timeout_seconds: Option<u64>,
     pub heartbeat_seconds: Option<u64>,
+    /// How many times the execution had been redriven when the event was written,
+    /// which is what an `ExecutionRedriven` event reports. The record's own count
+    /// moves again at the NEXT redrive, so the count belongs to the event rather
+    /// than being read back off the execution.
+    pub redrive_count: Option<i32>,
 }
 
 impl EventDetails {
@@ -1249,6 +1262,26 @@ impl EventDetails {
     /// The detail a failure's event carries.
     fn of_failure(error: Option<String>, cause: Option<String>) -> Self {
         Self {
+            error,
+            cause,
+            ..Self::default()
+        }
+    }
+
+    /// The detail the TERMINAL event of one attempt carries: what that attempt ended
+    /// with.
+    ///
+    /// An execution's own `output`, `error` and `cause` are those of its LATEST
+    /// attempt — a redrive clears them and the re-run computes its own — while the
+    /// event an earlier attempt ended on stays in the history, so the values it
+    /// reports are kept on the event itself.
+    fn of_outcome(
+        output: Option<String>,
+        error: Option<String>,
+        cause: Option<String>,
+    ) -> Self {
+        Self {
+            output,
             error,
             cause,
             ..Self::default()
@@ -1597,9 +1630,15 @@ impl Execution {
                 redrive_date: now,
             });
         }
-        for event in opening {
+        for mut event in opening {
             if self.history.len() >= MAX_HISTORY_EVENTS {
                 break;
+            }
+            // "The number of times you've redriven an execution": the count THIS
+            // redrive reached, kept on the event it opens with, because the record's
+            // own count moves again at the next one.
+            if event.event_type == EVENT_EXECUTION_REDRIVEN {
+                event.details.redrive_count = Some(self.redrive_count);
             }
             self.history.push(event);
         }
@@ -3723,7 +3762,11 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
                 },
                 timestamp: child.due_at,
                 state_name: None,
-                details: EventDetails::of_failure(child.error.clone(), child.cause.clone()),
+                details: EventDetails::of_outcome(
+                    child.output.clone(),
+                    child.error.clone(),
+                    child.cause.clone(),
+                ),
             };
             let record = Execution {
                 arn: child.arn.clone(),
@@ -3944,7 +3987,7 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             child.pending = None;
             child.status = EXECUTION_STATUS_ABORTED.to_string();
             child.stop_date = Some(now);
-            child.push_event("ExecutionAborted", now);
+            child.push_event(EVENT_EXECUTION_ABORTED, now);
             child.retained_bytes = child.measure();
             let after = child.retained_bytes;
             self.retained_bytes = self
@@ -3997,7 +4040,13 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         execution.stop_date = Some(now);
         execution.error = error;
         execution.cause = cause;
-        execution.push_event("ExecutionAborted", now);
+        // The event carries the error and the cause the STOP reported, so the history
+        // keeps them whatever a later attempt of this execution computes.
+        execution.push_detailed_event(
+            EVENT_EXECUTION_ABORTED,
+            now,
+            EventDetails::of_failure(execution.error.clone(), execution.cause.clone()),
+        );
         // The caller's `error` and `cause` are caller-sized, so the record is
         // re-measured and the store's total moved by the difference. The record
         // already reserved their maxima while it was running (see
@@ -6182,6 +6231,14 @@ fn plan_from_run(
     // offset no instant can represent is held at the furthest instant this clock
     // carries, rather than reached through the panicking `Add`.
     let due_at = after(start, settle.saturating_add(run.elapsed));
+    // What this attempt ENDED with, which is what the event it ends on reports: a
+    // later attempt of the same execution computes its own outcome, and the event
+    // this one wrote stays in the history.
+    let outcome = EventDetails::of_outcome(
+        run.output.clone(),
+        run.error.clone(),
+        run.cause.clone(),
+    );
     let events: Vec<HistoryEvent> = run
         .steps
         .into_iter()
@@ -6198,7 +6255,11 @@ fn plan_from_run(
                 after(start, step.after)
             },
             state_name: step.state_name,
-            details: EventDetails::default(),
+            details: if step.terminal {
+                outcome.clone()
+            } else {
+                EventDetails::default()
+            },
         })
         .collect();
     // Every Map Run the walk started, with its offsets turned into instants against

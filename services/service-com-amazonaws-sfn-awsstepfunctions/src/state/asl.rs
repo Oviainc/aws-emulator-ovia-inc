@@ -2440,7 +2440,7 @@ fn interpret(
                 terminal(
                     kept,
                     remaining,
-                    "ExecutionTimedOut",
+                    super::EVENT_EXECUTION_TIMED_OUT,
                     super::EXECUTION_STATUS_TIMED_OUT,
                     None,
                     Some(TIMEOUT_ERROR.to_string()),
@@ -2515,7 +2515,7 @@ fn succeeded(steps: Vec<Step>, elapsed: Duration, output: String) -> Run {
     terminal(
         steps,
         elapsed,
-        "ExecutionSucceeded",
+        super::EVENT_EXECUTION_SUCCEEDED,
         super::EXECUTION_STATUS_SUCCEEDED,
         Some(output),
         None,
@@ -2538,7 +2538,7 @@ fn failed(steps: Vec<Step>, elapsed: Duration, failure: Failure) -> Run {
         return terminal(
             steps,
             elapsed,
-            "ExecutionFailed",
+            super::EVENT_EXECUTION_FAILED,
             super::EXECUTION_STATUS_FAILED,
             None,
             Some(DATA_LIMIT_ERROR.to_string()),
@@ -2551,7 +2551,7 @@ fn failed(steps: Vec<Step>, elapsed: Duration, failure: Failure) -> Run {
     terminal(
         steps,
         elapsed,
-        "ExecutionFailed",
+        super::EVENT_EXECUTION_FAILED,
         super::EXECUTION_STATUS_FAILED,
         None,
         error,
