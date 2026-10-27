@@ -361,10 +361,13 @@ async fn an_app_monitor_can_be_created_again_once_the_name_is_free() {
 
 #[tokio::test]
 async fn put_rum_events_names_the_id_it_could_not_resolve() {
-    // The other half of the rule: `PutRumEvents` is the one operation that names its
-    // monitor by the minted `Id` rather than by `Name` (`POST /appmonitors/{Id}/`), so the
-    // message must report THAT value — which is what shows the message is built from
-    // whichever member identified the monitor, not from a `Name` member it does not have.
+    // `PutRumEvents` is the one operation that names its monitor by the minted `Id`
+    // rather than by `Name` (`POST /appmonitors/{Id}/`), and it is NOT part of the
+    // not-found rule this suite pins: the write is authorized against the monitor the id
+    // names, so an id that resolves to nothing is refused as an authorization failure and
+    // its body reports no part of the request at all. The rule and its table live in
+    // `put_rum_events_unresolvable_id`; what belongs here is that the refusal is not this
+    // suite's 404, which is what keeps the two rules from being confused.
     let (router, _engine) = emulator();
     let live = create(
         &router,
@@ -373,58 +376,37 @@ async fn put_rum_events_names_the_id_it_could_not_resolve() {
     )
     .await;
 
-    // `AppMonitorId`'s modelled pattern is a 36-character RFC 4122 v4 UUID (see
-    // `support::is_modelled_app_monitor_id`), so every row is a well-formed id that was
-    // never minted; the rows differ in which hex digits they carry and in letter case.
-    let unresolvable = [
-        ("all-zero", "00000000-0000-4000-8000-000000000000"),
-        ("all-f-lowercase", "ffffffff-ffff-4fff-bfff-ffffffffffff"),
-        ("mixed-case-hex", "DeAdBeEf-1234-4abc-89De-0123456789aB"),
-        ("digits-only", "12345678-9012-4345-8678-901234567890"),
-    ];
-    for (case, id) in unresolvable {
-        assert_ne!(
-            id, live,
-            "case {case:?}: the row must not be the id the seed minted"
-        );
-        let reply = call(
-            &router,
-            "POST",
-            &format!("/appmonitors/{id}/"),
-            Some(rum_events_body(id)),
-        )
-        .await;
-        assert_eq!(
-            reply.status,
-            404,
-            "case {case:?}: expected HTTP 404, got {} {:?}",
-            reply.status,
-            String::from_utf8_lossy(&reply.body)
-        );
-        let code = reply.error_code(case);
-        assert_eq!(
-            code, "ResourceNotFoundException",
-            "case {case:?}: expected ResourceNotFoundException, got {code:?}"
-        );
-        let document = reply.json(case);
-        let expected = format!("{NOT_FOUND_PREFIX}{id}");
-        assert_eq!(
-            message(&document),
-            Some(expected.as_str()),
-            "case {case:?}: expected the message {expected:?}, got {:?}",
-            message(&document)
-        );
-        assert_eq!(
-            document["resourceName"],
-            Value::Null,
-            "case {case:?}: a RUM not-found reports no resourceName, got {:?}",
-            document["resourceName"]
-        );
-        assert_eq!(
-            document["resourceType"],
-            Value::Null,
-            "case {case:?}: a RUM not-found reports no resourceType, got {:?}",
-            document["resourceType"]
-        );
-    }
+    let id = "00000000-0000-4000-8000-000000000000";
+    assert_ne!(
+        id, live,
+        "case \"unresolvable id\": the row must not be the id the seed minted"
+    );
+    let reply = call(
+        &router,
+        "POST",
+        &format!("/appmonitors/{id}/"),
+        Some(rum_events_body(id)),
+    )
+    .await;
+    assert_eq!(
+        reply.status,
+        403,
+        "case \"unresolvable id\": expected HTTP 403, got {} {:?}",
+        reply.status,
+        String::from_utf8_lossy(&reply.body)
+    );
+    let code = reply.error_code("unresolvable id");
+    assert_eq!(
+        code, "AccessDeniedException",
+        "case \"unresolvable id\": expected AccessDeniedException, got {code:?}"
+    );
+    let document = reply.json("unresolvable id");
+    let not_found = format!("{NOT_FOUND_PREFIX}{id}");
+    assert_ne!(
+        message(&document),
+        Some(not_found.as_str()),
+        "case \"unresolvable id\": the data-plane refusal must not carry the not-found \
+         message, got {:?}",
+        message(&document)
+    );
 }

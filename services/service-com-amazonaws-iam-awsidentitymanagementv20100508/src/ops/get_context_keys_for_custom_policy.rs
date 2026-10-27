@@ -152,22 +152,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // specified as a string containing the complete, valid JSON text of an IAM
         // policy" — which `policyDocumentType`'s own pattern does not ask for, so one
         // that is not is an "invalid … value … supplied for an input parameter". The
-        // rule is the shared one every operation taking a policy document applies
-        // (`crate::state::is_policy_document`), and the refusal names the member that
-        // broke it, the way `GetContextKeysForPrincipalPolicy` does for the same list.
-        if let Some(position) = input
+        // rule, and the fixed sentence each way of breaking it is refused with, are the
+        // shared ones every operation taking a policy document applies
+        // (`crate::state::policy_document_defect`), so the refusal carries neither the
+        // member that supplied the document nor anything read out of it — the same text
+        // `GetContextKeysForPrincipalPolicy` answers for the same list.
+        if let Some(defect) = input
             .policy_input_list
             .iter()
-            .position(|document| !crate::state::is_policy_document(document))
+            .find_map(|document| crate::state::policy_document_defect(document))
         {
             return Err(
                 GetContextKeysForCustomPolicyErrorModeled::InvalidInputException(
                     InvalidInputException {
-                        message: Some(format!(
-                            "Syntax errors in policy: PolicyInputList member {} must be a \
-                             JSON object carrying a Statement element",
-                            position + 1
-                        )),
+                        message: Some(defect.message().to_string()),
                     },
                 )
                 .into(),

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DetachGroupPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DetachGroupPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DetachGroupPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the attachment of the managed policy the request's `PolicyArn` names from the
+//! group it names, so `ListAttachedGroupPolicies` stops reporting it and `DeleteGroup`'s
+//! conflict guard stops counting it. A value that is not a managed-policy ARN is an
+//! `InvalidInputException`; a group name the account does not hold, and a policy the group
+//! does not carry, are each a `NoSuchEntityException`.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +167,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DetachGroupPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DetachGroupPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DetachGroupPolicy"))
+        // `ctx` carries request metadata only; nothing about a detachment depends on it —
+        // IAM is global, and both entities are named by the request.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DetachGroupPolicyErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `arnType` asks only for a 20..2048 character string, so the ARN still has to BE
+        // a managed policy's, exactly as this crate's `AttachGroupPolicy` reads one.
+        // Anything else is an "invalid … value … supplied for an input parameter".
+        if crate::state::parse_policy_arn(&input.policy_arn).is_none() {
+            return Err(DetachGroupPolicyErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "ARN {} is not valid: PolicyArn must be an IAM managed policy ARN",
+                        input.policy_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+
+        // The group is named (friendly name, not ARN) and IAM entity names "are not
+        // distinguished by case", so the case-folded name is the identity. A name the
+        // account holds no group under "referenced a resource entity that does not exist".
+        let group_key = crate::state::name_key(&input.group_name);
+        let Some(group) = store.groups.get(&group_key) else {
+            return Err(DetachGroupPolicyErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The group with name {} cannot be found.",
+                        input.group_name
+                    )),
+                },
+            )
+            .into());
+        };
+        let group_name = group.group_name.clone();
+
+        // "Removes the specified managed policy from the specified IAM group": what goes
+        // is the ATTACHMENT the group carries, read and written through the one set
+        // `AttachGroupPolicy` fills and `ListAttachedGroupPolicies` reports. A policy the
+        // group does not carry "referenced a resource entity that does not exist", worded
+        // as `DetachRolePolicy` words the same absence for a role.
+        let detached = store
+            .group_attached_policies
+            .get_mut(&group_key)
+            .is_some_and(|attached| attached.remove(&input.policy_arn));
+        if !detached {
+            return Err(DetachGroupPolicyErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "Policy {} was not found attached to group {group_name}.",
+                        input.policy_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A group carrying no attachment carries no attachment set either: an empty one
+        // left behind is bookkeeping for a dependency that no longer exists.
+        if store
+            .group_attached_policies
+            .get(&group_key)
+            .is_some_and(::std::collections::BTreeSet::is_empty)
+        {
+            store.group_attached_policies.remove(&group_key);
+        }
+
+        Ok(DetachGroupPolicyOutput)
     }
 }

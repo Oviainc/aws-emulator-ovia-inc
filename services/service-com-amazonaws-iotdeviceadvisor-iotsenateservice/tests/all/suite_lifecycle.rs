@@ -825,18 +825,23 @@ async fn unknown_and_malformed_ids_are_refused() {
 async fn a_suite_run_is_persisted_and_its_status_moves_on_the_clock() {
     let emulator = Emulator::new();
 
-    // The run configurations differ in the optional members and in list size.
-    let rows: Vec<(&str, Value)> = vec![
+    // The run configurations differ in the optional members and in list size; each row
+    // carries the thing ARN its primary device is named by, so the endpoint the start call
+    // reports can be checked against that device.
+    let rows: Vec<(&str, String, Value)> = vec![
         (
             "primary device only",
+            thing_arn(0),
             run_configuration(&thing_arn(0), None, None),
         ),
         (
             "empty selected test list",
+            thing_arn(1),
             run_configuration(&thing_arn(1), Some(Vec::new()), Some(false)),
         ),
         (
             "several selected tests, parallel",
+            thing_arn(2),
             run_configuration(
                 &thing_arn(2),
                 // `SelectedTestList` members are `UUID` (len 12..36).
@@ -850,7 +855,7 @@ async fn a_suite_run_is_persisted_and_its_status_moves_on_the_clock() {
         ),
     ];
 
-    for (case, configuration) in rows {
+    for (case, primary_thing_arn, configuration) in rows {
         let definition = emulator
             .create_definition(
                 &json!({
@@ -896,9 +901,34 @@ async fn a_suite_run_is_persisted_and_its_status_moves_on_the_clock() {
              ({} chars)",
             endpoint.len()
         );
+        // The run names a primary device, so the host it reports is that DEVICE's host —
+        // the one `GetEndpoint` vends over the wire for the same ARN — and not the
+        // account-level host, which belongs to a caller that names no device.
+        let vended = emulator
+            .call(
+                "GET",
+                &format!(
+                    "/endpoint?thingArn={}",
+                    crate::endpoint::percent_encode(&primary_thing_arn)
+                ),
+                "us-west-2",
+                None,
+            )
+            .await
+            .string("endpoint");
         assert_eq!(
-            endpoint, "000000000000.deviceadvisor.iot.us-west-2.amazonaws.com",
-            "case {case:?}: unexpected endpoint"
+            endpoint, vended,
+            "case {case:?}: the run must report the host GetEndpoint vends for its primary \
+             device, got {endpoint:?} and {vended:?}"
+        );
+        let account_level = emulator
+            .call("GET", "/endpoint", "us-west-2", None)
+            .await
+            .string("endpoint");
+        assert_ne!(
+            endpoint, account_level,
+            "case {case:?}: a run naming a primary device must not report the \
+             account-level host, got {endpoint:?}"
         );
 
         let run_path = format!("/suiteDefinitions/{definition_id}/suiteRuns/{run_id}");

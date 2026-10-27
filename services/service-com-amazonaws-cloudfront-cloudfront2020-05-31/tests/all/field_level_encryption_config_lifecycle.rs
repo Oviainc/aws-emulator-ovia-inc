@@ -50,7 +50,9 @@ use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::distribution_lifecycle::{call, emulator, Answer, Node, API_VERSION, HOST};
+use crate::distribution_lifecycle::{
+    call, emulator, inconsistent_quantities_message, Answer, Node, API_VERSION, HOST,
+};
 use crate::field_level_encryption_profile_lifecycle::store_profile;
 use crate::public_key_lifecycle::is_wire_timestamp;
 // The XML escaper is the crate's: one escaper for every suite, so no two of them can
@@ -793,10 +795,7 @@ async fn a_wrapper_whose_quantity_disagrees_with_its_items_is_refused() {
             row.case,
             refused.raw
         );
-        let expected = format!(
-            "The specified quantity of {wrapper} ({stated}) does not match the actual quantity \
-             supplied ({carried})."
-        );
+        let expected = inconsistent_quantities_message(&wrapper, stated, carried);
         assert_eq!(
             refused.root().find_text("Message"),
             Some(expected.as_str()),

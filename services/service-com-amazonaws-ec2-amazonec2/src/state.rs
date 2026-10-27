@@ -1541,6 +1541,13 @@ pub use snapshots::*;
 /// root block device mapping — one method on the state, in a module of its own.
 mod launched_root_volumes;
 
+/// The associations between the account's instances and the IAM instance profiles they run
+/// as — the store, the form of an association id, its ceiling, its refusals and the two
+/// clock-owed moves an association makes — in a module of its own, re-exported so a handler
+/// reaches them as `crate::state::<item>` like every other primitive here.
+pub mod iam_instance_profile_associations;
+pub use iam_instance_profile_associations::*;
+
 /// The one region whose Amazon-provided private DNS suffix is `ec2.internal`
 /// rather than `<region>.compute.internal`.
 pub const EC2_INTERNAL_REGION: &str = "us-east-1";
@@ -1753,6 +1760,7 @@ pub const SUPPORTED_INSTANCE_FILTERS: &[&str] = &[
     "instance.group-id",
     "instance.group-name",
     "instance-lifecycle",
+    "iam-instance-profile.arn",
     "key-name",
     "launch-index",
     "monitoring-state",
@@ -2939,6 +2947,28 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// `granted` whether or not anybody calls again.
     /// [`Self::materialize_due_transitions`] applies it.
     pub network_interface_permission_granted_at: BTreeMap<String, Instant>,
+    /// Every association between one of the account's instances and an IAM instance profile,
+    /// by `IamInstanceProfileAssociationId`, as the modelled
+    /// [`crate::ops::types::IamInstanceProfileAssociation`] shape itself. Written only by the
+    /// seams in [`iam_instance_profile_associations`], which is also where the rules about
+    /// one are stated.
+    ///
+    /// A fresh account holds NONE: an instance runs as an instance profile only once
+    /// something associates one with it.
+    pub iam_instance_profile_associations:
+        BTreeMap<String, crate::ops::types::IamInstanceProfileAssociation>,
+    /// The association each instance holds, by `InstanceId` — the index of the rule that an
+    /// instance cannot be given more than one IAM instance profile
+    /// (`AssociateIamInstanceProfile`), so the profile an instance runs as is answered
+    /// without scanning the associations.
+    pub iam_instance_profile_association_by_instance: BTreeMap<String, String>,
+    /// When the move the clock owes an IAM instance profile association falls due, by
+    /// `IamInstanceProfileAssociationId` — the association counterpart of
+    /// [`Self::network_interface_permission_granted_at`], on the same monotonic clock and
+    /// the same [`TRANSITION_DELAY`]: an `associating` association becomes `associated`, and
+    /// a `disassociating` one is removed, whether or not anybody calls again.
+    /// [`Self::materialize_due_transitions`] applies it.
+    pub iam_instance_profile_association_due_at: BTreeMap<String, Instant>,
     /// Every security group rule the account holds, by `SecurityGroupRuleId`.
     ///
     /// "When you add a rule to a security group, it is assigned a unique ID"
@@ -3761,6 +3791,10 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             // A fresh account has granted nothing over an interface it does not have yet.
             network_interface_permissions: BTreeMap::new(),
             network_interface_permission_granted_at: BTreeMap::new(),
+            // A fresh account runs no instance as an IAM instance profile.
+            iam_instance_profile_associations: BTreeMap::new(),
+            iam_instance_profile_association_by_instance: BTreeMap::new(),
+            iam_instance_profile_association_due_at: BTreeMap::new(),
             security_group_rules: BTreeMap::new(),
             // A fresh account has associated no security group with a second VPC.
             security_group_vpc_associations: BTreeMap::new(),
@@ -6569,6 +6603,9 @@ impl ComAmazonawsEc2Amazonec2State {
                 // The move is applied once; nothing is owed on this permission any more.
                 false
             });
+        // The two moves an IAM instance profile association owes the clock: `associating` ->
+        // `associated`, and the REMOVAL of one whose disassociation has been started.
+        self.settle_due_iam_instance_profile_associations(now);
         let subnets = &mut self.subnets;
         self.subnet_available_at.retain(|subnet_id, due_at| {
             if now < *due_at {
@@ -7552,6 +7589,11 @@ impl ComAmazonawsEc2Amazonec2State {
                 .as_ref()
                 .map(|_| INSTANCE_LIFECYCLE_SPOT.to_string()),
             spot_instance_request_id: instance.spot_instance_request_id.clone(),
+            // The IAM instance profile the instance runs as, "if applicable"
+            // (`Instance$IamInstanceProfile`): read off the association store rather than
+            // copied onto the instance record, so an instance report and an association
+            // report cannot disagree about one instance's profile.
+            iam_instance_profile: self.iam_instance_profile_of_instance(&instance.instance_id),
             ..Default::default()
         }
     }
@@ -7637,6 +7679,15 @@ impl ComAmazonawsEc2Amazonec2State {
                     .map(|_| INSTANCE_LIFECYCLE_SPOT.to_string()),
             ),
             "spot-instance-request-id" => single(instance.spot_instance_request_id.clone()),
+            // "iam-instance-profile.arn - The instance profile associated with the
+            // instance. Specified as an ARN" (`DescribeInstancesRequest$Filters`): read off
+            // the same projection the instance report carries, so a filter and a report
+            // cannot disagree about one instance's profile. An instance running as none
+            // holds no value for it, so a filter naming one selects only instances that do.
+            "iam-instance-profile.arn" => single(
+                self.iam_instance_profile_of_instance(&instance.instance_id)
+                    .and_then(|profile| profile.arn),
+            ),
             "key-name" => single(instance.key_name.clone()),
             "launch-index" => single(Some(instance.ami_launch_index.to_string())),
             "monitoring-state" => single(Some(instance.monitoring_state.clone())),
@@ -30501,6 +30552,11 @@ pub const IAM_ROOT_RESOURCE: &str = "root";
 /// The resource prefix of an IAM ROLE's ARN (`arn:aws:iam::<account>:role/<name>`).
 pub const IAM_ROLE_RESOURCE_PREFIX: &str = "role/";
 
+/// The resource prefix of an IAM INSTANCE PROFILE's ARN
+/// (`arn:aws:iam::<account>:instance-profile/<name>`) — the kind of IAM entity an instance
+/// runs as.
+pub const IAM_INSTANCE_PROFILE_RESOURCE_PREFIX: &str = "instance-profile/";
+
 /// The resource prefixes of the two kinds of IAM principal that are not the root user,
 /// as an IAM ARN spells them (`arn:aws:iam::<account>:user/<name>`,
 /// `…:role/<name>`).
@@ -30622,6 +30678,19 @@ pub fn iam_principal_arn_is_well_formed(arn: &str) -> bool {
 /// is not one of these either.
 pub fn iam_role_arn_is_well_formed(arn: &str) -> bool {
     iam_principal_arn_names(arn, &[IAM_ROLE_RESOURCE_PREFIX], false, false)
+}
+
+/// Is `arn` the ARN of an IAM INSTANCE PROFILE —
+/// `arn:<partition>:iam::<account>:instance-profile/<path><name>`?
+///
+/// The shape of a member that names the instance profile an INSTANCE runs as
+/// (`IamInstanceProfileSpecification$Arn` — "the Amazon Resource Name (ARN) of the instance
+/// profile"). Read through the same one reading as the user and role ARNs above, so the
+/// partition, the empty Region segment IAM's global ARNs carry and the bound on the
+/// path-and-name part are decided in one place. The ACCOUNT is not held to this emulator's
+/// own, for the reason [`iam_role_arn_is_well_formed`] gives.
+pub fn iam_instance_profile_arn_is_well_formed(arn: &str) -> bool {
+    iam_principal_arn_names(arn, &[IAM_INSTANCE_PROFILE_RESOURCE_PREFIX], false, false)
 }
 
 impl ComAmazonawsEc2Amazonec2State {

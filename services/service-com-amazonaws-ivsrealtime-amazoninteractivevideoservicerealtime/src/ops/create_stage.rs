@@ -239,19 +239,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A fresh id per creation, re-minted on the (vanishingly unlikely) chance the
-        // digest already names a live stage, so one ARN never denotes two stages.
-        let sequence = store.next_sequence();
-        let mut arn = crate::state::stage_arn(
-            &region,
-            &crate::state::mint_id(sequence, crate::state::STAGE_ID_LEN),
+        // digest already names a live stage, so one ARN never denotes two stages —
+        // minted through the one place `crate::state` applies that rule.
+        let crate::state::MintedResource { sequence, arn, .. } = crate::state::mint_unique_arn(
+            &mut store,
+            crate::state::STAGE_ID_LEN,
+            |stage_id| crate::state::stage_arn(&region, stage_id),
+            |store, candidate| store.stages.contains_key(candidate),
         );
-        while store.stages.contains_key(&arn) {
-            let retry = store.next_sequence();
-            arn = crate::state::stage_arn(
-                &region,
-                &crate::state::mint_id(retry, crate::state::STAGE_ID_LEN),
-            );
-        }
 
         let mut records = Vec::with_capacity(configurations.len());
         for configuration in configurations {

@@ -341,8 +341,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     state: crate::state::PENDING,
                     due: Some(due),
                     // No GUI session access exists yet: only
-                    // `CreateGUISessionAccessDetails` creates one, and nothing
-                    // has called it for an instance this call just created.
+                    // `StartGUISession` and `CreateGUISessionAccessDetails`
+                    // create one, and nothing has called either for an instance
+                    // this call just created.
                     gui_session: None,
                     // The metadata service of a new instance is configured the
                     // way Lightsail creates one;

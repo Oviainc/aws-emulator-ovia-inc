@@ -147,7 +147,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(TagResourceErrorModeled::InternalServerException(
                 InternalServerException {
@@ -228,6 +227,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags.insert(key, value);
         }
 
+        // This call CHANGED this service's state — the stored tag map of the resource the
+        // ARN names — so it leaves the audit record every mutating handler of this crate
+        // leaves: the operation, the resource it changed and the access-key id the
+        // REQUEST presented, and neither the keys nor the values it carried (see
+        // [`crate::state::record_state_change`]).
+        crate::state::record_state_change(Self::NAME, &input.resource_arn, ctx.parts());
         Ok(TagResourceOutput {})
     }
 }

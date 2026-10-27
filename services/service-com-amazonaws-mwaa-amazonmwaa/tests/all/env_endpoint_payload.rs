@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The BODY SHAPE every refusal of this service arrives in, end to end over HTTP through
-//! the router this service mounts in production.
+//! The BODY SHAPE the refusals of this service that its own modelled layers answer arrive
+//! in, end to end over HTTP through the router this service mounts in production.
 //!
-//! The rule: a refusal is serialized in the protocol's own error envelope — a JSON OBJECT
-//! root carrying the modelled error code and the `message` — on every operation, whichever
-//! endpoint the model hosts it on (`@endpoint` host prefix `api.` or `env.`) and whichever
-//! status and code the condition answers with. That envelope is what a restJson1 client's
-//! error parser reads a code and a message out of: it looks both up as MEMBERS of the
-//! parsed body, so a root that is not an object yields no error object at all and the
-//! caller is handed a client-library failure instead of the service's refusal. WHICH
-//! sentence the body carries is a separate rule with its own suite
-//! (`tests/all/env_endpoint_not_found_wording.rs`); this suite pins the shape it travels
-//! in.
+//! The rule: a refusal the service's own code answers is serialized in the protocol's error
+//! envelope — a JSON OBJECT root carrying the modelled error code and the `message` — on
+//! every operation, whichever endpoint the model hosts it on (`@endpoint` host prefix `api.`
+//! or `env.`) and whichever status and code the condition answers with. That envelope is
+//! what a restJson1 client's error parser reads a code and a message out of: it looks both
+//! up as MEMBERS of the parsed body. The ONE refusal outside this rule is the environment
+//! data endpoint's own: a name its front door cannot resolve is refused ahead of the layer
+//! that models the errors, with the sentence as the whole body, which has its own suite
+//! (`tests/all/env_endpoint_front_door.rs`). WHICH sentence a body carries is a separate
+//! rule with a third (`tests/all/env_endpoint_not_found_wording.rs`).
 //!
 //! Each table row varies what the rule generalises over: the operation and the endpoint
 //! hosting it, the status and the error code (404 `ResourceNotFoundException`, 400
@@ -41,14 +41,6 @@ const ACCOUNT: &str = "000000000000";
 /// The region the `AUTHORIZATION` scope signs for.
 const REGION: &str = "us-east-1";
 
-/// The response header restJson1 resolves an error shape from.
-const ERROR_TYPE_HEADER: &str = "x-amzn-errortype";
-
-/// The sentence the environment data endpoint's front door words a name it cannot resolve
-/// with, spelled out here rather than read from the service so this suite pins the text the
-/// endpoint really answers with and not whatever the implementation currently holds.
-const ENDPOINT_NOT_FOUND_SENTENCE: &str = "Environment not found";
-
 /// The body members a restJson1 error parser looks the error code up in, in that order.
 const CODE_MEMBERS: [&str; 3] = ["__type", "code", "Code"];
 
@@ -58,7 +50,6 @@ const MESSAGE_MEMBERS: [&str; 2] = ["message", "Message"];
 /// One HTTP answer, reduced to what these tests assert on.
 struct Answer {
     status: u16,
-    error_type_header: Option<String>,
     body: Vec<u8>,
 }
 
@@ -140,14 +131,8 @@ impl Harness {
             .body(bytes::Bytes::from(payload))
             .expect("a well-formed request");
         let response = self.router.dispatch(request).await;
-        let error_type_header = response
-            .headers()
-            .get(ERROR_TYPE_HEADER)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
         Answer {
             status: response.status().as_u16(),
-            error_type_header,
             body: response.into_body().to_vec(),
         }
     }
@@ -177,110 +162,6 @@ impl Harness {
     }
 }
 
-/// One row of the table: a label, an environment name no create ever stored, and the
-/// `InvokeRestApi` body the call carries.
-type Row = (&'static str, String, Value);
-
-/// The rows the rule is asserted over for the proxied operation. The names differ along what
-/// `EnvironmentName`'s own `@length(1, 80)` and `^[a-zA-Z][0-9a-zA-Z-_]*$` allow (the
-/// one-character minimum, mixed case, digits, both separators, the 80-character maximum);
-/// the bodies differ along `RestApiMethod`'s own value list (GET | PUT | POST | PATCH |
-/// DELETE), the `RestApiPath` `@length(1, 64)` bounds (one character, and 64), and whether
-/// `Body` / `QueryParameters` are carried at all.
-///
-/// Source for both value lists: this service's Smithy model —
-/// `smithy_query(query="shape",shape="RestApiMethod,RestApiPath",model_path="services/service-com-amazonaws-mwaa-amazonmwaa/smithy-model/com-amazonaws-mwaa-amazonmwaa.json")`.
-fn unresolvable_calls() -> Vec<Row> {
-    vec![
-        (
-            "the shortest name, a bare GET",
-            "A".to_string(),
-            json!({"Path": "/dags", "Method": "GET"}),
-        ),
-        (
-            "a POST carrying a body",
-            "NoSuchEnvironment".to_string(),
-            json!({"Path": "/dags/x/dagRuns", "Method": "POST", "Body": {"conf": {}}}),
-        ),
-        (
-            "a PATCH carrying query parameters",
-            "missing-env_7".to_string(),
-            json!({
-                "Path": "/dags/x",
-                "Method": "PATCH",
-                "QueryParameters": {"update_mask": "is_paused"},
-            }),
-        ),
-        (
-            "a DELETE at the one-character path minimum",
-            "MixedCase-Env_42".to_string(),
-            json!({"Path": "/", "Method": "DELETE"}),
-        ),
-        (
-            "a PUT at the 64-character path maximum",
-            format!("L{}", "o".repeat(79)),
-            json!({"Path": format!("/{}", "p".repeat(63)), "Method": "PUT"}),
-        ),
-    ]
-}
-
-#[tokio::test]
-async fn the_proxied_operation_refuses_an_unknown_environment_with_an_error_object_an_sdk_can_read()
-{
-    let harness = Harness::new();
-    // One environment exists, so a refusal below is the lookup failing and not an empty
-    // store answering.
-    assert_eq!(
-        harness.create("TheOnlyEnvironment").await.status,
-        200,
-        "the fixture create must succeed"
-    );
-
-    for (case, name, body) in unresolvable_calls() {
-        let answer = harness.invoke(&name, body).await;
-        assert_eq!(
-            answer.status, 404,
-            "case {case:?}: expected HTTP 404 for a name that resolves to nothing, got {} {}",
-            answer.status,
-            answer.text()
-        );
-        assert_eq!(
-            answer.error_type_header.as_deref(),
-            Some("ResourceNotFoundException"),
-            "case {case:?}: restJson1 resolves the shape from {ERROR_TYPE_HEADER}, got {:?}",
-            answer.error_type_header
-        );
-        let document = answer.json();
-        assert!(
-            document.is_object(),
-            "case {case:?}: the body's root must be a JSON object an error parser can read \
-             members out of, got {document:?}"
-        );
-        let (code, message) = answer.error_from_body().unwrap_or_else(|| {
-            panic!(
-                "case {case:?}: an SDK error parser read nothing out of {}",
-                answer.text()
-            )
-        });
-        assert_eq!(
-            code, "ResourceNotFoundException",
-            "case {case:?}: expected the body to carry the modelled code, got {code:?} in {}",
-            answer.text()
-        );
-        assert_eq!(
-            message, ENDPOINT_NOT_FOUND_SENTENCE,
-            "case {case:?}: expected the endpoint's own sentence, got {message:?}"
-        );
-        // The endpoint's refusal is worded by the front door, not by the control plane's
-        // request-derived builder, so it does not name the environment asked for.
-        assert!(
-            !answer.text().contains(name.as_str()),
-            "case {case:?}: the refusal must not echo the environment name, got {}",
-            answer.text()
-        );
-    }
-}
-
 /// What the `message` of a refusal must be.
 enum Sentence {
     /// The exact sentence the condition is worded with.
@@ -306,9 +187,12 @@ type Refusal = (
     Sentence,
 );
 
-/// A refusal of every other operation this service answers one for, spanning both endpoints
-/// and every status and wire code it refuses with — so the envelope is pinned as the rule it
-/// is rather than as one operation's quirk.
+/// A refusal of every operation this service answers one for through a layer that models
+/// it, spanning both endpoints and every status and wire code it refuses with — so the
+/// envelope is pinned as the rule it is rather than as one operation's quirk. The
+/// `env.`-hosted token operations appear through their SERVED path only: a name their front
+/// door cannot resolve is refused ahead of this envelope, by
+/// `tests/all/env_endpoint_front_door.rs`'s rule.
 fn other_refusals(unknown: &str, stored: &str) -> Vec<Refusal> {
     // `ResourceArn` is bound to a URI label, so its ARN's separators travel percent-encoded.
     let unresolvable_arn = format!("arn:aws:airflow:{REGION}:{ACCOUNT}:environment/NeverCreated")
@@ -341,24 +225,6 @@ fn other_refusals(unknown: &str, stored: &str) -> Vec<Refusal> {
             404,
             "ResourceNotFoundException",
             Sentence::Exactly(state::environment_not_found_message(unknown)),
-        ),
-        (
-            "CreateCliToken on an unknown name",
-            "POST",
-            format!("/clitoken/{unknown}"),
-            None,
-            404,
-            "ResourceNotFoundException",
-            Sentence::Exactly(ENDPOINT_NOT_FOUND_SENTENCE.to_string()),
-        ),
-        (
-            "CreateWebLoginToken on an unknown name",
-            "POST",
-            format!("/webtoken/{unknown}"),
-            None,
-            404,
-            "ResourceNotFoundException",
-            Sentence::Exactly(ENDPOINT_NOT_FOUND_SENTENCE.to_string()),
         ),
         (
             "ListTagsForResource on an ARN that resolves to nothing",
@@ -419,7 +285,8 @@ fn other_refusals(unknown: &str, stored: &str) -> Vec<Refusal> {
 }
 
 #[tokio::test]
-async fn every_other_refusal_of_this_service_carries_its_code_and_message_in_the_same_envelope() {
+async fn every_modelled_refusal_of_this_service_carries_its_code_and_message_in_the_same_envelope()
+{
     let harness = Harness::new();
     let stored = "TheOnlyEnvironment";
     assert_eq!(
