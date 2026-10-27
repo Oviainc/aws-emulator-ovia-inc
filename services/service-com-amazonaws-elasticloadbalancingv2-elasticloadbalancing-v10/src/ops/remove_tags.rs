@@ -247,7 +247,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // wondering which of them lost its tags.
         for (arn, kind) in &resolved {
             if guard.tags_of(arn.as_str()).is_none() {
-                return Err(not_found(*kind, arn));
+                return Err(not_found(*kind));
             }
         }
 
@@ -274,9 +274,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The modelled refusal for an ARN this store holds no resource for: the `NotFound`
-/// error of the resource kind the ARN names, worded as every tag operation words it.
-fn not_found(kind: TaggableResource, arn: &str) -> RemoveTagsError {
-    let message = Some(crate::state::taggable_not_found_message(kind, arn));
+/// error of the resource kind the ARN names, worded as every tag operation words it —
+/// the collection-level wording of that kind, because this call selects its resources
+/// through a LIST and so names none of them back.
+fn not_found(kind: TaggableResource) -> RemoveTagsError {
+    let message = Some(crate::state::taggable_not_found_message(kind));
     match kind {
         TaggableResource::LoadBalancer => RemoveTagsErrorModeled::LoadBalancerNotFoundException(
             LoadBalancerNotFoundException { message },

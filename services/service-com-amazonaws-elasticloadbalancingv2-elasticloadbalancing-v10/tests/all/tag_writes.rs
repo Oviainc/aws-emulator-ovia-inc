@@ -30,6 +30,7 @@ use crate::provisioning_loop::{
     TrustStoreSeed, REGION,
 };
 use crate::resource_tags::{absent_arn, describe_tags, reported, sorted, tag_fields, tag_sets};
+use crate::target_group_attributes_and_modification::unescaped;
 use service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10::state::TAGS_PER_RESOURCE;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -359,10 +360,17 @@ async fn a_write_to_a_resource_the_store_does_not_hold_is_refused_with_the_error
             refused.status,
             refused.body
         );
-        let said = message(&refused);
+        let said = unescaped(&message(&refused));
+        // A write selects its resources through a LIST, so the refusal is about the whole
+        // selection: the collection-level wording of the kind, naming no ARN.
+        assert_eq!(
+            said,
+            crate::tag_not_found_wording::collection_message(expected_code),
+            "case {case:?}: expected the service's wording, got {said:?}"
+        );
         assert!(
-            !said.is_empty() && said.contains(arn.as_str()),
-            "case {case:?}: expected a message naming {arn}, got {said:?}"
+            !said.contains(arn.as_str()),
+            "case {case:?}: expected a message naming no ARN, got {said:?}"
         );
 
         // A live resource named beside the absent one is not tagged either: the write is

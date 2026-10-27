@@ -252,7 +252,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // which of them was tagged.
         for (arn, kind) in &resolved {
             let Some(stored) = guard.tags_of(arn.as_str()) else {
-                return Err(not_found(*kind, arn));
+                return Err(not_found(*kind));
             };
             let after = merged_tag_count(stored, &additions);
             if after > crate::state::TAGS_PER_RESOURCE {
@@ -303,9 +303,11 @@ fn too_many_tags(message: String) -> AddTagsError {
 }
 
 /// The modelled refusal for an ARN this store holds no resource for: the `NotFound`
-/// error of the resource kind the ARN names, worded as every tag operation words it.
-fn not_found(kind: TaggableResource, arn: &str) -> AddTagsError {
-    let message = Some(crate::state::taggable_not_found_message(kind, arn));
+/// error of the resource kind the ARN names, worded as every tag operation words it —
+/// the collection-level wording of that kind, because this call selects its resources
+/// through a LIST and so names none of them back.
+fn not_found(kind: TaggableResource) -> AddTagsError {
+    let message = Some(crate::state::taggable_not_found_message(kind));
     match kind {
         TaggableResource::LoadBalancer => AddTagsErrorModeled::LoadBalancerNotFoundException(
             LoadBalancerNotFoundException { message },
