@@ -195,7 +195,31 @@ impl ResourceKind {
     /// value back after the kind that was expected, and says nothing about the ARN's
     /// internal form. It is composed from the request, so a caller sees exactly what it
     /// sent.
+    ///
+    /// `arn` is the value AS THE REQUEST SENT IT, so it is rendered through the module's
+    /// one echo ceiling (`echoed`). THIS sentence needs it because two layers word it: a
+    /// value refused at the boundary arrives already through the same ceiling (see
+    /// [`ResourceKind::invalid_arn_message_pre_elided`]), so putting the value a handler
+    /// read through it too is what makes one value reported one way whether the boundary
+    /// walk or a handler refused the request. (The 404 and 409 sentences below are worded
+    /// by the handler path alone, from a value that reached it only after
+    /// [`ResourceKind::names`] accepted it, and quote the ARN as sent.)
     pub fn invalid_arn_message(&self, arn: &str) -> String {
+        self.invalid_arn_message_pre_elided(&echoed(arn))
+    }
+
+    /// The same sentence as [`ResourceKind::invalid_arn_message`], worded from a value
+    /// that is ALREADY through that echo ceiling.
+    ///
+    /// For a caller holding a value something else elided — a boundary
+    /// [`constraints::Violation`], whose `value` the validation layer stores already
+    /// elided at the same ceiling (`crate::service`). Such a value must not be put
+    /// through the ceiling a second time: re-eliding would quote the elided text's own
+    /// byte count back and make the two paths disagree about the value a caller sent.
+    /// Everything holding the value as the request sent it words the sentence with
+    /// [`ResourceKind::invalid_arn_message`] instead. Not part of this crate's public
+    /// surface: a caller outside it cannot see the precondition it would have to uphold.
+    pub(crate) fn invalid_arn_message_pre_elided(&self, arn: &str) -> String {
         format!("Invalid ARN for {}: {}", self.resource_type, arn)
     }
 
