@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelExportTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelExportTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: cancels one stored export task that is still PENDING or RUNNING, and
+//! refuses a task that has already settled or an id the account holds no task under,
+//! leaving the stored task untouched in either refusal. This is the ONLY file to touch for
+//! this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`CancelExportTask::handle`] with real behaviour and
@@ -156,18 +157,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelExportTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelExportTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelExportTask"))
+        // `ctx` carries only request metadata; the task to cancel is named by `taskId` and
+        // by nothing about the request.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CancelExportTaskError::from(
+                CancelExportTaskErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let mut store = state.lock();
+
+        // An export runs asynchronously, so the status this cancel is judged against is the
+        // one the CLOCK had already made due at this instant: it is materialised before the
+        // decision rather than moved on because a cancel happened to look.
+        let now = crate::state::now_ms();
+        store.materialize_due_export_transitions(now);
+
+        // "The ID of the export task": an id this account holds no export task under names
+        // nothing to cancel, which is the missing resource this operation models.
+        let Some(task) = store.export_tasks.get_mut(&input.task_id) else {
+            return Err(CancelExportTaskErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message("export task")),
+                },
+            )
+            .into());
+        };
+
+        // "The task must be in the PENDING or RUNNING state." A task in any other status has
+        // no execution left to cancel, so the call is not valid on that resource — and the
+        // status the task settled at is left exactly as it is, so a report after the refusal
+        // answers what it did before.
+        if !task.is_active() {
+            return Err(CancelExportTaskErrorModeled::InvalidOperationException(
+                InvalidOperationException {
+                    message: Some(crate::state::EXPORT_TASK_FINISHED_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        task.cancel(now);
+
+        // "Cancels the specified export task" and answers nothing but the acceptance: what
+        // the cancel did to the task is read back through `DescribeExportTasks`.
+        Ok(CancelExportTaskOutput)
     }
 }

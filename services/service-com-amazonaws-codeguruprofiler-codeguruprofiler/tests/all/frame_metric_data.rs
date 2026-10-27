@@ -67,6 +67,14 @@ fn iso(at: i64) -> String {
         .unwrap_or_else(|error| panic!("unformattable instant {at}: {error}"))
 }
 
+/// An instant as this service renders one it NAMES IN A MESSAGE: the same ISO 8601 form,
+/// carrying the fixed, zero-padded 3-digit millisecond field the model's own doc spells
+/// that form with. The one shared [`crate::interval_validation::canonical`] states that
+/// rendering for every suite in this target.
+fn iso_in_message(at: i64) -> String {
+    crate::interval_validation::canonical(&iso(at))
+}
+
 /// The emulator's own clock, as the test reads it: a case about a window that ends "now"
 /// has to say which instant it expected.
 fn now() -> i64 {
@@ -198,8 +206,9 @@ fn datum_count(answer: &Answer) -> usize {
 }
 
 /// One requested frame metric, with the only aggregation the model's `MetricType`
-/// declares (`AggregatedRelativeTotalTime`).
-fn frame_metric(frame_name: &str, thread_states: &[&str]) -> serde_json::Value {
+/// declares (`AggregatedRelativeTotalTime`). `pub(crate)` so a sibling suite about a
+/// refusal of this operation sends the same body rather than forking it.
+pub(crate) fn frame_metric(frame_name: &str, thread_states: &[&str]) -> serde_json::Value {
     serde_json::json!({
         "frameName": frame_name,
         "type": "AggregatedRelativeTotalTime",
@@ -221,7 +230,8 @@ async fn create_group(harness: &Harness, name: &str) -> Answer {
 
 /// `BatchGetFrameMetricData` with `frameMetrics` in the body, the way an SDK sends it:
 /// the period and the resolution bind to the query string, the group to the path.
-async fn frame_metric_data(
+/// `pub(crate)` so a sibling suite drives this operation through the one sender.
+pub(crate) async fn frame_metric_data(
     harness: &Harness,
     name: &str,
     query: &str,
@@ -1086,8 +1096,8 @@ fn refusal_cases(group: &'static str) -> Vec<RefusalCase> {
             code: "ValidationException",
             message: format!(
                 "Interval start time ({}) must be before end time ({})",
-                iso(DAY_START + HOUR),
-                iso(DAY_START)
+                iso_in_message(DAY_START + HOUR),
+                iso_in_message(DAY_START)
             ),
         },
         RefusalCase {
@@ -1099,8 +1109,8 @@ fn refusal_cases(group: &'static str) -> Vec<RefusalCase> {
             code: "ValidationException",
             message: format!(
                 "Interval start time ({}) must be before end time ({})",
-                iso(DAY_START),
-                iso(DAY_START)
+                iso_in_message(DAY_START),
+                iso_in_message(DAY_START)
             ),
         },
         RefusalCase {
@@ -1112,8 +1122,8 @@ fn refusal_cases(group: &'static str) -> Vec<RefusalCase> {
             code: "ValidationException",
             message: format!(
                 "Interval start time ({}) must be before end time ({})",
-                iso(DAY_START),
-                iso(DAY_START)
+                iso_in_message(DAY_START),
+                iso_in_message(DAY_START)
             ),
         },
         RefusalCase {
@@ -1130,8 +1140,8 @@ fn refusal_cases(group: &'static str) -> Vec<RefusalCase> {
             message: format!(
                 "the time period for the returned time series values must be at most PT24H \
                  long, got {} to {}",
-                iso(DAY_START),
-                iso(two_days_on)
+                iso_in_message(DAY_START),
+                iso_in_message(two_days_on)
             ),
         },
         RefusalCase {
@@ -1144,8 +1154,8 @@ fn refusal_cases(group: &'static str) -> Vec<RefusalCase> {
             message: format!(
                 "the time period for the returned time series values must be at most PT24H \
                  long, got {} to {}",
-                iso(DAY_START),
-                iso(two_days_on)
+                iso_in_message(DAY_START),
+                iso_in_message(two_days_on)
             ),
         },
         RefusalCase {
@@ -1158,8 +1168,8 @@ fn refusal_cases(group: &'static str) -> Vec<RefusalCase> {
             message: format!(
                 "the time period for the returned time series values must be at most PT24H \
                  long, got {} to {}",
-                iso(DAY_START),
-                iso(DAY_START + DAY + 1)
+                iso_in_message(DAY_START),
+                iso_in_message(DAY_START + DAY + 1)
             ),
         },
         RefusalCase {

@@ -81,7 +81,7 @@
 //! FORM TYPES — the metadata schemas `PutFormType` registers — sit in such a per-account
 //! namespace too, keyed by form type name, because a put names its form type by `Name`
 //! alone and no `CatalogId`. They are ADDRESSED by the identifier a client holds for one —
-//! the opaque `FormTypeId` the first put under a name mints, or that name itself — which is
+//! the `FormTypeId` a put reports, which IS that name ([`FormTypeEntry::id`]) — which is
 //! the shape every operation that reads, deletes or attaches to one takes.
 //!
 //! ASSET TYPES — the asset structures `PutAssetType` registers, each naming the forms an
@@ -779,11 +779,10 @@ pub struct ComAmazonawsGlueAwsglueState {
     /// exactly as sent — the model documents no case fold for `FormTypeName`, whose
     /// pattern (`^[A-Z]\w*$`) already fixes the first character's case.
     ///
-    /// A form type is ADDRESSED by an `Identifier` rather than by this key: `GetFormType`
-    /// and `DeleteFormType` take one targeting `FormTypeId`, the same shape
-    /// `PutFormType`'s `Id` carries, and a client holds either that minted id or the name
-    /// it registered the form type under. [`Self::form_type_by_reference`] is that
-    /// resolution.
+    /// A form type is ADDRESSED by an `Identifier` targeting `FormTypeId`, the same shape
+    /// `PutFormType`'s `Id` carries, and that identifier is the form type's NAME
+    /// ([`FormTypeEntry::id`]) — so this key is the address.
+    /// [`Self::form_type_by_reference`] is that resolution.
     pub form_types: BTreeMap<String, FormTypeEntry>,
     /// Every asset type this emulator holds, keyed by `AssetTypeName`.
     ///
@@ -1710,32 +1709,28 @@ impl ComAmazonawsGlueAwsglueState {
         self.form_types.len() < MAX_FORM_TYPES
     }
 
-    /// The stored form type whose `Id` is `id`, or `None` when this store holds no form
-    /// type under that id.
+    /// The stored form type an `Identifier` targeting `FormTypeId` names — a
+    /// `GetFormType$Identifier`, a `DeleteFormType$Identifier` or an
+    /// `AssetTypeFormReference$FormTypeIdentifier` — or `None` when this store holds no
+    /// such form type.
     ///
-    /// Every operation that ADDRESSES a form type does so by a `FormTypeId`
-    /// (`GetFormType$Identifier`, `DeleteFormType$Identifier`, `PutAttachment$FormTypeId`
-    /// all target that shape), while the records are keyed by the name a put addresses
-    /// them by — so the id resolution is a walk, bounded by [`MAX_FORM_TYPES`]. One copy,
-    /// shared, so no two operations can disagree about which record an id names.
-    pub fn form_type_by_id(&self, id: &str) -> Option<&FormTypeEntry> {
-        self.form_types
-            .values()
-            .find(|form_type| form_type.id == id)
+    /// A form type's identifier is its name ([`FormTypeEntry::id`]), so the resolution is
+    /// this map's own lookup, exact as sent. One copy, shared, so no two operations can
+    /// disagree about which record an identifier names.
+    pub fn form_type_by_reference(&self, identifier: &str) -> Option<&FormTypeEntry> {
+        self.form_types.get(identifier)
     }
 
-    /// The stored form type an `AssetTypeFormReference$FormTypeIdentifier` names, or
-    /// `None` when this store holds no such form type.
+    /// Remove the form type an `Identifier` targeting `FormTypeId` names, reporting the
+    /// record that was removed, or `None` when this store holds no such form type.
     ///
-    /// A reference carries a form type's identifier as the CLIENT holds it, which is
-    /// either the `FormTypeId` the catalog minted for it or the `FormTypeName` it was
-    /// registered under: a client that put a form type by name addresses it by that name,
-    /// and the catalog serves that reference, so both resolve to the one record. The
-    /// minted id is tried first, so an identifier that could be read either way names the
-    /// record it was minted for.
-    pub fn form_type_by_reference(&self, identifier: &str) -> Option<&FormTypeEntry> {
-        self.form_type_by_id(identifier)
-            .or_else(|| self.form_types.get(identifier))
+    /// The identifier resolves exactly as a read resolves one, i.e. as this namespace's
+    /// own key ([`Self::form_type_by_reference`]), so a delete reaches the record a get of
+    /// the same identifier would report. Only the form type itself is removed: an asset
+    /// type's form references are written by that asset type's own puts and are left as
+    /// they stand.
+    pub fn remove_form_type_by_reference(&mut self, identifier: &str) -> Option<FormTypeEntry> {
+        self.form_types.remove(identifier)
     }
 
     /// Whether the store can hold another asset type, i.e. is below [`MAX_ASSET_TYPES`].
@@ -4263,24 +4258,24 @@ pub fn ml_transform_capacity(
     }
 }
 
-/// How many form type ids this process has minted. A nonce source for
-/// [`new_form_type_id`], exactly as [`MINTED_DATABASE_IDS`] is for a database id.
-static MINTED_FORM_TYPE_IDS: AtomicU64 = AtomicU64::new(0);
-
-/// A fresh `FormTypeId`: the opaque identifier the Data Catalog assigns a form type when
-/// `PutFormType` first stores it under a name.
+/// The message the catalog's metadata form type surface refuses an identifier it holds no
+/// form type under with: the value of that refusal's `EntityNotFoundException$Message`.
 ///
-/// 32 lowercase hexadecimal characters, i.e. 128 bits, which is the shape a
-/// catalog-assigned Data Catalog id has and is inside `FormTypeId`'s `length 1..256`. The
-/// bits come from [`mint_hex_id`], as a database id's do, so two puts landing
-/// in the same nanosecond cannot be given the same id. It is minted ONCE, when the name
-/// is first stored, and kept on the [`FormTypeEntry`] through every later update, so
-/// every read of that form type reports the same id and two form types never share one.
+/// This surface's refusal text is itself a JSON document carrying the sentence under a
+/// `Message` key, so that text — braces and all — is what the modelled member carries, and
+/// a client reading `Message` reads the document rather than a bare sentence. It is NOT an
+/// envelope this emulator adds around the member: the member's own value is this text, as
+/// the surface words it. `serde_json` renders it, so an identifier carrying a quote or a
+/// backslash still yields a well-formed document.
 ///
-/// This names a RESOURCE, not a credential: a credential would come from the credential
-/// store, never from here.
-pub fn new_form_type_id() -> String {
-    mint_hex_id(&MINTED_FORM_TYPE_IDS, CATALOG_ID_WORDS)
+/// `identifier` is the text's one variable part and is taken from the request.
+///
+/// One copy, shared by every operation that resolves a form type identifier
+/// ([`ComAmazonawsGlueAwsglueState::form_type_by_reference`]), so two of them cannot
+/// disagree about how the one miss is worded.
+pub fn form_type_not_found_message(identifier: &str) -> String {
+    let sentence = format!("Metadata form type {identifier} not found.");
+    serde_json::json!({ "Message": sentence }).to_string()
 }
 
 /// A stored form type: the schema for structured metadata `PutFormType` registers in the
@@ -4288,13 +4283,19 @@ pub fn new_form_type_id() -> String {
 ///
 /// Every member of the modelled form type is held here — its id, its name and its schema
 /// — and nothing else: the model gives a form type no status, owner or timestamp. The
-/// name and the schema come from the request; the id is the one server-set member, minted
-/// by [`new_form_type_id`] when the name is first stored.
+/// name and the schema come from the request, and the id is derived from the name (see
+/// [`Self::id`]).
 #[derive(Debug, Clone)]
 pub struct FormTypeEntry {
-    /// `FormTypeId`, minted by [`new_form_type_id`] at the first put under this name and
-    /// unchanged by every later one, so a caller that kept the id from an earlier put can
-    /// still address the form type after it has been updated.
+    /// `FormTypeId`: the identifier a client addresses this form type by, which is the
+    /// form type's own NAME.
+    ///
+    /// Not an opaque per-record id: the catalog can word a refusal for a form type it no
+    /// longer holds with that form type's name while all it was given is the identifier,
+    /// so the identifier it hands out carries the name. `FormTypeName`'s `length 1..128`
+    /// sits inside `FormTypeId`'s `length 1..256`, so every name is a usable identifier,
+    /// and because the name is also the namespace's key, two form types never share one
+    /// identifier and an update under a name keeps the identifier an earlier put reported.
     pub id: String,
     /// The form type's name, which is also its key in
     /// [`ComAmazonawsGlueAwsglueState::form_types`].
@@ -4309,7 +4310,7 @@ impl FormTypeEntry {
     /// name and schema, under a freshly minted id.
     pub fn new(name: String, schema: String) -> Self {
         Self {
-            id: new_form_type_id(),
+            id: name.clone(),
             name,
             schema,
         }
