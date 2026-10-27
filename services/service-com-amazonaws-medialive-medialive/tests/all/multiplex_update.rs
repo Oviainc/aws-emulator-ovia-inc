@@ -466,6 +466,9 @@ async fn a_packet_identifiers_mapping_sets_the_pids_of_the_programs_it_names() {
     for (case, mapping) in rows {
         let router = medialive();
         let (id, _) = multiplex_with_full_settings(&router, case, "original").await;
+        // The identifiers the service allocated each program when it was
+        // created, which is what a program the mapping does not name keeps.
+        let mut allocated: Vec<(&str, Value)> = Vec::new();
         for (program_name, program_number) in [("news", 1), ("sports", 2)] {
             let (status, created) = create_program(
                 &router,
@@ -479,14 +482,11 @@ async fn a_packet_identifiers_mapping_sets_the_pids_of_the_programs_it_names() {
                 status, 201,
                 "case {case:?}/{program_name}: CreateMultiplexProgram: expected 201, got {status}: {created}"
             );
-            // A created program carries no packet identifiers: the real
-            // service's multiplexer allocates them, and this emulator does not
-            // run it, so only a caller's mapping can set them.
-            assert_eq!(
-                created["packetIdentifiersMap"],
-                Value::Null,
-                "case {case:?}/{program_name}: expected no packet identifiers before the update, got {created}"
+            assert!(
+                created["packetIdentifiersMap"].is_object(),
+                "case {case:?}/{program_name}: expected the identifiers allocated at creation, got {created}"
             );
+            allocated.push((program_name, created["packetIdentifiersMap"].clone()));
         }
 
         let mut body = update_body(Some("remapped"), None);
@@ -513,11 +513,15 @@ async fn a_packet_identifiers_mapping_sets_the_pids_of_the_programs_it_names() {
                 "case {case:?}/{program_name}: DescribeMultiplexProgram: expected 200, got {status}: {described}"
             );
             // A program the mapping named carries exactly the identifiers it
-            // carried; one it did not name carries none, as it did before.
-            let expected = mapping
-                .get(program_name)
-                .cloned()
-                .unwrap_or(Value::Null);
+            // carried; one it did not name keeps the ones allocated to it when
+            // it was created, as it did before.
+            let expected = mapping.get(program_name).cloned().unwrap_or_else(|| {
+                allocated
+                    .iter()
+                    .find(|(name, _)| *name == program_name)
+                    .map(|(_, map)| map.clone())
+                    .unwrap_or(Value::Null)
+            });
             assert_eq!(
                 described["packetIdentifiersMap"], expected,
                 "case {case:?}/{program_name}: expected the packet identifiers the mapping supplied, got {:?}",
@@ -605,8 +609,9 @@ async fn a_mapping_naming_a_program_the_multiplex_does_not_hold_is_refused() {
             "case {case:?}: expected the refusal to name the program asked for, got {refusal}"
         );
 
-        // Nothing was written: the program that does exist still carries no
-        // packet identifiers, and the multiplex still carries its own name.
+        // Nothing was written: the program that does exist still carries the
+        // identifiers allocated to it at creation, and the multiplex still
+        // carries its own name.
         let (status, described) = describe_program(&router, &id, "news").await;
         assert_eq!(
             status, 200,
@@ -614,8 +619,8 @@ async fn a_mapping_naming_a_program_the_multiplex_does_not_hold_is_refused() {
         );
         assert_eq!(
             described["packetIdentifiersMap"],
-            Value::Null,
-            "case {case:?}: expected the refused update to set no packet identifiers, got {described}"
+            created["packetIdentifiersMap"],
+            "case {case:?}: expected the refused update to leave the allocated packet identifiers, got {described}"
         );
         let (_, multiplex) = describe_multiplex(&router, &id).await;
         assert_eq!(

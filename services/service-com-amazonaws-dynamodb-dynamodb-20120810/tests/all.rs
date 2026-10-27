@@ -88,6 +88,9 @@ mod resource_tags;
 #[path = "all/restore_table_from_backup.rs"]
 mod restore_table_from_backup;
 
+#[path = "all/result_filter_expressions.rs"]
+mod result_filter_expressions;
+
 #[path = "all/restore_table_to_point_in_time.rs"]
 mod restore_table_to_point_in_time;
 

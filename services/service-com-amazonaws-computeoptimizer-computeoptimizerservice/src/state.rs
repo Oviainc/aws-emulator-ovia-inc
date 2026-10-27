@@ -856,6 +856,20 @@ pub const CROSS_ACCOUNT_MESSAGE: &str = "Invalid permission to access another ac
      this is an organization account, request the management account to enable service \
      access.";
 
+/// What this service answers a caller that asks for `includeMemberAccounts` — the
+/// organization-wide switch — while it manages no organization.
+///
+/// That member is conditioned on the caller's role: it indicates whether to include the
+/// resources of "all member accounts of the organization", and only an organization's
+/// management account or delegated administrator has any. A caller that has none is refused
+/// rather than answered as though an organization-wide call had been honoured; the refusal
+/// names neither the member nor the account, it states the two reasons the caller cannot ask
+/// for member accounts. ONE spelling for the whole crate, so no two operations that take the
+/// member word the same refusal differently.
+pub const INCLUDE_MEMBER_ACCOUNTS_MESSAGE: &str = "Cannot include member accounts. This could \
+     be because you are not an AWS Organization user or you are not the master account in the \
+     organization.";
+
 /// Whether `account_id` — an id a request named, or the account field of an ARN it carried
 /// — names an account OTHER than the one this service answers for.
 ///
@@ -6930,6 +6944,40 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
             savings_estimation_mode: effective(|record| record.savings_estimation_mode.is_some())
                 .and_then(|record| record.savings_estimation_mode.clone()),
         }
+    }
+
+    /// Whether the account this service answers for MANAGES an organization — whether it is
+    /// an organization's management account or delegated administrator.
+    ///
+    /// AWS Organizations is what records an account's membership of an organization, and no
+    /// operation of THIS API creates a member account ([`OrganizationMemberStore`]), so the
+    /// account manages an organization exactly when this service's store holds member
+    /// accounts for it: an emulator that records none presents a standalone account. The ONE
+    /// test for the whole crate, so every operation whose surface is served only to a
+    /// management account — the reader of the organization's enrollment statuses, and every
+    /// operation taking the organization-wide `includeMemberAccounts` — judges the caller the
+    /// same way.
+    pub fn manages_an_organization(&self) -> bool {
+        !self.organization_members.is_empty()
+    }
+
+    /// Why an `includeMemberAccounts` the request carries cannot be honoured, or `None` when
+    /// it can.
+    ///
+    /// The member is the organization-wide switch every operation that takes it conditions on
+    /// the caller's role: it asks for the resources, or the enrollment, of "all member
+    /// accounts of the organization", which only a management account or delegated
+    /// administrator has. So asking for them while managing no organization
+    /// ([`manages_an_organization`](Self::manages_an_organization)) is refused with
+    /// [`INCLUDE_MEMBER_ACCOUNTS_MESSAGE`] before anything is written, rather than accepted as
+    /// a call over an organization this service does not record. Asking NOT to include them is
+    /// what a standalone account's own call carries and is always honoured.
+    pub fn include_member_accounts_rejection(
+        &self,
+        include_member_accounts: bool,
+    ) -> Option<&'static str> {
+        (include_member_accounts && !self.manages_an_organization())
+            .then_some(INCLUDE_MEMBER_ACCOUNTS_MESSAGE)
     }
 
     /// Every member account of the organization as `GetEnrollmentStatusesForOrganization`

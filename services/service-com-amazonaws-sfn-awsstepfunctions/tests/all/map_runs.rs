@@ -1029,10 +1029,9 @@ async fn redriving_the_execution_re_runs_the_map_run_it_already_started() {
 // ---------------------------------------------------------------------------
 
 /// `ListExecutions` on a Map Run ARN answers for the record the store holds: the
-/// child workflow executions of a Map Run that EXISTS — none, because this emulator
-/// runs a Distributed Map's items in the parent execution's own walk — and a 404 only
-/// for an ARN no record answers for. A token this service never issued is still
-/// refused on that branch.
+/// child workflow executions of a Map Run that EXISTS — one per item of its
+/// Distributed Map state — and a 404 only for an ARN no record answers for. A token
+/// this service never issued is still refused on that branch.
 #[tokio::test]
 async fn list_executions_answers_for_the_map_run_the_store_holds() {
     let emulator = Emulator::new();
@@ -1045,15 +1044,26 @@ async fn list_executions_answers_for_the_map_run_the_store_holds() {
     let listed = emulator
         .ok("ListExecutions", &json!({ "mapRunArn": arn }))
         .await;
+    let children = listed
+        .get("executions")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("expected an executions array in {listed:?}"));
     assert_eq!(
-        listed.get("executions").and_then(Value::as_array),
-        Some(&Vec::new()),
-        "a Map Run this emulator ran in the parent walk has no child execution \
-         records, got {listed:?}"
+        children.len(),
+        2,
+        "a Map Run over two items reports the two child executions it started, got \
+         {listed:?}"
     );
+    for child in children {
+        assert_eq!(
+            child.get("mapRunArn").and_then(Value::as_str),
+            Some(arn.as_str()),
+            "every child names the Map Run that started it, got {child:?}"
+        );
+    }
     assert!(
         listed.get("nextToken").is_none_or(Value::is_null),
-        "an empty page carries no nextToken, got {listed:?}"
+        "one page of two children carries no nextToken, got {listed:?}"
     );
 
     let (status, code) = emulator

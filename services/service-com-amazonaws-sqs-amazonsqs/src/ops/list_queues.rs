@@ -173,6 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "MaxResults",
                 crate::state::LIST_QUEUES_MAX_RESULTS_RANGE,
                 requested,
+                crate::state::MaxResultsWording::IntegerBetween,
             ) {
                 return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(why));
             }

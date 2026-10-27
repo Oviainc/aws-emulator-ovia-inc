@@ -260,11 +260,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     None => {
                         return Err(ListAliasesErrorModeled::InvalidMarkerException(
                             InvalidMarkerException {
-                                message: Some(
-                                    "The marker that specifies where pagination should next \
-                                     begin is not valid."
-                                        .to_string(),
-                                ),
+                                message: crate::state::invalid_marker_message(),
                             },
                         )
                         .into());

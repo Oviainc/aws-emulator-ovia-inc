@@ -33,8 +33,8 @@ use service_com_amazonaws_kms_trentservice::state::{random_bytes, KeyMaterial, M
 use sm2::pkcs8::EncodePrivateKey;
 
 use super::harness::{
-    b64, call, create_alias, create_key, describe, error_code, error_message, ok, refused, router,
-    text, unb64, wrap, REGION,
+    b64, call, create_alias, create_key, describe, error_code, error_message, ok, refused,
+    rotate_on_demand, router, text, unb64, wrap, REGION,
 };
 
 /// How many bytes of key material a symmetric encryption KMS key takes, which is what
@@ -231,7 +231,7 @@ async fn material_a_key_already_holds_is_not_new_key_material() {
 
         // The rotation the material was imported for makes it current, retains the
         // version it replaced, and is recorded as the on-demand rotation it was.
-        ok(&router, "RotateKeyOnDemand", &json!({"KeyId": key_id})).await;
+        rotate_on_demand(&router, case, &key_id).await;
         let materials = key_materials(&router, &key_id).await;
         assert_eq!(
             in_state(&materials, "CURRENT"),

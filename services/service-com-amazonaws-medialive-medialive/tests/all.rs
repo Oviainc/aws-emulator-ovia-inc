@@ -221,6 +221,9 @@ mod multiplex_program_deletion;
 #[path = "all/multiplex_program_listing.rs"]
 mod multiplex_program_listing;
 
+#[path = "all/multiplex_program_packet_identifiers.rs"]
+mod multiplex_program_packet_identifiers;
+
 #[path = "all/multiplex_program_update.rs"]
 mod multiplex_program_update;
 

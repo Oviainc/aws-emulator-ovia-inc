@@ -30,7 +30,7 @@ use crate::wire::{call, error_code, error_message, medialive};
 /// `DeleteMultiplexProgram`'s binding (`smithy_query(query="operation",
 /// operation="DeleteMultiplexProgram")`: `DELETE
 /// /prod/multiplexes/{MultiplexId}/programs/{ProgramName}`, success 200).
-async fn delete_program(
+pub(crate) async fn delete_program(
     router: &MultiServiceRouter,
     multiplex_id: &str,
     program_name: &str,
