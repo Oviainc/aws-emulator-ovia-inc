@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ResetAddressAttribute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ResetAddressAttribute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ResetAddressAttribute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Resets the `domain-name` attribute of one Elastic IP address — its reverse DNS (PTR)
+//! record — and reports the attribute the store now holds.
 //!
 //! ## Shape of an operation
 //!
@@ -136,18 +129,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ResetAddressAttribute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ResetAddressAttributeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ResetAddressAttribute"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            internal_error, pending_request_already_exists, require_known_address,
+            require_service_state, ADDRESS_ATTRIBUTE_DOMAIN_NAME,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it. The store
+        // is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "The attribute of the IP address" (`ResetAddressAttributeRequest$Attribute`):
+        // `AddressAttributeName` has exactly ONE member, `domain-name`
+        // (`smithy_query(query="shape",shape="AddressAttributeName")`), so the address's
+        // reverse DNS record is the only attribute there is to reset — which is why nothing
+        // below branches on the member. The request walk refuses every other spelling with
+        // its enum `ValidationError` before this handler runs, pinned by
+        // `tests/all/address_attribute_reset.rs`.
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // An update already owed on this address's record fell due at its own instant
+        // whether or not anybody called, so it is applied before the record is read: a
+        // request made after the previous one came due is not refused as though that one
+        // were still outstanding.
+        store.materialize_due_transitions();
+
+        // "[EC2-VPC] The allocation ID" (`ResetAddressAttributeRequest$AllocationId`): an id
+        // that names no address of the account has no attribute to reset.
+        // `require_known_address` answers `InvalidAllocationID.Malformed` for a value that is
+        // not an allocation id at all before `InvalidAllocationID.NotFound` for a well-formed
+        // one the account holds no address for, the way the service orders the two.
+        let allocation_id = input.allocation_id.clone();
+        require_known_address(&store, &allocation_id)?;
+
+        // A reverse DNS change is not immediate, and one record carries at most one
+        // outstanding request: while the previous one has not been applied, another cannot
+        // be started on it, so this one is refused rather than queued or silently dropped.
+        if store.address_ptr_update_is_pending(&allocation_id) {
+            return Err(pending_request_already_exists());
+        }
+
+        // DryRun sits AFTER every check that could refuse the request and BEFORE the one
+        // write: the flag asks whether the request WOULD have worked, so one that would have
+        // been refused is refused with that reason instead, and one that would have
+        // succeeded leaves the record untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // "Resets the attribute of the specified IP address": the reset names no new record,
+        // so the update it starts takes the record away rather than replacing it with
+        // another. Until that update falls due the record in effect is untouched and the
+        // update is reported beside it, which is what a caller reading the attribute straight
+        // after this call sees.
+        let address = store
+            .start_address_ptr_record_update(&allocation_id, None)
+            .ok_or_else(|| {
+                internal_error(format!(
+                    "the address '{allocation_id}' could not be read back after its \
+                     {ADDRESS_ATTRIBUTE_DOMAIN_NAME} attribute was reset"
+                ))
+            })?;
+        Ok(ResetAddressAttributeOutput {
+            address: Some(address),
+        })
     }
 }

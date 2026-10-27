@@ -586,10 +586,12 @@ fn subscription_request(row: &Subscriber, directory_id: &str, product: &str) -> 
 
 /// RULE: a subscription is persisted against the registration it was created through —
 /// the summary carries a minted `ProductUserArn` and a start date, a list reports exactly
-/// the subscriptions in state, and stopping one removes it (so a later list and a second
-/// stop both reflect the removal).
+/// the subscriptions in state, and stopping one ends it: the ended subscription is still
+/// reported while its teardown runs (see `product_subscription_teardown`) but resolves for
+/// nothing, so a second stop is refused, and once the teardown the clock owes has completed
+/// the list reports it no more.
 #[tokio::test]
-async fn product_subscriptions_round_trip_and_stop_removes_them() {
+async fn product_subscriptions_round_trip_and_stop_ends_them() {
     let h = harness();
     let registration = REGISTRATIONS[0];
     register(&h, &registration.request())
@@ -695,7 +697,8 @@ async fn product_subscriptions_round_trip_and_stop_removes_them() {
         let again = stop_subscription(&h, &request).await;
         assert_eq!(
             again.status, 404,
-            "case {:?}: a second stop has nothing to stop, got {again:?}",
+            "case {:?}: a subscription already ended resolves for nothing, so a second stop \
+             has nothing to end, got {again:?}",
             row.case
         );
         assert_eq!(
@@ -706,6 +709,42 @@ async fn product_subscriptions_round_trip_and_stop_removes_them() {
         );
     }
 
+    // The stop ENDED every subscription rather than deleting it: each one is still
+    // reported, in the status the stop answered and with the end date it stamped, so a
+    // client polling the list sees the subscription ending.
+    let listed = list_subscriptions(
+        &h,
+        &json!({
+            "IdentityProvider": provider_union(registration.directory_id),
+            "Product": registration.product,
+        }),
+    )
+    .await;
+    let body = listed.ok("every subscription stopped");
+    let summaries = body["ProductUserSummaries"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected ProductUserSummaries in {body:?}"))
+        .clone();
+    assert_eq!(
+        summaries.len(),
+        arns.len(),
+        "an ended subscription stays reported until its teardown completes, got {summaries:?}"
+    );
+    for summary in &summaries {
+        let case = as_str(summary, "ProductUserArn", "every subscription stopped");
+        assert_eq!(
+            as_str(summary, "Status", case),
+            "UNSUBSCRIBED",
+            "case {case:?}: the list reports the ended status, got {summary:?}"
+        );
+        assert!(
+            summary.get("SubscriptionEndDate").is_some(),
+            "case {case:?}: the list reports the end date the stop stamped, got {summary:?}"
+        );
+    }
+
+    tokio::time::sleep(PAST_THE_OWED_TRANSITION).await;
+
     let listed = list_subscriptions(
         &h,
         &json!({
@@ -715,11 +754,11 @@ async fn product_subscriptions_round_trip_and_stop_removes_them() {
     )
     .await;
     assert_eq!(
-        listed.ok("every subscription stopped")["ProductUserSummaries"]
+        listed.ok("past the owed teardown")["ProductUserSummaries"]
             .as_array()
             .map(Vec::len),
         Some(0),
-        "a stopped subscription must no longer be reported"
+        "a subscription whose teardown completed must no longer be reported"
     );
 }
 

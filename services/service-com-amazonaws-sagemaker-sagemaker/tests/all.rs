@@ -163,6 +163,8 @@ mod state_roundtrip;
 mod studio_app_lifecycle;
 #[path = "all/training_job_admission.rs"]
 mod training_job_admission;
+#[path = "all/trial_component_association.rs"]
+mod trial_component_association;
 #[path = "all/trial_component_tracking.rs"]
 mod trial_component_tracking;
 // Declared after the sorted list rather than among the other `hyperpod_*` suites: the

@@ -233,6 +233,9 @@ pub(crate) async fn create_named_resources(transcribe: &Transcribe) {
         )
         .await
         .ok("CreateLanguageModel support-model");
+    // A start may only apply a custom vocabulary once its build has finished: it is
+    // READY that makes one usable, and a create leaves it PENDING.
+    transcribe.vocabulary_ready("call-terms", None).await;
 }
 
 /// `ListCallAnalyticsJobs` with `request`.

@@ -551,7 +551,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let mut delivered = Vec::with_capacity(taking.len());
                 let mut minted = Vec::with_capacity(taking.len());
                 for index in taking {
-                    let receipt_handle = sqs::new_identifier();
+                    let receipt_handle = queue.mint_receipt_handle();
                     let message = &mut queue.messages[index];
                     message.receive_count = message.receive_count.saturating_add(1);
                     if message.first_received_at.is_none() {
