@@ -269,10 +269,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .iter()
             .find(|address| !crate::state::is_email_address(crate::state::addr_spec(address)))
         {
-            return Err(rejected(format!(
-                "Illegal address: {invalid:?} is not of the form \
-                 UserName@[SubDomain.]Domain.TopLevelDomain"
-            )));
+            return Err(rejected(crate::state::illegal_address_message(invalid)));
         }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
@@ -344,9 +341,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let quota = state.account.max_24_hour_send;
         let already_sent = state.sent_last_24_hours(now);
         if quota >= 0.0 && already_sent + destinations.len() as f64 > quota {
-            return Err(rejected(format!(
-                "Daily message quota exceeded: this account may send {quota} messages per \
-                 24 hours and has sent {already_sent}"
+            return Err(rejected(crate::state::daily_quota_exceeded_message(
+                quota,
+                already_sent,
             )));
         }
 

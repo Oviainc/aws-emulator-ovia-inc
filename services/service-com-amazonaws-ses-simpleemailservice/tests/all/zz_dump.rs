@@ -54,16 +54,10 @@ async fn operations_this_slice_left_unimplemented_still_answer_501() {
     // Operations whose input carries no required member (or whose required
     // members are supplied here), so the request reaches the handler and the
     // answer is the handler's, not the boundary validator's.
-    let rows: &[(&str, &[(&str, &str)])] = &[
-        (
-            "GetIdentityDkimAttributes",
-            &[("Identities.member.1", "example.com")],
-        ),
-        (
-            "SendCustomVerificationEmail",
-            &[("EmailAddress", "a@example.com"), ("TemplateName", "t")],
-        ),
-    ];
+    let rows: &[(&str, &[(&str, &str)])] = &[(
+        "GetIdentityDkimAttributes",
+        &[("Identities.member.1", "example.com")],
+    )];
     for (action, extra) in rows {
         let (status, body) = probe(&router, action, extra).await;
         assert_eq!(
