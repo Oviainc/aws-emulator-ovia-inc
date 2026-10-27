@@ -184,17 +184,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CREATE_LANGUAGE_MODEL_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
-    /// Record the custom language model this request describes.
+    /// Record the custom language model this request describes, and resolve the data
+    /// its training run reads.
     ///
-    /// A model's training (and tuning) data can only come from the Amazon S3 location
-    /// at `InputDataConfig$S3Uri`, which this operation models `@required` and for
-    /// which it publishes no inline alternative ("The location of your training and
-    /// tuning files (this must be an Amazon S3 URI)"). Reading that location is work
-    /// this emulator cannot perform, so the resource is recorded — the control plane
-    /// is real — and the training it cannot run ends in the service's own modelled
-    /// failure state: `IN_PROGRESS` here, then `FAILED` with a `FailureReason` once
-    /// the clock makes the transition due (see
-    /// [`crate::state::LanguageModelRecord`]).
+    /// A model's training (and tuning) data comes from the Amazon S3 locations at
+    /// `InputDataConfig$S3Uri` and `InputDataConfig$TuningDataS3Uri`, and this
+    /// emulator's own Amazon S3 answers for them in process, so the create resolves
+    /// them exactly where the service's training run would read them
+    /// ([`crate::state::resolve_training_data`]). The answer is stored on the record
+    /// and is what the clock-owed transition settles on: `IN_PROGRESS` here, then
+    /// `COMPLETED` — the status that makes a model usable — or, where the object store
+    /// says a named location cannot be read, `FAILED` with the `FailureReason` that
+    /// answer grounds (see [`crate::state::LanguageModelRecord`]).
+    ///
+    /// Resolving the locations takes no lock: the read is awaited BEFORE this service's
+    /// store is touched, so the uniqueness check and the insert still happen under one
+    /// lock and N concurrent creates of one name have exactly one winner.
     async fn handle(
         &self,
         input: Self::Input,
@@ -222,8 +227,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The Region this request is served in: Amazon Transcribe is regional, so the
-        // model is created in — and only in — the Region the caller signed for.
+        // model is created in — and only in — the Region the caller signed for, and its
+        // training data is resolved against that Region's object store.
         let region = crate::state::request_region(ctx.parts());
+        let training_data =
+            crate::state::resolve_training_data(ctx, &region, &input.input_data_config).await;
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
@@ -285,6 +293,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.input_data_config,
             input.encryption_configuration,
             input.tags.unwrap_or_default(),
+            training_data,
             now,
         );
 
@@ -300,7 +309,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             operation = "CreateLanguageModel",
             model = %record.name,
             status = %record.status,
-            "custom language model recorded; its training data is not read"
+            "custom language model recorded; its training data was resolved against \
+             this emulator's own Amazon S3"
         );
         let name = record.name.clone();
         store.language_models.insert(&region, &name, record);
