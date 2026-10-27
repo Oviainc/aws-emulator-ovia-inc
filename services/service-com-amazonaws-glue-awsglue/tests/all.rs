@@ -119,6 +119,8 @@ mod job_not_found_message;
 mod job_regions;
 #[path = "all/job_run_listing.rs"]
 mod job_run_listing;
+#[path = "all/job_run_miss_message.rs"]
+mod job_run_miss_message;
 #[path = "all/job_runs.rs"]
 mod job_runs;
 #[path = "all/job_updates.rs"]

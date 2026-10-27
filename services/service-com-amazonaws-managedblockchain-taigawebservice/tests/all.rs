@@ -43,6 +43,8 @@ mod network_and_node_lifecycle;
 mod node_configuration_validation;
 #[path = "all/node_deletion_lifecycle.rs"]
 mod node_deletion_lifecycle;
+#[path = "all/node_member_scope_lookup.rs"]
+mod node_member_scope_lookup;
 #[path = "all/not_found_and_malformed_ids.rs"]
 mod not_found_and_malformed_ids;
 #[path = "all/proposal_lifecycle.rs"]

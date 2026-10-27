@@ -208,11 +208,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The tier sets the maximum bitrate, in Mbps, for the router input", and the Tier
         // doc publishes the Mbps of each tier, so the tier the request names bounds the
         // `MaximumBitrate` it may ask for, and a bitrate at or below zero names no capacity
-        // at all. Both halves are the one rule
-        // `crate::state::router_input_bitrate_rejection` owns, which UpdateRouterInput
-        // judges the pair it leaves an input with through as well.
-        if let Some(rejection) =
-            crate::state::router_input_bitrate_rejection(&input.tier, input.maximum_bitrate)
+        // at all. Both halves are the one rule `crate::state::RouterTierLadder` owns for
+        // either side of the router, which UpdateRouterInput judges the pair it leaves an
+        // input with through as well.
+        if let Some(rejection) = crate::state::ROUTER_INPUT_TIERS
+            .bitrate_rejection(&input.tier, input.maximum_bitrate)
         {
             return Err(bad_request(rejection));
         }

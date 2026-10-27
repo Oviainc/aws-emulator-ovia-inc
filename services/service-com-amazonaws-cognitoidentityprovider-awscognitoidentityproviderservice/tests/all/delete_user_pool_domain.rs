@@ -11,7 +11,8 @@
 //! nor a read of that domain string reports it, the name is free again, and the
 //! pool's other domain is untouched; a request naming a pool that does not
 //! exist, or a name that pool does not hold (including one another pool holds),
-//! deletes nothing and is refused as a missing resource.
+//! deletes nothing and is refused as a bad parameter, since the pair
+//! `UserPoolId` + `Domain` is what addresses the domain.
 //!
 //! Note on the domain strings below: `DomainType`'s modelled pattern
 //! `^[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?$` admits no dots, and the framework
@@ -461,8 +462,13 @@ async fn a_delete_that_names_no_stored_domain_is_refused() {
         let (status, payload) = call(&router, "DeleteUserPoolDomain", &body).await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "ResourceNotFoundException"),
-            "case {label:?}: expected a 404 ResourceNotFoundException, got {status} with {payload}"
+            (400, "InvalidParameterException"),
+            "case {label:?}: expected a 400 InvalidParameterException, got {status} with {payload}"
+        );
+        assert_eq!(
+            payload["message"],
+            json!("No such domain or user pool exists."),
+            "case {label:?}: the refusal reports the pair and names neither half, got {payload}"
         );
     }
 
@@ -495,7 +501,7 @@ async fn a_delete_that_names_no_stored_domain_is_refused() {
     .await;
     assert_eq!(
         (status, error_code(&payload)),
-        (404, "ResourceNotFoundException"),
+        (400, "InvalidParameterException"),
         "deleting a domain twice is refused the second time, got {status} with {payload}"
     );
 }

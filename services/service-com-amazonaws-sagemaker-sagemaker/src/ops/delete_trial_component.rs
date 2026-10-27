@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTrialComponent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTrialComponent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTrialComponent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: releases the trial component `CreateTrialComponent` stored in
+//! `crate::state`, so a later `DescribeTrialComponent` cannot find it and the name is free
+//! again, and answers the ARN the deleted record carried. A component the account does not
+//! hold gets the modelled `ResourceNotFound`, and one that is still part of a trial is
+//! refused, because SageMaker documents disassociation from every trial as this
+//! operation's precondition, so the membership index never keeps an edge to a component
+//! that is gone. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +137,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTrialComponent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTrialComponentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTrialComponent"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // `TrialComponentName` here is an `ExperimentEntityName` — a name, never an ARN —
+        // and the name "is not case-sensitive", so the record is addressed through the same
+        // case-folded key `CreateTrialComponent` stored it under.
+        let region = crate::state::request_region(ctx);
+        let key = crate::state::entity_key(&input.trial_component_name);
+
+        let mut store = state.lock();
+        // Nothing stored under the name means there is nothing to release: the modelled
+        // not-found failure, never a 200 recording the deletion of nothing. The refusal
+        // names the component the way this service's trial-component readers do, by the
+        // identifier resolved to the ARN a successful call would have answered.
+        let Some(arn) = store.trial_components.get(&key).map(|component| component.arn.clone())
+        else {
+            return Err(DeleteTrialComponentErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(crate::state::could_not_find(
+                    crate::state::TRIAL_COMPONENT_KIND_LABEL,
+                    &crate::state::resource_arn(
+                        &region,
+                        crate::state::TRIAL_COMPONENT_KIND,
+                        &input.trial_component_name,
+                    ),
+                )),
+            })
+            .into());
+        };
+
+        // "A trial component must be disassociated from all trials before the trial
+        // component can be deleted" (this operation's model doc, smithy_query query=doc
+        // shape=DeleteTrialComponent), so a component any trial still holds is REFUSED
+        // rather than deleted out from under the memberships that reference it — otherwise
+        // `ListTrialComponents`' `TrialName` and `ExperimentName` filters report a component
+        // no reader can describe. The operation models no error for a precondition the
+        // caller can satisfy itself (with `DisassociateTrialComponent`), so this is the 400
+        // `ValidationException`, and its fixed text is that documented sentence: the
+        // condition the service states is what the caller has to act on. The ARN and the
+        // count are read off the stored record and the membership index, so the refusal
+        // carries nothing fixed here but the sentence itself.
+        let holding = store.trial_keys_holding_trial_component(&key).len();
+        if holding > 0 {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Unable to delete trial component {arn} because it is associated with \
+                 {holding} trial(s). A trial component must be disassociated from all \
+                 trials before the trial component can be deleted."
+            )));
+        }
+
+        // Disassociated from every trial, so the record itself is all there is to release:
+        // the name is free for another create from here on, and every reader of the
+        // component answers its not-found failure.
+        store.trial_components.remove(&key);
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        // The ARN the deleted component carried, so the caller reads back the same ARN
+        // `CreateTrialComponent` minted rather than one rebuilt from this request — the two
+        // differ whenever the component was created in another Region or spelled in another
+        // case.
+        Ok(DeleteTrialComponentOutput {
+            trial_component_arn: Some(arn),
+        })
     }
 }

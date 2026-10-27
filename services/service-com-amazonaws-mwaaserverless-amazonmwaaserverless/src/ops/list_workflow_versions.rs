@@ -299,8 +299,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// the snapshot that version froze — the same ones `GetWorkflow` serves when it is asked
 /// for that version by name. `ModifiedAt` is the version's own creation instant: a
 /// version is immutable once created, so nothing ever modifies it afterwards.
-/// `ScheduleConfiguration` stays absent because no modelled operation of this service
-/// accepts a schedule, so no stored version holds one.
+/// `ScheduleConfiguration` is the schedule the definition THIS version snapshotted
+/// declares, so it describes that version's own frozen definition however the Amazon S3
+/// object has changed since.
 fn summarize(
     workflow: &crate::state::Workflow,
     record: &crate::state::WorkflowVersionRecord,
@@ -312,7 +313,7 @@ fn summarize(
         created_at: Some(crate::state::timestamp(record.created_at)),
         modified_at: Some(crate::state::timestamp(record.created_at)),
         definition_s3_location: Some(record.snapshot.definition_s3_location.clone()),
-        schedule_configuration: None,
+        schedule_configuration: record.snapshot.schedule_configuration.clone(),
         trigger_mode: record.snapshot.trigger_mode.clone(),
     }
 }

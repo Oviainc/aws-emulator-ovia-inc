@@ -61,6 +61,8 @@ mod delete_user_pool_domain;
 mod describe_terms_by_client;
 #[path = "all/device_remembering.rs"]
 mod device_remembering;
+#[path = "all/domain_lookup_and_condition_messages.rs"]
+mod domain_lookup_and_condition_messages;
 #[path = "all/error_message_wording.rs"]
 mod error_message_wording;
 #[path = "all/explicit_auth_flows.rs"]

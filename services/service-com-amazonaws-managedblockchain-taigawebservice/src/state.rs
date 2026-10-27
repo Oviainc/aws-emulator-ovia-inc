@@ -822,6 +822,59 @@ impl StoredNetwork {
             .filter(|node| node.in_region(region))
     }
 
+    /// The node `node_id` names INSIDE the member scope `member_id` (`None` for a request
+    /// that names no member), as a request addressed to `region` sees it.
+    ///
+    /// The ONE member-scoped node lookup the node operations resolve through, so the scope
+    /// test cannot drift between them: `None` is the single answer for a node id this
+    /// network holds nothing under and for a node the named member does not own
+    /// ([`StoredNode::in_member_scope`]) — the modelled `ResourceNotFoundException` naming
+    /// the node either way.
+    pub fn scoped_node(
+        &self,
+        region: &str,
+        node_id: &str,
+        member_id: Option<&str>,
+    ) -> Option<&StoredNode> {
+        self.node(region, node_id)
+            .filter(|node| node.in_member_scope(member_id))
+    }
+
+    /// The same member-scoped node lookup, to write: the write counterpart of
+    /// [`Self::scoped_node`], so a mutation reaches exactly the node a read of that scope
+    /// reports.
+    pub fn scoped_node_mut(
+        &mut self,
+        region: &str,
+        node_id: &str,
+        member_id: Option<&str>,
+    ) -> Option<&mut StoredNode> {
+        self.node_mut(region, node_id)
+            .filter(|node| node.in_member_scope(member_id))
+    }
+
+    /// The refusal a node request that names NO member gets on this network, or `None` when
+    /// the request may be answered from the scope it carries.
+    ///
+    /// `MemberId` "Applies only to Hyperledger Fabric and is required for Hyperledger
+    /// Fabric": on a Fabric network the owning member scopes which node the request
+    /// addresses, so one that names none is refused rather than answered from an unscoped
+    /// search. Which framework a network runs is a property of the STORED network, so this
+    /// is asked only once the network has resolved — and it is asked HERE, in one place, so
+    /// the operations that make the refusal cannot word it differently.
+    pub fn member_scope_refusal(
+        &self,
+        member_id: Option<&str>,
+    ) -> Option<InvalidRequestException> {
+        (member_id.is_none() && self.framework == FRAMEWORK_HYPERLEDGER_FABRIC).then(|| {
+            InvalidRequestException {
+                message: Some(format!(
+                    "memberId is required on a {FRAMEWORK_HYPERLEDGER_FABRIC} network"
+                )),
+            }
+        })
+    }
+
     /// This network's nodes that belong to `region`, in the id order the listings take.
     pub fn nodes_in<'a>(&'a self, region: &'a str) -> impl Iterator<Item = &'a StoredNode> + 'a {
         self.nodes
@@ -1185,6 +1238,18 @@ impl StoredNode {
     /// Region its `CreateNode` was signed for, which is the Region its stored ARN names.
     pub fn in_region(&self, region: &str) -> bool {
         arn_in_region(&self.arn, region)
+    }
+
+    /// Whether a request that scoped its lookup with `member_id` reaches this node.
+    ///
+    /// A `MemberId` a node request carries names the member that owns the node, and it only
+    /// SCOPES the lookup: a node the named member does not own is not reached under that
+    /// scope, exactly as an unknown node id is not, while a request that names no member
+    /// addresses the node by network and node id alone. This is the ONE place that test is
+    /// written, which [`StoredNetwork::scoped_node`] and
+    /// [`StoredNetwork::scoped_node_mut`] resolve every node operation through.
+    pub fn in_member_scope(&self, member_id: Option<&str>) -> bool {
+        member_id.is_none_or(|member_id| self.member_id.as_deref() == Some(member_id))
     }
 
     /// The modelled `NodeFrameworkAttributes` for this record: the attributes of the

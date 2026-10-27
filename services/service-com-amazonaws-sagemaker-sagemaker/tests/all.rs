@@ -167,6 +167,8 @@ mod training_job_admission;
 mod training_job_constraint_admission;
 #[path = "all/trial_component_association.rs"]
 mod trial_component_association;
+#[path = "all/trial_component_deletion.rs"]
+mod trial_component_deletion;
 #[path = "all/trial_component_disassociation.rs"]
 mod trial_component_disassociation;
 #[path = "all/trial_component_tracking.rs"]

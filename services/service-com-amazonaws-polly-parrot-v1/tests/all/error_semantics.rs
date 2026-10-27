@@ -18,7 +18,7 @@ use service_com_amazonaws_polly_parrot_v1::state::{
 };
 
 use crate::lexicons_and_speech::{error_code, json, Polly};
-use crate::support::{fixture_task_id, seed_task, stored_task};
+use crate::support::{fixture_task_id, pls_with_replacement, seed_task, stored_task};
 
 /// The `message` an error response carries, absent when the error carries none.
 fn error_message(response: &http::Response<Bytes>) -> Option<String> {
@@ -66,17 +66,6 @@ fn assert_refusal(
             );
         }
     }
-}
-
-/// A PLS lexicon with one lexeme whose `element` replacement is `length` characters.
-fn pls_with_replacement(element: &str, length: usize) -> String {
-    format!(
-        "<lexicon version=\"1.0\" \
-         xmlns=\"http://www.w3.org/2005/01/pronunciation-lexicon\" \
-         alphabet=\"ipa\" xml:lang=\"en-US\">\
-         <lexeme><grapheme>G</grapheme><{element}>{}</{element}></lexeme></lexicon>",
-        "x".repeat(length)
-    )
 }
 
 /// RULE: a read of a resource that does not exist is refused with the modelled

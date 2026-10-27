@@ -11957,6 +11957,7 @@ dependencies = [
  "aws-emulator-smithy-macros",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
+ "aws-sdk-s3",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
@@ -11964,9 +11965,11 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-com-amazonaws-s3-amazons3",
  "sha2 0.10.9",
  "tokio",
  "tracing",
+ "yaml-rust2",
 ]
 
 [[package]]

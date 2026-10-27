@@ -180,32 +180,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // `MemberId` "Applies only to Hyperledger Fabric and is required for Hyperledger
-        // Fabric": on a Fabric network the owning member scopes which node is deleted.
-        // Which framework a network runs is a property of the stored network, which is
-        // why this refusal comes after the network resolved.
-        if input.member_id.is_none()
-            && network.framework == crate::state::FRAMEWORK_HYPERLEDGER_FABRIC
-        {
-            return Err(DeleteNodeErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    message: Some(format!(
-                        "memberId is required on a {} network",
-                        crate::state::FRAMEWORK_HYPERLEDGER_FABRIC
-                    )),
-                },
-            )
-            .into());
+        // Fabric": the one refusal for a Fabric network a request named no member scope on
+        // lives in `crate::state`, so this operation and `GetNode` cannot word it
+        // differently. It comes after the network resolved, because the framework it keys
+        // on is a property of the stored network.
+        if let Some(refusal) = network.member_scope_refusal(input.member_id.as_deref()) {
+            return Err(DeleteNodeErrorModeled::InvalidRequestException(refusal).into());
         }
 
         // The network resolved, so the leaf label is next: the NODE is the resource this
         // operation was asked to delete, and `MemberId` — a query member, not a path
-        // label — only scopes that lookup.
-        let found = network.node(&region, &input.node_id).filter(|node| {
-            input
-                .member_id
-                .as_deref()
-                .is_none_or(|member_id| node.member_id.as_deref() == Some(member_id))
-        });
+        // label — only scopes that lookup, through `crate::state`'s one scoped node
+        // lookup.
+        let found = network.scoped_node(&region, &input.node_id, input.member_id.as_deref());
         let Some(node) = found else {
             return Err(DeleteNodeErrorModeled::ResourceNotFoundException(
                 crate::state::not_found(crate::state::RESOURCE_NODE, &input.node_id),
