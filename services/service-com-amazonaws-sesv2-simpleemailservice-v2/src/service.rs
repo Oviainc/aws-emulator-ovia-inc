@@ -131,11 +131,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // every operation as a service-common error, and it is the code an SES
         // client branches on for a malformed or incomplete request. The framework's
         // own structured wording is kept: it names the member and the rule it
-        // broke, which is what the caller has to fix.
+        // broke, which is what the caller has to fix. The one difference SES makes
+        // to it — an enum clause states the member and its value set without the
+        // value that violated them — is single-homed in `crate::state`, so a
+        // refusal made at the boundary and one a handler makes itself read alike.
         match refusal {
             Refusal::Invalid(violations) => Some(Refused {
                 code: "BadRequestException".to_string(),
-                message: aws_smithy_schema_server::envelope(violations)
+                message: crate::state::boundary_refusal_message(violations)
                     .unwrap_or_else(|| "The input you provided is invalid.".to_string()),
             }),
             // An unauthenticated caller is the emulator's own 403, not a modelled

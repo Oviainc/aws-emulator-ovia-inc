@@ -15,6 +15,8 @@ use std::fmt::Write as _;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::{Duration, SystemTime};
 
+use smithy_server_runtime::{Violation, ViolationKind};
+
 /// How long after `CreateEmailIdentity` an identity's `PENDING` -> `SUCCESS`
 /// verification transition becomes due.
 ///
@@ -2329,6 +2331,52 @@ pub fn modelled_enum_value(
         "{member} {value} is not one of {}.",
         allowed.join(", ")
     ))
+}
+
+/// The text separating the subject of a validation clause from the requirement it
+/// states, as the framework renders one.
+const CONSTRAINT_SEPARATOR: &str = " failed to satisfy constraint: ";
+
+/// The message this service answers a refusal the constraint walk made at the request
+/// boundary with: one clause per violation, in the envelope AWS counts them in.
+///
+/// Every clause is the framework's own, with ONE difference: a value outside a
+/// modelled enum's value set is stated WITHOUT the value. SES names the member and
+/// the value set that member had to satisfy and withholds what was sent, while a
+/// length, range, pattern or absent-member clause quotes the value the way the
+/// framework renders it.
+///
+/// `None` when there is nothing to state, which keeps the framework's own wording.
+pub fn boundary_refusal_message(violations: &[Violation]) -> Option<String> {
+    let clauses: Vec<String> = violations.iter().map(boundary_clause).collect();
+    match clauses.len() {
+        0 => None,
+        1 => Some(format!("1 validation error detected: {}", clauses[0])),
+        n => Some(format!(
+            "{n} validation errors detected: {}",
+            clauses.join("; ")
+        )),
+    }
+}
+
+/// One clause of [`boundary_refusal_message`].
+///
+/// The requirement half is always the framework's own words — the clause is cut at
+/// the separator rather than rebuilt — so a constraint class the framework learns to
+/// check cannot drift from this wording, and only the SUBJECT of an enum clause
+/// changes: from the value-quoting form to the member on its own.
+fn boundary_clause(violation: &Violation) -> String {
+    let rendered = violation.message();
+    if !matches!(violation.kind, ViolationKind::EnumValue(_)) {
+        return rendered;
+    }
+    match rendered.split_once(CONSTRAINT_SEPARATOR) {
+        Some((_, requirement)) => format!(
+            "Value at '{}'{CONSTRAINT_SEPARATOR}{requirement}",
+            violation.path
+        ),
+        None => rendered,
+    }
 }
 
 /// The `TlsPolicy` value a configuration set holds when the caller configured none.
