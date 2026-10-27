@@ -163,7 +163,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // writes nothing. Each entitlement's `status` and `statusReasonCode`
         // are computed from the agreement and `now`, so the provisioning the
         // clock has already made due is reported without a write — and two
-        // reads of a settled entitlement answer the same thing.
+        // reads of a settled entitlement answer the same thing. Its
+        // `registrationToken` is the one provisioning minted, reported while
+        // that token is still valid: this read mints none.
         let store = state.lock();
         let Some(agreement) = store.agreements.get(&input.agreement_id) else {
             // The lookup found nothing: the modelled not-found body, at the

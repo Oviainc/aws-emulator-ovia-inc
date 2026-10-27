@@ -310,9 +310,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // no organization, so any other account is refused rather than used as a filter key
         // ([`crate::state::requested_account_id`], shared by every reader of this service).
         let accounts = input.account_ids.clone().unwrap_or_default();
-        if let Err(reason) = crate::state::requested_account_id(Some(&accounts)) {
-            return Err(invalid(reason));
-        }
+        let account_id = match crate::state::requested_account_id(Some(&accounts)) {
+            Ok(account_id) => account_id,
+            Err(reason) => return Err(invalid(reason)),
+        };
         let filters = requested_filters(input.filters.as_deref())?;
         // Every `serviceArns` entry must be in the documented form,
         // `arn:aws:ecs:region:aws_account_id:service/cluster-name/service-name`. An ARN
@@ -421,13 +422,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         candidates.dedup_by(|left, right| left.reference.arn == right.reference.arn);
         // "Return the Amazon ECS service recommendations to the specified Amazon Web
         // Services account IDs": the account that owns a service is the account field of
-        // its ARN. The filter NARROWS the result set rather than selecting resources, so a
-        // service it excludes is outside the request's scope and is neither reported nor an
-        // error OF the request — the request asked for one account's recommendations, and
-        // this service is not one of them.
-        candidates.retain(|candidate| {
-            accounts.is_empty() || accounts.contains(&candidate.reference.account_id)
-        });
+        // its ARN, and the account this request asks about is the one `accountIds` named or
+        // — when it named none — the caller's own ([`crate::state::requested_account_id`]).
+        // A service owned by any OTHER account is one no request to this service can be
+        // answered about, so it is left out of the sweep entirely rather than reported to a
+        // caller of a different account; a request that NAMES another account's service was
+        // already refused above, so this is the same rule applied where the request named
+        // no ARN at all. The same check every other reader of this service selects its
+        // resources with (`get_ebs_volume_recommendations`).
+        candidates.retain(|candidate| candidate.reference.account_id == account_id);
 
         // The preferences in force for each service, resolved from this service's own
         // preference store by the scope precedence every preference read uses.

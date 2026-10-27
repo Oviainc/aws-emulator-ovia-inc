@@ -187,6 +187,8 @@ mod template_quotas;
 mod template_stages_and_resource_events;
 #[path = "all/template_summary.rs"]
 mod template_summary;
+#[path = "all/template_validation.rs"]
+mod template_validation;
 #[path = "all/type_deactivation.rs"]
 mod type_deactivation;
 #[path = "all/type_testing.rs"]

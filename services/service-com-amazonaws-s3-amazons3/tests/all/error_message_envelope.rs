@@ -25,6 +25,7 @@ use quick_xml::Reader;
 use service_com_amazonaws_s3_amazons3::scaffolded::{
     documented_error_message, DOCUMENTED_ERROR_MESSAGES,
 };
+use service_com_amazonaws_s3_amazons3::state::CONTENT_MD5_MISMATCH_MESSAGE;
 
 use super::bucket_lifecycle::{create_bucket, router, send, Answer};
 use super::bucket_tagging::unescaped;
@@ -158,8 +159,8 @@ async fn every_refused_request_carries_its_documented_error_message() {
             Row {
                 case: "PutObject whose Content-MD5 does not match its payload",
                 status: 400,
-                code: "InvalidRequest",
-                message: documented("InvalidRequest"),
+                code: "BadDigest",
+                message: CONTENT_MD5_MISMATCH_MESSAGE,
             },
             put_object(
                 &router,

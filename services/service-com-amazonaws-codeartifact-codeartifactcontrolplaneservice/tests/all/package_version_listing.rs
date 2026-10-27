@@ -15,7 +15,9 @@
 //!    beside the package's own `(format, namespace, package)` coordinate and the
 //!    `defaultDisplayVersion` — the most recently published version of the package.
 //! 2. `status` and `originType` each filter EXACTLY, and neither is defaulted: with no
-//!    `status` the listing carries versions of every status the package holds.
+//!    `status` the listing carries versions of every status the package holds. A `status`
+//!    naming a state no stored version carries is refused, not answered as an empty page
+//!    (`package_version_input_status` owns that rule).
 //! 3. The listing has a stable order the cursor names a place in: the stored version-string
 //!    order by default, and most recently published FIRST under
 //!    `sortBy=PUBLISHED_TIME` — a `defaultDisplayVersion` and a page of the same package
@@ -444,7 +446,7 @@ async fn status_and_origin_type_filter_exactly() {
     // that owns that status: a publish stores `Published` (and `Unfinished` while it is
     // still accepting assets), `UpdatePackageVersionsStatus` moves one to `Archived` and
     // `Unlisted`, and `DisposePackageVersions` moves one to `Disposed`. No stored version is
-    // ever `Deleted` — a deleted version is gone — so that status matches nothing.
+    // ever `Deleted` — a deleted version is gone — so that status is not filterable at all.
     let published = publish_versions(
         &router,
         package,
@@ -470,17 +472,27 @@ async fn status_and_origin_type_filter_exactly() {
 
     // The whole modelled status catalog, each value paired with the versions that carry it.
     for status in PACKAGE_VERSION_STATUS_VALUES {
+        let answer = list(&router, &List::of(&published[0]).status(status)).await;
         let expected: Vec<&str> = match *status {
             PUBLISHED => vec!["1.0.0"],
             ARCHIVED => vec!["2.0.0"],
             UNLISTED => vec!["3.0.0"],
             DISPOSED => vec!["4.0.0"],
             UNFINISHED => vec!["5.0.0"],
-            // `Deleted` is the one status no stored version carries.
-            DELETED => vec![],
+            // `Deleted` is the one status no stored version carries, so it is not a status a
+            // request may filter on at all: the listing REFUSES it rather than answering an
+            // empty page. `package_version_input_status` owns that rule's own table.
+            DELETED => {
+                assert_eq!(
+                    (answer.status, answer.code()),
+                    (400, "ValidationException".to_string()),
+                    "case {status:?}: a status no stored version carries must be refused, \
+                     got {answer:?}"
+                );
+                continue;
+            }
             other => panic!("the model grew a status this table does not cover: {other}"),
         };
-        let answer = list(&router, &List::of(&published[0]).status(status)).await;
         assert_eq!(
             (answer.status, answer.code()),
             (200, String::new()),

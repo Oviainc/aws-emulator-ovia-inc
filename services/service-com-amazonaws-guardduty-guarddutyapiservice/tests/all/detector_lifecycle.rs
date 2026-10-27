@@ -1422,35 +1422,45 @@ async fn a_detector_belongs_to_the_region_its_endpoint_created_it_in() {
     );
 }
 
-/// An operation outside this slice still answers the scaffold's 501, so a client can
-/// tell "not written yet" from "the emulator is broken".
-#[tokio::test]
-async fn an_operation_outside_this_slice_still_answers_501() {
-    let router = new_router();
-    // `GetRemainingFreeTrialDays` is still a scaffold
-    // (`src/ops/get_remaining_free_trial_days.rs` carries the SCAFFOLDED marker), and
-    // this request satisfies every constraint the model puts on its input — the URI
-    // label `DetectorId` is `len 1..300` and `accountIds` is a `len 1..50` list
-    // (`smithy_query(operation="GetRemainingFreeTrialDays")`) — so the boundary
-    // validator passes the request through to the handler.
-    //
-    // `DeleteCustomDetectionRuleAssociation`, `ListMalwareProtectionPlans`,
-    // `ListFilters`, `ListIPSets`, `ListThreatIntelSets`, `ListThreatEntitySets` and
-    // `ListTrustedEntitySets` are implemented, and the
-    // `custom_detection_rule_association_delete`, `malware_protection_plan_listing`,
-    // `filter_listing`, `ip_set_listing`, `threat_intel_set_listing`,
-    // `threat_entity_set_listing` and `trusted_entity_set_listing` suites are what
-    // assert their behaviour.
-    let detector_id = enabled_detector(&router).await;
-    let (status, body) = call(
-        &router,
-        "POST",
-        &format!("/detector/{detector_id}/freeTrial/daysRemaining"),
-        Some(json!({"accountIds": ["111122223333"]})),
-    )
-    .await;
-    assert_eq!(
-        status, 501,
-        "GetRemainingFreeTrialDays is still scaffolded, so it must answer 501: got {status} {body:?}"
+// `GetRemainingFreeTrialDays` was the last operation of this service still carrying
+// the scaffold marker, and the suite that asserted its 501 lived here. It is
+// implemented now, so there is no operation left for such an assertion to be true
+// of, and the `free_trial_days` suite is what asserts the behaviour it answers with
+// instead. What is left to pin is the CENSUS, which the test below does
+// mechanically.
+
+/// No operation of this service is a scaffold any more: no `src/ops/*.rs` carries the
+/// marker line that says "nobody has written it yet", so none of them answers HTTP
+/// 501.
+///
+/// The census is a machine-readable record — the marker line is grepped for exactly
+/// this — so it is asserted here rather than only described: a re-scaffolded or newly
+/// generated operation shows up as a failure with its file named, where before it
+/// would have been noticed only by a client receiving a 501.
+#[test]
+fn no_operation_of_this_service_is_still_a_scaffold() {
+    /// The marker line the scaffold generator puts at the top of an unimplemented
+    /// operation, and that implementing one deletes.
+    const MARKER: &str = "//! SCAFFOLDED, NOT IMPLEMENTED:";
+
+    let ops = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ops");
+    let mut scaffolded: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(&ops).expect("this crate's src/ops directory") {
+        let path = entry.expect("an entry of src/ops").path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).expect("the source of an operation module");
+        if source.lines().any(|line| line.starts_with(MARKER)) {
+            scaffolded.push(
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            );
+        }
+    }
+    assert!(
+        scaffolded.is_empty(),
+        "these operation modules still carry the scaffold marker, so they answer 501: {scaffolded:?}"
     );
 }

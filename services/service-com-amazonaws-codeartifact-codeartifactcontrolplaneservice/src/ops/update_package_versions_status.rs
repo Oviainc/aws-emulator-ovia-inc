@@ -10,6 +10,9 @@
 //!   `Published` or `Unlisted` ("To set the status of a package version to Disposed, use
 //!   DisposePackageVersions"). `PackageVersionStatus` models six values, so one of the
 //!   other three is `ValidationException` (400) naming the member, not a status change;
+//! * an `expectedStatus` naming a state no stored version carries is also
+//!   `ValidationException` (400), from the set every operation that takes a status as input
+//!   shares ([`crate::state::input_package_version_status_refusal`]);
 //! * the addressed domain, repository and package are resolved next; one this caller does
 //!   not hold is `ResourceNotFoundException` (404), so a request that names no package is
 //!   refused rather than reported as a list of per-version failures;
@@ -239,6 +242,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             );
+        }
+
+        // `expectedStatus` is modelled as the same whole enum. A precondition naming a state
+        // no stored version carries can never hold, so it is a bad request rather than a
+        // per-version mismatch — refused from the shared input/report split, which
+        // `targetStatus` (narrower still: the statuses THIS operation moves a version to) is
+        // checked against above.
+        if let Some(expected) = input.expected_status.as_deref() {
+            if let Some(refusal) = crate::state::input_package_version_status_refusal(expected) {
+                return Err(
+                    UpdatePackageVersionsStatusErrorModeled::ValidationException(refusal).into(),
+                );
+            }
         }
 
         let mut store = state.lock();

@@ -17,7 +17,12 @@ pub struct StartDeleteMonitorDeploymentInput {
     pub identifier: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.medialive#StartDeleteMonitorDeploymentResponse")]
+/// `StartDeleteMonitorDeploymentResponse`, with its schema written out instead of
+/// derived because `CreatedAt`, `LastDiscoveredAt` and `ModifiedAt` target
+/// `__timestampIso8601`, which is `@timestampFormat("date-time")`; the note in
+/// `shared_types` says why that cannot be derived here. Member for member this is the
+/// model's shape — the same one every flat signal-map response is: same ids, same order,
+/// same indices.
 #[derive(Debug, Clone, Default)]
 pub struct StartDeleteMonitorDeploymentOutput {
     pub arn: Option<String>,
@@ -39,4 +44,10 @@ pub struct StartDeleteMonitorDeploymentOutput {
     pub status: Option<String>,
     pub tags: Option<std::collections::HashMap<String, String>>,
 }
+
+shared_types::signal_map_response!(
+    StartDeleteMonitorDeploymentOutput,
+    START_DELETE_MONITOR_DEPLOYMENT_OUTPUT_SCHEMA,
+    "StartDeleteMonitorDeploymentResponse"
+);
 

@@ -182,12 +182,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // caller sent it — never normalised: nothing in the model or in AWS's
         // documentation normalises it, so the queue a later Get/Update/Delete, or a job's
         // `Queue` reference, addresses is the one whose name matches byte for byte. The
-        // trim is only the test for a name that carries no characters at all, which the
-        // model's bare `__string` does not refuse before this handler runs.
+        // one test it takes is for a name that carries no characters at all, which the
+        // model's bare `__string` does not refuse before this handler runs — the same test
+        // every named resource in this service takes.
         let name = input.name;
-        if name.trim().is_empty() {
+        if crate::state::carries_no_characters(&name) {
             return Err(CreateQueueErrorModeled::BadRequestException(BadRequestException {
-                message: Some("Name must not be empty.".to_string()),
+                message: Some(crate::state::blank_member_message("Name")),
             })
             .into());
         }

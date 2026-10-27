@@ -1797,12 +1797,52 @@ fn tag_key_violation(path: &str, key: &str) -> Option<String> {
 /// the tag call that merges onto it — because the constraints are the map's, declared once
 /// on `TagMap`'s key shape, not the property of whichever operation happens to carry it.
 /// The keys are judged in SORTED order, so which key a multi-key refusal names is fixed by
-/// the request rather than by a `HashMap`'s iteration order.
+/// the request rather than by a `HashMap`'s iteration order. A tag key carried by a LIST
+/// rather than by the map — the keys a removal NAMES — is judged by
+/// [`tag_key_list_refusal`], which applies these same constraints at the path a list
+/// element is reported at.
 pub fn tag_keys_refusal<'a>(keys: impl IntoIterator<Item = &'a str>) -> Option<String> {
     let mut keys: Vec<&str> = keys.into_iter().collect();
     keys.sort_unstable();
     keys.into_iter()
         .find_map(|key| tag_key_violation(&format!("tags.{key}.member"), key))
+}
+
+/// The dotted member path a violation on the tag-key LIST a request carries is reported
+/// at: the lowerCamel spelling of `UntagResource$TagKeys`, which is the member every
+/// tag-key list of this service is carried by.
+const TAG_KEY_LIST_PATH: &str = "tagKeys";
+
+/// Why these tag keys cannot be NAMED, or `None` when every one of them satisfies the
+/// constraints the modelled `TagKey` declares.
+///
+/// The constraints are the same ones [`tag_keys_refusal`] applies — they are declared once,
+/// on the shape every tag key of this service targets, so they hold for a key a request
+/// names as well as for one it writes — and the `@pattern` half is unapplied at the
+/// boundary for the same reason: the validator's engine cannot compile a pattern opening
+/// with a negative lookahead and treats one it cannot compile as matching.
+///
+/// What differs from the map form is only WHERE a clause reports the offending key: a key
+/// carried by a LIST is reported at the position it holds in that list, which is the path
+/// the framework's walk spells a list element as (`<list>.<1-based position>.member`), and
+/// the keys are judged in the order the request listed them. EVERY offending key is stated,
+/// because the walk accumulates one violation per element rather than stopping at the first
+/// — so a caller is told about each key it has to fix.
+pub fn tag_key_list_refusal<'a>(keys: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let violations: Vec<::aws_smithy_schema_server::constraints::Violation> = keys
+        .into_iter()
+        .enumerate()
+        .filter_map(|(position, key)| {
+            let path = format!(
+                "{TAG_KEY_LIST_PATH}.{}",
+                ::aws_smithy_schema_server::constraints::path::element(position + 1)
+            );
+            validation::string_violation(validation::ConstrainedString::TagKey, &path, key)
+        })
+        .collect();
+    // `envelope` answers `None` for an EMPTY violation list, which is exactly the case
+    // where every key is admitted; a non-empty list always states its clauses.
+    ::aws_smithy_schema_server::envelope(&violations)
 }
 
 /// Why a tag write that would leave `resulting` tags on the resource `resource` names

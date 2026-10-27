@@ -33,7 +33,9 @@
 //! (`crate::state::template`) and computed by `crate::state::change_plan`, so it covers the
 //! JSON and YAML bodies `CreateStack` deploys; a body that reader will not read, or one
 //! declaring no resources, is refused with the `ValidationError` CloudFormation answers for
-//! a template format error.
+//! a template format error — as is a body whose own declarations it cannot resolve, by the
+//! same validation pass `CreateStack` holds a submitted template to
+//! ([`crate::state::template_validation`]).
 //!
 //! Answered 501 rather than guessed at: `TemplateURL` (fetching a template from Amazon S3
 //! needs an outbound connection this emulator does not make) and `ChangeSetType=IMPORT`
@@ -363,16 +365,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::validate_resource_types(body)
                 .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         }
+        // The values this change set would deploy with: what a language-extensions
+        // directive, a mapping lookup or a key an expression decides resolves against, and
+        // therefore part of what the stage below is computed from.
+        let supplied: ::std::collections::BTreeMap<String, String> = input
+            .parameters
+            .iter()
+            .flatten()
+            .filter_map(|parameter| {
+                Some((
+                    parameter.parameter_key.clone()?,
+                    parameter.parameter_value.clone()?,
+                ))
+            })
+            .collect();
         // The PROCESSED stage of a submitted body: the document the change set is PLANNED
         // from and the one its execution deploys, so the plan a caller reviews and the
         // deployment that is carried out cannot disagree. Applying a template's transforms
         // is caller-sized work, so it happens HERE — before the store lock below — the way
-        // `CreateStack` does it. A change set reusing the stack's template takes the stage
-        // the stack already stores instead, so nothing expands a template under the lock.
-        let submitted_processed = input
-            .template_body
-            .as_deref()
-            .map(crate::state::template::process);
+        // `CreateStack` does it, and from the same values, so all three submitting
+        // operations see one document. A change set reusing the stack's template takes the
+        // stage the stack already stores instead, so nothing expands a template under the
+        // lock.
+        let submitted_processed = input.template_body.as_deref().map(|body| {
+            crate::state::template::process_with_parameters(body, &supplied)
+        });
+        // The same template validation `CreateStack` applies: a change set is a plan over a
+        // template CloudFormation would deploy, so a body whose own declarations it cannot
+        // resolve is refused before the plan is written.
+        if let (Some(body), Some(processed)) =
+            (input.template_body.as_deref(), submitted_processed.as_ref())
+        {
+            crate::state::validate_submitted_template(
+                body,
+                processed,
+                &supplied,
+                &crate::state::request_region(ctx.parts()),
+            )
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // This service was mounted on an engine that is not the shared in-memory one,

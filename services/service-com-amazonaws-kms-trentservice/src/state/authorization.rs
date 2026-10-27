@@ -60,6 +60,17 @@
 //!
 //! An expired session credential speaks for nobody: it carries no documents and no
 //! principal spelling, so every action it asks for is refused.
+//!
+//! ## The condition keys a statement is judged under
+//!
+//! A statement applies to a request only when the `Condition` block it carries holds for
+//! that request, whichever effect it states — so a statement scoped to one principal
+//! governs that principal alone. The keys this gate can answer EXACTLY are the ones that
+//! name the signing principal, and they are in the request context of every call: the ARN
+//! of the principal that made the request and the account it belongs to
+//! ([`condition_context`]). Every other key — including this service's own `kms:` keys — is
+//! left unpublished, so a statement naming one stays undecided and the shared evaluator
+//! reads it fail-closed.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
@@ -67,6 +78,13 @@ use std::time::SystemTime;
 use ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam_store;
 use ::service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts_store;
 use ::service_common::iam_authorization::{self as iam, Decision};
+
+/// The global condition keys that name the PRINCIPAL a request was signed by, which this
+/// gate answers exactly: "aws:PrincipalArn — the ARN of the principal that made the
+/// request" and "aws:PrincipalAccount — the account the principal belongs to" (IAM's
+/// global condition keys).
+const PRINCIPAL_ARN_KEY: &str = "aws:PrincipalArn";
+const PRINCIPAL_ACCOUNT_KEY: &str = "aws:PrincipalAccount";
 
 /// The principal a request speaks for, with everything a decision about it is made from.
 #[derive(Debug, Clone)]
@@ -135,12 +153,24 @@ pub fn authorize(
 ) -> Result<(), String> {
     let action = format!("{}:{operation}", super::ARN_SERVICE);
 
+    // The condition keys this request answers for, and — since every key it carries is one
+    // this gate knows the request's value for — the keys the request DECLARES it models.
+    // Without them a statement scoped by a condition could not be decided at all, and the
+    // evaluator's fail-closed reading would apply a `Deny` to principals it does not name.
+    let principal_context = condition_context(caller);
+    let published: Vec<&str> = principal_context
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+
     // An explicit `Deny` wins over every grant, whichever document states it, and
     // denying the ACCOUNT denies each of its principals — so the deny is decided against
     // the caller's own spellings and its account's together.
     let mut denying = caller.principals.clone();
     denying.extend_from_slice(&caller.account);
-    let deny_request = iam::Request::new(&action, &key.arn, &denying);
+    let deny_request = iam::Request::new(&action, &key.arn, &denying)
+        .with_context(&principal_context)
+        .with_published_keys(&published);
     if iam::resource_decision(&key.policy, &deny_request) == Decision::Denied {
         return Err(explicit_deny_message(
             &caller.arn,
@@ -149,7 +179,9 @@ pub fn authorize(
             "a resource-based policy",
         ));
     }
-    let granting = iam::Request::new(&action, &key.arn, &caller.principals);
+    let granting = iam::Request::new(&action, &key.arn, &caller.principals)
+        .with_context(&principal_context)
+        .with_published_keys(&published);
     let identity_said = iam::identity_decision(&caller.documents, &granting);
     if identity_said == Decision::Denied {
         return Err(explicit_deny_message(
@@ -188,13 +220,38 @@ pub fn authorize(
     let delegates = !caller.account.is_empty()
         && iam::resource_decision(
             &key.policy,
-            &iam::Request::new(&action, &key.arn, &caller.account),
+            &iam::Request::new(&action, &key.arn, &caller.account)
+                .with_context(&principal_context)
+                .with_published_keys(&published),
         ) == Decision::Allowed;
     if delegates && (caller.identity_is_unbounded() || identity_said == Decision::Allowed) {
         return Ok(());
     }
 
     Err(no_identity_policy_message(&caller.arn, &action, &key.arn))
+}
+
+/// The condition keys a statement of these documents is judged under: the keys that name
+/// the signing principal, which every request carries a value for.
+///
+/// A key that is in this context is one the request DECLARES it models, so a clause naming
+/// it is DECIDED — which is what scopes a conditioned statement to the principals it names.
+/// A caller that speaks for nobody (an expired session credential) carries no principal
+/// spelling, so there is nothing to compare and the context is empty; the account is read
+/// out of the principal's own ARN through the tree's one ARN parse, so an ARN carrying none
+/// publishes no account key rather than a guess.
+fn condition_context(caller: &Caller) -> Vec<(String, String)> {
+    if caller.principals.is_empty() {
+        return Vec::new();
+    }
+    let mut context = vec![(PRINCIPAL_ARN_KEY.to_string(), caller.arn.clone())];
+    let account = ::service_common::arn::parse(&caller.arn)
+        .map(|arn| arn.account)
+        .filter(|account| !account.is_empty());
+    if let Some(account) = account {
+        context.push((PRINCIPAL_ACCOUNT_KEY.to_string(), account.to_string()));
+    }
+    context
 }
 
 /// How AWS words an authorization failure that no document allowed: who was refused,

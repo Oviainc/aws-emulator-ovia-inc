@@ -17,6 +17,8 @@ mod configuration_definitions;
 mod configuration_manager_teardown;
 #[path = "all/configuration_managers.rs"]
 mod configuration_managers;
+#[path = "all/date_time_timestamps.rs"]
+mod date_time_timestamps;
 #[path = "all/deployment_target_parameters.rs"]
 mod deployment_target_parameters;
 #[path = "all/deployment_target_required.rs"]

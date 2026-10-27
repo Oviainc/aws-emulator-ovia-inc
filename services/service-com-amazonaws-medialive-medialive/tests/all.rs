@@ -314,6 +314,9 @@ mod signal_map_deletion;
 #[path = "all/signal_map_listing.rs"]
 mod signal_map_listing;
 
+#[path = "all/signal_map_update.rs"]
+mod signal_map_update;
+
 #[path = "all/signal_maps.rs"]
 mod signal_maps;
 

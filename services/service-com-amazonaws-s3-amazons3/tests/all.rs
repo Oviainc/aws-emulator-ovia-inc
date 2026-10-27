@@ -81,6 +81,8 @@ mod bucket_tagging;
 mod bucket_versioning;
 #[path = "all/bucket_website.rs"]
 mod bucket_website;
+#[path = "all/directory_bucket_sessions_and_appends.rs"]
+mod directory_bucket_sessions_and_appends;
 #[path = "all/error_message_envelope.rs"]
 mod error_message_envelope;
 // Deliberately empty: this fix's own table for the error-message rule was folded into
@@ -167,8 +169,12 @@ mod public_access_block_default;
 mod public_access_guardrails;
 #[path = "all/refusal_codes.rs"]
 mod refusal_codes;
+#[path = "all/request_integrity_headers.rs"]
+mod request_integrity_headers;
 #[path = "all/refusal_messages_published.rs"]
 mod refusal_messages_published;
+#[path = "all/signature_refusal_wording.rs"]
+mod signature_refusal_wording;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/version_id_classification.rs"]
