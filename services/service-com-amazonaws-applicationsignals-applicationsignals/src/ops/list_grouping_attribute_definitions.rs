@@ -168,7 +168,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a forged cursor is never read as a page boundary.
         if input.next_token.is_some() {
             return Err(crate::scaffolded::Scaffolded::validation(
-                "NextToken is not a token this service issued",
+                crate::state::UNISSUED_NEXT_TOKEN,
             ));
         }
 
