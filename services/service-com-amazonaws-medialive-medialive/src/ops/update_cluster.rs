@@ -263,7 +263,11 @@ fn bounded(
 /// `BadRequestException`, worded by the shared not-found helper every reader of
 /// this service uses and carrying the id that was asked for — the same answer
 /// `ListChannelPlacementGroups`, which models no 404 either, gives for a
-/// `ClusterId` naming nothing. A `Name` another cluster of the account holds is a
+/// `ClusterId` naming nothing. An id whose DELETE this service has accepted is
+/// the same refusal with the shared already-deleted wording, which is how this
+/// service tells "the cluster is gone, recreate it" from "the cluster is busy":
+/// a tombstone is never answered with the conflict a cluster that still exists
+/// gets. A `Name` another cluster of the account holds is a
 /// clash with the stored state, which is what this operation's
 /// `ConflictException` (409) is for, worded exactly as the create words the same
 /// clash. More `InterfaceMappings` than this emulator stores for one cluster is
@@ -278,6 +282,13 @@ fn refused(
         Refusal::NoSuchCluster => {
             UpdateClusterErrorModeled::BadRequestException(BadRequestException {
                 message: Some(crate::state::not_found_message("Cluster", cluster_id)),
+            })
+        }
+        Refusal::AlreadyDeleted => {
+            UpdateClusterErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::already_deleted_message(&format!(
+                    "Cluster {cluster_id}"
+                ))),
             })
         }
         Refusal::NameTaken => UpdateClusterErrorModeled::ConflictException(ConflictException {

@@ -59,19 +59,22 @@
 //! DEREGISTRATION — the state its enum models — so a deleted node ends in
 //! `DEREGISTERED` rather than in a `DELETED` the model does not declare.
 //!
-//! A delete never drops a record: a deleted channel, input, input security group,
-//! network or SdiSource keeps its record in the terminal `DELETED` state its own
+//! A delete never drops a record: a deleted channel, cluster, input, input
+//! security group, network or SdiSource keeps its record in the terminal
+//! `DELETED` state its own
 //! state enum models, so a reader goes on reporting it there (which is what the
 //! SDK's `ChannelDeleted` / `InputDeleted` waiters poll for) instead of losing
-//! it. The `DELETING` step a channel's, an input's and a network's enum models is
+//! it. The `DELETING` step a channel's, a cluster's, an input's and a network's
+//! enum models is
 //! what the clock owes between the call and that terminal state, and a resource in
 //! `DELETED` is no longer *currently using* anything, so it leaves the derived
-//! `Inputs`, `Channels` and `AttachedChannels` lists.
+//! `Inputs`, `Channels`, `AttachedChannels` and `AssociatedClusterIds` lists.
 //!
 //! A kept record is READABLE, not writable: once a delete has been accepted for
 //! an id, that id names no resource a caller may still change. Every MUTATION
 //! therefore resolves its id through the live lookups
 //! ([`ComAmazonawsMedialiveMedialiveState::live_input`],
+//! [`ComAmazonawsMedialiveMedialiveState::live_cluster`],
 //! [`ComAmazonawsMedialiveMedialiveState::mutable_channel`] over
 //! [`ComAmazonawsMedialiveMedialiveState::live_channel_mut`], and the tag
 //! writers' own private `resource_tags_mut`) and answers a dead id with its own
@@ -393,10 +396,11 @@ pub(crate) use input_devices::input_device_output;
 pub mod clusters;
 
 pub use clusters::{
-    cluster_alert_output, cluster_alert_state, cluster_state, described_cluster_network_settings,
-    ClusterAlertRecord, ClusterChanges, ClusterRecord, ClusterRefusal, ClusterUpdateRefusal,
-    NewCluster, CLUSTER_ALERT_FILTERS, CLUSTER_ALERT_FILTER_ALL, MAX_CLUSTERS, MAX_CLUSTER_ALERTS,
-    MAX_CLUSTER_INTERFACE_MAPPINGS, MAX_CLUSTER_TOKENS,
+    cluster_alert_output, cluster_alert_state, cluster_not_idle_message, cluster_state,
+    described_cluster_network_settings, ClusterAlertRecord, ClusterChanges, ClusterDeleteRefusal,
+    ClusterRecord, ClusterRefusal, ClusterUpdateRefusal, NewCluster, CLUSTER_ALERT_FILTERS,
+    CLUSTER_ALERT_FILTER_ALL, MAX_CLUSTERS, MAX_CLUSTER_ALERTS, MAX_CLUSTER_INTERFACE_MAPPINGS,
+    MAX_CLUSTER_TOKENS,
 };
 
 pub(crate) use clusters::cluster_description_output;
@@ -2753,6 +2757,11 @@ impl ComAmazonawsMedialiveMedialiveState {
     pub fn clusters_using_network(&self, network_id: &str) -> Vec<String> {
         self.clusters
             .values()
+            // A cluster whose deletion has come due is no longer *currently
+            // using* anything, so it leaves this derived association exactly as
+            // a deleted channel leaves a cluster's own `ChannelIds`; its record
+            // stays readable in that terminal state.
+            .filter(|cluster| !cluster.is_deleted())
             .filter(|cluster| {
                 cluster
                     .network_settings
@@ -4334,6 +4343,7 @@ impl ComAmazonawsMedialiveMedialiveState {
             TaggedResource::Cluster(id) => self
                 .clusters
                 .get_mut(&id)
+                .filter(|record| !record.is_delete_accepted())
                 .map(|record| &mut record.tags),
             TaggedResource::ChannelPlacementGroup(id) => self
                 .channel_placement_groups
