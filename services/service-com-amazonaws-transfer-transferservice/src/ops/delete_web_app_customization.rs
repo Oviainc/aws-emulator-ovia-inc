@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteWebAppCustomization
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteWebAppCustomization`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteWebAppCustomization::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the customization object of the web app the request names — "deletes the
+//! WebAppCustomization object that corresponds to the web app ID specified" — so the
+//! web app keeps existing with no title, logo or icon of its own and
+//! `DescribeWebAppCustomization` then reports that it has none.
+//!
+//! A MUTATION of the web app this service stores, and an `@idempotent` one: the delete
+//! states the END state ("this web app has no customization"), so a repeat of it on a
+//! web app that already holds none is the same success rather than a refusal — there is
+//! nothing left for a retry to undo. What the delete is addressed AT is still resolved:
+//! a `WebAppId` the store does not hold is answered with the modelled
+//! `ResourceNotFoundException`, as every other operation addressing a web app answers
+//! it, because no customization of a web app that does not exist can be in any state.
+//!
+//! The output shape is `Unit`, so a success carries no member at all.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +178,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteWebAppCustomization` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteWebAppCustomizationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteWebAppCustomization"))
+        use crate::state as st;
+
+        // This operation reads no request metadata: it addresses a stored web app by id
+        // and answers an empty body, so nothing here is derived from the Region.
+        let _ = ctx;
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            DeleteWebAppCustomizationErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+
+        let mut guard = state.lock();
+        let Some(stored) = guard.web_apps.get_mut(&input.web_app_id) else {
+            return Err(st::not_found(
+                DeleteWebAppCustomizationErrorModeled::ResourceNotFoundException(
+                    st::unknown_web_app(&input.web_app_id),
+                ),
+            ));
+        };
+
+        // The whole object goes, not the members a request named: this operation models
+        // `WebAppId` alone. An `@idempotent` delete states the end state, so a web app
+        // that already held none is left in exactly that state and answered the same
+        // success.
+        stored.customization = None;
+        drop(guard);
+
+        Ok(DeleteWebAppCustomizationOutput)
     }
 }

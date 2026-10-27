@@ -75,3 +75,5 @@ mod authorization_token;
 mod package_version_listing;
 #[path = "all/package_version_input_status.rs"]
 mod package_version_input_status;
+#[path = "all/authorization_token_issuance.rs"]
+mod authorization_token_issuance;

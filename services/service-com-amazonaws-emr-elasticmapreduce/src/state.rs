@@ -384,6 +384,136 @@ pub fn unknown_ec2_instance_message(instance_id: &str) -> String {
     format!("EC2 instance id {}", not_valid_message(instance_id))
 }
 
+/// How a session-scoped operation refuses a session id the named cluster carries no
+/// session for: the id the caller sent and the cluster it was looked for on, since a
+/// session is addressed by both.
+///
+/// AWS does not document the wording, so the text is built from the request. What IS the
+/// contract is the refusal itself — HTTP 400 with the operation's client error — rather
+/// than an empty success.
+pub fn unknown_session_message(session_id: &str, cluster_id: &str) -> String {
+    format!("Session id '{session_id}' is not valid or does not exist on cluster '{cluster_id}'.")
+}
+
+/// How many tags one Amazon EMR resource carries at the most.
+///
+/// Amazon EMR's tagging restrictions publish a maximum of 50 tags per resource (Amazon
+/// EMR Management Guide, "Tag Clusters"), and that ceiling is also what keeps the tag
+/// list this emulator persists — and clones into every later read of the resource —
+/// bounded however many times a caller adds to it.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The longest tag key, in Unicode characters: a tag is "a required key string with a
+/// maximum of 128 characters" (`AddTags$Tags` doc, Smithy model). Characters, not bytes,
+/// so a key of non-ASCII text is measured the way Amazon EMR measures it.
+pub const MAX_TAG_KEY_CHARS: usize = 128;
+
+/// The longest tag value, in Unicode characters: a tag carries "an optional value string
+/// with a maximum of 256 characters" (`AddTags$Tags` doc, Smithy model).
+pub const MAX_TAG_VALUE_CHARS: usize = 256;
+
+/// The symbols a tag key or value may carry beside letters, digits and spaces.
+///
+/// The symbol set of the tag character class Amazon Web Services states for a tag
+/// ([`TAG_CHARACTER_PATTERN`]), so a tag carrying any other character — a symbol such as
+/// an emoji, punctuation outside this list, a control character — is not a tag Amazon EMR
+/// holds. Listed in the order the pattern states them.
+pub const TAG_PUNCTUATION: [char; 8] = ['_', '.', ':', '/', '=', '+', '-', '@'];
+
+/// The character class a tag key and value are drawn from, as Amazon Web Services states
+/// it for a tag: Unicode letters (`\p{L}`), separators (`\p{Z}`) and numbers (`\p{N}`),
+/// plus [`TAG_PUNCTUATION`].
+///
+/// This is the one statement of the class, so a caller reading it and
+/// [`is_tag_char`] applying it cannot come to disagree about what a tag may hold.
+pub const TAG_CHARACTER_PATTERN: &str = r"^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$";
+
+/// How a tag key or value Amazon EMR would not have stored is refused.
+///
+/// AWS publishes no wording for this class, so it is this service's own sentence for a
+/// value it rejects ([`not_valid_message`]) with the half of the pair in front of it, the
+/// way [`unknown_cluster_message`] is built: the member the caller has to fix and the
+/// value it sent. What IS the contract is the refusal itself — HTTP 400 with the client
+/// error the operation models — rather than a tag Amazon EMR would never have held.
+fn tag_not_valid_message(member: &str, value: &str) -> String {
+    format!("Tag {member} {}", not_valid_message(value))
+}
+
+/// Whether `c` may appear in a tag key or value: a letter or number of any script, a
+/// separator, or one of [`TAG_PUNCTUATION`] — the class [`TAG_CHARACTER_PATTERN`] states.
+///
+/// `char::is_alphanumeric` is what makes the rule "representable in UTF-8" rather than
+/// ASCII: a Cyrillic or CJK letter is a letter, while an emoji is a symbol and is not. A
+/// control character is not a separator, so a tab or a newline is outside the class even
+/// though both are whitespace.
+pub fn is_tag_char(c: char) -> bool {
+    c.is_alphanumeric() || (c.is_whitespace() && !c.is_control()) || TAG_PUNCTUATION.contains(&c)
+}
+
+/// Refuse a submitted tag list that holds something no Amazon EMR tag could be.
+///
+/// `Tag$Key` is "a user-defined key, which is the minimum required information for a
+/// valid tag" (Smithy model), so an entry carrying none — absent or empty — names no tag;
+/// a tag is "a required key string with a maximum of 128 characters, and an optional
+/// value string with a maximum of 256 characters" (`AddTags$Tags` doc), which bounds each
+/// half; and [`TAG_CHARACTER_PATTERN`] is the class both are drawn from. The model types
+/// both members as plain strings and constrains neither, so none of this is refused at
+/// the boundary.
+///
+/// One sentence states every one of those classes ([`tag_not_valid_message`]): each is a
+/// member of the request Amazon EMR rejects, so the caller is told which half of the pair
+/// it was and what it sent.
+pub fn validate_tags(tags: &[Tag]) -> Result<(), String> {
+    for tag in tags {
+        let Some(key) = tag.key.as_deref().filter(|key| !key.is_empty()) else {
+            // There is no value to quote: an entry with no key, or an empty one, names
+            // no tag at all.
+            return Err("Tag key is not valid.".to_string());
+        };
+        let value = tag.value.as_deref().unwrap_or_default();
+        for (member, text, max) in [
+            ("key", key, MAX_TAG_KEY_CHARS),
+            ("value", value, MAX_TAG_VALUE_CHARS),
+        ] {
+            if text.chars().count() > max || text.chars().any(|c| !is_tag_char(c)) {
+                return Err(tag_not_valid_message(member, text));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Merge `submitted` into the tag set `held` a resource already carries: a key the
+/// resource does not carry is added, and a key it does carry keeps its place and takes
+/// the submitted value.
+///
+/// A tag is "a key-value pair containing user-defined metadata" (`Tag` doc, Smithy
+/// model), so one key names at most one tag of a resource and re-submitting a key
+/// replaces its value rather than adding a second entry — which is what makes adding the
+/// same tag twice leave the resource exactly as the first call did.
+///
+/// The merge is computed on a copy and committed only once it fits
+/// [`MAX_TAGS_PER_RESOURCE`], so a refused request leaves the resource's tags as they
+/// were rather than half merged.
+pub fn merge_tags(held: &mut Vec<Tag>, submitted: &[Tag]) -> Result<(), String> {
+    let mut merged = held.clone();
+    for tag in submitted {
+        match merged.iter().position(|existing| existing.key == tag.key) {
+            Some(at) => merged[at].value = tag.value.clone(),
+            None => merged.push(tag.clone()),
+        }
+    }
+    if merged.len() > MAX_TAGS_PER_RESOURCE {
+        return Err(format!(
+            "These tags would leave the resource carrying {} tags; a resource carries at \
+             most {MAX_TAGS_PER_RESOURCE} tags",
+            merged.len()
+        ));
+    }
+    *held = merged;
+    Ok(())
+}
+
 /// The configurations one instance group may hold, counted over the whole nested tree.
 ///
 /// CHOSEN, not documented: every entry is retained on the group's record and reported on
@@ -587,6 +717,14 @@ pub const MAX_CONFIGURATION_ENTRIES: usize = MAX_PERMITTED_PUBLIC_RANGES;
 /// Width of the uppercase base-36 body of a minted `j-`/`s-` id.
 const ID_BODY_WIDTH: usize = 13;
 
+/// The prefix every cluster (job flow) id carries, as Amazon EMR mints it and as the
+/// `DescribeCluster` example ids show it.
+pub const CLUSTER_ID_PREFIX: &str = "j-";
+
+/// The prefix every EMR Studio id carries (`Studio$StudioId`, whose example ids are of
+/// the form `es-…`).
+pub const STUDIO_ID_PREFIX: &str = "es-";
+
 /// The largest `CreateSecurityConfiguration$SecurityConfiguration` document this
 /// emulator accepts, in bytes.
 ///
@@ -709,10 +847,10 @@ impl Default for ComAmazonawsEmrElasticmapreduceState {
 }
 
 impl ComAmazonawsEmrElasticmapreduceState {
-    /// A fresh cluster id: `j-` followed by uppercase alphanumerics.
+    /// A fresh cluster id: [`CLUSTER_ID_PREFIX`] followed by uppercase alphanumerics.
     pub fn mint_cluster_id(&mut self) -> String {
         self.next_cluster_seq += 1;
-        format!("j-{}", base36_id(self.next_cluster_seq))
+        format!("{CLUSTER_ID_PREFIX}{}", base36_id(self.next_cluster_seq))
     }
 
     /// A fresh step id: `s-` followed by uppercase alphanumerics.
@@ -733,10 +871,10 @@ impl ComAmazonawsEmrElasticmapreduceState {
         format!("ig-{}", base36_id(self.next_instance_group_seq))
     }
 
-    /// A fresh studio id: `es-` followed by uppercase alphanumerics.
+    /// A fresh studio id: [`STUDIO_ID_PREFIX`] followed by uppercase alphanumerics.
     pub fn mint_studio_id(&mut self) -> String {
         self.next_studio_seq += 1;
-        format!("es-{}", base36_id(self.next_studio_seq))
+        format!("{STUDIO_ID_PREFIX}{}", base36_id(self.next_studio_seq))
     }
 
     /// A fresh persistent application user interface id: `p-` followed by uppercase
@@ -1949,6 +2087,13 @@ impl ClusterRecord {
     pub fn session(&self, session_id: &str) -> Option<&Session> {
         self.sessions
             .iter()
+            .find(|session| session.id == session_id)
+    }
+
+    /// The session `session_id` of this cluster, for an operation that changes it.
+    pub fn session_mut(&mut self, session_id: &str) -> Option<&mut Session> {
+        self.sessions
+            .iter_mut()
             .find(|session| session.id == session_id)
     }
 

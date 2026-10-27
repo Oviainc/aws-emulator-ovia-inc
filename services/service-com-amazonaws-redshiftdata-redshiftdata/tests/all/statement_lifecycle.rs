@@ -28,7 +28,8 @@ use service_com_amazonaws_redshiftdata_redshiftdata::state::{
 // The harness every suite in this crate drives the emulator through.
 use super::emulator::{
     error_code, flag, id_of, list, number, timestamp, Emulator, ABSENT_ID,
-    LONGER_THAN_A_QUICK_STATEMENT, RUN_TIME_LOWER_BOUND_SECONDS, SLOW_SQL, WAIT_SECONDS,
+    LONGER_THAN_A_QUICK_STATEMENT, RUN_TIME_LOWER_BOUND_SECONDS, SLOW_SQL, UNBOUNDED_SQL,
+    WAIT_SECONDS,
 };
 
 // ---------------------------------------------------------------------------
@@ -1892,9 +1893,7 @@ async fn statements_outside_the_engine_s_bounds_are_interrupted_or_refused() {
             // Counts for ever: it emits one row, so neither the row cap nor the
             // byte cap can stop it — only the step budget and the deadline can.
             "an unbounded recursive query",
-            "WITH RECURSIVE counter(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM counter) \
-             SELECT count(*) FROM counter"
-                .to_string(),
+            UNBOUNDED_SQL.to_string(),
         ),
         (
             "a value larger than the engine's length limit",

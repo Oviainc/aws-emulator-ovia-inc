@@ -239,6 +239,8 @@ mod relational_database_pre_stop_snapshot;
 mod relational_database_reboot;
 #[path = "all/relational_database_restore_from_snapshot.rs"]
 mod relational_database_restore_from_snapshot;
+#[path = "all/relational_database_snapshot_create.rs"]
+mod relational_database_snapshot_create;
 #[path = "all/relational_database_snapshot_delete.rs"]
 mod relational_database_snapshot_delete;
 #[path = "all/relational_database_snapshot_listing.rs"]

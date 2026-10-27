@@ -227,59 +227,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let stages = crate::state::plan_stages(&pipeline.declaration, now);
             let pipeline_version = pipeline.version;
 
-            // The in-flight executions of this pipeline decide whether this start runs
-            // at once, waits, or is refused.
-            let in_flight: Vec<(String, bool)> = state
-                .executions_by_pipeline
-                .get(&input.name)
-                .map(|ids| {
-                    ids.iter()
-                        .filter_map(|id| state.executions.get(id))
-                        .filter(|record| !crate::state::is_terminal_status(&record.status))
-                        .map(|record| (record.pipeline_execution_id.clone(), record.queued))
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            // The pipeline's concurrent-execution ceiling: past it the start is refused
-            // with the error the model declares for exactly this condition.
-            if in_flight.len() >= crate::state::MAX_CONCURRENT_EXECUTIONS_PER_PIPELINE {
-                return Err(
-                    StartPipelineExecutionErrorModeled::ConcurrentPipelineExecutionsLimitExceededException(
-                        ConcurrentPipelineExecutionsLimitExceededException {
-                            message: Some(format!(
-                                "pipeline {} already has {} executions in flight, which is \
-                                 the limit of concurrent executions for the pipeline",
-                                input.name,
-                                crate::state::MAX_CONCURRENT_EXECUTIONS_PER_PIPELINE
-                            )),
-                        },
-                    )
-                    .into(),
-                );
-            }
-
-            // `PipelineDeclaration$executionMode`: in PARALLEL every execution runs on
-            // its own; QUEUED and SUPERSEDED run one at a time, and in SUPERSEDED mode
-            // the execution already waiting is superseded by this one.
-            let running = in_flight.iter().any(|(_, queued)| !queued);
-            let queued = execution_mode != "PARALLEL" && running;
-            if queued && execution_mode == crate::state::DEFAULT_EXECUTION_MODE {
-                let waiting: Vec<String> = in_flight
-                    .iter()
-                    .filter(|(_, queued)| *queued)
-                    .map(|(id, _)| id.clone())
-                    .collect();
-                for id in waiting {
-                    if let Some(record) = state.executions.get_mut(&id) {
-                        record.status = crate::state::STATUS_SUPERSEDED.to_string();
-                        record.status_summary = Some(
-                            "superseded by a later execution of the pipeline".to_string(),
-                        );
-                        record.last_update_time = now;
-                    }
+            // The pipeline's concurrent-execution accounting decides whether this start
+            // runs at once, waits, or is refused — the rule both calls that start an
+            // execution admit it by (`state::admit_execution`), which is also where the
+            // mode's effect on the executions already in flight is applied.
+            let queued = match state.admit_execution(&input.name, &execution_mode, now) {
+                crate::state::ExecutionAdmission::AtLimit => {
+                    return Err(
+                        StartPipelineExecutionErrorModeled::ConcurrentPipelineExecutionsLimitExceededException(
+                            ConcurrentPipelineExecutionsLimitExceededException {
+                                message: Some(
+                                    crate::state::CONCURRENT_EXECUTION_LIMIT_MESSAGE.to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
                 }
-            }
+                crate::state::ExecutionAdmission::Queued => true,
+                crate::state::ExecutionAdmission::Started => false,
+            };
 
             let record = crate::state::PipelineExecutionRecord {
                 // Minted against the store, so the id this call reports is the one the

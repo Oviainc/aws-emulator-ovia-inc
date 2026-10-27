@@ -33,6 +33,10 @@ use crate::job_flow_lifecycle::Emr;
 /// class it does not check itself.
 const GENERIC_CLIENT_ERROR: &str = "ValidationException";
 
+/// The client error Amazon EMR funnels its OWN refusals through, which is what a handler
+/// a request reached answers when it rejects that request on its own grounds.
+const MODELLED_CLIENT_ERROR: &str = "InvalidRequestException";
+
 /// Every value `com.amazonaws.emr#ClusterState` declares
 /// (`smithy_query(query="shape", shape="ClusterState")`).
 const CLUSTER_STATES: [&str; 7] = [
@@ -137,6 +141,26 @@ fn admitted(case: &'static str, operation: &'static str, body: Value) -> Case {
     }
 }
 
+/// A request the model admits, which the HANDLER then refuses on its own grounds: the
+/// error Amazon EMR models rather than the boundary's member-path envelope, which is
+/// what shows the request got past the boundary at all.
+fn admitted_then_refused(
+    case: &'static str,
+    operation: &'static str,
+    says: &str,
+    body: Value,
+) -> Case {
+    Case {
+        case,
+        operation,
+        body,
+        expected: Expectation::Refused {
+            code: MODELLED_CLIENT_ERROR,
+            says: says.to_string(),
+        },
+    }
+}
+
 /// A request the model admits, of an operation that is still a scaffold stub: it
 /// reaches the handler and is answered 501 there, which is the OTHER half of "a
 /// refusal of constrained input happens before the handler".
@@ -229,9 +253,13 @@ fn cases() -> Vec<Case> {
                 "MaxResults": MAX_RESULTS_RANGE.1,
             }),
         ),
-        admitted_by_a_stub(
+        // `AddTags` is implemented, so a `ClusterId` the boundary admits reaches the
+        // handler and is refused there for naming no cluster — the cluster-id sentence,
+        // not the validator's member-path envelope.
+        admitted_then_refused(
             "a ClusterId exactly at its maximum length",
             "AddTags",
+            "is not valid.",
             json!({
                 "ResourceId": "j-ABCDEFGHIJKLM",
                 "Tags": [{ "Key": "env", "Value": "test" }],
