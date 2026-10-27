@@ -92,7 +92,7 @@ impl PlannedEvent {
     }
 
     /// Whether this event OPENS a transition rather than ending it.
-    fn in_progress(&self) -> bool {
+    pub fn in_progress(&self) -> bool {
         self.status.ends_with(IN_PROGRESS)
     }
 }

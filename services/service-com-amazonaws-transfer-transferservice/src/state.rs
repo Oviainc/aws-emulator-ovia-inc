@@ -283,18 +283,21 @@ pub const MAX_STORED_PROFILES: usize = 200;
 ///
 /// AWS documents the transition ("it can take a couple of minutes for the server to
 /// be completely operational") but not a span the caller can rely on, so this span is
-/// CHOSEN: long enough that a caller acting straight after the call still observes
-/// `STARTING`, short enough not to stall a test. The due instant is stored
-/// and materialised on the next read; nothing sleeps for it.
-const SERVER_START_SPAN: Duration = Duration::from_millis(500);
+/// CHOSEN: the span this emulator gives every transition the clock owes. It has to
+/// outlast a caller that acts straight after the call AND keeps calling — the several
+/// requests a client makes before it looks at `State` again, each of which takes
+/// unbounded wall-clock time on a loaded host — or the transient state, and the state
+/// errors that depend on it, would be gone before that caller could observe either.
+/// The due instant is stored and materialised on the next read; nothing sleeps for it.
+pub const SERVER_START_SPAN: Duration = Duration::from_secs(3);
 
 /// How long after `StopServer` a server leaves `STOPPING` for `OFFLINE`.
 ///
 /// AWS documents the intermediate `STOPPING` state but no span, so this is CHOSEN on
-/// the same basis as [`SERVER_START_SPAN`]: a caller polling straight after
-/// `StopServer` still observes `STOPPING`, and the `OFFLINE` it waits for comes due
-/// shortly after without anything sleeping.
-const SERVER_STOP_SPAN: Duration = Duration::from_millis(500);
+/// the same basis, and at the same length, as [`SERVER_START_SPAN`]: a caller polling
+/// straight after `StopServer` still observes `STOPPING`, and the `OFFLINE` it waits
+/// for comes due after the span without anything sleeping.
+pub const SERVER_STOP_SPAN: Duration = Duration::from_secs(3);
 
 /// A server's `State` right after `CreateServer`: instantiated, not yet able to serve
 /// file operations.
@@ -2898,10 +2901,10 @@ pub struct WebApp {
 /// the modelled `ConflictException` rather than racing it — which is what makes two
 /// concurrent writers have exactly one winner. AWS documents no span for the roll-out,
 /// so this one is CHOSEN on the same basis as [`SERVER_START_SPAN`]: long enough that a
-/// caller writing straight after a write still meets the window, short enough not to
-/// stall a test. The due instant is stored and read on the next call; nothing sleeps
-/// for it.
-pub const WEB_APP_UPDATE_SPAN: Duration = Duration::from_millis(500);
+/// caller writing straight after a write — and making several further calls first —
+/// still meets the window. The due instant is stored and read on the next call;
+/// nothing sleeps for it.
+pub const WEB_APP_UPDATE_SPAN: Duration = Duration::from_secs(3);
 
 impl WebApp {
     /// Whether an update of this web app is still being applied at `now`.

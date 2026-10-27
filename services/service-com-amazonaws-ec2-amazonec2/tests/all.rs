@@ -92,6 +92,12 @@ mod report_instance_status;
 // neighbourhood of this suite is the contended region of this file.
 #[path = "all/local_gateway_routes.rs"]
 mod local_gateway_routes;
+// The Reachability Analyzer path analysis slice: what `StartNetworkInsightsAnalysis` stores
+// for one path, what the clock then does to it, and how `DescribeNetworkInsightsAnalyses`
+// narrows, pages and refuses. Declared here rather than in sorted position, for the reason
+// this file's header note gives: the sorted neighbourhood is the contended region.
+#[path = "all/network_insights_analyses.rs"]
+mod network_insights_analyses;
 // The transit gateway prefix list reference slice (create, then read it back) and the
 // error envelope's request id. Declared beside the suites above for the reason they
 // give: the sorted region is where every new ec2 suite inserts its lines, and these two

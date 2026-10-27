@@ -77,6 +77,8 @@ mod server_config_and_state;
 mod server_host_key_resource;
 #[path = "all/server_logging_configuration.rs"]
 mod server_logging_configuration;
+#[path = "all/server_transition_windows.rs"]
+mod server_transition_windows;
 #[path = "all/server_user_lifecycle.rs"]
 mod server_user_lifecycle;
 #[path = "all/state_roundtrip.rs"]

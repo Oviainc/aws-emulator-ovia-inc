@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartNetworkInsightsAnalysis
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartNetworkInsightsAnalysis`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartNetworkInsightsAnalysis::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores ONE analysis of the path the request names and answers it as it was stored:
+//! `running`, carrying the id, the ARN and the start date the store derives, the accounts
+//! and ARNs the request scopes it with, and the tags it assigns. The end of the analysis is
+//! owed to the clock rather than to this call, and a path the account does not hold is
+//! refused rather than analyzed.
+//!
+//! Nothing here traces the path: "If the path is reachable, the operation returns the
+//! shortest feasible path" is a computation over the account's real network, which this
+//! emulator does not perform, so the analysis the clock ends reports the modelled failure
+//! status with the reason why ([`crate::state::PATH_ANALYSIS_UNSUPPORTED_STATUS_MESSAGE`])
+//! rather than a reachability verdict, path components or explanations nothing computed.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +148,165 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartNetworkInsightsAnalysis` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartNetworkInsightsAnalysisErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartNetworkInsightsAnalysis"))
+        use crate::state;
+        use crate::state::{MAX_ANALYSIS_SCOPING_ENTRIES, MAX_CLIENT_TOKEN_CHARS};
+
+        // "Unique, case-sensitive identifier that you provide to ensure the idempotency of
+        // the request" (`ClientToken`): the token is retained for the life of the store, so
+        // its length is bounded the way every other client token of this crate is.
+        if input.client_token.chars().count() > MAX_CLIENT_TOKEN_CHARS {
+            return Err(state::invalid_parameter_value(format!(
+                "clientToken accepts at most {MAX_CLIENT_TOKEN_CHARS} characters"
+            )));
+        }
+
+        // The three caller-sized lists the stored analysis retains and reports back. The
+        // model bounds none of them, so each is capped before any work proportional to it
+        // is done and before the store is locked; what the entries themselves hold is
+        // charged against the store's byte budget below.
+        for (member, entries) in [
+            ("AdditionalAccounts", input.additional_accounts.as_deref()),
+            ("FilterInArns", input.filter_in_arns.as_deref()),
+            ("FilterOutArns", input.filter_out_arns.as_deref()),
+        ] {
+            let entries: &[String] = entries.unwrap_or_default();
+            if entries.len() > MAX_ANALYSIS_SCOPING_ENTRIES {
+                return Err(state::invalid_parameter_value(format!(
+                    "{member} carries {} entries, above the maximum of \
+                     {MAX_ANALYSIS_SCOPING_ENTRIES}",
+                    entries.len()
+                )));
+            }
+        }
+
+        // "The tags to apply" (`TagSpecifications`) — "you must specify the resource type to
+        // tag, otherwise the request will fail" (`TagSpecification`), and the only type this
+        // action tags is the analysis it starts. The tag payload's own bounds (the count per
+        // resource, each key and value's length, no key twice, nothing in the reserved
+        // namespace) are applied by the one shared reader every writer holds its tags to.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_NETWORK_INSIGHTS_ANALYSIS,
+            Self::NAME,
+        )?;
+
+        // Everything the store needs to hold this analysis, assembled once here so the
+        // budget check below charges exactly what the insert stores. The Region is the one
+        // the request was signed for, which the analysis's ARN names; `ctx` carries no other
+        // fact this operation reads.
+        let spec = state::NetworkInsightsAnalysisSpec {
+            network_insights_path_id: input.network_insights_path_id,
+            additional_accounts: input.additional_accounts.unwrap_or_default(),
+            filter_in_arns: input.filter_in_arns.unwrap_or_default(),
+            filter_out_arns: input.filter_out_arns.unwrap_or_default(),
+            region: state::request_region(ctx.parts()),
+            tags,
+            client_token: input.client_token,
+        };
+        let payload_bytes = state::network_insights_analysis_payload_bytes(&spec);
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // The clock-owed ends already due are applied before anything is read back, for the
+        // same reason the describe applies them: each was owed at this instant whether or
+        // not anybody called. Without it a `ClientToken` replay arriving after an analysis's
+        // span would answer the stale `running` view while the describe reported the same
+        // analysis ended.
+        store.materialize_due_transitions();
+
+        // Idempotency: one token names the one analysis it started, so a replay reports that
+        // analysis and starts no second one. Read BEFORE the path is resolved, so a replay
+        // answers the analysis it started for as long as it is stored, and answered after
+        // the DryRun check below, because a replay stores nothing and so passes the ceilings
+        // a fresh start has to clear.
+        let replayed = store
+            .network_insights_analysis_client_tokens
+            .get(&spec.client_token)
+            .cloned();
+
+        // A token names ONE request: reusing it for a different one is refused rather than
+        // answered with the analysis the first request started. "Do not reuse a client token
+        // with different requests, unless the requests are identical"
+        // (`IdempotentParameterMismatch`), and what makes two of these requests different is
+        // the path they analyze — the scoping lists and the tags name no other resource.
+        // Refused before the DryRun check below, because a dry run of a request that would
+        // have been refused is refused with that reason.
+        if let Some(analysis_id) = replayed.as_deref() {
+            let analyzed_before = store
+                .network_insights_analyses
+                .get(analysis_id)
+                .and_then(|record| record.view.network_insights_path_id.as_deref());
+            if analyzed_before.is_some_and(|path_id| path_id != spec.network_insights_path_id) {
+                return Err(state::idempotent_parameter_mismatch());
+            }
+        }
+
+        // "The ID of the path" (`NetworkInsightsPathId`): an id that names no path of the
+        // account is refused rather than analyzed.
+        if replayed.is_none()
+            && !store
+                .network_insights_paths
+                .contains_key(&spec.network_insights_path_id)
+        {
+            return Err(state::invalid_network_insights_path_id_not_found(
+                &spec.network_insights_path_id,
+            ));
+        }
+
+        // A count ceiling first, then the byte budget: a record count on its own admits
+        // gigabytes, because each record holds strings the caller chose the length of.
+        // Neither is charged to a replay, which stores nothing.
+        if replayed.is_none() && !store.has_network_insights_analysis_capacity() {
+            return Err(state::resource_count_exceeded(format!(
+                "This emulator holds {} network insights analyses, which is as many as it \
+                 stores",
+                state::MAX_NETWORK_INSIGHTS_ANALYSES
+            )));
+        }
+        if replayed.is_none() && store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(state::resource_count_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied data, \
+                 so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // DryRun sits AFTER every parameter has been validated and BEFORE the first write:
+        // the flag asks whether the request WOULD have worked, so one that would have been
+        // refused is refused with that reason instead, and one that would have succeeded
+        // leaves state untouched.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        if let Some(analysis_id) = replayed {
+            return store
+                .network_insights_analyses
+                .get(&analysis_id)
+                .map(|record| StartNetworkInsightsAnalysisOutput {
+                    network_insights_analysis: Some(record.view.clone()),
+                })
+                .ok_or_else(|| {
+                    state::internal_error(format!(
+                        "a client token names analysis '{analysis_id}', which is not stored"
+                    ))
+                });
+        }
+
+        // The record itself, built the one way this crate starts a path analysis — the id,
+        // the ARN, the `running` status, the start date and the end the clock owes it all
+        // come from the store, never from the request. The store refuses the write itself
+        // when it is full, so the ceiling holds even if the gate above is ever moved.
+        let analysis = store.insert_network_insights_analysis(spec).ok_or_else(|| {
+            state::resource_count_exceeded(format!(
+                "This emulator holds {} network insights analyses, which is as many as it \
+                 stores",
+                state::MAX_NETWORK_INSIGHTS_ANALYSES
+            ))
+        })?;
+        Ok(StartNetworkInsightsAnalysisOutput {
+            network_insights_analysis: Some(analysis),
+        })
     }
 }

@@ -21,7 +21,7 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::{member_of, Emulator, ROLE};
+use crate::harness::{member_of, Emulator, PAST_WEB_APP_UPDATE_SPAN, ROLE};
 
 /// An IAM Identity Center instance ARN satisfying `IdentityCenterInstanceArn`'s modelled
 /// pattern `^arn:[\w-]+:sso:::instance/(sso)?ins-[a-zA-Z0-9-.]{16}$`.
@@ -29,10 +29,6 @@ const INSTANCE_ARN: &str = "arn:aws:sso:::instance/ssoins-1234567890abcdef";
 
 /// A `WebAppId` satisfying the modelled `^webapp-[0-9a-f]{17}$` that no create minted.
 const NEVER_MINTED_WEB_APP: &str = "webapp-0000000000000dead";
-
-/// `state::WEB_APP_UPDATE_SPAN` is 500 ms; wait past it, so a sequential row's update is
-/// not read as racing the previous one.
-const PAST_UPDATE_SPAN: std::time::Duration = std::time::Duration::from_millis(900);
 
 /// Create one web app and hand back its id.
 async fn create_web_app(emulator: &Emulator, case: &str, request: Value) -> String {
@@ -227,7 +223,7 @@ async fn an_update_assigns_the_members_it_carries() {
         }
 
         // Past the roll-out window, so the next row is not read as racing this one.
-        tokio::time::sleep(PAST_UPDATE_SPAN).await;
+        tokio::time::sleep(PAST_WEB_APP_UPDATE_SPAN).await;
     }
 }
 
@@ -388,7 +384,7 @@ async fn concurrent_updates_have_exactly_one_winner() {
     );
 
     // Once the roll-out completes, the next update is accepted again.
-    tokio::time::sleep(PAST_UPDATE_SPAN).await;
+    tokio::time::sleep(PAST_WEB_APP_UPDATE_SPAN).await;
     let after = emulator
         .call(
             "UpdateWebApp",

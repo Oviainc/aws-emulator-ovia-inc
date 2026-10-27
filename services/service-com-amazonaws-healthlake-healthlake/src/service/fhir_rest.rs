@@ -305,6 +305,9 @@ impl<Eng: Send + Sync + 'static> FhirRestDataPlane<Eng> {
             last_updated: stamp,
             content,
             bytes,
+            // A created resource has superseded nothing: its first version is
+            // the only one there is.
+            superseded: Vec::new(),
         };
         let Some(datastore) = store.datastores.get_mut(&route.datastore_id) else {
             // `serving` resolved the record under this same lock.
@@ -334,6 +337,14 @@ impl<Eng: Send + Sync + 'static> FhirRestDataPlane<Eng> {
     /// resource at that id when it holds none, answering `201`; replacing the version it
     /// does hold answers `200`. Either way the stored version is the one a later `read`
     /// answers, and `meta.versionId` advances with every write.
+    ///
+    /// A write ENDS the span the version it replaces was current for rather than
+    /// erasing that version: the superseded version is retained on the record
+    /// ([`crate::state::FhirResource::supersede`]), bounded by
+    /// [`crate::state::MAX_FHIR_RESOURCE_VERSIONS`], so a reader asking what this
+    /// resource was at an earlier instant — the point-in-time restore
+    /// `RestoreFHIRDatastore` performs — is answered the version that was current
+    /// then.
     fn update(
         &self,
         route: &FhirEndpointPath,
@@ -393,13 +404,12 @@ impl<Eng: Send + Sync + 'static> FhirRestDataPlane<Eng> {
         }
 
         // What is held at this id already decides everything that differs between the
-        // two outcomes: the version the write lands on, the bytes it gives back to the
-        // budget, and the status.
-        let replaced = store
+        // two outcomes: the version the write lands on, and the status.
+        let held_version = store
             .datastores
             .get(&route.datastore_id)
             .and_then(|datastore| datastore.fhir_resource(resource_type, id))
-            .map(|resource| (resource.version, resource.bytes));
+            .map(|resource| resource.version);
 
         let now = SystemTime::now();
         let stamp = ::aws_smithy_types::DateTime::from(now);
@@ -410,7 +420,7 @@ impl<Eng: Send + Sync + 'static> FhirRestDataPlane<Eng> {
                 "The server could not render the resource's last-updated instant",
             );
         };
-        let version = replaced.map_or(1, |(held, _bytes)| held.saturating_add(1));
+        let version = held_version.map_or(1, |held| held.saturating_add(1));
         let content = stored_content(submitted, id, version, &last_updated);
         let serialized = content.to_string();
         let bytes = serialized.len();
@@ -426,15 +436,55 @@ impl<Eng: Send + Sync + 'static> FhirRestDataPlane<Eng> {
                 ),
             );
         }
-        let released = replaced.map_or(0, |(_version, held_bytes)| held_bytes);
-        if let Err(failure) = admits(&store, &route.datastore_id, bytes, released, replaced.is_none())
+        // The version this write supersedes is RETAINED beside the new one, so the
+        // write gives nothing back unless versions have to be DROPPED: the
+        // retained-version ceiling drops the oldest, and the retention budgets drop
+        // further ones, oldest first, rather than refusing a write that a data store
+        // keeping no history would have admitted. How many go is settled HERE, before
+        // anything is written, so the write either fits every budget or is refused.
+        let dropped = match store
+            .datastores
+            .get(&route.datastore_id)
+            .and_then(|datastore| datastore.fhir_resource(resource_type, id))
         {
-            return failure.response();
-        }
+            Some(held) => {
+                let mut admitted = None;
+                let mut refused = None;
+                for drop in held.forced_drops_on_supersede()..=held.max_drops_on_supersede() {
+                    match admits(
+                        &store,
+                        &route.datastore_id,
+                        bytes,
+                        held.release_dropping(drop),
+                        false,
+                    ) {
+                        Ok(()) => {
+                            admitted = Some(drop);
+                            break;
+                        }
+                        Err(failure) => refused = Some(failure),
+                    }
+                }
+                match (admitted, refused) {
+                    (Some(drop), _) => drop,
+                    // Not even retaining no earlier version at all fits the budgets,
+                    // so the refusal the last attempt earned is this write's answer.
+                    (None, Some(failure)) => return failure.response(),
+                    // The walk above runs at least once, so one of the two is always
+                    // set; answering a server fault keeps the handler total.
+                    (None, None) => return store_unavailable(),
+                }
+            }
+            // `update-as-create` retains one more resource and releases nothing.
+            None => {
+                if let Err(failure) = admits(&store, &route.datastore_id, bytes, 0, true) {
+                    return failure.response();
+                }
+                0
+            }
+        };
 
-        let resource = crate::state::FhirResource {
-            resource_type: resource_type.to_string(),
-            id: id.to_string(),
+        let next = crate::state::FhirResourceVersion {
             version,
             last_updated: stamp,
             content,
@@ -448,16 +498,39 @@ impl<Eng: Send + Sync + 'static> FhirRestDataPlane<Eng> {
             "{}{resource_type}/{id}/_history/{version}",
             datastore.endpoint
         );
-        // The replaced version's bytes go back to the budget before the new ones are
-        // charged, so repeatedly updating one resource does not accumulate.
+        let key = (resource_type.to_string(), id.to_string());
+        let released = match datastore.fhir_resources.get_mut(&key) {
+            // The same resource, one version on: the version it held moves into its
+            // history, where a read as of an earlier instant is still answered from,
+            // and this one takes its place.
+            Some(held) => held.supersede_dropping(next, dropped),
+            // `update-as-create`: nothing is held at this id, so this write mints the
+            // resource there at its first version, superseding nothing.
+            None => {
+                datastore.fhir_resources.insert(
+                    key,
+                    crate::state::FhirResource {
+                        resource_type: resource_type.to_string(),
+                        id: id.to_string(),
+                        version: next.version,
+                        last_updated: next.last_updated,
+                        content: next.content,
+                        bytes: next.bytes,
+                        superseded: Vec::new(),
+                    },
+                );
+                0
+            }
+        };
+        // The bytes this write retains are charged, and the bytes of the versions it
+        // dropped are given back: a superseded version stays held, so repeatedly
+        // updating one resource accumulates only up to the retained-version ceiling
+        // and whatever the retention budgets admit.
         datastore.fhir_resource_bytes = datastore
             .fhir_resource_bytes
             .saturating_sub(released)
             .saturating_add(bytes);
-        datastore
-            .fhir_resources
-            .insert((resource_type.to_string(), id.to_string()), resource);
-        let status = if replaced.is_some() { 200 } else { 201 };
+        let status = if held_version.is_some() { 200 } else { 201 };
         let mut response = fhir_response(status, serialized);
         response.headers_mut().insert("location", location);
         response
@@ -701,8 +774,8 @@ fn submitted_within_size(body: &[u8]) -> Result<(), Failure> {
 }
 
 /// `Ok` when the data store `datastore_id` can RETAIN a resource of `bytes` that
-/// releases `released` bytes of a version it replaces, and whether that write adds a
-/// resource (`retains_one_more`) or replaces one.
+/// releases `released` bytes of versions this write drops, and whether that write adds a
+/// resource (`retains_one_more`) or writes a further version of one it holds.
 ///
 /// The three ceilings this emulator holds the FHIR data plane to, in one place so a
 /// create and an update charge them identically: how many resources one data store

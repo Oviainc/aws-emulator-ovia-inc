@@ -195,6 +195,8 @@ mod load_balancer_listing;
 mod load_balancer_metric_data;
 #[path = "all/load_balancer_provisioning.rs"]
 mod load_balancer_provisioning;
+#[path = "all/load_balancer_tls_certificate_attach.rs"]
+mod load_balancer_tls_certificate_attach;
 #[path = "all/load_balancer_tls_certificate_create.rs"]
 mod load_balancer_tls_certificate_create;
 #[path = "all/load_balancer_tls_certificate_delete.rs"]

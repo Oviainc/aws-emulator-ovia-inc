@@ -431,6 +431,177 @@ pub struct Materialised {
     /// Every resource transition this deployment made, oldest first — the stack's
     /// per-resource event records.
     pub transitions: Vec<ResourceTransition>,
+    /// The resources this deployment CREATED whose owning service does not report them
+    /// ready yet: the create was accepted and the identifier is assigned, but the resource
+    /// is not usable, so CloudFormation holds its creation — and the operation — open until
+    /// that service says it is ([`super::stabilising`]).
+    pub stabilising: Vec<Stabilising>,
+}
+
+/// One resource whose creation an owning service accepted and has not finished.
+///
+/// What the stack needs in order to go on asking that service about it: which resource it
+/// is, and the state that service reported when the create answered.
+#[derive(Debug, Clone)]
+pub struct Stabilising {
+    pub logical_id: String,
+    pub resource_type: String,
+    /// The identifier the owning service assigned, which the readiness read addresses the
+    /// resource by.
+    pub physical_resource_id: String,
+    /// That service's own word for the state the resource is in, as its API spells it.
+    pub reported_state: String,
+}
+
+/// What the service that owns a resource says about a resource it has CREATED: whether the
+/// resource has reached the state that service reports it ready in.
+///
+/// Answered by the type's own arm ([`super::provisioner::Provisioner::readiness`]) from
+/// that service's own read, so it is never a status this crate guessed. A type whose create
+/// leaves the resource ready — which is most of them — answers [`Self::Ready`] without
+/// asking anything.
+#[derive(Debug, Clone)]
+pub(super) enum Readiness {
+    /// The resource is in the state that service reports it ready in, so its creation is
+    /// finished.
+    Ready,
+    /// Not yet: the state that service reports the resource in right now.
+    Pending(String),
+    /// That service reports the resource FAILED: nothing is going to bring it up, so the
+    /// resource's creation failed with this reason rather than waiting the window out.
+    Failed(String),
+}
+
+/// Ask the services that own a Region's still-creating resources whether they are ready
+/// yet, and record what they answer.
+///
+/// This is the other half of [`super::stabilising`]: a resource whose owning service
+/// accepted the create without reporting the resource ready holds its stack's operation
+/// open, and what ENDS that wait is that service's own answer about the resource — which
+/// only a call to it can give. `settle` cannot make that call (it runs under the store
+/// lock, and a read of this store cannot reach another service), so the operations that
+/// REPORT a stack's progress ask here, before they take the lock: a client polling a
+/// stack's resources is exactly the caller that needs the answer.
+///
+/// What this records was owed at the instant the owning service reached it, whether or not
+/// anybody called: the resource became ready then, and a wait that has run out
+/// ([`super::stabilising::StabilisationBarrier::has_expired`]) failed then. The one thing it
+/// changes in another service is what that failure owes: a failed create is rolled back, so
+/// the resources it had made are removed again — the same work
+/// [`crate::ops::create_stack`]'s own failure path does, and for the same reason
+/// [`super::settle_due_rollbacks`] performs a failed update's rollback here rather than under
+/// the store lock. Every other call this makes is that service's own READ.
+///
+/// Only the stacks of the Region the request was signed for are advanced: that is the set
+/// the operation calling this reports on, and the Region is what the credential scope of
+/// every call made here names.
+pub async fn advance_stabilisations(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    state: &::engine::ServiceState<super::ComAmazonawsCloudformationCloudformationState>,
+) {
+    let region = super::request_region(ctx.parts());
+    let region = region.as_str();
+    // Which resources are still waiting, read under a lock of its own: the readiness calls
+    // below reach other services' handlers, which take those services' locks, so a client
+    // reading THIS service must not be blocked behind them.
+    let waiting: Vec<(String, Vec<super::stabilising::StabilisationBarrier>)> = {
+        let store = state.lock();
+        store
+            .stacks
+            .iter()
+            .filter(|stack| stack.region == region)
+            .filter_map(|stack| {
+                let open = stack.open_stabilisations();
+                if open.is_empty() {
+                    None
+                } else {
+                    Some((stack.stack_id.clone(), open))
+                }
+            })
+            .collect()
+    };
+    for (stack_id, barriers) in waiting {
+        for barrier in barriers {
+            let readiness = match provisioner_for(&barrier.resource_type) {
+                Some(provisioner) => {
+                    provisioner
+                        .readiness(ctx, region, &barrier.physical_resource_id)
+                        .await
+                }
+                // Nothing owns the type any more, so there is nothing to ask: the wait is
+                // over, because what opened it was that provisioner's answer.
+                None => Ok(Readiness::Ready),
+            };
+            let now = SystemTime::now();
+            // What a failure the answer makes due owes besides the stack's own failed
+            // status: the resources a rolled-back CREATE has to remove again. Taken under
+            // the lock and performed with it RELEASED, as every other call this module
+            // makes is.
+            let unwinding = {
+                let mut store = state.lock();
+                let Some(stack) = store.resolve_mut(region, &stack_id) else {
+                    continue;
+                };
+                match readiness {
+                    Ok(Readiness::Ready) => {
+                        stack.release_stabilisation(&barrier.logical_id, now);
+                        None
+                    }
+                    // Still coming up: the wait holds, unless it has run out — which is the
+                    // instant the resource's creation failed.
+                    Ok(Readiness::Pending(state)) => {
+                        if barrier.has_expired(now) {
+                            stack.fail_stabilisation(
+                                now,
+                                &barrier.logical_id,
+                                &barrier.not_stabilised_reason(&state),
+                            )
+                        } else {
+                            None
+                        }
+                    }
+                    // That service says the resource will not come up, so waiting the window
+                    // out would report a resource as creating that nothing is creating.
+                    Ok(Readiness::Failed(reason)) => {
+                        stack.fail_stabilisation(now, &barrier.logical_id, &reason)
+                    }
+                    // The service could not be asked at all. One unanswered read is not
+                    // evidence about the resource — a service is allowed to throttle or be
+                    // briefly unreachable — so the wait holds and the next read asks again;
+                    // only the window running out ends it.
+                    Err(refusal) => {
+                        if barrier.has_expired(now) {
+                            stack.fail_stabilisation(
+                                now,
+                                &barrier.logical_id,
+                                &handler_failure_reason(&refusal),
+                            )
+                        } else {
+                            None
+                        }
+                    }
+                }
+            };
+            // "ROLLBACK — Roll back the stack creation. This is the default": the resources
+            // the failed create had already made are removed again in the services that own
+            // them, exactly as `crate::ops::create_stack`'s own failure path removes them,
+            // and only a delete one of those services REFUSES changes the status the
+            // rollback settles into.
+            let Some(resources) = unwinding else {
+                continue;
+            };
+            let deleted = unwind(ctx, region, &resources).await;
+            let mut store = state.lock();
+            let Some(stack) = store.resolve_mut(region, &stack_id) else {
+                continue;
+            };
+            stack.schedule_resource_events(&deleted.transitions);
+            stack.record_materialised_resources(deleted.resources);
+            if let Some(failure) = deleted.failure {
+                stack.fail_transition(SystemTime::now(), super::status::ROLLBACK_FAILED, failure);
+            }
+        }
+    }
 }
 
 /// Reconcile what a stack's newly deployed template declares with what the stack already
@@ -677,7 +848,11 @@ pub async fn reconcile(
         outcome
             .transitions
             .push(ResourceTransition::creating(&resource));
-        let created = match provisioner_for(&resource.resource_type) {
+        // Which service owns the type, resolved ONCE here: the create below and the
+        // readiness read that follows it are two questions for the same provisioner, and
+        // one lookup is what keeps them from ever being asked of different ones.
+        let owner = provisioner_for(&resource.resource_type);
+        let created = match owner {
             // The resource is created WITH the tags CloudFormation gives it: the stack's
             // own, plus the three that name the stack and this resource's place in it.
             Some(provisioner) => {
@@ -739,11 +914,75 @@ pub async fn reconcile(
                 outcome
                     .transitions
                     .push(ResourceTransition::initiated(&resource));
-                outcome.transitions.push(ResourceTransition::finished(
-                    &resource,
-                    super::resource_status::CREATE_COMPLETE,
-                    None,
-                ));
+                // The create was ACCEPTED; whether the resource is usable is the owning
+                // service's to say. A type whose create leaves it coming up answers the
+                // state it is in, and the resource's creation is held open until that
+                // service reports it ready ([`super::stabilising`]) — CloudFormation does
+                // not report a resource created on the strength of an accepted call.
+                let readiness = match owner {
+                    Some(provisioner) => {
+                        provisioner
+                            .readiness(ctx, region, &resource.physical_resource_id)
+                            .await
+                    }
+                    None => Ok(Readiness::Ready),
+                };
+                match readiness {
+                    Ok(Readiness::Ready) => {
+                        outcome.transitions.push(ResourceTransition::finished(
+                            &resource,
+                            super::resource_status::CREATE_COMPLETE,
+                            None,
+                        ));
+                    }
+                    Ok(Readiness::Pending(state)) => {
+                        // The terminal transition is planned here as it is for any other
+                        // resource; the gate this records is what holds it back until the
+                        // owning service reports the resource ready.
+                        outcome.stabilising.push(Stabilising {
+                            logical_id: resource.logical_id.clone(),
+                            resource_type: resource.resource_type.clone(),
+                            physical_resource_id: resource.physical_resource_id.clone(),
+                            reported_state: state,
+                        });
+                        outcome.transitions.push(ResourceTransition::finished(
+                            &resource,
+                            super::resource_status::CREATE_COMPLETE,
+                            None,
+                        ));
+                    }
+                    // The resource exists in that service and is not going to come up, or
+                    // that service could not be asked about it at all: either way the
+                    // create did not go through, so the deployment stops here exactly as it
+                    // does on a refused create. The record keeps `materialised`, so the
+                    // rollback still deletes what the create made.
+                    Ok(Readiness::Failed(reason)) => {
+                        outcome.failure = Some(super::resource_failure_summary(
+                            super::failed_action::CREATE,
+                            [resource.logical_id.as_str()],
+                        ));
+                        outcome.transitions.push(ResourceTransition::finished(
+                            &resource,
+                            super::resource_status::CREATE_FAILED,
+                            Some(reason),
+                        ));
+                        outcome.resources.push(resource);
+                        break;
+                    }
+                    Err(refusal) => {
+                        outcome.failure = Some(super::resource_failure_summary(
+                            super::failed_action::CREATE,
+                            [resource.logical_id.as_str()],
+                        ));
+                        outcome.transitions.push(ResourceTransition::finished(
+                            &resource,
+                            super::resource_status::CREATE_FAILED,
+                            Some(handler_failure_reason(&refusal)),
+                        ));
+                        outcome.resources.push(resource);
+                        break;
+                    }
+                }
             }
             Err(refusal) => {
                 outcome.failure = Some(super::resource_failure_summary(

@@ -28,18 +28,14 @@
 //! Every test drives the real wire path through the shared [`crate::harness`] — `POST /`
 //! with `X-Amz-Target: TransferService.<Op>` — so what is asserted is what an SDK sees.
 
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use serde_json::{json, Value};
 
 use crate::harness::{
     assert_members, generated_host_key, host_key_algorithm, is_modelled_host_key_id, member_of,
-    unix_seconds, Emulator, ACCOUNT, PAST_START_SPAN, REGION, SSH_KEY,
+    unix_seconds, Emulator, ACCOUNT, PAST_START_SPAN, PAST_STOP_SPAN, REGION, SSH_KEY,
 };
-
-/// `SERVER_STOP_SPAN` in `src/state.rs` is 500 ms; wait past it. Kept here, next to the
-/// only host-key test that stops a server, rather than in the shared harness.
-const PAST_STOP_SPAN: Duration = Duration::from_millis(900);
 
 /// How far outside the window measured around a call a reported timestamp may fall.
 ///

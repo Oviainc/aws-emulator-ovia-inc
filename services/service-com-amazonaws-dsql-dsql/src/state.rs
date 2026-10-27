@@ -27,7 +27,8 @@
 //! ([`RecordedDelete`]) lives here for the same reason: both deletes record and
 //! read back the same members, so the encoding and the refusal of an incomplete
 //! record are one implementation, parameterised by the output each handler
-//! builds.
+//! builds. The answer a served `CreateCluster` keeps
+//! ([`RecordedClusterCreation`]) lives here on the same terms.
 //!
 //! The checks a request's own input has to pass before anything is written live
 //! here for the same reason: a cluster's resource-based policy is attached by two
@@ -2105,6 +2106,24 @@ pub const POLICY_VERSION_MEMBER: &str = "policyVersion";
 /// under ([`RecordedCall::answering`]).
 pub const ARN_MEMBER: &str = "arn";
 
+/// The name a cluster's deletion-protection member carries on the wire
+/// (`smithy_query(query="operation", operation="CreateCluster")`: a `@required`
+/// `deletionProtectionEnabled`), and so the key a recorded call keeps that
+/// answer under ([`RecordedCall::answering`]).
+pub const DELETION_PROTECTION_ENABLED_MEMBER: &str = "deletionProtectionEnabled";
+
+/// The name a cluster's encryption member carries on the wire
+/// (`smithy_query(query="operation", operation="CreateCluster")`:
+/// `encryptionDetails`), and so the key a recorded call keeps that answer under
+/// ([`RecordedCall::answering`]).
+pub const ENCRYPTION_DETAILS_MEMBER: &str = "encryptionDetails";
+
+/// The name a cluster's multi-Region member carries on the wire
+/// (`smithy_query(query="operation", operation="CreateCluster")`:
+/// `multiRegionProperties`), and so the key a recorded call keeps that answer
+/// under ([`RecordedCall::answering`]).
+pub const MULTI_REGION_PROPERTIES_MEMBER: &str = "multiRegionProperties";
+
 /// The name a retired resource's creation-time member carries on the wire
 /// (`smithy_query(query="operation", operation="DeleteCluster,DeleteStream")`: a
 /// `@required` `creationTime` on each), and so the key a recorded call keeps
@@ -2179,6 +2198,152 @@ impl RecordedDelete {
             status: recorded.answered(STATUS_MEMBER)?.to_string(),
             creation_time: decode_instant(recorded.answered(CREATION_TIME_MEMBER)?)?,
         })
+    }
+}
+
+/// What a served `CreateCluster` answered that the cluster's own record no
+/// longer determines once something else has run.
+///
+/// A minted cluster's `identifier`, `arn`, `creationTime` and `endpoint` are
+/// fixed for its whole life, so a retry renders those from the stored record.
+/// The members here are not: the clock moves `status` on, and `UpdateCluster`
+/// writes `deletionProtectionEnabled`, `encryptionDetails` and
+/// `multiRegionProperties` again. Each is therefore kept with the token and
+/// served from the record, as [`RecordedCall`] requires of a value a later call
+/// can supersede, so the retry answers the result of the original request.
+#[derive(Debug, Clone)]
+pub struct RecordedClusterCreation {
+    /// The `status` the call answered.
+    pub status: String,
+    /// The `deletionProtectionEnabled` the call answered.
+    pub deletion_protection_enabled: bool,
+    /// The `encryptionDetails` the call answered, if it answered any.
+    pub encryption_details: Option<EncryptionDetails>,
+    /// The `multiRegionProperties` the call answered, if it answered any.
+    pub multi_region_properties: Option<MultiRegionProperties>,
+}
+
+impl RecordedClusterCreation {
+    /// This answer as the ledger stores it, against the cluster `resource` the
+    /// call minted.
+    pub fn into_record(self, resource: &str) -> RecordedCall {
+        RecordedCall::new(resource)
+            .answering(STATUS_MEMBER, &self.status)
+            .answering(
+                DELETION_PROTECTION_ENABLED_MEMBER,
+                &self.deletion_protection_enabled.to_string(),
+            )
+            .answering(
+                ENCRYPTION_DETAILS_MEMBER,
+                &encode_encryption_details(self.encryption_details.as_ref()),
+            )
+            .answering(
+                MULTI_REGION_PROPERTIES_MEMBER,
+                &encode_multi_region(self.multi_region_properties.as_ref()),
+            )
+    }
+
+    /// The answer `recorded` holds, or `None` when it is missing any member a
+    /// served create records — a record a handler has to refuse over rather than
+    /// serve a re-derived member from, since a served create records all four.
+    pub fn from_record(recorded: &RecordedCall) -> Option<Self> {
+        Some(Self {
+            status: recorded.answered(STATUS_MEMBER)?.to_string(),
+            deletion_protection_enabled: recorded
+                .answered(DELETION_PROTECTION_ENABLED_MEMBER)?
+                .parse()
+                .ok()?,
+            encryption_details: decode_encryption_details(
+                recorded.answered(ENCRYPTION_DETAILS_MEMBER)?,
+            )?,
+            multi_region_properties: decode_multi_region(
+                recorded.answered(MULTI_REGION_PROPERTIES_MEMBER)?,
+            )?,
+        })
+    }
+}
+
+/// How a [`RecordedCall`] keeps an `EncryptionDetails` it answered: the
+/// structure's members as a JSON object, and JSON `null` for a call that
+/// answered none.
+///
+/// A recorded answer is a string, so a structured member is encoded rather than
+/// flattened: `null` is what distinguishes "this call answered no
+/// `encryptionDetails`" from "no `encryptionDetails` was ever recorded", which
+/// is the case [`RecordedCall::answered`] reserves `None` for.
+fn encode_encryption_details(details: Option<&EncryptionDetails>) -> String {
+    match details {
+        None => ::serde_json::Value::Null.to_string(),
+        Some(details) => ::serde_json::json!({
+            "encryptionType": details.encryption_type,
+            "kmsKeyArn": details.kms_key_arn,
+            "encryptionStatus": details.encryption_status,
+        })
+        .to_string(),
+    }
+}
+
+/// Read back the `encryptionDetails` [`encode_encryption_details`] wrote (the
+/// outer `Option` is the decoding, the inner one the answer), or `None` for a
+/// string it did not write.
+fn decode_encryption_details(recorded: &str) -> Option<Option<EncryptionDetails>> {
+    let encoded: ::serde_json::Value = ::serde_json::from_str(recorded).ok()?;
+    if encoded.is_null() {
+        return Some(None);
+    }
+    let object = encoded.as_object()?;
+    Some(Some(EncryptionDetails {
+        encryption_type: object.get("encryptionType")?.as_str()?.to_string(),
+        kms_key_arn: decoded_text(object.get("kmsKeyArn"))?,
+        encryption_status: object.get("encryptionStatus")?.as_str()?.to_string(),
+    }))
+}
+
+/// How a [`RecordedCall`] keeps a `MultiRegionProperties` it answered, on the
+/// same terms as [`encode_encryption_details`].
+fn encode_multi_region(properties: Option<&MultiRegionProperties>) -> String {
+    match properties {
+        None => ::serde_json::Value::Null.to_string(),
+        Some(properties) => ::serde_json::json!({
+            "witnessRegion": properties.witness_region,
+            "clusters": properties.clusters,
+        })
+        .to_string(),
+    }
+}
+
+/// Read back the `multiRegionProperties` [`encode_multi_region`] wrote, on the
+/// same terms as [`decode_encryption_details`]. The peer list keeps the order it
+/// was answered in, which is the order the request carried.
+fn decode_multi_region(recorded: &str) -> Option<Option<MultiRegionProperties>> {
+    let encoded: ::serde_json::Value = ::serde_json::from_str(recorded).ok()?;
+    if encoded.is_null() {
+        return Some(None);
+    }
+    let object = encoded.as_object()?;
+    let clusters = match object.get("clusters") {
+        None | Some(::serde_json::Value::Null) => None,
+        Some(::serde_json::Value::Array(peers)) => Some(
+            peers
+                .iter()
+                .map(|peer| peer.as_str().map(str::to_string))
+                .collect::<Option<Vec<String>>>()?,
+        ),
+        Some(_) => return None,
+    };
+    Some(Some(MultiRegionProperties {
+        witness_region: decoded_text(object.get("witnessRegion"))?,
+        clusters,
+    }))
+}
+
+/// One optional string member of an encoded answer: absent or JSON `null` is a
+/// member the call answered nothing for, a string is its value, and anything
+/// else is not an encoding this module wrote.
+fn decoded_text(member: Option<&::serde_json::Value>) -> Option<Option<String>> {
+    match member {
+        None | Some(::serde_json::Value::Null) => Some(None),
+        Some(text) => Some(Some(text.as_str()?.to_string())),
     }
 }
 

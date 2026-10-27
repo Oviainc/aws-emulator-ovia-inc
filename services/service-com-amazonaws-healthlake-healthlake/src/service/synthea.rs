@@ -336,8 +336,11 @@ pub(crate) fn preloaded_resources(
                 last_updated: stamp,
                 content,
                 bytes: serialized.len(),
+                // A preloaded resource is written once, so it has superseded
+                // nothing: its first version is the only one there is.
+                superseded: Vec::new(),
             };
-            bytes = bytes.saturating_add(resource.bytes);
+            bytes = bytes.saturating_add(resource.retained_bytes());
             resources.insert((resource_type.to_string(), id), resource);
         }
     }
