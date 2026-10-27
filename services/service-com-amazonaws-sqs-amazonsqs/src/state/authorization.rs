@@ -120,6 +120,11 @@ const PRINCIPAL_TAG_PREFIX: &str = "aws:PrincipalTag/";
 /// The global condition keys that name the calling PRINCIPAL itself, which this gate knows
 /// exactly: "aws:PrincipalArn — the ARN of the principal that made the request" and
 /// "aws:PrincipalAccount — the account the principal belongs to".
+/// "For IAM roles, the request context returns the ARN of the role, not the ARN of the user
+/// that assumed the role" (`aws:PrincipalArn`, IAM's global condition keys), so a request
+/// signed by an assumed-role session answers that key with the ROLE's ARN — the identity
+/// whose policies are in force — while the ARN a refusal names stays the session's, which is
+/// what STS reports for that credential.
 const PRINCIPAL_ARN_KEY: &str = "aws:PrincipalArn";
 const PRINCIPAL_ACCOUNT_KEY: &str = "aws:PrincipalAccount";
 
@@ -221,7 +226,9 @@ fn not_authorized(principal: &str, action: &str, resource: &str, reason: &str) -
 /// The action as a refusal of this service NAMES it: lower case throughout.
 ///
 /// IAM compares a policy's action names case-insensitively, so the case a refusal reports
-/// is a wording choice rather than part of the decision — and the wording is the service's.
+/// is a wording choice rather than part of the decision — and the wording is the service's:
+/// the recorded refusals of this service name the action case-folded (`sqs:sendmessage`),
+/// whatever case the policy and the model spell it in.
 fn reported_action(action: &str) -> String {
     action.to_lowercase()
 }
@@ -399,13 +406,18 @@ pub fn caller<Eng: Send + Sync + 'static>(
     let session_tags = tags;
     // An assumed-role session is also named by the ARN of the role it is a session of,
     // which is the spelling a resource policy uses to name the role itself.
-    if let Some(role_arn) = role_arn {
-        if !caller.principals.contains(&role_arn) {
+    if let Some(role_arn) = &role_arn {
+        if !caller.principals.contains(role_arn) {
             caller.principals.push(role_arn.clone());
         }
     }
     let Some(iam) = iam else {
-        caller.context = condition_context(&caller.arn, &account, &[], &session_tags);
+        caller.context = condition_context(
+            role_arn.as_deref().unwrap_or(&caller.arn),
+            &account,
+            &[],
+            &session_tags,
+        );
         return caller;
     };
     let store = iam.lock();
@@ -418,7 +430,12 @@ pub fn caller<Eng: Send + Sync + 'static>(
         .cloned()
         .or_else(|| role_arn_of_session(&store, &caller.arn))
     else {
-        caller.context = condition_context(&caller.arn, &account, &[], &session_tags);
+        caller.context = condition_context(
+            role_arn.as_deref().unwrap_or(&caller.arn),
+            &account,
+            &[],
+            &session_tags,
+        );
         return caller;
     };
     if let Some(policies) = store.principal_policies(&identity_arn) {
@@ -429,7 +446,7 @@ pub fn caller<Eng: Send + Sync + 'static>(
         caller.principals.push(identity_arn.clone());
     }
     caller.context = condition_context(
-        &caller.arn,
+        &identity_arn,
         &account,
         &entity_tags(&store, &identity_arn),
         &session_tags,
@@ -446,8 +463,12 @@ pub fn caller<Eng: Send + Sync + 'static>(
 ///
 /// Nothing else is published: a key this emulator cannot answer for leaves the statement
 /// that names it undecided, which is the fail-closed reading the shared evaluator takes.
+///
+/// `principal_arn` is the ARN `aws:PrincipalArn` answers with: the IDENTITY whose policies
+/// are in force, which for an assumed-role session is the role rather than the session (see
+/// [`PRINCIPAL_ARN_KEY`]).
 fn condition_context(
-    arn: &str,
+    principal_arn: &str,
     account: &str,
     identity_tags: &[(String, String)],
     session_tags: &[(String, String)],
@@ -461,7 +482,7 @@ fn condition_context(
     named
         .into_iter()
         .chain([
-            (PRINCIPAL_ARN_KEY.to_string(), arn.to_string()),
+            (PRINCIPAL_ARN_KEY.to_string(), principal_arn.to_string()),
             (PRINCIPAL_ACCOUNT_KEY.to_string(), account.to_string()),
             (
                 SECURE_TRANSPORT_KEY.to_string(),
