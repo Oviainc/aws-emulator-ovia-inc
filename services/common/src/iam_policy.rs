@@ -23,7 +23,10 @@
 //!
 //! `Resource` is deliberately NOT required: in a resource-based policy the resource the
 //! document is attached to is the implicit one, which is why IAM's resource-policy examples
-//! omit it.
+//! omit it. A service whose API documents the resource element as the ARN of one of its
+//! resources reads the VALUES of that element separately, through [`non_arn_resource`]:
+//! the grammar here admits the wildcard the IAM language admits, and whether a particular
+//! service accepts a non-ARN resource is that service's rule, not the language's.
 //!
 //! This judges only the SHAPE of a document. What a policy then SAYS — whether it allows a
 //! request — is [`super::iam_authorization`], and the two read the same elements in the
@@ -107,29 +110,75 @@ pub fn resource_policy_defect(text: &str) -> Option<PolicyDefect> {
 /// [`resource_policy_defect`] for a document that is already parsed — for a caller that
 /// parsed it to read something else out of it and must not parse it twice.
 pub fn resource_policy_defect_of(document: &::serde_json::Value) -> Option<PolicyDefect> {
-    let Some(document) = document.as_object() else {
+    let Some(elements) = document.as_object() else {
         return Some(PolicyDefect::NotAnObject);
     };
 
-    if let Some(version) = document.get("Version") {
+    if let Some(version) = elements.get("Version") {
         let declared = version.as_str().unwrap_or_default();
         if !POLICY_VERSIONS.contains(&declared) {
             return Some(PolicyDefect::UnsupportedVersion);
         }
     }
 
-    let statements = match document.get("Statement") {
-        // One statement may be written as the object itself rather than as a list.
-        Some(::serde_json::Value::Array(entries)) if !entries.is_empty() => {
-            entries.iter().collect::<Vec<&::serde_json::Value>>()
-        }
-        Some(::serde_json::Value::Object(_)) => {
-            vec![&document["Statement"]]
-        }
-        _ => return Some(PolicyDefect::NoStatement),
-    };
+    let statements = statements(document);
+    if statements.is_empty() {
+        return Some(PolicyDefect::NoStatement);
+    }
 
     statements.into_iter().find_map(statement_defect)
+}
+
+/// The prefix every Amazon Resource Name begins with, and so the one thing a value has to
+/// carry to be read as an ARN at all.
+pub const ARN_PREFIX: &str = "arn:";
+
+/// The first value the statements' resource elements name that is not an ARN, or `None`
+/// when every value they name is one — which includes a document naming no resource at
+/// all, and a text that is not a policy.
+///
+/// `Resource` and its complement `NotResource` name RESOURCES, and a resource is named by
+/// its ARN, so a service whose API documents that element as the ARN of one of its own
+/// resources reads the values here: the IAM language admits a bare `*` there, which is a
+/// wildcard and not an ARN, so this reading is separate from the grammar above and is
+/// applied beside [`resource_policy_defect`] rather than instead of it. The value is
+/// reported as submitted, so a caller can name it in the refusal it words.
+pub fn non_arn_resource(text: &str) -> Option<String> {
+    let document = ::serde_json::from_str::<::serde_json::Value>(text).ok()?;
+    statements(&document)
+        .into_iter()
+        .flat_map(resource_values)
+        .find(|value| !value.starts_with(ARN_PREFIX))
+}
+
+/// The statements `document` declares: the entries of its `Statement` list, or the one
+/// statement written as the object itself rather than as a list. Empty for a document
+/// that is not an object or declares no statement.
+fn statements(document: &::serde_json::Value) -> Vec<&::serde_json::Value> {
+    match document.get("Statement") {
+        Some(::serde_json::Value::Array(entries)) => entries.iter().collect(),
+        Some(statement @ ::serde_json::Value::Object(_)) => vec![statement],
+        _ => Vec::new(),
+    }
+}
+
+/// Every value one statement's resource elements name, in the order they are written.
+fn resource_values(statement: &::serde_json::Value) -> Vec<String> {
+    ["Resource", "NotResource"]
+        .into_iter()
+        .filter_map(|key| statement.get(key))
+        .flat_map(element_values)
+        .collect()
+}
+
+/// `element`'s values: a policy element is written as one string or as a list of them,
+/// and anything else names no value.
+fn element_values(element: &::serde_json::Value) -> Vec<String> {
+    match element {
+        ::serde_json::Value::String(value) => vec![value.clone()],
+        ::serde_json::Value::Array(entries) => entries.iter().flat_map(element_values).collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// The clause one statement breaks, or `None` when it is a resource-policy statement.
@@ -316,6 +365,122 @@ mod tests {
                 defect,
                 Some(PolicyDefect::MissingPrincipal),
                 "case {case:?}: every statement is judged, got {defect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_first_resource_value_that_is_not_an_arn_is_reported() {
+        // The rows differ along what the rule generalises over: which resource element
+        // carries the value, the form it is written in (a string or a list), how many
+        // statements the document has and where in them the value sits, and the kind of
+        // value that is not an ARN (a wildcard, a bare name, a glob, a value whose ARN
+        // prefix is misspelled).
+        let identity = "arn:aws:svc:us-east-1:000000000000:identity/example.com";
+        let rows: [(&str, String, Option<&str>); 14] = [
+            ("no resource element at all", policy(STATEMENT), None),
+            (
+                "one resource named by its ARN",
+                policy(&format!(
+                    "{{\"Effect\":\"Allow\",\"Action\":\"svc:A\",\"Principal\":\"*\",\
+                     \"Resource\":\"{identity}\"}}"
+                )),
+                None,
+            ),
+            (
+                "a list of ARNs",
+                policy(&format!(
+                    "{{\"Effect\":\"Allow\",\"Action\":\"svc:A\",\"Principal\":\"*\",\
+                     \"Resource\":[\"{identity}\",\"{identity}/other\"]}}"
+                )),
+                None,
+            ),
+            (
+                "an ARN of another partition",
+                policy(
+                    "{\"Effect\":\"Allow\",\"Action\":\"svc:A\",\"Principal\":\"*\",\
+                     \"Resource\":\"arn:aws-cn:svc:cn-north-1:000000000000:identity/a\"}",
+                ),
+                None,
+            ),
+            (
+                "a bare wildcard",
+                policy(
+                    "{\"Effect\":\"Allow\",\"Action\":\"svc:A\",\"Principal\":\"*\",\
+                     \"Resource\":\"*\"}",
+                ),
+                Some("*"),
+            ),
+            (
+                "a bare resource name",
+                policy(
+                    "{\"Effect\":\"Allow\",\"Action\":\"svc:A\",\"Principal\":\"*\",\
+                     \"Resource\":\"example.com\"}",
+                ),
+                Some("example.com"),
+            ),
+            (
+                "a glob over a resource path",
+                policy(
+                    "{\"Effect\":\"Allow\",\"Action\":\"svc:A\",\"Principal\":\"*\",\
+                     \"Resource\":\"identity/*\"}",
+                ),
+                Some("identity/*"),
+            ),
+            (
+                "an ARN prefix that is misspelled",
+                policy(
+                    "{\"Effect\":\"Allow\",\"Action\":\"svc:A\",\"Principal\":\"*\",\
+                     \"Resource\":\"ARN:aws:svc:::thing\"}",
+                ),
+                Some("ARN:aws:svc:::thing"),
+            ),
+            (
+                "the wildcard second in a list of resources",
+                policy(&format!(
+                    "{{\"Effect\":\"Allow\",\"Action\":\"svc:A\",\"Principal\":\"*\",\
+                     \"Resource\":[\"{identity}\",\"*\"]}}"
+                )),
+                Some("*"),
+            ),
+            (
+                "a NotResource that is not an ARN",
+                policy(
+                    "{\"Effect\":\"Deny\",\"Action\":\"svc:A\",\"Principal\":\"*\",\
+                     \"NotResource\":\"*\"}",
+                ),
+                Some("*"),
+            ),
+            (
+                "the second statement carrying the wildcard",
+                policy(&format!(
+                    "{{\"Effect\":\"Allow\",\"Action\":\"svc:A\",\"Principal\":\"*\",\
+                     \"Resource\":\"{identity}\"}},\
+                     {{\"Effect\":\"Allow\",\"Action\":\"svc:B\",\"Principal\":\"*\",\
+                     \"Resource\":\"everything\"}}"
+                )),
+                Some("everything"),
+            ),
+            (
+                "one statement written as the object itself",
+                "{\"Version\":\"2012-10-17\",\"Statement\":\
+                 {\"Effect\":\"Allow\",\"Action\":\"svc:A\",\"Principal\":\"*\",\
+                 \"Resource\":\"*\"}}"
+                    .to_string(),
+                Some("*"),
+            ),
+            // A text that is not a policy names no resource: whether it is a policy at
+            // all is `resource_policy_defect`'s reading, not this one.
+            ("text that is not JSON", "not a policy".to_string(), None),
+            ("an empty object", "{}".to_string(), None),
+        ];
+
+        for (case, document, expected) in rows {
+            let offending = non_arn_resource(&document);
+            assert_eq!(
+                offending.as_deref(),
+                expected,
+                "case {case:?}: expected {expected:?}, got {offending:?} for {document}"
             );
         }
     }

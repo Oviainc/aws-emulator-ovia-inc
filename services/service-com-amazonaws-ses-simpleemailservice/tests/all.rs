@@ -65,6 +65,8 @@ mod ses_template_deletion;
 mod ses_template_listing;
 #[path = "all/ses_template_update.rs"]
 mod ses_template_update;
+#[path = "all/ses_unverified_sender_refusal.rs"]
+mod ses_unverified_sender_refusal;
 #[path = "all/ses_unverified_sender_region.rs"]
 mod ses_unverified_sender_region;
 #[path = "all/ses_update_receipt_rule.rs"]
