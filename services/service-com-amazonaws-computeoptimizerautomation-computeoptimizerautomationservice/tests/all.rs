@@ -47,6 +47,8 @@ mod enum_parameter_rejection;
 mod error_payloads;
 #[path = "all/filter_name_refusals.rs"]
 mod filter_name_refusals;
+#[path = "all/member_account_initiation_gate.rs"]
+mod member_account_initiation_gate;
 #[path = "all/not_found_wording.rs"]
 mod not_found_wording;
 #[path = "all/page_token_refusals.rs"]
