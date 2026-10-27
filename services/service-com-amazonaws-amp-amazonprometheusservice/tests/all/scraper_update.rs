@@ -111,19 +111,22 @@ async fn describe(
         .await
 }
 
-/// The alias the store holds for one scraper, or `None` when it holds no such record.
-fn stored_alias(amp: &Amp, scraper_id: &str) -> Option<String> {
+/// The alias the store of `region` holds for one scraper, or `None` when it holds no such
+/// record.
+fn stored_alias(amp: &Amp, region: &str, scraper_id: &str) -> Option<String> {
     amp.store()
         .lock()
+        .region(region)
         .scrapers
         .get(scraper_id)
         .and_then(|record| record.alias.clone())
 }
 
 /// When the clock owes one scraper's next transition, if anything is pending.
-fn owed_transition(amp: &Amp, scraper_id: &str) -> Option<std::time::SystemTime> {
+fn owed_transition(amp: &Amp, region: &str, scraper_id: &str) -> Option<std::time::SystemTime> {
     amp.store()
         .lock()
+        .region(region)
         .scrapers
         .get(scraper_id)
         .and_then(|record| record.transition_due)
@@ -246,7 +249,7 @@ async fn an_update_replaces_the_members_it_carries_and_leaves_the_rest() {
             eks_source("metrics-cluster"),
             workspace_destination("ws-11111111-1111-1111-1111-111111111111"),
         );
-        seed(&amp, &seeded);
+        seed(&amp, region, &seeded);
 
         let before = describe(&amp, region, scraper_id).await;
         assert_eq!(
@@ -365,6 +368,7 @@ async fn an_update_is_refused_for_every_status_but_active() {
         let amp = Amp::new();
         seed(
             &amp,
+            region,
             &scraper(
                 scraper_id,
                 Some("baseline"),
@@ -393,10 +397,10 @@ async fn an_update_is_refused_for_every_status_but_active() {
                 "case {status:?}: expected the status the call wrote, got {reply:?}"
             );
             assert_eq!(
-                stored_alias(&amp, scraper_id).as_deref(),
+                stored_alias(&amp, region, scraper_id).as_deref(),
                 Some("renamed"),
                 "case {status:?}: an accepted update must be applied, got {:?}",
-                stored_alias(&amp, scraper_id)
+                stored_alias(&amp, region, scraper_id)
             );
             continue;
         }
@@ -421,10 +425,10 @@ async fn an_update_is_refused_for_every_status_but_active() {
             "case {status:?}: the refusal must name the resource type, got {reply:?}"
         );
         assert_eq!(
-            stored_alias(&amp, scraper_id).as_deref(),
+            stored_alias(&amp, region, scraper_id).as_deref(),
             Some("baseline"),
             "case {status:?}: a refused update must change nothing, got {:?}",
-            stored_alias(&amp, scraper_id)
+            stored_alias(&amp, region, scraper_id)
         );
     }
 }
@@ -439,6 +443,7 @@ async fn an_update_of_a_scraper_the_store_does_not_hold_is_not_found() {
     let held = "s-33333333-3333-3333-3333-333333333333";
     seed(
         &amp,
+        region,
         &scraper(
             held,
             Some("bystander"),
@@ -496,10 +501,10 @@ async fn an_update_of_a_scraper_the_store_does_not_hold_is_not_found() {
     }
 
     assert_eq!(
-        stored_alias(&amp, held).as_deref(),
+        stored_alias(&amp, region, held).as_deref(),
         Some("bystander"),
         "an update that named another scraper must leave this one alone, got {:?}",
-        stored_alias(&amp, held)
+        stored_alias(&amp, region, held)
     );
 }
 
@@ -514,6 +519,7 @@ async fn describing_a_scraper_the_store_does_not_hold_is_not_found() {
     let held = "s-66666666-6666-6666-6666-666666666666";
     seed(
         &amp,
+        region,
         &scraper(
             held,
             Some("described"),
@@ -608,6 +614,7 @@ async fn replaying_the_update_with_its_client_token_is_the_same_request() {
         let amp = Amp::new();
         seed(
             &amp,
+            region,
             &scraper(
                 scraper_id,
                 Some("baseline"),
@@ -628,7 +635,7 @@ async fn replaying_the_update_with_its_client_token_is_the_same_request() {
             first.status, 202,
             "case {case:?}: the first update must be accepted, got {first:?}"
         );
-        let owed = owed_transition(&amp, scraper_id);
+        let owed = owed_transition(&amp, region, scraper_id);
         assert!(
             owed.is_some(),
             "case {case:?}: the first update must leave a settling owed, got {owed:?}"
@@ -658,12 +665,12 @@ async fn replaying_the_update_with_its_client_token_is_the_same_request() {
             );
         }
         assert_eq!(
-            stored_alias(&amp, scraper_id).as_deref(),
+            stored_alias(&amp, region, scraper_id).as_deref(),
             Some("first"),
             "case {case:?}: only the first update may be applied, got {:?}",
-            stored_alias(&amp, scraper_id)
+            stored_alias(&amp, region, scraper_id)
         );
-        let still_owed = owed_transition(&amp, scraper_id);
+        let still_owed = owed_transition(&amp, region, scraper_id);
         assert_eq!(
             still_owed, owed,
             "case {case:?}: the repeat must not move the instant the settling is owed, \
@@ -683,6 +690,7 @@ async fn the_same_token_after_the_update_settled_is_a_new_request() {
     let amp = Amp::new();
     seed(
         &amp,
+        region,
         &scraper(
             scraper_id,
             Some("baseline"),
@@ -723,9 +731,9 @@ async fn the_same_token_after_the_update_settled_is_a_new_request() {
         "the new request must move the record to {STATUS_UPDATING}, got {again:?}"
     );
     assert_eq!(
-        stored_alias(&amp, scraper_id).as_deref(),
+        stored_alias(&amp, region, scraper_id).as_deref(),
         Some("second"),
         "the new request must be applied, got {:?}",
-        stored_alias(&amp, scraper_id)
+        stored_alias(&amp, region, scraper_id)
     );
 }

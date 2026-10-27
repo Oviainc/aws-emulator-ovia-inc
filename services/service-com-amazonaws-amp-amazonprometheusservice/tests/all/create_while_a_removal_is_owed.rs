@@ -37,11 +37,12 @@ use service_com_amazonaws_amp_amazonprometheusservice::state::{
     QUERY_LOGGING_STATUS_DELETING, STATUS_ACTIVE, STATUS_DELETING,
 };
 
-/// The rules-and-alerting configuration the store holds for one workspace, or `None`
-/// once it holds none.
-fn stored_logging(amp: &Amp, workspace_id: &str) -> Option<LoggingConfiguration> {
+/// The rules-and-alerting configuration the store holds for one workspace of `region`,
+/// or `None` once it holds none.
+fn stored_logging(amp: &Amp, region: &str, workspace_id: &str) -> Option<LoggingConfiguration> {
     amp.store()
         .lock()
+        .region(region)
         .workspaces
         .get(workspace_id)
         .and_then(|workspace| workspace.logging_configuration.clone())
@@ -172,7 +173,7 @@ async fn a_logging_configuration_create_while_its_removal_is_owed_is_refused() {
             "case {name:?}: deleting an {LOGGING_STATUS_ACTIVE} configuration must be \
              accepted, got {deleted:?}"
         );
-        let pending = stored_logging(&amp, &workspace_id).unwrap_or_else(|| {
+        let pending = stored_logging(&amp, region, &workspace_id).unwrap_or_else(|| {
             panic!("case {name:?}: the record is held while its removal is owed")
         });
         assert_eq!(
@@ -200,7 +201,7 @@ async fn a_logging_configuration_create_while_its_removal_is_owed_is_refused() {
              {second_reply:?}"
         );
 
-        let after = stored_logging(&amp, &workspace_id)
+        let after = stored_logging(&amp, region, &workspace_id)
             .unwrap_or_else(|| panic!("case {name:?}: a refused create removes nothing"));
         assert_eq!(
             after.status_code, LOGGING_STATUS_DELETING,
@@ -400,6 +401,7 @@ async fn a_workspace_create_replaying_a_token_of_a_deleting_workspace_makes_a_ne
         assert_eq!(
             amp.store()
                 .lock()
+                .region(region)
                 .workspaces
                 .get(&first_id)
                 .map(|workspace| workspace.status_code.clone()),

@@ -164,14 +164,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+        // This service is REGIONAL, so the store this call acts on is the one of the
+        // Region the request was signed for: a workspace created in another Region is not
+        // reachable from this endpoint and is not found here.
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         store.materialize_due(now);
 
         // `workspaceId` names the configuration's parent resource ("Creates a query
         // logging configuration for the specified workspace"), and
         // `ResourceNotFoundException` is the modelled refusal for a request that
-        // "references a resources that doesn't exist".
-        if !store.workspaces.contains_key(&input.workspace_id) {
+        // "references a resources that doesn't exist" — a Region this account holds
+        // nothing in holds no workspace either, so the one refusal answers both.
+        let Some(store) = store
+            .held_region_mut(&region)
+            .filter(|store| store.workspaces.contains_key(&input.workspace_id))
+        else {
             return Err(
                 CreateQueryLoggingConfigurationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
@@ -182,7 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             );
-        }
+        };
 
         if let Some(existing) = store.query_logging.get(&input.workspace_id) {
             // A record whose removal the clock already owes is NOT the record the create

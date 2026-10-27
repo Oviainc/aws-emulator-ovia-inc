@@ -251,8 +251,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The `workspaceId` label names the PARENT this operation stores a detector
         // inside, and it must resolve before anything is stored: a workspace this account
         // does not hold is a not-found, answered the way every other operation on
-        // `/workspaces/{workspaceId}` answers it.
-        let Some(workspace) = store.workspaces.get_mut(&input.workspace_id) else {
+        // `/workspaces/{workspaceId}` answers it. This service is REGIONAL, so the store
+        // searched is the one of the Region the request was signed for — a workspace
+        // created in another Region is not reachable from this endpoint, and a Region this
+        // account holds nothing in holds no workspace at all.
+        let Some(workspace) = store
+            .held_region_mut(&region)
+            .and_then(|store| store.workspaces.get_mut(&input.workspace_id))
+        else {
             return Err(workspace_not_found(&input.workspace_id));
         };
         let workspace_id = workspace.workspace_id.clone();

@@ -183,10 +183,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+        // This service is REGIONAL, so the store this call acts on is the one of the
+        // Region the request was signed for: a workspace created in another Region is not
+        // reachable from this endpoint and is not found here.
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         store.materialize_due(now);
 
-        let Some(workspace) = store.workspaces.get_mut(&input.workspace_id) else {
+        // A Region this account holds nothing in holds no workspace either, so it answers
+        // the same refusal the missing workspace does.
+        let Some(workspace) = store
+            .held_region_mut(&region)
+            .and_then(|store| store.workspaces.get_mut(&input.workspace_id))
+        else {
             return Err(DeleteAnomalyDetectorErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: crate::state::WORKSPACE_NOT_FOUND_MESSAGE.to_string(),

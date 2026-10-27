@@ -170,12 +170,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+        // This service is REGIONAL, so the store this call acts on is the one of the
+        // Region the request was signed for: a workspace created in another Region is not
+        // reachable from this endpoint and is not found here.
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         store.materialize_due(now);
 
         // The configuration hangs off the workspace at `/workspaces/{workspaceId}/logging`,
-        // so an id naming no stored workspace is the missing resource — 404.
-        let Some(workspace) = store.workspaces.get_mut(&input.workspace_id) else {
+        // so an id naming no stored workspace is the missing resource — 404 — and a Region
+        // this account holds nothing in holds no workspace either.
+        let Some(workspace) = store
+            .held_region_mut(&region)
+            .and_then(|store| store.workspaces.get_mut(&input.workspace_id))
+        else {
             return Err(
                 UpdateLoggingConfigurationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {

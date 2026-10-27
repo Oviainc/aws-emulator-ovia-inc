@@ -156,7 +156,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListWorkspacesErrorModeled::InternalServerException(
                 InternalServerException {
@@ -167,8 +166,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // This service is REGIONAL, and "one or more workspaces in each Region in your
+        // account" is what an account holds, so this listing reports the workspaces of
+        // the Region the request was signed for and no other — whose summaries are the
+        // only ones whose `arn` and `prometheusEndpoint` name this endpoint's Region.
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         store.materialize_due(::std::time::SystemTime::now());
+        // A report reaches that store through a SHARED borrow of the whole store
+        // (`&*store`), so the compiler itself refuses here any accessor that could bring a
+        // Region's store into being: only a create may do that, and only under the ceiling
+        // on Regions held at once.
+        let held = &*store;
+        let store = held.region(&region);
 
         // `alias` "filters the results to only the workspaces with names that start
         // with the value that you specify here", and is trimmed the same way a stored

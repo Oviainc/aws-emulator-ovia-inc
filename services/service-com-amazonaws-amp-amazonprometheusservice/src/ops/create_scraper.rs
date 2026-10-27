@@ -230,8 +230,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let mut store = state.lock();
-        store.materialize_due(now);
+        let mut guard = state.lock();
+        guard.materialize_due(now);
+
+        // A scraper lives in ONE Region, like every other resource of this regional
+        // service, so the store this call reads and writes is the one of the Region the
+        // request was signed for. The Region comes from the caller's own credential scope,
+        // so this create — one of only two that may bring a Region's store into being — is
+        // refused once the store holds records for as many Regions as it may, and writes
+        // nothing. A Region the store already holds records in needs no room for a further
+        // one, so it is never refused here. `MAX_REGIONS` is a small finite figure and
+        // stays one: the assertion below fails to COMPILE otherwise.
+        const _: () = assert!(crate::state::MAX_REGIONS <= 64);
+        if !guard.holds_records_in(&region)
+            && guard.regions_holding_records() >= crate::state::MAX_REGIONS
+        {
+            return Err(CreateScraperErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: crate::state::region_ceiling_message(),
+                    // The bound is per account, so the account is the resource that
+                    // reached it.
+                    resource_id: ::engine::emulator_account_id().to_string(),
+                    resource_type: crate::state::SCRAPER_RESOURCE_TYPE.to_string(),
+                    service_code: ctx.identity().signing_name().to_string(),
+                    // `quotaCode` is `@required`, and the bound this refusal reports is
+                    // the EMULATOR's own (the message says so): the code names what it
+                    // bounds rather than claiming an identifier Service Quotas issues,
+                    // which this emulator does not model.
+                    quota_code: "EmulatorRegionsPerAccount".to_string(),
+                },
+            )
+            .into());
+        }
+        let held = &*guard;
+        let records = held.region(&region);
 
         // `clientToken` carries `@idempotencyToken`: replaying a token that already
         // created a scraper answers with THAT scraper instead of a second one — as long as
@@ -242,8 +274,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(existing) = input
             .client_token
             .as_deref()
-            .and_then(|token| store.scraper_tokens.get(token))
-            .and_then(|scraper_id| store.scrapers.get(scraper_id))
+            .and_then(|token| records.scraper_tokens.get(token))
+            .and_then(|scraper_id| records.scrapers.get(scraper_id))
             .filter(|scraper| scraper.status_code != crate::state::STATUS_DELETING)
         {
             return Ok(response_for(existing));
@@ -253,8 +285,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it is resolved before it is stored and a reference that does not resolve is
         // refused with the modelled `ResourceNotFoundException` — one rule, shared with
         // every other operation that stores a destination, in
-        // `crate::state::ComAmazonawsAmpAmazonprometheusserviceState::unresolved_destination_workspace`.
-        if let Some(not_found) = store.unresolved_destination_workspace(&input.destination) {
+        // `crate::state::RegionalState::unresolved_destination_workspace`. It resolves
+        // against THIS REGION's records: a workspace of another Region is not reachable
+        // from this endpoint, exactly as its own operations are not.
+        if let Some(not_found) = records.unresolved_destination_workspace(&input.destination) {
             return Err(
                 CreateScraperErrorModeled::ResourceNotFoundException(not_found).into(),
             );
@@ -263,16 +297,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The store is BOUNDED: past its quota a create is refused rather than adding
         // another record. `ServiceQuotaExceededException` is the modelled refusal for
         // exactly this, and `SCRAPERS_PER_ACCOUNT_QUOTA` is what stops the scraper and
-        // create-token maps growing without end.
-        if store.scrapers.len() >= crate::state::SCRAPERS_PER_ACCOUNT_QUOTA {
+        // create-token maps of ONE Region growing without end — the published quota is
+        // per account per Region, so a Region that is full says nothing about any other.
+        if records.scrapers.len() >= crate::state::SCRAPERS_PER_ACCOUNT_QUOTA {
             return Err(CreateScraperErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
                     message: format!(
-                        "this account already holds the maximum of {} scrapers",
+                        "this account already holds the maximum of {} scrapers in this Region",
                         crate::state::SCRAPERS_PER_ACCOUNT_QUOTA
                     ),
-                    // The bound is per account, so the account is the resource that
-                    // reached it.
+                    // The bound is per account and Region, so the account is the resource
+                    // that reached it.
                     resource_id: ::engine::emulator_account_id().to_string(),
                     resource_type: crate::state::SCRAPER_RESOURCE_TYPE.to_string(),
                     service_code: ctx.identity().signing_name().to_string(),
@@ -286,7 +321,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let scraper_id = crate::state::mint_scraper_id(&mut store.next_id);
+        // Every refusal above is answered off the Region's store as it STANDS, read
+        // through a shared borrow, so none of them materialises a store for the Region a
+        // caller named: the inserting accessor is taken only here, where the record is
+        // about to be written.
+        let (store, next_id) = guard.region_and_ids_mut_for_create(&region);
+
+        let scraper_id = crate::state::mint_scraper_id(next_id);
         let scraper = crate::state::Scraper {
             arn: crate::state::scraper_arn(&region, &scraper_id),
             // "An IAM role will be created for you that Amazon Managed Service for
@@ -322,7 +363,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             store.scraper_tokens.insert(token, scraper_id.clone());
         }
         store.scrapers.insert(scraper_id, scraper);
-        drop(store);
+        drop(guard);
         // Recorded because this call CHANGED this service's state: the operation, the
         // resource and the access-key id the request presented — see
         // `crate::state::record_state_change`.
