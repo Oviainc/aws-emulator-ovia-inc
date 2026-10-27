@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tags stored on the resource the request's `ResourceArn` names, resolved
+//! against this account's records in the Region the call executes in. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +140,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The engine is not the shared in-memory engine, so this service has no
+            // store to read. That is not a modelled SES state: answer the scaffold's
+            // 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListTagsForResource without the shared emulator state",
+            ));
+        };
+
+        let resource_arn = input.resource_arn;
+        // A value that is no resource ARN of this service, or one naming no resource
+        // within it, addresses nothing this API can tag, so it is refused on the input —
+        // before any lookup — with the `BadRequestException` the model binds for "the
+        // input you provided is invalid", rather than reported as a resource that
+        // happens to be missing.
+        if crate::state::ses_resource_of(&resource_arn).is_none() {
+            return Err(ListTagsForResourceErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::UNSUPPORTED_RESOURCE_ARN.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The resource this call can reach is one of the account the request is
+        // authenticated for, in the Region its own credential scope names.
+        let scope = crate::state::CallerScope::of(ctx.parts());
+
+        // Reporting only: nothing here writes, so a read leaves every later caller
+        // seeing exactly what it saw.
+        let tags = {
+            let store = state.lock();
+            store.resource_tags(&resource_arn, &scope)
+        };
+
+        let Some(tags) = tags else {
+            // "The resource you attempted to access doesn't exist": the ARN is one this
+            // API addresses, so an ARN resolving to no record is reported as the missing
+            // resource it names.
+            return Err(ListTagsForResourceErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::tagged_resource_not_found(&resource_arn)),
+                },
+            )
+            .into());
+        };
+
+        // `Tags` is required, so a resource carrying none reports an empty list rather
+        // than no member at all.
+        Ok(ListTagsForResourceOutput { tags })
     }
 }
