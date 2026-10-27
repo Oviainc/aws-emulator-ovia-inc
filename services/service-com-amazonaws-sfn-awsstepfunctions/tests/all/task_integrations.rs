@@ -593,11 +593,13 @@ async fn a_refused_call_fails_the_task_with_the_services_own_error() {
 /// nothing was written anywhere.
 ///
 /// The rows span the classes [`state::integration::read`] declines: a service whose
-/// request is not one JSON document, the two patterns whose outcome arrives after
-/// the call, a bare resource ARN, and a `Resource` that is no ARN at all. An
-/// ACTIVITY `Resource` is not among them — its work is a worker's, so the walk
-/// schedules a task and the execution waits at that state (its own suites cover
-/// that).
+/// request is not one JSON document, the callback pattern whose outcome arrives from
+/// outside the execution, a run-a-job pattern over an integration whose job this
+/// emulator cannot report or stop, a bare resource ARN, and a `Resource` that is no
+/// ARN at all. An ACTIVITY `Resource` is not among them — its work is a worker's, so
+/// the walk schedules a task and the execution waits at that state (its own suites
+/// cover that) — and neither is a run-a-job pattern this emulator DOES perform, whose
+/// job is started, polled and resolved (`sync_service_integration.rs`).
 #[tokio::test]
 async fn a_resource_no_call_is_made_for_fails_rather_than_being_faked() {
     let cases: [(&str, &str); 5] = [
@@ -606,8 +608,8 @@ async fn a_resource_no_call_is_made_for_fails_rather_than_being_faked() {
             "arn:aws:states:::sns:publish",
         ),
         (
-            "the .sync pattern, whose outcome arrives later",
-            "arn:aws:states:::states:startExecution.sync",
+            "the run-a-job pattern over an integration whose job cannot be reported",
+            "arn:aws:states:::dynamodb:putItem.sync",
         ),
         (
             "the .waitForTaskToken pattern, which waits for a later SendTaskSuccess",
