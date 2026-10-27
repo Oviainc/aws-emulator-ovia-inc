@@ -4,11 +4,11 @@
 //!
 //! Hands Amazon Bedrock a role and asks it to customize a base model, so the request is
 //! decided by the `iam:PassRole` step for `roleArn` BEFORE anything it names is resolved
-//! ([`crate::state::customization_pass_role_denial`] compares the role's account against the
-//! account of the principal that would take it on): a role the service may not be passed is
-//! the modelled `AccessDeniedException`, and such a refusal writes nothing at all.
+//! ([`crate::state::customization_pass_role_denial`] asks whether the value names a role of
+//! the CALLER'S OWN account, the only roles a caller can pass): a role the caller may not
+//! pass is the modelled `AccessDeniedException`, and such a refusal writes nothing at all.
 //!
-//! Where that comparison admits the pass the customization starts: the job is minted
+//! Where that decision admits the pass the customization starts: the job is minted
 //! `InProgress` and the clock owes it its terminal status, which is what brings the custom
 //! model named by `customModelName` into being. The record this operation writes is the one
 //! `ops/get_model_customization_job.rs` reads and `ops/stop_model_customization_job.rs`
