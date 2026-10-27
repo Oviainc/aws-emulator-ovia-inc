@@ -517,6 +517,12 @@ fn is_alarm_period(period: i32) -> bool {
 ///   data): it may not be a multi-series expression, while the same call wrapped in a function
 ///   that reduces it to one series is fine — which is why that check is for a multi-series
 ///   call nothing encloses.
+///
+/// The query the alarm's THRESHOLD comes from is not the one it watches: "If this is an alarm
+/// based on an anomaly detection model, make this value match the ID of the
+/// ANOMALY_DETECTION_BAND function." (`PutMetricAlarmInput$ThresholdMetricId`) — a band is the
+/// PAIR of bounds the watched series is compared against, so the designated query is a
+/// multi-series expression by definition and the single-series rule does not speak about it.
 fn unresolvable_metrics(input: &PutMetricAlarmInput) -> Option<String> {
     let queries = input.metrics.as_deref()?;
     let defined: HashSet<&str> = queries.iter().map(|query| query.id.as_str()).collect();
@@ -560,8 +566,10 @@ fn unresolvable_metrics(input: &PutMetricAlarmInput) -> Option<String> {
         }
         // "When used in PutMetricAlarm, specify true for the one expression result to use as
         // the alarm." … "If you omit this, the default of true is used."
-        // (`MetricDataQuery$ReturnData`)
+        // (`MetricDataQuery$ReturnData`) — and the query the alarm takes its THRESHOLD from
+        // is not the result it watches, so its value may be the pair of bounds a band is.
         if query.return_data != Some(false)
+            && input.threshold_metric_id.as_deref() != Some(query.id.as_str())
             && crate::state::metric_math::returns_many_series(&parsed)
         {
             return Some(format!(

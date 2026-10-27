@@ -23,6 +23,8 @@ mod channel_lifecycle;
 mod cluster_delete_state_guard;
 #[path = "all/cluster_lifecycle.rs"]
 mod cluster_lifecycle;
+#[path = "all/cluster_operation_v2.rs"]
+mod cluster_operation_v2;
 #[path = "all/cluster_policy.rs"]
 mod cluster_policy;
 #[path = "all/compatible_kafka_versions.rs"]

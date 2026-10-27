@@ -59,6 +59,8 @@ mod response_field_fidelity;
 mod state_roundtrip;
 #[path = "all/tag_resource.rs"]
 mod tag_resource;
+#[path = "all/untag_resource.rs"]
+mod untag_resource;
 // `authorization_token` is declared AFTER the sorted list rather than in its
 // alphabetical place at the top, for the reason `service-com-amazonaws-transfer-
 // transferservice` records for its own out-of-place suite: every suite this crate gains

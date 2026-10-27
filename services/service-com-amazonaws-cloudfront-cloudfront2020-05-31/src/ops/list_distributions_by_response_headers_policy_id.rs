@@ -201,15 +201,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // policy for — the account's own records or the catalog AWS published — is the
         // modelled 404 rather than a page of nothing: an empty page would claim the policy
         // exists and has no distributions.
+        //
+        // The id is a lookup KEY into the distributions this operation lists, not the
+        // address of the resource it serves, so it is resolved against the store ALONE: no
+        // precheck of the identifier's shape stands in front of the lookup, and every id no
+        // readable policy answers to is refused as an absent policy, whatever shape it
+        // takes. That is the one refusal the sibling by-policy listings answer too.
         if store
             .readable_response_headers_policy(&input.response_headers_policy_id)
             .is_none()
         {
             return Err(
                 ListDistributionsByResponseHeadersPolicyIdErrorModeled::NoSuchResponseHeadersPolicy(
-                    crate::state::no_such_response_headers_policy(
-                        &input.response_headers_policy_id,
-                    ),
+                    crate::state::no_such_response_headers_policy(),
                 )
                 .into(),
             );

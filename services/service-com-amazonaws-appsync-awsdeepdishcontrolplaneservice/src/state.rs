@@ -520,14 +520,14 @@ pub fn function_resource(api_id: &str, function_id: &str) -> String {
 }
 
 /// The text a `NotFoundException` (HTTP 404) carries for a function the named API does
-/// not hold: the absent function's id, which is what the caller has to act on.
+/// not hold: AppSync's own wording, a fixed template whose only variable part is the
+/// `functionId` the request asked for, which is what the caller has to act on.
 ///
-/// The requirement the refusal answers is the status and the error shape; the wording
-/// is a fixed template over the requested id, as the data-source not-found text
-/// ([`data_source_not_found_message`]) is over the requested name, rather than
-/// anything of the request's own values.
+/// Shared by every operation that addresses a function by id (`GetFunction`,
+/// `UpdateFunction`, `DeleteFunction`), so the three cannot disagree about how a
+/// missing function is reported.
 pub fn function_not_found_message(function_id: &str) -> String {
-    format!("Function {function_id} not found")
+    format!("function id {function_id} not found")
 }
 
 /// The refusal text for a function definition AppSync could not run, or `None` when

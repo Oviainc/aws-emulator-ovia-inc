@@ -42,6 +42,9 @@ use bytes::Bytes;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::query_wire::{elements, form_encode};
+use service_com_amazonaws_cloudformation_cloudformation::state::{
+    failed_action, resource_failure_summary,
+};
 
 /// The region every request here is signed for, and so the region the stack's topics and
 /// their ARNs belong to. Deliberately NOT the emulator's default region: the ARN a stack
@@ -813,11 +816,22 @@ async fn a_topic_sns_refuses_to_create_fails_the_stack() {
         "case {case:?}: expected the failed create to be rolled back rather than publish a \
          topic ARN nothing answers to, got {body}"
     );
+    // The STACK's reason summarises which resource failed; SNS's own refusal is reported
+    // on that resource's event.
     let reason = xml_text(&body, "StackStatusReason").unwrap_or_default();
+    assert_eq!(
+        reason,
+        resource_failure_summary(failed_action::CREATE, ["Topic"]),
+        "case {case:?}: expected the stack reason to summarise what failed, got {reason:?}"
+    );
+    let (_, events) =
+        cloudformation(&router, "DescribeStackEvents", &[("StackName", stack_name)]).await;
     assert!(
-        reason.contains("Topic") && reason.contains("InvalidParameter"),
-        "case {case:?}: expected the reason to name the resource and SNS's own refusal, got \
-         {reason:?}"
+        xml_texts(&events, "ResourceStatusReason")
+            .iter()
+            .any(|reported| reported.contains("Invalid parameter: Topic Name")),
+        "case {case:?}: expected the failing resource's event to carry SNS's own refusal, \
+         got {events}"
     );
 
     // And nothing was created: the ARN the template asked for resolves to no topic.
@@ -860,11 +874,22 @@ async fn a_subscription_sns_refuses_fails_the_stack_and_leaves_no_topic() {
         "case {case:?}: expected the failed create to be rolled back rather than report a \
          topic whose declared subscription does not exist, got {body}"
     );
+    // The STACK's reason summarises which resource failed; SNS's own refusal of the
+    // declared subscription is reported on that resource's event.
     let reason = xml_text(&body, "StackStatusReason").unwrap_or_default();
+    assert_eq!(
+        reason,
+        resource_failure_summary(failed_action::CREATE, ["Topic"]),
+        "case {case:?}: expected the stack reason to summarise what failed, got {reason:?}"
+    );
+    let (_, events) =
+        cloudformation(&router, "DescribeStackEvents", &[("StackName", stack_name)]).await;
     assert!(
-        reason.contains("Topic") && reason.contains("InvalidParameter"),
-        "case {case:?}: expected the reason to name the resource and SNS's own refusal, got \
-         {reason:?}"
+        xml_texts(&events, "ResourceStatusReason")
+            .iter()
+            .any(|reported| reported.contains("Invalid parameter:")),
+        "case {case:?}: expected the failing resource's event to carry SNS's own refusal, \
+         got {events}"
     );
 
     // And the topic the create had already made is gone: a resource the stack reports as

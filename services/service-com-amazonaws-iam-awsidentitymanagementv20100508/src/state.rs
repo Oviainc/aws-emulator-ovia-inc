@@ -1323,6 +1323,30 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
             .count()
     }
 
+    /// Whether a signed request presenting `access_key_id` carries a credential this
+    /// account will accept.
+    ///
+    /// `UpdateAccessKey$Status` documents what the stored value means: "Active means
+    /// that the key can be used for programmatic calls to Amazon Web Services, while
+    /// Inactive means that the key cannot be used" — so a key the account holds
+    /// authenticates a request only while its status is
+    /// [`ACCESS_KEY_ACTIVE_STATUS`], and deactivating one makes it unusable for API
+    /// calls while leaving it listed. Any other `statusType` value the member admits
+    /// is likewise not `Active`, so it is not usable either.
+    ///
+    /// A key id the account holds NO record of is usable: such a credential is not an
+    /// IAM user's at all — the key pair the emulator publishes at start, or a session
+    /// another service minted — and this account's `AccessKey$Status` says nothing
+    /// about it, so there is nothing here to refuse it on.
+    ///
+    /// A READ: the store is only consulted, so asking changes nothing a later caller
+    /// sees.
+    pub fn access_key_is_usable(&self, access_key_id: &str) -> bool {
+        self.access_keys
+            .get(access_key_id)
+            .is_none_or(|record| record.status == ACCESS_KEY_ACTIVE_STATUS)
+    }
+
     /// The groups the user keyed by `user_key` belongs to, by the key
     /// [`Self::groups`] holds each of them under, in that map's stable key order.
     ///
@@ -1882,19 +1906,22 @@ pub fn is_service_linked_role_path(path: &str) -> bool {
     path.starts_with(SERVICE_LINKED_ROLE_PATH_PREFIX)
 }
 
-/// The service principal a service-linked role's `path` names, or `None` when
-/// `path` is not one — a refinement of [`is_service_linked_role_path`] for the
-/// refusals whose message has to name that service.
+/// The one sentence this service states a refused change to a PROTECTED role with — a
+/// role a service links itself to, which "only the service that depends on the
+/// service-linked role can modify or delete … on your behalf"
+/// (`UnmodifiableEntityException`).
 ///
-/// A service-linked role lives at `/aws-service-role/<principal>/`, so the segment
-/// between that prefix and the closing `/` names the service that depends on the
-/// role — the one service AWS lets modify or delete it, which is what
-/// `UnmodifiableEntityException`'s documented message identifies.
-pub fn service_linked_role_principal(path: &str) -> Option<&str> {
-    let principal = path
-        .strip_prefix(SERVICE_LINKED_ROLE_PATH_PREFIX)?
-        .strip_suffix('/')?;
-    (!principal.is_empty()).then_some(principal)
+/// Every word of it is fixed but the role the request named, which is quoted exactly as
+/// the request spelled it. The protection is one rule about one kind of role, so every
+/// operation that refuses such a change states it through here rather than wording its
+/// own sentence: the sentence does not name which operation was refused, nor the service
+/// the role is linked to, so there is nothing per-operation to word. It is read back by
+/// `tests/all/protected_role_refusals.rs` across the operations the protection covers.
+pub fn protected_role_message(role_name: &str) -> String {
+    format!(
+        "Cannot perform the operation on the protected role '{role_name}' - this role is \
+         only modifiable by AWS"
+    )
 }
 
 /// What every service-linked role name starts with. AWS's "Using service-linked
@@ -3048,6 +3075,24 @@ pub fn uncarried_aws_managed_policy(arn: &str, what: &str) -> crate::scaffolded:
 /// and a delete cannot describe the same missing policy three different ways.
 pub fn policy_not_found(arn: &str) -> String {
     format!("Policy {arn} was not found.")
+}
+
+/// The message IAM refuses an operation addressed by a `PolicyArn` and a `VersionId`
+/// with when the policy that ARN resolves to carries no such version — the
+/// `NoSuchEntityException` message, whose fixed text is `Policy `, ` version ` and
+/// ` does not exist or is not attachable.` around the two values the request supplied.
+///
+/// The closing clause is part of IAM's fixed text for a policy the request cannot be
+/// served from, not a statement about this particular version: the same clause closes
+/// the refusal of an attach or a permissions-boundary put naming a policy that cannot
+/// be attached (`AttachUserPolicy`, `AttachRolePolicy`, `PutUserPermissionsBoundary`,
+/// `PutRolePermissionsBoundary` in this crate all word it that way), so a caller
+/// matching IAM's text sees one wording however it addressed the policy.
+///
+/// ONE wording, shared by every operation taking a policy version, so a read and a
+/// delete cannot describe the same missing version two different ways.
+pub fn policy_version_not_found(arn: &str, version_id: &str) -> String {
+    format!("Policy {arn} version {version_id} does not exist or is not attachable.")
 }
 
 /// Encode a state map key as the opaque pagination `Marker` a client echoes back.

@@ -5,8 +5,9 @@
 //!
 //! The rule every case here asserts: each environment operation answers from the ONE
 //! stored environment record — create/update write it, get/list/list-tags read it back,
-//! delete removes it — so no response is an echo of the request that asked for it, and
-//! the members a request did not carry keep the values already stored. Each table row
+//! delete starts its teardown — so no response is an echo of the request that asked for
+//! it, and the members a request did not carry keep the values already stored. Each table
+//! row
 //! varies what the rule generalises over (environment class, Airflow version, worker and
 //! web-server counts, security-group count, tag count, configured log types, optional S3
 //! path/version pairs, access mode, endpoint management); no row is privileged.
@@ -1264,7 +1265,7 @@ fn tags_json(tags: &BTreeMap<String, String>) -> Option<Value> {
 }
 
 #[tokio::test]
-async fn delete_removes_the_environment_from_every_reader() {
+async fn delete_tears_the_environment_down_and_only_then_every_reader_loses_it() {
     let harness = Harness::new();
     for case in cases() {
         assert_eq!(
@@ -1276,12 +1277,14 @@ async fn delete_removes_the_environment_from_every_reader() {
     }
     tokio::time::sleep(PAST_TRANSITION).await;
 
-    let mut remaining: Vec<String> = cases()
+    let mut all_names: Vec<String> = cases()
         .iter()
         .map(|case| case.name.to_string())
         .collect();
-    remaining.sort();
+    all_names.sort();
 
+    // A delete only STARTS the teardown: every reader still answers for the environment,
+    // reporting the status the model documents for a teardown in progress.
     for case in cases() {
         let arn = case.arn();
         let deleted = harness.delete(case.name).await;
@@ -1300,11 +1303,58 @@ async fn delete_removes_the_environment_from_every_reader() {
             String::from_utf8_lossy(&deleted.body)
         );
 
+        let environment = harness.environment(case.name).await;
+        assert_eq!(
+            environment.get("Status").and_then(Value::as_str),
+            Some(state::STATUS_DELETING),
+            "case {}: GetEnvironment must report the teardown in progress, got {:?}",
+            case.name,
+            environment.get("Status")
+        );
+
+        // The record is still there, so the tags that live on it still resolve.
+        let tags = harness.list_tags(&arn).await;
+        assert_eq!(
+            tags.status, 200,
+            "case {}: an environment being torn down still resolves its ARN, got {} {}",
+            case.name,
+            tags.status,
+            String::from_utf8_lossy(&tags.body)
+        );
+
+        // A repeated delete of an environment already tearing down answers the same empty
+        // 200 and starts nothing further.
+        let again = harness.delete(case.name).await;
+        assert_eq!(
+            again.status,
+            200,
+            "case {}: repeating DeleteEnvironment during the teardown, got {} {}",
+            case.name,
+            again.status,
+            String::from_utf8_lossy(&again.body)
+        );
+
+        // And the name is still listed: nothing has been removed yet.
+        let listed = harness.list("").await;
+        assert_eq!(
+            listed.json().get("Environments").cloned(),
+            Some(json!(all_names)),
+            "case {}: ListEnvironments must still name an environment being torn down",
+            case.name
+        );
+    }
+
+    // Only once the teardown has come due does every reader lose it.
+    tokio::time::sleep(PAST_TRANSITION).await;
+    for case in cases() {
+        let arn = case.arn();
         let gone = harness.get(case.name).await;
         assert_eq!(
             gone.status, 404,
-            "case {}: GetEnvironment after a delete must answer 404",
-            case.name
+            "case {}: GetEnvironment after a finished teardown must answer 404, got {} {}",
+            case.name,
+            gone.status,
+            String::from_utf8_lossy(&gone.body)
         );
         assert_eq!(gone.error_code(), "ResourceNotFoundException");
 
@@ -1312,27 +1362,27 @@ async fn delete_removes_the_environment_from_every_reader() {
         let tags = harness.list_tags(&arn).await;
         assert_eq!(
             tags.status, 404,
-            "case {}: the deleted environment's ARN must resolve to nothing",
-            case.name
+            "case {}: the deleted environment's ARN must resolve to nothing, got {}",
+            case.name,
+            tags.status
         );
 
-        // And a second delete of the same name is a 404, not a silent success.
+        // And a delete of the name is now a 404, not a silent success.
         let again = harness.delete(case.name).await;
         assert_eq!(
             again.status, 404,
-            "case {}: a second DeleteEnvironment must answer 404",
-            case.name
-        );
-
-        remaining.retain(|name| name != case.name);
-        let listed = harness.list("").await;
-        assert_eq!(
-            listed.json().get("Environments").cloned(),
-            Some(json!(remaining)),
-            "case {}: ListEnvironments must no longer name a deleted environment",
-            case.name
+            "case {}: DeleteEnvironment after a finished teardown must answer 404, got {}",
+            case.name,
+            again.status
         );
     }
+    let listed = harness.list("").await;
+    assert_eq!(
+        listed.json().get("Environments").cloned(),
+        Some(json!(Vec::<String>::new())),
+        "ListEnvironments must name no environment once every teardown finished, got {}",
+        listed.json()
+    );
 }
 
 #[tokio::test]

@@ -61,6 +61,8 @@ mod list_custom_line_item_versions;
 mod list_custom_line_items;
 #[path = "all/membership_writes_keep_superseded_generations.rs"]
 mod membership_writes_keep_superseded_generations;
+#[path = "all/ordered_billing_period_range_refusal.rs"]
+mod ordered_billing_period_range_refusal;
 #[path = "all/payer_account_authorization.rs"]
 mod payer_account_authorization;
 #[path = "all/payer_account_gate.rs"]

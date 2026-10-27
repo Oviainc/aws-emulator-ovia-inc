@@ -39,10 +39,28 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! ## Credentials the account has deactivated
+//!
+//! An access key this account holds authenticates a request only while its stored
+//! `Status` is `Active`: `UpdateAccessKey$Status` documents that "Active means that the
+//! key can be used for programmatic calls to Amazon Web Services, while Inactive means
+//! that the key cannot be used", so deactivating a key must cut the credential off
+//! while leaving it listed. That is an AUTHENTICATION outcome — no principal is
+//! resolved at all — so it is refused BEFORE any operation runs, and with the code an
+//! authentication failure carries ([`UNUSABLE_CREDENTIAL_CODE`]) rather than with an
+//! authorization denial or one of the modelled resource errors.
+//!
+//! The decision reads the records `iam:CreateAccessKey` and `iam:UpdateAccessKey` wrote
+//! ([`crate::state::ComAmazonawsIamAwsidentitymanagementv20100508State::access_key_is_usable`]);
+//! this file only reaches it ahead of dispatch, through [`Service::override_operation`]
+//! — the one seam that sees a whole request before the modelled walk deserializes,
+//! validates and dispatches it.
 
-use aws_smithy_schema_server::{envelope, Violation, ViolationKind};
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
+use aws_smithy_schema_server::{envelope, ProtocolError, Violation, ViolationKind};
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, BoxFuture, ErasedOperation, OperationContext, Refusal, Refused, Service,
 };
 use std::sync::Arc;
 
@@ -96,71 +114,62 @@ const WIRE_PATH_SEGMENTS: &[&str] = &[emulator_server::ROOT_PATH_SEGMENT];
 /// client branches on the code, so it must stay the one it would have seen.
 const BOUND_REFUSAL_CODE: &str = "ValidationError";
 
-/// The member every paginated listing of this service takes its page size in, spelled the
-/// way a validation path spells it (lowerCamel, as
-/// `aws_smithy_schema_server::constraints::path::member` builds it).
+/// Whether `violation` is a value outside a BOUND the model declares for its member — a
+/// number outside its `@range`, or a string or collection outside its `@length`.
 ///
-/// It is one member name shared by the whole listing surface: `smithy_query(query=
-/// "operation", operation="ListInstanceProfiles,ListRoles,ListUsers")` shows each taking
-/// `MaxItems` against the same `maxItemsType` (range 1..1000).
-const PAGE_SIZE_MEMBER: &str = "MaxItems";
-
-/// Whether `violation` is a page size outside the `@range` [`PAGE_SIZE_MEMBER`] declares.
-///
-/// The member is matched on the LAST path segment, because that is the member the clause
-/// names however deeply the walk reached it.
-fn is_page_size_bound(violation: &Violation) -> bool {
-    let bound = matches!(
+/// The other classes the framework reports are not bounds: a string outside its
+/// `@pattern`, a value outside an enumerated set, a repeated element, an absent required
+/// member.
+fn is_declared_bound(violation: &Violation) -> bool {
+    matches!(
         violation.kind,
-        ViolationKind::MinValue(_) | ViolationKind::MaxValue(_)
-    );
-    bound
-        && violation
-            .path
-            .rsplit('.')
-            .next()
-            .is_some_and(|member| member.eq_ignore_ascii_case(PAGE_SIZE_MEMBER))
+        ViolationKind::MinValue(_)
+            | ViolationKind::MaxValue(_)
+            | ViolationKind::MinLength(_)
+            | ViolationKind::MaxLength(_)
+    )
 }
 
-/// A boundary refusal restated so a PAGE SIZE outside its declared range names the member
-/// and the bound it broke and nothing of the number itself, or `None` when the request
-/// broke no page-size bound and the framework's own wording stands.
+/// A boundary refusal restated so a value outside a DECLARED BOUND names the member and
+/// the bound it broke and nothing of the value itself, or `None` when the request broke no
+/// such bound and the framework's own wording stands.
 ///
-/// This service states that class of refusal without echoing the rejected number — the
-/// clause reads `Value at 'maxItems' failed to satisfy constraint: Member must have value
-/// less than or equal to <bound>` — while every other class (a string outside its
-/// `@pattern` or `@length`, another numeric member outside its own range, an absent
-/// required member) keeps the framework's sentence, value and all. Only the
-/// `Value '<the number>' at` opening is lifted out: the envelope, the member path and the
-/// requirement are the framework's, built from the same two fields the renderer
-/// interpolated, so the two cannot drift and the replacement matches the echo whatever the
-/// number is.
+/// This service states that class of refusal without echoing the rejected value — the
+/// clause reads `Value at '<member>' failed to satisfy constraint: Member must have
+/// {value,length} {greater,less} than or equal to <bound>` — while the other classes (a
+/// string outside its `@pattern`, a value outside an enumerated set, an absent required
+/// member) keep the framework's sentence, value and all. Only the `Value '<the value>' at`
+/// opening is lifted out: the envelope, the member path and the requirement are the
+/// framework's, built from the same two fields the renderer interpolated, so the two
+/// cannot drift and the replacement matches the echo whatever the value is. The ONE thing
+/// it couples to is the renderer's quoting of that opening
+/// (`vendor/smithy-schema-server/src/constraints.rs::Violation::message`, `Value
+/// '<shown>' at '<path>'`); the suite below asserts the whole message and that the value
+/// appears nowhere in it, so a renderer that quoted it differently would fail there rather
+/// than turn this into a silent no-op.
 ///
-/// The class is the one the service's recorded answers cover — the page size every
-/// paginated listing takes ([`PAGE_SIZE_MEMBER`]). The observed answer to a listing whose
-/// `MaxItems` was above the modelled maximum is `1 validation error detected: Value at
-/// 'maxItems' failed to satisfy constraint: Member must have value less than or equal to
-/// 1000`: the member, the bound the model declares and no number from the request. The
-/// rewording is deliberately no wider than that — a member with no observed answer is
-/// better left as the framework states it than reworded on a guess, which is why
-/// `MaxSessionDuration` and every other numeric member keep the framework's sentence
-/// (pinned, both ways, by `tests/all/range_refusal_wording.rs`).
+/// The rule covers every member with a bound, not one member: the bound and the member
+/// path both come from the model, so a page size, a session duration, a description's
+/// length and a tag list's size are one class of refusal and are worded alike
+/// (`tests/all/range_refusal_wording.rs` reads them back, over both bound directions and
+/// over the scalar and collection forms of a length). Two of those rows go beyond what
+/// this service's recorded answers show — a role name over its `@length` maximum and a tag
+/// list over its own — and follow the class rather than an observation of their own; a
+/// later recording that echoes the value for one of them would narrow the class here, not
+/// contradict the seam.
 ///
 /// A refusal carrying an ABSENT required member is declined whole: that one renders under
 /// a different code than a failed bound, and restating it under [`BOUND_REFUSAL_CODE`]
 /// would change what a client branches on.
-fn without_page_size_value_echo(violations: &[Violation]) -> Option<Refused> {
+fn without_bound_value_echo(violations: &[Violation]) -> Option<Refused> {
     let absent_member = violations
         .iter()
         .any(|violation| matches!(violation.kind, ViolationKind::MissingRequiredMember));
-    if absent_member || !violations.iter().any(is_page_size_bound) {
+    if absent_member || !violations.iter().any(is_declared_bound) {
         return None;
     }
     let mut message = envelope(violations)?;
-    for violation in violations
-        .iter()
-        .filter(|violation| is_page_size_bound(violation))
-    {
+    for violation in violations.iter().filter(|violation| is_declared_bound(violation)) {
         let Some(value) = violation.value.as_deref() else {
             continue;
         };
@@ -175,6 +184,67 @@ fn without_page_size_value_echo(violations: &[Violation]) -> Option<Refused> {
     })
 }
 
+/// The error code AWS answers a signed request whose credential it will not accept
+/// with: a key id that was never issued, one that has been deleted, and one whose
+/// `Status` the account has moved off `Active`. It is an AUTHENTICATION failure — no
+/// principal was resolved — rather than an authorization denial, so it is the code an
+/// SDK's credential-refresh path keys on, the same code this emulator's STS front door
+/// answers an unresolvable credential with.
+const UNUSABLE_CREDENTIAL_CODE: &str = "InvalidClientTokenId";
+
+/// How AWS words that refusal: a fixed sentence carrying nothing from the request, so a
+/// caller presenting a credential the service will not accept learns nothing about the
+/// credential or about this account.
+const UNUSABLE_CREDENTIAL_MESSAGE: &str = "The security token included in the request is invalid.";
+
+/// Answers a request that presented a credential this account will not accept, as a
+/// pre-dispatch operation.
+///
+/// Rendered through the service's own refusal channel — the same path the framework's
+/// authentication refusal takes — so the envelope, the status (403) and the `<Code>` a
+/// client branches on are the ones every other refusal from this service carries.
+struct UnusableCredential;
+
+impl ErasedOperation for UnusableCredential {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        // The refusal is reached from the credential alone: nothing of the request's
+        // body or metadata is read, and nothing is written.
+        let _ = (req, ctx);
+        Box::pin(async move {
+            svc.definition().refusal_response(
+                ProtocolError::Unauthenticated {
+                    code: UNUSABLE_CREDENTIAL_CODE,
+                    message: UNUSABLE_CREDENTIAL_MESSAGE,
+                },
+                None,
+            )
+        })
+    }
+}
+
+/// The access key id `req` presented, or `None` for a request carrying no SigV4
+/// `Authorization` header at all.
+///
+/// Read through the framework's ONE parser of that header
+/// (`emulator_server::extract_akid`, which every handler in this crate resolves a
+/// nameless caller through). That parser takes an `http::HeaderMap`, which this
+/// pre-dispatch seam is not handed — it sees the runtime-API request — so the one
+/// header it reads is lifted into a map rather than the parse being written again here.
+fn presented_access_key_id(req: &RtRequest) -> Option<String> {
+    let authorization = req.headers().get(http::header::AUTHORIZATION.as_str())?;
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::AUTHORIZATION,
+        http::HeaderValue::from_str(authorization).ok()?,
+    );
+    Some(::engine::extract_akid(&headers))
+}
+
 /// The `com-amazonaws-iam-awsidentitymanagementv20100508` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -182,6 +252,13 @@ fn without_page_size_value_echo(violations: &[Violation]) -> Option<Refused> {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The SAME shared engine the generated entry threaded into every operation, kept
+    /// here too because the pre-dispatch credential check below has to read the access
+    /// keys this service's own operations wrote. Never a store of its own: it is the
+    /// `Arc` the router handed to `new`.
+    engine: Arc<Eng>,
+    /// Answers a request presenting a credential this account will not accept.
+    unusable_credential: UnusableCredential,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -190,8 +267,31 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            engine,
+            unusable_credential: UnusableCredential,
         }
+    }
+
+    /// Whether `req` presented an access key this account holds and will not accept —
+    /// one whose stored `Status` is not `Active` (see the module docs).
+    ///
+    /// A request that names no modelled operation is left alone: there is nothing to
+    /// serve it with, and the routing failure is the answer it gets. A store this
+    /// process cannot reach holds no key status either, so such a request is admitted
+    /// and the handler reports the unreachable store as the modelled server error.
+    ///
+    /// A READ: it takes the store's lock to look one key up and writes nothing, so a
+    /// refused request changes nothing a later caller sees.
+    fn presents_an_unusable_credential(&self, req: &RtRequest) -> bool {
+        if self.definition().protocol().routing_key(req).is_err() {
+            return false;
+        }
+        let Some(access_key_id) = presented_access_key_id(req) else {
+            return false;
+        };
+        crate::state::service_state(&*self.engine)
+            .is_some_and(|state| !state.lock().access_key_is_usable(&access_key_id))
     }
 }
 
@@ -233,20 +333,30 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // correctly; `None` (the default) lets the generated routing table resolve
         // it. `req` is the whole request, so a decision that depends on the body —
         // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        //
+        // A credential the account has deactivated is refused HERE, before the
+        // operation it named runs (see the module docs): the modelled walk
+        // deserializes, validates and dispatches before any handler could answer, so
+        // this pre-dispatch seam is the only place an authentication outcome is
+        // reachable from.
+        //
+        // The request's auth schemes are unaffected: the router reads them off the
+        // MODELLED operation the routing key names, so this changes nothing about which
+        // requests must be signed.
+        self.presents_an_unusable_credential(req)
+            .then_some(&self.unusable_credential as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
         // service reword it. Returning `None` keeps the framework's default
-        // wording; the one class this service words differently is a page size
-        // outside its declared range, which it states without echoing the number
-        // (see [`without_page_size_value_echo`], which answers with the code the
+        // wording; the one class this service words differently is a value outside
+        // a bound its member declares, which it states without echoing the value
+        // (see [`without_bound_value_echo`], which answers with the code the
         // framework would have chosen).
         match refusal {
-            Refusal::Invalid(violations) => without_page_size_value_echo(violations),
+            Refusal::Invalid(violations) => without_bound_value_echo(violations),
             _ => None,
         }
     }

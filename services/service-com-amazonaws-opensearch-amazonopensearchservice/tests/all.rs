@@ -71,6 +71,8 @@ mod package_associations;
 mod package_dependency_lifecycle;
 #[path = "all/package_dissociation.rs"]
 mod package_dissociation;
+#[path = "all/package_dissociation_batches.rs"]
+mod package_dissociation_batches;
 #[path = "all/package_listing_page_bounds.rs"]
 mod package_listing_page_bounds;
 #[path = "all/package_registry.rs"]

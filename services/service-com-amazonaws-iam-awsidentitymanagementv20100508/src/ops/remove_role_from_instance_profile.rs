@@ -222,15 +222,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // on your behalf." (`UnmodifiableEntityException` doc.) Taking one out of an
         // instance profile is such a modification, exactly as putting it in is for this
         // crate's `AddRoleToInstanceProfile`.
-        if let Some(principal) = crate::state::service_linked_role_principal(&role_path) {
+        // The refusal is stated in the one sentence this service words that protection
+        // with (`crate::state::protected_role_message`), which quotes the role the
+        // request named and nothing else.
+        if crate::state::is_service_linked_role_path(&role_path) {
             return Err(
                 RemoveRoleFromInstanceProfileErrorModeled::UnmodifiableEntityException(
                     UnmodifiableEntityException {
-                        message: Some(format!(
-                            "Service role {} is protected and can only be modified by \
-                             {principal}. You must request the change through that service.",
-                            input.role_name
-                        )),
+                        message: Some(crate::state::protected_role_message(&input.role_name)),
                     },
                 )
                 .into(),

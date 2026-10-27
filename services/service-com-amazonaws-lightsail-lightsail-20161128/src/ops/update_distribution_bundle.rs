@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDistributionBundle
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDistributionBundle`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDistributionBundle::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Moves ONE distribution of the account onto another of the CDN plans this
+//! service publishes: the plan names the distribution's monthly network transfer
+//! quota and monthly cost, so applying one replaces the `bundleId` the record
+//! carries and spends the one change a distribution gets "within your monthly
+//! Amazon Web Services billing cycle" — which is the `ableToUpdateBundle` a
+//! later `GetDistributions` reports.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +166,146 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDistributionBundle` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDistributionBundleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDistributionBundle"))
+        // Lightsail serves the distribution APIs from the N. Virginia endpoint
+        // ALONE — the modelled `InvalidInputException` documentation covers
+        // "Domain and distribution APIs" together and says to set the Region to
+        // us-east-1 "to create, view, or edit these resources" — so the Region
+        // the request was signed for decides whether this call is served at all.
+        // Checked through the crate's one owner of that rule, BEFORE anything is
+        // read or written, so a refused request moves no distribution.
+        if let Some(message) = crate::state::domain_region_refusal(ctx.parts()) {
+            return Err(invalid(message));
+        }
+
+        // `distributionName` carries the modelled `ResourceName` pattern, which
+        // the centralized walk already refused anything outside of, but the model
+        // makes neither member `@required`. What is left is what the model cannot
+        // express: this call applies ONE plan to ONE distribution — "the name of
+        // the distribution for which to update the bundle" and "the bundle ID of
+        // the new bundle to apply to your distribution" — so a request naming
+        // neither has no distribution to move, or no plan to move it to.
+        let Some(distribution_name) = input.distribution_name else {
+            return Err(invalid(
+                "distributionName is required to update a distribution's bundle; use \
+                 GetDistributions to list the distribution names you can specify"
+                    .to_string(),
+            ));
+        };
+        let Some(bundle_id) = input.bundle_id else {
+            return Err(invalid(
+                "bundleId is required to update a distribution's bundle; use \
+                 GetDistributionBundles to list the bundle IDs you can specify"
+                    .to_string(),
+            ));
+        };
+        // A plan a distribution may be put on is one this service publishes and
+        // one that is still active, since `DistributionBundle$isActive` says a
+        // bundle "can be specified for a new or existing distribution" — the same
+        // rule `CreateDistribution` applies, asked of the crate's one owner of it
+        // rather than re-derived here.
+        if !crate::state::distribution_bundle_is_applicable(&bundle_id) {
+            return Err(invalid(format!(
+                "bundleId '{bundle_id}' is not an active distribution bundle this service offers; \
+                 use GetDistributionBundles to list the bundle IDs you can specify"
+            )));
+        }
+
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // A distribution is not addressed per-Region ("all distributions are
+            // located in the us-east-1 Region"), so `distributionName` names one
+            // distribution of the account — and a name this account holds no
+            // distribution under is Lightsail's `DoesNotExist` rejection, the same
+            // one every other reader and writer of a distribution answers.
+            let distribution = store.distribution_mut(&distribution_name).ok_or_else(|| {
+                crate::scaffolded::Scaffolded::resource_does_not_exist(
+                    crate::state::RESOURCE_TYPE_DISTRIBUTION,
+                    &distribution_name,
+                )
+            })?;
+            // "You can update your distribution's bundle only one time within
+            // your monthly Amazon Web Services billing cycle. To determine if you
+            // can update your distribution's bundle, use the GetDistributions
+            // action. The ableToUpdateBundle parameter in the result will
+            // indicate whether you can currently update your distribution's
+            // bundle." — so a distribution that has already spent that one change
+            // is a well-formed request this resource's state does not allow,
+            // which is what the modelled `OperationFailureException` says.
+            // Refused BEFORE the first write, so it changes nothing.
+            if !distribution.able_to_update_bundle {
+                return Err(operation_failure(format!(
+                    "The bundle of the distribution {distribution_name} has already been updated \
+                     within this monthly Amazon Web Services billing cycle. You can update your \
+                     distribution's bundle only one time within your monthly Amazon Web Services \
+                     billing cycle."
+                )));
+            }
+
+            // The change itself: the distribution is billed and throttled on the
+            // plan this request names from here on, and the one change its
+            // monthly billing cycle allows is spent — including by a request
+            // naming the plan the distribution is already on, which asks for a
+            // bundle to be applied like any other rather than being
+            // short-circuited.
+            distribution.bundle_id = bundle_id;
+            distribution.able_to_update_bundle = false;
+            // The distribution's OWN status is left alone: a bundle names the
+            // monthly network transfer quota and the monthly cost, none of the
+            // configuration that is deployed to the edge locations, so this
+            // change rolls nothing out there.
+            let location = distribution.location.clone();
+
+            // One log entry, for the distribution that was moved — this
+            // operation's output carries a single `operation`, not a list. It is
+            // TERMINAL: the new plan is in force as this call returns, so the next
+            // read already reports it and the spent allowance, and the clock owes
+            // the entry nothing.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_UPDATE_DISTRIBUTION_BUNDLE,
+                crate::state::RESOURCE_TYPE_DISTRIBUTION,
+                &distribution_name,
+                &location,
+                None,
+            );
+            Ok(UpdateDistributionBundleOutput {
+                operation: Some(operation.view()),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the rule it broke.
+fn invalid(message: String) -> UpdateDistributionBundleError {
+    UpdateDistributionBundleErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// Lightsail's refusal of a well-formed request its resources' state does not
+/// allow: the modelled `OperationFailureException` — HTTP 400, "Lightsail throws
+/// this exception when an operation fails to execute" — whose message names the
+/// distribution the request is about and the rule that stands in the way.
+fn operation_failure(message: String) -> UpdateDistributionBundleError {
+    UpdateDistributionBundleErrorModeled::OperationFailureException(OperationFailureException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> UpdateDistributionBundleError {
+    UpdateDistributionBundleErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail distribution store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

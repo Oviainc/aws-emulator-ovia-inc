@@ -270,7 +270,12 @@ fn rows() -> Vec<Row> {
 
 /// A domain holding a settled (`ACTIVE`) association with each of `packages`, so a
 /// dissociation of it is judged with no other change in flight.
-async fn with_associations(emulator: &Emulator, domain: &str, ids: &[String], packages: &[usize]) {
+pub(crate) async fn with_associations(
+    emulator: &Emulator,
+    domain: &str,
+    ids: &[String],
+    packages: &[usize],
+) {
     create_baseline(emulator, domain).await;
     let named: Vec<String> = packages.iter().map(|index| ids[*index].clone()).collect();
     let answer = associate(emulator, domain, &named).await;

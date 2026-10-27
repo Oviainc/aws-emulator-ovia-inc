@@ -1,0 +1,89 @@
+Issue-Severity: CRITICAL
+Issue-Corpus: simparity-behavioral-ga-prod-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: cognito-identity.unlink-identity-removes-login-and-orphans-identity cognito-identity.unlink-identity-unknown-login-provider-accepted cognito-identity.deep-cognito-identity-2-disabled-identity-unlink-orphan-login-calls-rejected cognito-identity.unlink-identity-nonexistent-login-rejected cognito-identity.unlink-identity-mismatched-login-entry-rejected cognito-identity.unlink-with-an-unknown-developer-provider-is-rejected-and-the-login-survives
+Issue-Shape-Id: com.amazonaws.cognitoidentity#AWSCognitoIdentityService
+Issue-Key: cognito-identity.unlink-identity-removes-login-and-orphans-identity|run#17|AssertionError|assert unlinked.get("Logins") == [DISABLED], (
+Issue-Key: cognito-identity.unlink-identity-unknown-login-provider-accepted|run#20|AssertionError|assert after.get("Logins") == ["DISABLED"], (
+Issue-Key: cognito-identity.deep-cognito-identity-2-disabled-identity-unlink-orphan-login-calls-rejected|run#34|AssertionError|assert described["IdentityId"] == orphan_id and described.get("Logins") == [DISABLED], (
+Issue-Key: cognito-identity.unlink-identity-nonexistent-login-rejected|_error#14|AssertionError|raise AssertionError(
+Issue-Key: cognito-identity.unlink-identity-mismatched-login-entry-rejected|_error#17|AssertionError|raise AssertionError(f"expected the call to be rejected, but it SUCCEEDED and returned {result!r}")
+Issue-Key: cognito-identity.unlink-with-an-unknown-developer-provider-is-rejected-and-the-login-survives|run#14|AssertionError|assert code == EXPECTED_CODE, (
+Issue-Commit: 32af0d92e59e46f2fdf169ea1f28f8cf7b2e0f6a
+
+# cognito-identity: the identity-link lifecycle diverges in 4 ways — UnlinkIdentity empties Logins instead of projecting the DISABLED sentinel, honors an invalid login token, accepts a Logins map with no public provider, and UnlinkDeveloperIdentity misclassifies an unsupported developer provider
+
+> _Note: this issue was identified against the code base at commit `32af0d92e59e46f2fdf169ea1f28f8cf7b2e0f6a`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+UnlinkIdentity
+
+## Description
+This issue bundles FOUR distinct net-new root causes in the cognito-identity identity-link lifecycle (UnlinkIdentity / UnlinkDeveloperIdentity / DescribeIdentity projection). All four must be fixed and the checks in trace_ids re-replayed before this issue is closed.
+
+Related open issues that do NOT cover these (none of these checks is marked OWNED by them, and they describe other causes in other code paths): 20261025T005354Z-cognito-identity-getid-admits-unvalidatable-login-tokens-setprincipaltagattributemap.md (GetId's token admission, not UnlinkIdentity's), 20261023T185902Z-cognito-identity-input-validation-and-error-classification-diverge.md. The resolved stub issues 20261025T005354Z-cognito-identity-unlinkidentity-stub.md and 20261025T005354Z-cognito-identity-unlinkdeveloperidentity-stub.md stood both operations up: both now answer (no refusal, no 501), so these are fidelity defects in the implemented handlers, not a reopening of those.
+
+=== Cause 1 of 4: an unlinked identity's Logins is emptied instead of being replaced by the single sentinel "DISABLED" ===
+AWS: after UnlinkIdentity removes an identity's last (or only) public-provider login, the identity record SURVIVES and DescribeIdentity (and ListIdentities) continue to project its Logins as a one-element list holding the fixed sentinel string `DISABLED` — permanently — in place of the removed provider name. Smithy (services/service-com-amazonaws-cognitoidentity-awscognitoidentityservice/smithy-model/com-amazonaws-cognitoidentity-awscognitoidentityservice.json): DescribeIdentity output `Logins` targets `LoginsList`, UnlinkIdentity's documentation states only "Unlinked logins will be considered new identities next time they are seen. Removing the last linked login will make this identity inaccessible" — the sentinel itself is recorded behavior only (the check records it as MEASURED on real Cognito Identity, us-west-2, 2026-09, and asserts it in three independent scenarios). Fixed text: the literal element `DISABLED`; there are no request- or state-derived parts in it.
+Emulator: DescribeIdentity answers HTTP 200 with `Logins: []`. The handler drops the provider names from the identity record and writes nothing in their place.
+Why: a client cannot distinguish "this identity was unlinked and is now orphaned" from "this identity never had a login" — and code that reads the sentinel to detect an orphaned identity (the documented end state of an unlink) sees an empty list and concludes the unlink never happened. Every orphan-detection and re-link path built on the real projection is dead against the emulator.
+Fix: the identity record's login projection — the login-removal step of the UnlinkIdentity handler (services/service-com-amazonaws-cognitoidentity-awscognitoidentityservice/src/ops/unlink_identity.rs, the `unlink` body that retains `identity.logins`) and the DescribeIdentity/ListIdentities serializers that read it, so an identity whose logins were unlinked projects the sentinel rather than an empty list.
+Traces: cognito-identity.unlink-identity-removes-login-and-orphans-identity, cognito-identity.unlink-identity-unknown-login-provider-accepted, cognito-identity.deep-cognito-identity-2-disabled-identity-unlink-orphan-login-calls-rejected.
+
+=== Cause 2 of 4: UnlinkIdentity never validates the login token presented in Logins, so an unverifiable token performs the removal ===
+AWS: UnlinkIdentity is an UNSIGNED public API (Smithy: `auth: []`, `optionalAuth: true`) — the token in the `Logins` map IS the entire authorization for the call. A request that names the identity's genuinely linked provider but supplies a token that is not a valid OIDC identity token is refused with HTTP 403 `NotAuthorizedException` and the message `Invalid login token. Not a valid OpenId Connect identity token.` (entirely fixed text; no request- or state-derived parts), and the identity's Logins are left untouched. Smithy models `NotAuthorizedException` (HTTP 403) on UnlinkIdentity.
+Emulator: HTTP 200 with an empty body, and the login is actually removed. The handler validates only that each presented provider is one the pool accepts (`pool.accepts_login_provider`) and that it is not indexed against a different identity; the token VALUE is never verified, so `Logins={<provider>: "not-a-valid-jwt-token"}` is honored.
+Why: this is an authorization bypass on a destructive, unauthenticated operation. Anyone who learns an IdentityId can detach that identity's federated login — orphaning the user's identity and all state keyed to it — without holding any credential for the provider. The client-side handler for NotAuthorizedException is dead code, and a bogus-token regression passes against the emulator and corrupts real identities in production.
+Fix: the UnlinkIdentity handler's authorization step (services/service-com-amazonaws-cognitoidentity-awscognitoidentityservice/src/ops/unlink_identity.rs) must verify each presented `Logins` token against the issuing provider — the same token validation the GetId/GetCredentialsForIdentity path owes — and refuse with the modeled NotAuthorizedException and AWS's sentence above BEFORE any login index or identity record is mutated.
+Traces: cognito-identity.unlink-identity-nonexistent-login-rejected.
+
+=== Cause 3 of 4: a Logins map carrying no public provider at all (developer-provider only) is accepted instead of refused ===
+AWS: UnlinkIdentity operates on PUBLIC providers; a developer-provider login is detached through UnlinkDeveloperIdentity instead. A request whose `Logins` map contains only the pool's DeveloperProviderName — no recognized public provider — is refused with HTTP 400 `InvalidParameterException` and the message `Please provide a valid public provider` (entirely fixed text; no request- or state-derived parts), and the identity's existing developer login survives. Smithy models `InvalidParameterException` (HTTP 400, "Thrown for missing or bad input parameter(s)") on UnlinkIdentity.
+Emulator: HTTP 200 with an empty body for `UnlinkIdentity(IdentityId=<developer-authenticated identity>, Logins={<DeveloperProviderName>: <developerUserIdentifier>}, LoginsToRemove=[<some public provider>])`. The provider-acceptance check passes because the pool's DeveloperProviderName is an accepted login provider, and nothing afterwards requires a public one.
+Why: the API's own division of labour disappears — callers that wrongly route developer identities through UnlinkIdentity get a success against the emulator and a 400 in production, and the no-op/success is indistinguishable from a real detach, so the operator believes the developer login is gone when it is not.
+Fix: input validation in the UnlinkIdentity handler (services/service-com-amazonaws-cognitoidentity-awscognitoidentityservice/src/ops/unlink_identity.rs, alongside the existing `accepts_login_provider` loop) — require at least one PUBLIC provider entry in `Logins` and refuse with the modeled InvalidParameterException and AWS's sentence above when the map has none.
+Traces: cognito-identity.unlink-identity-mismatched-login-entry-rejected.
+
+=== Cause 4 of 4: UnlinkDeveloperIdentity misclassifies a developer provider the pool does not support as an authorization failure ===
+AWS: UnlinkDeveloperIdentity validates the `DeveloperProviderName` against the pool's configured one FIRST, and a mismatch is a bad input, not an access decision: HTTP 400 `InvalidParameterException` with the message `This identity pool does not support the specified developer provider.` (entirely fixed text; no request- or state-derived parts), and the identity's existing developer login survives. (A mismatched developer USER identifier under the correct provider is a different case and is not validated the same way.) Smithy models both `InvalidParameterException` (HTTP 400) and `NotAuthorizedException` (HTTP 403) on UnlinkDeveloperIdentity.
+Emulator: HTTP 403 `NotAuthorizedException` with `You do not have access to this identity`. The handler deliberately folds "the provider name is not this pool's" together with "the identifier was never registered" into one absent-mapping branch and answers the authorization error for both (services/service-com-amazonaws-cognitoidentity-awscognitoidentityservice/src/ops/unlink_developer_identity.rs: the `developer_provider.as_deref().filter(...)` resolution and the NotAuthorizedException that follows it).
+Why: the two codes mean opposite things. `InvalidParameterException` tells the caller to fix the request (a typo'd or stale DeveloperProviderName — the common misconfiguration); `NotAuthorizedException`/403 tells it the caller lacks access, which sends clients and SDK error handling down a credential/permission path that can never resolve the real problem, and hides a pool-configuration mistake behind a security error.
+Fix: the provider-resolution step of the UnlinkDeveloperIdentity handler — distinguish "the named DeveloperProviderName is not the pool's" (InvalidParameterException, AWS's sentence above) from "that developer user identifier is not registered" (the existing NotAuthorizedException), and check the provider before the identifier lookup.
+Traces: cognito-identity.unlink-with-an-unknown-developer-provider-is-rejected-and-the-login-survives.
+
+## Evidence
+Replay of suite simparity-behavioral-ga-prod-v1 against the booted emulator; every quotation below is from the failing-check list.
+
+Cause 1 — the DISABLED sentinel is never projected:
+- cognito-identity.unlink-identity-removes-login-and-orphans-identity: expected DescribeIdentity to report Logins == ['DISABLED'] after the unlink; actual "AssertionError: an unlinked identity's Logins list must be replaced by the single sentinel ['DISABLED'] -- not emptied, and not left holding 'cognito-idp.us-west-2.amazonaws.com/us-west-2_<poolid>' -- got []".
+- cognito-identity.unlink-identity-unknown-login-provider-accepted: actual "AssertionError: the real provider should now be detached and the identity marked DISABLED, got []".
+- cognito-identity.deep-cognito-identity-2-disabled-identity-unlink-orphan-login-calls-rejected: actual "AssertionError: DescribeIdentity on the orphan must SUCCEED with Logins exactly ['DISABLED'], got {'IdentityId': 'us-west-2:<guid>', 'Logins': [], 'CreationDate': ..., 'LastModifiedDate': ..., 'ResponseMetadata': {'HTTPStatusCode': 200, ...}}" — i.e. the record survives (correct) but projects an empty list.
+
+Cause 2 — an invalid login token performs the unlink:
+- cognito-identity.unlink-identity-nonexistent-login-rejected calls UnlinkIdentity(IdentityId=<id>, Logins={<linked provider>: "not-a-valid-jwt-token"}, LoginsToRemove=[<linked provider>]).
+  expected: HTTP 403 NotAuthorizedException, message "Invalid login token. Not a valid OpenId Connect identity token.", Logins unchanged.
+  actual:   "AssertionError: expected this call to be rejected, but it SUCCEEDED and returned {'ResponseMetadata': {'HTTPStatusCode': 200, 'HTTPHeaders': {'content-type': 'application/x-amz-json-1.1', 'content-length': '2', ...}, 'RetryAttempts': 0}}".
+
+Cause 3 — a developer-provider-only Logins map is accepted:
+- cognito-identity.unlink-identity-mismatched-login-entry-rejected calls UnlinkIdentity(IdentityId=<developer-authenticated identity>, Logins={<DeveloperProviderName>: <developer user id>}, LoginsToRemove=[<an unlinked public provider>]).
+  expected: HTTP 400 InvalidParameterException, message "Please provide a valid public provider", developer login untouched.
+  actual:   "AssertionError: expected the call to be rejected, but it SUCCEEDED and returned {'ResponseMetadata': {'HTTPStatusCode': 200, 'HTTPHeaders': {'content-length': '2', ...}, 'RetryAttempts': 0}}".
+
+Cause 4 — the unsupported developer provider is answered as an access failure:
+- cognito-identity.unlink-with-an-unknown-developer-provider-is-rejected-and-the-login-survives:
+  expected: HTTP 400 InvalidParameterException, message "This identity pool does not support the specified developer provider."
+  actual:   "AssertionError: expected 'InvalidParameterException' for an unknown developer provider, got 'NotAuthorizedException': 'You do not have access to this identity'".
+
+Model (smithy_query query=operation, model_path=services/service-com-amazonaws-cognitoidentity-awscognitoidentityservice/smithy-model/com-amazonaws-cognitoidentity-awscognitoidentityservice.json):
+- UnlinkIdentity: input {IdentityId required, Logins (LoginsMap, len 0..10) required, LoginsToRemove (LoginsList) required}; output Unit; auth [] / optionalAuth true; errors ExternalServiceException 400, InternalErrorException 500, InvalidParameterException 400, NotAuthorizedException 403, ResourceConflictException 409, ResourceNotFoundException 404, TooManyRequestsException 429.
+- UnlinkDeveloperIdentity: input {IdentityId, IdentityPoolId, DeveloperProviderName (len 1..128), DeveloperUserIdentifier (len 1..1024)} all required; errors InvalidParameterException 400, NotAuthorizedException 403, ResourceConflictException 409, ResourceNotFoundException 404, TooManyRequestsException 429, InternalErrorException 500.
+- DescribeIdentity: output {IdentityId, Logins (LoginsList), CreationDate, LastModifiedDate}.
+
+Handler code consulted for the Fix lines (read-only): services/service-com-amazonaws-cognitoidentity-awscognitoidentityservice/src/ops/unlink_identity.rs:259-324 (provider-acceptance check, conflict check, then the `retain` that empties `identity.logins`; no token verification anywhere in the handler) and services/service-com-amazonaws-cognitoidentity-awscognitoidentityservice/src/ops/unlink_developer_identity.rs:290-321 (provider name and identifier folded into one absent-mapping branch answering NotAuthorizedException).
+
+## Steps to Reproduce
+1. Build and boot the emulator, then replay the behavioral checks listed in trace_ids.
+2. Cause 1: CreateIdentityPool(AllowUnauthenticatedIdentities=True, CognitoIdentityProviders=[{ProviderName: cognito-idp.<region>.amazonaws.com/<user-pool-id>, ClientId: <client>, ServerSideTokenCheck: False}]); obtain a user-pool ID token; GetId(IdentityPoolId=<pool>, Logins={<provider>: <id token>}); DescribeIdentity -> Logins == [<provider>]; UnlinkIdentity(IdentityId=<id>, Logins={<provider>: <id token>}, LoginsToRemove=[<provider>]); DescribeIdentity -> expect Logins == ['DISABLED']; observe Logins == [].
+3. Cause 2: same setup, then UnlinkIdentity(IdentityId=<id>, Logins={<provider>: "not-a-valid-jwt-token"}, LoginsToRemove=[<provider>]) -> expect HTTP 403 NotAuthorizedException "Invalid login token. Not a valid OpenId Connect identity token." and DescribeIdentity still reporting [<provider>]; observe HTTP 200 and the login removed.
+4. Cause 3: CreateIdentityPool(..., DeveloperProviderName=<devprov>); GetOpenIdTokenForDeveloperIdentity(IdentityPoolId=<pool>, Logins={<devprov>: <devuser>}) to mint a developer-only identity; UnlinkIdentity(IdentityId=<that id>, Logins={<devprov>: <devuser>}, LoginsToRemove=[<any public provider>]) -> expect HTTP 400 InvalidParameterException "Please provide a valid public provider"; observe HTTP 200.
+5. Cause 4: on that same pool, UnlinkDeveloperIdentity(IdentityId=<that id>, IdentityPoolId=<pool>, DeveloperProviderName=<a provider name the pool was NOT created with>, DeveloperUserIdentifier=<devuser>) -> expect HTTP 400 InvalidParameterException "This identity pool does not support the specified developer provider." and the developer login still linked; observe HTTP 403 NotAuthorizedException "You do not have access to this identity".

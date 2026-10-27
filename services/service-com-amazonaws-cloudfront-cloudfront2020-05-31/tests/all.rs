@@ -19,6 +19,8 @@ mod anycast_ip_list_lifecycle;
 mod anycast_ip_list_list;
 #[path = "all/anycast_ip_list_update.rs"]
 mod anycast_ip_list_update;
+#[path = "all/by_policy_listing_refusal.rs"]
+mod by_policy_listing_refusal;
 #[path = "all/cache_policy_lifecycle.rs"]
 mod cache_policy_lifecycle;
 #[path = "all/cache_policy_list.rs"]

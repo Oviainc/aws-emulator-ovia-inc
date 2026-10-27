@@ -375,7 +375,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !store.lookup_tables.contains_key(table) {
                 return Err(StartQueryErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(crate::state::resource_not_found_message("lookup table")),
+                        // A missing lookup table is refused by naming the table and the
+                        // account it was looked for in, the way every lookup-table refusal
+                        // of this service names them — here the table the `lookup` command
+                        // named and the account this request is signed for.
+                        message: Some(crate::state::lookup_table_not_found_message(
+                            table,
+                            ::engine::emulator_account_id(),
+                        )),
                     },
                 )
                 .into());

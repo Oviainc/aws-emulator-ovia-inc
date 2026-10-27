@@ -24,10 +24,12 @@ use serde_json::json;
 
 use crate::stack_lifecycle::{
     acknowledging_iam, call, call_in, create_stack, describe_stack, iam, member,
-    wait_for_the_transition, xml_text, REGION,
+    resource_event_reason, wait_for_the_transition, xml_text, REGION,
 };
 use crate::stack_resource_provisioning::s3;
-use service_com_amazonaws_cloudformation_cloudformation::state::status;
+use service_com_amazonaws_cloudformation_cloudformation::state::{
+    failed_action, resource_failure_summary, resource_status, status,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The Region the misdeployed copy of the recorded case sits in: the clash is only
@@ -263,14 +265,29 @@ async fn a_create_whose_resource_is_refused_is_unwound_as_on_failure_says() {
                     "case {:?}: expected {expected_status}, got {described}",
                     row.case
                 );
-                // The reason is the owning service's own refusal, naming the resource that
-                // failed.
+                // The STACK's reason is the summary sentence naming the resource that
+                // failed, and nothing else; IAM's own refusal is reported on that
+                // resource's event instead, where a client reads the per-resource cause.
                 let reason = xml_text(&described, "StackStatusReason").unwrap_or_default();
+                assert_eq!(
+                    reason,
+                    resource_failure_summary(failed_action::CREATE, ["ZRole"]),
+                    "case {:?}: expected the stack reason to be the summary of what failed, \
+                     got {reason:?}",
+                    row.case
+                );
+                let on_the_resource = resource_event_reason(
+                    &router,
+                    row.stack,
+                    "ZRole",
+                    resource_status::CREATE_FAILED,
+                )
+                .await;
                 assert!(
-                    reason.contains("ZRole") && reason.contains("EntityAlreadyExists"),
-                    "case {:?}: expected the reason to name the resource and IAM's own \
-                     refusal, got {reason:?}"
-                    ,
+                    on_the_resource.contains(&format!("Role with name {role} already exists."))
+                        && on_the_resource.contains("HandlerErrorCode: AlreadyExists"),
+                    "case {:?}: expected IAM's own refusal on the failed resource's event, \
+                     got {on_the_resource:?}",
                     row.case
                 );
                 // No output resolves over resources the stack does not have.

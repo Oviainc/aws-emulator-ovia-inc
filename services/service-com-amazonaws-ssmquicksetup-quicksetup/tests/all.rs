@@ -19,6 +19,8 @@ mod configuration_manager_teardown;
 mod configuration_managers;
 #[path = "all/deployment_target_parameters.rs"]
 mod deployment_target_parameters;
+#[path = "all/deployment_target_required.rs"]
+mod deployment_target_required;
 #[path = "all/deployment_targets.rs"]
 mod deployment_targets;
 #[path = "all/list_tags_for_resource.rs"]

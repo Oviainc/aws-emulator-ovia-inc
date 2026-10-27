@@ -101,6 +101,8 @@ mod disk_snapshot;
 mod disk_snapshot_delete;
 #[path = "all/disk_snapshot_listing.rs"]
 mod disk_snapshot_listing;
+#[path = "all/distribution_bundle_update.rs"]
+mod distribution_bundle_update;
 #[path = "all/distribution_bundles.rs"]
 mod distribution_bundles;
 #[path = "all/distribution_cache_reset.rs"]

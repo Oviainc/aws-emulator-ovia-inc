@@ -22,10 +22,13 @@
 //! `Timeout` that has and has not run out.
 
 use crate::stack_lifecycle::{
-    call, create_stack, describe_stack, member, router, wait_for_the_transition, xml_text,
+    call, create_stack, describe_stack, member, resource_event_reason, router,
+    wait_for_the_transition, xml_text,
 };
 use crate::stack_resources::{resources_of, wire_resources};
-use service_com_amazonaws_cloudformation_cloudformation::state::resource_status;
+use service_com_amazonaws_cloudformation_cloudformation::state::{
+    failed_action, resource_failure_summary, resource_status,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// `SignalResource` for one resource of one stack.
@@ -554,12 +557,27 @@ async fn a_failure_signal_fails_the_create_and_rolls_it_back() {
     );
 
     // "A failure signal causes CloudFormation to immediately fail the stack creation or
-    // update": the create does not wait for its remaining signals.
+    // update": the create does not wait for its remaining signals. The stack's reason
+    // summarises which resource failed it; the signal that did so is reported on that
+    // resource's own event.
     let reason = status_reason_of(&router, "failing").await;
-    assert!(
-        reason.contains("host-x"),
-        "expected the failure reason to name the signal that failed the create, got \
+    assert_eq!(
+        reason,
+        resource_failure_summary(failed_action::CREATE, ["Wait"]),
+        "expected the failure reason to summarise the resource that failed the create, got \
          {reason:?}"
+    );
+    let on_the_resource = resource_event_reason(
+        &router,
+        "failing",
+        "Wait",
+        resource_status::CREATE_FAILED,
+    )
+    .await;
+    assert!(
+        on_the_resource.contains("host-x"),
+        "expected the resource's own event to name the signal that failed it, got \
+         {on_the_resource:?}"
     );
     wait_for_the_transition().await;
     let reported_status = status_of(&router, "failing").await;

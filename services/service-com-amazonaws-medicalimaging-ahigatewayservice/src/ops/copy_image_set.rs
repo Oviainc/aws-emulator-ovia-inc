@@ -31,12 +31,28 @@
 //! * `force` is recorded as the destination version's `Overrides.forced`, which is
 //!   exactly what the model says that member reports — "if `forced` exists, the
 //!   `forced` flag was used when creating the image set" — and is what `GetImageSet`
-//!   reads back.
+//!   reads back. It also does what it is documented FOR: it "will force completion of the
+//!   CopyImageSet operation, even if there are inconsistent Patient, Study, and/or Series
+//!   level metadata elements between the sourceImageSet and destinationImageSet", so
+//!   without it a copy whose content disagrees with the destination's about one of those
+//!   elements is not completed at all but refused with the modelled `ConflictException`
+//!   (409, [`crate::state::IMAGE_SET_COPY_INCONSISTENT_METADATA_MESSAGE`]). An element only
+//!   one of the two holds is no disagreement — the copy supplies it — so an image set that
+//!   holds no DICOM content yet takes any copy, and a MINTED destination holds nothing to
+//!   disagree with.
 //! * `sourceImageSet.DICOMCopies.copiableAttributes` is documented as "the JSON string
 //!   used to specify a subset of SOP Instances to copy", so a value that is not a JSON
 //!   document fails the constraint the service sets and is refused with
 //!   `ValidationException` (400), worded like every other refusal of this service and
-//!   WITHOUT echoing the value, which the model marks `@sensitive`.
+//!   WITHOUT echoing the value, which the model marks `@sensitive`. A value that IS one
+//!   SELECTS the content the copy carries: the document is written in the shape of the
+//!   aggregated metadata document, which places a SOP instance at `Study` → `Series` →
+//!   series UID → `Instances` → SOP Instance UID, and only the instances it names there
+//!   reach the destination — their pixel data and their attributes, and nothing of the
+//!   instances it leaves out. The patient, study and series attributes travel with them,
+//!   because the copied instances still belong to that patient, study and series. Nothing
+//!   of the selector itself is persisted: what the destination records is the content, and
+//!   the model marks the document `@sensitive`.
 //!
 //! Both image sets come back `LOCKED` — the source `COPYING_WITH_READ_ONLY_ACCESS`,
 //! the destination `COPYING` — and the CLOCK, not a later reader, releases them after
@@ -49,9 +65,10 @@
 //! with the same modelled `ConflictException` ([`crate::state::Datastore::is_active`]).
 //!
 //! A copy also carries the source's PIXEL DATA: the image frames the source holds when
-//! the copy is admitted are delivered to the destination by the same clock-owed
-//! transition that releases it, so `GetImageFrame` serves them from the destination once
-//! the copy has completed and finds nothing there before that.
+//! the copy is admitted — those of the selected SOP instances, where the request selected
+//! a subset — are delivered to the destination by the same clock-owed transition that
+//! releases it, so `GetImageFrame` serves them from the destination once the copy has
+//! completed and finds nothing there before that.
 //!
 //! ---
 //!
@@ -110,12 +127,184 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{ImageSet, ImageSetState, ImageSetWorkflowStatus, PendingImageSetTransition};
+use ::std::collections::{BTreeSet, HashMap};
+
+use ::serde_json::{Map, Value};
+
+use crate::state::{
+    ImageFrame, ImageSet, ImageSetAttributes, ImageSetState, ImageSetWorkflowStatus,
+    PendingImageSetTransition, METADATA_INSTANCES_KEY, METADATA_SERIES_KEY, METADATA_STUDY_KEY,
+};
 
 /// The validation path of `copiableAttributes`, as the boundary validator spells it —
 /// the member whose JSON this handler checks itself.
 const COPIABLE_ATTRIBUTES_PATH: &str =
     "copyImageSetInformation.sourceImageSet.DICOMCopies.copiableAttributes";
+
+/// The SOP instances a `copiableAttributes` document NAMES — the subset the copy is
+/// restricted to.
+///
+/// The member is "the JSON string used to specify a subset of SOP Instances to copy", and
+/// the document is written in the shape of the aggregated metadata document, which places
+/// one SOP instance at `Study` → `Series` → series UID → `Instances` → SOP Instance UID
+/// (the hierarchy `crate::ops::get_image_set_metadata` serves and
+/// `crate::ops::update_image_set_metadata` writes). So the instances selected are the keys
+/// of every `Instances` level the document carries, whichever series locates them: what
+/// identifies a SOP instance is its own UID. A document that names none selects none, and
+/// the copy carries no instance.
+fn selected_instances(document: &Value) -> BTreeSet<String> {
+    let mut selected = BTreeSet::new();
+    let series = document
+        .get(METADATA_STUDY_KEY)
+        .and_then(|study| study.get(METADATA_SERIES_KEY))
+        .and_then(Value::as_object);
+    for one_series in series.into_iter().flat_map(Map::values) {
+        let instances = one_series
+            .get(METADATA_INSTANCES_KEY)
+            .and_then(Value::as_object);
+        selected.extend(instances.into_iter().flat_map(Map::keys).cloned());
+    }
+    selected
+}
+
+/// The image frames of `frames` whose pixel data came from one of the SOP instances in
+/// `selected` — the pixel data a subset copy carries.
+///
+/// A frame records the instance its pixel data came from
+/// ([`crate::state::ImageFrame::sop_instance_uid`]), so pixel data stored under no instance
+/// is named by no selector and stays behind.
+fn frames_of_instances(
+    frames: &HashMap<String, ImageFrame>,
+    selected: &BTreeSet<String>,
+) -> HashMap<String, ImageFrame> {
+    frames
+        .iter()
+        .filter(|(_, frame)| {
+            frame
+                .sop_instance_uid
+                .as_ref()
+                .is_some_and(|uid| selected.contains(uid))
+        })
+        .map(|(image_frame_id, frame)| (image_frame_id.clone(), frame.clone()))
+        .collect()
+}
+
+/// `attributes` with every SOP instance outside `selected` left behind — the DICOM
+/// attributes a subset copy carries.
+///
+/// The attributes of the patient, the study and the series are kept: the selected instances
+/// still belong to them, so what the destination reports about them describes the content it
+/// holds. The two study counts are study-level elements of the study the content belongs to
+/// rather than a count of what one image set holds, so they are carried as they stand.
+fn attributes_of_instances(
+    mut attributes: ImageSetAttributes,
+    selected: &BTreeSet<String>,
+) -> ImageSetAttributes {
+    retain_selected_instances(&mut attributes.extra_attributes, selected);
+    attributes
+}
+
+/// Keep, in the `Instances` levels of `attributes`, only the SOP instances `selected`
+/// names, and drop every level the removal leaves empty — so an instance left out of the
+/// copy is gone from the destination's document rather than reported as a level with
+/// nothing in it.
+fn retain_selected_instances(attributes: &mut Map<String, Value>, selected: &BTreeSet<String>) {
+    let Some(study) = attributes
+        .get_mut(METADATA_STUDY_KEY)
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    let mut series_emptied = false;
+    if let Some(series_level) = study
+        .get_mut(METADATA_SERIES_KEY)
+        .and_then(Value::as_object_mut)
+    {
+        for one_series in series_level.values_mut() {
+            let Some(series_object) = one_series.as_object_mut() else {
+                continue;
+            };
+            let Some(instances) = series_object
+                .get_mut(METADATA_INSTANCES_KEY)
+                .and_then(Value::as_object_mut)
+            else {
+                continue;
+            };
+            instances.retain(|sop_instance_uid, _| selected.contains(sop_instance_uid));
+            if instances.is_empty() {
+                series_object.remove(METADATA_INSTANCES_KEY);
+            }
+        }
+        series_level.retain(|_, one_series| !one_series.as_object().is_some_and(Map::is_empty));
+        series_emptied = series_level.is_empty();
+    }
+    if series_emptied {
+        study.remove(METADATA_SERIES_KEY);
+    }
+    if study.is_empty() {
+        attributes.remove(METADATA_STUDY_KEY);
+    }
+}
+
+/// Whether the two sets of DICOM attributes DISAGREE about a patient, study or series level
+/// metadata element: an element both of them hold, holding different values.
+///
+/// An element only one of them holds is no disagreement — the copy supplies what the
+/// destination has not got — so an image set nothing has delivered DICOM content to is
+/// consistent with every source. The elements compared are the ones the model names at
+/// those three levels (`smithy_query(query="shape",shape="DICOMTags")`), each of which
+/// describes where the content sits in the DICOM hierarchy or who it is about.
+fn inconsistent_metadata(copied: &DICOMTags, held: &DICOMTags) -> bool {
+    text_elements(copied)
+        .into_iter()
+        .zip(text_elements(held))
+        .any(|(copied, held)| disagrees(copied.as_ref(), held.as_ref()))
+        || number_elements(copied)
+            .into_iter()
+            .zip(number_elements(held))
+            .any(|(copied, held)| disagrees(copied.as_ref(), held.as_ref()))
+}
+
+/// Whether one element's two values disagree: both are there, and they differ.
+fn disagrees<T: PartialEq>(copied: Option<&T>, held: Option<&T>) -> bool {
+    match (copied, held) {
+        (Some(copied), Some(held)) => copied != held,
+        _ => false,
+    }
+}
+
+/// Every patient, study and series level element the model carries as TEXT, in one order,
+/// so two image sets' elements are compared pairwise.
+fn text_elements(tags: &DICOMTags) -> [&Option<String>; 13] {
+    [
+        &tags.dicom_patient_id,
+        &tags.dicom_patient_name,
+        &tags.dicom_patient_birth_date,
+        &tags.dicom_patient_sex,
+        &tags.dicom_study_instance_uid,
+        &tags.dicom_study_id,
+        &tags.dicom_study_description,
+        &tags.dicom_study_date,
+        &tags.dicom_study_time,
+        &tags.dicom_accession_number,
+        &tags.dicom_series_instance_uid,
+        &tags.dicom_series_modality,
+        &tags.dicom_series_body_part,
+    ]
+}
+
+/// The same for the elements the model carries as NUMBERS. The two study counts are
+/// modelled as plain numbers rather than optional ones, so zero is what an image set
+/// nothing has stored a count for holds: absent, not a count of none.
+fn number_elements(tags: &DICOMTags) -> [Option<i32>; 3] {
+    [
+        (tags.dicom_number_of_study_related_series != 0)
+            .then_some(tags.dicom_number_of_study_related_series),
+        (tags.dicom_number_of_study_related_instances != 0)
+            .then_some(tags.dicom_number_of_study_related_instances),
+        tags.dicom_series_number,
+    ]
+}
 
 /// The validation path of the destination image set's identifier.
 const DESTINATION_IMAGE_SET_ID_PATH: &str = "copyImageSetInformation.destinationImageSet.imageSetId";
@@ -245,23 +434,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let information = &input.copy_image_set_information;
         let promote_to_primary = input.promote_to_primary.unwrap_or(false);
+        let forced = input.force.unwrap_or(false);
 
         // `copiableAttributes` is documented as "the JSON string used to specify a
         // subset of SOP Instances to copy", and the model constrains only its length —
         // so whether it IS a JSON document is checked here, before any state is read.
-        // The value is never echoed: the model marks the member `@sensitive`.
-        if let Some(copies) = &information.source_image_set.dicom_copies {
-            if ::serde_json::from_str::<::serde_json::Value>(&copies.copiable_attributes).is_err() {
-                return Err(CopyImageSetErrorModeled::ValidationException(ValidationException {
-                    message: crate::state::handler_requirement_error(
-                        COPIABLE_ATTRIBUTES_PATH,
-                        None,
-                        "Member must be a JSON document",
-                    ),
-                })
-                .into());
-            }
-        }
+        // The value is never echoed: the model marks the member `@sensitive`. What the
+        // document NAMES is the subset the copy is then restricted to; a request that
+        // carries no `DICOMCopies` copies the whole image set.
+        let selected = match &information.source_image_set.dicom_copies {
+            Some(copies) => match ::serde_json::from_str::<Value>(&copies.copiable_attributes) {
+                Ok(document) => Some(selected_instances(&document)),
+                Err(_) => {
+                    return Err(CopyImageSetErrorModeled::ValidationException(
+                        ValidationException {
+                            message: crate::state::handler_requirement_error(
+                                COPIABLE_ATTRIBUTES_PATH,
+                                None,
+                                "Member must be a JSON document",
+                            ),
+                        },
+                    )
+                    .into());
+                }
+            },
+            None => None,
+        };
 
         // A promote answers with "a new primary image set ID ... as the destination image
         // set", so it mints its destination: a request that ALSO names one is asking for
@@ -350,13 +548,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Which DICOM hierarchy the source belongs to, which a whole copy of it carries.
         let source_is_primary = source.is_primary;
         // The pixel data this copy carries to its destination: read from the source as
-        // it stands when the copy is admitted, delivered when the copy completes.
-        let copied_image_frames = source.image_frames.clone();
+        // it stands when the copy is admitted, delivered when the copy completes. A
+        // request that selected a subset of the source's SOP instances carries the pixel
+        // data of THOSE instances and no other.
+        let copied_image_frames = match &selected {
+            Some(selected) => frames_of_instances(&source.image_frames, selected),
+            None => source.image_frames.clone(),
+        };
         // The DICOM attributes travel with it: a copy of an image set describes the same
         // patient, study and series — the attributes the model names and the attributes a
         // metadata update wrote alike — so the destination is searchable by them, and
-        // reports them, once the copy has landed.
-        let copied_attributes = source.attributes();
+        // reports them, once the copy has landed. A subset copy carries the attributes of
+        // the instances it selected, and none of those it left behind.
+        let copied_attributes = match &selected {
+            Some(selected) => attributes_of_instances(source.attributes(), selected),
+            None => source.attributes(),
+        };
         let held_image_sets = datastore.image_sets.len();
 
         // Every refusal the destination can raise, before anything is written.
@@ -381,6 +588,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if held.latest_version.image_set_state != ImageSetState::Active {
                     return Err(CopyImageSetErrorModeled::ConflictException(ConflictException {
                         message: crate::state::IMAGE_SET_NOT_ACTIVE_MESSAGE.to_string(),
+                    })
+                    .into());
+                }
+                // `force` "will force completion of the CopyImageSet operation, even if
+                // there are inconsistent Patient, Study, and/or Series level metadata
+                // elements between the sourceImageSet and destinationImageSet" — so
+                // WITHOUT it a copy whose content disagrees with the destination's about
+                // one of those elements is not completed: the destination would end up
+                // describing two different studies, which is the inconsistent state the
+                // modelled `ConflictException` (HTTP 409) reports.
+                if !forced && inconsistent_metadata(&copied_attributes.dicom_tags, &held.dicom_tags)
+                {
+                    return Err(CopyImageSetErrorModeled::ConflictException(ConflictException {
+                        message: crate::state::IMAGE_SET_COPY_INCONSISTENT_METADATA_MESSAGE
+                            .to_string(),
                     })
                     .into());
                 }
@@ -422,14 +644,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Past here the request is accepted, so both image sets are written before
         // anything is reported: a 200 naming a destination that was never stored would
         // dress absence as success.
-        let forced = input.force.unwrap_or(false);
+        //
         // The hierarchy a MINTED destination comes into existence in. A promote asks for a
         // primary one outright; otherwise the copy carries what it copied — the whole
         // image set keeps its source's membership, a subset of its SOP instances
         // reproduces that hierarchy only in part and lands outside the primary one.
         let minted_is_primary = if promote_to_primary {
             true
-        } else if information.source_image_set.dicom_copies.is_some() {
+        } else if selected.is_some() {
             false
         } else {
             source_is_primary

@@ -757,7 +757,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => None,
                 Some(failure) => {
                     // A resource an owning service refused: the update does not reach
-                    // UPDATE_COMPLETE, and the reason reported is the one that service gave.
+                    // UPDATE_COMPLETE, and the stack reports the summary of what failed
+                    // ([`crate::state::resource_failure_summary`]) — that service's own
+                    // refusal is on the failing resource's event.
                     let failed_at = ::std::time::SystemTime::now();
                     stack.fail_transition(failed_at, status::UPDATE_FAILED, failure.clone());
                     // Nothing to put back, or a caller that asked for the failed state to be

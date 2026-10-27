@@ -533,7 +533,8 @@ async fn a_write_in_one_region_leaves_the_same_name_in_every_other_region_alone(
         );
     }
 
-    // A delete of the shared name in ONE Region removes it only there.
+    // A delete of the shared name in ONE Region removes it only there — once the teardown
+    // it starts has come due.
     let answer = harness.delete(updated_region, SHARED_NAME).await;
     assert_eq!(
         answer.status,
@@ -542,6 +543,7 @@ async fn a_write_in_one_region_leaves_the_same_name_in_every_other_region_alone(
         answer.status,
         answer.text()
     );
+    tokio::time::sleep(PAST_TRANSITION).await;
     for region in POPULATED_REGIONS {
         let listed = harness.list(region).await;
         let expected = if region == updated_region {

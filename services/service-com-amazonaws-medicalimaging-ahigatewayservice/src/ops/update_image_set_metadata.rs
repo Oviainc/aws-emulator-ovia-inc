@@ -169,13 +169,13 @@ const SCHEMA_VERSION_KEY: &str = "SchemaVersion";
 const PATIENT_KEY: &str = "Patient";
 
 /// The study level of the aggregated metadata document.
-const STUDY_KEY: &str = "Study";
+const STUDY_KEY: &str = crate::state::METADATA_STUDY_KEY;
 
 /// The map of series inside the study level, keyed by Series Instance UID.
-const SERIES_KEY: &str = "Series";
+const SERIES_KEY: &str = crate::state::METADATA_SERIES_KEY;
 
 /// The map of SOP instances inside one series, keyed by SOP Instance UID.
-const INSTANCES_KEY: &str = "Instances";
+const INSTANCES_KEY: &str = crate::state::METADATA_INSTANCES_KEY;
 
 /// The object holding one level's DICOM attributes, keyed by attribute keyword.
 const DICOM_KEY: &str = "DICOM";
