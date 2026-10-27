@@ -238,10 +238,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let size = crate::state::page_size(input.max_results);
 
         // What an Outpost's hardware can support is a fact about that hardware, but
-        // WHICH hardware it holds is installed as its provisioning finishes, so the
-        // installation the clock has already made due is materialised before an
-        // `AssetId` is resolved against it: nothing else here is written, and nothing
-        // written is anything a later caller would not have seen anyway.
+        // WHICH hardware it holds is installed when an order placed on it has delivered
+        // some, so the installation the clock has already made due is materialised
+        // before an `AssetId` is resolved against it: nothing else here is written, and
+        // nothing written is anything a later caller would not have seen anyway.
         let mut store = state.lock();
         store.settle_outposts();
         // The supported instance types are reported OFF one Outpost, so one the store

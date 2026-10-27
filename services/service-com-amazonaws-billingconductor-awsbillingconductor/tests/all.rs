@@ -35,6 +35,8 @@ mod billing_group_core_loop;
 mod billing_group_cost_report;
 #[path = "all/billing_group_period_occupancy.rs"]
 mod billing_group_period_occupancy;
+#[path = "all/billing_group_size_one_rule.rs"]
+mod billing_group_size_one_rule;
 #[path = "all/billing_transfer_identity.rs"]
 mod billing_transfer_identity;
 #[path = "all/billing_transfer_preference.rs"]

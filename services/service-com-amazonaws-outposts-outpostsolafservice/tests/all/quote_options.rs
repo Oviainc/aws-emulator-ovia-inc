@@ -48,7 +48,9 @@ use service_com_amazonaws_outposts_outpostsolafservice::state::{
 
 use crate::quote_lifecycle::{create_quote, get_quote, request};
 use crate::renewal_pricing::{assert_price, months, price, upfront_share, CENT};
-use crate::site_and_outpost_lifecycle::{address, is_minted_id, segment, settle, text, Outposts};
+use crate::site_and_outpost_lifecycle::{
+    address, install_hardware, is_minted_id, segment, text, Outposts,
+};
 
 /// The two `OrderingRequirementStatus` values a check this service RAN reports.
 ///
@@ -558,15 +560,16 @@ fn priced_details(quote: &Value, case: &str) -> Vec<Value> {
 /// and only those.
 ///
 /// The rows differ along everything those checks read: whether the quote names an
-/// Outpost at all, whether that Outpost has settled in its active status, which of
-/// its site's two addresses are recorded, and whether the country the quote is for is
-/// the country of that site.
+/// Outpost at all, whether that Outpost has had its ordered hardware installed, which
+/// of its site's two addresses are recorded, and whether the country the quote is for
+/// is the country of that site.
 #[tokio::test]
 async fn a_quote_reports_the_outcome_of_every_check_this_store_can_decide() {
     let outposts = Outposts::new();
 
-    // One Outpost per shape of site the rows need. They are created first and
-    // settled together, so every row but the last reads a settled Outpost.
+    // One Outpost per shape of site the rows need. Hardware is ordered for each and
+    // installed, which is what makes them active, so every row but the last reads an
+    // active Outpost.
     let complete = an_outpost(
         &outposts,
         "quote-checks-complete",
@@ -583,7 +586,9 @@ async fn a_quote_reports_the_outcome_of_every_check_this_store_can_decide() {
     )
     .await;
     let addressless = an_outpost(&outposts, "quote-checks-addressless", json!({})).await;
-    settle();
+    for outpost_id in [&complete, &operating_only, &addressless] {
+        install_hardware(&outposts, outpost_id).await;
+    }
 
     // Each row: the country code the quote is for, the Outpost it names, and the
     // outcome of every check it must report.
@@ -675,9 +680,8 @@ async fn a_quote_reports_the_outcome_of_every_check_this_store_can_decide() {
         );
     }
 
-    // An Outpost that has not settled yet fails the check that it is active: the row
-    // creates its Outpost and quotes against it inside the provisioning span, which
-    // no other row does.
+    // An Outpost nothing has been ordered for fails the check that it is active: the
+    // row quotes against an Outpost that holds no hardware, which no other row does.
     let provisioning = an_outpost(&outposts, "quote-checks-provisioning", json!({})).await;
     let created = create_quote(
         &outposts,
@@ -691,7 +695,7 @@ async fn a_quote_reports_the_outcome_of_every_check_this_store_can_decide() {
     assert_eq!(
         requirement_status(&created, OUTPOST_ACTIVE).as_deref(),
         Some("FAIL"),
-        "an Outpost still being provisioned is not active yet, got {created}"
+        "an Outpost whose hardware has not been installed is not active yet, got {created}"
     );
 }
 
@@ -730,7 +734,7 @@ async fn an_update_reprices_the_quote_and_re_runs_its_checks() {
         }),
     )
     .await;
-    settle();
+    install_hardware(&outposts, &outpost_id).await;
     let vcpus = published_vcpus(&outposts, "c5.24xlarge");
     let created = create_quote(
         &outposts,
