@@ -716,6 +716,16 @@ pub fn rfc3339(at: SystemTime) -> Option<String> {
         .ok()
 }
 
+/// `at` as the modelled timestamp type, the form this service reports an instant in a
+/// member the model TYPES as a timestamp with (`PhoneNumberInformation$CreatedAt`) —
+/// the typed counterpart of [`rfc3339`], which is what a string-valued field carries.
+///
+/// The protocol, not this service, then decides how such a member reaches the wire, so
+/// a stored instant is handed over as an instant rather than pre-rendered as text.
+pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
+    ::aws_smithy_types::DateTime::from(at)
+}
+
 // =============================================================================
 // The delivery policy document
 // =============================================================================
@@ -2820,6 +2830,54 @@ impl PhoneNumberRecord {
 }
 
 // =============================================================================
+// The account's dedicated origination numbers
+// =============================================================================
+
+/// How many origination numbers one page of `ListOriginationNumbers` holds when the
+/// request names no page size.
+///
+/// This listing's page size is bounded by its OWN page-size member rather than by the
+/// [`PAGE_SIZE`] of the notification-plane listings:
+/// `smithy_query(query="shape", shape="MaxItemsListOriginationNumbers")` reports
+/// `range {min: 1, max: 30}`, so thirty is the largest page a caller can ask this
+/// listing for — and the page a caller that asks for no size is answered with.
+pub const ORIGINATION_NUMBERS_PAGE_SIZE: usize = 30;
+
+/// One dedicated origination number this account holds, as `ListOriginationNumbers`
+/// reports it.
+///
+/// A dedicated origination number is acquired OUT OF BAND — a short code, a toll-free
+/// number or a ten-digit long code is requested and registered through a separate AWS
+/// request, and no SNS API performs that — so nothing a caller sends to this service
+/// creates a record here: `ListOriginationNumbers` only REPORTS the inventory, the way
+/// the opt-out store of [`PhoneNumberRecord`] is only read by the operations that
+/// report it. Every member of a reported entry comes from the record, so the listing
+/// states what the account holds rather than anything one call made up.
+#[derive(Debug, Clone)]
+pub struct OriginationNumberRecord {
+    /// The origination number itself. The model marks the member it is reported in
+    /// `@sensitive`, so it belongs in the modelled listing and in no error string.
+    pub phone_number: String,
+    /// "The status of the phone number" (`PhoneNumberInformation$Status` doc). The
+    /// model leaves the member an unconstrained string, so the listing reports the
+    /// value the record carries.
+    pub status: String,
+    /// The two-letter ISO country code of the number's country, as
+    /// `PhoneNumberInformation$Iso2CountryCode` (pattern `^[A-Za-z]{2}$`) carries it.
+    pub iso2_country_code: String,
+    /// The number's route, one of [`crate::ops::types::ROUTE_TYPE_VALUES`] — the
+    /// values the modelled `RouteType` enum accepts.
+    pub route_type: String,
+    /// What the number can send, each entry one of
+    /// [`crate::ops::types::NUMBER_CAPABILITY_VALUES`] — the values the modelled
+    /// `NumberCapability` enum accepts.
+    pub number_capabilities: Vec<String>,
+    /// "The date and time when the phone number was created"
+    /// (`PhoneNumberInformation$CreatedAt` doc), which also ORDERS the listing.
+    pub created_at: SystemTime,
+}
+
+// =============================================================================
 // Mobile push: platform applications and their device endpoints
 // =============================================================================
 
@@ -3265,6 +3323,11 @@ pub struct ComAmazonawsSnsAmazonsimplenotificationserviceState {
     /// performs — `OptInPhoneNumber` only clears and annotates a record already here,
     /// and `CheckIfPhoneNumberIsOptedOut` and `ListPhoneNumbersOptedOut` only read.
     pub phone_numbers: HashMap<String, PhoneNumberRecord>,
+    /// The dedicated origination numbers this account holds, keyed by the number
+    /// itself: what `ListOriginationNumbers` reports. NOT caller-grown, so it needs no
+    /// ceiling of its own — a number is acquired out of band and no SNS API adds one,
+    /// as [`OriginationNumberRecord`] sets out.
+    pub origination_numbers: HashMap<String, OriginationNumberRecord>,
     /// The device endpoints of this account's platform applications, keyed by the
     /// endpoint's own ARN: what `DeleteEndpoint` removes one of. A caller-grown store,
     /// so the registration that adds a record is held to [`MAX_RECORDS_PER_STORE`]
@@ -3394,6 +3457,22 @@ impl ComAmazonawsSnsAmazonsimplenotificationserviceState {
         found.sort_by(|a, b| {
             a.opted_out_at
                 .cmp(&b.opted_out_at)
+                .then_with(|| a.phone_number.cmp(&b.phone_number))
+        });
+        found
+    }
+
+    /// Every dedicated origination number this account holds, oldest first (the number
+    /// itself breaking a tie), so a listing and its pagination token are stable across
+    /// calls — see [`Self::subscriptions_of`].
+    ///
+    /// Selects on nothing but the record's existence: a number the account holds is a
+    /// number the listing reports, whatever status its record carries.
+    pub fn origination_numbers_in_order(&self) -> Vec<&OriginationNumberRecord> {
+        let mut found: Vec<&OriginationNumberRecord> = self.origination_numbers.values().collect();
+        found.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
                 .then_with(|| a.phone_number.cmp(&b.phone_number))
         });
         found
