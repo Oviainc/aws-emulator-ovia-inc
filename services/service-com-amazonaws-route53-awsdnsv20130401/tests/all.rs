@@ -77,6 +77,8 @@ mod record_set_validation;
 mod private_zone_creation;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/resource_tags_batch.rs"]
+mod resource_tags_batch;
 #[path = "all/reusable_delegation_sets.rs"]
 mod reusable_delegation_sets;
 #[path = "all/state_roundtrip.rs"]

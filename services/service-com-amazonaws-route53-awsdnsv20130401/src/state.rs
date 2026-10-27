@@ -45,7 +45,7 @@ use crate::ops::types::shared_types::{
     HealthCheckObservation, HostedZone, HostedZoneConfig, HostedZoneFeatures,
     InvalidPaginationToken, InvalidTrafficPolicyDocument, KeySigningKey, NoSuchDelegationSet,
     NoSuchHealthCheck, NoSuchHostedZone, NoSuchTrafficPolicy, NoSuchTrafficPolicyInstance,
-    ResourceRecordSet, StatusReport, Tag, TrafficPolicy, TrafficPolicyInstance, VPC,
+    ResourceRecordSet, ResourceTagSet, StatusReport, Tag, TrafficPolicy, TrafficPolicyInstance, VPC,
     HEALTH_CHECK_REGION_VALUES, R_R_TYPE_VALUES, V_P_C_REGION_VALUES,
 };
 
@@ -2254,6 +2254,77 @@ pub fn tags_to_list(tags: &BTreeMap<String, String>) -> Vec<Tag> {
             value: Some(value.clone()),
         })
         .collect()
+}
+
+/// Why a tag read could not resolve the resource one `ResourceId` names.
+///
+/// A tag read addresses a resource by `ResourceType` plus `ResourceId`, and the
+/// resource type decides which not-found the refusal reports. Both tag reads
+/// resolve an id through [`resource_tag_set`] and lift this into their OWN
+/// modelled error enum, because a modelled error belongs to the operation that
+/// declares it.
+#[derive(Debug)]
+pub enum MissingTagResource {
+    /// The id names no hosted zone in this store.
+    HostedZone(NoSuchHostedZone),
+    /// The id names no health check in this store.
+    HealthCheck(NoSuchHealthCheck),
+    /// The `ResourceType` names neither taggable resource type. Unreachable
+    /// through the API — `TagResourceType` is a modelled enum, so a value
+    /// outside it is refused at the request boundary — and carried here so the
+    /// resolution has one total answer rather than a per-handler fallback.
+    UnknownResourceType(String),
+}
+
+/// The `ResourceTagSet` a tag read reports for ONE resource of this store.
+///
+/// The one place this service resolves `ResourceType` + `ResourceId` to a tag
+/// set, so the single-resource read and the batch read cannot report one
+/// resource's tags differently or refuse a missing one differently. A pure
+/// READ: it takes the store by shared reference, so nothing a tag read does can
+/// change what a later caller sees.
+///
+/// The reported `ResourceId` is the resource's OWN id, not the spelling the
+/// request addressed it by, so a zone asked for as `/hostedzone/<id>` is
+/// reported as the bare id every other response names it with.
+pub fn resource_tag_set(
+    store: &ComAmazonawsRoute53Awsdnsv20130401State,
+    resource_type: &str,
+    resource_id: &str,
+) -> Result<ResourceTagSet, MissingTagResource> {
+    match resource_type {
+        TAG_RESOURCE_TYPE_HOSTED_ZONE => {
+            // The caller may pass the bare id or the `/hostedzone/`-prefixed
+            // `Id` a HostedZone handed it back; both name the same zone.
+            let zone = store
+                .zones
+                .get(normalize_zone_id(resource_id))
+                .ok_or_else(|| {
+                    MissingTagResource::HostedZone(no_such_hosted_zone(resource_id))
+                })?;
+            Ok(ResourceTagSet {
+                resource_type: Some(resource_type.to_string()),
+                resource_id: Some(zone.id.clone()),
+                // The `Tags` container is always reported, empty when the
+                // resource carries no tags, so a client walking it reads an
+                // empty collection rather than a missing node.
+                tags: Some(zone.to_tag_list()),
+            })
+        }
+        TAG_RESOURCE_TYPE_HEALTH_CHECK => {
+            // A health check is addressed by the bare id `CreateHealthCheck`
+            // assigned it, which is the id the store is keyed by.
+            let health_check = store.health_checks.get(resource_id).ok_or_else(|| {
+                MissingTagResource::HealthCheck(no_such_health_check(resource_id))
+            })?;
+            Ok(ResourceTagSet {
+                resource_type: Some(resource_type.to_string()),
+                resource_id: Some(health_check.id.clone()),
+                tags: Some(health_check.to_tag_list()),
+            })
+        }
+        other => Err(MissingTagResource::UnknownResourceType(other.to_string())),
+    }
 }
 
 /// Apply one `ChangeTagsForResource` batch to a resource's tag set.
