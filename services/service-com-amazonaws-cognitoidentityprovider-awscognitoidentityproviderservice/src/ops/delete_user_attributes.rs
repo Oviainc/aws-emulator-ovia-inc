@@ -188,117 +188,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let (pool, user) = guard
                 .signed_in_user(&input.access_token, now)
                 .map_err(token_rejected)?;
-            plan_deletion(pool, user, &input.user_attribute_names)?
+            crate::state::plan_attribute_deletion(pool, user, &input.user_attribute_names)
+                .map_err(invalid_parameter)?
         };
 
         let user = guard
             .pool_mut(&plan.user_pool_id)
             .and_then(|pool| pool.user_mut(&plan.username))
             .ok_or_else(internal_error)?;
-        // Naming an attribute the user holds no value of removes nothing, so it
-        // is the values that WERE held that make this call a modification.
-        let mut removed = false;
-        for name in &plan.deletions {
-            removed |= user.attributes.remove(name).is_some();
-            // A value asked for but not confirmed yet is a value of the same
-            // attribute, so it goes with the attribute rather than outliving it.
-            removed |= user.pending_attributes.remove(name).is_some();
-        }
-        // A call that removed nothing changed nothing, so the user's
-        // last-modified instant stands.
-        if removed {
-            user.user_last_modified_date = now;
-        }
+        user.apply_attribute_deletion(&plan, now);
 
         Ok(DeleteUserAttributesOutput {})
     }
-}
-
-/// The whole deletion: which stored user it applies to and which of that user's
-/// attributes it removes.
-#[derive(Debug)]
-struct Plan {
-    user_pool_id: String,
-    username: String,
-    /// Every attribute name to remove, each once: the names the request asked
-    /// for, plus the verified flag of each, which has nothing left to vouch for
-    /// once the value it describes is gone.
-    deletions: ::std::collections::BTreeSet<String>,
-}
-
-/// Decide what deleting `requested` does to `user` of `pool`, or the refusal it
-/// earns.
-///
-/// A pure read of the stored pool and user: it returns the plan rather than
-/// applying it, so a request refused halfway through leaves nothing written.
-///
-/// Every per-attribute step below is bounded by the POOL's schema rather than
-/// by the length of the submitted list: the names are reduced to the distinct
-/// ones and their count is capped before any per-attribute work.
-fn plan_deletion(
-    pool: &crate::state::UserPool,
-    user: &crate::state::User,
-    requested: &[String],
-) -> Result<Plan, DeleteUserAttributesError> {
-    // `AttributeNameListType` is a list of attribute NAMES, and a user holds at
-    // most one value per attribute: naming an attribute twice asks for the same
-    // single removal, so the distinct names are the whole request.
-    let names: Vec<String> = requested
-        .iter()
-        .collect::<::std::collections::BTreeSet<&String>>()
-        .into_iter()
-        .cloned()
-        .collect();
-    // A request cannot name more distinct attributes than the pool declares:
-    // past that it names one the schema does not declare, which is refused
-    // below. Checked FIRST, so nothing further is proportional to a list length
-    // the caller chose.
-    if names.len() > pool.schema.len() {
-        return Err(invalid_parameter(format!(
-            "Invalid attributes given, at most {} attributes of this user pool can be deleted in one request",
-            pool.schema.len()
-        )));
-    }
-    // An attribute the pool's schema does not declare cannot hold a value, so
-    // it is not one a user can be asked to give up.
-    if let Some(unknown) = pool.unknown_attribute(&names) {
-        return Err(invalid_parameter(format!(
-            "Invalid attributes given, {unknown} is not a valid attribute of this user pool"
-        )));
-    }
-
-    let mut deletions = ::std::collections::BTreeSet::new();
-    for name in names {
-        // `SchemaAttributeType.Mutable` is what says a stored value may change,
-        // and taking it away changes it, so an attribute the schema freezes
-        // cannot be deleted.
-        if !pool.attribute_mutable(&name) {
-            return Err(invalid_parameter(format!(
-                "Attribute {name} cannot be deleted: this user pool's schema declares it immutable"
-            )));
-        }
-        // An attribute the schema marks required must hold a value, so it is
-        // not one this operation may take away.
-        if pool.attribute_required(&name) {
-            return Err(invalid_parameter(format!(
-                "Attribute {name} cannot be deleted: this user pool's schema declares it required"
-            )));
-        }
-        // A deleted email address or phone number leaves its verified flag
-        // vouching for a value the user no longer holds, so the flag goes with
-        // it — exactly as a blank value submitted to `UpdateUserAttributes`
-        // takes it.
-        if let Some(flag) = crate::state::verified_flag(&name) {
-            deletions.insert(flag.to_string());
-        }
-        deletions.insert(name);
-    }
-
-    Ok(Plan {
-        user_pool_id: pool.id.clone(),
-        username: user.username.clone(),
-        deletions,
-    })
 }
 
 /// This operation's answer to an `AccessToken` that names no signed-in user.

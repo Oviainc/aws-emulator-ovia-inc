@@ -106,9 +106,9 @@ use super::types::*;
 
 use crate::state::{
     application_not_found, attachment_client_token_taken, attachment_outcome,
-    attachment_quota_exceeded, data_source_not_found, internal_failure, is_arn, malformed_arn,
-    service_state, state_unavailable, workspace_selection_conflict, DataSourceAttachment,
-    ATTACHMENT_QUOTA, ATTACHMENT_STATUS_FAILED,
+    attachment_quota_exceeded, internal_failure, is_arn, malformed_arn, service_state,
+    state_unavailable, workspace_selection_conflict, DataSourceAttachment, ATTACHMENT_QUOTA,
+    ATTACHMENT_STATUS_FAILED, PROVISIONING,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -259,18 +259,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let attachments_held = application.attachments.len();
         let replaces_failed = held.is_some();
 
-        // "The data source must be an Amazon OpenSearch Service domain": an ARN naming
-        // no domain of this account names nothing that can be attached, and the state
-        // of the domain it does name is what decides whether the attachment completes
-        // now or is owed to the clock.
-        let data_source_up_at = store
-            .domain_of_arn(&input.data_source_arn)
-            .ok_or_else(|| {
-                AttachDataSourceErrorModeled::ResourceNotFoundException(data_source_not_found(
-                    &input.data_source_arn,
-                ))
-            })?
-            .cluster_up_at();
+        // The attach is asynchronous: "if both the application and the data source are
+        // active, the attachment completes immediately with a status of ATTACHED.
+        // Otherwise, the operation returns PENDING and completes the attachment
+        // automatically once both become active. If the attachment cannot be completed,
+        // its status becomes FAILED." So whether the ARN resolves to a data source is
+        // carried by the attachment's status, not by refusing the call — the same way
+        // this service accepts a cross-cluster connection whose far domain does not
+        // resolve and reports the outcome on the connection.
+        let data_source_up_at = match store.domain_of_arn(&input.data_source_arn) {
+            // The state of the domain the ARN names is what decides whether the
+            // attachment completes now or is owed to the clock.
+            Some(domain) => domain.cluster_up_at(),
+            // An ARN naming no domain of this account has nothing that becomes active,
+            // so the attachment is owed its outcome a span from here, and settles as the
+            // non-retryable FAILED unless the account holds that data source by then.
+            None => Some(now + PROVISIONING),
+        };
 
         // The set is bounded: past its quota an attach is refused rather than adding
         // another record, so a caller looping with fresh data sources cannot grow one

@@ -391,7 +391,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 bundle_id: input.bundle_id.clone(),
                 // Nothing has moved this distribution between bundles yet, so
                 // its one monthly bundle change is still available.
-                able_to_update_bundle: true,
+                bundle_updated_at_ms: None,
                 // The certificate the request named is recorded as asked for,
                 // after the store confirmed it is one a distribution may serve
                 // HTTPS traffic with.

@@ -227,20 +227,18 @@ fn judge_against_store(
         .into());
     }
 
-    // `Environment$bandwidths.available` is "the list of currently available
-    // bandwidths": a bandwidth outside it cannot be allocated, even when the
-    // environment `supported`s it (which is exactly what `limited` means).
-    let available = environment.bandwidths.available.clone().unwrap_or_default();
-    if !available.contains(&input.bandwidth) {
+    // The bandwidth the connection would be allocated at, judged by the one rule
+    // every writer of a connection's bandwidth uses: it has to be one the
+    // Environment it is allocated on currently offers. The create that allocates
+    // the first bandwidth is therefore bounded exactly as the update that
+    // re-allocates one is, so neither path can store a value the other would refuse.
+    if let Some(message) = crate::state::bandwidth_availability_violation(
+        Some(&environment),
+        &environment.environment_id,
+        &input.bandwidth,
+    ) {
         return Err(CreateConnectionErrorModeled::InterconnectValidationException(
-            InterconnectValidationException {
-                message: format!(
-                    "bandwidth '{}' is not available on environment '{}'; available bandwidths are [{}]",
-                    input.bandwidth,
-                    environment.environment_id,
-                    available.join(", ")
-                ),
-            },
+            InterconnectValidationException { message },
         )
         .into());
     }

@@ -791,3 +791,132 @@ async fn a_read_without_stored_settings_is_the_modelled_miss() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// The wording of the misses
+// ---------------------------------------------------------------------------
+
+/// The sentence a create addressed at a table the database does not hold is refused with:
+/// fixed text that names the members the request addressed the table by and carries no
+/// value read off the request.
+const CREATE_TABLE_MISS_MESSAGE: &str = "Table passed as input within input database not found.";
+
+/// The sentence a read with no settings entry to report is refused with: fixed text that
+/// names the two members the entry is addressed by, whether the table carries no settings
+/// or the database holds no such table at all.
+const READ_SETTINGS_MISS_MESSAGE: &str =
+    "ColumnStatisticsTaskSettings entry for input DatabaseName and TableName does not exist";
+
+/// A create addressed at a table the database does not hold is refused with the one fixed
+/// sentence for that miss, whichever way the name misses — the requested `TableName` is
+/// never part of it — and the read that follows reports the entry it holds none of in its
+/// own fixed sentence. The database miss keeps its own wording, so a client can still tell
+/// which half of the address was wrong, and the stored table still takes a create.
+#[tokio::test]
+async fn a_table_miss_is_refused_in_one_fixed_sentence_that_withholds_the_name() {
+    let router = emulator();
+    store_table(&router, "wording_db", "stored_table", &["a", "b"]).await;
+    store_table(&router, "other_db", "elsewhere_table", &["a"]).await;
+
+    // (case, the `TableName` the create addresses) — the rows differ along HOW the name
+    // misses: a name nothing created, the name of a table another database holds, a stored
+    // name carrying a suffix, and the shortest and longest names `NameString` admits
+    // (`length 1..255`, `smithy_query operation=CreateColumnStatisticsTaskSettings`).
+    let cases: Vec<(&str, String)> = vec![
+        ("a name nothing created", "no_such_table".to_string()),
+        (
+            "the name of a table another database holds",
+            "elsewhere_table".to_string(),
+        ),
+        (
+            "a stored name carrying a suffix",
+            "stored_table-does-not-exist".to_string(),
+        ),
+        ("the shortest name the model admits", "t".to_string()),
+        ("the longest name the model admits", "t".repeat(255)),
+    ];
+
+    for (case, table) in cases {
+        let (status, parsed) = call(
+            &router,
+            "CreateColumnStatisticsTaskSettings",
+            &create_body("wording_db", &table, json!({})),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a create for a table the database does not hold is refused, got \
+             {status} with {parsed}"
+        );
+        assert!(
+            error_code(&parsed).ends_with("EntityNotFoundException"),
+            "case {case:?}: expected EntityNotFoundException, got {}",
+            error_code(&parsed)
+        );
+        assert_eq!(
+            error_message(&parsed),
+            CREATE_TABLE_MISS_MESSAGE,
+            "case {case:?}: expected the fixed table-miss sentence, got {:?}",
+            error_message(&parsed)
+        );
+
+        // The refused create stored nothing, and the read of the same address reports the
+        // entry it holds none of rather than echoing the name either.
+        let (read_status, read_parsed) =
+            call(&router, "GetColumnStatisticsTaskSettings", &read_body("wording_db", &table)).await;
+        assert_eq!(
+            read_status, 400,
+            "case {case:?}: the read of the same address is refused too, got {read_status} with \
+             {read_parsed}"
+        );
+        assert!(
+            error_code(&read_parsed).ends_with("EntityNotFoundException"),
+            "case {case:?}: expected EntityNotFoundException from the read, got {}",
+            error_code(&read_parsed)
+        );
+        assert_eq!(
+            error_message(&read_parsed),
+            READ_SETTINGS_MISS_MESSAGE,
+            "case {case:?}: expected the fixed settings-miss sentence, got {:?}",
+            error_message(&read_parsed)
+        );
+    }
+
+    // A database the catalog does not hold is a DIFFERENT miss: its sentence is not the
+    // table's, so the two halves of the address stay distinguishable.
+    let (status, parsed) = call(
+        &router,
+        "CreateColumnStatisticsTaskSettings",
+        &create_body("no_such_db", "stored_table", json!({})),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case {:?}: a create for a database the catalog does not hold is refused, got {status} \
+         with {parsed}",
+        "a database the catalog does not hold"
+    );
+    assert_ne!(
+        error_message(&parsed),
+        CREATE_TABLE_MISS_MESSAGE,
+        "case {:?}: the database miss must not answer the table's sentence, got {:?}",
+        "a database the catalog does not hold",
+        error_message(&parsed)
+    );
+
+    // The stored table still takes a create, so the refusals above are misses and not a
+    // broken lookup.
+    ok(
+        &router,
+        "CreateColumnStatisticsTaskSettings",
+        &create_body("wording_db", "stored_table", json!({})),
+    )
+    .await;
+    let settings = get_settings(&router, &read_body("wording_db", "stored_table")).await;
+    assert_eq!(
+        settings.get("Role").and_then(Value::as_str),
+        Some(ROLE),
+        "case {:?}: the stored table's settings report the role the create named, got {settings}",
+        "the stored table"
+    );
+}

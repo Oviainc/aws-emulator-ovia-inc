@@ -11,13 +11,13 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    AdditionalAuthenticationProvider, Api, ApiCache, ApiKey, AppSyncRuntime, AuthMode,
-    ChannelNamespace, DataSource, DynamodbDataSourceConfig, ElasticsearchDataSourceConfig,
-    EnhancedMetricsConfig, EventConfig, EventBridgeDataSourceConfig, FunctionConfiguration,
-    GraphqlApi, HandlerConfigs, HttpDataSourceConfig, LambdaAuthorizerConfig,
-    LambdaDataSourceConfig, LogConfig, OpenIDConnectConfig, OpenSearchServiceDataSourceConfig,
-    RelationalDatabaseDataSourceConfig, SourceApiAssociation, SourceApiAssociationConfig,
-    SourceApiAssociationSummary, SyncConfig, UserPoolConfig,
+    AdditionalAuthenticationProvider, Api, ApiAssociation, ApiCache, ApiKey, AppSyncRuntime,
+    AuthMode, ChannelNamespace, DataSource, DomainNameConfig, DynamodbDataSourceConfig,
+    ElasticsearchDataSourceConfig, EnhancedMetricsConfig, EventConfig, EventBridgeDataSourceConfig,
+    FunctionConfiguration, GraphqlApi, HandlerConfigs, HttpDataSourceConfig,
+    LambdaAuthorizerConfig, LambdaDataSourceConfig, LogConfig, OpenIDConnectConfig,
+    OpenSearchServiceDataSourceConfig, RelationalDatabaseDataSourceConfig, SourceApiAssociation,
+    SourceApiAssociationConfig, SourceApiAssociationSummary, SyncConfig, UserPoolConfig,
 };
 
 /// One stored `GraphqlApi`, plus the API keys created under it.
@@ -884,6 +884,269 @@ pub fn channel_namespace_auth_modes_refusal(
     })
 }
 
+/// One stored custom domain name, plus the API association it carries.
+///
+/// Every member of the modelled `DomainNameConfig` shape is kept, so the create and
+/// `GetDomainName` project exactly what was created rather than a subset. The API
+/// association lives ON the domain because a custom domain carries at most one — every
+/// association operation addresses it by the domain alone
+/// (`/v1/domainnames/{domainName}/apiassociation`).
+#[derive(Debug, Clone)]
+pub struct DomainNameRecord {
+    /// Creation order, so a listing over domains has a stable page order.
+    pub seq: u64,
+    pub domain_name: String,
+    pub description: Option<String>,
+    pub certificate_arn: String,
+    /// The domain name AppSync itself serves this custom domain through
+    /// ([`ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState::mint_appsync_domain_name`]).
+    pub appsync_domain_name: String,
+    pub hosted_zone_id: String,
+    pub domain_name_arn: String,
+    pub tags: BTreeMap<String, String>,
+    /// The API this custom domain is mapped to, or `None` while it is mapped to none —
+    /// before the first `AssociateApi` and after a `DisassociateApi`.
+    pub api_association: Option<ApiAssociationRecord>,
+}
+
+impl DomainNameRecord {
+    /// This record as the modelled `DomainNameConfig` shape — the single projection
+    /// the create and the read both answer with.
+    pub fn to_domain_name_config(&self) -> DomainNameConfig {
+        DomainNameConfig {
+            domain_name: Some(self.domain_name.clone()),
+            description: self.description.clone(),
+            certificate_arn: Some(self.certificate_arn.clone()),
+            appsync_domain_name: Some(self.appsync_domain_name.clone()),
+            hosted_zone_id: Some(self.hosted_zone_id.clone()),
+            tags: Some(map_out(&self.tags)),
+            domain_name_arn: Some(self.domain_name_arn.clone()),
+        }
+    }
+}
+
+/// One stored mapping of an API onto the custom domain that holds it.
+#[derive(Debug, Clone)]
+pub struct ApiAssociationRecord {
+    /// The `apiId` of the associated API, of either resource family — a
+    /// [`GraphqlApiRecord`] or an [`EventApiRecord`].
+    pub api_id: String,
+    /// The `AssociationStatus` the mapping is in.
+    pub status: String,
+    /// The instant the mapping the clock is deploying becomes successful, or `None`
+    /// once nothing is owed. Stored rather than slept on: see [`API_ASSOCIATION_SPAN`].
+    pub successful_at: Option<SystemTime>,
+}
+
+impl ApiAssociationRecord {
+    /// A mapping onto `api_id` as the call that asked for it leaves it: the deployment
+    /// of the association is owed by the clock from `now`, so the mapping starts out in
+    /// the non-terminal [`ASSOCIATION_PROCESSING`] status.
+    pub fn new(api_id: String, now: SystemTime) -> Self {
+        Self {
+            api_id,
+            status: ASSOCIATION_PROCESSING.to_string(),
+            successful_at: Some(now + API_ASSOCIATION_SPAN),
+        }
+    }
+
+    /// Materialise the transition to [`ASSOCIATION_SUCCESS`] the CLOCK already made
+    /// due at `now`.
+    ///
+    /// Owed by the clock alone: the due instant was recorded by the call that asked for
+    /// the association, so the same transition is applied whether or not anybody read
+    /// the domain in between.
+    pub fn settle(&mut self, now: SystemTime) {
+        let Some(due) = self.successful_at else {
+            return;
+        };
+        if now < due {
+            return;
+        }
+        self.successful_at = None;
+        self.status = ASSOCIATION_SUCCESS.to_string();
+    }
+
+    /// Whether the service is still deploying the mapping, i.e. whether it is in the
+    /// status during which `AssociationStatus` documents that "you cannot modify
+    /// association requests".
+    pub fn is_processing(&self) -> bool {
+        self.status == ASSOCIATION_PROCESSING
+    }
+
+    /// This record as the modelled `ApiAssociation` shape — the single projection the
+    /// associate call and the read both answer with. `domain_name` is the domain the
+    /// record is stored under, so the two members can never disagree.
+    pub fn to_api_association(&self, domain_name: &str) -> ApiAssociation {
+        ApiAssociation {
+            domain_name: Some(domain_name.to_string()),
+            api_id: Some(self.api_id.clone()),
+            association_status: Some(self.status.clone()),
+            deployment_detail: Some(association_deployment_detail(&self.status).to_string()),
+        }
+    }
+}
+
+/// The `AssociationStatus` a fresh API association carries: the service is deploying
+/// the mapping, which has not been served yet. Source: the `AssociationStatus` enum,
+/// "PROCESSING: The API association is being created".
+pub const ASSOCIATION_PROCESSING: &str = "PROCESSING";
+
+/// The `AssociationStatus` an API association reaches once the mapping has been
+/// deployed. Source: the `AssociationStatus` enum, "SUCCESS: The API association was
+/// successful".
+pub const ASSOCIATION_SUCCESS: &str = "SUCCESS";
+
+/// How long after an `AssociateApi` the mapping it asked for is deployed.
+///
+/// A chosen span, inside the emulator's 250-750 ms band for a transition the clock owes
+/// (as [`MERGE_SPAN`] and [`CACHE_SPAN`] are): AppSync reports a fresh association in
+/// the non-terminal [`ASSOCIATION_PROCESSING`] status, so the span is never zero and a
+/// caller reading straight after the call still observes it. Nothing sleeps for it —
+/// the due instant is stored on the record and [`ApiAssociationRecord::settle`] applies
+/// it.
+pub const API_ASSOCIATION_SPAN: Duration = Duration::from_millis(500);
+
+/// The `deploymentDetail` ("Details about the last deployment status") that goes with
+/// each `AssociationStatus`, in the enum's own words: "The API association is being
+/// created" while it is [`ASSOCIATION_PROCESSING`], "The API association was
+/// successful" once it is [`ASSOCIATION_SUCCESS`].
+pub fn association_deployment_detail(status: &str) -> &'static str {
+    if status == ASSOCIATION_SUCCESS {
+        "The API association was successful."
+    } else {
+        "The API association is being created."
+    }
+}
+
+/// The text the association operations that MODIFY a custom domain's mapping
+/// (`AssociateApi`, `DisassociateApi`) carry for a domain this account does not hold.
+pub const DOMAIN_NAME_NOT_FOUND_MESSAGE: &str = "Domain name not found.";
+
+/// The text the operations that READ a custom domain (`GetDomainName`,
+/// `GetApiAssociation`) carry for a domain this account does not hold.
+///
+/// AppSync words the same condition without the sentence's full stop on the reads; the
+/// two constants exist so neither wording is rebuilt from the other.
+pub const DOMAIN_NAME_NOT_FOUND_READ_MESSAGE: &str = "Domain name not found";
+
+/// The text `BadRequestException` (HTTP 400) carries for a create under a domain name
+/// this account already holds: a custom domain is created once and then addressed by
+/// that name, so a second create conflicts with the domain holding it rather than
+/// replacing it.
+///
+/// AppSync's own sentence for this refusal is not among the texts this service has to
+/// go on, so this follows the wording the service uses for an existing resource of
+/// another kind ([`CHANNEL_NAMESPACE_EXISTS_MESSAGE`]) and is provisional until the
+/// real one is known.
+pub const DOMAIN_NAME_EXISTS_MESSAGE: &str = "Domain name already exists.";
+
+/// The text `NotFoundException` (404) carries for a domain that exists and carries no
+/// API association: the association, not the domain, is the resource the call
+/// addresses, so an absent one is reported as the absent association it is.
+///
+/// Worded after the service's other absent-resource sentences ([`API_NOT_FOUND_MESSAGE`],
+/// [`API_KEY_NOT_FOUND_MESSAGE`]); AppSync's own sentence for this one is not among the
+/// texts this service has to go on, so it is provisional until the real one is known.
+pub const API_ASSOCIATION_NOT_FOUND_MESSAGE: &str = "API association not found.";
+
+/// The text `BadRequestException` (HTTP 400) carries for an `AssociateApi` on a mapping
+/// the service is still deploying: `AssociationStatus` documents that during
+/// [`ASSOCIATION_PROCESSING`] "you cannot modify association requests", and that is the
+/// ground the request is malformed on.
+pub const ASSOCIATION_PROCESSING_MESSAGE: &str =
+    "You cannot modify association requests during processing.";
+
+/// The text `ConcurrentModificationException` (HTTP 409) carries, in the model's own
+/// words for the shape: "Another modification is in progress at this time and it must
+/// complete before you can make your change."
+pub const CONCURRENT_MODIFICATION_MESSAGE: &str =
+    "Another modification is in progress at this time and it must complete before you can \
+     make your change.";
+
+/// The `GraphQLApiVisibility` of an API that is reachable only from inside a VPC, and
+/// therefore cannot be mapped onto a custom domain: `AssociateApiRequest$apiId` states
+/// "Private APIs can not be associated with custom domains". Source: the
+/// `GraphQLApiVisibility` enum.
+pub const PRIVATE_VISIBILITY: &str = "PRIVATE";
+
+/// The text `BadRequestException` (HTTP 400) carries for an `AssociateApi` naming an
+/// API whose visibility is [`PRIVATE_VISIBILITY`], in the member's own words.
+pub const PRIVATE_API_NOT_ASSOCIABLE_MESSAGE: &str =
+    "Private APIs can not be associated with custom domains.";
+
+/// The Route 53 hosted zone every AppSync custom domain resolves through.
+///
+/// An AppSync custom domain is served by a CloudFront distribution
+/// ([`appsync_domain_name`]), and AWS publishes ONE hosted zone id for every
+/// CloudFront distribution, so `DomainNameConfig$hostedZoneId` is the same value for
+/// every custom domain rather than a per-domain one.
+pub const CLOUDFRONT_HOSTED_ZONE_ID: &str = "Z2FDTNDATAQYW2";
+
+/// The domain name AppSync serves a custom domain through, built from the distribution
+/// label `label`: a CloudFront distribution domain, which is what
+/// `DomainNameConfig$appsyncDomainName` ("The domain name that AppSync provides")
+/// reports.
+pub fn appsync_domain_name(label: &str) -> String {
+    format!("{label}.cloudfront.net")
+}
+
+/// The number of characters in the host label of a CloudFront distribution domain,
+/// i.e. how much of a minted opaque id
+/// [`mint_appsync_domain_name`] spends on one.
+///
+/// [`mint_appsync_domain_name`]: ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState::mint_appsync_domain_name
+pub const CLOUDFRONT_DOMAIN_LABEL_LEN: usize = 14;
+
+/// The ARN resource part of a custom domain name, the form every AppSync domain-name
+/// resource is addressed under.
+pub fn domain_name_resource(domain_name: &str) -> String {
+    format!("domainnames/{domain_name}")
+}
+
+/// Why a call that modifies a custom domain's API association was refused.
+///
+/// Each operation answers it with the error ITS model declares and with that error's
+/// own text, which is why this carries the ground alone and no message.
+#[derive(Debug)]
+pub enum DomainAssociationRefusal {
+    /// This account holds no custom domain of that name, so there is no association to
+    /// map or unmap.
+    DomainNotFound,
+    /// The service is still deploying the domain's association
+    /// ([`ASSOCIATION_PROCESSING`]), during which the association cannot be modified.
+    Processing,
+}
+
+/// The custom domain `domain_name` names, for a call that CHANGES the API association
+/// it carries (`AssociateApi`, `DisassociateApi`), or the refusal the request meets.
+///
+/// The rule both modifications follow, in one place:
+///
+/// * an association is a property OF a custom domain, so a domain this account does
+///   not hold carries none and there is nothing to change — whatever the request asks
+///   for, and whoever else is asking at the same time, which is what makes concurrent
+///   callers on an absent domain all get the same answer;
+/// * while the service is deploying an association, "you cannot modify association
+///   requests" (`AssociationStatus`), so the change is refused until the deployment the
+///   clock owes has been applied.
+pub fn domain_for_association_change<'a>(
+    state: &'a mut ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState,
+    domain_name: &str,
+) -> Result<&'a mut DomainNameRecord, DomainAssociationRefusal> {
+    let Some(domain) = state.domain_names.get_mut(domain_name) else {
+        return Err(DomainAssociationRefusal::DomainNotFound);
+    };
+    if domain
+        .api_association
+        .as_ref()
+        .is_some_and(ApiAssociationRecord::is_processing)
+    {
+        return Err(DomainAssociationRefusal::Processing);
+    }
+    Ok(domain)
+}
+
 /// One stored association between a Merged API and one of its source APIs.
 ///
 /// Both sides are kept by `apiId` AND by ARN, the two forms the modelled
@@ -1410,6 +1673,10 @@ pub struct ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
     pub event_apis: BTreeMap<String, EventApiRecord>,
     /// Every source-API association, keyed by its minted `associationId`.
     pub source_api_associations: BTreeMap<String, SourceApiAssociationRecord>,
+    /// Every created custom domain name, keyed by the domain name itself — the name is
+    /// what every domain-name and association operation addresses one by, so it
+    /// identifies the domain and no second key is needed.
+    pub domain_names: BTreeMap<String, DomainNameRecord>,
     /// Advanced once per minted id, so no id is ever a function of the request.
     id_seed: u64,
     /// Advanced once per created resource, giving each record its creation order.
@@ -1427,6 +1694,25 @@ impl ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
         for association in self.source_api_associations.values_mut() {
             association.settle(now);
         }
+    }
+
+    /// Apply every API-association transition the clock owes at `now`, so a custom
+    /// domain's association reports the same status to every caller whether or not
+    /// another call touched it first.
+    pub fn settle_api_associations(&mut self, now: SystemTime) {
+        for domain in self.domain_names.values_mut() {
+            if let Some(association) = domain.api_association.as_mut() {
+                association.settle(now);
+            }
+        }
+    }
+
+    /// A fresh `appsyncDomainName`: a CloudFront distribution domain
+    /// ([`appsync_domain_name`]) whose label is minted from this state's own id
+    /// counter, never from the request, so two domains never share one.
+    pub fn mint_appsync_domain_name(&mut self) -> String {
+        let minted = self.mint_id();
+        appsync_domain_name(&minted[..CLOUDFRONT_DOMAIN_LABEL_LEN])
     }
 
     /// Apply every cache transition the clock owes at `now`, so a cache reports the

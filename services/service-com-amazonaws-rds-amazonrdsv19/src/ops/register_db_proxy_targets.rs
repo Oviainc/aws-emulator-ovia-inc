@@ -265,15 +265,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 is_cluster: false,
             });
         }
-        for identifier in &clusters {
-            let identifier = identifier.to_ascii_lowercase();
+        for named in &clusters {
+            let identifier = named.to_ascii_lowercase();
             if !store
                 .db_clusters
                 .contains_key(&(region.clone(), identifier.clone()))
             {
                 return Err(RegisterDBProxyTargetsErrorModeled::DBClusterNotFoundFault(
                     DBClusterNotFoundFault {
-                        message: Some(format!("DBCluster {identifier} not found.")),
+                        message: Some(crate::state::db_cluster_not_found_message(named)),
                     },
                 )
                 .into());

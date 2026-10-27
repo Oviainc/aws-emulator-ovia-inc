@@ -2436,6 +2436,11 @@ fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // `__stringMin1Max64`, `@length(min: 1, max: 64)` (that service's own Smithy
         // model), which a generated name is already inside but may be longer than.
         MSK_CLUSTER | MSK_SERVERLESS_CLUSTER => rules(64, Characters::AsGenerated),
+        // AWS Backup `CreateBackupVault.BackupVaultName`: `BackupVaultName`, pattern
+        // `^[a-zA-Z0-9\-\_]{2,50}$` (that service's own Smithy model), which admits the
+        // letters, digits and hyphens a generated name is built from but is shorter than
+        // one may be.
+        BACKUP_VAULT => rules(50, Characters::AsGenerated),
         // Amazon MQ `CreateBroker.BrokerName`: that member's own rule is "1-50 characters
         // long, must contain only letters, numbers, dashes, and underscores" (`BrokerName`,
         // Amazon MQ's own Smithy model) — a generated name is already inside that character
@@ -2819,6 +2824,7 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     APIGATEWAYV2_API,
     APIGATEWAYV2_API_MAPPING,
     APIGATEWAYV2_DOMAIN_NAME,
+    BACKUP_VAULT,
     BATCH_COMPUTE_ENVIRONMENT,
     BATCH_JOB_QUEUE,
     BATCH_SERVICE_ENVIRONMENT,
@@ -3947,6 +3953,26 @@ fn return_values(
             );
             (id, attributes)
         }
+        // "Ref returns the backup vault name"; Fn::GetAtt: BackupVaultArn, BackupVaultName.
+        // This is the type `super::provisioning` creates in AWS Backup itself, which then
+        // answers with the vault's own ARN — the same ARN this computes, since both are
+        // built from the one account id this emulator mints and the vault's name, which is
+        // how AWS Backup keys a vault (`backup_vault_arn` in that service's own state
+        // module). (A plan and a selection of the same namespace carry no arm here: each
+        // one's identifier and ARN are MINTED by AWS Backup, so there is nothing for these
+        // naming rules to compute — see [`identity_is_service_assigned`].)
+        BACKUP_VAULT => {
+            attributes.insert(
+                "BackupVaultArn".to_string(),
+                ::emulator_server::emulator_arn(
+                    BACKUP_ARN_NAMESPACE,
+                    region,
+                    &format!("backup-vault:{name}"),
+                ),
+            );
+            attributes.insert("BackupVaultName".to_string(), name.to_string());
+            (name.to_string(), attributes)
+        }
         _ => (name.to_string(), attributes),
     }
 }
@@ -3970,6 +3996,7 @@ fn return_values(
 /// a document built from them is byte-for-byte the same on every read.
 pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str] {
     match resource_type {
+        BACKUP_VAULT => &["BackupVaultArn", "BackupVaultName"],
         "AWS::SNS::Topic" => &["TopicArn", "TopicName"],
         SQS_QUEUE => &["Arn", "QueueName", "QueueUrl"],
         "AWS::S3::Bucket" => &[
@@ -4157,6 +4184,15 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // answers with the `brokerId` Amazon MQ generated for it, which is the id that
         // type's `Ref` returns and the one every `mq` operation addresses a broker by.
         || resource_type == MQ_BROKER
+        // An AWS Backup plan and one of its resource selections are two more:
+        // `CreateBackupPlan` takes no identifier and answers the `BackupPlanId` it minted
+        // (which is what that type's `Ref` returns), and `CreateBackupSelection` answers
+        // the `SelectionId` it assigned to the selection it created. A template declares
+        // the plan's BODY and the selection's, never either id. (An `AWS::Backup::
+        // BackupVault` is NOT one of them: its identifier is the vault name the template
+        // states.)
+        || resource_type == BACKUP_PLAN
+        || resource_type == BACKUP_SELECTION
 }
 
 /// The `AWS::<cloudFormationName>::<Resource>` type of an Amazon Data Firehose stream.
@@ -4458,6 +4494,28 @@ pub const WAFV2_WEB_ACL: &str = "AWS::WAFv2::WebACL";
 pub const WAFV2_RULE_GROUP: &str = "AWS::WAFv2::RuleGroup";
 pub const WAFV2_IP_SET: &str = "AWS::WAFv2::IPSet";
 pub const WAFV2_REGEX_PATTERN_SET: &str = "AWS::WAFv2::RegexPatternSet";
+
+/// The three AWS Backup resource types a stack creates in that service (the AWS Backup
+/// model: `cloudFormationName: Backup`).
+///
+/// A VAULT is keyed by the name the template states: "Ref returns the backup vault name",
+/// which is the `@httpLabel` `CreateBackupVault`, `DescribeBackupVault` and
+/// `DeleteBackupVault` all address one by, so its physical id is that name
+/// ([`naming_rules`] holds a generated one to the name form that service publishes).
+///
+/// A PLAN's and a SELECTION's identifiers are AWS Backup's OWN to mint — `Ref` of a plan
+/// returns the `BackupPlanId` `CreateBackupPlan` answered with, and `CreateBackupSelection`
+/// answers the `SelectionId` it assigned, neither create taking an identifier — so what a
+/// stack reports for one is the id that service answered with, which is what
+/// `GetBackupPlan`, `ListBackupSelections` and `GetBackupSelection` resolve. That is what
+/// [`identity_is_service_assigned`] names both types for.
+pub const BACKUP_VAULT: &str = "AWS::Backup::BackupVault";
+pub const BACKUP_PLAN: &str = "AWS::Backup::BackupPlan";
+pub const BACKUP_SELECTION: &str = "AWS::Backup::BackupSelection";
+
+/// AWS Backup's ARN namespace, which is its model's own `awsService.arnNamespace`
+/// (`backup`) — the service segment of a backup vault ARN.
+pub const BACKUP_ARN_NAMESPACE: &str = "backup";
 
 /// An Amazon Managed Grafana workspace's resource type (that service's model:
 /// `cloudFormationName: Grafana`). This is a type `super::provisioning` creates in that

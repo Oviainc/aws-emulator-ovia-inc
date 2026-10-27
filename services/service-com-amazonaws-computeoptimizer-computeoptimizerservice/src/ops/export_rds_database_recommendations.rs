@@ -232,6 +232,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 exportable_fields: EXPORTABLE_R_D_S_D_B_FIELD_VALUES,
                 file_format: input.file_format,
                 one_job_in_progress: ONE_JOB_IN_PROGRESS,
+                // `recommendationPreferences` "describes the recommendation preferences to
+                // return in the response of a … GetRDSDatabaseRecommendations … request", so
+                // an export of those same recommendations is of the recommendations those
+                // preferences settle: the shared rule resolves the member and the exported
+                // rows state the preferences the recommendation was generated under, exactly
+                // as `GetRDSDatabaseRecommendations` reports them for the same database.
+                recommendation_preferences: input.recommendation_preferences,
             },
         )
         .map_err(refuse)?;

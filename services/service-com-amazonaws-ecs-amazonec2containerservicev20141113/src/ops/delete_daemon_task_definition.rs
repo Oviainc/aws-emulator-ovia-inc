@@ -154,17 +154,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let _ = ctx;
 
+        // "The family and revision (family:revision) or full Amazon Resource Name (ARN) of
+        // the daemon task definition to delete": a value that is none of those forms — a
+        // family part outside the documented character set, a revision that is no positive
+        // revision number, an ARN of some other resource — identifies no daemon task
+        // definition, so the call is refused as invalid input before the store is
+        // consulted.
         let Some((family, revision)) =
             crate::state::parse_daemon_task_definition_reference(&input.daemon_task_definition)
         else {
-            return Err(DeleteDaemonTaskDefinitionErrorModeled::ClientException(
-                ClientException {
-                    message: Some(crate::state::daemon_task_definition_reference_message(
-                        &input.daemon_task_definition,
-                    )),
-                },
-            )
-            .into());
+            return Err(
+                DeleteDaemonTaskDefinitionErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(
+                            crate::state::DAEMON_TASK_DEFINITION_INVALID_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
         };
 
         // "The family and revision (family:revision) or full Amazon Resource Name (ARN)

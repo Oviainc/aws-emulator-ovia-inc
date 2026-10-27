@@ -23,6 +23,10 @@
 //!   for the same ARN;
 //! * a Region the instance is ALREADY enabled in, and a Region of it with another add or
 //!   remove Region workflow in progress, are the modelled `ConflictException`;
+//! * an instance whose own creation has not finished serves only its describe and its
+//!   delete (`DescribeInstance`: "While the instance is in the CREATE_IN_PROGRESS state,
+//!   you can call only DescribeInstance and DeleteInstance operations"), so an add made
+//!   inside that window is the modelled `ConflictException` too, and enables nothing;
 //! * an add past the emulator's per-instance Region ceiling
 //!   (`crate::state::MAX_REGIONS_PER_INSTANCE`) is the modelled
 //!   `ServiceQuotaExceededException`.
@@ -230,6 +234,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let instance = store
             .instance_mut(&input.instance_arn)
             .ok_or_else(|| instance_not_found(&input.instance_arn))?;
+
+        // An instance whose own CREATION has not finished serves only its own describe and
+        // delete ("While the instance is in the CREATE_IN_PROGRESS state, you can call only
+        // DescribeInstance and DeleteInstance operations"), so it is not one a Region can
+        // be added to yet: the conflict is with the `CreateInstance` still in flight rather
+        // than with a Region workflow some other call started.
+        if instance.creation_in_progress() {
+            return Err(conflict(
+                crate::state::instance_creation_in_progress_message(&input.instance_arn),
+            ));
+        }
 
         // A Region the instance already holds a record for is not one this add can
         // replicate the instance to.

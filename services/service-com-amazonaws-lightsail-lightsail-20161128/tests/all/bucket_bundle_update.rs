@@ -18,15 +18,18 @@
 //!
 //! So the cases are TABLES: one row per direction a plan can move in (up, down,
 //! and onto the plan already applied), covering every active plan the published
-//! catalog holds as a target; one row per rule a refused request breaks; and, for
-//! the `isActive` dimension the published catalog cannot show (Lightsail has
-//! retired no object-storage plan), rows over a catalog that holds a retired one.
+//! catalog holds as a target; one row per rule a refused request breaks; one row
+//! per boundary a billing cycle can be crossed at, since the allowance belongs
+//! to the cycle the change was made in; and, for the `isActive` dimension the
+//! published catalog cannot show (Lightsail has retired no object-storage plan),
+//! rows over a catalog that holds a retired one.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_lightsail_lightsail_20161128::state::{
-    applicable_bucket_bundle, applicable_bucket_bundle_in, BucketBundleSpec, BUCKET_BUNDLE_SPECS,
+    applicable_bucket_bundle, applicable_bucket_bundle_in, billing_cycle, bundle_change_available,
+    now_ms, with_state, BucketBundleSpec, BUCKET_BUNDLE_SPECS,
 };
 
 use crate::instance_lifecycle::{error_code, is_uuid_shaped, Emulator};
@@ -383,6 +386,212 @@ async fn a_second_bundle_update_within_the_billing_cycle_is_refused() {
             "case {case}: expected the refused update to change nothing, got {after:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The billing cycle the one change belongs to
+// ---------------------------------------------------------------------------
+
+/// Milliseconds in one day. Used to put a stored change far enough back to be in
+/// an earlier calendar month than the one the case runs in, whichever day of the
+/// month that is.
+const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
+
+/// The instant `utc` names, in epoch milliseconds. The calendar conversion is the
+/// library's, so these cases re-derive no month arithmetic of their own.
+fn instant(utc: &str) -> i64 {
+    let parsed = ::aws_smithy_types::DateTime::from_str(
+        utc,
+        ::aws_smithy_types::date_time::Format::DateTime,
+    )
+    .unwrap_or_else(|error| panic!("case {utc}: expected a parsable instant, got {error:?}"));
+    parsed
+        .to_millis()
+        .unwrap_or_else(|error| panic!("case {utc}: expected epoch milliseconds, got {error:?}"))
+}
+
+/// RULE: the one bundle change a bucket is allowed belongs to the monthly billing
+/// cycle it was made in — a calendar month, which is what an account is billed by
+/// — so it is spent for the rest of that cycle and available again in the next
+/// one.
+#[test]
+fn the_one_bundle_change_belongs_to_the_billing_cycle_it_was_made_in() {
+    // (the case, when the bucket's bundle was last changed, when the request is
+    // made, whether a change is available then). The rows differ along how far
+    // apart those two instants are and which boundary lies between them: none at
+    // all, a day, a whole month, a leap February's end, and a year.
+    let rows: &[(&str, Option<&str>, &str, bool)] = &[
+        (
+            "a bucket that has never been moved",
+            None,
+            "2026-10-24T01:05:05Z",
+            true,
+        ),
+        (
+            "the very instant of the change",
+            Some("2026-10-24T01:05:05Z"),
+            "2026-10-24T01:05:05Z",
+            false,
+        ),
+        (
+            "later the same day",
+            Some("2026-10-24T01:05:05Z"),
+            "2026-10-24T23:59:59Z",
+            false,
+        ),
+        (
+            "the first and the last instant of one month",
+            Some("2026-10-01T00:00:00Z"),
+            "2026-10-31T23:59:59Z",
+            false,
+        ),
+        (
+            "one second later, over a month boundary",
+            Some("2026-10-31T23:59:59Z"),
+            "2026-11-01T00:00:00Z",
+            true,
+        ),
+        (
+            "the month after the change",
+            Some("2026-10-24T01:05:05Z"),
+            "2026-11-24T01:05:05Z",
+            true,
+        ),
+        (
+            "one second later, over a year boundary",
+            Some("2026-12-31T23:59:59Z"),
+            "2027-01-01T00:00:00Z",
+            true,
+        ),
+        (
+            "the last day of a leap February, within that month",
+            Some("2024-02-01T00:00:00Z"),
+            "2024-02-29T23:59:59Z",
+            false,
+        ),
+        (
+            "the day after a leap February",
+            Some("2024-02-29T23:59:59Z"),
+            "2024-03-01T00:00:00Z",
+            true,
+        ),
+        (
+            "the same month of the following year",
+            Some("2026-10-24T01:05:05Z"),
+            "2027-10-24T01:05:05Z",
+            true,
+        ),
+    ];
+
+    for (case, changed, at, expected) in rows {
+        let changed_ms = changed.map(instant);
+        let at_ms = instant(at);
+        let available = bundle_change_available(changed_ms, at_ms);
+        assert_eq!(
+            available,
+            *expected,
+            "case {case}: expected a change in the {} cycle to be available={expected} to a \
+             bucket last moved in {:?}, got {available}",
+            billing_cycle(at_ms),
+            changed_ms.map(billing_cycle)
+        );
+    }
+}
+
+/// RULE, over the wire: the allowance is the CYCLE's, so a bucket whose bundle was
+/// last changed in an earlier billing cycle can be moved again, and that move
+/// spends the cycle it is made in.
+///
+/// Nothing moves this emulator's clock a month on, so the earlier cycle is reached
+/// the way every other clock-bound case here reaches a state no request can put a
+/// resource in: through the store the handlers read.
+#[tokio::test]
+async fn a_bucket_moved_in_an_earlier_billing_cycle_can_be_moved_again() {
+    let emulator = Emulator::new();
+
+    let name = "bundle-bucket-next-cycle";
+    create(&emulator, name, SMALL).await;
+    let (status, answered) = update(
+        &emulator,
+        REGION,
+        json!({"bucketName": name, "bundleId": MEDIUM}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case the change of this cycle: expected HTTP 200, got {status} {answered:?}"
+    );
+
+    // Backdate the change out of the cycle this case runs in. 60 days is more
+    // than any month is long, so the instant is in an earlier calendar month
+    // whatever day the case runs on — asserted rather than assumed.
+    let at = now_ms();
+    let earlier = at - 60 * DAY_MS;
+    assert_ne!(
+        billing_cycle(earlier),
+        billing_cycle(at),
+        "case the earlier cycle: expected {earlier} to be in a cycle before {at}"
+    );
+    with_state(emulator.engine(), |store| {
+        let bucket = store
+            .bucket_mut(REGION, name)
+            .expect("this case created the bucket through CreateBucket");
+        bucket.bundle_updated_at_ms = Some(earlier);
+    })
+    .expect("this case's engine is the shared in-memory one");
+
+    // A read reports the allowance of the cycle the READ is made in, with nothing
+    // having had to be materialised in between.
+    let ready = read(&emulator, name).await;
+    assert_eq!(
+        ready["ableToUpdateBundle"].as_bool(),
+        Some(true),
+        "case the next cycle: expected the allowance of this cycle to be available, got {ready:?}"
+    );
+    assert_eq!(
+        ready["bundleId"].as_str(),
+        Some(MEDIUM),
+        "case the next cycle: expected the plan of the earlier change to be in force, got \
+         {ready:?}"
+    );
+
+    let (status, moved) = update(
+        &emulator,
+        REGION,
+        json!({"bucketName": name, "bundleId": LARGE}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case the next cycle: expected HTTP 200, got {status} {moved:?}"
+    );
+    assert_logged_entry("the next cycle", &moved["operations"], name);
+    let after = read(&emulator, name).await;
+    assert_only_expected_changed("the next cycle", &ready, &after, &expected_after(LARGE));
+
+    // And that move spent THIS cycle's change: another one is refused.
+    let (status, refused) = update(
+        &emulator,
+        REGION,
+        json!({"bucketName": name, "bundleId": SMALL}),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case a second change of the new cycle: expected HTTP 400, got {status} {refused:?}"
+    );
+    let code = error_code(&refused);
+    assert_eq!(
+        code, "InvalidInputException",
+        "case a second change of the new cycle: expected InvalidInputException, got {code} \
+         {refused:?}"
+    );
+    let unchanged = read(&emulator, name).await;
+    assert_eq!(
+        unchanged, after,
+        "case a second change of the new cycle: expected the refused update to change nothing, \
+         got {unchanged:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

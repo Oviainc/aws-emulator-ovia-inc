@@ -404,7 +404,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();
-        state.materialize_due(now);
+        state.materialize_due(&*self.engine, now);
 
         let Some(group) = state.groups.get(&name) else {
             return Err(crate::scaffolded::Scaffolded::validation_error(format!(
@@ -602,7 +602,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 current_capacity,
                 desired_capacity,
             );
-            state.apply_capacity(&name, desired_capacity, &cause, now);
+            state.apply_capacity(&*self.engine, &name, desired_capacity, &cause, now);
         }
 
         crate::state::audit(ctx.parts(), "UpdateAutoScalingGroup", &name, "updated");

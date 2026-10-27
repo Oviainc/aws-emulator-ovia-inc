@@ -1,0 +1,443 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The Amazon EC2 instances an Auto Scaling group's capacity changes launch and
+//! terminate, in the account's own Amazon EC2 store.
+//!
+//! An instance id a group reports under `AutoScalingGroups[].Instances[].InstanceId`
+//! names an instance OF THE ACCOUNT: a capacity change launches it from the group's
+//! launch source, so the account's own `DescribeInstances` resolves it, and a scale-in
+//! (or a forced delete of the group) terminates that same instance. This module is the
+//! one place that launch and that termination happen: the instances live in Amazon
+//! EC2's own store, reached through EC2's own accessor and writers, so one instance is
+//! never described by two services differently and no id is minted that resolves
+//! nowhere.
+//!
+//! What an instance runs comes from the group's launch source, resolved here: a launch
+//! configuration the account holds, or the launch template the group (or its mixed
+//! instances policy) names, read from Amazon EC2's own launch-template store. A group
+//! whose `VPCZoneIdentifier` names subnets places each instance in one of them, so the
+//! instance reports a `SubnetId` of the group and the Availability Zone that subnet is
+//! in; a group that names only zones places into those zones.
+//!
+//! LOCKING. This service's own store is locked by the handler, and Amazon EC2's is
+//! taken here for the one pass that launches or terminates and released when it ends;
+//! nothing awaits while either is held. Amazon EC2 never reaches this service, so the
+//! two locks are never taken in the other order and no cycle exists.
+
+use std::collections::BTreeMap;
+use std::time::SystemTime;
+
+use ::service_com_amazonaws_ec2_amazonec2::ops::types::RequestLaunchTemplateData;
+use ::service_com_amazonaws_ec2_amazonec2::state as ec2;
+
+use crate::ops::types::{LaunchTemplateSpecification, MixedInstancesPolicy, Tag};
+use crate::state::{ec2_subnets, StoredLaunchConfiguration};
+
+/// The tag Amazon EC2 Auto Scaling itself puts on every instance it launches, naming
+/// the group the instance belongs to — beside the group's own propagate-at-launch tags.
+pub const GROUP_NAME_TAG: &str = "aws:autoscaling:groupName";
+
+/// The `Version` a launch template specification carries for "the default version of
+/// the launch template", from the model's own documentation for
+/// `LaunchTemplateSpecification$Version`: "The version number, `$Latest`, or
+/// `$Default`. … The default value is `$Default`."
+const VERSION_DEFAULT: &str = "$Default";
+
+/// The `Version` for "the latest version of the launch template" (same documentation).
+const VERSION_LATEST: &str = "$Latest";
+
+/// What a group asks Amazon EC2 to launch: how many instances, where they go and what
+/// they run.
+#[derive(Debug)]
+pub struct LaunchRequest<'a> {
+    /// The Region the group lives in, which is the Region its instances run in.
+    pub region: &'a str,
+    /// The group the instances belong to.
+    pub group_name: &'a str,
+    /// How many instances to launch.
+    pub count: usize,
+    /// How many instances the group already holds, so the placements are used in turn
+    /// ACROSS capacity changes instead of restarting at the first one every time.
+    pub placed: usize,
+    /// The group's Availability Zones.
+    pub zones: &'a [String],
+    /// The group's `VPCZoneIdentifier`, when it has one.
+    pub vpc_zone_identifier: Option<&'a str>,
+    /// The launch configuration the group launches from, when it launches from one.
+    pub launch_configuration: Option<&'a StoredLaunchConfiguration>,
+    /// The launch template the group launches from, when it names one.
+    pub launch_template: Option<&'a LaunchTemplateSpecification>,
+    /// The mixed instances policy the group launches from, when it has one.
+    pub mixed_instances_policy: Option<&'a MixedInstancesPolicy>,
+    /// The group's tags; the ones marked `PropagateAtLaunch` go on the instances.
+    pub tags: &'a [Tag],
+}
+
+/// One instance Amazon EC2 launched: its id, where EC2 placed it and what it runs.
+#[derive(Debug, Clone)]
+pub struct LaunchedInstance {
+    pub instance_id: String,
+    pub availability_zone: String,
+    pub instance_type: Option<String>,
+    pub image_id: Option<String>,
+}
+
+/// Where one instance of the group goes: an Availability Zone, and the subnet of that
+/// zone the group named, when it named subnets.
+#[derive(Debug, Clone)]
+struct Placement {
+    availability_zone: String,
+    subnet_id: Option<String>,
+    /// The subnet's own block, which the instance's primary private address comes out
+    /// of; `None` for a group that named no subnet, whose instances are addressed from
+    /// the default VPC's block the way any launch without a subnet is.
+    cidr_block: Option<String>,
+}
+
+/// The launch parameters a group's launch source gives every instance it launches.
+#[derive(Debug, Clone, Default)]
+struct LaunchParameters {
+    image_id: Option<String>,
+    instance_type: Option<String>,
+    key_name: Option<String>,
+    /// The security groups the launch source names, as `(group id, group name)`: a
+    /// launch source may name either, exactly as a launch does.
+    security_groups: Vec<(Option<String>, Option<String>)>,
+    user_data: Option<String>,
+    ebs_optimized: bool,
+    monitoring_enabled: bool,
+}
+
+/// Launch `request.count` instances for the group and answer the ones Amazon EC2
+/// stored, in launch order.
+///
+/// Answers FEWER than asked for — or none at all — when the account's Amazon EC2 store
+/// cannot hold them (its instance count or its byte budget, or a subnet with no free
+/// address left) or when the group has nowhere to place one. The caller gives the group
+/// only the instances that come back, so a group never reports an id Amazon EC2 does
+/// not hold.
+pub fn launch<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    request: &LaunchRequest<'_>,
+) -> Vec<LaunchedInstance> {
+    if request.count == 0 {
+        return Vec::new();
+    }
+    let Some(state) = ec2::service_state(engine) else {
+        // No Amazon EC2 store on this engine is nowhere to launch an instance, so the
+        // group is given none rather than an id nothing holds.
+        return Vec::new();
+    };
+    let mut store = state.lock();
+    let parameters = launch_parameters(&store, request);
+    let placements = placements(&store, request);
+    if placements.is_empty() {
+        return Vec::new();
+    }
+
+    let mut tags: BTreeMap<String, String> = request
+        .tags
+        .iter()
+        .filter(|tag| tag.propagate_at_launch == Some(true))
+        .map(|tag| (tag.key.clone(), tag.value.clone().unwrap_or_default()))
+        .collect();
+    tags.insert(GROUP_NAME_TAG.to_string(), request.group_name.to_string());
+
+    let instance_type = parameters
+        .instance_type
+        .clone()
+        .unwrap_or_else(|| ec2::DEFAULT_INSTANCE_TYPE.to_string());
+    let monitoring_state = if parameters.monitoring_enabled {
+        ec2::MONITORING_STATE_ENABLED
+    } else {
+        ec2::MONITORING_STATE_DISABLED
+    };
+    let launch_time = SystemTime::now();
+    let mut launched = Vec::new();
+    for offset in 0..request.count {
+        if store.instances.len() >= ec2::MAX_STORED_INSTANCES {
+            break;
+        }
+        let placement = &placements[(request.placed + offset) % placements.len()];
+        // An instance of a subnet is addressed out of that subnet's own block; one the
+        // group placed by zone alone is addressed the way a launch that names no subnet
+        // is.
+        let private_ip = match placement.cidr_block.as_deref() {
+            Some(cidr_block) => store.mint_private_ip_in_cidr(cidr_block),
+            None => store.allocate_private_ip(),
+        };
+        let Some(private_ip) = private_ip else {
+            break;
+        };
+        let (kernel_id, ramdisk_id) =
+            store.image_kernel_and_ramdisk(parameters.image_id.as_deref());
+        let instance_id = store.mint_instance_id();
+        // Amazon EC2 Auto Scaling launches each instance on its own, so each lands in
+        // its own reservation, the unit of state one launch creates.
+        let reservation_id = store.mint_reservation_id();
+        let record = ec2::InstanceRecord {
+            instance_id: instance_id.clone(),
+            reservation_id: reservation_id.clone(),
+            image_id: parameters.image_id.clone(),
+            instance_type: instance_type.clone(),
+            key_name: parameters.key_name.clone(),
+            subnet_id: placement.subnet_id.clone(),
+            security_groups: parameters.security_groups.clone(),
+            private_dns_name: ec2::private_dns_name(&private_ip, request.region),
+            private_ip: private_ip.clone(),
+            // A public address comes from a default-VPC subnet or an Elastic IP,
+            // neither of which is modelled.
+            public_ip: None,
+            // A launched instance is `pending` and becomes `running` on Amazon EC2's own
+            // clock, so a caller that describes it straight away still sees `pending` —
+            // the same transient state the group reports it `Pending` for.
+            state: ec2::InstanceStateName::Pending,
+            pending_transition: Some(ec2::PendingTransition::starting_now(
+                ec2::InstanceStateName::Running,
+            )),
+            state_transition_reason: None,
+            state_reason: None,
+            queued_reboots: 0,
+            last_reboot_queued_at: None,
+            launch_time,
+            // One instance per reservation, so it is that reservation's first.
+            ami_launch_index: 0,
+            user_data: parameters.user_data.clone(),
+            placement_az: placement.availability_zone.clone(),
+            monitoring_state: monitoring_state.to_string(),
+            architecture: ec2::architecture_for(&instance_type),
+            kernel_id,
+            ramdisk_id,
+            source_dest_check: ec2::DEFAULT_SOURCE_DEST_CHECK,
+            ebs_optimized: parameters.ebs_optimized,
+            hibernation_configured: false,
+            disable_api_termination: false,
+            tags: tags.clone(),
+            // No client token: this launch is not a caller's request to replay.
+            client_token: None,
+            // An Auto Scaling group's own capacity is on-demand here: no Spot Instance
+            // request is modelled, so the instance fulfills none.
+            spot_instance_request_id: None,
+        };
+        // The store's byte budget is asked about the record itself, the same charge
+        // storing it applies, so a run of capacity changes cannot grow this process's
+        // memory past the bound Amazon EC2 keeps on it.
+        if store.would_exceed_stored_bytes(ec2::instance_payload_bytes(&record)) {
+            store.release_private_ip(&private_ip);
+            break;
+        }
+        store.insert_reservation(ec2::ReservationRecord {
+            reservation_id,
+            owner_id: ::engine::emulator_account_id().to_string(),
+            requester_id: None,
+            instance_ids: Vec::new(),
+        });
+        store.insert_instance(record);
+        launched.push(LaunchedInstance {
+            instance_id,
+            availability_zone: placement.availability_zone.clone(),
+            instance_type: Some(instance_type.clone()),
+            image_id: parameters.image_id.clone(),
+        });
+    }
+    launched
+}
+
+/// Terminate the instances `instance_ids` names in the account's Amazon EC2 store.
+///
+/// What Amazon EC2 does for a termination: the instance is `shutting-down` and reaches
+/// `terminated` on EC2's own clock, so a caller that reads it straight after a scale-in
+/// still sees it on its way out. An instance already on its way to (or at) `terminated`
+/// is left alone — terminating is idempotent — and an id the store holds nothing for
+/// changes nothing.
+pub fn terminate<Eng: Send + Sync + 'static>(engine: &Eng, instance_ids: &[String]) {
+    if instance_ids.is_empty() {
+        return;
+    }
+    let Some(state) = ec2::service_state(engine) else {
+        return;
+    };
+    let mut store = state.lock();
+    let now = SystemTime::now();
+    for instance_id in instance_ids {
+        let Some(instance) = store.instances.get_mut(instance_id) else {
+            continue;
+        };
+        if instance.state.is_terminating() {
+            continue;
+        }
+        instance.state = ec2::InstanceStateName::ShuttingDown;
+        instance.pending_transition = Some(ec2::PendingTransition::starting_now(
+            ec2::InstanceStateName::Terminated,
+        ));
+        instance.state_transition_reason = Some(ec2::user_initiated_reason(now));
+        // A scaling activity a caller asked for shut the instance down, so the shutdown
+        // is the client's — the reason Amazon EC2 records for a termination a caller
+        // asked for, which is also what `state_transition_reason` above says.
+        instance.state_reason = Some((
+            TERMINATION_REASON_CODE.to_string(),
+            format!("{TERMINATION_REASON_CODE}: {TERMINATION_REASON_MESSAGE}"),
+        ));
+    }
+}
+
+/// The `StateReason` code of an instance terminated because a caller's capacity change
+/// scaled the group in: the client asked for the shutdown, which is the code Amazon EC2
+/// records for a termination a caller asked for.
+const TERMINATION_REASON_CODE: &str = "Client.UserInitiatedShutdown";
+
+/// The sentence that code carries.
+const TERMINATION_REASON_MESSAGE: &str = "User initiated shutdown";
+
+/// Where the group's instances go, in the order the group names them: one entry per
+/// subnet of its `VPCZoneIdentifier` that the account holds in one of the group's zones,
+/// or one per zone for a group that named no usable subnet.
+///
+/// A subnet named twice is one placement: naming it again does not place more instances
+/// there.
+fn placements(
+    store: &ec2::ComAmazonawsEc2Amazonec2State,
+    request: &LaunchRequest<'_>,
+) -> Vec<Placement> {
+    let mut placements: Vec<Placement> = Vec::new();
+    for subnet_id in ec2_subnets::subnet_ids(request.vpc_zone_identifier.unwrap_or_default()) {
+        let Some(subnet) = store.subnets.get(subnet_id) else {
+            continue;
+        };
+        let Some(zone) = subnet.availability_zone.clone() else {
+            continue;
+        };
+        // The group's zones are what it places into: a subnet outside them is not one
+        // of this group's placements, however the request named it.
+        if !request.zones.is_empty() && !request.zones.contains(&zone) {
+            continue;
+        }
+        if placements
+            .iter()
+            .any(|placement| placement.subnet_id.as_deref() == Some(subnet_id))
+        {
+            continue;
+        }
+        placements.push(Placement {
+            availability_zone: zone,
+            subnet_id: Some(subnet_id.to_string()),
+            cidr_block: subnet.cidr_block.clone(),
+        });
+    }
+    if placements.is_empty() {
+        placements = request
+            .zones
+            .iter()
+            .map(|zone| Placement {
+                availability_zone: zone.clone(),
+                subnet_id: None,
+                cidr_block: None,
+            })
+            .collect();
+    }
+    placements
+}
+
+/// The launch parameters the group's launch source gives its instances.
+///
+/// A launch configuration the account holds is read from this service's own store by
+/// the caller; a launch template is read from Amazon EC2's, which is where launch
+/// templates live. A group whose launch source names a template the account does not
+/// hold (or holds no such version of) contributes no parameters, so its instances run
+/// what Amazon EC2 gives a launch that names none.
+fn launch_parameters(
+    store: &ec2::ComAmazonawsEc2Amazonec2State,
+    request: &LaunchRequest<'_>,
+) -> LaunchParameters {
+    if let Some(configuration) = request.launch_configuration {
+        return LaunchParameters {
+            image_id: Some(configuration.image_id.clone()),
+            instance_type: Some(configuration.instance_type.clone()),
+            key_name: configuration.key_name.clone(),
+            security_groups: configuration
+                .security_groups
+                .iter()
+                .map(|group| (Some(group.clone()), None))
+                .collect(),
+            user_data: configuration.user_data.clone(),
+            ebs_optimized: configuration.ebs_optimized,
+            monitoring_enabled: configuration.instance_monitoring_enabled,
+        };
+    }
+
+    // A mixed instances policy carries the group's launch template, and its overrides
+    // name the instance types to launch; the first override is the one this takes, the
+    // way an allocation strategy prefers the first type it is given.
+    let policy_template = request
+        .mixed_instances_policy
+        .and_then(|policy| policy.launch_template.as_ref());
+    let specification = request.launch_template.or_else(|| {
+        policy_template.and_then(|template| template.launch_template_specification.as_ref())
+    });
+    let override_entry = policy_template
+        .and_then(|template| template.overrides.as_ref())
+        .and_then(|overrides| overrides.first());
+    let data = specification.and_then(|specification| template_data(store, specification));
+
+    LaunchParameters {
+        image_id: override_entry
+            .and_then(|entry| entry.image_id.clone())
+            .or_else(|| data.as_ref().and_then(|data| data.image_id.clone())),
+        instance_type: override_entry
+            .and_then(|entry| entry.instance_type.clone())
+            .or_else(|| data.as_ref().and_then(|data| data.instance_type.clone())),
+        key_name: data.as_ref().and_then(|data| data.key_name.clone()),
+        security_groups: data
+            .as_ref()
+            .map(|data| {
+                data.security_group_ids
+                    .iter()
+                    .flatten()
+                    .map(|group_id| (Some(group_id.clone()), None))
+                    .chain(
+                        data.security_groups
+                            .iter()
+                            .flatten()
+                            .map(|group_name| (None, Some(group_name.clone()))),
+                    )
+                    .collect()
+            })
+            .unwrap_or_default(),
+        user_data: data.as_ref().and_then(|data| data.user_data.clone()),
+        ebs_optimized: data
+            .as_ref()
+            .and_then(|data| data.ebs_optimized)
+            .unwrap_or(false),
+        monitoring_enabled: data
+            .as_ref()
+            .and_then(|data| data.monitoring.as_ref())
+            .and_then(|monitoring| monitoring.enabled)
+            .unwrap_or(false),
+    }
+}
+
+/// The launch parameters of the one launch-template version a group's specification
+/// names, from Amazon EC2's own launch-template store.
+///
+/// The template is named by id or by name, and the version by number or by one of the
+/// two words the model documents: `$Default` (also what a specification carrying no
+/// version means) and `$Latest`.
+fn template_data(
+    store: &ec2::ComAmazonawsEc2Amazonec2State,
+    specification: &LaunchTemplateSpecification,
+) -> Option<RequestLaunchTemplateData> {
+    let launch_template_id = match specification.launch_template_id.as_deref() {
+        Some(launch_template_id) => launch_template_id.to_string(),
+        None => store.launch_template_id_for_name(specification.launch_template_name.as_deref()?)?,
+    };
+    let record = store.launch_templates.get(&launch_template_id)?;
+    let version = match specification.version.as_deref() {
+        None | Some(VERSION_DEFAULT) => record.template.default_version_number?,
+        Some(VERSION_LATEST) => record.template.latest_version_number?,
+        Some(version) => version.parse::<i64>().ok()?,
+    };
+    record
+        .versions
+        .get(&version)
+        .map(|version| version.data.clone())
+}

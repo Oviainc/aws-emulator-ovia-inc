@@ -232,6 +232,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 exportable_fields: EXPORTABLE_AUTO_SCALING_GROUP_FIELD_VALUES,
                 file_format: input.file_format,
                 one_job_in_progress: ONE_JOB_IN_PROGRESS,
+                // "When you specify AWS_ARM64 with an ExportAutoScalingGroupRecommendations
+                // request, Compute Optimizer exports recommendations that consist of Graviton
+                // instance types only": the preference selects which recommendation options
+                // the file holds, by the same rule
+                // `GetAutoScalingGroupRecommendations` reports them under.
+                recommendation_preferences: input.recommendation_preferences,
             },
         )
         .map_err(refuse)?;

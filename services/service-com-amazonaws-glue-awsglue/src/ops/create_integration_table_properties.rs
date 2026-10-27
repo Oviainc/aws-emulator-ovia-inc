@@ -244,7 +244,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 CreateIntegrationTablePropertiesErrorModeled::EntityNotFoundException(
                     EntityNotFoundException {
                         message: Some(
-                            crate::state::messages::integration_table_target_resource_not_found(
+                            crate::state::messages::target_resource_not_found(
                                 &input.resource_arn,
                             ),
                         ),

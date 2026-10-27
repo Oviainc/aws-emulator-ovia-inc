@@ -3,9 +3,12 @@
 //! @op SetDesiredCapacity
 //!
 //! Sets a group's desired capacity and moves its instances to match, recording a
-//! scaling activity for each instance launched or terminated. With
-//! `HonorCooldown` the change waits for the group's cooldown to elapse, as the
-//! model documents, instead of being applied at once.
+//! scaling activity for each instance launched or terminated. The instances are the
+//! account's own Amazon EC2 instances: a scale-out launches them from the group's
+//! launch source in the account's Amazon EC2 store and a scale-in terminates them
+//! there ([`crate::state::ec2_instances`]), so every id the group reports is one
+//! Amazon EC2 resolves. With `HonorCooldown` the change waits for the group's cooldown
+//! to elapse, as the model documents, instead of being applied at once.
 //!
 //! ## Shape of an operation
 //!
@@ -179,7 +182,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let honor_cooldown = input.honor_cooldown.unwrap_or(false);
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();
-        state.materialize_due(now);
+        state.materialize_due(&*self.engine, now);
 
         let Some(group) = state.groups.get(&name) else {
             return Err(crate::scaffolded::Scaffolded::validation_error(format!(
@@ -261,7 +264,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
             return Ok(SetDesiredCapacityOutput);
         }
-        state.apply_capacity(&name, desired_capacity, &cause, now);
+        state.apply_capacity(&*self.engine, &name, desired_capacity, &cause, now);
 
         crate::state::audit(ctx.parts(), "SetDesiredCapacity", &name, "capacity set");
         Ok(SetDesiredCapacityOutput)

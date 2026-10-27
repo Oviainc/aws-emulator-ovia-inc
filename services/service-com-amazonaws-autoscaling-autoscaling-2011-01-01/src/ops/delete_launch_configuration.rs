@@ -167,7 +167,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let name = input.launch_configuration_name;
         let mut state = state.lock();
-        state.materialize_due(::std::time::SystemTime::now());
+        state.materialize_due(&*self.engine, ::std::time::SystemTime::now());
 
         if !state.launch_configurations.contains_key(&name) {
             return Err(crate::scaffolded::Scaffolded::validation_error(format!(

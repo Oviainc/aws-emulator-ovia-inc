@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDBClusterSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDBClusterSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDBClusterSnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Takes a snapshot OF a stored DB cluster: the cluster's settings as they stand now are
+//! copied onto a new cluster-snapshot record (`DbClusterSnapshotRecord::from_cluster`),
+//! which answers `creating` with the clock owing it `available` and is read back by
+//! `DescribeDBClusterSnapshots`, copied by `CopyDBClusterSnapshot` and removed by
+//! `DeleteDBClusterSnapshot` — the same store those three already work on.
 //!
 //! ## Shape of an operation
 //!
@@ -86,6 +83,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// `DBClusterSnapshotIdentifier`'s own length bound: "Must contain from 1 to 63 letters,
+/// numbers, or hyphens" — the same bound `CopyDBClusterSnapshot` holds the target
+/// identifier it mints to.
+const MAX_DB_CLUSTER_SNAPSHOT_IDENTIFIER_LEN: usize = 63;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -158,18 +160,144 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDBClusterSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDBClusterSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDBClusterSnapshot"))
+        let region =
+            crate::state::request_region(ctx).map_err(CreateDBClusterSnapshotError::validation)?;
+        // `DBClusterSnapshotIdentifier` constraints: "Must contain from 1 to 63 letters,
+        // numbers, or hyphens. First character must be a letter. Can't end with a hyphen or
+        // contain two consecutive hyphens." The snapshot this call MINTS is named by it, so
+        // its form is checked before anything is written.
+        crate::state::check_identifier(
+            "DBClusterSnapshotIdentifier",
+            &input.db_cluster_snapshot_identifier,
+            MAX_DB_CLUSTER_SNAPSHOT_IDENTIFIER_LEN,
+        )
+        .map_err(CreateDBClusterSnapshotError::invalid_parameter_value)?;
+        // `Tags` are STORED on the snapshot, so the list the caller sized is bounded before
+        // any of it is kept.
+        crate::state::check_tag_list(input.tags.as_ref())
+            .map_err(CreateDBClusterSnapshotError::validation)?;
+        // "This parameter is stored as a lowercase string", so the key folds the same way
+        // every cluster-snapshot lookup does.
+        let snapshot_key = input.db_cluster_snapshot_identifier.to_ascii_lowercase();
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a snapshot nothing took.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // The transitions the clock already made due, so the snapshot is taken of the
+        // cluster as it really stands.
+        store.settle_due_transitions(&region);
+
+        // The cluster this call takes the snapshot OF is resolved FIRST: the operation
+        // models `DBClusterNotFoundFault` for exactly this, and a cluster that does not
+        // exist has nothing to snapshot, whatever the other members say. RDS is regional,
+        // so only the region the request was signed for is in scope.
+        let cluster_key = (
+            region.clone(),
+            crate::state::db_cluster_identifier_of(&input.db_cluster_identifier)
+                .to_ascii_lowercase(),
+        );
+        let Some(cluster) = store.db_clusters.get(&cluster_key) else {
+            return Err(
+                CreateDBClusterSnapshotErrorModeled::DBClusterNotFoundFault(
+                    DBClusterNotFoundFault {
+                        message: Some(crate::state::db_cluster_not_found_colon_message(
+                            &input.db_cluster_identifier,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        // A snapshot is taken of a cluster that is up: one still being created, stopped,
+        // failing over, modifying or on its way out is the modelled cluster state fault
+        // rather than a snapshot of a cluster that was not there to read. The status the
+        // clock has yet to settle is real, so a snapshot asked for immediately after the
+        // create is refused exactly as the real service refuses it.
+        if cluster.status != crate::state::DB_CLUSTER_STATUS_AVAILABLE {
+            let status = cluster.status.clone();
+            let named = cluster.identifier.clone();
+            return Err(
+                CreateDBClusterSnapshotErrorModeled::InvalidDBClusterStateFault(
+                    InvalidDBClusterStateFault {
+                        message: Some(format!(
+                            "DB cluster {named} is not available for a snapshot (status {status})"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "The user already has a DB cluster snapshot with the given identifier" is the
+        // modelled already-exists fault: a second snapshot under one identifier would
+        // otherwise overwrite the first, losing the cluster state it holds.
+        if store
+            .db_cluster_snapshots
+            .contains_key(&(region.clone(), snapshot_key.clone()))
+        {
+            return Err(
+                CreateDBClusterSnapshotErrorModeled::DBClusterSnapshotAlreadyExistsFault(
+                    DBClusterSnapshotAlreadyExistsFault {
+                        message: Some(format!("DB cluster snapshot already exists: {snapshot_key}")),
+                    },
+                )
+                .into(),
+            );
+        }
+        // The region's manual cluster-snapshot quota, and the number of regions this store
+        // keeps records for at all: the store cannot be grown without bound, and the
+        // modelled fault says exactly this — the same bound `CopyDBClusterSnapshot` writes
+        // under.
+        if store.cluster_snapshots_in(&region).len()
+            >= crate::state::DB_CLUSTER_SNAPSHOT_QUOTA_PER_REGION
+            || !store.has_room_for_region(&region)
+        {
+            return Err(
+                CreateDBClusterSnapshotErrorModeled::SnapshotQuotaExceededFault(
+                    SnapshotQuotaExceededFault {
+                        message: Some(format!(
+                            "the request would exceed the allowed number of manual DB cluster \
+                             snapshots ({} per region, in at most {} regions)",
+                            crate::state::DB_CLUSTER_SNAPSHOT_QUOTA_PER_REGION,
+                            crate::state::MAX_REGIONS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `DBCluster$CopyTagsToSnapshot` — "indicates whether tags from the DB cluster are
+        // copied to snapshots of the DB cluster" — so the snapshot carries the cluster's
+        // tags when the cluster asks for it, and the request's own `Tags` on top of them:
+        // a key the request names wins, since it is the one the caller asked this snapshot
+        // to carry.
+        let mut tags = if cluster.copy_tags_to_snapshot {
+            cluster.tags.clone()
+        } else {
+            Vec::new()
+        };
+        crate::state::tags::merge_tags(&mut tags, &input.tags.clone().unwrap_or_default());
+        crate::state::check_tags(&tags).map_err(CreateDBClusterSnapshotError::validation)?;
+
+        let snapshot = crate::state::DbClusterSnapshotRecord::from_cluster(
+            cluster,
+            &snapshot_key,
+            tags,
+        );
+        // The answer is the record this call stored, so a following describe reports the
+        // same snapshot.
+        let db_cluster_snapshot = snapshot.to_wire();
+        store
+            .db_cluster_snapshots
+            .insert((region, snapshot_key), snapshot);
+
+        Ok(CreateDBClusterSnapshotOutput {
+            db_cluster_snapshot: Some(db_cluster_snapshot),
+        })
     }
 }

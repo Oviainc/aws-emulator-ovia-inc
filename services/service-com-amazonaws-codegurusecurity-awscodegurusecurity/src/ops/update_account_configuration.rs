@@ -11,6 +11,13 @@
 //! yet gets one ([`crate::state::Store::set_encryption_kms_key_arn`]) instead of a
 //! not-found refusal.
 //!
+//! The one thing the write IS conditioned on is the submitted key: a `kmsKeyArn` names a
+//! KMS resource, so it is resolved against KMS (`DescribeKey`, in process) before
+//! anything is committed, and a value KMS says names no key this account can read earns
+//! the modelled `ResourceNotFoundException` (HTTP 404) with the account's stored
+//! configuration left exactly as it was. An `encryptionConfig` naming no key asks for the
+//! AWS-managed key, so there is nothing to resolve and nothing to refuse.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -115,6 +122,128 @@ impl From<UpdateAccountConfigurationErrorModeled> for UpdateAccountConfiguration
     }
 }
 
+/// What this operation says when the submitted `kmsKeyArn` names no key this account can
+/// use, so there is no configuration to report back.
+///
+/// A CONSTANT that interpolates no part of the request: the refusal states the outcome —
+/// the account is left with no configuration of the key it asked for — and names neither
+/// the key nor the account, as the recorded refusal of this operation does.
+const NO_ACCOUNT_CONFIGURATION_MESSAGE: &str = "No existing account configuration found.";
+
+/// The ARN namespace of the service that owns a `kmsKeyArn`, as the modelled
+/// `EncryptionConfig$kmsKeyArn` `@pattern` spells it (`^arn:aws:kms:…`).
+const KMS_ARN_VENDOR: &str = "kms";
+
+/// A KMS client over the in-process callback into this same emulator.
+///
+/// The callback is the framework's documented seam for calling another emulated service:
+/// it routes in process, so no network client is configured here and this service names
+/// no other service's crate. `region` is the Region the submitted key ARN names, so the
+/// key is looked up where the ARN says it lives — a KMS key is a regional resource.
+fn kms_client(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> ::aws_sdk_kms::Client {
+    let config = ::aws_sdk_kms::Config::builder()
+        .behavior_version(::aws_sdk_kms::config::BehaviorVersion::latest())
+        .region(::aws_sdk_kms::config::Region::new(region.to_string()))
+        .endpoint_url(format!("https://kms.{region}.amazonaws.com"))
+        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .http_client(ctx.callback().http_client())
+        // The transport is in-process: there is nothing to retry, time out or watch for
+        // a stalled stream, and each of those would need a sleep implementation this
+        // client is not given. The same goes for caching the identity: the credentials
+        // are handed over directly.
+        .retry_config(::aws_sdk_kms::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_kms::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_kms::config::IdentityCache::no_cache())
+        .stalled_stream_protection(::aws_sdk_kms::config::StalledStreamProtectionConfig::disabled())
+        .build();
+    ::aws_sdk_kms::Client::from_conf(config)
+}
+
+/// What asking KMS about the submitted key settled.
+#[derive(Debug)]
+enum KeyLookup {
+    /// KMS answered about a key it holds.
+    Resolved,
+    /// KMS said this value names no key it can read at all.
+    Unresolvable,
+    /// Nothing was established about the key: KMS answered about itself (a fault, a
+    /// throttle), answered with no KMS error code, or was not reached.
+    Indeterminate,
+}
+
+/// The KMS error codes that say the submitted value names no key this account can read,
+/// rather than something about the call, about KMS, or about the key's current state:
+/// the two codes `DescribeKey` models for an identifier it cannot resolve
+/// (`NotFoundException` for a key ARN naming no key, `InvalidArnException` for a value
+/// that is not a key ARN), and the authorization refusal for a key this caller may not
+/// read.
+///
+/// Deliberately NOT the state codes (`DisabledException`, `KMSInvalidStateException`):
+/// those describe a key that DOES resolve. A code outside this list, or no code at all,
+/// leaves the lookup indeterminate, so a condition nobody attributed to the key's
+/// existence never refuses an update.
+const KEY_NEGATIVE_KMS_ERROR_CODES: &[&str] = &[
+    "AccessDeniedException",
+    "InvalidArnException",
+    "NotFoundException",
+];
+
+/// Resolve `kms_key_arn` against KMS, with `DescribeKey` — the read that establishes
+/// whether a key exists and this account may use it.
+///
+/// A definite negative only when KMS names one of [`KEY_NEGATIVE_KMS_ERROR_CODES`] with
+/// a client status; anything else is [`KeyLookup::Indeterminate`] and the update proceeds
+/// rather than refusing a key nothing said was bad (a server fault, a throttle, a reply
+/// carrying no KMS error code at all — a routing failure rather than a KMS answer, as
+/// when KMS is not mounted beside this service — or a lookup that never reached KMS).
+async fn resolve_kms_key(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    kms_key_arn: &str,
+) -> KeyLookup {
+    // The ARN's own Region decides which KMS endpoint is asked — a KMS key is a regional
+    // resource. Read through the workspace's one caller-supplied-ARN parse, which reports
+    // the Region only when that field is a Region LABEL: the value reaches an endpoint
+    // URL's authority, and the modelled pattern's region class (`[\S]+`) admits text that
+    // would re-point one. A key whose ARN names no Region of KMS addresses no endpoint, so
+    // nothing can be established about it.
+    let Some(region) = ::service_common::arn::region_of(kms_key_arn, KMS_ARN_VENDOR) else {
+        return KeyLookup::Indeterminate;
+    };
+    let err = match kms_client(ctx, region)
+        .describe_key()
+        .key_id(kms_key_arn)
+        .send()
+        .await
+    {
+        Ok(_) => return KeyLookup::Resolved,
+        Err(err) => err,
+    };
+    let reason = ::aws_smithy_types::error::display::DisplayErrorContext(&err).to_string();
+    // The status KMS answered with, when it answered at all: a 5xx is about KMS, not
+    // about the key, whatever code travels with it.
+    let client_error = err
+        .raw_response()
+        .is_some_and(|response| response.status().is_client_error());
+    let code = ::aws_sdk_kms::error::ProvideErrorMetadata::code(&err).unwrap_or_default();
+    let about_the_key = KEY_NEGATIVE_KMS_ERROR_CODES
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(code));
+    if client_error && about_the_key {
+        return KeyLookup::Unresolvable;
+    }
+    // Visible to an operator: an indeterminate lookup is accepted, so without this line
+    // it would be indistinguishable from a key KMS resolved.
+    ::tracing::warn!(
+        kms_key_arn,
+        error = %reason,
+        "KMS gave no answer about this account's encryption key; accepting it"
+    );
+    KeyLookup::Indeterminate
+}
+
 /// The `UpdateAccountConfiguration` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -151,8 +280,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The request carries the configuration itself; no request metadata takes part.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 UpdateAccountConfigurationErrorModeled::InternalServerException(
@@ -179,6 +306,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // runs, so a value that arrives here is a well-formed KMS key ARN.
         let requested = input.encryption_config.kms_key_arn.clone();
 
+        // A key the account asks to be encrypted WITH has to exist and be readable by
+        // this account before it is committed: the configuration names a KMS resource, so
+        // the write is conditioned on resolving it rather than on anything of this
+        // service's own state. Awaited BEFORE the store is locked — a guard is never held
+        // across an await — and nothing is written when the lookup is a definite negative,
+        // so the configured key survives a refused update.
+        if let Some(kms_key_arn) = requested.as_deref() {
+            if let KeyLookup::Unresolvable = resolve_kms_key(ctx, kms_key_arn).await {
+                return Err(
+                    UpdateAccountConfigurationErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            error_code: "ResourceNotFoundException".to_string(),
+                            message: NO_ACCOUNT_CONFIGURATION_MESSAGE.to_string(),
+                            resource_id: kms_key_arn.to_string(),
+                            resource_type: "kmsKey".to_string(),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
         let now = crate::state::now_millis();
 
         // ONE lock for the write and the read-back, so the configuration this call
@@ -190,9 +339,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // documented default, not a named resource: the request carries no resource
         // identifier, and `GetAccountConfiguration` reports the AWS-managed default for
         // an account that has configured nothing. So the write always applies — an
-        // account CodeGuru Security holds no record for gets one here — and the modelled
-        // `ResourceNotFoundException` is left for a request that names a resource the
-        // service does not hold, of which this operation has none.
+        // account CodeGuru Security holds no record for gets one here — and nothing but
+        // the submitted key's own resolution can refuse it.
         //
         // "An EncryptionConfig object that contains the KMS key ARN that is used for
         // encryption. If you did not specify a customer-managed KMS key in the request,

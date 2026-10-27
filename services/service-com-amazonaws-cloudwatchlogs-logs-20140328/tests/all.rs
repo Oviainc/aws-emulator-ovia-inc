@@ -157,6 +157,8 @@ mod s3_table_integration_sources;
 mod scheduled_queries;
 #[path = "all/scheduled_query_enumeration.rs"]
 mod scheduled_query_enumeration;
+#[path = "all/scheduled_query_insights_start.rs"]
+mod scheduled_query_insights_start;
 #[path = "all/scheduled_query_updates.rs"]
 mod scheduled_query_updates;
 #[path = "all/scratch_queries.rs"]
