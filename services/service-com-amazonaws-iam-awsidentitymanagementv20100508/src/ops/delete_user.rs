@@ -268,6 +268,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // A group membership is a dependent too: this operation's own documentation
+        // lists "Group memberships (RemoveUserFromGroup)" among the items to remove
+        // before deleting a user, so a user that still belongs to a group is refused
+        // rather than being dropped out of it behind the caller's back.
+        // `AddUserToGroup` is what writes one.
+        if store.group_keys_held_by(&key).next().is_some() {
+            return Err(DeleteUserErrorModeled::DeleteConflictException(
+                DeleteConflictException {
+                    message: Some(
+                        "Cannot delete entity, must remove users from group first.".to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
 
         store.users.remove(&key);
         // The user held no policies, so this only drops an empty leftover entry.

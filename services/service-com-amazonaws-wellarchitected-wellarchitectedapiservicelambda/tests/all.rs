@@ -332,3 +332,11 @@ mod create_agent_profile;
 // review-template suite falls in a crowded run of this list.
 #[path = "all/review_template_imported_lens_answer_writes.rs"]
 mod review_template_imported_lens_answer_writes;
+
+// Declared last for the same reason as the declaration above.
+#[path = "all/workload_create_token_parameters.rs"]
+mod workload_create_token_parameters;
+
+// Declared last for the same reason as the declaration above.
+#[path = "all/workload_from_review_template_content.rs"]
+mod workload_from_review_template_content;

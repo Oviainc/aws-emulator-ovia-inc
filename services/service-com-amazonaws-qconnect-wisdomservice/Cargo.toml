@@ -23,6 +23,9 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# `service-common` carries the workspace's ONE rendering of a `@pattern` as the service
+# publishes it, which this crate's constraint-violation messages state.
+service-common = { path = "../common" }
 # The digest the opaque `assistantId`/`sessionId` mint spreads the store's own sequence
 # number over, and the hex codec that renders it (and the opaque list cursor).
 sha2 = { workspace = true }

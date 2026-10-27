@@ -323,6 +323,81 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         resp.headers_mut().insert("content-length", "0");
         resp
     }
+
+    /// Whether this request FOLLOWS a content-asset URL this service handed out: its path
+    /// is one the asset plane publishes and it names a content THIS store holds.
+    ///
+    /// The same rule as [`Self::holds_content_upload`], and for the same reason: the id in
+    /// the path is the receipt, so exactly the view that handed the URL out claims a
+    /// request following it.
+    fn holds_content(&self, target: &crate::state::ContentAssetTarget) -> bool {
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return false;
+        };
+        let store = state.lock();
+        let knowledge_base_id = crate::state::resolve_id(&target.knowledge_base_label);
+        store.content(knowledge_base_id, &target.content_id).is_some()
+    }
+
+    /// Serve one request to a published content-asset URL.
+    ///
+    /// A `GET` answers the bytes `CreateContent` finalized into the content the URL names
+    /// — which is the only thing the plane can touch, and it changes nothing — and is
+    /// refused when the content's `urlExpiry` has passed. The content, the knowledge base
+    /// it lives in and the id in the path must all agree: a path that crosses one
+    /// knowledge base with another's content names nothing.
+    fn serve_content_asset(
+        &self,
+        req: &RtRequest,
+        target: &crate::state::ContentAssetTarget,
+    ) -> RtResponse {
+        if req.method() != "GET" {
+            return upload_error(
+                405,
+                "MethodNotAllowed",
+                "This content URL is read by a single GET",
+            );
+        }
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return upload_error(
+                500,
+                "InternalServerException",
+                "the content store is unavailable",
+            );
+        };
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+        let knowledge_base_id = crate::state::resolve_id(&target.knowledge_base_label);
+        let Some(content) = store.content(knowledge_base_id, &target.content_id) else {
+            return upload_error(404, "NoSuchKey", ASSET_NOT_FOUND_MESSAGE);
+        };
+        // The URL stops being usable at the `urlExpiry` every read of the content
+        // reports, so a late GET is refused rather than served: what the plane honours
+        // and what a read publishes are the one stored instant.
+        if content.has_expired_url(now) {
+            return upload_error(403, "AccessDenied", UPLOAD_EXPIRED_MESSAGE);
+        }
+        let mut resp = RtResponse::new(
+            StatusCode::try_from(200u16).expect("200 is a valid status"),
+            SdkBody::from(content.body.clone()),
+        );
+        // The media type is a STORED value that came from a request, so it is written
+        // with the fallible insert: a stored string no header may carry (a byte outside
+        // visible ASCII, a line break) falls back to the generic binary type rather than
+        // unwinding this request, which arrives with no credential and is served before
+        // authentication. The length is this process's own number.
+        if resp
+            .headers_mut()
+            .try_insert("content-type", content.content_type.clone())
+            .is_err()
+        {
+            resp.headers_mut()
+                .insert("content-type", GENERIC_ASSET_CONTENT_TYPE);
+        }
+        resp.headers_mut()
+            .insert("content-length", content.body.len().to_string());
+        resp
+    }
 }
 
 impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
@@ -363,6 +438,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // diverted here. See [`Self::holds_content_upload`].
         if let Some(target) = crate::state::parse_content_upload_path(parts.uri.path()) {
             return self.holds_content_upload(&target);
+        }
+        // A request that follows a content-asset URL this service handed out is claimed
+        // the same way, by the store that minted the content id in its path. That path
+        // binds no modelled operation either — it is one segment deeper than the modelled
+        // read of the content — so nothing modelled is diverted here.
+        if let Some(target) = crate::state::parse_content_asset_path(parts.uri.path()) {
+            return self.holds_content(&target);
         }
         claims_endpoint_traffic(parts)
     }
@@ -418,8 +500,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // there, before anything reads a value out of it.
         //
         // Every other class — a `@pattern`, an absent `@required` member, a `@range`, and
-        // a length refusal of a value that travelled in the query string — returns `None`
-        // and keeps the modelled wording.
+        // a length refusal of a value that travelled in the query string — is stated by
+        // the workspace's ONE renderer of an AWS constraint refusal,
+        // `service_common::aws_validation_refusal`: it keeps the framework's envelope, its
+        // member paths and every other requirement, and restates only the two renderings
+        // that are AWS's rather than the framework's — a `@pattern` quoted without the
+        // whole-value anchors a model wraps the service's expression in, and a collection's
+        // `@length` clause stated without a value half. The code and status stay the
+        // framework's own for that class, 400 `ValidationException`, which is also what
+        // this service's model declares for a constraint it validates itself.
         match refusal {
             Refusal::Invalid(violations) if refuses_the_request_body(violations) => {
                 Some(Refused {
@@ -432,13 +521,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
                     .iter()
                     .any(|violation| matches!(violation.kind, ViolationKind::EnumValue(_))) =>
             {
+                // Only the CODE is this service's for the enumeration class; the sentence
+                // is the shared renderer's, so a request that ALSO breaks a `@pattern`
+                // states that pattern the one way too.
                 Some(Refused {
                     code: BODY_REFUSAL_CODE.to_string(),
-                    message: aws_smithy_schema_server::envelope(violations)
-                        .unwrap_or_else(|| "invalid request".to_string()),
+                    message: ::service_common::aws_validation_refusal(refusal)
+                        .map_or_else(|| "invalid request".to_string(), |stated| stated.message),
                 })
             }
-            _ => None,
+            _ => ::service_common::aws_validation_refusal(refusal),
         }
     }
 
@@ -454,10 +546,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         //
         // A request to an upload URL this service handed out is exactly that case by
         // construction — the model binds no operation to the upload path — so this is
-        // where `StartContentUpload`'s URL is served. Anything else keeps the framework's
-        // default.
-        let target = crate::state::parse_content_upload_path(request_path(req.uri()))?;
-        Some(self.serve_content_upload(req, &target))
+        // where `StartContentUpload`'s URL is served, and the content-asset path the same
+        // way. Anything else keeps the framework's default.
+        let path = request_path(req.uri());
+        if let Some(target) = crate::state::parse_content_upload_path(path) {
+            return Some(self.serve_content_upload(req, &target));
+        }
+        let target = crate::state::parse_content_asset_path(path)?;
+        Some(self.serve_content_asset(req, &target))
     }
 
     fn override_framework_error(
@@ -478,6 +574,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 /// The body of an upload-plane refusal that found no upload: one sentence carrying
 /// nothing from the request, so a caller cannot probe for uploads it was not handed.
 const UPLOAD_NOT_FOUND_MESSAGE: &str = "The requested upload does not exist";
+
+/// The body of an asset-plane refusal that found no content: the same rule as
+/// [`UPLOAD_NOT_FOUND_MESSAGE`].
+const ASSET_NOT_FOUND_MESSAGE: &str = "The requested content does not exist";
+
+/// The media type an asset is served as when the content's own stored media type is not
+/// a string a header may carry: the generic binary type, which says only "these are
+/// bytes" rather than claiming a type the asset is not.
+const GENERIC_ASSET_CONTENT_TYPE: &str = "application/octet-stream";
 
 /// The body of an upload-plane refusal of a write after the URL's `urlExpiry`.
 const UPLOAD_EXPIRED_MESSAGE: &str = "Request has expired";
@@ -523,3 +628,4 @@ fn request_path(uri: &str) -> &str {
         None => without_query,
     }
 }
+

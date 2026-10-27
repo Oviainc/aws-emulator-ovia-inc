@@ -35,7 +35,7 @@ use super::domain_lifecycle::{error_code, string_member, Answer, Emulator, PREFI
 /// The span the seeded runs below are given: long enough that reading a fraction of it
 /// back through the wire lands well inside the step that fraction falls in, whatever
 /// the few milliseconds a dispatch takes.
-const SEEDED_SPAN: Duration = Duration::from_secs(3600);
+pub(crate) const SEEDED_SPAN: Duration = Duration::from_secs(3600);
 
 /// `GetUpgradeStatus`: `GET /2021-01-01/opensearch/upgradeDomain/{DomainName}/status`.
 pub(crate) async fn status(emulator: &Emulator, name: &str) -> Answer {
@@ -90,14 +90,14 @@ async fn settled_domain(emulator: &Emulator, name: &str, engine_version: &str) {
 
 /// One row of the progress table: how far through its span the run has got, whether it
 /// only checks eligibility, and the step and step status the read must report.
-struct Row {
+pub(crate) struct Row {
     /// How much of [`SEEDED_SPAN`] has elapsed when the status is read, as a
     /// thousandth, so a row can sit anywhere inside a step rather than only at a
     /// boundary.
-    elapsed_per_mille: u32,
-    check_only: bool,
-    step: &'static str,
-    step_status: &'static str,
+    pub(crate) elapsed_per_mille: u32,
+    pub(crate) check_only: bool,
+    pub(crate) step: &'static str,
+    pub(crate) step_status: &'static str,
 }
 
 /// The progress table every seeded case is asserted over.
@@ -107,7 +107,7 @@ struct Row {
 /// the instant the span falls due, and long past it) and the KIND of run (an upgrade,
 /// which performs three steps, and an eligibility check, which performs one — so the
 /// same fraction of the span reports a different step for each).
-const PROGRESS: [Row; 12] = [
+pub(crate) const PROGRESS: [Row; 12] = [
     Row {
         elapsed_per_mille: 0,
         check_only: false,
@@ -189,7 +189,7 @@ const PROGRESS: [Row; 12] = [
 /// observed at its very start or once it is over, so the rows that sit INSIDE a step
 /// seed the record `UpgradeDomain` writes with a span long enough to read a fraction of
 /// — and everything the rule is asserted on is read back through the wire.
-fn seed_run(emulator: &Emulator, name: &str, row: &Row) {
+pub(crate) fn seed_run(emulator: &Emulator, name: &str, row: &Row) {
     let elapsed = SEEDED_SPAN * row.elapsed_per_mille / 1000;
     let started_at = SystemTime::now() - elapsed;
     let store = emulator.store();
@@ -213,7 +213,7 @@ fn seed_run(emulator: &Emulator, name: &str, row: &Row) {
 }
 
 /// The status of an accepted read, as `(UpgradeStep, StepStatus, UpgradeName)`.
-fn reported(answer: &Answer, case: &str) -> (String, String, String) {
+pub(crate) fn reported(answer: &Answer, case: &str) -> (String, String, String) {
     assert_eq!(
         answer.status, 200,
         "case {case}: expected HTTP 200, got {} with {:?}",
