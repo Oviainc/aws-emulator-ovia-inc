@@ -21,6 +21,8 @@ mod change_pair_uniqueness;
 mod change_set_failures;
 #[path = "all/change_set_lifecycle.rs"]
 mod change_set_lifecycle;
+#[path = "all/change_type_validation.rs"]
+mod change_type_validation;
 #[path = "all/delete_resource_policy_existence.rs"]
 mod delete_resource_policy_existence;
 #[path = "all/entity_reads.rs"]
