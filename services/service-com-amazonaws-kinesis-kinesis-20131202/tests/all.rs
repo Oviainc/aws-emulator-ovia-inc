@@ -21,6 +21,8 @@ mod resource_tags;
 mod shard_iterators;
 #[path = "all/shard_listing.rs"]
 mod shard_listing;
+#[path = "all/shard_scaling.rs"]
+mod shard_scaling;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/stream_lifecycle.rs"]

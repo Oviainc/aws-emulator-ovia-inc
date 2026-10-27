@@ -634,7 +634,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             {
                 return Err(CreateCacheClusterErrorModeled::ReplicationGroupNotFoundFault(
                     ReplicationGroupNotFoundFault {
-                        message: Some(format!("Replication group {group} not found.")),
+                        message: Some(crate::state::replication_group_not_found_message(group)),
                     },
                 )
                 .into());

@@ -199,7 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     DescribeServiceUpdatesErrorModeled::ServiceUpdateNotFoundFault(
                         ServiceUpdateNotFoundFault {
-                            message: Some(format!("Service update {name} not found.")),
+                            message: Some(crate::state::service_update_not_found_message(name)),
                         },
                     )
                     .into(),

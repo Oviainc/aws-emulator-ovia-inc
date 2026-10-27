@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RevokeDBSecurityGroupIngress
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RevokeDBSecurityGroupIngress`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation revokes ingress from a DB security group this service
+//! holds — and on this account every group is VPC-backed, so it answers the refusal this
+//! API version owes a VPC group. This is the ONLY file to touch for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RevokeDBSecurityGroupIngress::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! It modifies the same rules `AuthorizeDBSecurityGroupIngress` does, so it owes the same
+//! answer for the same reason: this operation's own documentation records that
+//! "EC2-Classic was retired on August 15, 2022", so a group created through
+//! `CreateDBSecurityGroup` belongs to a VPC and nothing else, and a VPC DB security group
+//! cannot be modified through this API version. The group is resolved first, so a name
+//! naming no group is still the modelled 404; the refusal itself is
+//! [`crate::state::VPC_DB_SECURITY_GROUP_NOT_MODIFIABLE`], the one both ingress operations
+//! share. Nothing is written: a refused revocation leaves the group's rules as they were.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +171,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RevokeDBSecurityGroupIngress` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RevokeDBSecurityGroupIngressErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RevokeDBSecurityGroupIngress"))
+        let region = crate::state::request_region(ctx)
+            .map_err(RevokeDBSecurityGroupIngressError::validation)?;
+        // `DBSecurityGroupName` "is stored as a lowercase string" on the create, so the
+        // lookup folds the name the same way and one spelling cannot hide the group
+        // another spelling created.
+        let name = input.db_security_group_name.to_ascii_lowercase();
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router
+        // builds; 501 is the honest answer, never a fabricated revocation.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let store = state.lock();
+
+        // RDS is regional: the group is resolved in the region the request was signed
+        // for, and a name that names no group there is the modelled 404
+        // ("DBSecurityGroupName doesn't refer to an existing DB security group").
+        if store.resolve_db_security_group(&region, &name).is_none() {
+            return Err(
+                RevokeDBSecurityGroupIngressErrorModeled::DBSecurityGroupNotFoundFault(
+                    DBSecurityGroupNotFoundFault {
+                        message: Some(crate::state::db_security_group_not_found_message(&name)),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The group exists and is VPC-backed, so this API version cannot modify its
+        // rules — whichever rule the request names. See
+        // [`crate::state::VPC_DB_SECURITY_GROUP_NOT_MODIFIABLE`].
+        Err(RevokeDBSecurityGroupIngressError::invalid_parameter_value(
+            crate::state::VPC_DB_SECURITY_GROUP_NOT_MODIFIABLE,
+        ))
     }
 }

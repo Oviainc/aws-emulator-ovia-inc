@@ -239,6 +239,11 @@ async fn a_medical_scribe_start_naming_a_custom_resource_this_account_lacks_is_r
                 let members = (reference.members)(resource, index);
                 for (operation, input) in (reference.creates)(resource) {
                     transcribe.call(operation, input).await.ok(&case);
+                    // A held custom vocabulary is applicable only once its build has
+                    // finished: READY is what makes one usable.
+                    if operation == "CreateVocabulary" {
+                        transcribe.vocabulary_ready(resource, None).await;
+                    }
                 }
 
                 let request = start_request(&name, mode, &members);

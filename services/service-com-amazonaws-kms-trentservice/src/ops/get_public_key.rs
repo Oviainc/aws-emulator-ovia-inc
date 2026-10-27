@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPublicKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPublicKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the PUBLIC half of the key pair of the asymmetric KMS key a
+//! `KeyId` names, with what a caller needs to use it safely outside KMS. This is the
+//! ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPublicKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The public key is COMPUTED from the private key the store holds for that KMS key
+//! ([`crate::state::Cmk::public_key`]), so it really is the public half of the key
+//! that signs, decrypts or agrees under it — whether that key pair was generated when
+//! the KMS key was created or imported into it. The private half never leaves the
+//! process: nothing here reads it into the response.
+//!
+//! This operation only REPORTS, so it writes nothing: a download of the public half
+//! is not a use of the key, which is why `GetPublicKey` is not one of the operations
+//! the key's last-usage record tracks
+//! (`smithy_query(query="shape",shape="KeyLastUsageTrackingOperation")`).
+//!
+//! The three per-usage algorithm lists are the ones the key's own `KeyUsage` selects,
+//! exactly as `KeyMetadata` carries them, so `DescribeKey` and this operation cannot
+//! disagree about what a key supports.
+//!
+//! `GrantTokens` is treated as every other cryptographic operation in this service
+//! treats it: a presented token is the only permission a handler here can judge,
+//! because there is no caller identity to evaluate a key policy or an IAM policy
+//! against.
 //!
 //! ## Shape of an operation
 //!
@@ -249,18 +263,189 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPublicKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPublicKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPublicKey"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal("the KMS state store is unavailable"));
+        };
+
+        let region = crate::state::request_region(ctx);
+        let state = state.lock();
+
+        // Permission a request draws from a grant is judged below, once the key is
+        // known and its key state has been judged.
+        let tokens = input.grant_tokens.clone().unwrap_or_default();
+
+        let key = match state.resolve(&region, &input.key_id) {
+            crate::state::KeyRef::Found(key) => key,
+            crate::state::KeyRef::UnauthorizedAccount => {
+                return Err(crate::state::unauthorized_account(Self::NAME));
+            }
+            // This operation models `InvalidArnException`, so an identifier shaped
+            // like an ARN but not a valid one is refused as the malformed ARN it is
+            // rather than as a key that does not exist.
+            crate::state::KeyRef::MalformedArn => {
+                return Err(GetPublicKeyErrorModeled::InvalidArnException(
+                    InvalidArnException {
+                        message: Some(crate::state::invalid_arn_message(&input.key_id)),
+                    },
+                )
+                .into());
+            }
+            crate::state::KeyRef::NotFound => {
+                return Err(GetPublicKeyErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(crate::state::key_not_found_message(&region, &input.key_id)),
+                    },
+                )
+                .into());
+            }
+        };
+
+        // "The KMS key that you use for this operation must be in a compatible key
+        // state" (this operation's own doc): a disabled key answers
+        // `DisabledException`, and any other state a cryptographic operation cannot
+        // run in answers `KMSInvalidStateException`, which names the state the key is
+        // actually in. Judged BEFORE the grant tokens, so a key that cannot be used at
+        // all reports why rather than reporting an authorization failure.
+        if !key.is_usable() {
+            if key.key_state == crate::state::KEY_STATE_DISABLED {
+                return Err(GetPublicKeyErrorModeled::DisabledException(
+                    DisabledException {
+                        message: Some(crate::state::invalid_state_message(key)),
+                    },
+                )
+                .into());
+            }
+            return Err(GetPublicKeyErrorModeled::KMSInvalidStateException(
+                KMSInvalidStateException {
+                    message: Some(crate::state::invalid_state_message(key)),
+                },
+            )
+            .into());
+        }
+
+        // The permission a request draws from a grant is exactly what that grant
+        // carries: the grant is on THIS key and it permits this operation. A token
+        // that is not one this service minted names no grant at all, so the TOKEN "is
+        // not valid". A request presenting no grant token is not asking to be
+        // authorized by a grant and is not judged here.
+        if !tokens.is_empty() {
+            let named = match state.grants_for_tokens(&region, &tokens) {
+                Ok(named) => named,
+                Err(crate::state::GrantRefusal::MalformedToken) => {
+                    return Err(GetPublicKeyErrorModeled::InvalidGrantTokenException(
+                        InvalidGrantTokenException {
+                            message: Some("The specified grant token is not valid.".to_string()),
+                        },
+                    )
+                    .into());
+                }
+                Err(crate::state::GrantRefusal::NotAuthorized) => Vec::new(),
+            };
+            // `GetPublicKey` takes no `EncryptionContext`, so no encryption-context
+            // grant constraint applies to it.
+            let permitted = named
+                .iter()
+                .any(|grant| grant.permits(&key.key_id, Self::NAME, None));
+            if !permitted {
+                return Err(crate::scaffolded::Scaffolded::access_denied(
+                    crate::state::grant_access_denied_message(Self::NAME, &key.arn),
+                ));
+            }
+        }
+
+        // "Valid values for asymmetric key pairs are ENCRYPT_DECRYPT, SIGN_VERIFY, and
+        // KEY_AGREEMENT" (the `KeyUsage` output member documented above), so a key
+        // created to generate and verify MACs carries a usage that has no public half:
+        // "the KeyUsage value of the KMS key is incompatible with the API operation"
+        // (`smithy_query(query="doc",shape="InvalidKeyUsageException")`).
+        if !PUBLIC_KEY_USAGES.contains(&key.key_usage.as_str()) {
+            return Err(GetPublicKeyErrorModeled::InvalidKeyUsageException(
+                InvalidKeyUsageException {
+                    message: Some(format!(
+                        "{} has KeyUsage {}, which has no public key; it must be {}.",
+                        key.arn,
+                        key.key_usage,
+                        PUBLIC_KEY_USAGES.join(" or ")
+                    )),
+                },
+            )
+            .into());
+        }
+        // Only an asymmetric KMS key HAS a public half: a symmetric encryption key is
+        // "a specified resource [that] is not valid for this operation"
+        // (`smithy_query(query="doc",shape="UnsupportedOperationException")`), whatever
+        // usage it carries.
+        let family = crate::state::key_spec_profile(&key.key_spec).map(|profile| profile.family());
+        if family != Some(crate::state::FAMILY_ASYMMETRIC) {
+            return Err(GetPublicKeyErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: Some(format!(
+                        "{} has KeySpec {}, which is not an asymmetric KMS key; only an \
+                         asymmetric KMS key has a public key to download.",
+                        key.arn, key.key_spec
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The public half is computed from the private key this store holds for the
+        // key, so it is the public half of the key that signs, decrypts or agrees
+        // under it. A key pair of a spec no library reachable from here produces is
+        // the one case there is no private key to compute it from, and that is
+        // answered as not implemented rather than with a public key nothing holds the
+        // private half of.
+        let Some(public_key) = key.public_key() else {
+            if key.material.private_key_pkcs8().is_none() {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                    "GetPublicKey for a KMS key whose KeySpec is {}",
+                    key.key_spec
+                )));
+            }
+            return Err(internal("the public key could not be encoded"));
+        };
+
+        Ok(GetPublicKeyOutput {
+            // KMS answers with "the Amazon Resource Name (key ARN) of the asymmetric
+            // KMS key from which the public key was downloaded", not the identifier
+            // the request used.
+            key_id: Some(key.arn.clone()),
+            public_key: Some(public_key),
+            // "The KeySpec and CustomerMasterKeySpec fields have the same value" — for
+            // every spec the DEPRECATED enum can express, which was frozen before the
+            // newer specs were added, so a key whose spec it cannot name reports the
+            // spec through `KeySpec` alone rather than putting an unmodelled value on
+            // the wire. Exactly as `KeyMetadata` reports the pair.
+            customer_master_key_spec: CUSTOMER_MASTER_KEY_SPEC_VALUES
+                .contains(&key.key_spec.as_str())
+                .then(|| key.key_spec.clone()),
+            key_spec: Some(key.key_spec.clone()),
+            key_usage: Some(key.key_usage.clone()),
+            // Each list "appears in the response only when the KeyUsage of the public
+            // key is" the matching one (the output members documented above), and
+            // which algorithms it names follows from the key's spec — the same
+            // projection `KeyMetadata` carries.
+            encryption_algorithms: key.algorithms_under(crate::state::KEY_USAGE_ENCRYPT_DECRYPT),
+            signing_algorithms: key.algorithms_under(crate::state::KEY_USAGE_SIGN_VERIFY),
+            key_agreement_algorithms: key.algorithms_under(crate::state::KEY_USAGE_KEY_AGREEMENT),
+        })
     }
+}
+
+/// The `KeyUsage` values a key with a public half can carry: "valid values for
+/// asymmetric key pairs are ENCRYPT_DECRYPT, SIGN_VERIFY, and KEY_AGREEMENT" (the
+/// `KeyUsage` output member of this operation).
+const PUBLIC_KEY_USAGES: &[&str] = &[
+    crate::state::KEY_USAGE_ENCRYPT_DECRYPT,
+    crate::state::KEY_USAGE_SIGN_VERIFY,
+    crate::state::KEY_USAGE_KEY_AGREEMENT,
+];
+
+/// The state store is missing, or the public key could not be encoded: a server fault
+/// rather than a bad request.
+fn internal(message: impl Into<String>) -> GetPublicKeyError {
+    GetPublicKeyErrorModeled::KMSInternalException(KMSInternalException {
+        message: Some(message.into()),
+    })
+    .into()
 }

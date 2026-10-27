@@ -158,15 +158,40 @@ fn bounds() -> Vec<Bounds> {
     ]
 }
 
-/// `at` as the service renders an instant it names in a message: the ISO 8601
-/// `date-time` form, which is also the form the request carried it in — so the expected
-/// message below is derived from the row's own bounds and not written out by hand.
+/// `at` as the service renders an instant it names in a message: the ISO 8601 `date-time`
+/// form the model documents for every time member of this service, whose fractional-second
+/// field is a fixed, zero-padded 3-digit millisecond field (`2020-06-01T13:15:02.001Z`) —
+/// so the expected message below is derived from the row's own bounds and not written out
+/// by hand.
+///
+/// Computed from the TEXT the request carried, independently of the service's own
+/// renderer: the whole-second part stands as sent, a shorter fraction is zero-padded to
+/// the field's three digits and a finer one is reported at the field's resolution. The
+/// field itself is pinned digit by digit, against instants whose milliseconds are written
+/// out, in [`crate::message_timestamp_rendering`].
 pub(crate) fn canonical(at: &str) -> String {
+    // The guard the suites rely on: a row's bound has to be an instant at all, or its
+    // expected message would be derived from text the service never parsed.
     DateTime::from_str(at, Format::DateTime)
-        .unwrap_or_else(|error| panic!("unparseable instant {at:?}: {error}"))
-        .fmt(Format::DateTime)
-        .unwrap_or_else(|error| panic!("unformattable instant {at:?}: {error}"))
+        .unwrap_or_else(|error| panic!("unparseable instant {at:?}: {error}"));
+    let civil = at
+        .strip_suffix('Z')
+        .unwrap_or_else(|| panic!("instant {at:?} must be spelled in the Z form"));
+    let (seconds, fraction) = civil.split_once('.').unwrap_or((civil, ""));
+    let millis: String = fraction
+        .chars()
+        .chain(std::iter::repeat('0'))
+        .take(MILLISECOND_DIGITS)
+        .collect();
+    format!("{seconds}.{millis}Z")
 }
+
+/// How many digits the documented form's fractional-second field carries. Source: the
+/// doc every time member of this service states its form in — "This is specified using
+/// the ISO 8601 format. For example, 2020-06-01T13:15:02.001Z represents 1 millisecond
+/// past June 1, 2020 1:15:02 PM UTC" (`smithy_query(query="doc",
+/// shape="GetRecommendationsRequest", member="startTime")`).
+pub(crate) const MILLISECOND_DIGITS: usize = 3;
 
 /// The refusal a non-interval must answer with, built from that request's own bounds.
 /// `pub(crate)` so every suite about this rule asserts the one sentence.

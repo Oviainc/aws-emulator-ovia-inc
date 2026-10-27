@@ -109,6 +109,26 @@ pub(crate) async fn put_integration(
         .await
 }
 
+/// `DeleteIntegration` for `verb` on `resource` of `api`.
+///
+/// This crate's one copy of that call, shared with the sibling `delete_integration` and
+/// `test_invoke_method_no_integration` suites, so every suite removes an integration the
+/// same way; see [`put_integration`].
+pub(crate) async fn delete_integration(
+    gateway: &Gateway,
+    api: &str,
+    resource: &str,
+    verb: &str,
+) -> Answer {
+    gateway
+        .call(
+            "DELETE",
+            &format!("/restapis/{api}/resources/{resource}/methods/{verb}/integration"),
+            None,
+        )
+        .await
+}
+
 /// `GetIntegration` for `verb` on `resource` of `api`. Shared with the sibling
 /// `integration_response` suite, which reads the stored responses back through the
 /// integration that owns them.

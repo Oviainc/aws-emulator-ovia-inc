@@ -662,11 +662,12 @@ async fn describe_export_tasks_refuses_a_request_it_cannot_serve() {
         ),
         (
             // `SourceType` targets the `ExportSourceType` enum, so the boundary refuses a
-            // value outside the set the model publishes before the handler runs.
+            // value outside the set the model publishes before the handler runs — under
+            // the code this service answers an unacceptable parameter value with.
             "a SourceType outside the published values",
             params(&[("SourceType", "snapshot")]),
             400,
-            "ValidationError",
+            "InvalidParameterValue",
         ),
         (
             // `MaxRecords` publishes its range in the model ("Minimum 20, maximum 100"), so
@@ -674,13 +675,13 @@ async fn describe_export_tasks_refuses_a_request_it_cannot_serve() {
             "MaxRecords one below the published minimum",
             params(&[("MaxRecords", "19")]),
             400,
-            "ValidationError",
+            "InvalidParameterValue",
         ),
         (
             "MaxRecords one above the published maximum",
             params(&[("MaxRecords", "101")]),
             400,
-            "ValidationError",
+            "InvalidParameterValue",
         ),
         (
             "a Marker no prior page issued",

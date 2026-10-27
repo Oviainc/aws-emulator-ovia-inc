@@ -40,7 +40,12 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 //!
-//! Two of those seams are taken here.
+//! Three of those seams are taken here.
+//!
+//! `override_refusal` names the error code this front door answers a value that broke a
+//! constraint the model declares with — see [`invalid_parameter_value`]. The framework's
+//! own code for that class is not one this service's Query API publishes, and the code is
+//! what a client branches on.
 //!
 //! `override_operation` refuses a request whose Query envelope asks for an API version
 //! this service does not serve — see [`api_version`]. The framework's `awsQuery` routing
@@ -66,11 +71,62 @@ pub mod api_version;
 pub mod query_error_envelope;
 
 use api_version::UnsupportedApiVersionOperation;
+use aws_smithy_schema_server::{envelope, Violation, ViolationKind};
 use query_error_envelope::{RdsDefinition, RequestIdEnvelopeOperation};
 use smithy_server_runtime::{
     http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+/// The Query API error code this service answers a parameter value its member does not
+/// accept with.
+///
+/// It is one of the common client errors the Query API publishes — `InvalidParameterValue`
+/// for a value that is not valid for the parameter it was given for — and the code every
+/// handler of this crate already refuses such a value under
+/// (`crate::scaffolded::Scaffolded::invalid_parameter_value`). The framework picks a
+/// generic validation code for the refusals it raises itself, which is no code this
+/// service publishes, so a client branching on the documented one never fires.
+const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
+
+/// Whether `violation` reports a member that was ABSENT rather than a value that was
+/// present and unacceptable.
+///
+/// The two are different refusals to this service: a value outside what its member accepts
+/// is [`INVALID_PARAMETER_VALUE`], while a required parameter missing from the request is
+/// the Query API's own missing-parameter error, with its own text — so absence is left as
+/// the framework states it rather than restated under a code that does not fit it.
+fn is_absent_member(violation: &Violation) -> bool {
+    matches!(violation.kind, ViolationKind::MissingRequiredMember)
+}
+
+/// A refusal of a value that broke a constraint the MODEL declares, restated under the
+/// error code this service's Query API publishes for it, or `None` when the refusal is not
+/// of that class and the framework's own wording stands.
+///
+/// Only the CODE changes. The message is the framework's, built from the member path and
+/// the requirement the violation carries (`1 validation error detected: Value '<value>' at
+/// '<member>' failed to satisfy constraint: <requirement>`), which is the text AWS answers
+/// a constraint violation with — so there is nothing to reword and the two cannot drift.
+///
+/// The class is every constraint a member can declare — a numeric range, a length, a
+/// pattern, an enumerated value set, uniqueness — because one code covers them all: each
+/// is a value its parameter does not accept. That makes one refusal of one class whichever
+/// layer finds it: the operations whose page size is a modelled `@range` are now refused
+/// exactly as the ones that carry the same bound in prose and check it in the handler.
+///
+/// A refusal carrying an absent required member ([`is_absent_member`]) is declined whole:
+/// restating it here would answer a missing parameter under a code that reports a bad
+/// value, and a bundle mixing the two cannot be answered under one code at all.
+fn invalid_parameter_value(violations: &[Violation]) -> Option<Refused> {
+    if violations.iter().any(is_absent_member) {
+        return None;
+    }
+    Some(Refused {
+        code: INVALID_PARAMETER_VALUE.to_string(),
+        message: envelope(violations)?,
+    })
+}
 
 /// The `com-amazonaws-rds-amazonrdsv19` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -162,16 +218,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) to let this service state
+        // it the way this service states it. The one class reworded here is a value that
+        // broke a constraint the model declares, which carries this service's own
+        // `InvalidParameterValue` code and the framework's message unchanged (see
+        // [`invalid_parameter_value`]); every other refusal keeps the framework's wording.
+        match refusal {
+            Refusal::Invalid(violations) => invalid_parameter_value(violations),
+            _ => None,
+        }
     }
 
     fn override_routing_error(

@@ -42,19 +42,13 @@ use service_com_amazonaws_controltower_awscontroltowerapis::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::enabled_control_lifecycle::{
-    configuration, configured, control, control_operation, control_operations, details,
-    drift_dimensions, enable_with, last_operation, member, ou, status_summary_status as status,
+    catalog_arn, configuration, configured, control, control_operation, control_operations,
+    details, drift_dimensions, enable_with, last_operation, member, ou,
+    status_summary_status as status,
 };
 use crate::landing_zone_lifecycle::{
     call, emulator, is_operation_identifier, past_the_settle_span, Answer,
 };
-
-/// The AWS Control Catalog ARN of a control, whose resource segment is its opaque id; the
-/// control ARN form, whose resource segment is the control's name, is [`control`]. That
-/// catalog is global, so the ARN names neither a region nor an account.
-fn catalog_arn(catalog_id: &str) -> String {
-    format!("arn:aws:controlcatalog:::control/{catalog_id}")
-}
 
 /// POST `/reset-enabled-control`. `enabledControlIdentifier` is the only member the model
 /// gives this operation: a reset carries no configuration of its own.

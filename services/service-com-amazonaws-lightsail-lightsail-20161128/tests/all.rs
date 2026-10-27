@@ -49,6 +49,8 @@ mod bucket_object_data_plane;
 mod bucket_resource_access;
 #[path = "all/bundle_catalog.rs"]
 mod bundle_catalog;
+#[path = "all/certificate_delete.rs"]
+mod certificate_delete;
 #[path = "all/certificate_request.rs"]
 mod certificate_request;
 #[path = "all/cloud_formation_stack.rs"]

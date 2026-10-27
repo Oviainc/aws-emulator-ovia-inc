@@ -59,6 +59,10 @@
 //! only the events occurring within the last hour are returned"). `Duration` is the
 //! relative spelling of the start of the window, so an explicit `StartTime` is what
 //! bounds it when both are sent.
+//!
+//! Within that window the list is strictly REVERSE-chronological — the most recent
+//! `Event$Date` first — and `Marker` pages through it in the same order, so the first
+//! page a client reads is what just happened rather than the oldest events retained.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -226,8 +230,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut page: Vec<Event> = Vec::new();
         let mut marker = None;
-        for (key, event) in store.events.iter().filter(|(key, event)| {
-            resume_from.as_ref().is_none_or(|from| *key >= from)
+        // Newest FIRST: the event list a client reads is strictly
+        // reverse-chronological, so the first page of "what just happened" is the
+        // most recent events rather than the oldest ones. The log is keyed by the
+        // instant each event happened (`crate::state::event_key`), so reading the
+        // map backwards IS that order, and the `Marker` indexes into the same
+        // order — the cursor a page hands back resumes at the next OLDER event,
+        // which is why the resume bound runs the other way round too.
+        for (key, event) in store.events.iter().rev().filter(|(key, event)| {
+            resume_from.as_ref().is_none_or(|from| *key <= from)
                 && event.at >= start
                 && event.at <= end
                 && source_identifier

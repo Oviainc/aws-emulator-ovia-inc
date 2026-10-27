@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeManagedProductsByVendor
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeManagedProductsByVendor`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the managed products published by ONE vendor: the entries of this
+//! service's catalogue ([`crate::state::MANAGED_RULE_GROUP_CATALOGUE`]) whose
+//! publishing vendor is the requested `VendorName`, as the same
+//! `ManagedProductDescriptor` projection `DescribeAllManagedProducts` reports for
+//! the whole catalogue, in the order that catalogue publishes them.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeManagedProductsByVendor::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The vendor is matched exactly, like the `(VendorName, Name)` pair that
+//! identifies a managed rule group ([`crate::state::managed_rule_group`]): a
+//! `VendorName` no catalogued group is published under names a vendor with nothing
+//! on offer here, which is an EMPTY product list rather than a refusal — the model
+//! gives this operation no "nonexistent item" error, and a vendor is not a resource
+//! anything in this API creates, gets or deletes.
+//!
+//! A managed product is a VENDOR's publication, not a resource of this account —
+//! nothing creates, updates or deletes one — so this reporting call reads the
+//! published catalogue and neither reads nor writes the per-account store, and
+//! two callers in any order see the same products.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +161,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeManagedProductsByVendor` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeManagedProductsByVendorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeManagedProductsByVendor"))
+        // A report of what a vendor publishes: the per-account store (reached
+        // through `self.engine`) holds nothing about a vendor's products, so nothing
+        // here reads or writes it. `ctx` is read only for the signed region a
+        // product's notification topic ARN carries.
+        let _ = &self.engine;
+        if !crate::state::is_known_scope(&input.scope) {
+            return Err(
+                DescribeManagedProductsByVendorErrorModeled::WAFInvalidParameterException(
+                    crate::state::invalid_parameter_exception(
+                        crate::state::FIELD_SCOPE_VALUE,
+                        &input.scope,
+                        "the scope names the namespace the managed products are offered \
+                         in, and is one of CLOUDFRONT or REGIONAL",
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // Every catalogued group is published in both scopes; the scope and the
+        // signed region only decide which region a product's notification topic ARN
+        // names (see `ManagedRuleGroupDescriptor::product`). `VendorName` is the one
+        // filter this call adds: it is "the name of the managed rule group vendor.
+        // You use this, along with the rule group name, to identify a rule group"
+        // (the member's own doc), so it is matched exactly against each group's
+        // publishing vendor, and a vendor that publishes nothing here reports an
+        // empty list rather than a refusal.
+        let region = crate::state::request_region(ctx.parts());
+        let managed_products = crate::state::MANAGED_RULE_GROUP_CATALOGUE
+            .iter()
+            .filter(|group| group.vendor_name == input.vendor_name)
+            .map(|group| group.product(&input.scope, &region))
+            .collect();
+
+        Ok(DescribeManagedProductsByVendorOutput {
+            managed_products: Some(managed_products),
+        })
     }
 }

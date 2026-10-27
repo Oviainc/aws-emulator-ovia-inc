@@ -186,12 +186,15 @@ async fn each_connect_campaigns_api_version_serves_its_own_route_space() {
             Expect::Error("ResourceNotFoundException"),
         ),
         (
-            "V2 GetCampaignStateBatch (still a stub)",
+            // V2 implements this one, so its answer is its own per-id state report:
+            // the id row 1 minted resolves in V2's store, which neither a router
+            // refusal nor v1's own stub for `/campaigns-state` can produce.
+            "V2 GetCampaignStateBatch",
             "POST",
             "/v2/campaigns-state",
             r#"{"campaignIds":["000000000000"]}"#,
-            501,
-            Expect::Error("NotImplemented"),
+            200,
+            Expect::Member("successfulRequests"),
         ),
         (
             "V2 StartInstanceOnboardingJob",

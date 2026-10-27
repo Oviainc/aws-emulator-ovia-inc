@@ -46,6 +46,14 @@ pub(crate) fn control(name: &str) -> String {
     format!("arn:aws:controltower:us-west-2::control/{name}")
 }
 
+/// The AWS Control Catalog ARN of a control, whose resource segment is its opaque
+/// `catalog_id`; the AWS Control Tower form, whose resource segment is the control's name,
+/// is [`control`]. That catalog is global, so the ARN names neither a region nor an
+/// account. The one definition every suite that names a control in this form uses.
+pub(crate) fn catalog_arn(catalog_id: &str) -> String {
+    format!("arn:aws:controlcatalog:::control/{catalog_id}")
+}
+
 /// An organizational-unit `TargetIdentifier`.
 pub(crate) fn ou(id: &str) -> String {
     format!("arn:aws:organizations::000000000000:ou/o-emulatororg/ou-abcd-{id}")

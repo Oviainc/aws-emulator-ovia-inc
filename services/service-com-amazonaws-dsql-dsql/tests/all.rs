@@ -53,6 +53,8 @@ mod resource_tags;
 mod retired_cluster_token_cleanup;
 #[path = "all/shared_page_walk.rs"]
 mod shared_page_walk;
+#[path = "all/shared_recorded_delete.rs"]
+mod shared_recorded_delete;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/stream_deletion.rs"]

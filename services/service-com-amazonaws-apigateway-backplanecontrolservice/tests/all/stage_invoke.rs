@@ -24,7 +24,7 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
-use crate::rest_api_lifecycle::{create_api, create_resource, string_member, Gateway};
+use crate::rest_api_lifecycle::{create_api, resource_under, Gateway};
 
 /// The region the invoke host is addressed in; see `execute_api_data_plane`'s note on why
 /// one is enough.
@@ -162,12 +162,6 @@ async fn deploy(gateway: &Gateway, api: &str, stage: &str) {
         "case CreateDeployment({stage}): expected 201, got {} with {:?}",
         answer.status, answer.body
     );
-}
-
-/// A child resource under `parent`, answering its resource id.
-async fn resource_under(gateway: &Gateway, api: &str, parent: &str, path_part: &str) -> String {
-    let created = create_resource(gateway, api, parent, path_part).await;
-    string_member(&created, "id", &format!("CreateResource({path_part})"))
 }
 
 #[tokio::test]

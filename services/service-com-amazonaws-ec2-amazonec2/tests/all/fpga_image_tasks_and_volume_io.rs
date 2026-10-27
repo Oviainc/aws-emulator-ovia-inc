@@ -10,10 +10,11 @@
 //! The rules under test are:
 //!
 //! 1. AN AMAZON S3 STORAGE LOCATION THE SERVICE CANNOT READ IS REFUSED with 400
-//!    `InaccessibleStorageLocation`, never accepted: a bucket name outside Amazon S3's
-//!    published naming rules names no bucket, and a stored object nothing holds cannot be
-//!    restored from. The `CreateFpgaImage` side of that rule — the design checkpoint it
-//!    reads, which this emulator holds no object for — is [`super::create_fpga_image`]'s;
+//!    `InaccessibleStorageLocation`, never accepted: a stored object nothing holds cannot be
+//!    read. The `CreateFpgaImage` side of that rule — the design checkpoint it reads, which
+//!    this emulator holds no object for — is [`super::create_fpga_image`]'s, and the
+//!    `CreateRestoreImageTask` side, which answers a name that is no bucket name as a
+//!    malformed parameter, is [`super::create_restore_image_task`]'s;
 //! 2. `DryRun` ASKS WHETHER THE CALLER MAY MAKE THE REQUEST, so an authorized `DryRun` call
 //!    is answered 412 `DryRunOperation` once the request's own members have been read and
 //!    before any resource is resolved or written — including for a resource the account
@@ -249,82 +250,10 @@ pub(super) fn bucket_name_rows() -> Vec<(&'static str, String, bool)> {
 // faults it answers ahead of that read — is [`super::create_fpga_image`]'s, which runs the
 // bucket table above through it.
 
-/// `CreateRestoreImageTask` keeps the same rule: a bucket name outside the naming rules is
-/// refused for being no bucket, and a readable bucket name is refused for the object, whose
-/// location the message names — this emulator holds no stored AMI object to restore from, so
-/// no AMI is ever minted.
-#[tokio::test]
-async fn create_restore_image_task_refuses_a_location_it_cannot_read() {
-    let (router, _engine) = emulator();
-
-    for (case, bucket, readable_name) in bucket_name_rows() {
-        let (status, body) = op(
-            &router,
-            "CreateRestoreImageTask",
-            &[p("Bucket", bucket.clone()), p("ObjectKey", "ami/stored.bin")],
-        )
-        .await;
-        assert_eq!(
-            status, 400,
-            "case {case:?}: expected HTTP 400 for bucket {bucket:?}, \
-             got {status} with body {body}"
-        );
-        assert_eq!(
-            error_code(&body),
-            "InaccessibleStorageLocation",
-            "case {case:?}: expected InaccessibleStorageLocation for bucket {bucket:?}, got {body}"
-        );
-        let message = unescaped(&element(&body, "Message").unwrap_or_default());
-        if readable_name {
-            assert!(
-                message.contains(&format!("s3://{bucket}/ami/stored.bin")),
-                "case {case:?}: expected the message to name the object that could not be \
-                 read, got {message:?}"
-            );
-        }
-        assert!(
-            element(&body, "imageId").is_none(),
-            "case {case:?}: expected no AMI to be minted, got {body}"
-        );
-    }
-}
-
-/// A `CreateRestoreImageTask` tag specification may only name the AMI and the snapshots it
-/// restores, so one naming any other resource type is refused rather than discarded.
-#[tokio::test]
-async fn create_restore_image_task_tags_only_what_it_restores() {
-    let (router, _engine) = emulator();
-
-    let rows: [(&str, &str, &str); 4] = [
-        ("the AMI", "image", "InaccessibleStorageLocation"),
-        ("the snapshots", "snapshot", "InaccessibleStorageLocation"),
-        ("a volume", "volume", "InvalidParameterValue"),
-        ("an instance", "instance", "InvalidParameterValue"),
-    ];
-    for (case, resource_type, expected_code) in rows {
-        let (status, body) = op(
-            &router,
-            "CreateRestoreImageTask",
-            &[
-                p("Bucket", READABLE_BUCKET),
-                p("ObjectKey", "ami/stored.bin"),
-                p("TagSpecification.1.ResourceType", resource_type),
-                p("TagSpecification.1.Tag.1.Key", "Name"),
-                p("TagSpecification.1.Tag.1.Value", "restored"),
-            ],
-        )
-        .await;
-        assert_eq!(
-            status, 400,
-            "case {case:?}: expected HTTP 400, got {status} with body {body}"
-        );
-        assert_eq!(
-            error_code(&body),
-            expected_code,
-            "case {case:?}: expected {expected_code}, got {body}"
-        );
-    }
-}
+// `CreateRestoreImageTask`'s side of this rule — the stored AMI object it reads, which name
+// reaches no bucket at all and so is answered as a malformed parameter instead, and the
+// request faults it answers ahead of that read — is [`super::create_restore_image_task`]'s,
+// which runs the bucket table above through it.
 
 // ---------------------------------------------------------------------------
 // RULE 2: DryRun is a question about the caller
