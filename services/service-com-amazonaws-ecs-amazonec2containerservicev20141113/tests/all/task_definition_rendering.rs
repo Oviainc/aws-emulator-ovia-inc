@@ -11,8 +11,10 @@
 //!   `host`) or to `0` under a DYNAMIC one (`bridge`), while a declared value is kept;
 //! * `registeredBy` names the principal that registered the revision;
 //! * `requiresAttributes` is DERIVED from the features the revision declares, one
-//!   container-agent capability per feature, deduplicated and sorted — and stays absent
-//!   when it declares none;
+//!   container-agent capability per feature — including the log router a
+//!   `firelensConfiguration` names and the execution-role capability the `awslogs`
+//!   driver needs when the revision carries an `executionRoleArn` — deduplicated and
+//!   sorted, and stays absent when it declares none;
 //! * `compatibilities` reports the launch types the revision's parameters support and
 //!   that ECS validated it against, in the order ECS reports them;
 //! * `DescribeTaskDefinition` always materialises its top-level `tags` list, whose
@@ -313,16 +315,25 @@ async fn requires_attributes_are_derived_from_the_features_the_revision_declares
     // `ecs.capability.secrets.{asm,ssm}.bootstrap.log-driver` for a
     // `logConfiguration.secretOptions` one, `ecs.capability.env-files.s3` for an S3
     // `environmentFiles` entry, `com.amazonaws.ecs.capability.privileged-container` for
-    // a privileged container and `com.amazonaws.ecs.capability.logging-driver.<driver>`
-    // for a named log driver.
+    // a privileged container, `com.amazonaws.ecs.capability.logging-driver.<driver>`
+    // for a named log driver, `ecs.capability.firelens.<type>` for the log router a
+    // `firelensConfiguration` names (`FirelensConfiguration$type`: "The log router to
+    // use. The valid values are fluentd or fluentbit") and
+    // `ecs.capability.execution-role-awslogs` for the `awslogs` driver on a revision
+    // that also carries an `executionRoleArn`.
     const ASM_SECRET: &str = "arn:aws:secretsmanager:us-west-2:000000000000:secret:db-AbCdEf";
     const SSM_SECRET: &str = "arn:aws:ssm:us-west-2:000000000000:parameter/prod/db";
     const DOCKER_1_18: &str = "com.amazonaws.ecs.capability.docker-remote-api.1.18";
     const TASK_ENI: &str = "ecs.capability.task-eni";
+    const EXECUTION_ROLE_AWSLOGS: &str = "ecs.capability.execution-role-awslogs";
+    const DRIVER_AWSLOGS: &str = "com.amazonaws.ecs.capability.logging-driver.awslogs";
+    const DRIVER_AWSFIRELENS: &str = "com.amazonaws.ecs.capability.logging-driver.awsfirelens";
 
     struct Row {
         case: &'static str,
         network_mode: &'static str,
+        /// Whether the revision carries an `executionRoleArn`.
+        execution_role: bool,
         /// What each container of the revision declares beyond name/image/memory.
         containers: Vec<Value>,
         /// The attribute names expected back, in order; empty means the member stays
@@ -334,18 +345,21 @@ async fn requires_attributes_are_derived_from_the_features_the_revision_declares
         Row {
             case: "no feature that needs an attribute",
             network_mode: "bridge",
+            execution_role: true,
             containers: vec![json!({})],
             expected: vec![],
         },
         Row {
             case: "awsvpc network mode",
             network_mode: "awsvpc",
+            execution_role: true,
             containers: vec![json!({})],
             expected: vec![DOCKER_1_18, TASK_ENI],
         },
         Row {
             case: "secrets manager secret",
             network_mode: "bridge",
+            execution_role: true,
             containers: vec![json!({
                 "secrets": [{ "name": "DB_PASSWORD", "valueFrom": ASM_SECRET }],
             })],
@@ -354,6 +368,7 @@ async fn requires_attributes_are_derived_from_the_features_the_revision_declares
         Row {
             case: "parameter store secret by arn",
             network_mode: "bridge",
+            execution_role: true,
             containers: vec![json!({
                 "secrets": [{ "name": "DB_PASSWORD", "valueFrom": SSM_SECRET }],
             })],
@@ -362,6 +377,7 @@ async fn requires_attributes_are_derived_from_the_features_the_revision_declares
         Row {
             case: "parameter store secret by name",
             network_mode: "bridge",
+            execution_role: true,
             containers: vec![json!({
                 "secrets": [{ "name": "DB_PASSWORD", "valueFrom": "/prod/db/password" }],
             })],
@@ -370,6 +386,7 @@ async fn requires_attributes_are_derived_from_the_features_the_revision_declares
         Row {
             case: "environment file in s3",
             network_mode: "bridge",
+            execution_role: true,
             containers: vec![json!({
                 "environmentFiles": [{
                     "type": "s3",
@@ -381,29 +398,54 @@ async fn requires_attributes_are_derived_from_the_features_the_revision_declares
         Row {
             case: "privileged container",
             network_mode: "bridge",
+            execution_role: true,
             containers: vec![json!({ "privileged": true })],
             expected: vec!["com.amazonaws.ecs.capability.privileged-container"],
         },
         Row {
             case: "privileged declared false",
             network_mode: "bridge",
+            execution_role: true,
             containers: vec![json!({ "privileged": false })],
             expected: vec![],
         },
         Row {
-            case: "awslogs log driver",
+            case: "awslogs log driver with an execution role",
             network_mode: "bridge",
+            execution_role: true,
             containers: vec![json!({
                 "logConfiguration": {
                     "logDriver": "awslogs",
                     "options": { "awslogs-group": "/ecs/rendering" },
                 },
             })],
-            expected: vec!["com.amazonaws.ecs.capability.logging-driver.awslogs"],
+            expected: vec![DRIVER_AWSLOGS, EXECUTION_ROLE_AWSLOGS],
+        },
+        Row {
+            case: "awslogs log driver with no execution role",
+            network_mode: "bridge",
+            execution_role: false,
+            containers: vec![json!({
+                "logConfiguration": {
+                    "logDriver": "awslogs",
+                    "options": { "awslogs-group": "/ecs/rendering" },
+                },
+            })],
+            expected: vec![DRIVER_AWSLOGS],
+        },
+        Row {
+            case: "a driver other than awslogs does not need the execution role",
+            network_mode: "bridge",
+            execution_role: true,
+            containers: vec![json!({
+                "logConfiguration": { "logDriver": "splunk" },
+            })],
+            expected: vec!["com.amazonaws.ecs.capability.logging-driver.splunk"],
         },
         Row {
             case: "fluentd log driver with a secret option",
             network_mode: "bridge",
+            execution_role: true,
             containers: vec![json!({
                 "logConfiguration": {
                     "logDriver": "fluentd",
@@ -415,9 +457,98 @@ async fn requires_attributes_are_derived_from_the_features_the_revision_declares
                 "ecs.capability.secrets.asm.bootstrap.log-driver",
             ],
         },
+        // One row per `FirelensConfiguration$type` value, so the capability is
+        // completed by the router the container names rather than by one of them.
+        Row {
+            case: "fluentbit log router",
+            network_mode: "bridge",
+            execution_role: false,
+            containers: vec![json!({ "firelensConfiguration": { "type": "fluentbit" } })],
+            expected: vec!["ecs.capability.firelens.fluentbit"],
+        },
+        Row {
+            case: "fluentd log router",
+            network_mode: "bridge",
+            execution_role: false,
+            containers: vec![json!({ "firelensConfiguration": { "type": "fluentd" } })],
+            expected: vec!["ecs.capability.firelens.fluentd"],
+        },
+        Row {
+            case: "a log router with options is still one router capability",
+            network_mode: "bridge",
+            execution_role: false,
+            containers: vec![json!({
+                "firelensConfiguration": {
+                    "type": "fluentbit",
+                    "options": { "enable-ecs-log-metadata": "true" },
+                },
+            })],
+            expected: vec!["ecs.capability.firelens.fluentbit"],
+        },
+        Row {
+            case: "a fluentbit router shipping its own logs with awslogs under an execution role",
+            network_mode: "awsvpc",
+            execution_role: true,
+            containers: vec![
+                json!({
+                    "firelensConfiguration": { "type": "fluentbit" },
+                    "logConfiguration": {
+                        "logDriver": "awslogs",
+                        "options": { "awslogs-stream-prefix": "log-router" },
+                    },
+                }),
+                json!({ "logConfiguration": { "logDriver": "awsfirelens" } }),
+            ],
+            expected: vec![
+                DOCKER_1_18,
+                DRIVER_AWSFIRELENS,
+                DRIVER_AWSLOGS,
+                EXECUTION_ROLE_AWSLOGS,
+                "ecs.capability.firelens.fluentbit",
+                TASK_ENI,
+            ],
+        },
+        Row {
+            case: "the same router kind in two containers is reported once",
+            network_mode: "bridge",
+            execution_role: false,
+            containers: vec![
+                json!({ "firelensConfiguration": { "type": "fluentd" } }),
+                json!({ "firelensConfiguration": { "type": "fluentd" } }),
+            ],
+            expected: vec!["ecs.capability.firelens.fluentd"],
+        },
+        Row {
+            case: "two router kinds are each reported",
+            network_mode: "bridge",
+            execution_role: false,
+            containers: vec![
+                json!({ "firelensConfiguration": { "type": "fluentd" } }),
+                json!({ "firelensConfiguration": { "type": "fluentbit" } }),
+            ],
+            expected: vec![
+                "ecs.capability.firelens.fluentbit",
+                "ecs.capability.firelens.fluentd",
+            ],
+        },
+        Row {
+            case: "the awslogs driver of the second container needs the execution role too",
+            network_mode: "bridge",
+            execution_role: true,
+            containers: vec![
+                json!({ "logConfiguration": { "logDriver": "awsfirelens" } }),
+                json!({ "logConfiguration": { "logDriver": "awslogs" } }),
+            ],
+            expected: vec![
+                DRIVER_AWSFIRELENS,
+                DRIVER_AWSLOGS,
+                EXECUTION_ROLE_AWSLOGS,
+            ],
+        },
         Row {
             case: "the same feature in two containers is reported once",
             network_mode: "bridge",
+            execution_role: true,
             containers: vec![
                 json!({ "secrets": [{ "name": "A", "valueFrom": ASM_SECRET }] }),
                 json!({ "secrets": [{ "name": "B", "valueFrom": ASM_SECRET }] }),
@@ -427,6 +558,7 @@ async fn requires_attributes_are_derived_from_the_features_the_revision_declares
         Row {
             case: "features of several containers under awsvpc, sorted",
             network_mode: "awsvpc",
+            execution_role: true,
             containers: vec![
                 json!({ "privileged": true }),
                 json!({ "secrets": [{ "name": "A", "valueFrom": ASM_SECRET }] }),
@@ -455,17 +587,17 @@ async fn requires_attributes_are_derived_from_the_features_the_revision_declares
             })
             .collect();
 
-        for (source, definition) in register_and_describe(
-            &router,
-            &format!("attributes-{index}"),
-            json!({
-                "networkMode": row.network_mode,
-                "executionRoleArn": format!("arn:aws:iam::{ACCOUNT}:role/ecsTaskExecutionRole"),
-                "containerDefinitions": containers,
-            }),
-            case,
-        )
-        .await
+        let mut request = json!({
+            "networkMode": row.network_mode,
+            "containerDefinitions": containers,
+        });
+        if row.execution_role {
+            request["executionRoleArn"] =
+                json!(format!("arn:aws:iam::{ACCOUNT}:role/ecsTaskExecutionRole"));
+        }
+
+        for (source, definition) in
+            register_and_describe(&router, &format!("attributes-{index}"), request, case).await
         {
             if row.expected.is_empty() {
                 assert!(
