@@ -402,16 +402,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A fresh id per start, re-minted on the (vanishingly unlikely) chance the digest
-        // already names a live composition, so one ARN never denotes two of them — the
-        // uniqueness rule every other mint of this service applies.
-        let sequence = store.next_sequence();
-        let mut composition_id = crate::state::mint_id(sequence, crate::state::COMPOSITION_ID_LEN);
-        let mut arn = crate::state::composition_arn(&region, &composition_id);
-        while store.compositions.contains_key(&arn) {
-            let retry = store.next_sequence();
-            composition_id = crate::state::mint_id(retry, crate::state::COMPOSITION_ID_LEN);
-            arn = crate::state::composition_arn(&region, &composition_id);
-        }
+        // already names a live composition, so one ARN never denotes two of them —
+        // minted through the one place `crate::state` applies that rule.
+        let crate::state::MintedResource {
+            sequence,
+            id: composition_id,
+            arn,
+        } = crate::state::mint_unique_arn(
+            &mut store,
+            crate::state::COMPOSITION_ID_LEN,
+            |candidate_id| crate::state::composition_arn(&region, candidate_id),
+            |store, candidate| store.compositions.contains_key(candidate),
+        );
 
         let destinations: Vec<crate::state::DestinationRecord> = input
             .destinations
