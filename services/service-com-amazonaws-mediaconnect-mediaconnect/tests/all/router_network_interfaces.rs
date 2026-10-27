@@ -159,7 +159,10 @@ fn now_epoch_seconds() -> f64 {
 /// The members of a `RouterNetworkInterface` that a read must report exactly as the create
 /// stored them. `state` is excluded on purpose: it is the one member the CLOCK moves (see
 /// [`the_clock_settles_a_new_router_network_interface_into_active`]).
-const PERSISTED_MEMBERS: [&str; 10] = [
+///
+/// `pub(crate)` because the single-resource read side (`get_router_network_interface`) asserts
+/// the same list, so the two read suites cannot drift apart.
+pub(crate) const PERSISTED_MEMBERS: [&str; 10] = [
     "name",
     "arn",
     "id",
