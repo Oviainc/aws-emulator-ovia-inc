@@ -30,13 +30,14 @@
 //! about a member's length. [`property_count_refusal`] states that one, for a service
 //! whose recordings show it, and is asked before the envelope.
 //!
-//! [`too_many_properties`], [`pattern_mismatch`] and [`string_too_long`] are the SENTENCES
-//! that layer states for the three constraint classes it reports on a member it read from
-//! the request BODY. A service whose front door words those findings itself — because it
-//! has to tell a body member from one bound to the URI, which the refusal seam cannot —
-//! builds them from here, so the sentences do not drift per crate. [`expected_vendor`] is
-//! the one sentence here that is not a schema finding: how the resource-tagging layer
-//! refuses an ARN of another vendor, which it decides before any lookup.
+//! [`too_many_properties`], [`pattern_mismatch`], [`string_too_long`] and
+//! [`string_too_short`] are the SENTENCES that layer states for the constraint classes it
+//! reports on a member it read from the request BODY. A service whose front door words
+//! those findings itself — because it has to tell a body member from one bound to the URI,
+//! which the refusal seam cannot — builds them from here, so the sentences do not drift
+//! per crate. [`expected_vendor`] is the one sentence here that is not a schema finding:
+//! how the resource-tagging layer refuses an ARN of another vendor, which it decides
+//! before any lookup.
 //!
 //! The other difference this module owns is the VALUE half of a clause: a COLLECTION
 //! (list or map) whose `@length` was broken is stated with no value at all —
@@ -137,6 +138,27 @@ pub fn string_too_long(value: &str, length: usize, max: i64) -> String {
     format!("string \"{value}\" is too long (length: {length}, maximum allowed: {max})")
 }
 
+/// The finding that layer states for a string shorter than the schema's minimum: the
+/// string the caller submitted, its length, and that minimum.
+///
+/// The mirror of [`string_too_long`], down to where the number comes from: `length` is
+/// the length the CONSTRAINT counted, passed in rather than measured here.
+#[must_use]
+pub fn string_too_short(value: &str, length: usize, min: i64) -> String {
+    format!("string \"{value}\" is too short (length: {length}, required minimum: {min})")
+}
+
+/// The findings of one refusal as that layer LISTS them: `[<finding>, <finding>]`.
+///
+/// A JSON-schema layer reports what it found as a list, so one finding and five render
+/// the same way. What a service puts in FRONT of the list is its own (the recordings do
+/// not even agree on the punctuation before it), but the list itself is one rendering and
+/// lives here.
+#[must_use]
+pub fn bracketed_findings(findings: &[String]) -> String {
+    format!("[{}]", findings.join(", "))
+}
+
 /// The sentence the resource-tagging layer in front of a service refuses a caller-supplied
 /// `resourceArn` of ANOTHER vendor with: it names the vendor it expected — the serving
 /// service's own ARN namespace — and nothing of the ARN it was handed.
@@ -194,7 +216,7 @@ pub fn property_count_refusal(refusal: &Refusal) -> Option<Refused> {
     }
     Some(Refused {
         code: VALIDATION_EXCEPTION.to_owned(),
-        message: format!("[{}]", clauses.join(", ")),
+        message: bracketed_findings(&clauses),
     })
 }
 
@@ -278,7 +300,7 @@ pub fn aws_validation_refusal_with(
 mod tests {
     use super::{
         aws_validation_refusal, aws_validation_refusal_with, pattern_mismatch,
-        property_count_refusal, string_too_long,
+        property_count_refusal, string_too_long, string_too_short,
     };
     use crate::validation::unanchored_grouping_alternation;
     use aws_smithy_schema_server::{Violation, ViolationKind};
@@ -683,6 +705,24 @@ mod tests {
             let expected =
                 format!(r#"string "{value}" is too long (length: {length}, maximum allowed: {max})"#);
             let actual = string_too_long(value, length, max);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+
+        // The same rows against the MINIMUM bound: (case, the value, the length the
+        // constraint counted, the minimum).
+        let minimums: [(&str, &str, usize, i64); 3] = [
+            ("one character short of the minimum", "x", 1, 2),
+            ("the empty string", "", 0, 1),
+            ("a unicode value", "é", 1, 2),
+        ];
+        for (case, value, length, min) in minimums {
+            let expected = format!(
+                r#"string "{value}" is too short (length: {length}, required minimum: {min})"#
+            );
+            let actual = string_too_short(value, length, min);
             assert_eq!(
                 actual, expected,
                 "case {case:?}: expected {expected:?}, got {actual:?}"

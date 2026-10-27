@@ -598,9 +598,14 @@ async fn a_replayed_client_token_returns_the_first_resource() {
     );
 }
 
-/// A name identifies a resource within its parent, at every level of the hierarchy.
+/// A name identifies a resource within its parent, at the levels where this service
+/// scopes names to one: a control panel inside its cluster, a routing control inside its
+/// control panel. The refusal is of the request's input (400), not a transient collision.
+///
+/// Cluster names are NOT in this table — they are labels, not identities; see
+/// `tests/all/rejection_error_classes.rs`.
 #[tokio::test]
-async fn a_duplicate_name_within_the_same_parent_is_a_conflict() {
+async fn a_duplicate_name_within_the_same_parent_is_refused() {
     let router = router();
 
     let cluster = create_cluster(&router, json!({ "ClusterName": "dup" })).await;
@@ -626,9 +631,9 @@ async fn a_duplicate_name_within_the_same_parent_is_a_conflict() {
     )
     .await;
 
-    // One row per resource level: the same name under the same parent conflicts.
+    // One row per resource level that scopes names to a parent: the same name under the
+    // same parent is refused.
     let conflicts: &[(&str, &str, Value)] = &[
-        ("cluster", "/cluster", json!({ "ClusterName": "dup" })),
         (
             "control panel",
             "/controlpanel",
@@ -647,13 +652,13 @@ async fn a_duplicate_name_within_the_same_parent_is_a_conflict() {
     for (level, path, body) in conflicts {
         let (status, answer) = call(&router, "POST", path, Some(body.clone())).await;
         assert_eq!(
-            status, 409,
-            "case duplicate {level}: expected 409, got {status} {answer:?}"
+            status, 400,
+            "case duplicate {level}: expected 400, got {status} {answer:?}"
         );
         assert_eq!(
             error_code(&answer),
-            "ConflictException",
-            "case duplicate {level}: expected ConflictException, got {answer:?}"
+            "ValidationException",
+            "case duplicate {level}: expected ValidationException, got {answer:?}"
         );
     }
 
@@ -670,8 +675,11 @@ async fn a_duplicate_name_within_the_same_parent_is_a_conflict() {
     );
 }
 
-/// An ARN no resource is stored under is `ResourceNotFoundException` (404) on every
-/// read, delete and create that names it as a parent.
+/// An ARN no resource is stored under is `ResourceNotFoundException` (404) on every read
+/// and delete that ADDRESSES it.
+///
+/// A create that only names it as a parent is refused on its input instead — see
+/// `tests/all/rejection_error_classes.rs`.
 #[tokio::test]
 async fn an_unknown_arn_is_not_found_everywhere() {
     let router = router();
@@ -680,8 +688,7 @@ async fn an_unknown_arn_is_not_found_everywhere() {
     let missing_panel = format!("{ARN_PREFIX}controlpanel/00000000-0000-0000-0000-000000000000");
     let missing_control = format!("{missing_panel}/routingcontrol/11111111-1111-1111-1111-111111111111");
 
-    // Rows span the operation kinds (read, delete, create-under-a-parent, list) and
-    // all three resource levels.
+    // Rows span the operation kinds (read, delete, list) and all three resource levels.
     let cases: Vec<(String, &str, String, Option<Value>)> = vec![
         (
             "DescribeCluster".to_string(),
@@ -725,18 +732,6 @@ async fn an_unknown_arn_is_not_found_everywhere() {
             format!("/controlpanel/{}/routingcontrols", enc(&missing_panel)),
             None,
         ),
-        (
-            "CreateControlPanel".to_string(),
-            "POST",
-            "/controlpanel".to_string(),
-            Some(json!({ "ClusterArn": missing_cluster, "ControlPanelName": "orphan" })),
-        ),
-        (
-            "CreateRoutingControl".to_string(),
-            "POST",
-            "/routingcontrol".to_string(),
-            Some(json!({ "ClusterArn": missing_cluster, "RoutingControlName": "orphan" })),
-        ),
     ];
 
     for (case, method, path, body) in cases {
@@ -753,8 +748,10 @@ async fn an_unknown_arn_is_not_found_everywhere() {
     }
 }
 
-/// A request outside a modelled constraint is refused with `ValidationException`
-/// (400), and a request on the published bounds is accepted.
+/// A request outside a modelled constraint is refused with 400, under the class of the
+/// layer that refused it — the request-body validator for a string constraint on a body
+/// member, the modelled `ValidationException` for a query parameter outside its `@range`
+/// — and a request on the published bounds is accepted.
 #[tokio::test]
 async fn constraint_violations_are_refused_and_the_bounds_are_accepted() {
     let router = router();
@@ -772,38 +769,47 @@ async fn constraint_violations_are_refused_and_the_bounds_are_accepted() {
         .to_string();
 
     // `ClusterName`/`ControlPanelName` are len 1..64 pattern ^\S+$, and
-    // `MaxResults` is range 1..1000 (`smithy_query(query="operation", ...)`).
+    // `MaxResults` is range 1..1000 (`smithy_query(query="operation", ...)`). The last
+    // column is the class the refusal carries: the body members' string constraints are
+    // the request-body validator's, `MaxResults` is a query parameter it never sees.
+    // The message of each body refusal is pinned in
+    // `tests/all/rejection_error_classes.rs`.
     let sixty_five = "a".repeat(65);
-    let refusals: Vec<(&str, &str, String, Option<Value>)> = vec![
+    let refusals: Vec<(&str, &str, String, Option<Value>, &str)> = vec![
         (
             "empty ClusterName",
             "POST",
             "/cluster".to_string(),
             Some(json!({ "ClusterName": "" })),
+            "BadRequestException",
         ),
         (
             "ClusterName one past the length maximum",
             "POST",
             "/cluster".to_string(),
             Some(json!({ "ClusterName": sixty_five })),
+            "BadRequestException",
         ),
         (
             "ClusterName with whitespace breaks ^\\S+$",
             "POST",
             "/cluster".to_string(),
             Some(json!({ "ClusterName": "has space" })),
+            "BadRequestException",
         ),
         (
             "empty ControlPanelName",
             "POST",
             "/controlpanel".to_string(),
             Some(json!({ "ClusterArn": cluster_arn, "ControlPanelName": "" })),
+            "BadRequestException",
         ),
         (
             "MaxResults one below the range minimum",
             "GET",
             format!("/controlpanel/{}/routingcontrols?MaxResults=0", enc(&panel_arn)),
             None,
+            "ValidationException",
         ),
         (
             "MaxResults one above the range maximum",
@@ -813,9 +819,10 @@ async fn constraint_violations_are_refused_and_the_bounds_are_accepted() {
                 enc(&panel_arn)
             ),
             None,
+            "ValidationException",
         ),
     ];
-    for (case, method, path, body) in refusals {
+    for (case, method, path, body, expected) in refusals {
         let (status, answer) = call(&router, method, &path, body).await;
         assert_eq!(
             status, 400,
@@ -823,8 +830,8 @@ async fn constraint_violations_are_refused_and_the_bounds_are_accepted() {
         );
         assert_eq!(
             error_code(&answer),
-            "ValidationException",
-            "case {case}: expected ValidationException, got {answer:?}"
+            expected,
+            "case {case}: expected {expected}, got {answer:?}"
         );
     }
 
@@ -1041,13 +1048,13 @@ async fn a_parent_with_children_cannot_be_deleted() {
     for (case, path) in conflicts {
         let (status, answer) = call(&router, "DELETE", path, None).await;
         assert_eq!(
-            status, 409,
-            "case {case}: expected 409, got {status} {answer:?}"
+            status, 400,
+            "case {case}: expected 400, got {status} {answer:?}"
         );
         assert_eq!(
             error_code(&answer),
-            "ConflictException",
-            "case {case}: expected ConflictException, got {answer:?}"
+            "ValidationException",
+            "case {case}: expected ValidationException, got {answer:?}"
         );
     }
 
