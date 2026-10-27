@@ -6,18 +6,21 @@
 //! ## The rule this module implements
 //!
 //! A template may stand a property's value in as a dynamic reference rather than write the
-//! value itself: `{{resolve:<store>:<reference key>}}`. CloudFormation resolves it when the
-//! stack DEPLOYS the resource, against the store the reference names, and the FORM of the
-//! reference is what decides which values that store may answer with — the `ssm` form
-//! resolves a Parameter Store parameter held as plain text (a `String` or a `StringList`),
-//! and the `ssm-secure` form resolves only one held encrypted (a `SecureString`) — as well
-//! as WHERE the reference may stand: a secure one is supported only in the resource
-//! properties AWS publishes for it ([`SSM_SECURE_PROPERTIES`]). A reference the deployment
-//! cannot honour — the named store holds no such parameter, or holds one of a type that
-//! form does not resolve, or a secure reference stands in an unsupported property — is a
-//! MISUSE of the reference rather than a value: the resource carrying it fails, so the
-//! operation deploying it fails with it and a create rolls the stack back
-//! ([`super::provisioning::reconcile`] is what records that).
+//! value itself: `{{resolve:<store>:<reference key>}}`. CloudFormation resolves it ITSELF,
+//! against the store the reference names, BEFORE the deployment asks any owning service for
+//! anything ([`resolve_declared`]), and the FORM of the reference is what decides which
+//! values that store may answer with — the `ssm` form resolves a Parameter Store parameter
+//! held as plain text (a `String` or a `StringList`), and the `ssm-secure` form resolves
+//! only one held encrypted (a `SecureString`) — as well as WHERE the reference may stand: a
+//! secure one is supported only in the resource properties AWS publishes for it
+//! ([`SSM_SECURE_PROPERTIES`]). A reference the deployment cannot honour — the named store
+//! holds no such parameter, or holds one of a type that form does not resolve, or a secure
+//! reference stands in an unsupported property — is a MISUSE of the reference rather than a
+//! value, and the misuse is CLOUDFORMATION's own refusal: no resource provider is asked
+//! about any of the deployment's resources, and the diagnostic saying WHICH reference could
+//! not be honoured and why is what the stack itself reports as its status reason, so a
+//! create rolls back carrying the resolver's words rather than a summary of resources that
+//! tried and failed ([`super::provisioning::reconcile`] is what records that).
 //!
 //! The store is read through the SAME in-process, signed call a resource's own create rides
 //! on ([`super::provisioner::call_ssm`]), so a reference resolves against the very
@@ -101,6 +104,43 @@ pub(super) struct Resolution {
     pub(super) recorded: Value,
 }
 
+impl Resolution {
+    /// The resolution of a document carrying no dynamic reference this module resolves: it
+    /// is deployed and recorded exactly as the declaration wrote it.
+    pub(super) fn verbatim(properties: &Value) -> Self {
+        Self {
+            deployed: properties.clone(),
+            recorded: properties.clone(),
+        }
+    }
+}
+
+/// Resolve the dynamic references of EVERY resource a deployment declares, in the order the
+/// template declares them, and before anything is asked of any owning service.
+///
+/// This is CloudFormation's OWN gate on a deployment (see the module docs): `Err(reason)` is
+/// a reference the deployment cannot honour, worded as the diagnostic the STACK reports as
+/// its own status reason — no resource of the deployment is deployed at all, so the failure
+/// is not attributed to a resource provider that was never asked.
+///
+/// `Ok` is one [`Resolution`] per declared resource, keyed by the logical id the template
+/// declares it under: the documents that deployment then deploys and records the resource
+/// with.
+pub(super) async fn resolve_declared(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    declared: &[super::StoredResource],
+) -> Result<BTreeMap<String, Resolution>, String> {
+    let mut resolutions = BTreeMap::new();
+    for resource in declared {
+        resolutions.insert(
+            resource.logical_id.clone(),
+            resolve(ctx, region, &resource.resource_type, &resource.properties).await?,
+        );
+    }
+    Ok(resolutions)
+}
+
 /// Resolve every dynamic reference `properties` carries against the store it names.
 ///
 /// `resource_type` is the type of the resource whose properties these are, which is what
@@ -108,10 +148,10 @@ pub(super) struct Resolution {
 ///
 /// `Err(reason)` is a reference this resource cannot be deployed with — one the named store
 /// cannot satisfy, or a secure one standing somewhere it is not supported — worded as the
-/// `ResourceStatusReason` of the resource that carries it: such a resource cannot be
-/// created, so the deployment fails on it rather than asking its owning service for a
-/// resource configured with the reference's own text.
-pub(super) async fn resolve(
+/// `ResourceStatusReason` the failure is reported with: such a reference has no value, so
+/// the deployment fails rather than asking an owning service for a resource configured with
+/// the reference's own text.
+async fn resolve(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     resource_type: &str,
@@ -121,10 +161,7 @@ pub(super) async fn resolve(
     collect(properties, "", 0, &mut occurrences);
     if occurrences.is_empty() {
         // The common case: nothing to resolve, so both documents are the declaration's.
-        return Ok(Resolution {
-            deployed: properties.clone(),
-            recorded: properties.clone(),
-        });
+        return Ok(Resolution::verbatim(properties));
     }
     if occurrences.len() > MAX_REFERENCES {
         return Err(format!(
@@ -367,9 +404,18 @@ fn collect(value: &Value, path: &str, depth: usize, into: &mut Vec<(String, Stri
 /// Every dynamic reference this module resolves that one text carries, in the SAME
 /// left-to-right scan [`substituted_text`] replaces them in — so a reference that is
 /// collected is one that gets substituted, and the reverse.
+///
+/// The collection bound holds INSIDE one text as well as across the document: a single
+/// property value can carry as many references as its own length allows, each costing an
+/// entry that clones the path it stands at, so the scan stops at the bound rather than
+/// growing the set to the size of the text it is reading. The set the scan hands back has
+/// then PASSED the bound, which is what [`resolve`] refuses the whole document on.
 fn references_in(text: &str, path: &str, into: &mut Vec<(String, String)>) {
     let mut rest = text;
     while let Some(start) = rest.find(OPEN) {
+        if into.len() > MAX_REFERENCES {
+            return;
+        }
         let at = &rest[start..];
         let Some(end) = at.find(CLOSE) else {
             break;
@@ -550,6 +596,23 @@ mod tests {
         assert_eq!(
             actual, expected,
             "case {document:?}: expected {expected:?}, got {collected:?}"
+        );
+    }
+
+    /// The collection bound holds inside ONE property value too: a text carrying more
+    /// references than the scan collects stops at the bound rather than growing the set to
+    /// the size of the text, and the set it hands back has passed the bound the whole
+    /// document is then refused on.
+    #[test]
+    fn one_text_cannot_grow_the_collected_set_beyond_the_bound() {
+        let case = "one property value carrying four times the bound in references";
+        let text = "{{resolve:ssm:/a}}".repeat(MAX_REFERENCES * 4);
+        let mut collected = Vec::new();
+        references_in(&text, "Property", &mut collected);
+        assert!(
+            collected.len() > MAX_REFERENCES && collected.len() <= MAX_REFERENCES + 1,
+            "case {case:?}: expected the scan to stop just past {MAX_REFERENCES}, got {}",
+            collected.len()
         );
     }
 
