@@ -5529,6 +5529,7 @@ dependencies = [
  "csv",
  "hex",
  "http",
+ "mime",
  "percent-encoding",
  "serde",
  "serde_json",

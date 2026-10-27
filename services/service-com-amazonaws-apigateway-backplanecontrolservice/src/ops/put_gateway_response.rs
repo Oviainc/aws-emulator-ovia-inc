@@ -96,9 +96,58 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// Refuse a request whose caller-sized members would grow the store past a bound.
+/// The two prefixes a gateway response parameter mapping expression carries: the single
+/// header the customization sets, and the multi-valued form of the same header.
 ///
-/// Called BEFORE the store lock is taken, so an over-sized request never reaches the
+/// A `responseParameters` key is a mapping expression naming what the customization
+/// writes on the response, and a gateway response writes HEADERS — the mapping targets
+/// API Gateway publishes for a gateway response are
+/// `gatewayresponse.header.{name}` and `gatewayresponse.headers.{name}`. Hand-written
+/// because the model types the map key as a bare `String` and declares no pattern for it
+/// (`smithy_query(query="doc", shape="com.amazonaws.apigateway#PutGatewayResponseRequest",
+/// member="responseParameters")`). `pub` because `UpdateGatewayResponse` writes the same
+/// member under the same rule, so the two operations resolve the form in one place.
+pub const GATEWAY_RESPONSE_HEADER_PREFIXES: [&str; 2] =
+    ["gatewayresponse.header.", "gatewayresponse.headers."];
+
+/// Whether `key` is a gateway response parameter mapping expression naming a valid
+/// header: one of [`GATEWAY_RESPONSE_HEADER_PREFIXES`] followed by a non-empty HTTP field
+/// name.
+///
+/// The name's character set is the HTTP field-name token this crate already resolves for
+/// the other side of a response parameter mapping
+/// (`super::put_method_response::is_field_name_char`), which is what "a valid header
+/// name" means on the wire.
+pub fn is_gateway_response_parameter(key: &str) -> bool {
+    GATEWAY_RESPONSE_HEADER_PREFIXES.iter().any(|prefix| {
+        key.strip_prefix(prefix).is_some_and(|name| {
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(super::put_method_response::is_field_name_char)
+        })
+    })
+}
+
+/// The `BadRequestException` message for a `responseParameters` key that is not a gateway
+/// response parameter mapping expression; see [`is_gateway_response_parameter`].
+///
+/// Stated the way this service states the sibling mapping-expression refusal
+/// (`super::put_method_response::invalid_response_parameter`), so a key outside the
+/// documented form is refused in one wording whichever member carried it. `pub` because
+/// `UpdateGatewayResponse` refuses the same key by the same rule.
+pub fn invalid_response_parameter(key: &str) -> String {
+    format!(
+        "Invalid mapping expression specified: {key}; a gateway response parameter must \
+         match {}{{name}} or {}{{name}}, where name is a valid header name",
+        GATEWAY_RESPONSE_HEADER_PREFIXES[0], GATEWAY_RESPONSE_HEADER_PREFIXES[1]
+    )
+}
+
+/// Refuse a request whose caller-sized members would grow the store past a bound, or
+/// whose `responseParameters` keys are not mapping expressions.
+///
+/// Called BEFORE the store lock is taken, so a refused request never reaches the
 /// records at all. The gateway response COUNT per API needs no cap of its own: a
 /// response is keyed by a `responseType` the model declares as an enum, so an API holds
 /// at most one customization per declared value.
@@ -114,6 +163,15 @@ fn bound_input(input: &PutGatewayResponseInput) -> Result<(), String> {
         for (key, value) in entries {
             bound_chars(&format!("a {member} key"), key, MAX_STRING_CHARS)?;
             bound_chars(&format!("a {member} value"), value, MAX_STRING_CHARS)?;
+        }
+    }
+    // The `responseTemplates` keys are content types the template renders, which the
+    // member publishes no form for, so they are stored as given; a `responseParameters`
+    // key is a mapping expression, and one that is not is refused rather than stored for
+    // the request path to ignore.
+    for key in input.response_parameters.iter().flatten().map(|(key, _)| key) {
+        if !is_gateway_response_parameter(key) {
+            return Err(invalid_response_parameter(key));
         }
     }
     Ok(())
@@ -132,10 +190,10 @@ fn bound_input(input: &PutGatewayResponseInput) -> Result<(), String> {
 /// `DEFAULT_4XX` and `DEFAULT_5XX` is none at all. Resolving it here, at write time, is
 /// what makes a read of this record agree with a read of the uncustomized type.
 ///
-/// The `responseParameters` keys are mapping expressions and the `responseTemplates`
-/// keys content types; the model types both as a bare `String` and declares no pattern
-/// for either, so each is stored as given rather than refused against a form this
-/// service does not publish.
+/// The `responseTemplates` keys are content types the template renders, which the member
+/// publishes no form for, so each is stored as given; the `responseParameters` keys are
+/// mapping expressions, checked against the form they publish before this function runs
+/// (see [`is_gateway_response_parameter`]).
 fn gateway_response_of(input: &PutGatewayResponseInput) -> GetGatewayResponseOutput {
     GetGatewayResponseOutput {
         // The response type is a path label the model constrains to the

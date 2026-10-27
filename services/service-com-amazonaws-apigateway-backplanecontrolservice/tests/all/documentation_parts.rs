@@ -20,7 +20,8 @@
 //! * an import, over both `PutMode` values and a re-import, with the content map read
 //!   back through both readers;
 //! * a malformed import body, over a table of bodies that are not a documentation set,
-//!   each asserted to change nothing.
+//!   each asserted to change nothing, and a body whose entries are not all storable,
+//!   which is refused in whole.
 
 use serde_json::{json, Map, Value};
 
@@ -893,9 +894,10 @@ async fn a_documentation_set_is_read_with_or_without_the_openapi_envelope() {
 }
 
 #[tokio::test]
-async fn an_entry_the_import_cannot_store_is_a_warning_and_failonwarnings_writes_nothing() {
+async fn an_entry_the_import_cannot_store_refuses_the_whole_import_and_writes_nothing() {
     // One body, three entries this service cannot store beside one it can, differing
-    // along what is wrong with them.
+    // along what is wrong with them. The import is ALL-OR-NOTHING, so the storable entry
+    // is not written either.
     let body = {
         let parts = json!([
             {
@@ -922,52 +924,19 @@ async fn an_entry_the_import_cannot_store_is_a_warning_and_failonwarnings_writes
         .to_string()
     };
 
-    let gateway = Gateway::new();
-    let (api, _root) = create_api(&gateway, "documentation-import-warnings").await;
-    let answer = import_parts(&gateway, &api, None, false, &body).await;
-    assert_eq!(
-        answer.status, 200,
-        "case failonwarnings absent: expected 200, got {} with {:?}",
-        answer.status, answer.body
-    );
-    let ids = answer.body["ids"].as_array().unwrap_or_else(|| {
-        panic!(
-            "case failonwarnings absent: expected an ids array, got {:?}",
-            answer.body
-        )
-    });
-    assert_eq!(
-        ids.len(),
-        1,
-        "case failonwarnings absent: expected the one storable entry, got {ids:?}"
-    );
-    let warnings = answer.body["warnings"].as_array().unwrap_or_else(|| {
-        panic!(
-            "case failonwarnings absent: expected a warnings array, got {:?}",
-            answer.body
-        )
-    });
-    assert_eq!(
-        warnings.len(),
-        3,
-        "case failonwarnings absent: expected one warning per unstorable entry, got {warnings:?}"
-    );
-    let listed = listed_ids(&gateway, &api, "", "after the partial import").await;
-    assert_eq!(
-        listed.len(),
-        1,
-        "case after the partial import: expected the one stored part, got {listed:?}"
-    );
-
-    // The same body with `failonwarnings=true` rolls the import back: the refusal is the
-    // modelled 400 and no record changed.
-    let gateway = Gateway::new();
-    let (api, _root) = create_api(&gateway, "documentation-import-failonwarnings").await;
-    let answer = import_parts(&gateway, &api, None, true, &body).await;
-    assert_failure(&answer, 400, BAD_REQUEST, "failonwarnings=true");
-    let listed = listed_ids(&gateway, &api, "", "after failonwarnings=true").await;
-    assert!(
-        listed.is_empty(),
-        "case after failonwarnings=true: expected nothing written, got {listed:?}"
-    );
+    // Whichever way `failonwarnings` is set: an entry that cannot be stored is not a
+    // warning the caller may choose to tolerate, so both rows answer the modelled 400 and
+    // leave the API's documentation set empty.
+    for fail_on_warnings in [false, true] {
+        let case = format!("failonwarnings={fail_on_warnings}");
+        let gateway = Gateway::new();
+        let (api, _root) = create_api(&gateway, "documentation-import-unstorable").await;
+        let answer = import_parts(&gateway, &api, None, fail_on_warnings, &body).await;
+        assert_failure(&answer, 400, BAD_REQUEST, &case);
+        let listed = listed_ids(&gateway, &api, "", &format!("after {case}")).await;
+        assert!(
+            listed.is_empty(),
+            "case after {case}: expected nothing written, got {listed:?}"
+        );
+    }
 }

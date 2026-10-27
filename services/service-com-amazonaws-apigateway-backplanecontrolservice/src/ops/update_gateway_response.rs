@@ -156,11 +156,20 @@ fn apply_patch(
         }
         // "Response parameters (paths, query strings and headers) of the GatewayResponse
         // as a string-to-string map of key-value pairs"
-        // (`GatewayResponse$responseParameters`). The key is a mapping expression the
-        // model types as a bare `String` with no pattern, so it is stored as given — the
-        // rule `PutGatewayResponse` stores one by.
+        // (`GatewayResponse$responseParameters`). The key is a mapping expression, so a
+        // patch that SETS an entry is refused when the key it names is not one — the same
+        // rule `PutGatewayResponse` stores a key by, so a mapping this service refuses on
+        // one path cannot be written through the other. A `remove` names an entry already
+        // stored, so it is not checked against the form again.
         "responseParameters" => {
             let name = crate::state::bounded_map_key(patch, 1)?;
+            if matches!(patch.op, PatchOpKind::Add | PatchOpKind::Replace)
+                && !super::put_gateway_response::is_gateway_response_parameter(&name)
+            {
+                return Err(PatchFailure::BadRequest(
+                    super::put_gateway_response::invalid_response_parameter(&name),
+                ));
+            }
             let mut parameters = crate::state::ordered_map(entry.response_parameters.take());
             patch_string_map(
                 &mut parameters,
