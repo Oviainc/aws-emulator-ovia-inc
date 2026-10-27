@@ -18,12 +18,13 @@
 //! encodes a private key in. Both come from the key pair that was generated, so the
 //! public key and the key `Decrypt` recovers are two halves of one pair.
 //!
-//! The key pairs themselves come from maintained cryptography libraries rather than
-//! from anything written here: `aws_lc_rs` generates the RSA, NIST ECDSA, secp256k1
-//! and Ed25519 pairs and encodes them, and the `sm2` crate the SM2 pair. Every
-//! `DataKeyPairSpec` is offered in every Region, including `SM2`: that is how this
-//! service already treats the SM2 `KeySpec` ([`crate::state::key_spec_profile`]), and
-//! nothing in this crate distinguishes one partition from another.
+//! The pair comes from [`crate::state::generate_key_pair`], the ONE generator every
+//! key pair in this service is drawn from, which in turn draws each pair from the
+//! maintained library that implements its algorithm rather than from anything written
+//! here. Every `DataKeyPairSpec` is offered in every Region, including `SM2`: that is
+//! how this service already treats the SM2 `KeySpec`
+//! ([`crate::state::key_spec_profile`]), and nothing in this crate distinguishes one
+//! partition from another.
 //!
 //! "To generate a data key pair, you must specify a symmetric encryption KMS key to
 //! encrypt the private key in a data key pair. You cannot use an asymmetric KMS key or
@@ -199,138 +200,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use aws_lc_rs::encoding::{AsDer, Pkcs8V1Der, PublicKeyX509Der};
-use aws_lc_rs::signature::{
-    EcdsaKeyPair, EcdsaSigningAlgorithm, Ed25519KeyPair, KeyPair as _,
-    ECDSA_P256K1_SHA256_ASN1_SIGNING, ECDSA_P256_SHA256_ASN1_SIGNING,
-    ECDSA_P384_SHA384_ASN1_SIGNING, ECDSA_P521_SHA512_ASN1_SIGNING,
-};
-use sm2::pkcs8::{EncodePrivateKey, EncodePublicKey};
-
-/// How many times a scalar is drawn before SM2 key generation gives up. A uniform
-/// 32-byte string is below the curve order with probability above 1 - 2^-32, so a
-/// handful of attempts is already beyond any practical failure.
-const SM2_SCALAR_ATTEMPTS: usize = 8;
-
-/// The length of an SM2 private scalar: the curve order is 256 bits
-/// (GM/T 0003-2012, the standard the `sm2` crate implements).
-const SM2_SCALAR_LEN: usize = 32;
-
-/// What a `DataKeyPairSpec` value names: the kind of key pair this operation
-/// generates for it, and so which library generates it.
-///
-/// One variant per family rather than per spec, so a spec is described by the
-/// parameter that differs (the RSA modulus size, the elliptic curve) instead of by a
-/// case of its own.
-enum KeyPairAlgorithm {
-    /// An RSA key pair of the modulus size the spec names.
-    Rsa(aws_lc_rs::rsa::KeySize),
-    /// An elliptic curve key pair on the curve the signing algorithm names.
-    Ecdsa(&'static EcdsaSigningAlgorithm),
-    /// An Ed25519 key pair.
-    Ed25519,
-    /// An SM2 key pair.
-    Sm2,
-}
-
-/// Every `DataKeyPairSpec` value
-/// (`smithy_query(query="shape",shape="DataKeyPairSpec")`, the list
-/// [`DATA_KEY_PAIR_SPEC_VALUES`] renders) with the key pair it names. A value this
-/// table does not name is one no key pair can be generated for, so a request naming
-/// it is refused rather than answered.
-const KEY_PAIR_ALGORITHMS: &[(&str, KeyPairAlgorithm)] = &[
-    (
-        "RSA_2048",
-        KeyPairAlgorithm::Rsa(aws_lc_rs::rsa::KeySize::Rsa2048),
-    ),
-    (
-        "RSA_3072",
-        KeyPairAlgorithm::Rsa(aws_lc_rs::rsa::KeySize::Rsa3072),
-    ),
-    (
-        "RSA_4096",
-        KeyPairAlgorithm::Rsa(aws_lc_rs::rsa::KeySize::Rsa4096),
-    ),
-    (
-        "ECC_NIST_P256",
-        KeyPairAlgorithm::Ecdsa(&ECDSA_P256_SHA256_ASN1_SIGNING),
-    ),
-    (
-        "ECC_NIST_P384",
-        KeyPairAlgorithm::Ecdsa(&ECDSA_P384_SHA384_ASN1_SIGNING),
-    ),
-    (
-        "ECC_NIST_P521",
-        KeyPairAlgorithm::Ecdsa(&ECDSA_P521_SHA512_ASN1_SIGNING),
-    ),
-    (
-        "ECC_SECG_P256K1",
-        KeyPairAlgorithm::Ecdsa(&ECDSA_P256K1_SHA256_ASN1_SIGNING),
-    ),
-    ("ECC_NIST_EDWARDS25519", KeyPairAlgorithm::Ed25519),
-    ("SM2", KeyPairAlgorithm::Sm2),
-];
-
-/// One freshly generated data key pair, in the encodings the response reports.
-struct DataKeyPair {
-    /// The public key as a DER-encoded X.509 `SubjectPublicKeyInfo`.
-    public_key: Vec<u8>,
-    /// The private key as a DER-encoded PKCS#8 `PrivateKeyInfo`. Sealed by the
-    /// caller and dropped with this record; it is never persisted and never
-    /// serialized into a response.
-    private_key: Vec<u8>,
-}
-
-/// The key pair `algorithm` names, drawn from the OS CSPRNG by the library that
-/// implements that algorithm.
-///
-/// `None` means the library refused to produce a key pair or to encode one; the
-/// caller answers a modelled server error rather than a pair it did not generate.
-fn generate(algorithm: &KeyPairAlgorithm) -> Option<DataKeyPair> {
-    match algorithm {
-        KeyPairAlgorithm::Rsa(key_size) => {
-            let private = aws_lc_rs::rsa::PrivateDecryptingKey::generate(*key_size).ok()?;
-            let public = private.public_key();
-            let private_key: Pkcs8V1Der<'static> = AsDer::as_der(&private).ok()?;
-            let public_key: PublicKeyX509Der<'static> = AsDer::as_der(&public).ok()?;
-            Some(DataKeyPair {
-                public_key: public_key.as_ref().to_vec(),
-                private_key: private_key.as_ref().to_vec(),
-            })
-        }
-        KeyPairAlgorithm::Ecdsa(signing_algorithm) => {
-            let pair = EcdsaKeyPair::generate(signing_algorithm).ok()?;
-            let private_key = pair.to_pkcs8v1().ok()?;
-            let public_key: PublicKeyX509Der<'static> = AsDer::as_der(pair.public_key()).ok()?;
-            Some(DataKeyPair {
-                public_key: public_key.as_ref().to_vec(),
-                private_key: private_key.as_ref().to_vec(),
-            })
-        }
-        KeyPairAlgorithm::Ed25519 => {
-            let pair = Ed25519KeyPair::generate().ok()?;
-            let private_key = pair.to_pkcs8v1().ok()?;
-            let public_key: PublicKeyX509Der<'static> = AsDer::as_der(pair.public_key()).ok()?;
-            Some(DataKeyPair {
-                public_key: public_key.as_ref().to_vec(),
-                private_key: private_key.as_ref().to_vec(),
-            })
-        }
-        // The `sm2` crate derives a public key from a scalar but draws no scalar of
-        // its own here: the bytes come from the same OS CSPRNG every other key this
-        // service generates is drawn from, and a draw that is not a valid scalar is
-        // redrawn rather than reduced, so every scalar is uniform over the curve
-        // order.
-        KeyPairAlgorithm::Sm2 => (0..SM2_SCALAR_ATTEMPTS).find_map(|_| {
-            let scalar = crate::state::random_bytes(SM2_SCALAR_LEN)?;
-            let secret = sm2::SecretKey::from_slice(&scalar).ok()?;
-            Some(DataKeyPair {
-                public_key: secret.public_key().to_public_key_der().ok()?.as_ref().to_vec(),
-                private_key: secret.to_pkcs8_der().ok()?.as_bytes().to_vec(),
-            })
-        }),
-    }
-}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -422,7 +291,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Everything about the request is judged BEFORE anything is generated, and
         // the state lock is held only for the reads that judgment needs — never
         // across the generation below.
-        let algorithm = {
+        {
             let state = state.lock();
             let key = sealing_key(&state, &region, &input.key_id)?;
 
@@ -465,17 +334,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // generate. That is not modelled as an error of this operation, so it is
             // refused as an invalid request rather than answered with a pair of some
             // other type.
-            let Some((_, algorithm)) = KEY_PAIR_ALGORITHMS
-                .iter()
-                .find(|(key_pair_spec, _)| *key_pair_spec == input.key_pair_spec)
-            else {
+            if !DATA_KEY_PAIR_SPEC_VALUES.contains(&input.key_pair_spec.as_str()) {
                 return Err(crate::scaffolded::Scaffolded::validation(format!(
                     "KeyPairSpec {} is not a supported data key pair spec; it must be one \
                      of {}.",
                     input.key_pair_spec,
                     DATA_KEY_PAIR_SPEC_VALUES.join(", ")
                 )));
-            };
+            }
 
             // "The request was rejected because the DryRun parameter was specified"
             // (`smithy_query(query="doc",shape="DryRunOperationException")`): a dry run
@@ -495,22 +361,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
                 );
             }
-
-            algorithm
-        };
+        }
 
         // "GenerateDataKeyPairWithoutPlaintext returns a unique data key pair for each
         // request. The bytes in the key are not related to the caller or KMS key that
         // is used to encrypt the private key" (the operation doc), so the pair is
         // generated per request and every call yields a different one.
         //
-        // Generating one is CPU work — bounded by the table above, whose largest
-        // entry is a 4096-bit modulus, but still hundreds of milliseconds of it — so
-        // it runs on the blocking pool with the state lock RELEASED:
+        // Generating one is CPU work — bounded by the `DataKeyPairSpec` catalog, whose
+        // largest entry is a 4096-bit modulus, but still hundreds of milliseconds of
+        // it — so it runs on the blocking pool with the state lock RELEASED:
         // `spawn_blocking(..).await` is a real await point, so one key pair cannot
         // starve the worker that serves health checks and every other request, and no
         // other request waits on the store while it runs.
-        let generated = ::tokio::task::spawn_blocking(move || generate(algorithm)).await;
+        let key_pair_spec = input.key_pair_spec.clone();
+        let generated =
+            ::tokio::task::spawn_blocking(move || crate::state::generate_key_pair(&key_pair_spec))
+                .await;
         let pair = match generated {
             Ok(Some(pair)) => pair,
             Ok(None) => return Err(internal("a data key pair could not be generated")),
@@ -536,9 +403,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The private key leaves this handler ONLY sealed: the response models no
         // plaintext private key member, and the bytes are dropped with `pair` when
         // `handle` returns.
-        let Some(private_key_ciphertext_blob) =
-            crate::state::seal(key, &pair.private_key, input.encryption_context.as_ref())
-        else {
+        let Some(private_key_ciphertext_blob) = crate::state::seal(
+            key,
+            &pair.private_key_pkcs8,
+            input.encryption_context.as_ref(),
+        ) else {
             return Err(internal("the private key could not be encrypted"));
         };
         // "The Amazon Resource Name (key ARN) of the KMS key that encrypted the
@@ -555,7 +424,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(GenerateDataKeyPairWithoutPlaintextOutput {
             private_key_ciphertext_blob: Some(private_key_ciphertext_blob),
-            public_key: Some(pair.public_key),
+            public_key: Some(pair.public_key_spki),
             key_id: Some(key_arn),
             // "The type of data key pair that was generated", which is the type the
             // request asked for.

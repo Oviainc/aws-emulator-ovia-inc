@@ -220,3 +220,5 @@ mod delete_gateway_response;
 mod update_usage_plan;
 #[path = "all/base_path_mapping_private_domain.rs"]
 mod base_path_mapping_private_domain;
+#[path = "all/test_invoke_method_no_integration.rs"]
+mod test_invoke_method_no_integration;

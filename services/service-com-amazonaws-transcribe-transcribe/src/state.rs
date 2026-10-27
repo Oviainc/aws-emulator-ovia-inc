@@ -936,6 +936,25 @@ pub fn not_found_message(kind: &str) -> String {
     )
 }
 
+/// How this service refuses a request that would APPLY a custom resource whose build
+/// has not finished successfully: the resource of `kind` named `name` is in `state`,
+/// and only [`VOCABULARY_STATE_READY`] is a state its terms can be applied in ("If the
+/// state is READY, you can use the custom vocabulary" — the model's own doc for
+/// `VocabularyState`).
+///
+/// Worded like the state refusals the deletes of every family carry ("... is in the
+/// {state} state and can't be deleted. Wait until ..."), because it is the same kind of
+/// refusal: a resource whose processing has not produced something usable. The
+/// variable parts are the name the request asked for and the state this emulator holds
+/// the resource in.
+pub fn resource_not_usable_message(kind: &str, name: &str, state: &str) -> String {
+    format!(
+        "The custom {kind} {name} is in the {state} state and can't be used. A custom \
+         {kind} can only be used when its state is {VOCABULARY_STATE_READY}. Check the \
+         state of the {kind} and try your request again."
+    )
+}
+
 /// How this service words "that name is already taken", for a resource of `kind`.
 ///
 /// Same shape of text as [`not_found_message`], and the same reason for naming only
@@ -1690,7 +1709,9 @@ impl ComAmazonawsTranscribeTranscribeState {
     }
 
     /// The refusal for the first resource `references` names that the Region this
-    /// request is served in does not hold, or `None` when every named one is held.
+    /// request is served in cannot apply — because it holds no such resource at all, or
+    /// because the one it holds is not in a state its terms can be applied in — or
+    /// `None` when every named one is held and usable.
     ///
     /// A job's settings may NAME a custom vocabulary, custom vocabulary filter or
     /// custom language model, and a name no create of that family ever recorded IN THIS
@@ -1701,15 +1722,70 @@ impl ComAmazonawsTranscribeTranscribeState {
     /// there, or `None` where the request left the member out; the families are distinct
     /// stores, so a resource of one family never stands in for another's, and so is each
     /// Region, so a resource of another Region never stands in either.
+    ///
+    /// A resource that IS held must also be one a job can apply: a custom vocabulary
+    /// carries a `VocabularyState` precisely so that only a build that finished
+    /// successfully is usable ("If the state is READY, you can use the custom
+    /// vocabulary"), so one still being built or one whose build failed is refused with
+    /// [`resource_not_usable_message`] — see [`Self::unusable_reference_state`] for
+    /// which families carry such a state here. Takes `&mut self` and `now` for that
+    /// reason: the state compared against is the one the CLOCK already owes the
+    /// resource, materialised first exactly as every reader of that family materialises
+    /// it, so a build that fell due before this request is not mistaken for one still
+    /// running.
     pub fn unheld_reference_error(
-        &self,
+        &mut self,
         region: &str,
+        now: SystemTime,
         references: &[(ResourceFamily, Option<&str>)],
     ) -> Option<String> {
-        references.iter().find_map(|(family, name)| {
-            let name = (*name)?;
-            (!self.holds(*family, region, name)).then(|| not_found_message(family.kind()))
-        })
+        for (family, name) in references {
+            let Some(name) = *name else {
+                continue;
+            };
+            if !self.holds(*family, region, name) {
+                return Some(not_found_message(family.kind()));
+            }
+            if let Some(state) = self.unusable_reference_state(*family, region, name, now) {
+                return Some(resource_not_usable_message(family.kind(), name, &state));
+            }
+        }
+        None
+    }
+
+    /// The state the resource of `family` named `name` is in when that state is NOT one
+    /// a job may apply the resource in, and `None` when it is usable — or when this
+    /// family has no such state here.
+    ///
+    /// The custom vocabulary family is the one whose records reach the usable state the
+    /// model defines, [`VOCABULARY_STATE_READY`], and whose records a request can
+    /// therefore find in a state that is not it: `PENDING` while the build runs, or
+    /// `FAILED` once it has not produced any terms. The other families a settings
+    /// reference can name are checked for existence only:
+    ///
+    /// * a custom vocabulary FILTER models no processing state anywhere (see
+    ///   [`VocabularyFilterRecord`]), so a held filter is always applicable;
+    /// * a custom MEDICAL vocabulary ([`MedicalVocabularyRecord`]) and a custom
+    ///   LANGUAGE model ([`LanguageModelRecord`]) are built only from a location this
+    ///   emulator reads nothing from, so no record of either family ever reaches a
+    ///   usable state. Refusing every job that names one would refuse a request the real
+    ///   service serves — a limitation of this emulator's build, not an error in the
+    ///   caller's request — so a held resource of those families is applied as named;
+    /// * the job families are never the target of a settings reference.
+    fn unusable_reference_state(
+        &mut self,
+        family: ResourceFamily,
+        region: &str,
+        name: &str,
+        now: SystemTime,
+    ) -> Option<String> {
+        match family {
+            ResourceFamily::Vocabulary => {
+                let record = self.vocabulary_mut(region, name, now)?;
+                (record.state != VOCABULARY_STATE_READY).then(|| record.state.clone())
+            }
+            _ => None,
+        }
     }
 
     /// The tag set of the resource `resource` names to a request served in `region`, or

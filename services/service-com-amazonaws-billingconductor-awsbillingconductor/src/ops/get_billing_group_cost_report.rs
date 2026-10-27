@@ -95,32 +95,12 @@ use std::collections::BTreeMap;
 /// `smithy_query(query="operation",operation="GetBillingGroupCostReport")`).
 const MAX_PAGE_SIZE: i32 = 300;
 
-/// The actual Amazon Web Services charges this emulator has recorded for a billing
-/// group's accounts: NONE.
-///
-/// `AWSCost` is "the actual Amazon Web Services charges for the billing group" — the
-/// metered usage of its member accounts. Nothing in this service's surface reports usage
-/// into the store (its writes create billing groups, pricing plans, pricing rules and
-/// custom line items), and no other recorded state prices usage either, so a group's
-/// actual charges are zero. Zero is REPORTED as the amount it is rather than withheld or
-/// invented, and it is what the pro forma cost — the custom line items the caller really
-/// did create — is measured against.
-const AWS_COST: f64 = 0.0;
-
 /// `GroupByAttributeName.BILLING_PERIOD`: break the summary down by billing period.
 const GROUP_BY_BILLING_PERIOD: &str = "BILLING_PERIOD";
 
 /// `GroupByAttributeName.PRODUCT_NAME`: break the summary down by the product the
 /// charges are presented under.
 const GROUP_BY_PRODUCT_NAME: &str = "PRODUCT_NAME";
-
-/// How many decimal places a reported amount keeps.
-///
-/// The reported members are strings carrying a decimal amount, summed and multiplied out
-/// of the stored `double` charge values, so the sum carries binary floating-point residue
-/// that is not part of any amount. Rounding to this many places drops it while keeping
-/// far more precision than the minor unit of either currency this service bills in.
-const REPORTED_DECIMALS: i32 = 6;
 
 /// One row of the margin summary: the charges of one group of the requested breakdown.
 #[derive(Debug, Default)]
@@ -129,16 +109,6 @@ struct ReportRow {
     attributes: Vec<Attribute>,
     /// The pro forma charges of the billing periods and products this row covers.
     proforma_cost: f64,
-}
-
-/// An amount as the reported `AWSCost` / `ProformaCost` / `Margin` / `MarginPercentage`
-/// strings carry one: a decimal rounded to [`REPORTED_DECIMALS`] places.
-fn reported_amount(value: f64) -> String {
-    let scale = 10f64.powi(REPORTED_DECIMALS);
-    // Adding zero normalises a negative zero (a credit cancelling a fee) to the one
-    // amount it is, so no row reports `-0`.
-    let rounded = (value * scale).round() / scale + 0.0;
-    format!("{rounded}")
 }
 
 /// The cursor key of one row — what orders the rows and what a `NextToken` names.
@@ -349,28 +319,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // The margin a billing group earns on a group of charges is what it is charged for
-        // them (pro forma) less what they actually cost (AWS), and the margin percentage is
-        // that margin as a share of the pro forma amount — undefined, and so reported as
-        // zero, where there is no pro forma amount to take a share of.
+        // The four amounts of a row are the margin summary of its charges, computed where
+        // both of this service's cost reports share it
+        // ([`crate::state::MarginSummary`]).
         let currency = crate::state::partition_currency_code(&group.arn).to_string();
         let results: Vec<(String, BillingGroupCostReportResultElement)> = rows
             .into_iter()
             .map(|(key, row)| {
-                let margin = row.proforma_cost - AWS_COST;
-                let margin_percentage = if row.proforma_cost == 0.0 {
-                    0.0
-                } else {
-                    margin / row.proforma_cost * 100.0
-                };
+                let summary = crate::state::MarginSummary::of_proforma(row.proforma_cost);
                 (
                     key,
                     BillingGroupCostReportResultElement {
                         arn: Some(group.arn.clone()),
-                        aws_cost: Some(reported_amount(AWS_COST)),
-                        proforma_cost: Some(reported_amount(row.proforma_cost)),
-                        margin: Some(reported_amount(margin)),
-                        margin_percentage: Some(reported_amount(margin_percentage)),
+                        aws_cost: Some(crate::state::reported_amount(summary.aws_cost)),
+                        proforma_cost: Some(crate::state::reported_amount(summary.proforma_cost)),
+                        margin: Some(crate::state::reported_amount(summary.margin)),
+                        margin_percentage: Some(crate::state::reported_amount(
+                            summary.margin_percentage,
+                        )),
                         currency: Some(currency.clone()),
                         // A request that asked for no breakdown gets no attributes: an
                         // empty list would claim a breakdown by nothing.

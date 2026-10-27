@@ -51,6 +51,8 @@ mod db_parameter_group_provisioning;
 mod db_parameter_groups;
 #[path = "all/db_parameters.rs"]
 mod db_parameters;
+#[path = "all/db_security_group_ingress.rs"]
+mod db_security_group_ingress;
 #[path = "all/db_security_groups.rs"]
 mod db_security_groups;
 #[path = "all/db_shard_group_primary_cluster.rs"]

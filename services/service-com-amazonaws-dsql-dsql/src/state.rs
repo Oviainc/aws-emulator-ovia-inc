@@ -23,7 +23,11 @@
 //! page walk ([`PageBounds`]) lives here for the same reason: the cursor, the
 //! `maxResults` bounds and the rule for when a `nextToken` is issued are one
 //! implementation, parameterised by each operation's modelled default and the
-//! summary it builds.
+//! summary it builds. The answer a served delete keeps for its retry
+//! ([`RecordedDelete`]) lives here for the same reason: both deletes record and
+//! read back the same members, so the encoding and the refusal of an incomplete
+//! record are one implementation, parameterised by the output each handler
+//! builds.
 //!
 //! The tagging operations address a resource by a caller-supplied `resourceArn`
 //! rather than by identifier, so the read of that ARN ([`parse_resource_arn`]), the
@@ -1880,16 +1884,16 @@ pub const STATUS_MEMBER: &str = "status";
 /// ([`RecordedCall::answering`]).
 pub const POLICY_VERSION_MEMBER: &str = "policyVersion";
 
-/// The name a cluster's ARN member carries on the wire
-/// (`smithy_query(query="operation", operation="DeleteCluster")`: a `@required`
-/// `arn`), and so the key a recorded call keeps that answer under
-/// ([`RecordedCall::answering`]).
+/// The name a retired resource's ARN member carries on the wire
+/// (`smithy_query(query="operation", operation="DeleteCluster,DeleteStream")`: a
+/// `@required` `arn` on each), and so the key a recorded call keeps that answer
+/// under ([`RecordedCall::answering`]).
 pub const ARN_MEMBER: &str = "arn";
 
-/// The name a cluster's creation-time member carries on the wire
-/// (`smithy_query(query="operation", operation="DeleteCluster")`: a `@required`
-/// `creationTime`), and so the key a recorded call keeps that answer under
-/// ([`RecordedCall::answering`], through [`encode_instant`]).
+/// The name a retired resource's creation-time member carries on the wire
+/// (`smithy_query(query="operation", operation="DeleteCluster,DeleteStream")`: a
+/// `@required` `creationTime` on each), and so the key a recorded call keeps
+/// that answer under ([`RecordedCall::answering`], through [`encode_instant`]).
 pub const CREATION_TIME_MEMBER: &str = "creationTime";
 
 /// How a [`RecordedCall`] keeps an instant it answered: whole nanoseconds since
@@ -1914,6 +1918,53 @@ pub fn decode_instant(recorded: &str) -> Option<SystemTime> {
     let seconds = u64::try_from(nanos / 1_000_000_000).ok()?;
     let subsec = (nanos % 1_000_000_000) as u32;
     UNIX_EPOCH.checked_add(Duration::new(seconds, subsec))
+}
+
+/// What a served delete answered, as its `clientToken` ledger keeps it.
+///
+/// A delete's answer cannot be re-derived when its retry arrives: the resource
+/// the call retired is by then on its way out or gone, and neither its current
+/// status nor its absence is what that request answered. So the three members
+/// every delete of this service answers beside the retired resource's own
+/// identifier — [`ARN_MEMBER`], [`STATUS_MEMBER`] and [`CREATION_TIME_MEMBER`]
+/// — are kept on the record, and this is the one codec that writes and reads
+/// them: [`Self::into_record`] on the call that serves the delete,
+/// [`Self::from_record`] on its retry. Each delete handler keeps only the shape
+/// of its own output, which names the resource (and, for a nested one, its
+/// parent) its own way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedDelete {
+    /// The resource that call retired, as [`RecordedCall::resource`] names it.
+    pub resource: String,
+    /// The ARN the call answered.
+    pub arn: String,
+    /// The status the call answered.
+    pub status: String,
+    /// The creation time the call answered.
+    pub creation_time: SystemTime,
+}
+
+impl RecordedDelete {
+    /// This answer as the ledger stores it. Every member is kept, because the
+    /// resource this record describes is on its way out of the store.
+    pub fn into_record(self) -> RecordedCall {
+        RecordedCall::new(&self.resource)
+            .answering(STATUS_MEMBER, &self.status)
+            .answering(ARN_MEMBER, &self.arn)
+            .answering(CREATION_TIME_MEMBER, &encode_instant(self.creation_time))
+    }
+
+    /// The answer `recorded` holds, or `None` when it is missing any member a
+    /// served delete records — a record a handler has to refuse over rather
+    /// than serve an empty member from, since a delete always records all three.
+    pub fn from_record(recorded: &RecordedCall) -> Option<Self> {
+        Some(Self {
+            resource: recorded.resource.clone(),
+            arn: recorded.answered(ARN_MEMBER)?.to_string(),
+            status: recorded.answered(STATUS_MEMBER)?.to_string(),
+            creation_time: decode_instant(recorded.answered(CREATION_TIME_MEMBER)?)?,
+        })
+    }
 }
 
 /// The modelled `ResourceNotFoundException` for a cluster this service does not

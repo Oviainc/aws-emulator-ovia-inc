@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutBucketInventoryConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutBucketInventoryConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: records an S3 Inventory configuration on an existing bucket under the
+//! inventory id the request identifies it by, replacing in full whatever configuration the
+//! bucket carried under THAT id and leaving every other id untouched. The payload IS the
+//! configuration, so what the request names becomes the stored configuration — the
+//! destination, the schedule, the filter and the optional fields it asked for — and
+//! `GetBucketInventoryConfiguration` reports it back. Refused before anything is written
+//! when the request is not one S3 records: an id outside the published length, an id that
+//! disagrees with the payload's own `Id`, or a member naming a value outside its enum's
+//! published set (`InvalidArgument`), and a NEW configuration past
+//! [`crate::state::MAX_INVENTORY_CONFIGURATIONS_PER_BUCKET`] (`TooManyConfigurations`).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutBucketInventoryConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The read side is `GetBucketInventoryConfiguration`, implemented in the same change so a
+//! put can be read back; `DeleteBucketInventoryConfiguration` and
+//! `ListBucketInventoryConfigurations` are still the scaffold's 501 and are their own stub
+//! issues.
 //!
 //! ## Shape of an operation
 //!
@@ -138,14 +144,21 @@ impl ::aws_smithy_schema::serde::SerializableStruct for PutBucketInventoryConfig
     fn serialize_members(&self, _s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer) -> Result<(), ::aws_smithy_schema::serde::SerdeError> { Ok(()) }
 }
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `PutBucketInventoryConfigurationError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#PutBucketInventoryConfiguration")]
+// The operation's MODELED errors, widened by `NoSuchBucket` for the reason
+// `PutBucketAnalyticsConfiguration` widens it: the model's error list for this operation is
+// empty (`smithy_query(query="operation",operation="PutBucketInventoryConfiguration")`
+// reports `errors: []`), but `Bucket` is an @httpLabel, so a request can name a bucket that
+// does not exist and AWS answers the service-wide `NoSuchBucket` ("The specified bucket does
+// not exist", `httpError 404`). `extra_errors` widens the set with that shape, which the
+// SERVICE models, so this handler answers the same 404 every other bucket-scoped operation
+// does rather than inventing a second rule.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#PutBucketInventoryConfiguration",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum PutBucketInventoryConfigurationErrorModeled {
+    NoSuchBucket(NoSuchBucket),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -199,18 +212,165 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutBucketInventoryConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutBucketInventoryConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutBucketInventoryConfiguration"))
+        // Everything this write needs is in its deserialized input: the expected owner, the
+        // id and the configuration travel as members, not as raw headers.
+        let _ = ctx;
+
+        // "The account ID of the expected bucket owner. If the account ID that you provide
+        // does not match the actual owner of the bucket, the request fails with the HTTP
+        // status code 403 Forbidden (access denied)"
+        // (`PutBucketInventoryConfigurationRequest$ExpectedBucketOwner`), judged the way
+        // every other bucket-scoped operation in this crate judges it: this emulator serves
+        // one account, so that account owns every bucket it holds.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                ACCESS_DENIED_STATUS,
+                "Access Denied",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The store is unreachable only when this service is mounted on an engine that
+            // is not the shared `InMemoryEngine`; nothing can then be persisted, and this
+            // operation models no server-fault error to say so, so the scaffold's 501
+            // carries "this emulator cannot serve it" rather than a false success.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutBucketInventoryConfiguration",
+            ));
+        };
+
+        // Every refusal below is decided BEFORE anything is written, so a refused put leaves
+        // the bucket's stored configurations exactly as they were; and the bucket is looked
+        // up FIRST, so a request naming a bucket this emulator does not hold answers that
+        // rather than reporting whatever is wrong with a configuration the bucket could
+        // never have carried.
+        let mut store = state.lock();
+        if store.bucket(&input.bucket).is_none() {
+            return Err(
+                PutBucketInventoryConfigurationErrorModeled::NoSuchBucket(NoSuchBucket {}).into(),
+            );
+        }
+
+        // An id is what the configuration is addressable by, bounded by the length every
+        // bucket configuration id shares: a value outside it identifies no configuration the
+        // service can record, which is what this operation's own `InvalidArgument` reports.
+        if !crate::state::is_valid_inventory_id(&input.id) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_ARGUMENT_CODE,
+                crate::state::INVALID_ARGUMENT_STATUS,
+                format!(
+                    "Id {:?} is not an inventory configuration id: between 1 and {} characters",
+                    input.id,
+                    crate::state::MAX_INVENTORY_ID_CHARS
+                ),
+            ));
+        }
+
+        let configuration = &input.inventory_configuration;
+
+        // The configuration a put adds is the one "identified by the inventory ID" and the
+        // `Id` that "identifies the inventory configuration" in the payload name ONE
+        // configuration, so two different values name no configuration the service can
+        // record.
+        if configuration.id != input.id {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_ARGUMENT_CODE,
+                crate::state::INVALID_ARGUMENT_STATUS,
+                format!(
+                    "InventoryConfiguration.Id {:?} does not identify the inventory \
+                     configuration the request names, {:?}",
+                    configuration.id, input.id
+                ),
+            ));
+        }
+
+        // Each of these members is an ENUM, so a value outside its published set describes a
+        // configuration the service cannot apply. The boundary validator refuses such a
+        // value before this handler runs, so these checks are what keep the handler TOTAL
+        // rather than a second statement of the bound — the reading
+        // `PutBucketIntelligentTieringConfiguration` gives its own status check. The sets
+        // come from the crate's own generated catalogs, so they cannot drift from the model.
+        for (member, value, published) in [
+            (
+                "InventoryConfiguration.IncludedObjectVersions",
+                configuration.included_object_versions.as_str(),
+                INVENTORY_INCLUDED_OBJECT_VERSIONS_VALUES,
+            ),
+            (
+                "InventoryConfiguration.Schedule.Frequency",
+                configuration.schedule.frequency.as_str(),
+                INVENTORY_FREQUENCY_VALUES,
+            ),
+            (
+                "InventoryConfiguration.Destination.S3BucketDestination.Format",
+                configuration.destination.s3_bucket_destination.format.as_str(),
+                INVENTORY_FORMAT_VALUES,
+            ),
+        ] {
+            if !published.contains(&value) {
+                return Err(invalid_enum_value(member, value, published));
+            }
+        }
+        for field in configuration.optional_fields.iter().flatten() {
+            if !INVENTORY_OPTIONAL_FIELD_VALUES.contains(&field.as_str()) {
+                return Err(invalid_enum_value(
+                    "InventoryConfiguration.OptionalFields",
+                    field,
+                    INVENTORY_OPTIONAL_FIELD_VALUES,
+                ));
+            }
+        }
+
+        let Some(bucket) = store.bucket_mut(&input.bucket) else {
+            // Unreachable: the lookup above ran under this same guard.
+            return Err(
+                PutBucketInventoryConfigurationErrorModeled::NoSuchBucket(NoSuchBucket {}).into(),
+            );
+        };
+
+        // The payload is the whole configuration, so the stored container is exactly the one
+        // this request carried, under the id it names: a second put under the same id
+        // replaces it rather than merging into it.
+        match bucket.put_inventory_configuration(input.id, input.inventory_configuration) {
+            crate::state::BucketConfigurationWrite::Stored
+            | crate::state::BucketConfigurationWrite::Replaced => Ok(
+                // `Unit` output: success is the modelled 200 and an empty body.
+                PutBucketInventoryConfigurationOutput,
+            ),
+            // "You are attempting to create a new configuration but have already reached the
+            // 1,000-configuration limit" — this operation's own special error, with the
+            // status it documents. A REPLACEMENT never reaches here: it creates no new
+            // configuration.
+            crate::state::BucketConfigurationWrite::QuotaReached => {
+                Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::TOO_MANY_CONFIGURATIONS_CODE,
+                    crate::state::TOO_MANY_CONFIGURATIONS_STATUS,
+                    crate::state::TOO_MANY_CONFIGURATIONS_MESSAGE,
+                ))
+            }
+        }
     }
 }
+
+/// The refusal for a member whose value is not one its enum publishes, naming the member,
+/// the value and the set it had to come from — what a caller has to fix the request from.
+fn invalid_enum_value(
+    member: &str,
+    value: &str,
+    published: &[&str],
+) -> PutBucketInventoryConfigurationError {
+    crate::scaffolded::Scaffolded::unmodeled(
+        crate::state::INVALID_ARGUMENT_CODE,
+        crate::state::INVALID_ARGUMENT_STATUS,
+        format!("{member} must name one of {published:?}, got {value:?}"),
+    )
+}
+
+/// The status `ExpectedBucketOwner` names for a mismatch: "the request fails with the HTTP
+/// status code 403 Forbidden (access denied)".
+const ACCESS_DENIED_STATUS: u16 = 403;

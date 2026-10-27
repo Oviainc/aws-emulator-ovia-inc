@@ -3892,6 +3892,17 @@ pub const MAX_ARTIFACTS_PER_ACTION: usize = 10;
 /// The `ActionCategory` of an action that brings a revision INTO the pipeline.
 pub const CATEGORY_SOURCE: &str = "Source";
 
+/// The message `InvalidStructureException` carries when a pipeline's FIRST stage is not
+/// made up exclusively of `Source` actions.
+///
+/// A FIXED sentence: this defect class is a property of the declaration as a whole (its
+/// first stage is not a source stage), so the refusal states the law and interpolates
+/// NOTHING — no stage name, action name, category, count or index — exactly as the
+/// service words it. Shared by every operation that takes a `PipelineDeclaration`, so
+/// `CreatePipeline` and `UpdatePipeline` cannot word one law two ways.
+pub const FIRST_STAGE_NOT_SOURCE_ONLY_MESSAGE: &str =
+    "Pipeline should start with a stage that only contains source actions";
+
 /// The message `PipelineNotFoundException` carries, for every operation that raises it.
 ///
 /// The text is built from the request and the caller's account — the lookup is scoped
@@ -4050,8 +4061,10 @@ pub fn arn_resource(resource_arn: &str) -> String {
 /// * an `inputArtifacts` entry must name an artifact some EARLIER action outputs (an
 ///   earlier stage, or the same stage at a lower `runOrder`): an action cannot consume
 ///   an artifact nothing produces, and two actions cannot output the same name.
-/// * the first stage is the pipeline's source stage: it carries at least one `Source`
-///   action and nothing else, and no later stage carries a `Source` action.
+/// * the first stage is the pipeline's source stage: every action it carries is a
+///   `Source` action, and no later stage carries one. A first stage that is not a
+///   source stage is refused with [`FIRST_STAGE_NOT_SOURCE_ONLY_MESSAGE`], the fixed
+///   sentence that defect class carries.
 /// * a declaration that states `pipelineType` `V1` cannot carry the V2-only members
 ///   `variables` or `triggers` — `PipelineDeclaration$pipelineType` documents that
 ///   "including V2 parameters … in the pipeline JSON" is what makes a pipeline V2, so
@@ -4169,31 +4182,22 @@ pub fn validate_declaration(
         )));
     }
 
-    // The first stage is the source stage: it carries at least one Source action and
-    // nothing else, and no later stage carries one.
+    // The first stage is the source stage: EVERY action it carries is a Source action
+    // (the stage is already known to carry at least one, by the check above), and no
+    // later stage carries one. One check for the whole first-stage law, so a first stage
+    // carrying no Source action and one mixing a Source action with a non-source action
+    // are refused identically — they are the same defect, stated by the same fixed
+    // sentence.
     let (first, rest) = declaration.stages.split_at(1);
     let first = &first[0];
     if !first
         .actions
         .iter()
-        .any(|action| action.action_type_id.category == CATEGORY_SOURCE)
+        .all(|action| action.action_type_id.category == CATEGORY_SOURCE)
     {
-        return Err(DeclarationProblem::Structure(format!(
-            "the first stage of a pipeline must contain at least one {CATEGORY_SOURCE} \
-             action, but stage {} contains none",
-            first.name
-        )));
-    }
-    if let Some(action) = first
-        .actions
-        .iter()
-        .find(|action| action.action_type_id.category != CATEGORY_SOURCE)
-    {
-        return Err(DeclarationProblem::Structure(format!(
-            "the first stage of a pipeline can contain only {CATEGORY_SOURCE} actions, \
-             but action {} in stage {} is a {} action",
-            action.name, first.name, action.action_type_id.category
-        )));
+        return Err(DeclarationProblem::Structure(
+            FIRST_STAGE_NOT_SOURCE_ONLY_MESSAGE.to_string(),
+        ));
     }
     for stage in rest {
         if let Some(action) = stage

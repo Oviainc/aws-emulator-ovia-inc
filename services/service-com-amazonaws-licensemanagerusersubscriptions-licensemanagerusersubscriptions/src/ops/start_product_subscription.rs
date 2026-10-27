@@ -195,11 +195,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.product.clone(),
             input.username.clone(),
         );
+        // The triple is occupied by whatever subscription state holds for it, including
+        // one still being torn down after a stop: the user's subscription to this product
+        // can be created again only once that teardown has completed.
         if let Some(existing) = state.product_user_index.get(&index_key) {
             return Err(StartProductSubscriptionErrorModeled::ConflictException(
                 ConflictException {
                     message: Some(format!(
-                        "user {} is already subscribed to product {} as {existing}",
+                        "user {} already has a subscription to product {} as {existing}",
                         input.username, input.product
                     )),
                 },
@@ -241,6 +244,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             domain: input.domain.clone(),
             subscribed_at: now,
             unsubscribed_at: None,
+            unsubscribed_due_at: None,
         };
 
         if let Some(tags) = input.tags.as_ref() {
