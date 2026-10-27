@@ -29,6 +29,17 @@ use smithy_server_runtime::{Violation, ViolationKind};
 /// is stored on the record; nothing ever sleeps for it.
 pub const VERIFICATION_SETTLE: Duration = Duration::from_millis(500);
 
+/// How long after a custom MAIL FROM domain is configured the search for that
+/// domain's MX record is reported as having found it.
+///
+/// Real SES reports `SUCCESS` only once it observes something it cannot observe
+/// here (the MX record the caller is told to publish appearing in the MAIL FROM
+/// domain's DNS), so the span is CHOSEN, not documented: it is long enough that a
+/// caller which reads straight back still sees the transient `PENDING` state the
+/// configuration starts in, and the behaviour that goes with it. The due instant is
+/// stored on the record; nothing ever sleeps for it.
+pub const MAIL_FROM_MX_SETTLE: Duration = Duration::from_secs(3);
+
 /// How long after a certificate association is created its `PROVISIONING` ->
 /// `ACTIVE` transition becomes due, and how long after it is removed its
 /// `DEPROVISIONING` clean-up is due.
@@ -1036,8 +1047,10 @@ impl IdentityKind {
     }
 }
 
-/// The value set shared by the model's `VerificationStatus` and `DkimStatus`
-/// enums. Only the states this emulator can reach are represented.
+/// The value set shared by the model's `VerificationStatus`, `DkimStatus` and
+/// `MailFromDomainStatus` enums. Only the states this emulator can reach are
+/// represented, and `NOT_STARTED` is not one of `MailFromDomainStatus`'s values, so
+/// no MAIL FROM record carries it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SesStatus {
     /// The process has not been initiated for this identity.
@@ -1129,6 +1142,61 @@ impl DkimState {
             tokens: Vec::new(),
             origin: DkimOrigin::AwsSes,
             signing_key_length: None,
+        }
+    }
+}
+
+/// The `BehaviorOnMxFailure` a custom MAIL FROM configuration takes when the
+/// request that set it named none: SES then sends the mail using its own domain
+/// rather than refusing it.
+pub const BEHAVIOR_ON_MX_FAILURE_DEFAULT: &str = "USE_DEFAULT_VALUE";
+
+/// The custom MAIL FROM configuration stored for one identity.
+#[derive(Debug, Clone)]
+pub struct MailFromState {
+    /// `MailFromDomain`, as the request that configured it spelled the domain.
+    pub domain: String,
+    /// `MailFromDomainStatus`: where the search for the domain's MX record stands.
+    pub status: SesStatus,
+    /// `BehaviorOnMxFailure`: what sending does while the configuration is not in
+    /// the `SUCCESS` state.
+    pub behavior_on_mx_failure: String,
+    /// When the `PENDING` -> `SUCCESS` transition falls due.
+    pub mx_lookup_due_at: SystemTime,
+}
+
+impl MailFromState {
+    /// A freshly configured custom MAIL FROM domain: "PENDING - Amazon SES hasn't
+    /// started searching for the MX record yet", so the configuration starts there
+    /// and the search's outcome falls due [`MAIL_FROM_MX_SETTLE`] later.
+    pub fn new(domain: &str, behavior_on_mx_failure: String, now: SystemTime) -> Self {
+        Self {
+            domain: domain.to_string(),
+            status: SesStatus::Pending,
+            behavior_on_mx_failure,
+            mx_lookup_due_at: now.checked_add(MAIL_FROM_MX_SETTLE).unwrap_or(now),
+        }
+    }
+
+    /// Apply the transition the clock owes this configuration at `now`.
+    ///
+    /// SES reports `SUCCESS` once it "detected the required MX record for the MAIL
+    /// FROM domain". Nothing here resolves DNS, so the emulator takes the caller at
+    /// its word that the record it was told to publish is published — the same
+    /// assumption the identity's own verification and its Easy DKIM tokens are
+    /// settled under.
+    pub fn settle(&mut self, now: SystemTime) {
+        if self.status == SesStatus::Pending && now >= self.mx_lookup_due_at {
+            self.status = SesStatus::Success;
+        }
+    }
+
+    /// The modelled `MailFromAttributes` view of this record.
+    pub fn view(&self) -> crate::ops::types::MailFromAttributes {
+        crate::ops::types::MailFromAttributes {
+            mail_from_domain: self.domain.clone(),
+            mail_from_domain_status: self.status.as_str().to_string(),
+            behavior_on_mx_failure: self.behavior_on_mx_failure.clone(),
         }
     }
 }
@@ -1278,6 +1346,8 @@ pub struct EmailIdentityRecord {
     pub dkim: DkimState,
     /// The configuration set used by default when sending from this identity.
     pub configuration_set_name: Option<String>,
+    /// The custom MAIL FROM configuration, when one is enabled for this identity.
+    pub mail_from: Option<MailFromState>,
     /// Tags, in the order they were supplied.
     pub tags: Vec<(String, String)>,
     /// Sending-authorization policies, keyed by policy name.
@@ -1310,6 +1380,9 @@ impl EmailIdentityRecord {
             feedback_forwarding: true,
             dkim,
             configuration_set_name: None,
+            // A new identity sends with SES's own MAIL FROM domain until
+            // `PutEmailIdentityMailFromAttributes` configures a custom one.
+            mail_from: None,
             tags: Vec::new(),
             policies: BTreeMap::new(),
             created_at: now,
@@ -1362,7 +1435,8 @@ impl EmailIdentityRecord {
     }
 
     /// Apply the transitions the clock owes this identity at `now`: its verification
-    /// transition, and each certificate association's own.
+    /// transition, its custom MAIL FROM domain's MX search, and each certificate
+    /// association's own.
     pub fn settle(&mut self, now: SystemTime) {
         if self.verification_status == SesStatus::Pending && now >= self.verification_due_at {
             self.verification_status = SesStatus::Success;
@@ -1371,8 +1445,31 @@ impl EmailIdentityRecord {
                 self.dkim.status = SesStatus::Success;
             }
         }
+        if let Some(mail_from) = self.mail_from.as_mut() {
+            mail_from.settle(now);
+        }
         self.certificates
             .retain(|_, certificate| certificate.settle(now));
+    }
+
+    /// Configure `domain` as this identity's custom MAIL FROM domain.
+    ///
+    /// Setting a domain starts the search for that domain's MX record, so the
+    /// configuration enters `PENDING`; re-writing the domain already configured
+    /// starts no new search, which is what makes the same request sent twice change
+    /// nothing beyond the behaviour it carries.
+    pub fn set_mail_from(&mut self, domain: &str, behavior_on_mx_failure: String, now: SystemTime) {
+        match self.mail_from.as_mut() {
+            Some(mail_from) if domain_key(&mail_from.domain) == domain_key(domain) => {
+                // The latest request's spelling is what every read reports, as it is
+                // for every other value a request carries.
+                mail_from.domain = domain.to_string();
+                mail_from.behavior_on_mx_failure = behavior_on_mx_failure;
+            }
+            _ => {
+                self.mail_from = Some(MailFromState::new(domain, behavior_on_mx_failure, now));
+            }
+        }
     }
 }
 
@@ -3170,9 +3267,91 @@ pub fn email_identity_not_found(identity: &str) -> String {
 pub fn identity_key(identity: &str) -> String {
     let identity = addr_spec(identity);
     match identity.rsplit_once('@') {
-        Some((local, domain)) => format!("{local}@{}", domain.to_lowercase()),
-        None => identity.to_lowercase(),
+        Some((local, domain)) => format!("{local}@{}", domain_key(domain)),
+        None => domain_key(identity),
     }
+}
+
+/// The key a domain name is compared under.
+///
+/// DNS compares labels without regard to case, so one domain written in any case
+/// names the same thing, and nothing else about the value is normalised: a value
+/// carrying what a domain name cannot carry — surrounding whitespace, say — is
+/// still a different string from every domain, so it matches none of them. The value
+/// kept on a record, and reported by every response, is the one the request spelled.
+pub fn domain_key(domain: &str) -> String {
+    domain.to_lowercase()
+}
+
+/// The domain an email identity belongs to: the domain part of an address, or the
+/// whole value of a domain identity, as the identity spells it.
+///
+/// Compare two of them with [`domain_key`]; this is the value a response reports.
+pub fn identity_domain(identity: &str) -> &str {
+    let identity = addr_spec(identity);
+    match identity.rsplit_once('@') {
+        Some((_, domain)) => domain,
+        None => identity,
+    }
+}
+
+/// Whether `candidate` is `domain` itself or a domain under it.
+///
+/// Both arguments are [`domain_key`]s, so the names compare the way DNS compares
+/// them. `example.com` covers `example.com` and `any.subdomain.of.it`, and nothing
+/// else — not `notexample.com`, and not the empty name or `.example.com`, neither of
+/// which names a domain under it.
+pub fn domain_covers(domain: &str, candidate: &str) -> bool {
+    if domain.is_empty() || candidate.is_empty() {
+        return false;
+    }
+    candidate == domain
+        || candidate
+            .strip_suffix(domain)
+            // The remainder is the subdomain part, so it ends at the separating dot
+            // and must carry at least one label character before it: `.example.com`
+            // names no subdomain of `example.com`.
+            .is_some_and(|parent| parent.ends_with('.') && parent.len() > 1)
+}
+
+/// The longest a single DNS label may be, in characters (RFC 1035 §2.3.4).
+const MAX_DOMAIN_LABEL_CHARS: usize = 63;
+
+/// The longest a domain name may be written out, in characters: RFC 1035 §2.3.4
+/// limits a name to 255 octets on the wire, of which 253 are the name's own
+/// characters.
+const MAX_DOMAIN_NAME_CHARS: usize = 253;
+
+/// Whether `name` is spelled as a domain name.
+///
+/// DNS's preferred name syntax (RFC 1035 §2.3.1, §2.3.4): dot-separated labels, each
+/// one of [`MAX_DOMAIN_LABEL_CHARS`] or fewer ASCII letters, digits and hyphens that
+/// begins and ends with neither a hyphen nor a dot, and [`MAX_DOMAIN_NAME_CHARS`] or
+/// fewer characters in all. A value carrying anything else — whitespace, an `@`, an
+/// empty label — names no domain at all, so nothing can be sent from it.
+pub fn domain_name_is_well_formed(name: &str) -> bool {
+    if name.is_empty() || name.chars().count() > MAX_DOMAIN_NAME_CHARS {
+        return false;
+    }
+    name.split('.').all(|label| {
+        !label.is_empty()
+            && label.chars().count() <= MAX_DOMAIN_LABEL_CHARS
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '-')
+    })
+}
+
+/// Whether `candidate` names a domain strictly under `domain`.
+///
+/// Both arguments are [`domain_key`]s, so the names compare the way DNS compares
+/// them. `example.com` has `mail.example.com` and `bounce.mail.example.com` under
+/// it, and nothing else — not itself, not `notexample.com`, and not the empty name
+/// or `.example.com`, neither of which names a domain at all.
+pub fn domain_is_under(domain: &str, candidate: &str) -> bool {
+    candidate != domain && domain_covers(domain, candidate)
 }
 
 /// Whether `address` is an address in `domain` or in one of its subdomains.
@@ -3187,13 +3366,7 @@ pub fn address_in_domain(domain: &str, address: &str) -> bool {
     if local.is_empty() {
         return false;
     }
-    address_domain == domain
-        || address_domain
-            .strip_suffix(domain)
-            // The remainder is the subdomain part, so it ends at the separating dot
-            // and must carry at least one label character before it: `.example.com`
-            // names no subdomain of `example.com`.
-            .is_some_and(|parent| parent.ends_with('.') && parent.len() > 1)
+    domain_covers(domain, address_domain)
 }
 
 /// The Easy DKIM CNAME tokens SES publishes for `domain`.

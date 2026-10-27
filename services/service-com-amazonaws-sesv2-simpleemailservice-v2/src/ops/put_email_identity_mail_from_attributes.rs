@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutEmailIdentityMailFromAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutEmailIdentityMailFromAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutEmailIdentityMailFromAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enables or disables the custom MAIL FROM domain configuration of one email
+//! identity: the request carries the whole configuration, so the identity ends up
+//! with exactly the domain and behaviour it names, and a request that names no
+//! domain disables the configuration. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +144,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutEmailIdentityMailFromAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutEmailIdentityMailFromAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutEmailIdentityMailFromAttributes"))
+        // Request metadata is not needed: the identity is keyed by name within the
+        // one emulated account.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The engine is not the shared in-memory engine, so this service has no
+            // store to write to. That is not a modelled SES state: answer the
+            // scaffold's 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutEmailIdentityMailFromAttributes without the shared emulator state",
+            ));
+        };
+
+        // The enum arrives as a plain string, so a value outside it is this handler's
+        // to refuse, with the `BadRequestException` the model binds for "the input you
+        // provided is invalid". A request that names no behaviour takes the one SES
+        // applies by default, under which mail is sent using SES's own domain instead
+        // of being rejected.
+        let behavior_on_mx_failure = match input.behavior_on_mx_failure {
+            Some(value) => crate::state::modelled_enum_value(
+                "BehaviorOnMxFailure",
+                value,
+                BEHAVIOR_ON_MX_FAILURE_VALUES,
+            )
+            .map_err(bad_request)?,
+            None => crate::state::BEHAVIOR_ON_MX_FAILURE_DEFAULT.to_string(),
+        };
+
+        let mut store = state.lock();
+        // A read of the table reports settled statuses; do the same here so this
+        // write lands on the same record a read would have reported.
+        let now = ::std::time::SystemTime::now();
+        store.settle(now);
+
+        let Some(record) = store
+            .identities
+            .get_mut(&crate::state::identity_key(&input.email_identity))
+        else {
+            return Err(
+                PutEmailIdentityMailFromAttributesErrorModeled::NotFoundException(
+                    NotFoundException {
+                        // The sentence the sibling `PutEmailIdentity*` writes answer,
+                        // so a client sees one wording whichever attribute of a
+                        // missing identity it tried to set.
+                        message: Some(format!(
+                            "Email identity {} does not exist.",
+                            input.email_identity
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        match input.mail_from_domain.as_deref() {
+            Some(domain) => {
+                // "The MAIL FROM domain ... has to be a subdomain of the verified
+                // identity. It can't be used to receive email": the names this
+                // identity may send MAIL FROM are the domain names strictly under
+                // its own — a dedicated subdomain, never the identity's own domain,
+                // which is the one that receives its mail — and any other value is
+                // refused, with nothing stored. A value that is not spelled as a
+                // domain name at all names none of them, so it is refused the same
+                // way. Domain names compare the way DNS compares them, so the case
+                // either value is spelled in does not come into it, while the values
+                // the refusal quotes are the ones the request and the identity
+                // spell.
+                let identity_domain = crate::state::identity_domain(&record.name).to_string();
+                if !crate::state::domain_name_is_well_formed(domain)
+                    || !crate::state::domain_is_under(
+                        &crate::state::domain_key(&identity_domain),
+                        &crate::state::domain_key(domain),
+                    )
+                {
+                    return Err(bad_request(format!(
+                        "Provided MAIL-FROM domain <{domain}> is not subdomain of the domain of \
+                         the identity <{identity_domain}>."
+                    )));
+                }
+                record.set_mail_from(domain, behavior_on_mx_failure, now);
+                Ok(PutEmailIdentityMailFromAttributesOutput {})
+            }
+            // The call "enables or disables" the configuration, and the domain is
+            // the whole of what it enables: a request that names none disables the
+            // custom MAIL FROM configuration, leaving the identity sending with
+            // SES's own domain and nothing for a behaviour to apply to.
+            None => {
+                record.mail_from = None;
+                Ok(PutEmailIdentityMailFromAttributesOutput {})
+            }
+        }
     }
+}
+
+/// Refuse the request with this operation's input error.
+fn bad_request(message: impl Into<String>) -> PutEmailIdentityMailFromAttributesError {
+    PutEmailIdentityMailFromAttributesErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
 }

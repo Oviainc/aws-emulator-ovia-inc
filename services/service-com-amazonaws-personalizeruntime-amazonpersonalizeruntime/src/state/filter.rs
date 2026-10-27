@@ -34,6 +34,12 @@
 //! Personalize's own Items CSV uses, so `IN` matches when ANY of the attribute's
 //! values matches.
 //!
+//! A clause is evaluated against the value the entry STORES for its column, so an entry
+//! that stores none satisfies no clause of any predicate — `NOT IN` included — and such
+//! an entry is therefore kept by an `EXCLUDE` expression and dropped by an `INCLUDE`
+//! one, whatever shape the predicates take. The clause evaluator is where that is
+//! decided.
+//!
 //! # What a request binds a `$placeholder` to
 //!
 //! A request's `filterValues` entry holds the value(s) of ONE placeholder, separated by
@@ -757,15 +763,24 @@ impl BoundFilter {
 }
 
 /// Whether one bound clause holds for an entry carrying `attributes`.
+///
+/// A clause asserts something about the value the entry STORES for its column, so an
+/// entry that stores no value for that column satisfies it under NO predicate: there is
+/// nothing to compare, and negating the comparison does not turn an absent value into a
+/// match any more than it does in SQL, where a predicate over a missing value is
+/// unknown rather than true. That is decided here, once, before the predicate is read —
+/// so `NOT IN`, `IN` and every comparison answer an attribute-less entry the same way,
+/// and an entry is kept or removed only by the attributes it actually holds.
 fn evaluate(clause: &BoundClause, attributes: &BTreeMap<String, String>) -> bool {
-    let stored = attributes.get(&clause.column);
+    let Some(stored) = attributes.get(&clause.column) else {
+        return false;
+    };
     match &clause.predicate {
         BoundPredicate::In { values, negated } => {
-            let matched = stored.is_some_and(|raw| {
-                raw.split('|')
-                    .map(str::trim)
-                    .any(|held| values.iter().any(|value| value == held))
-            });
+            let matched = stored
+                .split('|')
+                .map(str::trim)
+                .any(|held| values.iter().any(|value| value == held));
             matched != *negated
         }
         BoundPredicate::Compare { op, value } => {
@@ -773,7 +788,9 @@ fn evaluate(clause: &BoundClause, attributes: &BTreeMap<String, String>) -> bool
                 return false;
             };
             stored
-                .and_then(|raw| raw.trim().parse::<f64>().ok())
+                .trim()
+                .parse::<f64>()
+                .ok()
                 .is_some_and(|left| op.holds(left, right))
         }
     }
