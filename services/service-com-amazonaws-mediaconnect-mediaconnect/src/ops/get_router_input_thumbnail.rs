@@ -1,15 +1,35 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRouterInputThumbnail
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRouterInputThumbnail`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRouterInputThumbnail::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports what this service holds about the addressed ROUTER INPUT's THUMBNAIL: it answers
+//! from [`crate::state`], so the input it reports on is the one CreateRouterInput stored (as
+//! UpdateRouterInput has since changed it), and an ARN the store holds no input for is
+//! refused `NotFoundException`.
+//!
+//! ## What there is to report, and what there is not
+//!
+//! `RouterInputThumbnailDetails$Thumbnail` is "the thumbnail image, encoded as a
+//! Base64-encoded binary data object" — a still frame decoded out of the content a RUNNING
+//! input is carrying — and `Timecode` and `Timestamp` are "the timecode associated with the
+//! thumbnail" and "the timestamp associated with the thumbnail", which describe that image.
+//! No such image exists for a router input of this emulator: nothing listens on an input's
+//! ingest address and no flow output or MediaLive channel output feeds one, so no frame has
+//! ever been received for any input and there is no instant at which a thumbnail was taken.
+//! Those three optional members are therefore ABSENT rather than carrying a synthesised
+//! picture, the timecode of a frame that was never decoded or a generation instant for work
+//! nothing did. This is the same reading of the same condition as the flow-side
+//! [`crate::ops::describe_flow_source_thumbnail`].
+//!
+//! What the operation CAN report is the input the ARN resolved to and the STATUS of that
+//! absence, which is what the required `RouterInputThumbnailDetails$ThumbnailMessages` is for
+//! ("the messages associated with the router input thumbnail"): one coded entry per condition
+//! that stands between this input and a thumbnail, computed from the input's STORED state and
+//! configuration (see [`thumbnail_messages`]), so the list is never empty.
+//!
+//! AWS publishes no catalog of `RouterInputMessage$Code` values (the model says only "a code
+//! and a message"), so the codes below are this emulator's own, chosen to describe the
+//! condition; the 200 status and the response shape are the contract.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +179,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRouterInputThumbnail` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRouterInputThumbnailErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRouterInputThumbnail"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetRouterInputThumbnailErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        message: "the mediaconnect router input store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+        // `router_input_mut` is the one lookup every router input operation resolves its
+        // `@httpLabel` ARN through, so this read cannot see a state another request would
+        // not. The ONLY write it makes is the one GetRouterInput makes: a state change the
+        // clock already made due (see `crate::state::TRANSITION_SPAN`) was owed at that
+        // instant whether or not anybody called, and it is materialised before reporting
+        // because the input's state is what `thumbnail_messages` reads.
+        let now = ::std::time::SystemTime::now();
+        let Some(router_input) = store.router_input_mut(&input.arn, now) else {
+            return Err(
+                GetRouterInputThumbnailErrorModeled::NotFoundException(NotFoundException {
+                    message: crate::state::not_found_message(&input.arn),
+                })
+                .into(),
+            );
+        };
+
+        Ok(GetRouterInputThumbnailOutput {
+            // The identity the label resolved to, read off the STORED record rather than
+            // echoed back from the request.
+            arn: router_input.arn.clone(),
+            name: router_input.name.clone(),
+            thumbnail_details: RouterInputThumbnailDetails {
+                thumbnail_messages: thumbnail_messages(router_input),
+                // No frame has ever been received on any router input of this emulator, so
+                // there is no image to encode, no timecode to report it at and no instant at
+                // which one was taken. See the module docs.
+                thumbnail: None,
+                timecode: None,
+                timestamp: None,
+            },
+        })
     }
+}
+
+/// `RouterInputMessage$Code` for an input that is not running: MediaConnect decodes a
+/// thumbnail out of the content an input is CARRYING, so an input that is not
+/// [`crate::state::ROUTER_INPUT_STATE_ACTIVE`] has none.
+const CODE_ROUTER_INPUT_NOT_RUNNING: &str = "ROUTER_INPUT_NOT_RUNNING";
+
+/// `RouterInputMessage$Code` for an input whose configuration takes its content from a
+/// resource of another service and names no such resource
+/// ([`crate::state::router_input_connected_source`]): there is no source to decode a
+/// thumbnail from until the configuration connects one.
+const CODE_SOURCE_NOT_CONNECTED: &str = "SOURCE_NOT_CONNECTED";
+
+/// `RouterInputMessage$Code` for a running, connected input nothing has arrived on. Nothing
+/// ingests media in this emulator, so this is the condition every such input is in.
+const CODE_NO_THUMBNAIL_AVAILABLE: &str = "NO_THUMBNAIL_AVAILABLE";
+
+/// `ThumbnailMessages`: "the messages associated with the router input thumbnail" — one entry
+/// per condition that stands between this input and a thumbnail, in a fixed order: the input
+/// is not running, and its configuration is not connected to the source it would take content
+/// from. When neither holds, the one remaining condition is that no content has arrived on it
+/// (see the module docs), so the list is never empty.
+///
+/// Every condition is read from the input's own stored record — its state and its
+/// configuration — so both the codes and the wording follow what the store holds, never the
+/// shape of the request that asked.
+fn thumbnail_messages(router_input: &crate::state::StoredRouterInput) -> Vec<RouterInputMessage> {
+    let mut messages = Vec::new();
+
+    if router_input.state != crate::state::ROUTER_INPUT_STATE_ACTIVE {
+        messages.push(RouterInputMessage {
+            code: CODE_ROUTER_INPUT_NOT_RUNNING.to_string(),
+            message: format!(
+                "The router input is {}; a thumbnail is generated only while it is {} and \
+                 carrying content.",
+                router_input.state,
+                crate::state::ROUTER_INPUT_STATE_ACTIVE
+            ),
+        });
+    }
+
+    // An input that ingests on a router network interface of this account is reachable at an
+    // address of its own ([`crate::state::router_input_has_own_address`]), so its content
+    // arrives there and there is nothing for it to be connected to; one that takes its
+    // content from another AWS resource is connected only while its configuration names that
+    // resource ([`crate::state::router_input_connected_source`]).
+    let connected = crate::state::router_input_has_own_address(&router_input.configuration)
+        || crate::state::router_input_connected_source(&router_input.configuration).is_some();
+    if !connected {
+        messages.push(RouterInputMessage {
+            code: CODE_SOURCE_NOT_CONNECTED.to_string(),
+            message: "The router input is not connected to a source, so it has no content to \
+                      generate a thumbnail from."
+                .to_string(),
+        });
+    }
+
+    if messages.is_empty() {
+        messages.push(RouterInputMessage {
+            code: CODE_NO_THUMBNAIL_AVAILABLE.to_string(),
+            message: format!(
+                "The router input is {} and no content has been received on its source, so no \
+                 thumbnail has been generated for it yet.",
+                router_input.state
+            ),
+        });
+    }
+
+    messages
 }

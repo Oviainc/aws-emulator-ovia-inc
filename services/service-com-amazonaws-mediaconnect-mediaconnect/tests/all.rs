@@ -171,3 +171,5 @@ mod create_router_output_request_bounds;
 mod get_router_output;
 #[path = "all/router_input_source_metadata.rs"]
 mod router_input_source_metadata;
+#[path = "all/router_input_thumbnail.rs"]
+mod router_input_thumbnail;
