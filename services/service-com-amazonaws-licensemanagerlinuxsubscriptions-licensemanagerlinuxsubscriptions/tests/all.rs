@@ -37,3 +37,5 @@ mod subscription_providers;
 mod tag_not_found_status;
 #[path = "all/tag_removal.rs"]
 mod tag_removal;
+#[path = "all/tag_selection_limit.rs"]
+mod tag_selection_limit;
