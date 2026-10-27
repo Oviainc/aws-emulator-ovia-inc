@@ -47,6 +47,8 @@ mod minted_export_arn;
 mod not_found_message;
 #[path = "all/not_found_wire_status.rs"]
 mod not_found_wire_status;
+#[path = "all/owed_delivery_survives_update.rs"]
+mod owed_delivery_survives_update;
 #[path = "all/page_token_refusal.rs"]
 mod page_token_refusal;
 #[path = "all/property_gated_columns.rs"]

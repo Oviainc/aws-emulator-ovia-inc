@@ -19,6 +19,8 @@ mod account_details;
 mod account_sending_attributes;
 #[path = "all/account_suppression_attributes.rs"]
 mod account_suppression_attributes;
+#[path = "all/account_vdm_attributes.rs"]
+mod account_vdm_attributes;
 #[path = "all/configuration_set_event_destinations.rs"]
 mod configuration_set_event_destinations;
 #[path = "all/configuration_set_event_publication_surface.rs"]
