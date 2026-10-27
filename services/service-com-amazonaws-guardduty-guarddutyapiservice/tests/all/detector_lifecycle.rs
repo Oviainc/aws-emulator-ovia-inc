@@ -1427,26 +1427,30 @@ async fn a_detector_belongs_to_the_region_its_endpoint_created_it_in() {
 #[tokio::test]
 async fn an_operation_outside_this_slice_still_answers_501() {
     let router = new_router();
-    // `DeleteCustomDetectionRuleAssociation` is still a scaffold
-    // (`src/ops/delete_custom_detection_rule_association.rs` carries the SCAFFOLDED
-    // marker), and both its path labels here satisfy the patterns the model puts on
-    // them (`smithy_query(operation="DeleteCustomDetectionRuleAssociation")`), so the
-    // boundary validator passes the request through to the handler.
+    // `GetRemainingFreeTrialDays` is still a scaffold
+    // (`src/ops/get_remaining_free_trial_days.rs` carries the SCAFFOLDED marker), and
+    // this request satisfies every constraint the model puts on its input — the URI
+    // label `DetectorId` is `len 1..300` and `accountIds` is a `len 1..50` list
+    // (`smithy_query(operation="GetRemainingFreeTrialDays")`) — so the boundary
+    // validator passes the request through to the handler.
     //
-    // `ListMalwareProtectionPlans`, `ListFilters`, `ListIPSets`, `ListThreatIntelSets`,
-    // `ListThreatEntitySets` and `ListTrustedEntitySets` are implemented, and the
-    // `malware_protection_plan_listing`, `filter_listing`, `ip_set_listing`,
-    // `threat_intel_set_listing`, `threat_entity_set_listing` and
-    // `trusted_entity_set_listing` suites are what assert their behaviour.
+    // `DeleteCustomDetectionRuleAssociation`, `ListMalwareProtectionPlans`,
+    // `ListFilters`, `ListIPSets`, `ListThreatIntelSets`, `ListThreatEntitySets` and
+    // `ListTrustedEntitySets` are implemented, and the
+    // `custom_detection_rule_association_delete`, `malware_protection_plan_listing`,
+    // `filter_listing`, `ip_set_listing`, `threat_intel_set_listing`,
+    // `threat_entity_set_listing` and `trusted_entity_set_listing` suites are what
+    // assert their behaviour.
+    let detector_id = enabled_detector(&router).await;
     let (status, body) = call(
         &router,
-        "DELETE",
-        "/custom-detection-rule/rule/my-rule/association/my-association",
-        None,
+        "POST",
+        &format!("/detector/{detector_id}/freeTrial/daysRemaining"),
+        Some(json!({"accountIds": ["111122223333"]})),
     )
     .await;
     assert_eq!(
         status, 501,
-        "DeleteCustomDetectionRuleAssociation is still scaffolded, so it must answer 501: got {status} {body:?}"
+        "GetRemainingFreeTrialDays is still scaffolded, so it must answer 501: got {status} {body:?}"
     );
 }
