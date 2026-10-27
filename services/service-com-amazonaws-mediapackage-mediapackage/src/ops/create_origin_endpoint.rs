@@ -253,10 +253,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // MediaPackage acts AS every role this request names — it reads the CDN secret as
         // the authorization role and reaches the key provider as the SPEKE role — so a role
-        // it could never assume is refused here instead of being stored as credentials that
+        // it could never assume is refused instead of being stored as credentials that
         // would reject every playback request. The IAM store is a different store in the
         // same engine, and its guard is taken and released BEFORE this service's, so no two
-        // orders of the same two locks exist.
+        // orders of the same two locks exist. The ANSWER is held and reported below, after
+        // the channel this endpoint packages has been resolved, so a request failing both is
+        // told to fix the reference to the stored resource rather than the role — the order
+        // `UpdateOriginEndpoint` and `CreateHarvestJob` report the same two verdicts in.
         let assumed_roles = crate::state::origin_endpoint_assumed_roles(
             input.authorization.as_ref(),
             input.hls_package.as_ref(),
@@ -264,7 +267,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.cmaf_package.as_ref(),
             input.mss_package.as_ref(),
         );
-        if !assumed_roles.is_empty() {
+        let role_refusal = if assumed_roles.is_empty() {
+            None
+        } else {
             let iam = crate::state::iam_state(&*self.engine).ok_or_else(|| {
                 CreateOriginEndpointErrorModeled::InternalServerErrorException(
                     InternalServerErrorException {
@@ -273,12 +278,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?;
             let iam = iam.lock();
-            for (member, role_arn) in &assumed_roles {
-                if let Some(refusal) = crate::state::assume_role_refusal(member, role_arn, &iam) {
-                    return Err(refusal.into());
-                }
-            }
-        }
+            assumed_roles
+                .iter()
+                .find_map(|(member, role_arn)| {
+                    crate::state::assume_role_refusal(member, role_arn, &iam)
+                })
+        };
 
         let mut state = state.lock();
 
@@ -294,6 +299,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // which is a different answer from "the endpoint you asked about is gone" (404).
         if !state.has_channel(&region, &input.channel_id) {
             return Err(crate::state::member_not_found("channelId").into());
+        }
+        // The channel this endpoint packages resolves, so a role the service could not act
+        // as is now the thing the caller has to fix, and the verdict read off the IAM store
+        // above is reported.
+        if let Some(refusal) = role_refusal {
+            return Err(refusal.into());
         }
 
         // "The ID must be unique within the region": a second create on an id already in

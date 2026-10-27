@@ -156,3 +156,5 @@ mod recorder_discovers_other_service_resources;
 mod aggregate_conformance_pack_compliance_summary;
 #[path = "all/conformance_pack_in_use_message.rs"]
 mod conformance_pack_in_use_message;
+#[path = "all/aggregate_compliance_by_conformance_packs.rs"]
+mod aggregate_compliance_by_conformance_packs;

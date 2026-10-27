@@ -6,10 +6,11 @@
 //!
 //! This is the ONLY file to touch for this operation.
 //!
-//! The containers this operation answers about are the ones the deployment that
-//! became ACTIVE declares — the service's `currentDeployment`, which is the one
-//! deployment the store has ever had active; a name outside it is the service's
-//! `DoesNotExist` refusal. The log of a container that DID run is empty, and stays
+//! The containers this operation answers about are the ones declared by a
+//! deployment of the service that became ACTIVE — the one active now and every
+//! superseded one the store still holds, since a container of a superseded
+//! deployment PREVIOUSLY RAN on the service; a name outside that set is the
+//! service's `DoesNotExist` refusal. The log of a container that DID run is empty, and stays
 //! empty: a log event is a line the container's own process wrote, this emulator runs
 //! no container runtime, so nothing ran and nothing wrote one — the same reason the
 //! service's public URL answers 501 rather than the image's response
@@ -240,18 +241,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // empty report, which would read as "it ran and wrote nothing".
             //
             // The containers that have run are the ones declared by a deployment
-            // that BECAME ACTIVE, and the store holds that deployment as the
-            // service's CURRENT one: a `nextDeployment` is still waiting, so its
-            // containers have not run yet, and a deployment the clock replaces is
-            // marked inactive and dropped. So the current deployment's container
-            // map IS the set of containers that have run on the service, and this
-            // reads it rather than keeping a second copy of it beside the record.
-            // (Nothing can give a service a second deployment while
-            // `CreateContainerServiceDeployment` is a scaffold; when that lands
-            // and the store retains the deployments that ran before — what
-            // `GetContainerServiceDeployments` reports — this set widens to the
-            // containers of every deployment that was active, in that change.)
-            if !has_run_container(&input.container_name, service) {
+            // of this service that BECAME ACTIVE: the one active now, and every
+            // one it superseded that the store still holds (a container of a
+            // superseded deployment is exactly one that "previously ran"). A
+            // deployment that never activated — one still waiting on the clock,
+            // or one replaced while it was waiting — launched nothing, so what it
+            // declares is not among them.
+            if !service.has_run_container(&input.container_name) {
                 return Err(container_does_not_exist(
                     &input.container_name,
                     &input.service_name,
@@ -333,41 +329,31 @@ fn service_does_not_exist(name: &str) -> GetContainerLogError {
     )
 }
 
-/// Whether `container` is one that is running, or previously ran, on `service` —
-/// i.e. one the deployment that became active declares (see the call site for why
-/// the current deployment is that whole set).
-fn has_run_container(container: &str, service: &crate::state::StoredContainerService) -> bool {
-    service
-        .current_deployment()
-        .is_some_and(|deployment| deployment.containers.contains_key(container))
-}
-
 /// The container service exists, but no deployment of it has ever launched a
 /// container of that name: the same `DoesNotExist` envelope (HTTP 400, wire error
 /// `NotFoundException`, body `code` `DoesNotExist`), with a message built from the
 /// request — the container and service it named — and the containers that HAVE run
-/// on that service, so the caller can fix the request from the text alone. A
-/// container is not a resource of the account (the modelled `ResourceType` enum has
-/// no entry for one), so the message is not the resource-type/name one. The list is
-/// bounded by `crate::state::MAX_CONTAINERS_PER_DEPLOYMENT`, so the refusal's size
-/// does not grow with what the store holds.
+/// on that service, across every deployment of it that became active, so the
+/// caller can fix the request from the text alone. A container is not a resource of
+/// the account (the modelled `ResourceType` enum has no entry for one), so the
+/// message is not the resource-type/name one. The list is bounded by
+/// `crate::state::MAX_CONTAINERS_PER_DEPLOYMENT` per deployment the store keeps
+/// (`crate::state::MAX_DEPLOYMENTS_PER_SERVICE`), so the refusal's size is
+/// bounded however many deployments the service has had.
 fn container_does_not_exist(
     container: &str,
     service_name: &str,
     service: &crate::state::StoredContainerService,
 ) -> GetContainerLogError {
-    let known = match service.current_deployment() {
-        None => "no deployment of it has become active yet, so no container has run on it"
-            .to_string(),
-        Some(deployment) => format!(
-            "the containers that have run on it are [{}]",
-            deployment
-                .containers
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<&str>>()
-                .join(", ")
-        ),
+    let ran = service.containers_that_ran();
+    // Whether anything has run is whether a deployment BECAME ACTIVE, not
+    // whether that deployment declared a container: the two readings part for a
+    // deployment that launched none, and only the first is what the caller is
+    // being told.
+    let known = if service.deployments_that_ran().next().is_none() {
+        "no deployment of it has become active yet, so no container has run on it".to_string()
+    } else {
+        format!("the containers that have run on it are [{}]", ran.join(", "))
     };
     crate::scaffolded::Scaffolded::does_not_exist(format!(
         "No container named \"{container}\" is running, or previously ran, on the container \

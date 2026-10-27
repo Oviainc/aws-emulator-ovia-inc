@@ -33,3 +33,5 @@ mod shape_validation;
 mod shared_query_decision;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/unknown_filter_key_message.rs"]
+mod unknown_filter_key_message;

@@ -5,8 +5,9 @@
 //!
 //! The ARN is read as the resource it identifies before anything is written: a
 //! value that is not in the ARN format is the modelled `InvalidArnException`, an
-//! ARN naming something these operations do not act on is
-//! `ArnNotSupportedException`, and an ARN whose resource the store does not hold
+//! ARN naming a resource TYPE these operations do not act on — anything but an
+//! application or a deployment group — is `ArnNotSupportedException`, and an ARN
+//! whose resource the store does not hold
 //! is that resource kind's own DoesNotExist error. A tag whose key the resource
 //! already carries REPLACES that key's value rather than adding a second entry
 //! for it, so the tags are merged onto the resource's own record and read back
@@ -152,13 +153,6 @@ fn resource_missing(missing: crate::state::MissingResource) -> TagResourceErrorM
             TagResourceErrorModeled::DeploymentGroupDoesNotExistException(
                 DeploymentGroupDoesNotExistException {
                     message: Some(crate::state::deployment_group_not_found(&name)),
-                },
-            )
-        }
-        crate::state::MissingResource::DeploymentConfig(name) => {
-            TagResourceErrorModeled::DeploymentConfigDoesNotExistException(
-                DeploymentConfigDoesNotExistException {
-                    message: Some(crate::state::deployment_config_not_found(&name)),
                 },
             )
         }

@@ -3,7 +3,9 @@
 //! @op DeleteAnomalyDetector
 //! IMPLEMENTED: starts the deletion of one anomaly detector. The detector moves to
 //! `DELETING` and the clock owes its removal ([`crate::state::TRANSITION_DELAY`]),
-//! after which DescribeAnomalyDetector answers `ResourceNotFoundException`.
+//! after which DescribeAnomalyDetector answers `ResourceNotFoundException`. A detector
+//! that is not in the one usable status — or one inside a workspace that is not — is
+//! refused with the modelled `ConflictException`.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -206,6 +208,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The parent's own status decides whether a child of it can be deleted at all, so
+        // it is read before the detector is resolved (the borrow of the workspace ends
+        // there).
+        let workspace_id = workspace.workspace_id.clone();
+        let workspace_status = workspace.status_code.clone();
+
         let Some(detector) = workspace
             .anomaly_detectors
             .get_mut(&input.anomaly_detector_id)
@@ -221,13 +229,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The deletion is asynchronous (modelled 202): the detector moves to `DELETING`
-        // and the clock owes its removal. A second call while that is pending starts
-        // nothing new — the operation is `@idempotent`, so it accepts the repeat and
-        // leaves the removal already owed where it is, rather than pushing it out.
-        // `clientToken` is what makes that repeat safe, so it needs no record of its
-        // own here: the pending status IS the record.
+        // and the clock owes its removal. A second call while that removal is pending
+        // starts nothing new — the operation is `@idempotent`, so it accepts the repeat
+        // and leaves the removal already owed where it is, rather than pushing it out,
+        // and the refusals below do not apply to it. `clientToken` is what makes that
+        // repeat safe, so it needs no record of its own here: the pending status IS the
+        // record.
         let _ = input.client_token;
-        if detector.status_code != crate::state::STATUS_DELETING {
+        let replays_pending_delete = detector.status_code == crate::state::STATUS_DELETING;
+
+        // A lifecycle-managed record of this service is deletable only while it — and,
+        // for a child, the workspace it lives in — is in the one usable status: every
+        // status enum this service models states the rule the same way ("Deletion is
+        // disallowed until status is ACTIVE", "Update/Deletion is disallowed until
+        // namespace is ACTIVE and workspace status is ACTIVE"). A detector still being
+        // created, or still settling the retraining `PutAnomalyDetector` started, is
+        // mid-transition, and dropping it would discard what the earlier call left owed —
+        // the inconsistent state `ConflictException` (409) is modelled for, and the same
+        // refusal `PutAnomalyDetector` gives the same record.
+        if !replays_pending_delete && workspace_status != crate::state::STATUS_ACTIVE {
+            return Err(conflict(
+                format!(
+                    "The workspace is {workspace_status}; deletions are allowed only when \
+                     status is {}",
+                    crate::state::STATUS_ACTIVE,
+                ),
+                workspace_id,
+                crate::state::WORKSPACE_RESOURCE_TYPE,
+            ));
+        }
+        if !replays_pending_delete && detector.status_code != crate::state::STATUS_ACTIVE {
+            return Err(conflict(
+                format!(
+                    "The anomaly detector is {}; deletions are allowed only when status is {}",
+                    detector.status_code,
+                    crate::state::STATUS_ACTIVE,
+                ),
+                detector.anomaly_detector_id.clone(),
+                crate::state::ANOMALY_DETECTOR_RESOURCE_TYPE,
+            ));
+        }
+
+        if !replays_pending_delete {
             detector.status_code = crate::state::STATUS_DELETING.to_string();
             detector.transition_due = Some(now + crate::state::TRANSITION_DELAY);
             detector.modified_at = now;
@@ -235,4 +278,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(DeleteAnomalyDetectorOutput)
     }
+}
+
+/// The modelled `ConflictException` (409) this handler refuses with, naming the resource
+/// whose status the refusal is about — the shape every status refusal of this crate uses.
+fn conflict(
+    message: String,
+    resource_id: String,
+    resource_type: &str,
+) -> DeleteAnomalyDetectorError {
+    DeleteAnomalyDetectorErrorModeled::ConflictException(ConflictException {
+        message,
+        resource_id,
+        resource_type: resource_type.to_string(),
+    })
+    .into()
 }

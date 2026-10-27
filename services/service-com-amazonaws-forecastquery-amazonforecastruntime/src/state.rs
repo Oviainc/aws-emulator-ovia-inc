@@ -608,9 +608,15 @@ impl StoredForecast {
         }
 
         let known = self.dimension_names();
+        // The SMALLEST offending key, not whichever one iteration reached first: a map has
+        // no wire order, its iteration order is unspecified and differs per map, so a key
+        // chosen that way would name a different key run to run for a byte-identical
+        // request — the same reason `rendered_map` sorts, applied to a refusal that names
+        // ONE entry of a map instead of the whole map.
         if let Some(unknown) = filters
             .keys()
-            .find(|key| !known.iter().any(|name| name == *key))
+            .filter(|key| !known.iter().any(|name| name == *key))
+            .min()
         {
             return Err(QueryRejection::UnknownDimension {
                 key: unknown.clone(),
@@ -1031,6 +1037,10 @@ impl DateWindow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryRejection {
     /// A `Filters` key that is not `item_id` and not one of the forecast's dimensions.
+    ///
+    /// `key` is the smallest such key by key order and `known` is sorted, so a request
+    /// carrying several offending keys earns one fixed message rather than one per
+    /// iteration order.
     UnknownDimension { key: String, known: Vec<String> },
     /// `Filters` carried no criteria at all, so it names no time series.
     NoFilters,

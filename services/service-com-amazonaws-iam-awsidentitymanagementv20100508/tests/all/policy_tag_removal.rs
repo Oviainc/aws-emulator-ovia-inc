@@ -460,8 +460,8 @@ async fn an_aws_managed_policy_cannot_be_untagged() {
         );
 
         // The refusal changed nothing. A catalog entry reads back carrying no tags of
-        // its own; an ARN in AWS's namespace the catalog does not carry is not read as
-        // absent at all, so that read is the emulator's 501 rather than a 200.
+        // its own; an ARN in AWS's namespace the catalog does not carry resolves to no
+        // policy, so that read is the modelled `NoSuchEntity` rather than a 200.
         let (status, read) = call(&router, "GetPolicy", &[("PolicyArn", arn)]).await;
         if case.starts_with("the catalog entry") {
             assert_eq!(
@@ -479,8 +479,13 @@ async fn an_aws_managed_policy_cannot_be_untagged() {
             );
         } else {
             assert_eq!(
-                status, 501,
-                "case {case:?}: an uncarried AWS-managed ARN is not reported as absent, got {status}: {read}"
+                status, 404,
+                "case {case:?}: an ARN resolving to no policy is the modelled missing entity, got {status}: {read}"
+            );
+            assert_eq!(
+                error_code(&read),
+                "NoSuchEntity",
+                "case {case:?}: expected the modelled awsQuery code, got {read}"
             );
         }
     }

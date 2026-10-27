@@ -499,10 +499,10 @@ struct MissCase {
     code: &'static str,
 }
 
-/// RULE: an ARN naming no readable policy is refused by its KIND — an account ARN the
-/// account does not hold is the missing entity `NoSuchEntity` is for, a value that is
-/// not a managed-policy ARN at all is an invalid input, and an ARN in AWS's own
-/// namespace whose catalog entry this emulator does not carry is not claimed absent.
+/// RULE: an ARN naming no readable policy is refused by its KIND, always with a code
+/// this operation MODELS — an ARN naming no policy the service can report, the
+/// account's own or an entry of AWS's catalog, is the missing entity `NoSuchEntity` is
+/// for, and a value that is not a managed-policy ARN at all is an invalid input.
 #[tokio::test]
 async fn an_arn_naming_no_readable_policy_is_refused_by_its_kind() {
     let (router, _engine) = router_with_engine();
@@ -523,14 +523,20 @@ async fn an_arn_naming_no_readable_policy_is_refused_by_its_kind() {
         MissCase {
             name: "an AWS-managed policy under /job-function/ the catalog does not carry",
             arn: "arn:aws:iam::aws:policy/job-function/ViewOnlyAccess".to_string(),
-            status: 501,
-            code: "NotImplemented",
+            status: 404,
+            code: "NoSuchEntity",
         },
         MissCase {
             name: "an AWS-managed policy at the root the catalog does not carry",
             arn: "arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess".to_string(),
-            status: 501,
-            code: "NotImplemented",
+            status: 404,
+            code: "NoSuchEntity",
+        },
+        MissCase {
+            name: "an AWS-managed policy under /service-role/ the catalog does not carry",
+            arn: "arn:aws:iam::aws:policy/service-role/NoSuchAwsManagedPolicyHere".to_string(),
+            status: 404,
+            code: "NoSuchEntity",
         },
         MissCase {
             name: "an ARN of another service",

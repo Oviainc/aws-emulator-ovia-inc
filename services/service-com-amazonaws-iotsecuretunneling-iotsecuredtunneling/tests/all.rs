@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/close_tunnel_idempotence.rs"]
 mod close_tunnel_idempotence;
+#[path = "all/closed_tunnel_shape.rs"]
+mod closed_tunnel_shape;
 #[path = "all/destination_service_limit.rs"]
 mod destination_service_limit;
 #[path = "all/limit_refusals.rs"]

@@ -95,7 +95,10 @@ pub(crate) async fn get_connection_group(router: &MultiServiceRouter, identifier
 }
 
 /// `POST /2020-05-31/connection-groups` with the request document `body`.
-async fn list_connection_groups(router: &MultiServiceRouter, body: &str) -> Answer {
+///
+/// `pub(crate)` so a sibling suite that has to see what the collection holds after a
+/// mutation — a delete, say — reads it over this one wire path rather than growing a copy.
+pub(crate) async fn list_connection_groups(router: &MultiServiceRouter, body: &str) -> Answer {
     call(
         router,
         "POST",
@@ -108,7 +111,11 @@ async fn list_connection_groups(router: &MultiServiceRouter, body: &str) -> Answ
 
 /// A `ListConnectionGroupsRequest` document naming whichever of the three input members
 /// the case under test names.
-fn list_body(max_items: Option<i32>, marker: Option<&str>, anycast_filter: Option<&str>) -> String {
+pub(crate) fn list_body(
+    max_items: Option<i32>,
+    marker: Option<&str>,
+    anycast_filter: Option<&str>,
+) -> String {
     let mut out = format!(
         "<ListConnectionGroupsRequest xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">"
     );
@@ -142,7 +149,7 @@ fn summaries(answer: &Answer) -> Vec<&Node> {
 }
 
 /// The ids one listing reported, in the order it reported them.
-fn summary_ids(answer: &Answer) -> Vec<String> {
+pub(crate) fn summary_ids(answer: &Answer) -> Vec<String> {
     summaries(answer)
         .iter()
         .map(|summary| {

@@ -787,9 +787,10 @@ pub fn is_tag_value(candidate: &str) -> bool {
 /// This is a judgement on the INPUT alone: every entry of `incoming` is held to
 /// AWS's own tagging limits — a key in no reserved namespace
 /// ([`validate_tag_keys_unreserved`]) and the length bounds [`is_tag_key`] /
-/// [`is_tag_value`] state — and a map arriving through a member that targets the
-/// modelled constrained map is additionally held to the character class that map's
-/// key shape states ([`TagConstraints`]).
+/// [`is_tag_value`] state — the map is held to the part of
+/// [`MAX_TAGS_PER_RESOURCE`] the request alone decides, and a map arriving through a
+/// member that targets the modelled constrained map is additionally held to the
+/// character class that map's key shape states ([`TagConstraints`]).
 ///
 /// Because it judges only the input, a request carrying a tag the member does not
 /// admit is refused the SAME way whichever path the operation would then take, and
@@ -834,6 +835,27 @@ pub fn validate_tags_member(
             });
         }
     }
+    // The part of the per-resource cap the REQUEST alone decides. Applying a tag set
+    // can only leave a resource holding at least as many tags as the set itself, so a
+    // map carrying more entries than one resource may hold could not be stored on any
+    // resource in any state: it is an over-sized input, not a full resource, and so is
+    // refused here with everything else the request decides on its own. The cap on the
+    // RESULT of merging onto what a record already holds needs the record, so it stays
+    // where the record is known ([`merge_tags`]).
+    //
+    // It is judged AFTER the walk above deliberately: a request that breaks a bound of
+    // one entry AND carries too many entries is told about the entry, which is the
+    // narrower fault and the one a caller can see in what it sent. The precedence is
+    // the same whatever the store holds, so it is no part of the rule above.
+    if incoming.len() > MAX_TAGS_PER_RESOURCE {
+        return Err(ValidationException {
+            message: format!(
+                "the request carries {} tags; a deployment parameter holds at most {MAX_TAGS_PER_RESOURCE}",
+                incoming.len()
+            ),
+            field_name: "tags".to_string(),
+        });
+    }
     Ok(())
 }
 
@@ -845,10 +867,11 @@ pub fn validate_tags_member(
 /// Every entry of `incoming` is judged first ([`validate_tags_member`], which the
 /// operations also run on their own input ahead of resolving anything), so no merge
 /// can leave on a record an entry that judgement refuses — a reserved-namespace key,
-/// a key or value outside its length bound, or a key outside the character class the
-/// member's own map shape states. What this adds is the one limit that is a property
-/// of the RESULT rather than of the input: [`MAX_TAGS_PER_RESOURCE`] entries on the
-/// record the merge would leave.
+/// a key or value outside its length bound, a map of more entries than one resource
+/// may hold, or a key outside the character class the member's own map shape states.
+/// What this adds is the one limit that needs the record rather than the request:
+/// whether merging onto the tags the record ALREADY holds would pass
+/// [`MAX_TAGS_PER_RESOURCE`].
 pub fn merge_tags(
     existing: &BTreeMap<String, String>,
     incoming: &HashMap<String, String>,
