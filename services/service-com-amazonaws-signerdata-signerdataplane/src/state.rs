@@ -11,11 +11,18 @@
 //! the Signer CONTROL plane (`RevokeSignature` / `RevokeSigningProfile`), which is a
 //! different service. A record therefore enters this store through
 //! [`ComAmazonawsSignerdataSignerdataplaneState::revoke`] — the seam a host embedding
-//! this emulator (a test, or the signer control-plane crate once its revoke operations
-//! are implemented) uses to record a revocation whose effect the read then reports.
-//! Nothing is seeded at construction: the store starts empty, so a read against an
-//! emulator where nothing was ever revoked answers an EMPTY `revokedEntities` list,
-//! which is what the real service answers for an artifact with no revocations.
+//! this emulator (a test, say) uses to record a revocation whose effect the read then
+//! reports. Nothing is seeded at construction: the store starts empty, so a read
+//! against an emulator where nothing was ever revoked answers an EMPTY
+//! `revokedEntities` list, which is what the real service answers for an artifact with
+//! no revocations.
+//!
+//! Which requests reach that read is [`crate::service`]'s subject: the control plane
+//! holds the profiles and signing jobs its own revoke operations write, so it serves
+//! `/revocations` for the shared `signer` signing name — every request an SDK signs,
+//! whichever endpoint host it sends it to — and this service answers the requests
+//! addressed at its OWN endpoint key, which only a request carrying no credential
+//! scope resolves to.
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

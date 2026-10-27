@@ -43,6 +43,8 @@ mod daemons;
 mod delete_attributes;
 #[path = "all/describe_failure_identifiers.rs"]
 mod describe_failure_identifiers;
+#[path = "all/describe_service_deployments.rs"]
+mod describe_service_deployments;
 #[path = "all/ecs_wire.rs"]
 mod ecs_wire;
 #[path = "all/enum_value_refusals.rs"]

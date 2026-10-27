@@ -5,10 +5,11 @@
 //! The rules pinned here:
 //!
 //! 1. an operation that PRODUCES a table registers it in state under the name it was
-//!    given, so every later call addresses it: the restore reports the new table and a
-//!    `DescribeTable` sent straight afterwards reports the same one, `CREATING` until the
-//!    clock makes it `ACTIVE` — and then the data plane serves it (`PutItem`, `GetItem`,
-//!    `Query`) and `DeleteTable` tears it down;
+//!    given, so every later call addresses it: the restore reports the new table
+//!    `CREATING` and a `DescribeTable` sent straight afterwards reports the same one,
+//!    settled, because that reader answers once the creation the clock owed the table has
+//!    fallen due — and then the data plane serves it (`PutItem`, `GetItem`, `Query`) and
+//!    `DeleteTable` tears it down;
 //! 2. what the restored table carries is the SOURCE table's current settings and data —
 //!    "Global secondary indexes (GSIs) Local secondary indexes (LSIs) Provisioned read
 //!    and write capacity ... All these settings come from the current settings of the
@@ -306,6 +307,10 @@ async fn a_restore_registers_the_table_it_creates_and_every_later_call_addresses
 
         // The table is registered from the instant the restore answered: a call sent
         // straight afterwards addresses it rather than answering as if it were absent.
+        // `DescribeTable` is what a client's waiter polls, so it answers once the creation
+        // the clock owed the restored table has fallen due (see `ops::describe_table`) —
+        // the transient span itself is what the restore's own response above reports, and
+        // what the refusals of a second restore onto the same name pin further down.
         let creating = described(&router, &target).await;
         assert_eq!(
             (
@@ -315,10 +320,11 @@ async fn a_restore_registers_the_table_it_creates_and_every_later_call_addresses
             ),
             (
                 json!(&target),
-                json!("CREATING"),
+                json!("ACTIVE"),
                 before["KeySchema"].clone(),
             ),
-            "case {case:?}: the table is registered while it is still CREATING, got {creating}"
+            "case {case:?}: the table is registered and the first poll reports it settled, \
+             got {creating}"
         );
 
         // Once the clock has made the transition due, the table and every index it

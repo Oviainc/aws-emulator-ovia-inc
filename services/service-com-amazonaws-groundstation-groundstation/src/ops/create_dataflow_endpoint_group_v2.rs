@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDataflowEndpointGroupV2
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDataflowEndpointGroupV2`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDataflowEndpointGroupV2::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +150,154 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDataflowEndpointGroupV2` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDataflowEndpointGroupV2ErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDataflowEndpointGroupV2"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateDataflowEndpointGroupV2ErrorModeled::DependencyException(DependencyException {
+                message: Some("this service's state store is unavailable".to_string()),
+                parameter_name: None,
+            })
+        })?;
+
+        // The platform's tagging rules, refused before an id and an ARN are minted: the
+        // model's `TagsMap` carries no constraint, so this is the only gate (see
+        // `crate::state::validate_tags`).
+        crate::state::validate_tags(input.tags.as_ref())
+            .map_err(CreateDataflowEndpointGroupV2ErrorModeled::InvalidParameterException)?;
+
+        // Every endpoint of the group, as this service will store it. A
+        // `CreateEndpointDetails` names exactly one of two AWS Ground Station Agent
+        // endpoints and the union admits no other member, so the conversion cannot fail and
+        // the group needs no agreement on endpoint KIND: every endpoint of a group created
+        // here is agent-carried.
+        let stored_endpoints: Vec<EndpointDetails> =
+            input.endpoints.iter().map(endpoint_as_created).collect();
+
+        // The name each accepted endpoint was taken under, and the item that carried it,
+        // so a second endpoint claiming a name already taken is refused naming both.
+        let mut names: ::std::collections::HashMap<&str, String> =
+            ::std::collections::HashMap::new();
+        for (index, details) in stored_endpoints.iter().enumerate() {
+            // Every address the endpoint carries is a socket Ground Station connects a
+            // stream to, so each port it names has to be one a transport can address, and
+            // the name it is selected by has to be one no other endpoint of this group
+            // took. Both rules belong to every create of a dataflow endpoint group, so both
+            // are held in `crate::state` rather than in one of its handlers.
+            let path = format!("endpoints[{index}]");
+            crate::state::check_endpoint_ports(&path, details)
+                .map_err(CreateDataflowEndpointGroupV2ErrorModeled::InvalidParameterException)?;
+            let member = crate::state::endpoint_members(details)
+                .first()
+                .map(|(member, _)| *member)
+                .unwrap_or("endpoints");
+            crate::state::claim_endpoint_name(&path, member, details, &mut names)
+                .map_err(CreateDataflowEndpointGroupV2ErrorModeled::InvalidParameterException)?;
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let dataflow_endpoint_group_id = crate::state::new_uuid();
+        // `DataflowEndpointGroupV2` is identified by `dataflowEndpointGroupId` and
+        // ARN-addressed as `dataflow-endpoint-group/{dataflowEndpointGroupId}`, exactly as
+        // `DataflowEndpointGroup` is (`smithy_query(query="shape",
+        // shape="DataflowEndpointGroupV2")`), and the model gives it no read, list or delete
+        // of its own — so a group created here is one of this account's dataflow endpoint
+        // groups, held in the one store the other create writes and the read, the listing,
+        // the delete and the tagging operations address.
+        let dataflow_endpoint_group_arn = ::engine::emulator_arn(
+            crate::state::ARN_SERVICE,
+            &region,
+            &format!("dataflow-endpoint-group/{dataflow_endpoint_group_id}"),
+        );
+
+        let mut guard = state.lock();
+
+        // The store this emulator keeps is bounded, so a caller cannot grow it without
+        // limit; past the bound a create is refused with the error this operation models
+        // for a request that would take the account past a quota. Checked after the request
+        // itself, so what the caller hears is what is wrong with the request.
+        if guard.dataflow_endpoint_groups.len() >= crate::state::MAX_RECORDS_PER_STORE {
+            return Err(
+                CreateDataflowEndpointGroupV2ErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "this account already holds the maximum of {} dataflow endpoint \
+                             groups",
+                            crate::state::MAX_RECORDS_PER_STORE
+                        )),
+                        parameter_name: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let stored = crate::state::DataflowEndpointGroup {
+            dataflow_endpoint_group_id: dataflow_endpoint_group_id.clone(),
+            dataflow_endpoint_group_arn: dataflow_endpoint_group_arn.clone(),
+            endpoint_details: stored_endpoints,
+            contact_pre_pass_duration_seconds: input.contact_pre_pass_duration_seconds,
+            contact_post_pass_duration_seconds: input.contact_post_pass_duration_seconds,
+            tags: input.tags.unwrap_or_default(),
+            // Only a `DataflowEndpoint` carries a `status` the service moves from `creating`
+            // to `created` once it has attached the stream; an AWS Ground Station Agent
+            // endpoint carries none, its health being the health of the agent that carries
+            // it (`crate::state::apply_agent_endpoint_health`), so a group of those owes no
+            // clock-driven move at all.
+            endpoints_settle_at: None,
+        };
+
+        guard.arn_index.insert(
+            dataflow_endpoint_group_arn,
+            crate::state::ResourceRef::DataflowEndpointGroup {
+                dataflow_endpoint_group_id: dataflow_endpoint_group_id.clone(),
+            },
+        );
+        guard
+            .dataflow_endpoint_groups
+            .insert(dataflow_endpoint_group_id.clone(), stored);
+
+        Ok(CreateDataflowEndpointGroupV2Output {
+            dataflow_endpoint_group_id: Some(dataflow_endpoint_group_id),
+        })
     }
+}
+
+/// One requested endpoint as the service stores a freshly created one: the endpoint the
+/// request described, carried in the `EndpointDetails` member for its kind, plus the
+/// members the SERVICE owns rather than the caller.
+///
+/// A group is stored as an `EndpointDetails` list whichever create wrote it, so every read
+/// of a dataflow endpoint group reports its endpoints the same way. The two members
+/// `CreateEndpointDetails` declares are the same two agent endpoints `EndpointDetails`
+/// carries, differing only in the `agentStatus`/`auditResults` the SERVICE fills in
+/// (`smithy_query(query="shape", shape="CreateEndpointDetails")`).
+///
+/// An AWS Ground Station Agent endpoint's stream is carried by an agent the customer
+/// registers with `RegisterAgent`, so what it reports is that agent's
+/// (`crate::state::apply_agent_endpoint_health`) — and at create time no agent can carry
+/// it, the ARN of the capability an agent registers for being minted by this very call, so
+/// it reports `NO_REGISTERED_AGENT`, an `INACTIVE` agent and no audit result, none having
+/// run.
+fn endpoint_as_created(requested: &CreateEndpointDetails) -> EndpointDetails {
+    let mut stored = EndpointDetails::default();
+    match requested {
+        CreateEndpointDetails::uplinkAwsGroundStationAgentEndpoint(uplink) => {
+            stored.uplink_aws_ground_station_agent_endpoint =
+                Some(UplinkAwsGroundStationAgentEndpointDetails {
+                    name: uplink.name.clone(),
+                    dataflow_details: uplink.dataflow_details.clone(),
+                    agent_status: None,
+                    audit_results: None,
+                });
+        }
+        CreateEndpointDetails::downlinkAwsGroundStationAgentEndpoint(downlink) => {
+            stored.downlink_aws_ground_station_agent_endpoint =
+                Some(DownlinkAwsGroundStationAgentEndpointDetails {
+                    name: downlink.name.clone(),
+                    dataflow_details: downlink.dataflow_details.clone(),
+                    agent_status: None,
+                    audit_results: None,
+                });
+        }
+    }
+    crate::state::apply_agent_endpoint_health(&mut stored, None);
+    stored
 }

@@ -2910,14 +2910,15 @@ pub const MESSAGE_SYSTEM_ATTRIBUTE_NAMES: &[&str] = &[
 /// How a refusal states that the queue a message movement task names as its source is
 /// not one it can move messages out of.
 ///
-/// The sentence is `StartMessageMoveTask`'s own documented rule, carried verbatim rather
-/// than paraphrased: "This action is currently limited to supporting message redrive from
-/// queues that are configured as dead-letter queues (DLQs) of other Amazon SQS queues
-/// only." The source queue the request named is not such a queue, which is the whole
-/// reason the call cannot be served.
+/// The sentence states the pre-condition the named source does not meet — the queue has
+/// to be the dead-letter queue of another queue — and nothing else: the whole message is
+/// fixed text, because the parameter whose value is refused is already named by the
+/// parameter-refusal class this is answered as. The documentation sentence of the
+/// service's `UnsupportedOperation` class ("This action is currently limited to
+/// supporting message redrive from queues that are configured as dead-letter queues
+/// (DLQs) ... only") belongs to that OTHER class and is not reused here.
 pub const DEAD_LETTER_SOURCE_REQUIRED: &str =
-    "This action is currently limited to supporting message redrive from queues that are \
-     configured as dead-letter queues (DLQs) of other Amazon SQS queues only.";
+    "Source queue must be configured as a Dead Letter Queue.";
 
 /// How a refusal states that the source queue a message movement task names already has
 /// one running: "only one active message movement task is supported per queue at any
@@ -2947,6 +2948,38 @@ pub const NO_DEDUPLICATION_ID: &str = "The queue should either have ContentBased
 pub fn invalid_value_message(parameter: &str) -> String {
     format!("Invalid value for the parameter {parameter}.")
 }
+
+/// The same template with the rule the value broke stated after it, in the `Reason:`
+/// clause every refusal of this service that HAS a rule to state carries.
+///
+/// A value refused for what ANOTHER attribute holds cannot be repaired from the refused
+/// attribute's own published value set, so the rule that rejected the pair is the only
+/// thing that tells the caller what to change. `reason` is a whole sentence and carries
+/// its own terminal period.
+pub fn invalid_value_message_with_reason(parameter: &str, reason: &str) -> String {
+    format!("{} Reason: {reason}", invalid_value_message(parameter))
+}
+
+/// The rule the FIFO throughput limit and the deduplication scope have to satisfy
+/// TOGETHER, as the reason a refusal of either half states: "The perMessageGroupId value
+/// is allowed only when the value for DeduplicationScope is messageGroup"
+/// ([`FIFO_THROUGHPUT_LIMIT`]'s own documentation), stated as the change the caller has
+/// to make.
+pub fn fifo_throughput_pair_reason() -> String {
+    format!(
+        "To set {FIFO_THROUGHPUT_LIMIT} to {FIFO_THROUGHPUT_LIMIT_PER_MESSAGE_GROUP}, the \
+         {DEDUPLICATION_SCOPE} must be {DEDUPLICATION_SCOPE_MESSAGE_GROUP}."
+    )
+}
+
+/// Why a retry under a `ReceiveRequestAttemptId` can no longer be served, as the reason
+/// of the refusal that turns it away: the token replays its batch only "if none of the
+/// messages have been modified (deleted or had their visibility changes)"
+/// (`ReceiveMessageRequest$ReceiveRequestAttemptId`), so once one of them was, the
+/// receive that token names is not a retryable call any more.
+pub const RECEIVE_ATTEMPT_NOT_RETRYABLE: &str = "The receiveRequestAttemptId is not valid \
+                                                 anymore since the receive call is not \
+                                                 retryable.";
 
 /// The modelled refusal for an attribute value the call does not accept: it names the
 /// attribute whose value was refused, which is all this refusal states.
@@ -3076,14 +3109,16 @@ pub fn attribute_combination_refusal(
         .get(DEDUPLICATION_SCOPE)
         .is_some_and(|value| value == DEDUPLICATION_SCOPE_MESSAGE_GROUP);
     (per_message_group && !message_group_scope).then(|| InvalidAttributeValue {
-        // The fixed text Amazon SQS words a refused attribute value in — recorded for
-        // this error class against three different attributes, differing only in the
-        // parameter it names — instantiated with the parameter this request got wrong.
-        // The rule itself is the one that parameter's documentation states: "the
-        // perMessageGroupId value is allowed only when the value for DeduplicationScope
-        // is messageGroup".
-        message: Some(format!(
-            "Invalid value for the parameter {FIFO_THROUGHPUT_LIMIT}."
+        // The fixed text Amazon SQS words a refused attribute value in, instantiated with
+        // the attribute whose value the pair rule rejects, and carrying the `Reason:`
+        // clause stating that rule — without it the refusal names no way to repair the
+        // request, because the value is outside nothing the named attribute itself
+        // publishes. The attribute named is the one the rule is stated ON, whichever half
+        // of the pair the call supplied: it is the value that is only conditionally
+        // allowed, and the scope is what has to change for it.
+        message: Some(invalid_value_message_with_reason(
+            FIFO_THROUGHPUT_LIMIT,
+            &fifo_throughput_pair_reason(),
         )),
     })
 }
