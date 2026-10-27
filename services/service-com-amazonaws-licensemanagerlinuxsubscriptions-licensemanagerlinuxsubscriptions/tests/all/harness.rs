@@ -24,8 +24,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_licensemanagerlinuxsubscriptions_licensemanagerlinuxsubscriptions::state::{
-    SubscriptionProviderRecord, PROVIDER_STATUS_ACTIVE, PROVIDER_STATUS_INVALID,
-    PROVIDER_STATUS_PENDING, TOKEN_VALIDATION_DELAY,
+    DiscoveredInstanceRecord, SubscriptionProviderRecord, PROVIDER_STATUS_ACTIVE,
+    PROVIDER_STATUS_INVALID, PROVIDER_STATUS_PENDING, TOKEN_VALIDATION_DELAY,
 };
 use service_com_amazonaws_licensemanagerlinuxsubscriptions_licensemanagerlinuxsubscriptions::{
     ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscriptionsState,
@@ -405,6 +405,25 @@ pub fn seed_provider(
     );
     state.provider_order.push(arn.clone());
     arn
+}
+
+/// Put one discovered instance DIRECTLY into the store, keyed by its `instance_id`, and
+/// answer that id.
+///
+/// Discovery reads the account's EC2 inventory in the configured source Regions, and no
+/// operation of THIS service writes a discovered instance, so a suite whose rule is about
+/// what the two discovery lists project places the records itself — through the same
+/// `engine.state::<…>()` seam the handlers use, not a second copy of the store.
+pub fn seed_discovered_instance(h: &Harness, record: DiscoveredInstanceRecord) -> String {
+    let instance_id = record.instance_id.clone();
+    let state = h
+        .engine
+        .state::<ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscriptionsState>();
+    state
+        .lock()
+        .discovered_instances
+        .insert(instance_id.clone(), record);
+    instance_id
 }
 
 /// How many registrations the store holds.
