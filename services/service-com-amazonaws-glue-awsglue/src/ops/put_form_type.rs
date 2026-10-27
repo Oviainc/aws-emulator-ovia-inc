@@ -5,8 +5,9 @@
 //! Registers a metadata form type in this account's per-account form type namespace
 //! ([`crate::state::ComAmazonawsGlueAwsglueState::form_types`]), keyed by the request's
 //! `Name`: "Creates or updates a form type", so a put under a free name mints a form type
-//! and a put under a name already stored replaces that form type's schema, keeping the id
-//! the first put minted. `GetFormType` reads the record back by that id.
+//! and a put under a name already stored replaces that form type's schema. The `Id` the
+//! put reports is the form type's name ([`crate::state::FormTypeEntry::id`]), so it is the
+//! same across every put under that name. `GetFormType` reads the record back by that id.
 //!
 //! ## Shape of an operation
 //!
@@ -168,9 +169,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         // "Creates or updates a form type": the name decides which. A name this store
-        // already holds is UPDATED in place — the stored schema becomes the request's,
-        // and the id minted when the name was first stored is kept, so a caller holding
-        // that id still addresses the form type it addressed before.
+        // already holds is UPDATED in place — the stored schema becomes the request's, and
+        // the record keeps the identifier every put under that name reports, so a caller
+        // holding that id still addresses the form type it addressed before.
         let stored = if let Some(existing) = store.form_types.get_mut(&input.name) {
             existing.schema = input.schema;
             existing.clone()
