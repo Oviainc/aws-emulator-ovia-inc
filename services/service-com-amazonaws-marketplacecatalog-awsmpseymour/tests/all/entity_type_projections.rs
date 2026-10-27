@@ -21,7 +21,7 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_marketplacecatalog_awsmpseymour::state::{
     entity_type_sort_fields, CHANGE_SET_APPLYING, CHANGE_SET_PREPARING, ENTITY_SORT_BY,
-    ENTITY_TYPES,
+    SHAPED_ENTITY_TYPES,
 };
 use service_com_amazonaws_marketplacecatalog_awsmpseymour::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -831,9 +831,9 @@ async fn a_type_specific_sort_orders_by_the_listed_types_own_fields() {
         );
     }
 
-    // Every type publishes its own sort fields, and none of them repeats the two every
-    // type carries.
-    for entity_type in ENTITY_TYPES {
+    // Every type the model declares a sort shape for publishes its own sort fields, and
+    // none of them repeats the two every type carries.
+    for entity_type in SHAPED_ENTITY_TYPES {
         let fields = entity_type_sort_fields(entity_type);
         assert!(
             !fields.is_empty(),

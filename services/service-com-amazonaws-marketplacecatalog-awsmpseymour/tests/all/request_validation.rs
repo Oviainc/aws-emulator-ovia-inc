@@ -88,19 +88,30 @@ const RESOURCE_POLICY_DOCUMENT: &str = "{\"Version\":\"2012-10-17\",\"Statement\
      [{\"Effect\":\"Allow\",\"Principal\":\"*\",\"Action\":\"aws-marketplace:DescribeEntity\"}]}";
 
 /// The entity types this catalog has, written out here from the model rather than read
-/// from the crate: they are `EntitySummary`'s per-type summary members with the `Summary`
-/// suffix dropped (`smithy_query(query="shape", shape="EntitySummary")`), which is the
-/// same set the `EntityTypeFilters` union names with `Filters` dropped.
-const MODELLED_ENTITY_TYPES: [&str; 9] = [
+/// from the crate so a wrong implementation cannot make this suite pass by quoting its own
+/// set. It is the UNION of the two places the model names them: the valid values
+/// `ListEntitiesRequest$EntityType` enumerates in prose
+/// (`smithy_query(query="doc", shape="ListEntitiesRequest", member="EntityType")`), and
+/// `EntitySummary`'s per-type summary members with the `Summary` suffix dropped
+/// (`smithy_query(query="shape", shape="EntitySummary")`, the same set the
+/// `EntityTypeFilters` union names with `Filters` dropped), which adds
+/// `MachineLearningProduct` and `ExpressPrivateOfferConfiguration`.
+const MODELLED_ENTITY_TYPES: [&str; 15] = [
     "AmiProduct",
+    "Audience",
+    "BrandingSettings",
     "ContainerProduct",
     "DataProduct",
+    "Experience",
     "ExpressPrivateOfferConfiguration",
     "MachineLearningProduct",
     "Offer",
     "OfferSet",
+    "ProcurementPolicy",
     "ResaleAuthorization",
     "SaaSProduct",
+    "Seller",
+    "Solution",
 ];
 
 /// How long after the start a change set has certainly reached `SUCCEEDED`.

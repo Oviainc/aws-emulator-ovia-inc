@@ -222,20 +222,20 @@ pub const PRODUCT_ENTITY_TYPES: &[&str] = &[
     "SaaSProduct",
 ];
 
-/// The entity types this catalog has at all — what an `EntityType` member is
-/// checked against, beyond the characters `EntityType`'s `@pattern` admits.
+/// The entity types whose own per-type shapes the model declares: the types a
+/// request can filter, sort and summarise field by field.
 ///
-/// `EntityType` is `^[a-zA-Z]+$`, which admits any letters-only word; the
-/// catalog itself serves a FIXED set of types, and the model names it twice over
-/// — once as `EntitySummary`'s per-type summary members
-/// (`AmiProductSummary`, `ContainerProductSummary`, `DataProductSummary`,
-/// `SaaSProductSummary`, `MachineLearningProductSummary`, `OfferSummary`,
+/// Read off `EntitySummary`'s per-type summary members (`AmiProductSummary`,
+/// `ContainerProductSummary`, `DataProductSummary`, `SaaSProductSummary`,
+/// `MachineLearningProductSummary`, `OfferSummary`,
 /// `ResaleAuthorizationSummary`, `OfferSetSummary`,
-/// `ExpressPrivateOfferConfigurationSummary`) and once as the `EntityTypeFilters`
-/// / `EntityTypeSort` union members (`AmiProductFilters`, …), each the type's
-/// name with the suffix dropped. A letters-only value naming none of them names
-/// no entity type, so it is refused rather than listed as empty.
-pub const ENTITY_TYPES: &[&str] = &[
+/// `ExpressPrivateOfferConfigurationSummary`) with the suffix dropped, which is
+/// the same set the `EntityTypeFilters` / `EntityTypeSort` unions name
+/// (`AmiProductFilters`, `AmiProductSort`, …). A type OUTSIDE this set is still
+/// a type this catalog has ([`ENTITY_TYPES`]) — it just carries no per-type
+/// summary, filter or sort shape, so it is summarised by the members every
+/// entity carries and ordered only by [`ENTITY_SORT_BY`].
+pub const SHAPED_ENTITY_TYPES: &[&str] = &[
     "AmiProduct",
     "ContainerProduct",
     "DataProduct",
@@ -245,6 +245,46 @@ pub const ENTITY_TYPES: &[&str] = &[
     "OfferSet",
     "ResaleAuthorization",
     "SaaSProduct",
+];
+
+/// The entity types this catalog has at all — what an `EntityType` member is
+/// checked against, beyond the characters `EntityType`'s `@pattern` admits.
+///
+/// `EntityType` is `^[a-zA-Z]+$`, which admits any letters-only word; the
+/// catalog itself serves a FIXED set of types, and the model names that set in
+/// two places, each naming types the other leaves out, so the set is their
+/// UNION:
+///
+/// * `ListEntitiesRequest$EntityType` enumerates them in prose — "Valid values
+///   are: `AmiProduct`, `ContainerProduct`, `DataProduct`, `SaaSProduct`,
+///   `ProcurementPolicy`, `Experience`, `Audience`, `BrandingSettings`,
+///   `Offer`, `OfferSet`, `Seller`, `ResaleAuthorization`, `Solution`"
+///   (`smithy_query(query="doc", shape="ListEntitiesRequest",
+///   member="EntityType")`);
+/// * the per-type shapes the model declares name the rest
+///   ([`SHAPED_ENTITY_TYPES`], which adds `MachineLearningProduct` and
+///   `ExpressPrivateOfferConfiguration`).
+///
+/// A type the model names either way is one this catalog serves, so listing it
+/// answers a page (empty while the catalog holds nothing of it) and a change set
+/// may create one. A letters-only value naming NO type of the model names no
+/// entity type at all, so it is refused rather than listed as empty.
+pub const ENTITY_TYPES: &[&str] = &[
+    "AmiProduct",
+    "Audience",
+    "BrandingSettings",
+    "ContainerProduct",
+    "DataProduct",
+    "Experience",
+    "ExpressPrivateOfferConfiguration",
+    "MachineLearningProduct",
+    "Offer",
+    "OfferSet",
+    "ProcurementPolicy",
+    "ResaleAuthorization",
+    "SaaSProduct",
+    "Seller",
+    "Solution",
 ];
 
 /// The change types this catalog performs — what a `Change$ChangeType` is
@@ -262,8 +302,9 @@ pub const ENTITY_TYPES: &[&str] = &[
 /// It is read as ONE set — the change types this catalog performs — rather than
 /// as a change type per entity type: the pages publish a set per PRODUCT and
 /// name none at all for several of the types this catalog serves
-/// ([`ENTITY_TYPES`] has nine), so a per-type pairing is nowhere this service
-/// states it. What it does state either way is that a change type is the name of
+/// ([`ENTITY_TYPES`] names fifteen), so a per-type pairing is nowhere this
+/// service states it. What it does state either way is that a change type is the
+/// name of
 /// an intention the catalog can carry out, so a value naming none of them asks
 /// for no change this catalog can make, and is refused rather than stored as a
 /// change nothing could apply.
@@ -1073,7 +1114,9 @@ impl EntityCriterion {
 /// `DataProductSortBy`, `ExpressPrivateOfferConfigurationSortBy`,
 /// `MachineLearningProductSortBy`, `OfferSortBy`, `OfferSetSortBy`,
 /// `ResaleAuthorizationSortBy`, `SaaSProductSortBy`). This is those enums with
-/// the two common attributes dropped.
+/// the two common attributes dropped, so a type the model declares no sort shape
+/// for (one outside [`SHAPED_ENTITY_TYPES`]) adds none and is ordered by the
+/// common attributes alone.
 pub fn entity_type_sort_fields(entity_type: &str) -> &'static [&'static str] {
     match entity_type {
         "AmiProduct" | "DataProduct" | "MachineLearningProduct" => &["ProductTitle", "Visibility"],
