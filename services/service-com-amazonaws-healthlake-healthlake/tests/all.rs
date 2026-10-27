@@ -57,6 +57,8 @@ mod list_data_transformation_profile_versions;
 mod list_data_transformation_profiles;
 #[path = "all/list_tags_for_resource.rs"]
 mod list_tags_for_resource;
+#[path = "all/profile_client_token_lifetime.rs"]
+mod profile_client_token_lifetime;
 #[path = "all/publish_data_transformation_profile.rs"]
 mod publish_data_transformation_profile;
 #[path = "all/resource_tagging.rs"]
