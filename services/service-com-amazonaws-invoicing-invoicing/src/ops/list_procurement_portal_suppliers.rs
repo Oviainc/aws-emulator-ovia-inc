@@ -131,11 +131,12 @@ impl From<ListProcurementPortalSuppliersErrorModeled> for ListProcurementPortalS
 const MAX_PAGE_SIZE: usize = 100;
 
 /// What an opaque `NextToken` this operation minted decodes to, before the portal it was
-/// minted for and the position the next page resumes at. Its own prefix, so a token
+/// minted for and the ordinal the next page resumes at. Its own prefix, so a token
 /// minted for another paginated walk of this service — or for another PORTAL's walk,
 /// whose order is its own — is not accepted here. The portal is named by its
 /// `ProcurementPortalName`, one of the enum's values, so no caller-supplied text reaches
-/// the prefix and no portal's namespace can be a prefix of another's.
+/// the prefix and no portal's namespace can be a prefix of another's — and neither does
+/// any reach the position, so every token stays inside the member's modelled length.
 const NEXT_TOKEN_PREFIX: &str = "procurement-portal-suppliers:";
 
 /// The `ListProcurementPortalSuppliers` operation.
@@ -192,8 +193,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resume at a position in an order it was never minted against. The RESOLVED
         // portal name namespaces it rather than the request's identifier, so the prefix
         // is one of the enum's values and cannot be made ambiguous by what was asked.
+        //
+        // The POSITION the token carries is the ordinal of the entry the next page starts
+        // at, not the key that orders the walk: that key is built from a preference's
+        // `SupplierIdentifier` and seller-of-record id, both caller-supplied and modelled
+        // `@length(max: 1024)` each, so naming a position by it would mint a `NextToken`
+        // past the `@length(max: 1024)` the model puts on that member — a token this
+        // operation would then refuse when the caller handed it straight back. An ordinal
+        // is bounded by how many suppliers the registry can configure
+        // (`crate::state::MAX_PROCUREMENT_PORTAL_PREFERENCES * 2 * 100`), so every token
+        // this walk mints is one it accepts back.
         let token_prefix = format!("{NEXT_TOKEN_PREFIX}{portal_name}:");
-        let resume_at = crate::state::decode_page_token(&token_prefix, input.next_token.as_deref())
+        let resume_at = crate::state::decode_page_offset(&token_prefix, input.next_token.as_deref())
             .map_err(|_| {
                 ListProcurementPortalSuppliersErrorModeled::ValidationException(
                     // This plane keys the refusal's text as `Message` (see
@@ -217,7 +228,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // One stable, deterministic order (the `BTreeMap` key
         // `crate::state::procurement_portal_supplier_key` builds), so a token — a
         // POSITION in that order — stays meaningful across calls and the resumed page
-        // seeks straight to it rather than re-walking what the earlier pages reported.
+        // seeks straight to it rather than re-reporting what the earlier pages reported.
         //
         // The derived set is bounded by the registry and the model, not by the request:
         // at most `crate::state::MAX_PROCUREMENT_PORTAL_PREFERENCES` preferences, each
@@ -225,19 +236,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `@length(min: 0, max: 100)` (see `procurement_portal_suppliers`). Deriving it
         // per call is what keeps this read from caching — and so from writing — anything.
         let configured = store.procurement_portal_suppliers(portal_name);
-        let mut procurement_portal_suppliers = Vec::new();
-        let mut next_token = None;
-        let page = match resume_at.as_deref() {
-            Some(from) => configured.range(from.to_string()..),
-            None => configured.range::<String, _>(..),
-        };
-        for (key, supplier) in page {
-            if procurement_portal_suppliers.len() == page_size {
-                next_token = Some(crate::state::encode_page_token(&token_prefix, key));
-                break;
-            }
-            procurement_portal_suppliers.push(supplier.clone());
-        }
+        let resume_at = resume_at.unwrap_or(0);
+        let procurement_portal_suppliers: Vec<ProcurementPortalSupplier> = configured
+            .values()
+            .skip(resume_at)
+            .take(page_size)
+            .cloned()
+            .collect();
+        // Where the next page resumes: past everything reported through this one. A token
+        // is minted only while suppliers remain, so the last page of a walk carries none
+        // and a position past the end of the listing is an empty last page.
+        let reported_through = resume_at.saturating_add(procurement_portal_suppliers.len());
+        let next_token = (reported_through < configured.len())
+            .then(|| crate::state::encode_page_offset(&token_prefix, reported_through));
 
         Ok(ListProcurementPortalSuppliersOutput {
             procurement_portal_suppliers,

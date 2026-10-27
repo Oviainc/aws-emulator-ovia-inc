@@ -45,15 +45,53 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
-/// The URI `AssociateUser` is bound to (`@http(method: "POST", uri:
-/// "/user/AssociateUser")`), matched by the authorization gate below before the framework
-/// has resolved a routing key.
-const ASSOCIATE_USER_URI: &str = "/user/AssociateUser";
+/// The HTTP method every gated route below is bound to: each one is
+/// `@http(method: "POST", …)`, so a request arriving at one of those paths under any other
+/// method names no gated operation and the gate does not apply to it.
+const GATED_METHOD: &str = "POST";
 
-/// The operation name a gated request is recorded under: the one the model names for that
-/// route, so a refusal lands in the same telemetry series as the requests that reach the
-/// handler.
-const ASSOCIATE_USER_OPERATION: &str = "AssociateUser";
+/// One operation whose instance-authorization refusal is decided BEFORE the framework
+/// examines the request's shape.
+struct InstanceGatedRoute {
+    /// The path the operation's `@http` `uri` binds it to, matched before the framework has
+    /// resolved a routing key.
+    uri: &'static str,
+    /// The refusal this route serves, carrying the operation name a gated request is
+    /// recorded under: the one the model names for that route, so a refusal lands in the
+    /// same telemetry series as the requests that reach the handler.
+    fail_closed: FailClosed,
+}
+
+/// Every route the authorization gate covers.
+///
+/// An operation belongs here exactly when it requires an `InstanceId` and gates on the
+/// account's ownership of that instance before it looks anything else up — which is
+/// `AssociateUser` and `ListUserAssociations`, the two operations whose input declares
+/// `InstanceId` `@required`
+/// (`smithy_query(query="operation", operation="AssociateUser,ListUserAssociations")`) and
+/// whose handler opens with that predicate. Listing them in ONE table is what keeps the
+/// hoisted gate from covering some of them and not others: the refusal a caller gets for an
+/// instance this service will not authorize cannot depend on which of those operations it
+/// called, nor on what else the request got wrong.
+///
+/// `DisassociateUser` is deliberately NOT here. Its `InstanceId` is optional and it gates on
+/// something else — whether an association resolves at all — and it refuses a request that
+/// addresses no association BEFORE resolving anything, so there is no instance-ownership
+/// decision in front of it to hoist.
+static INSTANCE_GATED_ROUTES: &[InstanceGatedRoute] = &[
+    InstanceGatedRoute {
+        uri: "/user/AssociateUser",
+        fail_closed: FailClosed {
+            operation: "AssociateUser",
+        },
+    },
+    InstanceGatedRoute {
+        uri: "/user/ListUserAssociations",
+        fail_closed: FailClosed {
+            operation: "ListUserAssociations",
+        },
+    },
+];
 
 /// The member every tagging operation addresses its resource by, as the violation path the
 /// boundary validator reports for it.
@@ -78,9 +116,6 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// constraint-checks the request, which is the one decision that cannot be made from
     /// inside a handler.
     engine: Arc<Eng>,
-    /// The refusal the authorization gate serves, held here because
-    /// [`Service::override_operation`] hands back a borrowed operation.
-    fail_closed: FailClosed,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -91,12 +126,11 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
             engine,
-            fail_closed: FailClosed,
         }
     }
 
-    /// Whether this service will authorize an `AssociateUser` request, read off the RAW
-    /// request body.
+    /// Whether this service will authorize a request that acts on the EC2 instance it names,
+    /// read off the RAW request body.
     ///
     /// The predicate is the handler's own
     /// ([`crate::state::ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState::authorizes_instance`]):
@@ -108,7 +142,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// names no `InstanceId` at all, so there is nothing to authorize and the framework's
     /// own refusal stands. `Some(false)` is a request this service refuses before it looks
     /// at the request's shape.
-    fn authorizes_user_association(
+    fn authorizes_named_instance(
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<bool> {
@@ -144,22 +178,28 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     ) -> Option<&dyn ErasedOperation> {
         // THE AUTHORIZATION GATE, and the only seam it can run in.
         //
-        // `AssociateUser` is authorized before its request shape is validated: the same
-        // call against an instance this service will not authorize is refused identically
-        // whether its `Tags` map is within the modelled `@length` or past it. The
-        // framework's centralized walk is deserialize -> validate -> handle, so a handler
-        // runs only AFTER modelled-constraint enforcement; this hook is consulted before
-        // any of it, which is why the decision lives here and not in
-        // `crate::ops::associate_user`.
+        // An operation that acts on a caller-named EC2 instance is authorized before its
+        // request shape is validated: the same call against an instance this service will
+        // not authorize is refused identically whatever else the request gets wrong —
+        // whether its `Tags` map is within the modelled `@length` or past it, and whether or
+        // not it even carries the members the model requires. The framework's centralized
+        // walk is deserialize -> validate -> handle, so a handler runs only AFTER
+        // modelled-constraint enforcement; this hook is consulted before any of it, which is
+        // why the decision lives here and not in the handlers.
         //
-        // Only `AssociateUser` is gated. `DisassociateUser` answers the scaffold's 501 for
-        // every request, so there is nothing yet for a gate in front of it to be
-        // consistent with; its own issue owns it.
-        if req.method() == "POST" && request_path(req.uri()) == ASSOCIATE_USER_URI {
-            if self.authorizes_user_association(req) == Some(false) {
-                return Some(&self.fail_closed);
-            }
+        // It covers EVERY such operation ([`INSTANCE_GATED_ROUTES`]), so the refusal does
+        // not depend on which one the caller reached for; each handler asks the same
+        // predicate again, so the two gates cannot disagree about a request that gets this
+        // far.
+        if req.method() != GATED_METHOD {
             return None;
+        }
+        let path = request_path(req.uri());
+        let route = INSTANCE_GATED_ROUTES
+            .iter()
+            .find(|route| route.uri == path)?;
+        if self.authorizes_named_instance(req) == Some(false) {
+            return Some(&route.fail_closed);
         }
         None
     }
@@ -260,7 +300,10 @@ fn request_path(uri: &str) -> &str {
 /// gives it the 400 this service reports a refusal with
 /// ([`crate::scaffolded::SERVICE_REFUSAL_STATUS`]); the chosen code and message replace
 /// the wording that error would otherwise carry.
-struct FailClosed;
+struct FailClosed {
+    /// The operation the gated request named, for the telemetry row below.
+    operation: &'static str,
+}
 
 impl ErasedOperation for FailClosed {
     fn run<'r>(
@@ -279,7 +322,12 @@ impl ErasedOperation for FailClosed {
                     message: crate::scaffolded::UNAUTHORIZED_EXCEPTION_MESSAGE.to_string(),
                 }),
             );
-            record_refusal(ctx, response.status().as_u16(), started.elapsed());
+            record_refusal(
+                ctx,
+                self.operation,
+                response.status().as_u16(),
+                started.elapsed(),
+            );
             response
         })
     }
@@ -298,13 +346,18 @@ impl ErasedOperation for FailClosed {
 /// the error code), same folded handle (this service's signing name and the operation the
 /// request named), same already-sanitized request metadata, and gated on a client
 /// collecting exactly as the framework gates it.
-fn record_refusal(ctx: &OperationContext<'_>, status: u16, latency: std::time::Duration) {
+fn record_refusal(
+    ctx: &OperationContext<'_>,
+    operation: &'static str,
+    status: u16,
+    latency: std::time::Duration,
+) {
     if !emulator_telemetry::recording_active() {
         return;
     }
     let handle = emulator_telemetry::OperationHandle::folded(
         ctx.identity().signing_name_static(),
-        ASSOCIATE_USER_OPERATION,
+        operation,
     );
     emulator_telemetry::record_generated_operation_with_handle(
         &handle,

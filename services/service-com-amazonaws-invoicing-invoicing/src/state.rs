@@ -726,9 +726,15 @@ pub const PORTAL_ENV_PROD: &str = "PROD";
 /// [`crate::ops::types::PROCUREMENT_PORTAL_ENV_VALUES`].
 pub const PORTAL_ENV_TEST: &str = "TEST";
 
-/// What distinguishes one configured portal supplier from another, and the position a
-/// paginated walk of them resumes at: its identifier, the environment it is configured
-/// in and the seller of record it applies to (empty when it applies to all of them).
+/// What distinguishes one configured portal supplier from another, and the order a
+/// paginated walk of them reports and resumes in: its identifier, the environment it is
+/// configured in and the seller of record it applies to (empty when it applies to all of
+/// them).
+///
+/// It is the walk's ORDER, not its token: the identifier and the seller of record are
+/// caller-supplied `BasicStringWithoutSpace` members (`@length(max: 1024)` each), so a
+/// token naming a position by this key would run past `NextToken`'s own modelled maximum
+/// — the walk pages on the ordinal in this order instead (see [`encode_page_offset`]).
 ///
 /// The parts are joined with a SPACE, which none of them can contain: a supplier
 /// identifier and a seller-of-record id both come from a preference's
@@ -1193,8 +1199,45 @@ pub struct InvalidPageToken;
 /// The token is opaque to the caller (hex over the prefixed position) and the prefix is
 /// what makes a token this service did not mint — or one minted for another operation's
 /// walk — recognisable rather than silently resuming from arbitrary bytes.
+///
+/// A `NextToken` carries the model's constraints on BOTH sides of a paginated operation
+/// (the output member a page hands back and the input member the next call hands in), so
+/// a token has to stay inside them to be one this service will accept back. Hex doubles
+/// the byte count, so `position` must be text whose length THIS SERVICE bounds — an
+/// identifier it mints, an enum value, or the ordinal
+/// [`encode_page_offset`] encodes — and never a caller-supplied value whose own modelled
+/// length can carry the token past the `NextToken` member's maximum. Where a walk's
+/// order is keyed by caller-supplied text, page it with [`encode_page_offset`].
 pub fn encode_page_token(prefix: &str, position: &str) -> String {
     hex::encode(format!("{prefix}{position}"))
+}
+
+/// The `NextToken` that resumes a walk at the `offset`-th entry of its order, under the
+/// walk's own `prefix`.
+///
+/// An ORDINAL is what a walk keyed by caller-supplied text pages on: the position it
+/// names is a number bounded by how many entries the walk can hold, so the token stays
+/// inside the `NextToken` member's modelled maximum whatever a caller stored, while a
+/// key built from those members would not (see [`encode_page_token`]).
+pub fn encode_page_offset(prefix: &str, offset: usize) -> String {
+    encode_page_token(prefix, &offset.to_string())
+}
+
+/// The ordinal a caller's `NextToken` resumes at, or `Ok(None)` when it asked for the
+/// first page. A token that is not one this `prefix`'s walk minted — including one whose
+/// position is not an ordinal — is [`InvalidPageToken`], answered as the operation's own
+/// modelled `ValidationException` ([`invalid_next_token`]).
+pub fn decode_page_offset(
+    prefix: &str,
+    token: Option<&str>,
+) -> Result<Option<usize>, InvalidPageToken> {
+    match decode_page_token(prefix, token)? {
+        Some(position) => position
+            .parse::<usize>()
+            .map(Some)
+            .map_err(|_| InvalidPageToken),
+        None => Ok(None),
+    }
 }
 
 /// The position a caller's `NextToken` resumes at, or `Ok(None)` when it asked for the
