@@ -617,26 +617,19 @@ fn invalid_parameter_value(message: String) -> PutMetricDataError {
 /// family this operation answers an unusable input value in, as its recorded `Value` and
 /// `Namespace` refusals carry it.
 fn value_is_invalid(value: &str, parameter: &str) -> PutMetricDataError {
-    invalid_parameter_value(format!(
-        "The value {value} for parameter {parameter} is invalid."
-    ))
+    invalid_parameter_value(crate::state::value_is_invalid_message(value, parameter))
 }
 
 /// Refuse a list that carries more entries than its documented cap.
 fn collection_too_large(collection: &str, cap: usize) -> PutMetricDataError {
-    invalid_parameter_value(format!(
-        "The collection {collection} must not have a size greater than {cap}."
-    ))
+    invalid_parameter_value(crate::state::collection_too_large_message(collection, cap))
 }
 
 /// Refuse a request that carries two members which state the same thing two ways.
 fn mutually_exclusive(first: &str, second: &str) -> PutMetricDataError {
     PutMetricDataErrorModeled::InvalidParameterCombinationException(
         InvalidParameterCombinationException {
-            message: Some(format!(
-                "The parameters {first} and {second} are mutually exclusive and you have \
-                 specified both."
-            )),
+            message: Some(crate::state::mutually_exclusive_message(first, second)),
         },
     )
     .into()

@@ -237,19 +237,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .flatten()
             .map(String::as_str)
             .collect();
+        // "When calling GetMetricStatistics, you must specify either Statistics or
+        // ExtendedStatistics" (`GetMetricStatisticsInput$Statistics`, `$ExtendedStatistics`) —
+        // the two members are one EITHER/OR combination, so a call naming neither of them is
+        // a combination this operation cannot be served under, not a single member that is
+        // missing.
         if statistics.is_empty() && extended.is_empty() {
-            return Err(
-                GetMetricStatisticsErrorModeled::MissingRequiredParameterException(
-                    MissingRequiredParameterException {
-                        message: Some(
-                            "either Statistics or ExtendedStatistics must name at least one \
-                             statistic"
-                                .into(),
-                        ),
-                    },
-                )
-                .into(),
-            );
+            return Err(invalid_combination(crate::state::one_of_required_message(
+                "Statistics",
+                "ExtendedStatistics",
+            )));
         }
         // Resolve every extended statistic BEFORE any data is read, so an unsupported name is
         // refused whether or not the requested range happens to hold datapoints.
@@ -272,30 +269,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                  EndTime {end} (epoch seconds)"
             )));
         }
+        let period = f64::from(input.period);
+        // How many data points the REQUEST asks for: the range the caller named, over the
+        // period the caller named. Measured from the requested start time and not from the
+        // rounded one below, because the cap is about what was requested.
+        let requested_datapoints = ((end - requested_start) / period).ceil();
+        if requested_datapoints > MAX_DATAPOINTS {
+            return Err(invalid_combination(datapoint_cap_exceeded(
+                requested_datapoints,
+                MAX_DATAPOINTS,
+            )));
+        }
+        // The one clock this read is answered against: the windows it lays, the tier a span is
+        // still readable at, and the datapoints inside it are all judged at the same instant.
+        let now = crate::state::now_secs();
         // "CloudWatch rounds the specified time stamp" (`GetMetricStatisticsInput$StartTime`):
         // the first window begins at the rounded start time, not at the requested instant, so
         // a request whose start is not on a period boundary is answered at the boundaries
         // CloudWatch lays — by the one rule every read of a series shares.
-        let start = crate::state::rounded_start(
-            requested_start,
-            input.period,
-            crate::state::now_secs(),
-        );
-        let period = f64::from(input.period);
-        let windows = ((end - start) / period).ceil();
-        if windows > MAX_DATAPOINTS {
-            return Err(
-                GetMetricStatisticsErrorModeled::InvalidParameterCombinationException(
-                    InvalidParameterCombinationException {
-                        message: Some(format!(
-                            "the requested time range and Period span {windows} periods; at most \
-                             {MAX_DATAPOINTS} data points can be returned from one call"
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
+        let start = crate::state::rounded_start(requested_start, input.period, now);
 
         // A metric's identity includes its dimension set, so only the series published with
         // exactly these dimensions answers this request.
@@ -307,20 +299,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
 
+        // "If the StartTime parameter specifies a time stamp that is greater than 3 hours ago,
+        // you must specify the period as follows or no data points in that time range is
+        // returned: Start time between 3 hours and 15 days ago - Use a multiple of 60 seconds
+        // (1 minute). Start time between 15 and 63 days ago - Use a multiple of 300 seconds (5
+        // minutes). Start time greater than 63 days ago - Use a multiple of 3600 seconds (1
+        // hour)." (`GetMetricStatisticsInput$Period`) — the granularity a RANGE can be read at
+        // is the one the tier of its start time still holds, and a read at a finer one answers
+        // with no data point for the range at all. The same rule, applied to each datapoint's
+        // own instant, is what ages a datapoint out of its tier ([`crate::state::windows_by_unit`]).
+        let series = if crate::state::retained_at_period(requested_start, input.period, now) {
+            store.metrics.get(&key).map_or(&[][..], Vec::as_slice)
+        } else {
+            &[][..]
+        };
+
         // `StartTime` inclusive, `EndTime` exclusive; windows are `Period` seconds wide and
         // anchored at the ROUNDED start time, folded by the one shared helper every reader of
-        // a series uses ([`crate::state::windows_of`]).
-        let series = store.metrics.get(&key).map_or(&[][..], Vec::as_slice);
-        let buckets = crate::state::windows_of(series, start, end, period, input.unit.as_deref());
+        // a series uses ([`crate::state::windows_by_unit`]) — which also decides, by the one
+        // retention rule, what a read at this period can still see.
+        let buckets = crate::state::windows_by_unit(
+            series,
+            start,
+            end,
+            input.period,
+            input.unit.as_deref(),
+            now,
+        );
 
         let mut datapoints = Vec::with_capacity(buckets.len());
-        for (index, data) in buckets {
+        for ((index, unit), data) in buckets {
             datapoints.push(aggregate(
                 crate::state::window_start(start, index, period),
                 &data,
                 &statistics,
                 &extended,
-                input.unit.as_deref(),
+                unit,
             ));
         }
 
@@ -342,6 +356,34 @@ fn invalid_value(message: String) -> GetMetricStatisticsError {
     .into()
 }
 
+/// Refuse a request whose members cannot be served together: "Parameters were used together
+/// that cannot be used together." (`InvalidParameterCombinationException`)
+fn invalid_combination(message: String) -> GetMetricStatisticsError {
+    GetMetricStatisticsErrorModeled::InvalidParameterCombinationException(
+        InvalidParameterCombinationException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// What a read that asks for more data points than one call returns is told.
+///
+/// "The maximum number of data points returned from a single call is 1,440. If you request
+/// more than 1,440 data points, CloudWatch returns an error. To reduce the number of data
+/// points, you can narrow the specified time range and make multiple requests across adjacent
+/// time ranges, or you can increase the specified period." (`GetMetricStatistics`) — the
+/// sentence states what the request asked for, the cap it broke, and the two remedies, so the
+/// caller can turn it into a request that is served. Both numbers come from the request and
+/// the cap, never from fixed text.
+fn datapoint_cap_exceeded(requested: f64, cap: f64) -> String {
+    format!(
+        "You have requested up to {requested:.0} datapoints, which exceeds the limit of \
+         {cap:.0}. You may reduce the datapoints requested by increasing Period, or decreasing \
+         the time range."
+    )
+}
+
 /// Refuse a `Period` the member does not document, in the words the one shared rule
 /// ([`crate::state::period_error`]) states it in.
 fn validate_period(period: i32) -> Result<(), GetMetricStatisticsError> {
@@ -352,12 +394,16 @@ fn validate_period(period: i32) -> Result<(), GetMetricStatisticsError> {
 }
 
 /// Aggregate one window's datapoints, emitting ONLY the statistics the caller asked for.
+///
+/// `unit` is the unit the window's datapoints were published with — the window is keyed by it
+/// ([`crate::state::windows_by_unit`]), so a datapoint reports the unit its own observations
+/// carry whether or not the request filtered on one.
 fn aggregate(
     window_start: f64,
     data: &[&crate::state::StoredDatum],
     statistics: &[&str],
     extended: &[&str],
-    requested_unit: Option<&str>,
+    unit: Option<&str>,
 ) -> Datapoint {
     let folded = crate::state::BasicStatistics::of(data.iter().copied());
     let (sample_count, sum) = (folded.sample_count, folded.sum);
@@ -387,20 +433,7 @@ fn aggregate(
             .contains(&"Maximum")
             .then_some(maximum)
             .filter(|value: &f64| value.is_finite()),
-        // The unit the caller filtered on, else the one the window's data was published
-        // with — reported only when that is unambiguous.
-        unit: requested_unit
-            .map(ToString::to_string)
-            .or_else(|| window_unit(data)),
+        unit: unit.map(ToString::to_string),
         extended_statistics: (!extended_statistics.is_empty()).then_some(extended_statistics),
     }
-}
-
-/// The one unit every datapoint in the window was published with, if they agree.
-fn window_unit(data: &[&crate::state::StoredDatum]) -> Option<String> {
-    let first = data.first()?.unit.clone();
-    data.iter()
-        .all(|datum| datum.unit == first)
-        .then_some(first)
-        .flatten()
 }
