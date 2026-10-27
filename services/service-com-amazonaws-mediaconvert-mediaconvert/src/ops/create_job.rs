@@ -268,6 +268,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // `Tags` is written onto the job record itself, the one tag map `TagResource`,
+        // `UntagResource` and `ListTagsForResource` work on, so the set this request
+        // carries takes the record's own tests before anything is stored — the one rule
+        // in `crate::state::tags_to_store`, which every door onto a record's tags shares.
+        // (`UserMetadata` is not that map: it is the job's own metadata, which no tagging
+        // operation reads.)
+        let tags = match crate::state::tags_to_store(input.tags) {
+            Ok(tags) => tags,
+            Err(refusal) => return Err(tag_refusal_error(refusal).into()),
+        };
+
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
 
@@ -576,7 +587,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             simulate_reserved_queue: input.simulate_reserved_queue,
             user_metadata: input.user_metadata.unwrap_or_default().into_iter().collect(),
             client_request_token: token,
-            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            tags,
             timing: crate::state::JobTiming {
                 submit_time: Some(now),
                 start_time: None,
@@ -615,6 +626,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(CreateJobOutput {
             job: Some(job.view(&region)),
         })
+    }
+}
+
+/// The modelled error this operation answers a tag-set refusal with: the request-shaped
+/// one is a bad request and the quota-shaped one the quota error, both worded by
+/// [`crate::state::TagRefusal`] so every door onto a record's tags refuses alike.
+fn tag_refusal_error(refusal: crate::state::TagRefusal) -> CreateJobErrorModeled {
+    let message = Some(refusal.message());
+    match refusal {
+        crate::state::TagRefusal::EmptyKey => {
+            CreateJobErrorModeled::BadRequestException(BadRequestException { message })
+        }
+        crate::state::TagRefusal::PastCap => {
+            CreateJobErrorModeled::ServiceQuotaExceededException(ServiceQuotaExceededException {
+                message,
+            })
+        }
     }
 }
 

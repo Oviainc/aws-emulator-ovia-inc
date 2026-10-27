@@ -231,6 +231,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // `Tags` is written onto the record itself, the one tag map `TagResource`,
+        // `UntagResource` and `ListTagsForResource` work on, so the set this request
+        // carries takes the record's own tests before it is stored — the one rule in
+        // `crate::state::tags_to_store`, which every door onto a record's tags shares.
+        let tags = match crate::state::tags_to_store(input.tags) {
+            Ok(tags) => tags,
+            Err(refusal) => return Err(tag_refusal_error(refusal).into()),
+        };
+
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();
@@ -301,7 +310,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|settings| crate::state::reservation_plan(settings, now)),
             created_at: now,
             last_updated: now,
-            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            tags,
         };
 
         // The store owns the existence probe, the idempotent return and the insert
@@ -338,6 +347,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into())
             }
+        }
+    }
+}
+
+/// The modelled error this operation answers a tag-set refusal with: the request-shaped
+/// one is a bad request and the quota-shaped one the quota error, both worded by
+/// [`crate::state::TagRefusal`] so every door onto a record's tags refuses alike.
+fn tag_refusal_error(refusal: crate::state::TagRefusal) -> CreateQueueErrorModeled {
+    let message = Some(refusal.message());
+    match refusal {
+        crate::state::TagRefusal::EmptyKey => {
+            CreateQueueErrorModeled::BadRequestException(BadRequestException { message })
+        }
+        crate::state::TagRefusal::PastCap => {
+            CreateQueueErrorModeled::ServiceQuotaExceededException(ServiceQuotaExceededException {
+                message,
+            })
         }
     }
 }
