@@ -176,11 +176,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // does not narrow to its values — so a value the enum does not have is
         // refused here rather than stored and reported back as one AWS accepted.
         if !CONNECTION_AUTHORIZATION_TYPE_VALUES.contains(&input.authorization_type.as_str()) {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
+            return Err(crate::scaffolded::Scaffolded::validation(refused(&format!(
                 "Parameter AuthorizationType is not valid. Reason: {:?} is not one of {}.",
                 input.authorization_type,
                 CONNECTION_AUTHORIZATION_TYPE_VALUES.join(" | ")
-            )));
+            ))));
         }
 
         // "You must include only authorization parameters for the
@@ -191,7 +191,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.authorization_type,
             &input.auth_parameters,
         ) {
-            return Err(crate::scaffolded::Scaffolded::validation(reason));
+            return Err(crate::scaffolded::Scaffolded::validation(refused(&reason)));
         }
 
         // The endpoint a token is obtained from is an `HttpsEndpoint`, so a
@@ -205,7 +205,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::authorization_endpoint_violation(&oauth.authorization_endpoint)
             })
         {
-            return Err(crate::scaffolded::Scaffolded::validation(reason));
+            return Err(crate::scaffolded::Scaffolded::validation(refused(&reason)));
         }
 
         let region = crate::state::request_region(ctx.parts());
@@ -243,7 +243,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if store.connection(&input.name).is_some() {
                 return Err(CreateConnectionErrorModeled::ResourceAlreadyExistsException(
                     ResourceAlreadyExistsException {
-                        message: Some(format!("Connection {} already exists.", input.name)),
+                        message: Some(refused(&format!(
+                            "Connection {} already exists.",
+                            input.name
+                        ))),
                     },
                 )
                 .into());
@@ -251,10 +254,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if store.connections.len() >= crate::state::MAX_CONNECTIONS {
                 return Err(CreateConnectionErrorModeled::LimitExceededException(
                     LimitExceededException {
-                        message: Some(format!(
+                        message: Some(refused(&format!(
                             "The account already holds the maximum of {} connections.",
                             crate::state::MAX_CONNECTIONS
-                        )),
+                        ))),
                     },
                 )
                 .into());
@@ -347,6 +350,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         Ok(created)
     }
+}
+
+/// The verb of THIS call, as the clause every one of its refusals opens with
+/// names it ([`crate::state::connection_refusal`]).
+const VERB: &str = "create";
+
+/// One refusal of this call: the clause naming the call that failed and then
+/// `reason`.
+fn refused(reason: &str) -> String {
+    crate::state::connection_refusal(VERB, reason)
 }
 
 /// Why the submitted authorization parameters do not match the authorization
