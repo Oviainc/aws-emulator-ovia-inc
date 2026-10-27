@@ -924,12 +924,30 @@ impl ComAmazonawsGlueAwsglueState {
         database_name: &str,
         table_name: &str,
     ) -> Option<&ColumnStatisticsTaskRunEntry> {
-        self.column_statistics_task_runs.iter().find(|run| {
-            !run.is_terminal()
-                && run.catalog_id == catalog_id
-                && run.database_name == fold_name(database_name)
-                && run.table_name == fold_name(table_name)
-        })
+        let database = fold_name(database_name);
+        let table = fold_name(table_name);
+        self.column_statistics_task_runs
+            .iter()
+            .find(|run| run.is_running_for(catalog_id, &database, &table))
+    }
+
+    /// The column statistics task run of this table that has not finished, mutably: the
+    /// one `StopColumnStatisticsTaskRun` moves into its stopped state.
+    ///
+    /// The lookup rule is [`Self::running_column_statistics_task_run`]'s — both ask
+    /// [`ColumnStatisticsTaskRunEntry::is_running_for`] — so the run a stop ends is
+    /// exactly the run a second start would have been refused for.
+    pub fn running_column_statistics_task_run_mut(
+        &mut self,
+        catalog_id: &str,
+        database_name: &str,
+        table_name: &str,
+    ) -> Option<&mut ColumnStatisticsTaskRunEntry> {
+        let database = fold_name(database_name);
+        let table = fold_name(table_name);
+        self.column_statistics_task_runs
+            .iter_mut()
+            .find(|run| run.is_running_for(catalog_id, &database, &table))
     }
 
     /// The LAST column statistics task run started for this table, or `None` when none
@@ -6647,19 +6665,11 @@ pub mod messages {
     }
 
     /// A column statistics task settings read (`GetColumnStatisticsTaskSettings`) for a
-    /// table no create has written settings for. NOT recorded: what is pinned is the
-    /// behaviour — 400 with the operation's modelled `EntityNotFoundException` — and the
-    /// sentence names the table the request addressed, the way
-    /// [`column_statistics_task_already_running`] names its table.
-    pub fn column_statistics_task_settings_not_found(
-        database_name: &str,
-        table_name: &str,
-    ) -> String {
-        format!(
-            "Column statistics task settings for table {database_name}.{table_name} do not \
-             exist"
-        )
-    }
+    /// table no create has written settings for. RECORDED constant: the whole sentence is
+    /// fixed — it names the MEMBERS the request addressed the entry by rather than the
+    /// values it sent, so neither the database nor the table name appears in it.
+    pub const COLUMN_STATISTICS_TASK_SETTINGS_NOT_FOUND: &str =
+        "ColumnStatisticsTaskSettings entry for input DatabaseName and TableName does not exist";
 
     /// `CreateColumnStatisticsTaskSettings` for a table whose settings a create already
     /// wrote. NOT recorded: inferred from the recorded `CreateDatabase` duplicate, like
@@ -6668,17 +6678,30 @@ pub mod messages {
     pub const COLUMN_STATISTICS_TASK_SETTINGS_ALREADY_EXIST: &str =
         "Column statistics task settings already exist.";
 
-    /// `StartColumnStatisticsTaskRun` for a table that already has a run in flight. NOT
-    /// recorded: what is pinned is the behaviour — 400 with the operation's modelled
-    /// `ColumnStatisticsTaskRunningException`, "thrown when you try to start another job
-    /// while running a column stats generation job" — and the sentence names the table the
-    /// request addressed, the way the recorded per-resource templates name their resource.
-    pub fn column_statistics_task_already_running(database_name: &str, table_name: &str) -> String {
-        format!(
-            "A column statistics generation job is already running for table \
-             {database_name}.{table_name}"
-        )
-    }
+    /// `StartColumnStatisticsTaskRun` for a table that already has a run in flight — the
+    /// operation's modelled `ColumnStatisticsTaskRunningException`, "thrown when you try
+    /// to start another job while running a column stats generation job". RECORDED
+    /// constant: the whole sentence is fixed, naming neither the database, the table nor
+    /// the in-flight run, so a client can recognise the transient conflict by the text
+    /// alone.
+    pub const COLUMN_STATISTICS_TASK_RUN_ALREADY_STARTED: &str =
+        "Column Statistics task for input table has already started";
+
+    /// `CreateColumnStatisticsTaskSettings` while a statistics run of the addressed table
+    /// is in flight — the same modelled `ColumnStatisticsTaskRunningException`. RECORDED
+    /// constant, and a SEPARATE string from the start's above: the two recorded sentences
+    /// differ in the case of "statistics", so each operation answers with its own rather
+    /// than sharing one.
+    pub const COLUMN_STATISTICS_TASK_SETTINGS_RUN_ALREADY_STARTED: &str =
+        "Column statistics task for input table has already started";
+
+    /// `StopColumnStatisticsTaskRun` for a table with no statistics run in flight — the
+    /// operation's modelled `ColumnStatisticsTaskNotRunningException`, "thrown when you
+    /// try to stop a task run when there is no task running". NOT recorded: what is
+    /// pinned is the behaviour, and the sentence is fixed like the in-flight refusals
+    /// above, naming neither the database nor the table.
+    pub const COLUMN_STATISTICS_TASK_NOT_RUNNING: &str =
+        "Column Statistics task for input table is not running";
 
     /// `CreateRegistry` for a `RegistryName` this account already holds. NOT recorded
     /// either: inferred from the recorded `CreateDatabase` duplicate, like
@@ -6760,8 +6783,8 @@ pub mod messages {
     /// `StartDataQualityRuleRecommendationRun` for a data source whose recommendation run
     /// has not finished. NOT recorded: what is pinned is the behaviour — 400 with the
     /// operation's modelled `ConflictException` — and the sentence names the table the
-    /// request addressed, the way [`column_statistics_task_already_running`] names its
-    /// table.
+    /// request addressed, the way the recorded per-resource templates name their
+    /// resource.
     pub fn data_quality_run_already_running(database_name: &str, table_name: &str) -> String {
         format!(
             "A data quality rule recommendation run is already in progress for table \
@@ -6809,12 +6832,17 @@ pub mod messages {
     pub const PARTITION_ALREADY_EXISTS: &str = "Partition already exists.";
 
     /// A partition read (`GetPartition`) for a value list the addressed table holds no
-    /// partition for. NOT recorded: the wording follows [`table_not_found`], the refusal
-    /// for the resource one step up, and carries only the values the request addressed —
-    /// which are the whole address of a partition within its table.
-    pub fn partition_not_found(values: &[String]) -> String {
-        format!("Partition [{}] not found.", values.join(", "))
-    }
+    /// partition for. RECORDED constant: the whole sentence is fixed — it names neither
+    /// the values the request addressed nor the table they were looked for in.
+    pub const PARTITION_NOT_FOUND: &str = "Cannot find partition.";
+
+    /// A partition-metadata read of the Lake Formation application-integration surface
+    /// (`GetUnfilteredPartitionMetadata`, `GetUnfilteredPartitionsMetadata`) made with
+    /// ordinary credentials rather than through a vended query session. RECORDED: the
+    /// refusal carries NO wording at all — an empty message — so it discloses nothing
+    /// about the catalog, and in particular nothing about whether the addressed partition
+    /// exists.
+    pub const UNFILTERED_PARTITION_METADATA_ACCESS_DENIED: &str = "";
 
     /// `CreateSecurityConfiguration` for a name already taken. NOT recorded: inferred
     /// from the recorded `CreateDatabase` duplicate, like [`CRAWLER_ALREADY_EXISTS`] —
@@ -7286,6 +7314,28 @@ pub fn to_date_time(at: SystemTime) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from_secs_f64(since_epoch.as_secs_f64())
 }
 
+/// How many digits the instant part of a continuation token is padded to, so the token
+/// orders the same way as a string as the instant it names orders as a number. Twenty
+/// digits hold any nanosecond count this clock can report.
+const CURSOR_INSTANT_DIGITS: usize = 20;
+
+/// One record's place in a time-ordered listing, as that listing's continuation token
+/// renders it: the instant the listing orders by, zero-padded so the string orders as the
+/// number does, then the record's own id to separate two records stamped in the same
+/// nanosecond.
+///
+/// ONE copy, shared by every listing of this crate that pages over a run history
+/// (`GetJobRuns`, `GetColumnStatisticsTaskRuns`), so the token format cannot drift between
+/// them. Comparing a token against this key is what resumes a page, which is why any
+/// string a request sends names a well-defined place in the order.
+pub fn history_page_cursor(ordered_by: SystemTime, id: &str) -> String {
+    let at = ordered_by
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{at:0CURSOR_INSTANT_DIGITS$}:{id}")
+}
+
 /// The `ColumnStatisticsState` a column statistics task run is recorded in by
 /// `StartColumnStatisticsTaskRun`: the first of the modelled enum
 /// (`STARTING | RUNNING | SUCCEEDED | FAILED | STOPPED`), because the run has been
@@ -7294,12 +7344,19 @@ pub const COLUMN_STATISTICS_TASK_RUN_STATE_STARTING: &str = "STARTING";
 /// See [`COLUMN_STATISTICS_TASK_RUN_STATE_STARTING`].
 pub const COLUMN_STATISTICS_TASK_RUN_STATE_FAILED: &str = "FAILED";
 
+/// See [`COLUMN_STATISTICS_TASK_RUN_STATE_STARTING`]: the state
+/// `StopColumnStatisticsTaskRun` leaves the run it stopped in.
+pub const COLUMN_STATISTICS_TASK_RUN_STATE_STOPPED: &str = "STOPPED";
+
 /// The `ColumnStatisticsState` values a column statistics task run never moves out of
 /// again: of the modelled enum quoted on
 /// [`COLUMN_STATISTICS_TASK_RUN_STATE_STARTING`], the ones that name a finished run. The
 /// other two (`STARTING`, `RUNNING`) each still owe a further state.
-pub const TERMINAL_COLUMN_STATISTICS_TASK_RUN_STATES: [&str; 3] =
-    ["SUCCEEDED", "FAILED", "STOPPED"];
+pub const TERMINAL_COLUMN_STATISTICS_TASK_RUN_STATES: [&str; 3] = [
+    "SUCCEEDED",
+    COLUMN_STATISTICS_TASK_RUN_STATE_FAILED,
+    COLUMN_STATISTICS_TASK_RUN_STATE_STOPPED,
+];
 
 /// How long a column statistics task run stays in
 /// [`COLUMN_STATISTICS_TASK_RUN_STATE_STARTING`] before the clock owes it its terminal
@@ -7457,6 +7514,19 @@ impl ColumnStatisticsTaskRunEntry {
         TERMINAL_COLUMN_STATISTICS_TASK_RUN_STATES.contains(&self.status.as_str())
     }
 
+    /// Whether this run is the one in flight for that catalog, database and table: it has
+    /// not finished and it covers exactly that table.
+    ///
+    /// ONE predicate, so the run a start is refused for, the run a settings create is
+    /// refused for and the run a stop ends cannot drift apart. `database` and `table` are
+    /// already folded the way the catalog stores them ([`fold_name`]).
+    pub fn is_running_for(&self, catalog_id: &str, database: &str, table: &str) -> bool {
+        !self.is_terminal()
+            && self.catalog_id == catalog_id
+            && self.database_name == database
+            && self.table_name == table
+    }
+
     /// Move this run into the status the clock owed it at `now`, if it owed one.
     ///
     /// The run was due to leave [`COLUMN_STATISTICS_TASK_RUN_STATE_STARTING`] at
@@ -7475,6 +7545,18 @@ impl ColumnStatisticsTaskRunEntry {
         self.error_message = Some(COLUMN_STATISTICS_TASK_RUN_NOT_EXECUTED_MESSAGE.to_string());
         self.end_time = Some(due);
         self.last_updated = due;
+    }
+
+    /// Move this run into the state a stop leaves it in.
+    ///
+    /// Of the modelled `ColumnStatisticsState` values the one that names a run somebody
+    /// stopped, which is terminal — so the run owes the clock no further state, its end
+    /// instant is the stop, and it carries no failure reason: nothing failed.
+    pub fn stop(&mut self, now: SystemTime) {
+        self.settles_at = None;
+        self.status = COLUMN_STATISTICS_TASK_RUN_STATE_STOPPED.to_string();
+        self.end_time = Some(now);
+        self.last_updated = now;
     }
 
     /// This run as the `ExecutionAttempt` a settings read reports: "a run attempt for a
