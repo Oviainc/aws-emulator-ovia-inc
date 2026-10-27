@@ -12,8 +12,17 @@
 //! sort key. The expression grammar is parsed here — it is DynamoDB's own, so there
 //! is no third-party parser for it — by [`parse_key_condition_expression`].
 //!
-//! Secondary indexes, result filters (`FilterExpression`, `QueryFilter`) and
-//! projections are refused with the scaffold's 501 and filed as their own gap
+//! `FilterExpression` is applied AFTER the key conditions have selected the page —
+//! "a filter expression is applied after a Query finishes, but before the results are
+//! returned" — so the items it removes are still read and still charged for, and
+//! `ScannedCount` therefore counts what the page evaluated while `Count` counts what
+//! it answered. It is the `ConditionExpression` language, parsed by the one parser
+//! this crate has for it ([`crate::state::ParsedCondition`]), and it "does not allow
+//! key attributes".
+//!
+//! Secondary indexes, the legacy result filters (`QueryFilter`,
+//! `ConditionalOperator`) and projections are refused with the scaffold's 501 and
+//! filed as their own gap
 //! issues. `ConsistentRead` needs no handling beyond its effect on
 //! `ConsumedCapacity`: this store has one copy of each item.
 //!
@@ -345,22 +354,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         let name = crate::state::resolve_table_name(&input.table_name).map_err(lift)?;
 
-        // A `FilterExpression` the request sends is VALIDATED whether or not the
-        // filtering itself is served, for the reason `Scan` gives: whether the
-        // expression is one this service's language accepts is a fact of the request.
-        if let Some(expression) = input.filter_expression.as_deref() {
-            crate::state::ParsedCondition::parse(
-                "FilterExpression",
-                expression,
-                crate::state::Substitutions::new(
-                    input.expression_attribute_names.as_ref(),
-                    input.expression_attribute_values.as_ref(),
-                ),
-            )
-            .map_err(lift)?;
+        // A request may not state its filter twice: the legacy `QueryFilter` and
+        // `ConditionalOperator` are what `FilterExpression` replaces ("This is a
+        // legacy parameter. Use FilterExpression instead"), so a request carrying
+        // both is refused the way the service refuses it, before either is read.
+        if input.filter_expression.is_some() {
+            if input.query_filter.as_ref().is_some_and(|map| !map.is_empty()) {
+                return Err(lift(crate::state::expression_conflict(
+                    "QueryFilter",
+                    "FilterExpression",
+                )));
+            }
+            if input.conditional_operator.is_some() {
+                return Err(lift(crate::state::expression_conflict(
+                    "ConditionalOperator",
+                    "FilterExpression",
+                )));
+            }
         }
-        // A `ProjectionExpression` the request sends is validated the same way, and for
-        // the same reason.
+        // A `ProjectionExpression` the request sends is VALIDATED whether or not the
+        // projection itself is served, for the reason `Scan` gives: whether the
+        // expression is one this service's language accepts is a fact of the request.
         if let Some(expression) = input.projection_expression.as_deref() {
             crate::state::projection_expression_attributes(
                 "ProjectionExpression",
@@ -390,6 +404,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let comparisons = key_comparisons(&input).map_err(lift)?;
+        // "A filter expression is applied after a Query finishes, but before the
+        // results are returned" (`Query$FilterExpression`): the same
+        // `ConditionExpression` language `Scan` filters with, judged against each
+        // item the key conditions selected. Parsed BEFORE the store is read, so an
+        // expression the service would refuse is refused without reading anything.
+        let filter = match input.filter_expression.as_deref() {
+            Some(expression) => Some(
+                crate::state::ParsedCondition::parse(
+                    "FilterExpression",
+                    expression,
+                    crate::state::Substitutions::new(
+                        input.expression_attribute_names.as_ref(),
+                        input.expression_attribute_values.as_ref(),
+                    ),
+                )
+                .map_err(lift)?,
+            ),
+            None => None,
+        };
 
         let mut store = state.lock();
         store.apply_due_transitions(now);
@@ -400,6 +433,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::access_denied(denial));
         }
         let condition = KeyCondition::resolve(table, comparisons).map_err(lift)?;
+        // "A FilterExpression does not allow key attributes. You cannot define a
+        // filter expression based on a partition key or a sort key": which attributes
+        // the expression reads comes from the parsed tree, judged against the table's
+        // own key schema.
+        if let Some(filter) = &filter {
+            if let Some(key) = filter
+                .attribute_reads()
+                .keys()
+                .find(|attribute| table.is_table_key(attribute))
+            {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "Filter Expression can only contain non-primary key attributes: \
+                     Primary key attribute: {key}"
+                )));
+            }
+        }
 
         // One partition's items are contiguous in the store and already in sort-key
         // order, so this is a range scan rather than a table walk.
@@ -470,16 +519,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let items: Vec<crate::state::Item> =
             matched.iter().map(|(_, item)| (*item).clone()).collect();
-        // Nothing is filtered out after the key conditions (FilterExpression is not
-        // served here), so every item examined is an item returned: "If you did not
-        // use a filter in the request, then Count and ScannedCount are the same"
-        // (`Query$Count`).
-        let count = i32::try_from(items.len()).unwrap_or(i32::MAX);
+        // "A filter expression is applied after a Query finishes": every item the
+        // page read is scanned — and charged for — and the ones the filter does not
+        // match are left out of the response. "ScannedCount [is] the number of items
+        // evaluated, before any QueryFilter is applied"; with no filter, "Count and
+        // ScannedCount are the same" (`Query$Count`).
+        let scanned_count = i32::try_from(items.len()).unwrap_or(i32::MAX);
+        let mut kept: Vec<crate::state::Item> = Vec::with_capacity(items.len());
+        for item in items {
+            let keep = match &filter {
+                Some(filter) => filter.evaluate(Some(&item)).map_err(lift)?,
+                None => true,
+            };
+            if keep {
+                kept.push(item);
+            }
+        }
+        let count = i32::try_from(kept.len()).unwrap_or(i32::MAX);
 
         Ok(QueryOutput {
-            items: if count_only { None } else { Some(items) },
+            items: if count_only { None } else { Some(kept) },
             count,
-            scanned_count: count,
+            scanned_count,
             last_evaluated_key,
             consumed_capacity: crate::state::consumed_capacity(
                 input.return_consumed_capacity.as_deref(),
@@ -528,9 +589,6 @@ fn lift(error: crate::state::RequestError) -> QueryError {
 fn unsupported_member(input: &QueryInput) -> Option<&'static str> {
     if input.index_name.is_some() {
         return Some("IndexName");
-    }
-    if input.filter_expression.is_some() {
-        return Some("FilterExpression");
     }
     if input.query_filter.as_ref().is_some_and(|map| !map.is_empty()) {
         return Some("QueryFilter");

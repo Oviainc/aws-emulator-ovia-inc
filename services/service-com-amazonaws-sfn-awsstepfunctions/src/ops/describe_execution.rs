@@ -269,14 +269,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Executions of an EXPRESS state machine aren't supported by
         // DescribeExecution unless a Map Run dispatched them": an Express execution
-        // this emulator started was not dispatched by a Map Run, so there is nothing
-        // for this operation to report about it — which is the same refusal as for an
-        // execution that is not there, worded the way the service words it.
+        // this emulator started on its own was not dispatched by a Map Run, so there
+        // is nothing for this operation to report about it — which is the same
+        // refusal as for an execution that is not there, worded the way the service
+        // words it.
         let express = store
             .state_machines
             .get(&execution.state_machine_arn)
             .is_some_and(|machine| machine.sm_type == crate::state::STATE_MACHINE_TYPE_EXPRESS);
-        if express {
+        if express && !execution.is_map_run_child() {
             return Err(DescribeExecutionErrorModeled::ExecutionDoesNotExist(
                 ExecutionDoesNotExist {
                     message: Some(crate::state::resource_error_message(
@@ -298,13 +299,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // otherwise, and `redriveStatusReason` carries the documented reason only in
         // the second case. Both come from the ONE predicate `RedriveExecution`
         // itself reads, so what this reports cannot disagree with what that call
-        // does. `REDRIVABLE_BY_MAP_RUN` belongs to an execution a Map Run
-        // dispatched, and no Map Run can dispatch one in this emulator.
+        // does. A CHILD workflow execution of a Distributed Map is redriven by
+        // redriving the Map Run that started it rather than by its own ARN, so one
+        // the same predicate would redrive reports `REDRIVABLE_BY_MAP_RUN`: "for a
+        // Distributed Map that includes child workflows [...] redriveStatus
+        // indicates whether or not the Map Run can redrive child workflow
+        // executions".
         let (redrive_status, redrive_status_reason) =
             match store.not_redrivable_reason(execution, now) {
                 Some(reason) => (
                     crate::state::REDRIVE_STATUS_NOT_REDRIVABLE.to_string(),
                     Some(reason.to_string()),
+                ),
+                None if execution.is_map_run_child() => (
+                    crate::state::REDRIVE_STATUS_REDRIVABLE_BY_MAP_RUN.to_string(),
+                    None,
                 ),
                 None => (crate::state::REDRIVE_STATUS_REDRIVABLE.to_string(), None),
             };
@@ -321,7 +330,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             output: execution.output.clone(),
             output_details: execution.output.as_ref().and(included),
             trace_header: execution.trace_header.clone(),
-            map_run_arn: None,
+            // "The Amazon Resource Name (ARN) that identifies a Map Run, which
+            // dispatched this execution": the Map Run the record belongs to, and null
+            // for an execution no Map Run dispatched.
+            map_run_arn: execution.map_run_arn.clone(),
             error: execution.error.clone(),
             cause: execution.cause.clone(),
             // The alias and version the start was made through, which the execution

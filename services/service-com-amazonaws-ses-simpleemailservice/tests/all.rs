@@ -57,6 +57,8 @@ mod ses_template_listing;
 mod ses_template_update;
 #[path = "all/ses_update_receipt_rule.rs"]
 mod ses_update_receipt_rule;
+#[path = "all/ses_verify_email_address.rs"]
+mod ses_verify_email_address;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 // The `z`-prefixed service-wide suites sort after the per-operation ones;

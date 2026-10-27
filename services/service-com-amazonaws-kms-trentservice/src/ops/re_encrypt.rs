@@ -14,13 +14,12 @@
 //! plaintext never leaves the handler, and the two reported key material ids are read
 //! from the material that actually did each half.
 //!
-//! One deliberate divergence, the same one `Encrypt` and `Decrypt` carry: `GrantTokens`.
-//! A request that presents one is treated as drawing its permission FROM the grant the
-//! token names — the grant must be on that key, permit `ReEncryptFrom` (source) or
-//! `ReEncryptTo` (destination), and have its encryption-context constraints met. In the
-//! real service a grant token is ADDITIVE, but a handler here has no caller identity to
-//! evaluate a key or IAM policy against, so a presented token is the only permission
-//! there is to judge.
+//! Permission is the service's one authorization decision
+//! ([`crate::state::authorization`]), taken SEPARATELY for the two halves — the source
+//! key under `ReEncryptFrom` and the destination key under `ReEncryptTo`, each with its
+//! own encryption context — from the key's own key policy, the calling principal's
+//! identity policies and the grants in force, with the presented-token divergence
+//! [`crate::state::authorization::authorize`] records.
 //!
 //! ## Shape of an operation
 //!
@@ -317,6 +316,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // Who the request speaks for, resolved BEFORE this service's store is locked, so
+        // the IAM and STS stores the resolution reads are never reached while this
+        // service's guard is held.
+        let caller = crate::state::authorization::caller(&*self.engine, ctx);
         let region = crate::state::request_region(ctx);
         let mut state = state.lock();
 
@@ -368,6 +371,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 Err(crate::state::GrantRefusal::NotAuthorized) => Vec::new(),
             };
+            // `None` once the request presents no grant token at all, which is what
+            // makes the caller's own authorities decide instead.
+            let presented = (!tokens.is_empty()).then_some(grants.as_slice());
 
             let source_key = match &envelope {
                 Some(envelope) => {
@@ -489,24 +495,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
 
-            // Each half draws on its own grant permission and its own encryption
-            // context, which is why KMS grants the two halves separately.
-            if !tokens.is_empty() {
-                for (key, grant_operation, context) in [
-                    (
-                        source_key,
-                        GRANT_OPERATION_RE_ENCRYPT_FROM,
-                        input.source_encryption_context.as_ref(),
-                    ),
-                    (
-                        destination_key,
-                        GRANT_OPERATION_RE_ENCRYPT_TO,
-                        input.destination_encryption_context.as_ref(),
-                    ),
-                ] {
-                    if let Some(refusal) = grant_refusal(&grants, key, grant_operation, context) {
-                        return Err(refusal);
-                    }
+            // Each half draws on its own permission and its own encryption context,
+            // which is why KMS authorizes the two halves separately.
+            for (key, grant_operation, context) in [
+                (
+                    source_key,
+                    GRANT_OPERATION_RE_ENCRYPT_FROM,
+                    input.source_encryption_context.as_ref(),
+                ),
+                (
+                    destination_key,
+                    GRANT_OPERATION_RE_ENCRYPT_TO,
+                    input.destination_encryption_context.as_ref(),
+                ),
+            ] {
+                if let Err(message) = crate::state::authorization::authorize(
+                    &caller,
+                    &state,
+                    &region,
+                    key,
+                    grant_operation,
+                    context,
+                    presented,
+                ) {
+                    return Err(crate::scaffolded::Scaffolded::access_denied(message));
                 }
             }
 
@@ -556,7 +568,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 destination_arn: destination_key.arn.clone(),
                 // The material that sealed the new ciphertext, which is the destination
                 // key's current one.
-                destination_key_material_id: destination_key.material.id(),
+                destination_key_material_id: destination_key.reported_key_material_id(),
                 destination_algorithm,
             }
         };
@@ -666,25 +678,6 @@ fn capability_refusal(
         )));
     }
     None
-}
-
-/// Refuse one half of the operation when no grant the request's tokens name carries the
-/// permission it needs on that key.
-fn grant_refusal(
-    grants: &[&crate::state::Grant],
-    key: &crate::state::Cmk,
-    grant_operation: &str,
-    context: Option<&::std::collections::HashMap<String, String>>,
-) -> Option<ReEncryptError> {
-    if grants
-        .iter()
-        .any(|grant| grant.permits(&key.key_id, grant_operation, context))
-    {
-        return None;
-    }
-    Some(crate::scaffolded::Scaffolded::access_denied(
-        crate::state::grant_access_denied_message(grant_operation, &key.arn),
-    ))
 }
 
 /// Refuse a key or algorithm that cannot perform this operation.

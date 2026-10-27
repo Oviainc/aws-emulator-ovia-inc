@@ -33,7 +33,15 @@
 //! * a **map run**, the resource a Distributed Map state starts, keyed by its own ARN
 //!   (`arn:aws:states:<region>:<account>:mapRun:<stateMachineName>/<label>:<id>`),
 //!   with `map_runs_by_execution` listing one execution's map runs in the order their
-//!   states were entered so `ListMapRuns` pages the same way.
+//!   states were entered so `ListMapRuns` pages the same way;
+//! * a **child workflow execution**, the execution ONE item of a Distributed Map
+//!   state ran as. It is an execution like any other — the same record, keyed by its
+//!   own ARN
+//!   (`arn:aws:states:<region>:<account>:execution:<stateMachineName>/<label>:<id>`)
+//!   — and `executions_by_map_run` lists one map run's children in the order their
+//!   items started, which is the index `ListExecutions(mapRunArn)` pages. A child is
+//!   indexed there and NOT under its state machine, so `ListExecutions` for the
+//!   parent's state machine reports the executions started on it and none of them.
 //!
 //! ## What the clock owes
 //!
@@ -55,7 +63,8 @@
 //!   `DELETING` now and is removed once [`DELETE_SETTLE_DELAY`] has passed.
 //! * a map run a Distributed Map state started is `RUNNING` until the instant its
 //!   items were due, so a caller that lists or describes it straight after the start
-//!   sees it running, exactly as the execution around it is.
+//!   sees it running, exactly as the execution around it is — and so is each child
+//!   workflow execution it started, until the instant its own item finished.
 //!
 //! Nothing sleeps: the due instant is stored and [`ComAmazonawsSfnAwsstepfunctionsState::settle`]
 //! materialises whatever the clock has already made due. That is the only write a
@@ -305,6 +314,13 @@ pub const REDRIVE_STATUS_REDRIVABLE: &str = "REDRIVABLE";
 /// ExecutionNotRedrivable error".
 pub const REDRIVE_STATUS_NOT_REDRIVABLE: &str = "NOT_REDRIVABLE";
 
+/// `ExecutionRedriveStatus`'s value for a CHILD workflow execution of a Distributed
+/// Map state that its Map Run could redrive: "for a Distributed Map that includes
+/// child workflows [...] redriveStatus indicates whether or not the Map Run can
+/// redrive child workflow executions". A child is redriven by redriving the Map Run
+/// that started it, so this is what one reports instead of `REDRIVABLE`.
+pub const REDRIVE_STATUS_REDRIVABLE_BY_MAP_RUN: &str = "REDRIVABLE_BY_MAP_RUN";
+
 // The `redriveStatusReason` values below are the ones that member's own
 // documentation lists verbatim, so the reason this emulator reports is a reason the
 // service publishes rather than wording of its own.
@@ -465,6 +481,9 @@ pub const EVENT_ACTIVITY_SUCCEEDED: &str = "ActivitySucceeded";
 
 /// The history event an execution that one of its states failed ends on.
 pub const EVENT_EXECUTION_FAILED: &str = "ExecutionFailed";
+
+/// The history event an execution that reached its end ends on.
+pub const EVENT_EXECUTION_SUCCEEDED: &str = "ExecutionSucceeded";
 
 // ---------------------------------------------------------------------------
 // Store bounds
@@ -1312,6 +1331,11 @@ pub struct RedriveToken {
 
 /// One stored execution: every member `DescribeExecution` and `ListExecutions`
 /// report.
+///
+/// Both the execution a `StartExecution` began and the CHILD workflow execution one
+/// item of a Distributed Map state ran as are this one record: a child is an
+/// execution in its own right, reached by its own ARN, and [`Execution::map_run_arn`]
+/// is what tells the two apart.
 #[derive(Debug, Clone)]
 pub struct Execution {
     pub arn: String,
@@ -1345,7 +1369,24 @@ pub struct Execution {
     /// updated — so this is what `DescribeStateMachineForExecution` reports and what
     /// a redrive re-runs, however the state machine (or the version it was published
     /// from) has moved since.
-    pub ran: RanConfiguration,
+    ///
+    /// SHARED: the child workflow executions a Distributed Map state of this
+    /// execution started run the same state machine this one does, so each of them
+    /// holds this very snapshot rather than a copy of a definition the model bounds
+    /// at 1 MiB. That is why only the record that does not belong to a Map Run counts
+    /// its bytes in [`Execution::measure`].
+    pub ran: std::sync::Arc<RanConfiguration>,
+    /// The Map Run that started this execution, for a CHILD workflow execution one of
+    /// a Distributed Map state's items ran as; `None` for an execution a
+    /// `StartExecution` began.
+    ///
+    /// It is what `ListExecutions` enumerates a Map Run's children by, and what
+    /// `DescribeExecution` reports in `mapRunArn`.
+    pub map_run_arn: Option<String>,
+    /// "The total number of items processed in a child workflow execution", for a
+    /// child; `None` for an execution that is not one, which processes no items of a
+    /// Map Run.
+    pub item_count: Option<i32>,
     pub redrive_count: i32,
     /// The instant the last successful `RedriveExecution` redrove this execution;
     /// `None` until one has, which is what `redriveDate`'s own documentation says it
@@ -1386,6 +1427,12 @@ impl Execution {
         self.status != EXECUTION_STATUS_RUNNING
     }
 
+    /// Whether this is a CHILD workflow execution a Distributed Map state started,
+    /// which is the one a Map Run enumerates and redrives.
+    pub fn is_map_run_child(&self) -> bool {
+        self.map_run_arn.is_some()
+    }
+
     /// The bytes this record would retain, including the outcome the interpreter
     /// already computed for it: that outcome is allocated at `StartExecution` and
     /// only moved into the record later, so it counts from the moment the execution
@@ -1406,7 +1453,15 @@ impl Execution {
                 .as_ref()
                 .map_or(0, String::len)
             + self.state_machine_alias_arn.as_ref().map_or(0, String::len)
-            + self.ran.measure()
+            + self.map_run_arn.as_ref().map_or(0, String::len)
+            // The configuration is SHARED with the child workflow executions this
+            // execution's Distributed Map states started, so its bytes are counted
+            // once, on the record that owns it.
+            + if self.is_map_run_child() {
+                0
+            } else {
+                self.ran.measure()
+            }
             + redrive_tokens_bytes(&self.redrive_tokens)
             + history_bytes(&self.history)
             + self.redrive_step.as_ref().map_or(0, asl::RedriveStep::measure)
@@ -1833,6 +1888,12 @@ pub struct ComAmazonawsSfnAwsstepfunctionsState {
     /// Every execution, keyed by its ARN.
     pub executions: BTreeMap<String, Execution>,
     /// One state machine's execution ARNs in start order.
+    ///
+    /// The CHILD workflow executions a Distributed Map state started are NOT listed
+    /// here: "`ListExecutions` [...] returns the child workflow executions of a Map
+    /// Run" only when it is asked for that Map Run, so a child is indexed under the
+    /// Map Run that started it ([`Self::executions_by_map_run`]) and the parent state
+    /// machine's listing holds the executions that were started on it.
     pub executions_by_sm: HashMap<String, Vec<String>>,
     /// Every Map Run a Distributed Map state started, keyed by its own ARN — the one
     /// name `DescribeMapRun` and `UpdateMapRun` reach it by.
@@ -1840,6 +1901,11 @@ pub struct ComAmazonawsSfnAwsstepfunctionsState {
     /// One execution's Map Run ARNs in the order their `Map` states were entered, so
     /// `ListMapRuns` pages one execution's Map Runs without walking the whole store.
     pub map_runs_by_execution: HashMap<String, Vec<String>>,
+    /// One Map Run's CHILD workflow execution ARNs in the order their items were
+    /// started, so `ListExecutions` pages one Map Run's children without walking the
+    /// whole store — the index `executions_by_sm` is for a state machine's own
+    /// executions.
+    pub executions_by_map_run: HashMap<String, Vec<String>>,
     /// Every outstanding activity task, keyed by the `taskToken` that names it — the
     /// one name the worker holding it has, and what `SendTaskHeartbeat`,
     /// `SendTaskSuccess` and `SendTaskFailure` resolve it by.
@@ -3495,6 +3561,9 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
                 self.retained_bytes = self.retained_bytes.saturating_sub(map_run.retained_bytes);
             }
             self.pending_map_runs.retain(|pending| pending != &arn);
+            // A record that is no longer a Map Run of this execution takes the child
+            // workflow executions it had started with it.
+            self.discard_child_executions_of(&arn);
         }
         self.map_runs_by_execution
             .insert(execution_arn.to_string(), recorded);
@@ -3594,7 +3663,153 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             .saturating_sub(retained_before);
         self.pending_map_runs.retain(|pending| pending != &arn);
         self.pending_map_runs.push(arn.clone());
-        self.map_runs.insert(arn, record);
+        self.map_runs.insert(arn.clone(), record);
+        // The children of the attempt this record is REPLACING belong to a run of
+        // this `Map` state that happened before: a redrive re-ran the state, so the
+        // executions it started then are gone and the ones it started now take their
+        // place under the same Map Run.
+        self.discard_child_executions_of(&arn);
+        self.record_child_executions(&arn, execution_arn, plan.children);
+    }
+
+    /// Store the CHILD workflow executions one Map Run's items ran as, and index them
+    /// under that Map Run.
+    ///
+    /// Each one is an execution in its own right, with the input its item was handed
+    /// and the terminal status its iteration reached owed to the clock exactly as the
+    /// Map Run's own status is — so a caller reading one straight after the start sees
+    /// it `RUNNING`. It runs the state machine its PARENT ran, which is the state
+    /// machine the Map Run reports, so it holds that parent's configuration snapshot
+    /// rather than a copy of it.
+    ///
+    /// Called with the bytes already admitted ([`PlannedChildExecution::measure`]).
+    fn record_child_executions(
+        &mut self,
+        map_run_arn: &str,
+        execution_arn: &str,
+        children: Vec<PlannedChildExecution>,
+    ) {
+        if children.is_empty() {
+            return;
+        }
+        // The parent is stored before its Map Runs are, so what it RAN is in hand;
+        // without it there is no state machine for a child to have run and nothing to
+        // record.
+        let Some(parent) = self.executions.get(execution_arn) else {
+            return;
+        };
+        let ran = std::sync::Arc::clone(&parent.ran);
+        let state_machine_arn = parent.state_machine_arn.clone();
+        let version_arn = parent.state_machine_version_arn.clone();
+        let alias_arn = parent.state_machine_alias_arn.clone();
+        let trace_header = parent.trace_header.clone();
+        let mut recorded = Vec::with_capacity(children.len());
+        for child in children {
+            let opened = HistoryEvent {
+                id: 1,
+                previous_event_id: 0,
+                event_type: EVENT_EXECUTION_STARTED.to_string(),
+                timestamp: child.start_date,
+                state_name: None,
+                details: EventDetails::default(),
+            };
+            let terminal = HistoryEvent {
+                id: 2,
+                previous_event_id: 1,
+                event_type: if child.status == EXECUTION_STATUS_SUCCEEDED {
+                    EVENT_EXECUTION_SUCCEEDED.to_string()
+                } else {
+                    EVENT_EXECUTION_FAILED.to_string()
+                },
+                timestamp: child.due_at,
+                state_name: None,
+                details: EventDetails::of_failure(child.error.clone(), child.cause.clone()),
+            };
+            let record = Execution {
+                arn: child.arn.clone(),
+                state_machine_arn: state_machine_arn.clone(),
+                name: child.name,
+                status: EXECUTION_STATUS_RUNNING.to_string(),
+                start_date: child.start_date,
+                stop_date: None,
+                input: child.input,
+                output: None,
+                error: None,
+                cause: None,
+                trace_header: trace_header.clone(),
+                state_machine_version_arn: version_arn.clone(),
+                state_machine_alias_arn: alias_arn.clone(),
+                ran: std::sync::Arc::clone(&ran),
+                redrive_count: 0,
+                redrive_date: None,
+                redrive_tokens: Vec::new(),
+                history: vec![opened],
+                redrive_step: None,
+                pending: Some(PendingOutcome {
+                    due_at: child.due_at,
+                    status: child.status,
+                    output: child.output,
+                    error: child.error,
+                    cause: child.cause,
+                    events: vec![terminal],
+                }),
+                map_run_arn: Some(map_run_arn.to_string()),
+                item_count: Some(child.item_count),
+                // Measured and counted below, exactly as `insert_execution` does.
+                retained_bytes: 0,
+            };
+            recorded.push(record.arn.clone());
+            self.insert_child_execution(record);
+        }
+        self.executions_by_map_run
+            .insert(map_run_arn.to_string(), recorded);
+    }
+
+    /// Store one child workflow execution and count what it retains.
+    ///
+    /// It is indexed under its Map Run by its caller, NOT under its state machine:
+    /// `ListExecutions` reports a Map Run's children for that Map Run alone.
+    fn insert_child_execution(&mut self, mut execution: Execution) {
+        execution.retained_bytes = execution.measure();
+        self.retained_bytes = self.retained_bytes.saturating_add(execution.retained_bytes);
+        if execution.pending.is_some() {
+            self.pending_executions.push(execution.arn.clone());
+        }
+        self.executions.insert(execution.arn.clone(), execution);
+    }
+
+    /// Drop every child workflow execution of the Map Run `map_run_arn` names, so no
+    /// execution is left under a Map Run whose items it no longer belongs to.
+    fn discard_child_executions_of(&mut self, map_run_arn: &str) {
+        for arn in self
+            .executions_by_map_run
+            .remove(map_run_arn)
+            .unwrap_or_default()
+        {
+            if let Some(execution) = self.executions.remove(&arn) {
+                self.retained_bytes = self.retained_bytes.saturating_sub(execution.retained_bytes);
+            }
+            self.pending_executions.retain(|pending| pending != &arn);
+            self.discard_tasks_of_executions(std::slice::from_ref(&arn));
+        }
+    }
+
+    /// One Map Run's child workflow executions, most recent first.
+    ///
+    /// The same order `ListExecutions` reports a state machine's executions in
+    /// ([`Self::executions_newest_first`]), because it is the same listing: "results
+    /// are sorted by time, with the most recent execution first".
+    pub fn child_executions_newest_first(&self, map_run_arn: &str) -> Vec<&Execution> {
+        let mut children: Vec<&Execution> = self
+            .executions_by_map_run
+            .get(map_run_arn)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|arn| self.executions.get(arn))
+            .collect();
+        children.sort_by(|left, right| newest_first(left, right));
+        children
     }
 
     /// Apply `UpdateMapRun`'s configuration to the Map Run `arn` names.
@@ -3668,7 +3883,8 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             .unwrap_or_default()
     }
 
-    /// Stop every Map Run of `execution_arn` that has not finished, at `now`.
+    /// Stop every Map Run of `execution_arn` that has not finished, at `now`, and
+    /// every child workflow execution of theirs that has not finished either.
     ///
     /// A Map Run runs INSIDE its execution, so an execution that was stopped before
     /// its Map Run's items were due stopped them too: the terminal status the walk
@@ -3701,6 +3917,41 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
                 .saturating_add(after)
                 .saturating_sub(before);
             self.pending_map_runs.retain(|pending| pending != &arn);
+            self.abort_child_executions_of(&arn, now);
+        }
+    }
+
+    /// Stop every child workflow execution of the Map Run `map_run_arn` names that
+    /// has not reached a terminal status, at `now`.
+    ///
+    /// A child runs INSIDE its Map Run, so the outcome the walk computed for one the
+    /// clock had not reached is discarded along with its place in the settle queue,
+    /// exactly as the Map Run's own status and the execution's around it are.
+    fn abort_child_executions_of(&mut self, map_run_arn: &str, now: SystemTime) {
+        let arns = self
+            .executions_by_map_run
+            .get(map_run_arn)
+            .cloned()
+            .unwrap_or_default();
+        for arn in arns {
+            let Some(child) = self.executions.get_mut(&arn) else {
+                continue;
+            };
+            if child.stop_date.is_some() {
+                continue;
+            }
+            let before = child.retained_bytes;
+            child.pending = None;
+            child.status = EXECUTION_STATUS_ABORTED.to_string();
+            child.stop_date = Some(now);
+            child.push_event("ExecutionAborted", now);
+            child.retained_bytes = child.measure();
+            let after = child.retained_bytes;
+            self.retained_bytes = self
+                .retained_bytes
+                .saturating_add(after)
+                .saturating_sub(before);
+            self.pending_executions.retain(|pending| pending != &arn);
         }
     }
 
@@ -3716,6 +3967,9 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
                 self.retained_bytes = self.retained_bytes.saturating_sub(map_run.retained_bytes);
             }
             self.pending_map_runs.retain(|pending| pending != &arn);
+            // The child workflow executions it started go with it, for the same
+            // reason: no execution ARN is left naming one whose Map Run is gone.
+            self.discard_child_executions_of(&arn);
         }
     }
 
@@ -3880,14 +4134,8 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             .map_or(0, Vec::len)
     }
 
-    /// One state machine's executions, most recent first.
-    ///
-    /// From `ListExecutions`' own documentation: "Results are sorted by time, with
-    /// the most recent execution first. Running executions are sorted by their
-    /// `startDate` [...] and other executions are sorted by their `stopDate`." The
-    /// sort key is therefore an execution's `stopDate` once it has one and its
-    /// `startDate` until then, descending; the ARN breaks ties so the order is total
-    /// and a page token means the same thing on the next call.
+    /// One state machine's executions, most recent first ([`newest_first`]); the
+    /// child workflow executions of its Map Runs are not among them.
     pub fn executions_newest_first(&self, state_machine_arn: &str) -> Vec<&Execution> {
         let mut executions: Vec<&Execution> = self
             .executions_by_sm
@@ -3897,16 +4145,27 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             .iter()
             .filter_map(|arn| self.executions.get(arn))
             .collect();
-        executions.sort_by(|left, right| {
-            let left_key = left.stop_date.unwrap_or(left.start_date);
-            let right_key = right.stop_date.unwrap_or(right.start_date);
-            right_key
-                .cmp(&left_key)
-                .then_with(|| right.start_date.cmp(&left.start_date))
-                .then_with(|| left.arn.cmp(&right.arn))
-        });
+        executions.sort_by(|left, right| newest_first(left, right));
         executions
     }
+}
+
+/// How `ListExecutions` orders two executions: "results are sorted by time, with the
+/// most recent execution first. Running executions are sorted by their `startDate`
+/// [...] and other executions are sorted by their `stopDate`."
+///
+/// The sort key is therefore an execution's `stopDate` once it has one and its
+/// `startDate` until then, descending; the ARN breaks ties so the order is total and
+/// a page token means the same thing on the next call. ONE comparator for both
+/// listings, so a Map Run's children and a state machine's executions are never
+/// ordered two ways.
+fn newest_first(left: &Execution, right: &Execution) -> std::cmp::Ordering {
+    let left_key = left.stop_date.unwrap_or(left.start_date);
+    let right_key = right.stop_date.unwrap_or(right.start_date);
+    right_key
+        .cmp(&left_key)
+        .then_with(|| right.start_date.cmp(&left.start_date))
+        .then_with(|| left.arn.cmp(&right.arn))
 }
 
 /// Why the clock closed an activity task, for the `cause` the execution it failed
@@ -5672,11 +5931,62 @@ pub struct PlannedMapRun {
     /// Each item the `Map` state iterated, with the instant its iteration finished:
     /// what the stored record counts its items from.
     pub items: Vec<MapRunItem>,
+    /// The child execution each of those items ran as, in the order they started:
+    /// what `ListExecutions` reports for this Map Run once the store holds them.
+    pub children: Vec<PlannedChildExecution>,
+}
+
+/// One child workflow execution a planned run's Distributed Map state started, ready
+/// for the store to record as an execution of its own.
+///
+/// This is [`asl::StartedChildExecution`] with the run's offsets turned into
+/// instants: the child started when its iteration did and reaches the terminal status
+/// its iteration produced when the clock makes it due — the same delay the Map Run
+/// around it and the execution around that are owed after, so no child reports a
+/// terminal status before the Map Run that started it could.
+#[derive(Debug, Clone)]
+pub struct PlannedChildExecution {
+    pub name: String,
+    pub arn: String,
+    pub input: String,
+    pub output: Option<String>,
+    pub error: Option<String>,
+    pub cause: Option<String>,
+    pub status: String,
+    pub start_date: SystemTime,
+    pub due_at: SystemTime,
+    pub item_count: i32,
+}
+
+impl PlannedChildExecution {
+    /// The bytes the execution record this will become retains.
+    pub fn measure(&self) -> usize {
+        std::mem::size_of::<Execution>()
+            + self.name.len()
+            + self.arn.len()
+            + self.input.len()
+            + self.output.as_ref().map_or(0, String::len)
+            + self.error.as_ref().map_or(0, String::len)
+            + self.cause.as_ref().map_or(0, String::len)
+            // `status` is held twice while the terminal one is still owed to the
+            // clock, as the Map Run's own is.
+            + 2 * self.status.len()
+            // The state machine ARN and the Map Run ARN the record carries, each
+            // inside the modelled maximum.
+            + 2 * MAX_ARN_BYTES
+            // The two history events a child's own life appends: the one it opens
+            // with and the terminal one it ends on.
+            + 2 * (std::mem::size_of::<HistoryEvent>() + EVENT_EXECUTION_FAILED.len())
+    }
 }
 
 impl PlannedMapRun {
     /// The bytes the record this will become retains, so an execution is admitted
     /// against the whole of what its start adds to the store.
+    ///
+    /// The child executions this Map Run started are records of their own, so what
+    /// they retain is counted here too: the start is admitted against everything it
+    /// writes.
     pub fn measure(&self) -> usize {
         std::mem::size_of::<MapRun>()
             + self.label.len()
@@ -5687,6 +5997,11 @@ impl PlannedMapRun {
             // machine name, an execution name and a state label, all of which the
             // model bounds well inside the `Arn` maximum.
             + 3 * MAX_ARN_BYTES
+            + self
+                .children
+                .iter()
+                .map(PlannedChildExecution::measure)
+                .sum::<usize>()
     }
 }
 
@@ -5914,6 +6229,27 @@ fn plan_from_run(
                 .map(|item| MapRunItem {
                     due_at: after(start, settle.saturating_add(item.finished_at)),
                     failed: item.failed,
+                })
+                .collect(),
+            // And each CHILD execution the same way: it started when its own
+            // iteration did, and the terminal status that iteration produced is owed
+            // one `settle` after the instant it finished — so a caller reading a
+            // child straight after the start sees it RUNNING, exactly as the Map Run
+            // and the execution around it are.
+            children: map_run
+                .children
+                .into_iter()
+                .map(|child| PlannedChildExecution {
+                    name: child.name,
+                    arn: child.arn,
+                    input: child.input,
+                    output: child.output,
+                    error: child.error,
+                    cause: child.cause,
+                    status: child.status.to_string(),
+                    start_date: after(start, child.started_at),
+                    due_at: after(start, settle.saturating_add(child.finished_at)),
+                    item_count: child.item_count,
                 })
                 .collect(),
         })

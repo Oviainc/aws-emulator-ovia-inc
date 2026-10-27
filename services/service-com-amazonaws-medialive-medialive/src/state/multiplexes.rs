@@ -20,10 +20,12 @@
 //! multiplex, which is what the multiplex's own derived `ProgramCount` counts. A
 //! program has no id and no ARN of its own — it is reached by naming its
 //! multiplex and its name — and it goes away with the multiplex that holds it.
-//! A program's `PacketIdentifiersMap` lives on that record too, because
-//! `UpdateMultiplex`'s `PacketIdentifiersMapping` is keyed by program name: an
-//! entry of that map is the packet identifiers of one program of the multiplex
-//! the update names.
+//! A program's `PacketIdentifiersMap` lives on that record too: the transport
+//! stream PIDs the service allocates the program when it is created
+//! ([`allocated_packet_identifiers`]), which `UpdateMultiplex`'s
+//! `PacketIdentifiersMapping` — keyed by program name, so an entry of it is the
+//! packet identifiers of one program of the multiplex the update names — can
+//! replace.
 //!
 //! A multiplex's LIFECYCLE is one stored pending transition per record (a
 //! [`MultiplexTransition`]: the instant it comes due and the `MultiplexState` it
@@ -666,6 +668,90 @@ fn program_settings_refusal(
         })
 }
 
+/// The lowest packet identifier a program of a multiplex may be allocated.
+///
+/// A program's identifiers are the PIDs its elementary streams and its own
+/// tables occupy in the multiplex's transport stream, and every
+/// transport-stream PID this service's model publishes a range for publishes the
+/// SAME one: "Valid values are 32 (or 0x20)..8182 (or 0x1ff6)"
+/// (`smithy_query(query="doc", shape="M2tsSettings", member="VideoPid")`, and
+/// the same sentence on `PmtPid`, `Scte35Pid` and the rest). The range starts
+/// above zero because the low PIDs belong to the stream itself rather than to
+/// any one program.
+const FIRST_PROGRAM_PACKET_IDENTIFIER: i32 = 32;
+
+/// The highest packet identifier a program of a multiplex may be allocated, from
+/// the same published range as [`FIRST_PROGRAM_PACKET_IDENTIFIER`].
+const LAST_PROGRAM_PACKET_IDENTIFIER: i32 = 8_182;
+
+/// How many consecutive packet identifiers one program of a multiplex is
+/// allocated.
+///
+/// Identifiers are allocated a BLOCK at a time, which is what keeps the programs
+/// of one multiplex apart: a transport stream carries each elementary stream on
+/// a PID of its own, so no PID of one program may be a PID of another. The block
+/// holds one PID per identifier [`allocated_packet_identifiers`] reports, rounded
+/// up to a power of two so a block starts at a round offset.
+const PROGRAM_PACKET_IDENTIFIER_BLOCK: i32 = 16;
+
+/// The published PID range is wide enough for one block per program of the
+/// fullest multiplex this emulator stores, so the allocation never leaves it.
+const _: () = assert!(
+    FIRST_PROGRAM_PACKET_IDENTIFIER
+        + PROGRAM_PACKET_IDENTIFIER_BLOCK * (MAX_MULTIPLEX_PROGRAMS as i32)
+        <= LAST_PROGRAM_PACKET_IDENTIFIER
+);
+
+/// The packet identifiers of the program holding the `block`th PID block of its
+/// multiplex: one identifier per stream and per table that program carries,
+/// taken from that block in a fixed order.
+///
+/// A pure function of the block, so the same block always yields the same
+/// identifiers — a program's PIDs do not move while it exists — and two
+/// different blocks share no identifier at all.
+///
+/// `PcrPid` is the program's VIDEO PID rather than one of its own, which is what
+/// the service's own rule for an unasked-for PCR PID says happens: "When no value
+/// is given, the encoder will assign the same value as the Video PID"
+/// (`smithy_query(query="doc", shape="M2tsSettings", member="PcrPid")`).
+/// `DvbTeletextPids` reports the same identifier as `DvbTeletextPid` because both
+/// members name the one DVB teletext stream of the program. `EcmPid` is the only
+/// member nothing is allocated for: the model documents it as "This field is
+/// unused and deprecated".
+fn allocated_packet_identifiers(block: usize) -> MultiplexProgramPacketIdentifiersMap {
+    debug_assert!(
+        block < MAX_MULTIPLEX_PROGRAMS,
+        "a block is allocated only to a program a multiplex has room for"
+    );
+    let base = FIRST_PROGRAM_PACKET_IDENTIFIER
+        + PROGRAM_PACKET_IDENTIFIER_BLOCK
+            * i32::try_from(block.min(MAX_MULTIPLEX_PROGRAMS - 1)).unwrap_or(0);
+    // The block's fixed order: the program's map table, its video, then one PID
+    // per other stream the program can carry.
+    let pid = |offset: i32| base + offset;
+    let video_pid = pid(1);
+    let dvb_teletext_pid = pid(10);
+    MultiplexProgramPacketIdentifiersMap {
+        pmt_pid: Some(pid(0)),
+        video_pid: Some(video_pid),
+        pcr_pid: Some(video_pid),
+        audio_pids: Some(vec![pid(2)]),
+        scte35_pid: Some(pid(3)),
+        timed_metadata_pid: Some(pid(4)),
+        private_metadata_pid: Some(pid(5)),
+        smpte2038_pid: Some(pid(6)),
+        arib_captions_pid: Some(pid(7)),
+        scte27_pids: Some(vec![pid(8)]),
+        dvb_sub_pids: Some(vec![pid(9)]),
+        dvb_teletext_pid: Some(dvb_teletext_pid),
+        dvb_teletext_pids: Some(vec![dvb_teletext_pid]),
+        klv_data_pids: Some(vec![pid(11)]),
+        etv_platform_pid: Some(pid(12)),
+        etv_signal_pid: Some(pid(13)),
+        ecm_pid: None,
+    }
+}
+
 /// One created multiplex program, as `CreateMultiplexProgram` stored it.
 ///
 /// The members mirror the model's `MultiplexProgram` shape minus the two it
@@ -676,21 +762,27 @@ fn program_settings_refusal(
 /// currently ingesting from, which this emulator does not run and therefore does
 /// not claim.
 ///
-/// `PacketIdentifiersMap` is stored, because a caller CAN set it: it is what
-/// `UpdateMultiplex`'s `PacketIdentifiersMapping` carries, keyed by the
-/// `ProgramName` the identifiers belong to (the value shape's own documentation:
-/// "Packet identifiers map for a given Multiplex program"). Until a caller sets
-/// it the program carries none — the PIDs the real service's multiplexer
-/// allocates on its own are not something this emulator invents.
+/// `PacketIdentifiersMap` ("Packet identifiers map for a given Multiplex
+/// program") is stored because the service supplies it: the PIDs this program's
+/// streams occupy in the multiplex's transport stream are allocated to it when it
+/// is created and reported by every read of it from then on. A caller can replace
+/// them, which is what `UpdateMultiplex`'s `PacketIdentifiersMapping` carries,
+/// keyed by the `ProgramName` the identifiers belong to.
 #[derive(Debug, Clone)]
 pub struct MultiplexProgramRecord {
     /// The `ProgramName` the request created the program under, which is also
     /// the key it is stored at: it identifies the program within its multiplex.
     pub program_name: String,
     pub multiplex_program_settings: MultiplexProgramSettings,
-    /// The packet identifiers a caller set for this program through
-    /// `UpdateMultiplex`, or `None` while none have been set.
-    pub packet_identifiers_map: Option<MultiplexProgramPacketIdentifiersMap>,
+    /// Which PID block of its multiplex's transport stream was allocated to this
+    /// program when it was created. Stored, so a program created later is
+    /// allocated a block no program of that multiplex holds — including a block
+    /// a caller's own `PacketIdentifiersMapping` has since replaced the reported
+    /// identifiers of.
+    packet_identifier_block: usize,
+    /// This program's packet identifiers: the ones allocated to its block at
+    /// creation, until a caller replaces them through `UpdateMultiplex`.
+    pub packet_identifiers_map: MultiplexProgramPacketIdentifiersMap,
 }
 
 /// One created multiplex, as `CreateMultiplex` stored it plus its lifecycle
@@ -777,6 +869,20 @@ impl MultiplexRecord {
         } else {
             0
         }
+    }
+
+    /// The lowest PID block of this multiplex's transport stream that no program
+    /// it holds has been allocated, or `None` when every block is taken.
+    ///
+    /// The lowest FREE block rather than the next of a counter, so the block a
+    /// deleted program held is allocated to the next program created instead of
+    /// the allocation walking off the end of the published PID range.
+    fn free_packet_identifier_block(&self) -> Option<usize> {
+        (0..MAX_MULTIPLEX_PROGRAMS).find(|block| {
+            self.programs
+                .values()
+                .all(|program| program.packet_identifier_block != *block)
+        })
     }
 
     /// The multiplex's current `MultiplexState`, which is stored rather than
@@ -1295,7 +1401,7 @@ impl ComAmazonawsMedialiveMedialiveState {
         // exactly once and none can be quietly skipped.
         for (program_name, program) in &mut multiplex.programs {
             if let Some(packet_identifiers_map) = mapping.remove(program_name) {
-                program.packet_identifiers_map = Some(packet_identifiers_map);
+                program.packet_identifiers_map = packet_identifiers_map;
             }
         }
         debug_assert!(
@@ -1421,17 +1527,22 @@ impl ComAmazonawsMedialiveMedialiveState {
         if multiplex.programs.len() >= MAX_MULTIPLEX_PROGRAMS {
             return Err(MultiplexProgramRefusal::MultiplexFull);
         }
+        // The PIDs this program's streams occupy in the multiplex's transport
+        // stream are allocated HERE, because creating the program is when the
+        // service allocates them: the lowest block no program of this multiplex
+        // holds, so the identifiers of two programs of one multiplex never
+        // collide and a program's own stay its own for as long as it exists.
+        let Some(packet_identifier_block) = multiplex.free_packet_identifier_block() else {
+            return Err(MultiplexProgramRefusal::MultiplexFull);
+        };
 
         multiplex.programs.insert(
             program_name.clone(),
             MultiplexProgramRecord {
                 program_name,
                 multiplex_program_settings,
-                // A created program carries no packet identifiers: the real
-                // service's multiplexer allocates them, and this emulator does
-                // not run it. `UpdateMultiplex`'s `PacketIdentifiersMapping` is
-                // the one thing that sets them.
-                packet_identifiers_map: None,
+                packet_identifier_block,
+                packet_identifiers_map: allocated_packet_identifiers(packet_identifier_block),
             },
         );
         Ok(())
@@ -1618,11 +1729,11 @@ impl ComAmazonawsMedialiveMedialiveState {
         Some(MultiplexProgram {
             channel_id: self.channel_in_multiplex_program(multiplex_id, &program.program_name),
             multiplex_program_settings: Some(program.multiplex_program_settings.clone()),
-            // The packet identifiers a caller set through `UpdateMultiplex`,
-            // and ABSENT while none were set: the PIDs the real service's
-            // multiplexer allocates on its own are not ones this emulator
-            // invents for a transport stream nothing is producing.
-            packet_identifiers_map: program.packet_identifiers_map.clone(),
+            // The identifiers allocated to this program when it was created, or
+            // the ones a caller's `PacketIdentifiersMapping` replaced them with:
+            // either way the stored ones, so every read of the program reports
+            // the same PIDs.
+            packet_identifiers_map: Some(program.packet_identifiers_map.clone()),
             // ABSENT, not empty: `PipelineDetails` reports which channel
             // pipeline each multiplex pipeline is currently ingesting from.
             // This emulator runs no multiplexer, so it reports no active

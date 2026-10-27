@@ -37,6 +37,8 @@ mod definition_path_diagnostics;
 mod definition_validation;
 #[path = "all/describe_state_machine_for_execution.rs"]
 mod describe_state_machine_for_execution;
+#[path = "all/distributed_map_children.rs"]
+mod distributed_map_children;
 #[path = "all/error_messages.rs"]
 mod error_messages;
 #[path = "all/execution_alias_routing.rs"]
@@ -83,6 +85,8 @@ mod state_roundtrip;
 mod sync_execution;
 #[path = "all/task_integrations.rs"]
 mod task_integrations;
+#[path = "all/terminal_runtime_errors.rs"]
+mod terminal_runtime_errors;
 #[path = "all/test_state.rs"]
 mod test_state;
 #[path = "all/update_state_machine_alias_effects.rs"]

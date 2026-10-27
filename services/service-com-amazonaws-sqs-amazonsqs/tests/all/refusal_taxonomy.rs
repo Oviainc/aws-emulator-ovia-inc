@@ -129,6 +129,12 @@ fn invalid(value: &str, parameter: &str, reason: &str) -> String {
     format!("Value {value} for parameter {parameter} is invalid. Reason: {reason}")
 }
 
+/// The same template for a refusal that does NOT name the offending value, which is how
+/// this service words a refusal whose value is the very thing it will not take.
+fn invalid_without_value(parameter: &str, reason: &str) -> String {
+    format!("Value for parameter {parameter} is invalid. Reason: {reason}")
+}
+
 /// How a refusal states that a `MessageGroupId`-style token is not one `member` accepts.
 fn bad_token(value: &str, member: &str) -> String {
     invalid(
@@ -438,7 +444,10 @@ async fn every_input_refusal_carries_a_code_this_service_has() {
             address: Address::SourceArn("dead-letter"),
             request: json!({"MaxResults": 0}),
             code: "InvalidParameterValue",
-            message: invalid("0", "MaxResults", "must be between 1 and 10."),
+            message: invalid_without_value(
+                "MaxResults",
+                "You must enter a number that's between 1 and 10.",
+            ),
         },
         Row {
             case: "a queue listing asking for more than a page may hold",
@@ -446,11 +455,10 @@ async fn every_input_refusal_carries_a_code_this_service_has() {
             address: Address::None,
             request: json!({"MaxResults": LIST_QUEUES_MAX_RESULTS_RANGE.1 + 1}),
             code: "InvalidParameterValue",
-            message: invalid(
-                &(LIST_QUEUES_MAX_RESULTS_RANGE.1 + 1).to_string(),
+            message: invalid_without_value(
                 "MaxResults",
                 &format!(
-                    "must be between {} and {}.",
+                    "MaxResults must be an integer between {} and {}.",
                     LIST_QUEUES_MAX_RESULTS_RANGE.0, LIST_QUEUES_MAX_RESULTS_RANGE.1
                 ),
             ),
@@ -519,9 +527,7 @@ async fn every_input_refusal_carries_a_code_this_service_has() {
             request: json!({"Tags": {"Environment": long_tag_value.clone()}}),
             code: "InvalidParameterValue",
             message: format!(
-                "Value for parameter TagValue is invalid. Reason: the value of tag key \
-                 Environment must be at most {MAX_TAG_VALUE_LENGTH} characters long, but was {}.",
-                long_tag_value.chars().count()
+                "Tag values must be between 0 and {MAX_TAG_VALUE_LENGTH} characters in length."
             ),
         },
         // A message the queue will not carry: over its MaximumMessageSize, or holding a

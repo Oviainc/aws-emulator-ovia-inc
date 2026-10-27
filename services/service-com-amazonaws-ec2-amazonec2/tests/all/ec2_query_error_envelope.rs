@@ -81,7 +81,11 @@ const PREFIX_LIST_ID: &str = "pl-00000000000000ef1";
 ///
 /// Recorded behaviour: the model declares the protocol but not the media type's `charset`
 /// parameter, where the protocol's own default is the bare `text/xml`.
-const RESPONSE_CONTENT_TYPE: &str = "text/xml;charset=UTF-8";
+///
+/// `pub(crate)` for the same reason as [`refusal_request_id`]: a suite that brings ONE
+/// operation under this rule states the media type by naming this one rather than by
+/// declaring a second copy of it.
+pub(crate) const RESPONSE_CONTENT_TYPE: &str = "text/xml;charset=UTF-8";
 
 /// The `content-encoding` an AWS SDK sets to announce `aws-chunked` transfer framing — the
 /// header that makes the emulator decode the body as framed, and so the one that lets a

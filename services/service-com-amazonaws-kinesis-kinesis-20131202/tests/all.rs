@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/data_records.rs"]
 mod data_records;
+#[path = "all/max_record_size.rs"]
+mod max_record_size;
 #[path = "all/record_flow.rs"]
 mod record_flow;
 #[path = "all/resource_tags.rs"]

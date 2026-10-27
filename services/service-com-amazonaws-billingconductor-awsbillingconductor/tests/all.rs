@@ -17,6 +17,8 @@ mod account_association_billing_periods;
 mod account_exclusivity_at_list_bounds;
 #[path = "all/account_exclusivity_refusal.rs"]
 mod account_exclusivity_refusal;
+#[path = "all/associate_accounts_generation_history.rs"]
+mod associate_accounts_generation_history;
 #[path = "all/associate_pricing_rules.rs"]
 mod associate_pricing_rules;
 #[path = "all/auto_associate_billing_group_cap.rs"]

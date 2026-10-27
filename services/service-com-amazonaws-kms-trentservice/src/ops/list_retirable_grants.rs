@@ -235,13 +235,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "You can specify any principal in your Amazon Web Services account", given as
-        // an ARN the same way `CreateGrant` takes one; anything that is not an ARN is
-        // the modelled `InvalidArnException`.
+        // the ARN of an AWS principal the same way `CreateGrant` takes one — "valid
+        // principals include Amazon Web Services accounts, IAM users, IAM roles,
+        // federated users, and assumed role users". `PrincipalIdType`'s modelled pattern
+        // admits any word-ish string, so the ARN grammar is this handler's to read, which
+        // is exactly why the operation models `InvalidArnException`: a value that names
+        // no such identity selects nothing and is refused rather than answered with an
+        // empty page, which a caller cannot tell from a principal that holds no grants.
         if let Some(principal) = input.retiring_principal.as_deref() {
             if !crate::state::names_a_principal_arn(principal) {
                 return Err(ListRetirableGrantsErrorModeled::InvalidArnException(
                     InvalidArnException {
-                        message: Some(crate::state::invalid_arn_message(principal)),
+                        message: Some(crate::state::invalid_principal_arn_message(principal)),
                     },
                 )
                 .into());
@@ -290,11 +295,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     None => {
                         return Err(ListRetirableGrantsErrorModeled::InvalidMarkerException(
                             InvalidMarkerException {
-                                message: Some(
-                                    "The marker that specifies where pagination should next \
-                                     begin is not valid."
-                                        .to_string(),
-                                ),
+                                message: crate::state::invalid_marker_message(),
                             },
                         )
                         .into());
