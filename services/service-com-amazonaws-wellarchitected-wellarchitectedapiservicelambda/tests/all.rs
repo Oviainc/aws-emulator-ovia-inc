@@ -360,3 +360,8 @@ mod lens_review_pinned_version_content;
 // profile suite falls in a crowded run of this list.
 #[path = "all/profile_share_quota.rs"]
 mod profile_share_quota;
+
+// Declared last for the same reason as the declarations above: modules are appended here so
+// a new suite does not collide with another insertion.
+#[path = "all/workload_industry_type.rs"]
+mod workload_industry_type;

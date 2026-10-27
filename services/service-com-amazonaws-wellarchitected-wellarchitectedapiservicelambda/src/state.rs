@@ -9509,6 +9509,70 @@ pub fn unknown_aws_region_exception(
     (!unknown.is_empty()).then(|| field_validation_exception(&unknown))
 }
 
+/// Every value a workload's `IndustryType` may carry.
+///
+/// SOURCE: the member's own documentation — "If specified, must be one of the following:
+/// Agriculture … Other" (`smithy_query(query="doc", shape="WorkloadIndustryType")`), listed
+/// here in the order it publishes them. The model types the member as a plain string bounded
+/// only by `@length(max: 100)`, so the boundary validator cannot hold it to the set; it is
+/// written out here for the same reason [`AWS_REGIONS`] is — a value outside the published
+/// set is an industry type the service does not publish, so an operation that WRITES a
+/// workload refuses it rather than storing it.
+pub const WORKLOAD_INDUSTRY_TYPES: &[&str] = &[
+    "Agriculture",
+    "Automobile",
+    "Defense",
+    "Design and Engineering",
+    "Digital Advertising",
+    "Education",
+    "Environmental Protection",
+    "Financial Services",
+    "Gaming",
+    "General Public Services",
+    "Healthcare",
+    "Hospitality",
+    "InfoTech",
+    "Justice and Public Safety",
+    "Life Sciences",
+    "Manufacturing",
+    "Media & Entertainment",
+    "Mining & Resources",
+    "Oil & Gas",
+    "Power & Utilities",
+    "Professional Services",
+    "Real Estate & Construction",
+    "Retail & Wholesale",
+    "Social Protection",
+    "Telecommunications",
+    "Travel, Transportation & Logistics",
+    "Other",
+];
+
+/// The modelled member an out-of-set industry-type finding reports
+/// (`CreateWorkloadInput$IndustryType` / `UpdateWorkloadInput$IndustryType`).
+const INDUSTRY_TYPE_MEMBER: &str = "IndustryType";
+
+/// The refusal for an `IndustryType` outside the published set, or `None` when the request
+/// names none or names one of [`WORKLOAD_INDUSTRY_TYPES`].
+///
+/// Shared by every operation that writes a workload's industry type, so a value one of them
+/// refuses cannot reach the store through the other.
+pub fn unknown_industry_type_exception(
+    industry_type: Option<&str>,
+) -> Option<crate::ops::types::ValidationException> {
+    let industry_type = industry_type?;
+    if WORKLOAD_INDUSTRY_TYPES.contains(&industry_type) {
+        return None;
+    }
+    Some(member_constraint_exception(
+        INDUSTRY_TYPE_MEMBER,
+        &format!(
+            "Member must satisfy enum value set: [{}]",
+            WORKLOAD_INDUSTRY_TYPES.join(", ")
+        ),
+    ))
+}
+
 /// The modelled member name an unknown-Region finding reports
 /// (`CreateWorkloadInput$AwsRegions` / `UpdateWorkloadInput$AwsRegions`).
 const AWS_REGIONS_MEMBER: &str = "AwsRegions";

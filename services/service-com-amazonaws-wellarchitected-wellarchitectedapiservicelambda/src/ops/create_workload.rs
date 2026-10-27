@@ -7,7 +7,10 @@
 //! A `ReviewTemplateArns` entry is resolved against the stored review templates, and the
 //! lenses, notes and recorded review content (the answers, and each lens review's notes
 //! and pillar notes) of an applied template carry over to the new workload. Every lens
-//! the request names is resolved against the service's lens catalog first.
+//! the request names is resolved against the service's lens catalog first, and a member
+//! whose documentation publishes a value set — the Regions the workload runs in, its
+//! industry type — is held to that set, so the store never holds a workload the real
+//! service would have refused.
 //!
 //! ## Shape of an operation
 //!
@@ -264,6 +267,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // state is written, so the store never holds a workload the real service would
         // have refused.
         if let Some(exception) = crate::state::unknown_aws_region_exception(&aws_regions) {
+            return Err(CreateWorkloadErrorModeled::ValidationException(exception).into());
+        }
+        // "If specified, must be one of the following: Agriculture … Other"
+        // (`WorkloadIndustryType` doc): the member carries one of a PUBLISHED set of industry
+        // types, which the model types as a plain string, so the value is held to the set
+        // here — before any state is written, as the Regions above are.
+        if let Some(exception) =
+            crate::state::unknown_industry_type_exception(input.industry_type.as_deref())
+        {
             return Err(CreateWorkloadErrorModeled::ValidationException(exception).into());
         }
 
