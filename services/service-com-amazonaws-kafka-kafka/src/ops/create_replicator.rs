@@ -304,6 +304,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
+            // A flow selects the topics it replicates by regular expression, so a
+            // pattern list this service could not match topics against describes
+            // no selection at all — refused here rather than stored and silently
+            // replicating nothing.
+            if let Some(reason) = crate::state::topic_patterns_violation(
+                &info.topic_replication.topics_to_replicate,
+                info.topic_replication
+                    .topics_to_exclude
+                    .as_deref()
+                    .unwrap_or(&[]),
+            ) {
+                return Err(CreateReplicatorErrorModeled::BadRequestException(
+                    BadRequestException {
+                        invalid_parameter: Some(format!(
+                            "ReplicationInfoList[{index}].TopicReplication.{}",
+                            reason.member
+                        )),
+                        message: Some(reason.message),
+                    },
+                )
+                .into());
+            }
         }
 
         let mut state = state.lock();

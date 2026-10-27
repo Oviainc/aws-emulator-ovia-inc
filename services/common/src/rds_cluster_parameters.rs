@@ -399,9 +399,10 @@ pub fn validate_setting_in_catalog(
 /// parameter the engine has. Where the catalog IS the whole list, the name itself is
 /// checked too: that is [`validate_setting_in_catalog`].
 ///
-/// `Err` carries the message to answer with, built from the request — the parameter the
-/// caller named and the values that parameter admits — so the caller can fix the request
-/// from the text alone.
+/// `Err` carries the message to answer with, built from the request — the submitted value,
+/// the values that parameter publishes and the parameter the caller named, in the wording
+/// Amazon RDS answers a value outside a parameter's published domain with — so the caller
+/// can fix the request from the text alone.
 pub fn validate_known_setting(
     catalog: Option<&'static [ClusterParameterSpec]>,
     name: &str,
@@ -417,7 +418,7 @@ pub fn validate_known_setting(
     }
     if !spec.admits(value) {
         return Err(format!(
-            "Invalid value '{value}' for parameter '{name}': allowed values are {}",
+            "Value: {value} is outside of range: {} for parameter: {name}",
             spec.allowed_values
         ));
     }

@@ -538,7 +538,9 @@ async fn every_timestamp_of_the_analysis_and_listing_responses_is_a_date_time_st
     cases.push((
         "DescribeProfilingGroup with agent activity".to_string(),
         described.json(),
-        4, // createdAt, updatedAt, and the two profilingStatus instants
+        // createdAt, updatedAt, the two profilingStatus instants, and the start of the
+        // aggregated profile that status reports for the stamped (and so aggregated) receipt
+        5,
     ));
 
     for (case, body, expected_members) in cases {

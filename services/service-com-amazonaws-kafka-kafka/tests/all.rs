@@ -71,6 +71,8 @@ mod storage_updates;
 mod topic_apis_serverless_gate;
 #[path = "all/topic_lifecycle.rs"]
 mod topic_lifecycle;
+#[path = "all/topic_replication.rs"]
+mod topic_replication;
 #[path = "all/vpc_connection_lifecycle.rs"]
 mod vpc_connection_lifecycle;
 #[path = "all/vpc_connection_listing.rs"]

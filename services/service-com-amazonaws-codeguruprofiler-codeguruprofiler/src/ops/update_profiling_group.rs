@@ -182,10 +182,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The record changed, so its last-modified time moves. `@idempotent` means a
         // repeated identical update is not an error, not that it is a no-op: the real
         // service stamps `updatedAt` on the write it performed.
-        group.updated_at = crate::state::now();
+        let updated_at = crate::state::now();
+        group.updated_at = updated_at;
 
         Ok(UpdateProfilingGroupOutput {
-            profiling_group: group.description(),
+            profiling_group: group.description(updated_at),
         })
     }
 }

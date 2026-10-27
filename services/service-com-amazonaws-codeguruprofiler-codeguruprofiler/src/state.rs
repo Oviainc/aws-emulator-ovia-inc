@@ -11,8 +11,8 @@ use std::time::Duration;
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    AgentOrchestrationConfig, Channel, FindingsReportSummary, NotificationConfiguration,
-    ProfilingGroupDescription, ProfilingStatus,
+    AggregatedProfileTime, AgentOrchestrationConfig, Channel, FindingsReportSummary,
+    NotificationConfiguration, ProfilingGroupDescription, ProfilingStatus,
 };
 
 /// The region an ARN carries when the request is unsigned (so it has no SigV4
@@ -907,7 +907,11 @@ impl ProfilingGroup {
     /// activity to report in it (its three members are each absent until the activity they
     /// name happens); the CREATE path is the one that omits the container, see
     /// [`ProfilingGroup::created_description`].
-    pub fn description(&self) -> ProfilingGroupDescription {
+    ///
+    /// `at` is the instant the description is reported as of: part of the status
+    /// ([`ProfilingGroup::latest_aggregated_profile`]) is a fact the CLOCK makes true, so
+    /// every read states which instant it answers for instead of each path reading its own.
+    pub fn description(&self, at: DateTime) -> ProfilingGroupDescription {
         ProfilingGroupDescription {
             name: Some(self.name.clone()),
             agent_orchestration_config: Some(AgentOrchestrationConfig {
@@ -916,7 +920,7 @@ impl ProfilingGroup {
             arn: Some(self.arn.clone()),
             created_at: Some(self.created_at),
             updated_at: Some(self.updated_at),
-            profiling_status: Some(self.profiling_status()),
+            profiling_status: Some(self.profiling_status(at)),
             compute_platform: Some(self.compute_platform.clone()),
             tags: Some(self.tags.clone()),
         }
@@ -937,37 +941,59 @@ impl ProfilingGroup {
     /// then there is something to report.
     ///
     /// [`description`]: ProfilingGroup::description
-    pub fn created_description(&self) -> ProfilingGroupDescription {
+    pub fn created_description(&self, at: DateTime) -> ProfilingGroupDescription {
         ProfilingGroupDescription {
             profiling_status: self
-                .has_profiling_activity()
-                .then(|| self.profiling_status()),
-            ..self.description()
+                .has_profiling_activity(at)
+                .then(|| self.profiling_status(at)),
+            ..self.description(at)
         }
     }
 
-    /// The group's `profilingStatus`: each member present only once the activity it names
-    /// has happened.
-    fn profiling_status(&self) -> ProfilingStatus {
+    /// The group's `profilingStatus` as of `at`: each member present only once the activity
+    /// it names has happened.
+    fn profiling_status(&self, at: DateTime) -> ProfilingStatus {
         ProfilingStatus {
             latest_agent_profile_reported_at: self.latest_agent_profile_reported_at,
-            // `latestAggregatedProfile` is ONE `AggregatedProfileTime`, i.e. one
-            // aggregation period, while the service aggregates a group's posted
-            // profiles at all three periods at once (see
-            // [`ProfilingGroup::aggregated_profile_starts`], which derives the
-            // aggregated profiles for the period a caller asks about). There is no
-            // stored fact saying which period to report here, so this stays absent
-            // rather than picking one arbitrarily.
-            latest_aggregated_profile: None,
+            latest_aggregated_profile: self.latest_aggregated_profile(at),
             latest_agent_orchestrated_at: self.latest_agent_orchestrated_at,
         }
     }
 
-    /// Whether anything has ever been reported about this group's profiling: an agent ping
-    /// (`ConfigureAgent`), a posted profile (`PostAgentProfile`) or an aggregated profile.
-    /// This is what decides whether a create's payload carries a `profilingStatus` at all.
-    fn has_profiling_activity(&self) -> bool {
-        let status = self.profiling_status();
+    /// The MOST RECENT aggregated profile this group holds as of `at`, as the
+    /// `AggregatedProfileTime` pair (`start`, `period`) the status reports it by — or
+    /// `None` while no aggregated profile covers any profile the group holds.
+    ///
+    /// A posted profile belongs to one aligned window of EVERY period the service
+    /// aggregates at ([`AGGREGATION_PERIODS`]), and
+    /// [`ProfilingGroup::aggregated_profile_starts`] is what derives those windows for one
+    /// period. The most recent of those aggregated profiles is the one whose aggregation
+    /// period STARTS latest, and — when two periods start their window at the same instant,
+    /// which happens where their alignments coincide — the narrowest of them, i.e. the
+    /// smallest span of time whose aggregate covers the group's latest aggregated profile.
+    pub fn latest_aggregated_profile(&self, at: DateTime) -> Option<AggregatedProfileTime> {
+        AGGREGATION_PERIODS
+            .iter()
+            .filter_map(|(period, period_seconds)| {
+                self.aggregated_profile_starts(*period_seconds, at)
+                    .last()
+                    .map(|start| (*start, *period_seconds, *period))
+            })
+            .max_by_key(|(start, period_seconds, _)| {
+                (instant_key(*start), ::std::cmp::Reverse(*period_seconds))
+            })
+            .map(|(start, _, period)| AggregatedProfileTime {
+                start: Some(start),
+                period: Some(period.to_string()),
+            })
+    }
+
+    /// Whether anything has ever been reported about this group's profiling as of `at`: an
+    /// agent ping (`ConfigureAgent`), a posted profile (`PostAgentProfile`) or an aggregated
+    /// profile. This is what decides whether a create's payload carries a `profilingStatus`
+    /// at all.
+    fn has_profiling_activity(&self, at: DateTime) -> bool {
+        let status = self.profiling_status(at);
         status.latest_agent_profile_reported_at.is_some()
             || status.latest_agent_orchestrated_at.is_some()
             || status.latest_aggregated_profile.is_some()

@@ -3,7 +3,11 @@
 //! @op DescribeTopic
 //! Reports one topic of a stored cluster, computed from the registered record:
 //! the ARN the create minted, the partition count and replication factor it was
-//! created with, the `Configs` string it was given, and the topic's state.
+//! created with, the `Configs` string it was given, and the topic's state. A topic
+//! a running MSK Replicator replicates ONTO this cluster is reported the same way,
+//! derived from its source topic: the lookup goes through
+//! [`crate::state::ComAmazonawsKafkaKafkaState::observable_topic_in`], the one
+//! derivation `ListTopics` pages, so a listed topic always reads back here.
 //!
 //! The cluster is resolved the same way as in `CreateTopic` / `DeleteTopic`, and
 //! after the checks the request alone decides: a `ClusterArn` that is not an MSK
@@ -213,8 +217,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Reporting only: the writes this makes materialise the transitions the
         // clock already owed THIS topic, each of which was due at the same instant
-        // whether or not anybody called.
-        let Some(topic) = state.settled_topic_in(
+        // whether or not anybody called. The lookup answers from the one
+        // derivation `ListTopics` pages, so a topic a running replicator carries
+        // onto this cluster reads back here exactly while the listing reports it.
+        let Some(topic) = state.observable_topic_in(
             &input.cluster_arn,
             &input.topic_name,
             std::time::SystemTime::now(),
@@ -228,12 +234,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
         Ok(DescribeTopicOutput {
-            topic_arn: Some(topic.arn.clone()),
-            topic_name: Some(topic.name.clone()),
+            topic_arn: Some(topic.arn),
+            topic_name: Some(topic.name),
             replication_factor: Some(topic.replication_factor),
             partition_count: Some(topic.partition_count),
-            configs: topic.configs.clone(),
-            status: Some(topic.state.clone()),
+            configs: topic.configs,
+            status: Some(topic.state),
         })
     }
 }

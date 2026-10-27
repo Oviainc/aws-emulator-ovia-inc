@@ -10357,6 +10357,7 @@ dependencies = [
  "aws-smithy-types",
  "bytes",
  "http",
+ "regex",
  "serde_json",
  "tokio",
  "tracing",

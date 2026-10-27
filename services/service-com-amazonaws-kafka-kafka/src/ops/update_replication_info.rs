@@ -183,6 +183,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // A flow selects the topics it replicates by regular expression, so a
+        // pattern list this service could not match topics against describes no
+        // selection at all — refused here rather than stored and silently
+        // replicating nothing, by the SAME rule the create admits its patterns
+        // by.
+        if let Some(update) = input.topic_replication.as_ref() {
+            if let Some(reason) = crate::state::topic_patterns_violation(
+                &update.topics_to_replicate,
+                &update.topics_to_exclude,
+            ) {
+                return Err(UpdateReplicationInfoErrorModeled::BadRequestException(
+                    BadRequestException {
+                        invalid_parameter: Some(format!("TopicReplication.{}", reason.member)),
+                        message: Some(reason.message),
+                    },
+                )
+                .into());
+            }
+        }
+
         // The ends of the replication this call addresses, as the ALIASES every
         // reader of a replicator reports them under: a cluster is named by its
         // Amazon MSK ARN or by its Apache Kafka cluster id, and both resolve to

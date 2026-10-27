@@ -443,10 +443,22 @@ async fn user_parameters(
     case: &ParameterGroupCase<'_>,
     group: &str,
 ) -> (u16, String, Vec<(String, String)>) {
+    group_settings(router, case.parameters_describe, case.name_member, group).await
+}
+
+/// [`user_parameters`] against a group addressed by the member and report action of its KIND:
+/// the one reader of a group's own parameter settings in this suite, so the create cases and
+/// the update cases below cannot drift apart about how that report is read.
+async fn group_settings(
+    router: &MultiServiceRouter,
+    parameters_describe: &str,
+    name_member: &str,
+    group: &str,
+) -> (u16, String, Vec<(String, String)>) {
     let (status_code, body) = rds(
         router,
-        case.parameters_describe,
-        &[(case.name_member, group), ("Source", "user")],
+        parameters_describe,
+        &[(name_member, group), ("Source", "user")],
     )
     .await;
     let reported = xml_texts(&body, "ParameterName")
@@ -909,5 +921,322 @@ async fn a_property_this_emulator_does_not_provision_is_refused_rather_than_drop
         status_code, 404,
         "nothing must have been created for the refused declaration, got {status_code} \
          {reported}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A changed declaration of a parameter group's settings
+// ---------------------------------------------------------------------------
+
+/// One row of the parameter-group UPDATE table: the stack as it is first deployed, the
+/// declaration an update states for it, and the settings Amazon RDS must then report.
+struct ParameterUpdateCase<'a> {
+    case: &'a str,
+    stack_name: &'a str,
+    /// The template the stack is created with, and the one the update declares.
+    created: &'a str,
+    updated: &'a str,
+    /// The member Amazon RDS addresses this group KIND by, and the action that reports its
+    /// parameters.
+    name_member: &'a str,
+    parameters_describe: &'a str,
+    /// The settings the group must carry after the create, and after the update — each in the
+    /// name order the parameter report answers in.
+    after_create: &'a [(&'a str, &'a str)],
+    after_update: &'a [(&'a str, &'a str)],
+}
+
+/// `UpdateStack` with a new template body.
+async fn update_stack(
+    router: &MultiServiceRouter,
+    stack: &str,
+    template: &str,
+) -> (u16, String) {
+    call(
+        router,
+        "UpdateStack",
+        &[member("StackName", stack), member("TemplateBody", template)],
+    )
+    .await
+}
+
+/// The settings a row's group carries, as `(ParameterName, ParameterValue)` pairs asserted to
+/// be answered 200.
+async fn settings_of(
+    router: &MultiServiceRouter,
+    case: &ParameterUpdateCase<'_>,
+    group: &str,
+    what: &str,
+) -> Vec<(String, String)> {
+    let (status_code, body, settings) =
+        group_settings(router, case.parameters_describe, case.name_member, group).await;
+    assert_eq!(
+        status_code, 200,
+        "case {:?}: {}({group}) must answer 200 {what}, got {status_code} {body}",
+        case.case, case.parameters_describe
+    );
+    settings
+}
+
+/// The settings a row expects, as the pairs the report is compared against.
+fn expected_settings(expected: &[(&str, &str)]) -> Vec<(String, String)> {
+    expected
+        .iter()
+        .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+        .collect()
+}
+
+/// A deployment that states a parameter group's `Parameters` differently reaches Amazon RDS
+/// as the modify of THAT group: the stack reaches `UPDATE_COMPLETE` without replacing the
+/// group, and the group's own parameter report answers the newly declared settings.
+///
+/// The rows differ along what the rule generalises over: the group KIND (each addressed by
+/// its own member, through its own modify), the engine family, the template spelling (YAML
+/// and JSON), and the shape of the change — a value re-stated, a parameter added beside one
+/// left alone, and a declaration that first carried none.
+#[tokio::test]
+async fn an_updated_declaration_changes_the_groups_parameters_in_rds() {
+    let cases: &[ParameterUpdateCase<'_>] = &[
+        ParameterUpdateCase {
+            case: "a declared value re-stated",
+            stack_name: "rds-params-restated",
+            created: concat!(
+                "Resources:\n",
+                "  Params:\n",
+                "    Type: AWS::RDS::DBParameterGroup\n",
+                "    Properties:\n",
+                "      Description: the probe stack's parameters\n",
+                "      Family: mysql8.0\n",
+                "      Parameters:\n",
+                "        max_connections: '150'\n",
+            ),
+            updated: concat!(
+                "Resources:\n",
+                "  Params:\n",
+                "    Type: AWS::RDS::DBParameterGroup\n",
+                "    Properties:\n",
+                "      Description: the probe stack's parameters\n",
+                "      Family: mysql8.0\n",
+                "      Parameters:\n",
+                "        max_connections: '250'\n",
+            ),
+            name_member: "DBParameterGroupName",
+            parameters_describe: "DescribeDBParameters",
+            after_create: &[("max_connections", "150")],
+            after_update: &[("max_connections", "250")],
+        },
+        ParameterUpdateCase {
+            case: "a parameter added beside one the update leaves alone, in JSON",
+            stack_name: "rds-params-added",
+            created: r#"{"Resources":{"Params":{"Type":"AWS::RDS::DBParameterGroup",
+                     "Properties":{"DBParameterGroupName":"cfn-updated-params",
+                       "Description":"a named probe group","Family":"postgres17",
+                       "Parameters":{"from_collapse_limit":"12"}}}}}"#,
+            updated: r#"{"Resources":{"Params":{"Type":"AWS::RDS::DBParameterGroup",
+                     "Properties":{"DBParameterGroupName":"cfn-updated-params",
+                       "Description":"a named probe group","Family":"postgres17",
+                       "Parameters":{"from_collapse_limit":"12",
+                         "join_collapse_limit":"20"}}}}}"#,
+            name_member: "DBParameterGroupName",
+            parameters_describe: "DescribeDBParameters",
+            after_create: &[("from_collapse_limit", "12")],
+            after_update: &[
+                ("from_collapse_limit", "12"),
+                ("join_collapse_limit", "20"),
+            ],
+        },
+        ParameterUpdateCase {
+            case: "a group first declared with no parameters at all",
+            stack_name: "rds-params-first",
+            created: concat!(
+                "Resources:\n",
+                "  Params:\n",
+                "    Type: AWS::RDS::DBParameterGroup\n",
+                "    Properties:\n",
+                "      Description: the probe stack's parameters\n",
+                "      Family: postgres16\n",
+            ),
+            updated: concat!(
+                "Resources:\n",
+                "  Params:\n",
+                "    Type: AWS::RDS::DBParameterGroup\n",
+                "    Properties:\n",
+                "      Description: the probe stack's parameters\n",
+                "      Family: postgres16\n",
+                "      Parameters:\n",
+                "        work_mem: '8192'\n",
+            ),
+            name_member: "DBParameterGroupName",
+            parameters_describe: "DescribeDBParameters",
+            after_create: &[],
+            after_update: &[("work_mem", "8192")],
+        },
+        ParameterUpdateCase {
+            case: "the CLUSTER-scoped group kind, whose own modify writes the change",
+            stack_name: "rds-cluster-params-updated",
+            created: concat!(
+                "Resources:\n",
+                "  Params:\n",
+                "    Type: AWS::RDS::DBClusterParameterGroup\n",
+                "    Properties:\n",
+                "      Description: the probe stack's cluster parameters\n",
+                "      Family: aurora-mysql8.0\n",
+                "      Parameters:\n",
+                "        binlog_format: ROW\n",
+            ),
+            updated: concat!(
+                "Resources:\n",
+                "  Params:\n",
+                "    Type: AWS::RDS::DBClusterParameterGroup\n",
+                "    Properties:\n",
+                "      Description: the probe stack's cluster parameters\n",
+                "      Family: aurora-mysql8.0\n",
+                "      Parameters:\n",
+                "        binlog_format: MIXED\n",
+            ),
+            name_member: "DBClusterParameterGroupName",
+            parameters_describe: "DescribeDBClusterParameters",
+            after_create: &[("binlog_format", "ROW")],
+            after_update: &[("binlog_format", "MIXED")],
+        },
+    ];
+
+    for case in cases {
+        let router = router();
+        let (status_code, created) =
+            create_stack(&router, case.stack_name, case.created, &[]).await;
+        assert_eq!(
+            status_code, 200,
+            "case {:?}: CreateStack must answer 200, got {status_code} {created}",
+            case.case
+        );
+        wait_for_the_transition().await;
+        let group = physical_id(&router, case.stack_name, "Params").await;
+        assert_eq!(
+            settings_of(&router, case, &group, "after the create").await,
+            expected_settings(case.after_create),
+            "case {:?}: the create must leave the declared settings on the group",
+            case.case
+        );
+
+        let (status_code, updated) =
+            update_stack(&router, case.stack_name, case.updated).await;
+        assert_eq!(
+            status_code, 200,
+            "case {:?}: UpdateStack must answer 200, got {status_code} {updated}",
+            case.case
+        );
+        wait_for_the_transition().await;
+
+        let (_, described) = describe_stack(&router, case.stack_name).await;
+        assert_eq!(
+            xml_text(&described, "StackStatus").as_deref(),
+            Some(status::UPDATE_COMPLETE),
+            "case {:?}: the stack must reach UPDATE_COMPLETE, got {described}",
+            case.case
+        );
+        // The group keeps its identity — it was changed in place, not replaced — and carries
+        // exactly the settings the new declaration states.
+        assert_eq!(
+            physical_id(&router, case.stack_name, "Params").await,
+            group,
+            "case {:?}: an in-place change must leave the group's name as it was",
+            case.case
+        );
+        assert_eq!(
+            settings_of(&router, case, &group, "after the update").await,
+            expected_settings(case.after_update),
+            "case {:?}: Amazon RDS must report the settings the update declared",
+            case.case
+        );
+    }
+}
+
+/// A value Amazon RDS refuses leaves the update FAILED with that service's own refusal as the
+/// resource's reason, and leaves the group carrying the value that was in force — never a
+/// stack that completed while the write was rejected.
+#[tokio::test]
+async fn a_parameter_value_rds_refuses_fails_the_update_and_leaves_the_group_unchanged() {
+    let router = router();
+    let case = ParameterUpdateCase {
+        case: "a value outside the parameter's published range",
+        stack_name: "rds-params-refused",
+        created: concat!(
+            "Resources:\n",
+            "  Params:\n",
+            "    Type: AWS::RDS::DBParameterGroup\n",
+            "    Properties:\n",
+            "      Description: the probe stack's parameters\n",
+            "      Family: mysql8.0\n",
+            "      Parameters:\n",
+            "        max_connections: '150'\n",
+        ),
+        // `max_connections` publishes the range 1-100000 for this family, so this value is
+        // outside the domain the engine admits and the modify is refused.
+        updated: concat!(
+            "Resources:\n",
+            "  Params:\n",
+            "    Type: AWS::RDS::DBParameterGroup\n",
+            "    Properties:\n",
+            "      Description: the probe stack's parameters\n",
+            "      Family: mysql8.0\n",
+            "      Parameters:\n",
+            "        max_connections: '200000'\n",
+        ),
+        name_member: "DBParameterGroupName",
+        parameters_describe: "DescribeDBParameters",
+        after_create: &[("max_connections", "150")],
+        after_update: &[("max_connections", "150")],
+    };
+
+    create_stack(&router, case.stack_name, case.created, &[]).await;
+    wait_for_the_transition().await;
+    let group = physical_id(&router, case.stack_name, "Params").await;
+    assert_eq!(
+        settings_of(&router, &case, &group, "after the create").await,
+        expected_settings(case.after_create),
+        "case {:?}: the create must leave the declared setting on the group",
+        case.case
+    );
+
+    let (status_code, updated) = update_stack(&router, case.stack_name, case.updated).await;
+    assert_eq!(
+        status_code, 200,
+        "case {:?}: UpdateStack must answer 200, got {status_code} {updated}",
+        case.case
+    );
+    wait_for_the_transition().await;
+
+    let (_, described) = describe_stack(&router, case.stack_name).await;
+    // The refusal came on the first resource the update asked anything of, so nothing was
+    // changed in any service and the previous configuration is the one in force: the stack
+    // stops at the failure rather than reporting a completed update.
+    assert_eq!(
+        xml_text(&described, "StackStatus").as_deref(),
+        Some(status::UPDATE_FAILED),
+        "case {:?}: a refused change must fail the update, got {described}",
+        case.case
+    );
+    // WHY it failed is the resource's own diagnosis: the refusal Amazon RDS answered.
+    let reason = resource_event_reason(
+        &router,
+        case.stack_name,
+        "Params",
+        resource_status::UPDATE_FAILED,
+    )
+    .await;
+    assert!(
+        reason.contains("max_connections"),
+        "case {:?}: the reason must carry the refusal of the parameter that was rejected, \
+         got {reason:?}",
+        case.case
+    );
+    // And the group still carries the value that was in force: a refused write changes
+    // nothing.
+    assert_eq!(
+        settings_of(&router, &case, &group, "after the refused update").await,
+        expected_settings(case.after_update),
+        "case {:?}: the group must still carry the setting that was in force",
+        case.case
     );
 }
