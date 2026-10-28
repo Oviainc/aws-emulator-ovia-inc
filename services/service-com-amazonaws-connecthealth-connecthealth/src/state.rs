@@ -357,6 +357,24 @@ pub struct Domain {
 }
 
 impl Domain {
+    /// Whether this record is still live: a `DeleteDomain` already recorded against it
+    /// has taken it out of `ACTIVE`, and from that instant it is gone as far as every
+    /// reader of what it CONTAINS — its subscriptions and the sessions and jobs under
+    /// them — and every transition on them is concerned.
+    ///
+    /// The ONE place this rule is stated, beside [`Subscription::is_live`]: every reader
+    /// that needs a live domain goes through it
+    /// ([`ComAmazonawsConnecthealthConnecthealthState::live_domain`],
+    /// [`ComAmazonawsConnecthealthConnecthealthState::live_domain_mut`],
+    /// [`ComAmazonawsConnecthealthConnecthealthState::domain_created_by`]), so two of them
+    /// cannot disagree about whether a domain is still live. The domain RECORD itself
+    /// outlives its liveness — a reporting operation reads it through
+    /// [`ComAmazonawsConnecthealthConnecthealthState::held_domain`] until
+    /// [`ComAmazonawsConnecthealthConnecthealthState::purge_due_deletions`] drops it.
+    pub fn is_live(&self) -> bool {
+        self.status == DomainStatus::Active
+    }
+
     /// Whether deleting this domain finishes inside the deleting call.
     ///
     /// Deleting a domain tears down everything the service provisioned for it. What it
@@ -848,7 +866,7 @@ impl ComAmazonawsConnecthealthConnecthealthState {
         fingerprint: &str,
     ) -> Option<&Domain> {
         self.domains_owned_by(region, account_id).find(|domain| {
-            domain.status == DomainStatus::Active && domain.creation_fingerprint == fingerprint
+            domain.is_live() && domain.creation_fingerprint == fingerprint
         })
     }
 
@@ -1030,11 +1048,16 @@ impl ComAmazonawsConnecthealthConnecthealthState {
     pub fn holds_resource_arn(&self, region: &str, arn: &str) -> bool {
         self.domains_in(region).any(|domain| {
             domain.arn == arn
-                || (domain.status == DomainStatus::Active
-                    && domain
-                        .subscriptions
-                        .values()
-                        .any(|subscription| subscription.is_live() && subscription.arn == arn))
+                || domain.subscriptions.values().any(|subscription| {
+                    subscription.arn == arn
+                        && self
+                            .live_subscription(
+                                region,
+                                &domain.domain_id,
+                                &subscription.subscription_id,
+                            )
+                            .is_some()
+                })
         })
     }
 
@@ -1061,14 +1084,14 @@ impl ComAmazonawsConnecthealthConnecthealthState {
     /// also read.
     pub fn live_domain(&self, region: &str, domain_id: &str) -> Option<&Domain> {
         self.held_domain(region, domain_id)
-            .filter(|domain| domain.status == DomainStatus::Active)
+            .filter(|domain| domain.is_live())
     }
 
     /// The live domain `domain_id` names in `region`, for writing. Liveness is exactly
     /// [`Self::live_domain`]'s.
     pub fn live_domain_mut(&mut self, region: &str, domain_id: &str) -> Option<&mut Domain> {
         self.held_domain_mut(region, domain_id)
-            .filter(|domain| domain.status == DomainStatus::Active)
+            .filter(|domain| domain.is_live())
     }
 
     /// The domain `region` holds under `domain_id`, WHATEVER its status — the reader a

@@ -17,6 +17,8 @@ mod arn_resolution_during_domain_deletion;
 mod create_domain_idempotent_repeat;
 #[path = "all/domain_account_cap_and_lookup_semantics.rs"]
 mod domain_account_cap_and_lookup_semantics;
+#[path = "all/domain_liveness_agreement.rs"]
+mod domain_liveness_agreement;
 #[path = "all/domain_response_projection.rs"]
 mod domain_response_projection;
 #[path = "all/domain_subscription_lifecycle.rs"]
