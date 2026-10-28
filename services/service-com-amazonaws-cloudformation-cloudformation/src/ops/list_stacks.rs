@@ -90,7 +90,7 @@ fn stack_summary(stored: &StoredStack) -> StackSummary {
         parent_id: None,
         root_id: None,
         drift_information: crate::state::stack_drift_information_summary(stored),
-        last_operations: crate::state::last_operation_views(stored.last_operation.as_ref()),
+        last_operations: crate::state::last_operation_views(stored.last_operation()),
     }
 }
 

@@ -376,3 +376,8 @@ mod agent_recommendation_items;
 // for a review-template suite falls in a crowded run of this list.
 #[path = "all/review_template_updates.rs"]
 mod review_template_updates;
+
+// Declared last for the same reason as the declaration above: the sorted position for a
+// lens suite falls in a crowded run of this list.
+#[path = "all/lens_share_listing.rs"]
+mod lens_share_listing;

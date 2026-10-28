@@ -14,6 +14,11 @@
 //! The service's **internet events** (see [`InternetEventRecord`]), which
 //! `ListInternetEvents` reports, live in their own store beside them.
 //!
+//! The query interface's **queries** (see [`QueryRecord`]) live in one store keyed by
+//! `QueryId`: `StartQuery` mints one, `GetQueryStatus` reports its status and `StopQuery`
+//! cancels it, so a started query is observable from a poll and a cancel is observable in
+//! what the next poll reports.
+//!
 //! The small helpers below (region, ARN, wire timestamp, epoch seconds, page token) live
 //! beside the store rather than in one operation's file because several handlers need
 //! exactly the same rule and two copies of it would be two rules.
@@ -22,8 +27,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    ClientLocation, HealthEventsConfig, ImpactedLocation, InternetMeasurementsLogDelivery,
-    ValidationException,
+    ClientLocation, FilterParameter, HealthEventsConfig, ImpactedLocation,
+    InternetMeasurementsLogDelivery, ValidationException,
 };
 
 /// `MonitorConfigState` members, as the model spells them (see
@@ -119,6 +124,37 @@ pub const MAX_INTERNET_EVENTS: usize = 1024;
 /// refuses a record past the ceiling rather than growing without limit.
 pub const MAX_HEALTH_EVENTS_PER_MONITOR: usize = 100;
 
+/// `QueryStatus` members, as the model spells them (see
+/// `crate::ops::types::QUERY_STATUS_VALUES`), with the meaning the model documents for
+/// each: `QUEUED` is scheduled to run, `RUNNING` in progress, `SUCCEEDED` complete,
+/// `FAILED` ended in an error and `CANCELED` stopped by its caller.
+pub const QUERY_STATUS_QUEUED: &str = "QUEUED";
+/// See [`QUERY_STATUS_QUEUED`].
+pub const QUERY_STATUS_RUNNING: &str = "RUNNING";
+/// See [`QUERY_STATUS_QUEUED`].
+pub const QUERY_STATUS_SUCCEEDED: &str = "SUCCEEDED";
+/// See [`QUERY_STATUS_QUEUED`].
+pub const QUERY_STATUS_FAILED: &str = "FAILED";
+/// See [`QUERY_STATUS_QUEUED`].
+pub const QUERY_STATUS_CANCELED: &str = "CANCELED";
+
+/// How long each step of a started query's lifecycle takes before the clock owes the next
+/// one: `QUEUED` -> `RUNNING` after one span, `RUNNING` -> `SUCCEEDED` after the second.
+///
+/// `StartQuery` answers with the query in the non-terminal `QUEUED` state, so both
+/// transitions are owed by the clock rather than by any later call. The span is chosen
+/// (AWS documents no duration for it) and is deliberately non-zero, so a caller polling
+/// immediately after the start still observes `QUEUED`.
+pub const QUERY_STEP_DELAY: Duration = Duration::from_secs(3);
+
+/// The most queries this emulator holds.
+///
+/// A bound on the store, not a claim about an AWS quota: the store lives as long as the
+/// process and grows one record per `StartQuery`, so
+/// [`ComAmazonawsInternetmonitorInternetmonitor20210603State::record_query`] evicts the
+/// queries started longest ago rather than growing without limit.
+pub const MAX_QUERIES: usize = 256;
+
 /// One idempotency record: the monitor a `ClientToken` acted on, and when it did, so the
 /// record can be expired and evicted.
 #[derive(Debug, Clone)]
@@ -194,6 +230,116 @@ impl MonitorRecord {
         } else {
             PROCESSING_STATUS_COLLECTING_DATA.to_string()
         }
+    }
+}
+
+/// One started query of the query interface: which monitor it queries, what it asked for,
+/// and where it is in the lifecycle the model documents (`QUEUED` -> `RUNNING` ->
+/// `SUCCEEDED`).
+///
+/// `StartQuery` mints one of these — the model documents it as starting a query and
+/// returning "the internally-generated identifier of a specific query" — and
+/// `GetQueryStatus` reports it, `StopQuery` cancels it. The two instants below are the
+/// clock-owed transitions, materialised by [`QueryRecord::settle`] rather than by a timer.
+#[derive(Debug, Clone)]
+pub struct QueryRecord {
+    /// `QueryId` — the store's key, kept on the record so a value-only scan can report it.
+    pub query_id: String,
+    /// The `MonitorName` the query runs against: a `QueryId` is reportable only through
+    /// the monitor it was started for, so both halves have to match for a lookup to
+    /// resolve (see
+    /// [`ComAmazonawsInternetmonitorInternetmonitor20210603State::query_for`]).
+    pub monitor_name: String,
+    /// `QueryType`, one of `crate::ops::types::QUERY_TYPE_VALUES`.
+    pub query_type: String,
+    /// The requested `StartTime`, on the scale [`epoch_seconds`] uses.
+    pub start_time: f64,
+    /// The requested `EndTime`, on the same scale as [`Self::start_time`].
+    pub end_time: f64,
+    /// The `FilterParameters` the request carried, which define what the query returns.
+    pub filter_parameters: Vec<FilterParameter>,
+    /// `Status`, one of [`QUERY_STATUS_QUEUED`] / [`QUERY_STATUS_RUNNING`] /
+    /// [`QUERY_STATUS_SUCCEEDED`] / [`QUERY_STATUS_FAILED`] / [`QUERY_STATUS_CANCELED`].
+    pub status: String,
+    /// When the query was started.
+    pub created_at: SystemTime,
+    /// When set, the instant from which this query's `QUEUED` -> `RUNNING` transition is
+    /// due. `None` once it is no longer owed.
+    pub running_at: Option<SystemTime>,
+    /// When set, the instant from which this query's `RUNNING` -> `SUCCEEDED` transition
+    /// is due. `None` once it is no longer owed.
+    pub succeeded_at: Option<SystemTime>,
+}
+
+impl QueryRecord {
+    /// A freshly started query of `monitor_name`, `QUEUED` and owed both of the
+    /// transitions the model's lifecycle documents.
+    pub fn new(
+        query_id: impl Into<String>,
+        monitor_name: impl Into<String>,
+        query_type: impl Into<String>,
+        start_time: f64,
+        end_time: f64,
+        filter_parameters: Vec<FilterParameter>,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            query_id: query_id.into(),
+            monitor_name: monitor_name.into(),
+            query_type: query_type.into(),
+            start_time,
+            end_time,
+            filter_parameters,
+            status: QUERY_STATUS_QUEUED.to_string(),
+            created_at: now,
+            running_at: Some(now + QUERY_STEP_DELAY),
+            succeeded_at: Some(now + QUERY_STEP_DELAY + QUERY_STEP_DELAY),
+        }
+    }
+
+    /// Materialise the transitions the clock already owed at `now`.
+    ///
+    /// A reporting operation calls this before it reads, for the same reason
+    /// [`MonitorRecord::settle`] exists: the query would have reached this status at this
+    /// instant whether or not anybody polled. A query that has reached a terminal status
+    /// is owed nothing, so nothing moves it again.
+    pub fn settle(&mut self, now: SystemTime) {
+        if self.is_terminal() {
+            return;
+        }
+        if let Some(due) = self.running_at {
+            if now >= due {
+                self.status = QUERY_STATUS_RUNNING.to_string();
+                self.running_at = None;
+            }
+        }
+        if let Some(due) = self.succeeded_at {
+            if now >= due {
+                self.status = QUERY_STATUS_SUCCEEDED.to_string();
+                self.succeeded_at = None;
+            }
+        }
+    }
+
+    /// Whether this query has reached a status nothing moves it out of.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            QUERY_STATUS_SUCCEEDED | QUERY_STATUS_FAILED | QUERY_STATUS_CANCELED
+        )
+    }
+
+    /// Stop a query that is still in progress, which is what `StopQuery` does ("Stop a
+    /// query that is progress for a specific monitor"): it becomes `CANCELED` and the
+    /// clock owes it nothing further. A query that has already reached a terminal status
+    /// keeps it — stopping cannot un-finish work that is done.
+    pub fn cancel(&mut self) {
+        if self.is_terminal() {
+            return;
+        }
+        self.status = QUERY_STATUS_CANCELED.to_string();
+        self.running_at = None;
+        self.succeeded_at = None;
     }
 }
 
@@ -371,14 +517,82 @@ pub struct ComAmazonawsInternetmonitorInternetmonitor20210603State {
     /// Bounded by [`MAX_HEALTH_EVENTS_PER_MONITOR`] per monitor; reach it through
     /// [`Self::health_events_for`] / [`Self::record_health_event`].
     pub health_events: BTreeMap<(String, String), HealthEventRecord>,
+    /// Every started query, keyed by `QueryId`. Bounded by [`MAX_QUERIES`] and written
+    /// through [`Self::record_query`]; read through [`Self::query_for`], which also
+    /// checks the monitor the query belongs to.
+    pub queries: BTreeMap<String, QueryRecord>,
+    /// The next query sequence number, which [`mint_query_id`] renders into a `QueryId`.
+    /// Monotonic for the life of the store, so no two queries can be handed the same id.
+    pub next_query_seq: u64,
 }
 
 impl ComAmazonawsInternetmonitorInternetmonitor20210603State {
-    /// Materialise every clock-owed monitor transition due at `now`.
+    /// Materialise every clock-owed monitor and query transition due at `now`.
     pub fn settle_all(&mut self, now: SystemTime) {
         for monitor in self.monitors.values_mut() {
             monitor.settle(now);
         }
+        for query in self.queries.values_mut() {
+            query.settle(now);
+        }
+    }
+
+    /// The query `query_id` of `monitor_name`, or `None` when no query of that monitor
+    /// carries that id.
+    ///
+    /// A `QueryId` is "an internally-generated identifier for a specific query" of one
+    /// monitor, so a request has to name both: one lookup, so every operation of the query
+    /// interface refuses an id it cannot resolve from the same place.
+    pub fn query_for(&self, monitor_name: &str, query_id: &str) -> Option<&QueryRecord> {
+        self.queries
+            .get(query_id)
+            .filter(|query| query.monitor_name == monitor_name)
+    }
+
+    /// [`Self::query_for`], for a caller that mutates what it finds.
+    pub fn query_for_mut(
+        &mut self,
+        monitor_name: &str,
+        query_id: &str,
+    ) -> Option<&mut QueryRecord> {
+        self.queries
+            .get_mut(query_id)
+            .filter(|query| query.monitor_name == monitor_name)
+    }
+
+    /// Hold `record` as a started query, keeping the map bounded by [`MAX_QUERIES`]: the
+    /// queries started longest ago are evicted to make room BEFORE the insert (as
+    /// [`Self::record_internet_event`] does), so the record this call stores is never the
+    /// one dropped.
+    pub fn record_query(&mut self, record: QueryRecord) {
+        while !self.queries.contains_key(&record.query_id) && self.queries.len() >= MAX_QUERIES {
+            let Some(oldest) = self
+                .queries
+                .values()
+                .min_by_key(|query| (query.created_at, query.query_id.as_str()))
+                .map(|query| query.query_id.clone())
+            else {
+                break;
+            };
+            self.queries.remove(&oldest);
+        }
+        self.queries.insert(record.query_id.clone(), record);
+    }
+
+    /// Take the next query sequence number, advancing the counter. [`mint_query_id`]
+    /// renders it into the `QueryId` `StartQuery` hands back.
+    pub fn take_query_seq(&mut self) -> u64 {
+        let seq = self.next_query_seq;
+        self.next_query_seq = self.next_query_seq.saturating_add(1);
+        seq
+    }
+
+    /// Forget every query of `monitor_name`, for a monitor that no longer exists: its
+    /// queries are no longer reportable, and a monitor later created with the same name is
+    /// a new monitor that has started none.
+    pub fn forget_queries_for(&mut self, monitor_name: &str) {
+        self.queries
+            .retain(|_, query| query.monitor_name != monitor_name);
     }
 
     /// The monitor whose ARN is `arn`, for the tagging operations that identify a monitor
@@ -558,8 +772,15 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 }
 
 /// A monitor's ARN: `arn:aws:internetmonitor:<region>:<account>:monitor/<MonitorName>`.
+///
+/// Its resource half is [`monitor_resource_path`], so the ARN and the messages that name
+/// the same resource cannot spell it differently.
 pub fn monitor_arn(region: &str, monitor_name: &str) -> String {
-    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("monitor/{monitor_name}"))
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &monitor_resource_path(monitor_name),
+    )
 }
 
 /// An internet event's ARN:
@@ -603,6 +824,63 @@ pub fn epoch_seconds(at: SystemTime) -> f64 {
         Ok(since_epoch) => since_epoch.as_secs_f64(),
         Err(before_epoch) => -before_epoch.duration().as_secs_f64(),
     }
+}
+
+/// The `QueryId` `StartQuery` hands back for the query it starts: "the
+/// internally-generated identifier of a specific query", minted from the store's
+/// monotonic query counter so it is unique for the life of the store and DERIVED FROM
+/// STORED STATE rather than from a random source this crate would need a new dependency
+/// for.
+///
+/// Internet Monitor renders one as a canonical hyphenated UUID, so that is the form: the
+/// version (`4`) and variant (`8`) nibbles sit where a UUID carries them and the counter
+/// fills the node field, offset by one so the first id minted is not the nil UUID.
+pub fn mint_query_id(seq: u64) -> String {
+    format!("00000000-0000-4000-8000-{:012x}", seq.saturating_add(1))
+}
+
+/// The message AWS words a not-found monitor with, built from the request and the
+/// caller's account: it names the account the lookup was made in and the monitor's own
+/// resource path (`monitor/<MonitorName>`, the resource half of [`monitor_arn`]).
+///
+/// One rule for every operation whose addressed resource IS the monitor the request names
+/// (`GetMonitor`, `UpdateMonitor`), so the two cannot word the same refusal differently.
+pub fn monitor_not_found_message(monitor_name: &str) -> String {
+    format!(
+        "No resource found for account {} and resource {}",
+        ::engine::emulator_account_id(),
+        monitor_resource_path(monitor_name)
+    )
+}
+
+/// The message this service words a request it refuses as failing input validation with —
+/// a value outside a constraint the model declares, or a documented limit on what one
+/// request may carry. The refusal names no member: the service states the class of the
+/// failure, and the shape it carries is `BadRequestException` (HTTP 400).
+pub const INVALID_REQUEST_BODY_MESSAGE: &str = "Invalid request body";
+
+/// The message the query interface words a `QueryId` it cannot resolve for the monitor the
+/// request named with, carried by the modelled `ValidationException` (HTTP 400).
+pub const INVALID_QUERY_ID_MESSAGE: &str = "Invalid query ID provided";
+
+/// The message this service words a resource id the request named but this account does
+/// not hold with, carried by the modelled `ValidationException` (HTTP 400): it states the
+/// resource PATH the request named, which is what identifies the resource inside the
+/// account (`health-event/<MonitorName>/<EventId>` for a health event,
+/// `monitor/<MonitorName>` for a monitor).
+///
+/// One rule for every operation whose addressed resource is reached THROUGH a monitor
+/// rather than being the monitor itself, so the two cannot word the same refusal
+/// differently.
+pub fn invalid_resource_id_message(resource_path: &str) -> String {
+    format!("resourceID is invalid: {resource_path}")
+}
+
+/// The resource path a monitor is identified by inside an account: the resource half of
+/// [`monitor_arn`], and what [`monitor_not_found_message`] and
+/// [`invalid_resource_id_message`] both name it with.
+pub fn monitor_resource_path(monitor_name: &str) -> String {
+    format!("monitor/{monitor_name}")
 }
 
 /// The value of an enum-valued filter a request carried, refused with this service's

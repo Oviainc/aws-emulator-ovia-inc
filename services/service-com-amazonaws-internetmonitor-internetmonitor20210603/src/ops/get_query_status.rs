@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetQueryStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetQueryStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetQueryStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports where a started query is in the lifecycle the model documents (`QUEUED` ->
+//! `RUNNING` -> `SUCCEEDED`, or `CANCELED` once `StopQuery` has stopped it), reading the
+//! query `StartQuery` recorded in [`crate::state`]. A `QueryId` no query of the named
+//! monitor carries is refused with the modelled `ValidationException` (400).
 //!
 //! ## Shape of an operation
 //!
@@ -150,20 +146,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetQueryStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetQueryStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetQueryStatus"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetQueryStatusError::Modeled(GetQueryStatusErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("monitor store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Materialise the clock-owed QUEUED -> RUNNING -> SUCCEEDED transitions before
+        // reading, so this report shows the status the query already had at `now`.
+        store.settle_all(now);
+
+        // One lookup, keyed by BOTH halves the request names: a `QueryId` is an identifier
+        // of a query of one monitor, so an id another monitor's query carries — or one
+        // nothing minted — resolves nothing.
+        let Some(query) = store.query_for(&input.monitor_name, &input.query_id) else {
+            return Err(GetQueryStatusErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::INVALID_QUERY_ID_MESSAGE.to_string()),
+            })
+            .into());
+        };
+
+        Ok(GetQueryStatusOutput {
+            status: query.status.clone(),
+        })
     }
 }

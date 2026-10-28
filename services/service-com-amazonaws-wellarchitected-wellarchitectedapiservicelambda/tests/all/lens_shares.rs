@@ -35,12 +35,13 @@
 //! document and publish helpers are the ones `super::custom_lens_import` and
 //! `super::custom_lens_versions` already spell.
 //!
-//! What a share records is read back through the store, because `CreateLensShare` is the
-//! only operation that REPORTS a lens share so far: `ListLensShares` is a stub with its
-//! own issue, and `DeleteLensShare` — whose own suite is `super::lens_share_deletion` —
-//! answers no members. The store is read exactly as `super::custom_lens_versions` reads a
-//! published version back, and the HTTP read-back of a recorded share is its idempotent
-//! replay and the conflict a second share collides with.
+//! What a share records is read back through the store here, because this suite is about
+//! what the CREATE records: `DeleteLensShare` — whose own suite is
+//! `super::lens_share_deletion` — answers no members, and the paged read of a lens's
+//! shares is `super::lens_share_listing`'s own suite. The store is read exactly as
+//! `super::custom_lens_versions` reads a published version back, and the HTTP read-back of
+//! a recorded share is its idempotent replay and the conflict a second share collides
+//! with.
 //!
 //! The share a RULE-5 invitation stands for is seeded through `record_lens_share` (see
 //! its doc), for the reason `Client::record_workload_share` gives: an invitation is
@@ -67,7 +68,7 @@ use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state
 /// organization ID, or organizational unit (OU) ID with which the workload, lens, profile,
 /// or review template is shared" (`SharedWith` doc, `@length(12, 2048)` and no pattern),
 /// so the rows span all three kinds rather than only an account id.
-const PRINCIPALS: [(&str, &str); 5] = [
+pub(crate) const PRINCIPALS: [(&str, &str); 5] = [
     ("another-account", "111122223333"),
     ("a-third-account", "444455556666"),
     ("an-account-of-nines", "999999999999"),
@@ -205,9 +206,9 @@ pub(crate) async fn one_published_lens(client: &Client, case: &'static str, name
 
 /// Every share the store holds for the lens `alias` names, in `ShareId` order.
 ///
-/// `CreateLensShare` is the only operation that reaches one, and nothing over the wire
-/// lists them yet (`ListLensShares` is a stub with its own issue), so the stored record is
-/// read here — exactly as `custom_lens_versions` reads back a published lens version.
+/// Read from the store rather than over the wire because the suites below assert what the
+/// WRITES recorded; the paged read of the same shares is `super::lens_share_listing`'s
+/// subject. Read exactly as `custom_lens_versions` reads back a published lens version.
 pub(crate) fn stored_shares(client: &Client, alias: &str) -> Vec<StoredShare> {
     let store = client.store();
     let store = store.lock();
