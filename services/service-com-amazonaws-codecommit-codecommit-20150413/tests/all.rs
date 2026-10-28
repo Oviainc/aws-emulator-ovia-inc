@@ -49,6 +49,8 @@ mod branch_listing;
 mod branch_listing_writes;
 #[path = "all/caller_credential_identity.rs"]
 mod caller_credential_identity;
+#[path = "all/caller_identity_matches_sts.rs"]
+mod caller_identity_matches_sts;
 #[path = "all/client_error_messages.rs"]
 mod client_error_messages;
 #[path = "all/client_request_token_validation.rs"]
@@ -107,6 +109,8 @@ mod merge_conflicts;
 mod merge_options;
 #[path = "all/merge_pull_request_fast_forward.rs"]
 mod merge_pull_request_fast_forward;
+#[path = "all/merge_pull_request_repeat.rs"]
+mod merge_pull_request_repeat;
 #[path = "all/merge_pull_request_squash.rs"]
 mod merge_pull_request_squash;
 #[path = "all/merge_pull_request_three_way.rs"]

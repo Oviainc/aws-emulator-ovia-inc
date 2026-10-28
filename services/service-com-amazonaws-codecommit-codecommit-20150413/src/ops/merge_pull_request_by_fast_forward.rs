@@ -17,12 +17,19 @@
 //! Two tips neither of which is the other's ancestor cannot be joined by moving a
 //! reference, so the merge is refused with the modelled
 //! `ManualMergeRequiredException` and nothing is written; so are a pull request that
-//! is no longer open, one whose approval rules still state conditions its approvals
-//! do not meet ([`crate::state::PullRequestRecord::approval_rules_satisfied`]), and
-//! one whose source or destination reference the repository no longer holds — the
-//! modelled `ReferenceDoesNotExistException`, which is the error the model gives
-//! THIS merge and not its squash and three-way siblings, because a fast-forward has
-//! nothing but those references to work with.
+//! was closed without ever being merged, one whose approval rules still state
+//! conditions its approvals do not meet
+//! ([`crate::state::PullRequestRecord::approval_rules_satisfied`]), and one whose
+//! source or destination reference the repository no longer holds — the modelled
+//! `ReferenceDoesNotExistException`, which is the error the model gives THIS merge
+//! and not its squash and three-way siblings, because a fast-forward has nothing but
+//! those references to work with.
+//!
+//! A pull request this operation ALREADY merged ([`crate::state::PullRequestRecord::
+//! is_merged`]) is not one it attempts again: the merge happened, so the call is the
+//! idempotent re-read of it and the stored pull request is answered unchanged — the
+//! same merge commit, the same `mergedBy`, the destination reference left where the
+//! merge put it.
 //!
 //! The merge is between the tips the two references hold NOW rather than the tips
 //! the pull request was opened at — `sourceCommitId` is the value to pass "if you
@@ -331,9 +338,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into()
                 });
             };
+            // A merge that was already MADE is not attempted twice: the pull request
+            // carries it, so this call is the idempotent re-read of that merge and
+            // the stored pull request — the same `mergeMetadata`, the same merge
+            // commit, the same `mergedBy` — is the answer. Nothing is written and no
+            // reference moves a second time.
+            if pull_request.is_merged() {
+                return Ok(MergePullRequestByFastForwardOutput {
+                    pull_request: Some(pull_request.to_modeled()),
+                });
+            }
             // A merge closes the pull request, and "pull request status can only
-            // change from OPEN to CLOSED": one that is already closed cannot be
-            // merged again, and nothing is written for it.
+            // change from OPEN to CLOSED": one that is closed WITHOUT ever having
+            // been merged can no longer be merged, and nothing is written for it.
             if pull_request.status != crate::state::PULL_REQUEST_STATUS_OPEN {
                 return Err(
                     MergePullRequestByFastForwardErrorModeled::PullRequestAlreadyClosedException(

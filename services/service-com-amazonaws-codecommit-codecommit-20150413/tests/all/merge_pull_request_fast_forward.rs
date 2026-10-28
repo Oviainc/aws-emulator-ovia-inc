@@ -600,19 +600,20 @@ async fn a_fast_forward_merge_moves_the_destination_reference_and_closes_the_pul
                      {merged}, got {stored}"
                 );
 
-                // "Pull request status can only change from OPEN to CLOSED": a
-                // second merge of the same pull request is refused and writes
-                // nothing.
-                let again = error(&built.router, OPERATION, &request, CLIENT_ERROR_STATUS).await;
+                // A merge that happened is not attempted twice: the identical call
+                // answers the merge the pull request already carries, writing
+                // nothing and moving no reference.
+                let again = ok(&built.router, OPERATION, &request).await;
                 assert_eq!(
-                    again, "PullRequestAlreadyClosedException",
-                    "case {case:?}: expected a closed pull request to refuse a second merge, got \
-                     {again:?}"
+                    pull_request_of(&again, case),
+                    merged,
+                    "case {case:?}: expected a repeated merge to answer the merge already \
+                     recorded {merged}, got {again}"
                 );
                 let tip_again = branch_tip(&built.router, repository, DESTINATION).await;
                 assert_eq!(
                     &tip_again, expected_commit,
-                    "case {case:?}: the refused second merge moved the destination branch to \
+                    "case {case:?}: the repeated merge moved the destination branch to \
                      {tip_again:?}"
                 );
             }

@@ -666,19 +666,20 @@ async fn merging_a_pull_request_three_way_writes_the_merge_and_closes_the_reques
                      {merged}, got {stored}"
                 );
 
-                // "Pull request status can only change from OPEN to CLOSED": a second
-                // merge of the same pull request is refused and writes nothing.
-                let again =
-                    error(&built.router, "MergePullRequestByThreeWay", &request, 400).await;
+                // A merge that happened is not attempted twice: the identical call
+                // answers the merge the pull request already carries, writing nothing
+                // and moving no reference.
+                let again = ok(&built.router, "MergePullRequestByThreeWay", &request).await;
                 assert_eq!(
-                    again, "PullRequestAlreadyClosedException",
-                    "case {case:?}: expected a closed pull request to refuse a second merge, got \
-                     {again:?}"
+                    pull_request_of(&again, case),
+                    merged,
+                    "case {case:?}: expected a repeated merge to answer the merge already \
+                     recorded {merged}, got {again}"
                 );
                 let tip_again = branch_tip(&built.router, repository, DESTINATION).await;
                 assert_eq!(
                     tip_again, merge_commit,
-                    "case {case:?}: the refused second merge moved the destination branch to \
+                    "case {case:?}: the repeated merge moved the destination branch to \
                      {tip_again:?}"
                 );
             }

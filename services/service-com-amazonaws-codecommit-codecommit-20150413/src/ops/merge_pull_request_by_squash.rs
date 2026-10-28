@@ -29,8 +29,13 @@
 //!
 //! A merge no strategy and no resolution settles is refused with the modelled
 //! `ManualMergeRequiredException`, and nothing is written; so is a pull request that
-//! is no longer open, and one whose destination branch the repository no longer
-//! holds.
+//! was closed without ever being merged, and one whose destination branch the
+//! repository no longer holds.
+//!
+//! A pull request that ALREADY carries a merge
+//! ([`crate::state::PullRequestRecord::is_merged`]) is not merged a second time: the
+//! call is the idempotent re-read of the merge that happened, so the stored pull
+//! request is answered unchanged and nothing is written.
 //!
 //! The merge runs under one per-request budget and off the async worker, exactly as
 //! `MergePullRequestByThreeWay`'s does, because it holds the store guard it reads
@@ -588,9 +593,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into()
                 });
             };
+            // A merge that was already MADE is not attempted twice: the pull request
+            // carries it, so this call is the idempotent re-read of that merge and
+            // the stored pull request — the same `mergeMetadata`, the same merge
+            // commit, the same `mergedBy` — is the answer. Nothing is written and no
+            // reference moves a second time.
+            if pull_request.is_merged() {
+                return Ok(MergePullRequestBySquashOutput {
+                    pull_request: Some(pull_request.to_modeled()),
+                });
+            }
             // A merge closes the pull request, and "pull request status can only
-            // change from OPEN to CLOSED": one that is already closed cannot be
-            // merged again, and nothing is written for it.
+            // change from OPEN to CLOSED": one that is closed WITHOUT ever having
+            // been merged can no longer be merged, and nothing is written for it.
             if pull_request.status != crate::state::PULL_REQUEST_STATUS_OPEN {
                 return Err(
                     MergePullRequestBySquashErrorModeled::PullRequestAlreadyClosedException(

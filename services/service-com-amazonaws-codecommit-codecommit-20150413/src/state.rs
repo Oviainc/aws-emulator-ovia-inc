@@ -2854,6 +2854,19 @@ impl PullRequestRecord {
         self.approval_rules_overridden() || self.approval_rules_not_satisfied().is_empty()
     }
 
+    /// Does this pull request already record a merge that was MADE?
+    ///
+    /// A merge is what closes a pull request ("if the merge is successful, it closes
+    /// the pull request"), so a closed pull request whose target carries the merge was
+    /// closed BY it: there is no second attempt to make, and the stored merge — the
+    /// commit it left, who made it and with which strategy — is the answer. Every
+    /// merge handler asks here before it refuses a closed pull request or writes
+    /// anything, so a repeated merge of one pull request cannot be answered one way by
+    /// one strategy and another way by the next.
+    pub fn is_merged(&self) -> bool {
+        self.targets.iter().any(|target| target.merged)
+    }
+
     /// Are the approval rules of this pull request currently set aside?
     ///
     /// Asked by every reader of the override and by a merge of the pull request, so
@@ -4090,29 +4103,48 @@ pub fn caller_identity_arn<Eng: Send + Sync + 'static>(
     resolved.unwrap_or(long_term).arn
 }
 
-/// The identity a LONG-TERM access key speaks for: the IAM user this account holds
-/// the key for, read through STS's own resolution of such a key, so a caller signing
-/// with it is the user `sts:GetCallerIdentity` answers for the same credential.
+/// The identity a LONG-TERM access key speaks for: the principal the account holds
+/// that key for, read through STS's own resolution of such a key, so a caller signing
+/// with it is the principal `sts:GetCallerIdentity` answers for the same credential.
 ///
-/// STS answers its own ambient caller for a key the account holds no user for,
-/// because the key IT publishes is the one it expects to see. This emulator instead
-/// serves every well-formed access key id, so that answer would make every such
-/// caller ONE identity: a key no IAM record names keeps [`stand_in_identity`],
-/// which keeps two callers signing with different keys two identities.
+/// Two kinds of long-term key resolve to a principal. One is an access key the account
+/// holds for an IAM user, which speaks for that user. The other is the key pair THIS
+/// EMULATOR publishes at start: a long-term access key belongs to an IAM user of the
+/// account, and the user that key is published for is the one
+/// [`::service_common::caller_principal`] states — the record IAM holds for it and the
+/// principal STS reports for it — so a request signed with the credential the emulator
+/// itself issued speaks for that user, and this service cannot name its caller anything
+/// else without disagreeing with `sts:GetCallerIdentity` about one credential.
+///
+/// An access key id the emulator never issued and no record names speaks for no
+/// principal at all. This emulator serves such a key anyway, and STS's answer for it is
+/// its ambient caller, which would make every one of them ONE identity: such a key keeps
+/// [`stand_in_identity`], so two callers signing with two different unissued keys stay
+/// two identities.
 fn long_term_caller_identity<Eng: Send + Sync + 'static>(
     engine: &Eng,
     access_key_id: &str,
 ) -> sts_state::Identity {
-    let stand_in = stand_in_identity(access_key_id);
-    let Some(iam) = sts_state::iam_state(engine) else {
-        return stand_in;
-    };
-    let held = sts_state::long_term_identity(Some(&iam.lock()), access_key_id);
-    if held.arn == sts_state::ambient_identity().arn {
-        stand_in
-    } else {
+    let iam = sts_state::iam_state(engine);
+    let guard = iam.as_ref().map(|iam| iam.lock());
+    let held = sts_state::long_term_identity(guard.as_deref(), access_key_id);
+    if held.arn != sts_state::ambient_identity().arn || emulator_published_key(access_key_id) {
         held
+    } else {
+        stand_in_identity(access_key_id)
     }
+}
+
+/// Is `access_key_id` the long-term key pair this emulator process publishes at start —
+/// the one credential it issues to its own clients?
+///
+/// Asked of the authenticator that MINTED that pair rather than of a copy of its text,
+/// so the key this answers for is exactly the one requests are verified against. `None`
+/// means nothing in this process published a key pair at all, and then no access key id
+/// can be it.
+fn emulator_published_key(access_key_id: &str) -> bool {
+    ::emulator_server::request_authentication::SigV4Authenticator::minted_credentials()
+        .is_some_and(|published| published.access_key_id == access_key_id)
 }
 
 /// The identity this service stands in with for an access key id neither store
