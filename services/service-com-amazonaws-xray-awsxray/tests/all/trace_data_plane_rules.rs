@@ -719,23 +719,26 @@ async fn each_outcome_flag_is_read_in_the_scope_the_model_documents_for_it() {
     // an outcome recorded by a document that is NOT the root sets only the
     // third. Each row puts the outcome on a second, child document of a root
     // that recorded nothing. A row that records a STATUS and declares no flag
-    // records no outcome at all, so it sets no flag and is no root cause.
+    // records no outcome at all, so it sets no flag and is no root cause; a row
+    // that declares a flag is a root cause of its class only when it also names
+    // the exception the outcome is attributed to, which is why the flagged rows
+    // carry a `cause` block.
     let rows: Vec<ScopeCase> = vec![
         ScopeCase {
-            case: "a child document's fault",
-            recorded: json!({"fault": true}),
+            case: "a child document's fault, with the exception it names",
+            recorded: json!({"fault": true, "cause": cause("FaultException", "boom")}),
             flags: (false, false, false),
             causes: (1, 0),
         },
         ScopeCase {
-            case: "a child document's error",
-            recorded: json!({"error": true}),
+            case: "a child document's error, with the exception it names",
+            recorded: json!({"error": true, "cause": cause("ErrorException", "bad input")}),
             flags: (false, false, false),
             causes: (0, 1),
         },
         ScopeCase {
             case: "a child document's throttle",
-            recorded: json!({"throttle": true}),
+            recorded: json!({"throttle": true, "cause": cause("ThrottleException", "slow down")}),
             flags: (false, false, true),
             causes: (0, 0),
         },
@@ -747,7 +750,11 @@ async fn each_outcome_flag_is_read_in_the_scope_the_model_documents_for_it() {
         },
         ScopeCase {
             case: "a child document's declared fault beside a 500 status",
-            recorded: json!({"fault": true, "http": {"response": {"status": 500}}}),
+            recorded: json!({
+                "fault": true,
+                "http": {"response": {"status": 500}},
+                "cause": cause("FaultException", "boom"),
+            }),
             flags: (false, false, false),
             causes: (1, 0),
         },
@@ -1059,6 +1066,7 @@ async fn a_submitted_document_cannot_claim_to_be_an_inferred_service() {
         "start_time": 1_000.1_f64,
         "end_time": 1_000.5_f64,
         "fault": true,
+        "cause": cause("RemoteServiceException", "downstream failed"),
     }]);
     let put = xray.put_segments(&[document.to_string()]).await;
     assert_eq!(put.status, 200, "seeding must succeed, got {put:?}");
@@ -1202,6 +1210,7 @@ fn corpus() -> Vec<(&'static str, String, Vec<String>)> {
                 "start_time": 1_500.0_f64,
                 "end_time": 1_500.2_f64,
                 "error": true,
+                "cause": {"exceptions": [{"type": "ValidationError", "message": "bad input"}]},
                 "http": {"request": {"method": "GET", "url": "http://shop.example.com/cart"}, "response": {"status": 404}},
                 "annotations": {"stage": "prod"},
             })
@@ -1339,9 +1348,13 @@ async fn a_filter_expression_selects_the_traces_it_matches() {
         // A root cause has both kinds of frame, so the dependency-bound filter
         // and the pipeline-bound one separate them.
         ("rootcause.fault.entity.remote = false", vec!["faulting", "remote"]),
-        // An outcome with no `cause` block is still a root cause: the entity
-        // that recorded it is named, with no exceptions.
+        // The error root cause is the one the errored trace's `cause` block
+        // names, selected by its entity and by the exception it carries.
         ("rootcause.error.entity.name = \"shop\"", vec!["errored"]),
+        ("rootcause.error.exception.name = \"ValidationError\"", vec!["errored"]),
+        // The throttled trace declared `error` beside its throttle and named no
+        // exception, so it has no error root cause to select on.
+        ("rootcause.error.entity.name = \"gateway\"", vec![]),
         ("rootcause.error.entity.name = \"frontend\"", vec![]),
         ("rootcause.error.exception.message = \"boom\"", vec![]),
         ("fault AND service(\"api.example.com\")", vec!["faulting"]),
@@ -1793,6 +1806,9 @@ async fn a_trace_reports_at_most_the_bounded_number_of_root_causes() {
                     document["parent_id"] = json!("0000000000000001");
                 }
                 document["fault"] = json!(true);
+                // Each failing segment names the exception its fault is
+                // attributed to, so each is a root cause of its own.
+                document["cause"] = cause("SegmentException", "boom");
                 document.to_string()
             })
             .collect();

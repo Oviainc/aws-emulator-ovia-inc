@@ -2005,6 +2005,25 @@ fn cause_document(exceptions: &[CauseException]) -> serde_json::Value {
     serde_json::json!({ "exceptions": exceptions })
 }
 
+/// Whether an entity classified `class` can ANCHOR a root cause of that class:
+/// it recorded the outcome, and its own `cause` block named at least one
+/// exception to attribute the outcome to.
+///
+/// A fault or error root cause is the attribution of an outcome to an exception
+/// a `cause` block named ([`RootCauseException`](CauseException) is "the
+/// exception associated with a root cause"), so an entity that declared a flag
+/// and submitted no exception gives the service nothing to attribute and
+/// anchors no root cause. This is the ONE place that condition is written, so
+/// every reader of a derived root cause — a trace summary's lists and the
+/// filter language's `rootcause.*` keywords — agrees on which entities have one.
+fn anchors_root_cause(
+    class: Classification,
+    recorded: Classification,
+    exceptions: &[CauseException],
+) -> bool {
+    recorded == class && !exceptions.is_empty()
+}
+
 /// One entity's recorded outcome.
 ///
 /// Two facts, because the model reports two: the EXCLUSIVE class the counters
@@ -2105,7 +2124,8 @@ impl SubsegmentRecord {
     }
 
     /// The entity path from this subsegment down to the deepest entity inside it
-    /// classified `class`, or `None` when its tree holds none.
+    /// that ANCHORS a root cause of `class` ([`anchors_root_cause`]), or `None`
+    /// when its tree holds none.
     ///
     /// A REMOTE subsegment is not walked: what happened on the other side of a
     /// call out belongs to the downstream service, which is the inferred segment
@@ -2129,7 +2149,8 @@ impl SubsegmentRecord {
                 }
             }
         }
-        (self.classification() == class).then(|| vec![self.entity()])
+        anchors_root_cause(class, self.classification(), &self.exceptions)
+            .then(|| vec![self.entity()])
     }
 }
 
@@ -2269,7 +2290,8 @@ impl SegmentRecord {
     }
 
     /// The entity path from this segment down to the deepest entity inside it
-    /// classified `class`, or `None` when it holds none.
+    /// that ANCHORS a root cause of `class` ([`anchors_root_cause`]), or `None`
+    /// when it holds none.
     ///
     /// The walk is bounded by [`MAX_SUBSEGMENT_DEPTH`], the depth the ingest
     /// refuses a deeper document with, so the stack it costs is this module's
@@ -2281,7 +2303,8 @@ impl SegmentRecord {
                 return Some(path);
             }
         }
-        (self.classification() == class).then(|| vec![self.entity()])
+        anchors_root_cause(class, self.classification(), &self.exceptions)
+            .then(|| vec![self.entity()])
     }
 
     /// The frames from this segment down to the entity with id `entity_id`, when
@@ -2533,12 +2556,17 @@ impl TraceRecord {
     /// recorded timing explains ([`response_time_root_causes`](Self::response_time_root_causes))
     /// for `RootCauseKind::ResponseTime`.
     ///
-    /// One per segment whose own tree recorded the outcome: its `Services` are
-    /// the chain of services from the trace's root down to that segment, each
-    /// carrying the frames inside it the outcome ran through — the frame that
-    /// called out (a dependency frame, `Remote`) or the work it did itself (a
-    /// pipeline frame) — and the deepest frame carries the exceptions its own
-    /// `cause` block named.
+    /// One per segment whose own tree holds an entity that ANCHORS a cause of
+    /// that class — one that recorded the outcome AND named the exceptions it is
+    /// attributed to ([`anchors_root_cause`]). Its `Services` are the chain of
+    /// services from the trace's root down to that segment, each carrying the
+    /// frames inside it the outcome ran through — the frame that called out (a
+    /// dependency frame, `Remote`) or the work it did itself (a pipeline frame)
+    /// — and the deepest frame carries the exceptions its own `cause` block
+    /// named. A trace whose documents declared an outcome but submitted no
+    /// exception to attribute it to reports NO root cause of that class: the
+    /// lists are derived from what the documents carry, and there is nothing
+    /// here to diagnose it with.
     ///
     /// Bounded in both dimensions a trace can grow in: at most
     /// [`MAX_ROOT_CAUSES_PER_TRACE`] causes are derived, and each chain walks

@@ -56,6 +56,9 @@ mod request_validation_before_resolution;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 
+#[path = "all/root_cause_attribution.rs"]
+mod root_cause_attribution;
+
 #[path = "all/sampling_rule_default_and_update.rs"]
 mod sampling_rule_default_and_update;
 

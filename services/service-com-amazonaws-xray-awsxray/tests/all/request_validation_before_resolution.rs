@@ -750,6 +750,11 @@ async fn a_document_nested_to_the_bound_is_read_by_every_derivation() {
         });
         if level == MAX_SUBSEGMENT_DEPTH - 1 {
             subsegment["fault"] = json!(true);
+            // The deepest entity names the exception its fault is attributed
+            // to, which is what makes it a root cause the walk can reach.
+            subsegment["cause"] = json!({
+                "exceptions": [{"id": "67ff000000000001", "type": "DeepException", "message": "deep"}],
+            });
             subsegment["annotations"] = json!({"deep": "yes"});
         }
         if !nested.as_array().is_some_and(Vec::is_empty) {
