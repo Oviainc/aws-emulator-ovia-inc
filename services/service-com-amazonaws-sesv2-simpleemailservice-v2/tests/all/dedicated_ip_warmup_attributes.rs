@@ -731,7 +731,7 @@ async fn a_listing_narrowed_to_a_pool_reports_that_pools_addresses() {
         );
         assert_eq!(
             reply.message(),
-            format!("Dedicated IP pool <{pool}> does not exist."),
+            format!("The requested pool <{pool}> does not exist."),
             "case {case:?}: expected the refusal to name {pool:?}, got {:?}",
             reply.message()
         );

@@ -648,6 +648,23 @@ fn resolve<'a>(document: &'a ::serde_json::Value, selector: &str) -> Option<&'a 
     Some(current)
 }
 
+/// The text a `$.path` selector names in one JSON log event, or `None` when the event
+/// carries no such field.
+///
+/// A selector may only name a VALUE of the event: a container node is a subtree rather than
+/// a value, so a selector that lands on one names nothing. The rendering is the one a
+/// condition reads a field as, so a number reads the way the event wrote it.
+///
+/// This is how a dimension value or a metric value resolves a selector against an event
+/// whose leaves a pattern did not extract — a pattern that selects no field of the event at
+/// all, or one whose extraction stopped at this module's bounds.
+pub fn json_selector_text(document: &::serde_json::Value, selector: &str) -> Option<String> {
+    match resolve(document, selector)? {
+        ::serde_json::Value::Object(_) | ::serde_json::Value::Array(_) => None,
+        leaf => field_value(leaf).as_text(),
+    }
+}
+
 /// Whether one segment of a `$.path` selects anything: a member name, followed by the
 /// decimal array indices applied to it. A bracket group that is not a decimal index selects
 /// nothing, so a selector carrying one is refused rather than read as if the brackets were

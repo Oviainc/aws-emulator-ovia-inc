@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetServiceLinkedRoleDeletionStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetServiceLinkedRoleDeletionStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetServiceLinkedRoleDeletionStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -76,6 +67,22 @@
 //!   resource entity that does not exist. The error message describes the resource.
 //! * `ServiceFailureException` (HTTP 500) — The request processing has failed because of an
 //!   unknown error, exception or failure.
+//!
+//! ---
+//!
+//! # How the status is served here
+//!
+//! A REPORT of the task `DeleteServiceLinkedRole` recorded under the id the request
+//! supplies: the status is read off that task's due instant
+//! ([`crate::state::service_linked_role_deletion_status`]) and nothing is written, so two
+//! reads of one task at one instant answer the same status and a read changes nothing a
+//! later caller sees.
+//!
+//! `Reason` is reported by no read here. It describes a deletion that FAILED — "if the
+//! service-linked role has active sessions or if any resources that were used by the role
+//! have not been deleted from the linked service" — and nothing in this emulator holds a
+//! resource of a linked service against a role the account asked to delete, so no task
+//! reaches `FAILED` and there is no failure to describe.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -150,18 +157,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetServiceLinkedRoleDeletionStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetServiceLinkedRoleDeletionStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetServiceLinkedRoleDeletionStatus"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetServiceLinkedRoleDeletionStatusErrorModeled::ServiceFailureException(
+                    ServiceFailureException {
+                        message: Some("the IAM store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let store = state.lock();
+
+        // "This identifier is returned by the DeleteServiceLinkedRole operation in the
+        // format task/aws-service-role/<service-principal-name>/<role-name>/<task-uuid>":
+        // a value outside that format is not an identifier of a deletion task at all,
+        // which is "an invalid or out-of-range value … supplied for an input parameter"
+        // rather than a task the account happens not to hold.
+        if !crate::state::is_service_linked_role_deletion_task_id(&input.deletion_task_id) {
+            return Err(
+                GetServiceLinkedRoleDeletionStatusErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(format!(
+                            "The deletion task ID {} is not valid: DeletionTaskId must be in \
+                             the format \
+                             task/aws-service-role/<service-principal-name>/<role-name>/<task-uuid>",
+                            input.deletion_task_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let Some(task) = store
+            .service_linked_role_deletions
+            .get(&input.deletion_task_id)
+        else {
+            return Err(
+                GetServiceLinkedRoleDeletionStatusErrorModeled::NoSuchEntityException(
+                    NoSuchEntityException {
+                        message: Some(crate::state::deletion_task_not_found(
+                            &input.deletion_task_id,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(GetServiceLinkedRoleDeletionStatusOutput {
+            status: crate::state::service_linked_role_deletion_status(task, crate::state::now())
+                .to_string(),
+            // No task reaches `FAILED` here, so there is no failure to describe (see the
+            // module documentation above).
+            reason: None,
+        })
     }
 }
