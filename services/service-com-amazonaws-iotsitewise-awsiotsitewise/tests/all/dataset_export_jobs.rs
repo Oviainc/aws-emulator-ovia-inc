@@ -110,7 +110,13 @@ fn trim(start: Value, end: Value) -> Value {
 }
 
 /// `CreateDatasetExportJob` with `body`.
+///
+/// A job is started INSIDE a workspace, which the create resolves through the
+/// workspace registry, so this helper opens the workspace it is pointed at first.
+/// A suite that is about an unopened workspace addresses the route directly
+/// instead.
 async fn create(router: &MultiServiceRouter, workspace: &str, body: Value) -> (u16, Value) {
+    crate::support::ensure_workspace(router, workspace).await;
     call(router, "POST", &jobs_uri(workspace), Some(body)).await
 }
 

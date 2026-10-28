@@ -171,6 +171,11 @@ async fn a_create_past_the_dataset_ceiling_is_the_modelled_quota_refusal() {
     for form in forms() {
         let case = form.label;
         let (router, engine) = router_with_engine();
+        // A form that names a workspace creates INSIDE it, and the create resolves
+        // the name through the workspace registry, so the workspace is opened first.
+        if let Some(workspace) = form.workspace {
+            crate::support::ensure_workspace(&router, workspace).await;
+        }
 
         // The map is filled to its ceiling through the shared store rather than
         // with `MAX_DATASETS` HTTP creates: the bound is what is under test, not
@@ -329,6 +334,11 @@ async fn the_tags_a_create_carries_are_persisted_on_the_dataset_it_mints() {
     let sizes: Vec<Option<usize>> = vec![None, Some(1), Some(7), Some(MAX_TAGS_PER_RESOURCE)];
 
     for form in forms() {
+        // A form that names a workspace creates INSIDE it, and the create resolves
+        // the name through the workspace registry, so the workspace is opened first.
+        if let Some(workspace) = form.workspace {
+            crate::support::ensure_workspace(&router, workspace).await;
+        }
         for size in &sizes {
             let count = size.unwrap_or(0);
             let case = format!("{} with {size:?} tags", form.label);

@@ -3,9 +3,12 @@
 //! @op GetQuery
 //! Reports the status of one query in flight on one graph: its id, its text, the state
 //! it is in and the milliseconds it waited and has been running. A graph or a query
-//! this store does not hold is a 404 `ResourceNotFoundException`. REPORTING only — the
-//! single write it makes is reclaiming the queries whose cancellation the clock has
-//! already made due, which had stopped at that instant whether or not anybody called.
+//! this store does not hold is a 404 `ResourceNotFoundException`, and a graph that is
+//! not serving is a 400 `ValidationException`: this operation is reached through the
+//! graph's own data plane, which answers only while the graph is `AVAILABLE`. REPORTING
+//! only — the single write it makes is reclaiming the queries whose cancellation the
+//! clock has already made due, which had stopped at that instant whether or not anybody
+//! called.
 //!
 //! ## Shape of an operation
 //!
@@ -165,14 +168,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A query is addressed as a query OF a graph, so the graph is resolved first:
         // an identifier no graph holds names no queries either, and a graph lives in
         // exactly one Region, so one of another Region is not found here.
-        if store
-            .settled_graph(&input.graph_identifier, &region, now)
-            .is_none()
-        {
+        let Some(graph) = store.settled_graph(&input.graph_identifier, &region, now) else {
             return Err(GetQueryErrorModeled::ResourceNotFoundException(
                 crate::state::graph_not_found(&input.graph_identifier),
             )
             .into());
+        };
+
+        // A query's status is read from the graph's OWN data endpoint — the operation
+        // is bound to the host prefix `{graphIdentifier}.`
+        // (`smithy_query(query="operation",operation="GetQuery")` -> endpoint) — and
+        // that endpoint serves only while the graph is serving, so a graph that is not
+        // serving has no plane to read a query's status from. That precondition and the
+        // refusal it is reported with are the ONE rule `crate::state` states for every
+        // operation on that endpoint, and it is settled before the query lookup: a
+        // query id resolved against a plane that is not answering says nothing.
+        if !graph.status.is_serving() {
+            let refused = crate::state::graph_data_plane_unavailable(
+                &graph.id,
+                graph.status,
+                "report a query on",
+            );
+            return Err(GetQueryErrorModeled::ValidationException(refused).into());
         }
 
         let Some(query) = store.live_query(&input.graph_identifier, &input.query_id, now) else {

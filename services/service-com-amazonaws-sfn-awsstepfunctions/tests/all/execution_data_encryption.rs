@@ -39,18 +39,18 @@ use crate::state_machine_lifecycle::{
 /// How one service's requests are addressed on the wire, from each model's own
 /// `service_info` (service shape, `sigv4Name` and the `awsJson` version its protocol
 /// declares).
-struct Wire {
-    signing_name: &'static str,
-    target_prefix: &'static str,
-    json_version: &'static str,
+pub(crate) struct Wire {
+    pub(crate) signing_name: &'static str,
+    pub(crate) target_prefix: &'static str,
+    pub(crate) json_version: &'static str,
 }
 
-const SFN: Wire = Wire {
+pub(crate) const SFN: Wire = Wire {
     signing_name: "states",
     target_prefix: "AWSStepFunctions",
     json_version: "1.0",
 };
-const KMS: Wire = Wire {
+pub(crate) const KMS: Wire = Wire {
     signing_name: "kms",
     target_prefix: "TrentService",
     json_version: "1.1",
@@ -62,14 +62,14 @@ const POLICY_NAME: &str = "default";
 /// The modelled error class a read refused for want of a grant on the key answers,
 /// and the status it carries: "Either your KMS key policy or API caller does not have
 /// the required permissions" (HTTP 400).
-const KMS_ACCESS_DENIED: &str = "KmsAccessDeniedException";
-const KMS_ACCESS_DENIED_STATUS: u16 = 400;
+pub(crate) const KMS_ACCESS_DENIED: &str = "KmsAccessDeniedException";
+pub(crate) const KMS_ACCESS_DENIED_STATUS: u16 = 400;
 
 /// A key policy that grants the account that owns the key, which is the form the
 /// default key policy takes: it delegates the decision to that account's own IAM, and
 /// the account's published credential — the one these requests are signed with — is
 /// the principal IAM does not bound.
-fn granting_policy() -> Value {
+pub(crate) fn granting_policy() -> Value {
     json!({
         "Version": "2012-10-17",
         "Statement": [account_root_statement()]
@@ -139,7 +139,7 @@ fn xml_element(body: &str, name: &str) -> Option<String> {
 /// The same document with the account's statement WITHDRAWN: the key still carries a
 /// policy, and that policy grants the action to one other principal only, so nothing
 /// in it allows the caller these requests are signed as.
-fn withdrawn_policy() -> Value {
+pub(crate) fn withdrawn_policy() -> Value {
     json!({
         "Version": "2012-10-17",
         "Statement": [{
@@ -154,7 +154,7 @@ fn withdrawn_policy() -> Value {
 
 /// Step Functions and KMS over ONE engine, so the key a state machine names is the
 /// key KMS's own handlers hold.
-struct Chain {
+pub(crate) struct Chain {
     router: MultiServiceRouter,
 }
 
@@ -165,7 +165,7 @@ struct Chain {
 const ACCOUNT_KEY: &str = "AKIDEXAMPLE";
 
 impl Chain {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -183,7 +183,7 @@ impl Chain {
     /// credential scope, and return `(status, body)`. The `Authorization` header is
     /// what routes the request, names the region its ARNs carry, and says which
     /// principal the request speaks for.
-    async fn call_as(
+    pub(crate) async fn call_as(
         &self,
         access_key_id: &str,
         wire: &Wire,
@@ -227,7 +227,7 @@ impl Chain {
     }
 
     /// [`Self::call_as`] for the account's own published credential.
-    async fn call(&self, wire: &Wire, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, wire: &Wire, operation: &str, body: &Value) -> (u16, Value) {
         self.call_as(ACCOUNT_KEY, wire, operation, body).await
     }
 
@@ -290,7 +290,7 @@ impl Chain {
     }
 
     /// Call one KMS operation, requiring a 200.
-    async fn kms(&self, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn kms(&self, operation: &str, body: &Value) -> Value {
         let (status, parsed) = self.call(&KMS, operation, body).await;
         assert_eq!(
             status, 200,
@@ -300,7 +300,7 @@ impl Chain {
     }
 
     /// Call one Step Functions operation, requiring a 200.
-    async fn sfn(&self, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn sfn(&self, operation: &str, body: &Value) -> Value {
         let (status, parsed) = self.call(&SFN, operation, body).await;
         assert_eq!(
             status, 200,
@@ -310,7 +310,7 @@ impl Chain {
     }
 
     /// A symmetric encryption key carrying `policy`, as its key ARN.
-    async fn create_key(&self, policy: &Value) -> String {
+    pub(crate) async fn create_key(&self, policy: &Value) -> String {
         let created = self
             .kms(
                 "CreateKey",
@@ -322,7 +322,7 @@ impl Chain {
 
     /// Replace the key's policy, which is how a caller withdraws a grant and puts it
     /// back.
-    async fn put_policy(&self, key: &str, policy: &Value) {
+    pub(crate) async fn put_policy(&self, key: &str, policy: &Value) {
         self.kms(
             "PutKeyPolicy",
             &json!({ "KeyId": key, "PolicyName": POLICY_NAME, "Policy": policy.to_string() }),
@@ -423,7 +423,7 @@ fn reads() -> Vec<Read> {
 }
 
 /// The encryption configuration a state machine on a customer managed key carries.
-fn customer_managed(key: &str) -> Value {
+pub(crate) fn customer_managed(key: &str) -> Value {
     json!({
         "type": "CUSTOMER_MANAGED_KMS_KEY",
         "kmsKeyId": key,

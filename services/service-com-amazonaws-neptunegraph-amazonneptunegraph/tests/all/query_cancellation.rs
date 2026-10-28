@@ -642,24 +642,39 @@ async fn deleting_a_graph_takes_its_in_flight_queries_with_it() {
     );
 
     // The delete is accepted, not performed: while it is in flight the graph is still a
-    // resource this service holds, so its query is still readable — and the other
-    // graph's query is untouched either way.
-    for (case, graph, query_id) in [
-        ("on the deleting graph", &deleted, "q-gone"),
-        ("on the kept graph", &kept, "q-kept"),
-    ] {
-        let (status, query) = get_query(&router, graph, query_id).await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: the query must still be readable, got {status}: {query}"
-        );
-        assert_eq!(
-            query["state"],
-            json!("RUNNING"),
-            "case {case:?}: expected RUNNING, got {}",
-            query["state"]
-        );
-    }
+    // resource this service holds, but it is no longer SERVING, so its own data plane
+    // answers nothing — the query is refused for the status the graph is in rather than
+    // reported (see `tests/all/graph_data_plane_gate.rs`). The other graph is serving, so
+    // its query is untouched either way.
+    let (status, refused) = get_query(&router, &deleted, "q-gone").await;
+    assert_eq!(
+        status, 400,
+        "case on the deleting graph: a graph on its way out serves no data plane, \
+         got {status}: {refused}"
+    );
+    assert_eq!(
+        error_code(&refused),
+        "ValidationException",
+        "case on the deleting graph: unexpected error code in {refused}"
+    );
+    assert!(
+        refused["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("DELETING"),
+        "case on the deleting graph: the refusal must name the status read, got {refused}"
+    );
+    let (status, query) = get_query(&router, &kept, "q-kept").await;
+    assert_eq!(
+        status, 200,
+        "case on the kept graph: the query must still be readable, got {status}: {query}"
+    );
+    assert_eq!(
+        query["state"],
+        json!("RUNNING"),
+        "case on the kept graph: expected RUNNING, got {}",
+        query["state"]
+    );
 
     // Once the deletion the clock owes falls due the graph is gone, and its queries are
     // gone with it — reported as the graph being absent, which is the first thing either
