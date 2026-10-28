@@ -105,7 +105,9 @@
 //! The recorded 201 carries two further top-level members the model declares on no
 //! shape — `accountId`, the domain's owning account, and `onboardingGeneration`, the
 //! provisioning-generation discriminator — both projected out of the stored record
-//! through [`crate::state::RecordedMembers`]. See [`ACCOUNT_ID_MEMBER`].
+//! through [`crate::state::RecordedMembers`], under the member schemas this module
+//! declares ([`ACCOUNT_ID_MEMBER`]) and with the one member list `GetDomain` projects
+//! the pair with too ([`crate::state::Domain::recorded_identity_members`]).
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -152,7 +154,9 @@ pub type CreateDomainResponse = crate::state::RecordedMembers<CreateDomainOutput
 /// One projection for both of this operation's answers — the create that minted the
 /// record and the `@idempotent` repeat that resolved to it — so the two cannot report
 /// one domain differently. Every member is read out of the store rather than echoed
-/// from the request.
+/// from the request, and the recorded pair beside the modelled payload is the shared
+/// projection in [`crate::state::Domain::recorded_identity_members`], so this answer
+/// and a later read cannot drift apart either.
 fn rendered(stored: &crate::state::Domain) -> CreateDomainResponse {
     CreateDomainResponse {
         payload: CreateDomainOutput {
@@ -169,13 +173,10 @@ fn rendered(stored: &crate::state::Domain) -> CreateDomainResponse {
                 .map(crate::state::WebAppConfigurationRecord::projected),
             created_at: crate::state::to_timestamp(stored.created_at),
         },
-        members: vec![
-            crate::state::RecordedMember::Text(&ACCOUNT_ID_MEMBER, stored.account_id.clone()),
-            crate::state::RecordedMember::Text(
-                &ONBOARDING_GENERATION_MEMBER,
-                stored.onboarding_generation.as_wire().to_string(),
-            ),
-        ],
+        members: stored.recorded_identity_members(
+            &ACCOUNT_ID_MEMBER,
+            &ONBOARDING_GENERATION_MEMBER,
+        ),
     }
 }
 

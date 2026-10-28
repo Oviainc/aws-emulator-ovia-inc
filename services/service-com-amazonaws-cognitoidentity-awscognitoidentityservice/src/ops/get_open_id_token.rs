@@ -246,6 +246,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetOpenIdToken<En
 
         let now = ::std::time::SystemTime::now();
         let logins = input.logins.unwrap_or_default();
+        // Which issuers the pool trusts is partly IAM's record — an
+        // `OpenIdConnectProviderARNs` entry names an IAM OpenID Connect provider — so the
+        // account's providers are read BEFORE this service's own store is locked, and only
+        // for a call that presents a login at all.
+        let registered = if logins.is_empty() {
+            crate::state::RegisteredOidcProviders::default()
+        } else {
+            crate::state::registered_oidc_providers(&*self.engine)
+        };
         let mut store = state.lock();
 
         // "using a known Cognito ID. This known Cognito ID is returned by GetId": the token
@@ -277,9 +286,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetOpenIdToken<En
         }
 
         // A `Logins` entry is decided by the pool the identity belongs to, exactly as it is
-        // wherever else this service is handed one: an entry naming an Amazon Cognito user
-        // pool carries its issuer in the provider name, so a token minted by a user pool
-        // that is none of this pool's `CognitoIdentityProviders` authenticates nobody here.
+        // wherever else this service is handed one: the entry carries its issuer in the
+        // provider name, so the trust that pool states for the issuer — and the audience
+        // that trust accepts — decides it.
         let Some(pool) = store.identity_pools.get(&identity_pool_id) else {
             return Err(GetOpenIdTokenErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
@@ -304,13 +313,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetOpenIdToken<En
             )
             .into());
         }
-        if logins
-            .keys()
-            .any(|provider| !pool.accepts_login_provider(provider))
-        {
+        if let Some(refusal) = pool.login_trust(&registered).refuse(&logins) {
             return Err(GetOpenIdTokenErrorModeled::NotAuthorizedException(
                 NotAuthorizedException {
-                    message: Some(crate::state::UNSUPPORTED_LOGIN_PROVIDER_MESSAGE.to_string()),
+                    message: Some(refusal.message().to_string()),
                 },
             )
             .into());

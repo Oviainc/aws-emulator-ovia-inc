@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartPolicyGeneration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartPolicyGeneration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartPolicyGeneration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts a policy generation for the IAM principal the request names and RECORDS it as
+//! a job in this service's state, so the `jobId` this operation returns is the one
+//! `GetGeneratedPolicy`, `CancelPolicyGeneration` and `ListPolicyGenerations` resolve.
+//!
+//! A generation is not instantaneous: the job is started `IN_PROGRESS` and the clock owes
+//! it `SUCCEEDED` ([`crate::state::POLICY_GENERATION_SPAN`] later), unless a cancel stops
+//! it first. The due instant is stored; nothing sleeps for it.
+//!
+//! The request is validated SYNCHRONOUSLY, before any job exists: a request that does not
+//! describe CloudTrail activity to analyze (no `cloudTrailDetails` at all, no trail in it,
+//! or a time range that ends before it starts) is refused with the modelled
+//! `ValidationException` (HTTP 400) and records nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +161,135 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartPolicyGeneration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartPolicyGenerationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartPolicyGeneration"))
+        // What a generation analyzes is the CloudTrail activity of the trails the request
+        // names over the range it names, so a request that describes none cannot start
+        // one. The model leaves `cloudTrailDetails` optional, so the boundary passed it
+        // and the refusal is raised here, with the modelled `ValidationException` the
+        // operation declares.
+        let Some(cloud_trail_details) = input.cloud_trail_details else {
+            crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::ValidationRefused);
+            return Err(StartPolicyGenerationErrorModeled::ValidationException(
+                crate::state::missing_member_exception("cloudTrailDetails"),
+            )
+            .into());
+        };
+
+        // `trails` is `@required`, so the boundary refused a request that omits it — but
+        // `TrailList` carries no `@length`, so an EMPTY list reaches here, and it names no
+        // CloudTrail data to analyze.
+        if cloud_trail_details.trails.is_empty() {
+            crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::ValidationRefused);
+            return Err(StartPolicyGenerationErrorModeled::ValidationException(
+                crate::state::field_validation_exception(
+                    "cloudTrailDetails.trails",
+                    "cloudTrailDetails.trails must name at least one trail to analyze",
+                ),
+            )
+            .into());
+        }
+
+        // `startTime` is "the start of the time range for which IAM Access Analyzer
+        // reviews your CloudTrail events" and `endTime` its end, so a range whose end
+        // precedes its start contains no events and is not a range at all. Compared on
+        // seconds-then-nanoseconds, the pair an instant is carried as.
+        let start_time = cloud_trail_details.start_time;
+        if let Some(end_time) = cloud_trail_details.end_time {
+            if (end_time.secs(), end_time.subsec_nanos())
+                < (start_time.secs(), start_time.subsec_nanos())
+            {
+                crate::state::audit(
+                    Self::NAME,
+                    ctx,
+                    crate::state::AuditOutcome::ValidationRefused,
+                );
+                return Err(StartPolicyGenerationErrorModeled::ValidationException(
+                    crate::state::field_validation_exception(
+                        "cloudTrailDetails.endTime",
+                        "cloudTrailDetails.endTime must be at or after cloudTrailDetails.startTime",
+                    ),
+                )
+                .into());
+            }
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::StoreUnavailable);
+            StartPolicyGenerationErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+        })?;
+        let mut state = state.lock();
+
+        // A repeated `clientToken` is the SAME start retried, not a second generation: it
+        // answers with the `jobId` the first call returned, as long as that job is still
+        // held.
+        if let Some(recorded) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| state.start_policy_generation_tokens.get(token))
+            .filter(|job_id| state.policy_generations.contains_key(job_id.as_str()))
+            .cloned()
+        {
+            drop(state);
+            crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::NoChange);
+            return Ok(StartPolicyGenerationOutput { job_id: recorded });
+        }
+
+        if state.policy_generations.len() >= crate::state::MAX_POLICY_GENERATION_JOBS {
+            // The emulator's own ceiling on caller-driven growth, expressed with the
+            // quota error this operation models (HTTP 402) rather than by growing the
+            // store.
+            drop(state);
+            crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::QuotaExceeded);
+            return Err(
+                StartPolicyGenerationErrorModeled::ServiceQuotaExceededException(
+                    crate::state::policy_generation_quota_exceeded(
+                        &input.policy_generation_details.principal_arn,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        let now = ::std::time::SystemTime::now();
+        // A `jobId` already held would overwrite that job, so mint until one is free.
+        let job_id = ::std::iter::repeat_with(crate::state::new_policy_generation_job_id)
+            .find(|candidate| !state.policy_generations.contains_key(candidate))
+            .expect("repeat_with yields candidate ids until an unused one is found");
+
+        state.policy_generations.insert(
+            job_id.clone(),
+            crate::state::PolicyGenerationJob {
+                job_id: job_id.clone(),
+                principal_arn: input.policy_generation_details.principal_arn,
+                trails: cloud_trail_details.trails,
+                analysis_start_time: start_time,
+                // "If this is not included in the request, the default value is the
+                // current time" — the instant the generation was started.
+                analysis_end_time: cloud_trail_details
+                    .end_time
+                    .unwrap_or_else(|| ::aws_smithy_types::DateTime::from(now)),
+                started_at: now,
+                completes_at: now + crate::state::POLICY_GENERATION_SPAN,
+                canceled_at: None,
+            },
+        );
+        if let Some(token) = input.client_token {
+            // First result wins, and the store is bounded (oldest record evicted first),
+            // so a token already recorded keeps the job it recorded.
+            state
+                .start_policy_generation_tokens
+                .remember(token, job_id.clone());
+        }
+
+        // The store guard is released before the call is recorded, so the lock is held
+        // for the write alone.
+        drop(state);
+        crate::state::audit(
+            Self::NAME,
+            ctx,
+            crate::state::AuditOutcome::PolicyGenerationStarted,
+        );
+        Ok(StartPolicyGenerationOutput { job_id })
     }
 }

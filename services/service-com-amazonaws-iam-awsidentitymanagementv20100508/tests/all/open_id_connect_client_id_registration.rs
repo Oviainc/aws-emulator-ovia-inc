@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! `AddClientIDToOpenIDConnectProvider`, end to end over the awsQuery wire.
+//! `AddClientIDToOpenIDConnectProvider` and `DeleteOpenIDConnectProvider`, end to end over
+//! the awsQuery wire.
 //!
 //! Every assertion drives a `MultiServiceRouter` holding this service over one shared
 //! `InMemoryEngine`, exactly as the production router does, so what is under test is the
@@ -22,10 +23,16 @@
 //! including a value carrying the characters XML gives meaning to, which must come back
 //! out of the read as the caller wrote it in a body that still parses), so no single
 //! request is the specification.
+//!
+//! The DELETE half is the second rule: it FORGETS the named provider with everything held
+//! on it, is idempotent ("it does not fail or return an error if you call the operation for
+//! a provider that does not exist"), and updates nothing that references the provider — so
+//! a later read of that ARN is a 404, the URL it was registered under is free again, and
+//! every other provider is untouched.
 
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::open_id_connect_providers::list_members;
+use crate::open_id_connect_providers::{client_ids, list_members};
 use crate::role_lifecycle::{borrowed, param, reported_tags};
 use crate::user_lifecycle::{account_id, call, element, error_code, router};
 
@@ -233,6 +240,12 @@ async fn add(router: &MultiServiceRouter, arn: &str, client_id: &str) -> (u16, S
         &borrowed(&params),
     )
     .await
+}
+
+/// One delete request.
+async fn delete(router: &MultiServiceRouter, arn: &str) -> (u16, String) {
+    let params = vec![param("OpenIDConnectProviderArn", arn)];
+    call(router, "DeleteOpenIDConnectProvider", &borrowed(&params)).await
 }
 
 // ---------------------------------------------------------------------------
@@ -567,6 +580,121 @@ async fn adding_to_a_provider_the_account_does_not_hold_is_refused() {
         registered,
         "a refused registration must leave the held client IDs alone, got {after}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The delete
+// ---------------------------------------------------------------------------
+
+/// A delete forgets the named provider and nothing else: its ARN stops resolving, every
+/// other provider the account holds is untouched, repeating the delete still succeeds, and
+/// the URL it was registered under is free again — while a value that is not an ARN is
+/// refused `InvalidInput`.
+#[tokio::test]
+async fn deleting_a_provider_forgets_only_that_provider_and_is_idempotent() {
+    let router = router();
+    // Rows: providers whose records differ in what is held on them, so the delete is
+    // exercised on more than one shape of record.
+    let providers: Vec<(&str, Vec<String>)> = vec![
+        ("deleted-none", Vec::new()),
+        ("deleted-one", client_ids(1)),
+        ("kept-three", client_ids(3)),
+    ];
+    let mut arns = Vec::new();
+    for (name, registered) in &providers {
+        arns.push(seed(&router, name, registered).await);
+    }
+
+    for index in 0..2 {
+        let (name, registered) = &providers[index];
+        let arn = &arns[index];
+        for attempt in 1..=3 {
+            let (status, body) = delete(&router, arn).await;
+            assert_eq!(
+                status, 200,
+                "case {name:?}: attempt {attempt}: expected HTTP 200, got {status} with body \
+                 {body}"
+            );
+            let (status, after) = read(&router, arn).await;
+            assert_eq!(
+                status, 404,
+                "case {name:?}: attempt {attempt}: a deleted provider must stop resolving, got \
+                 {status} with {after}"
+            );
+            assert_eq!(
+                error_code(&after),
+                "NoSuchEntity",
+                "case {name:?}: attempt {attempt}: expected NoSuchEntity, got {after}"
+            );
+        }
+        // Nothing may be registered with a provider that is gone.
+        let (status, body) = add(&router, arn, "audience-z").await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (404, "NoSuchEntity"),
+            "case {name:?}: an add to a deleted provider expected (404, NoSuchEntity), got \
+             ({status}, {body})"
+        );
+        // The URL is free again, and a provider registered for it again carries only what
+        // the new create asked for.
+        let recreated = seed(&router, name, registered).await;
+        assert_eq!(
+            &recreated, arn,
+            "case {name:?}: the ARN is derived from the URL, so re-registering it answers the \
+             same ARN, got {recreated}"
+        );
+        let (status, after) = read(&router, arn).await;
+        assert_eq!(
+            status, 200,
+            "case {name:?}: the re-registered provider must read back, got {status}: {after}"
+        );
+        assert_eq!(
+            &list_members(&after, "ClientIDList"),
+            registered,
+            "case {name:?}: the re-registered provider holds what its create asked for, got \
+             {after}"
+        );
+    }
+
+    // The provider no delete named is exactly as it was created.
+    let (status, kept) = read(&router, &arns[2]).await;
+    assert_eq!(
+        status, 200,
+        "the provider no delete named must still read back, got {status}: {kept}"
+    );
+    assert_eq!(
+        &list_members(&kept, "ClientIDList"),
+        &providers[2].1,
+        "another provider's client IDs must be untouched, got {kept}"
+    );
+
+    for value in [
+        "https://kept-three.example.net",
+        "kept-three.example.net-provider",
+        "aws:iam::000000000000:oidc-provider/kept-three.example.net",
+    ] {
+        let (status, body) = delete(&router, value).await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "InvalidInput"),
+            "case {value:?}: expected (400, InvalidInput), got ({status}, {body})"
+        );
+    }
+
+    // "This operation is idempotent; it does not fail or return an error if you call the
+    // operation for a provider that does not exist": a well-formed ARN naming no provider is
+    // answered as the deletion it already is.
+    for arn in [
+        format!("arn:aws:iam::{}:oidc-provider/never.example.net", account_id()),
+        "arn:aws:iam::111122223333:oidc-provider/kept-three.example.net".to_string(),
+    ] {
+        let (status, body) = delete(&router, &arn).await;
+        assert_eq!(
+            status, 200,
+            "case {arn:?}: deleting a provider the account does not hold expected HTTP 200, got \
+             {status} with body {body}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

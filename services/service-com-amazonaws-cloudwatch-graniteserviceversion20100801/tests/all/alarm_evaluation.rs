@@ -393,6 +393,27 @@ async fn an_alarms_state_is_evaluated_from_the_datapoints_it_watches() {
             "INSUFFICIENT_DATA",
         ),
         (
+            // A publisher that declares no unit publishes under the value the enumerated type
+            // declares for a measurement that has none, so the alarm selecting THAT value is
+            // the one that grades the series (`crate::state::UNIT_NONE`).
+            "a breaching datapoint with no declared unit, watched by the alarm naming None",
+            json!({"Unit": "None"}),
+            vec![datum(42.0, 0.0)],
+            "ALARM",
+        ),
+        (
+            "a breaching datapoint with no declared unit, watched by an alarm naming another",
+            json!({"Unit": "Count"}),
+            vec![datum(42.0, 0.0)],
+            "INSUFFICIENT_DATA",
+        ),
+        (
+            "a breaching datapoint declaring a unit, watched by the alarm naming None",
+            json!({"Unit": "None"}),
+            vec![datum(42.0, 0.0).with(json!({"Unit": "Count"}))],
+            "INSUFFICIENT_DATA",
+        ),
+        (
             "a breaching datapoint of another dimension set than the alarm watches",
             json!({}),
             vec![datum(42.0, 0.0).with(json!({

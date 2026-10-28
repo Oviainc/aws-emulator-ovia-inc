@@ -414,13 +414,14 @@ fn validate_period(period: i32) -> Result<(), GetMetricStatisticsError> {
 ///
 /// `unit` is the unit the window's datapoints were published with — the window is keyed by it
 /// ([`crate::state::windows_by_unit`]), so a datapoint reports the unit its own observations
-/// carry whether or not the request filtered on one.
+/// carry whether or not the request filtered on one, and reports the value the enumerated type
+/// declares for a measurement with no unit where its publisher named none.
 fn aggregate(
     window_start: f64,
     data: &[&crate::state::StoredDatum],
     statistics: &[&str],
     extended: &[&str],
-    unit: Option<&str>,
+    unit: &str,
 ) -> Datapoint {
     let folded = crate::state::BasicStatistics::of(data.iter().copied());
     let (sample_count, sum) = (folded.sample_count, folded.sum);
@@ -450,7 +451,7 @@ fn aggregate(
             .contains(&"Maximum")
             .then_some(maximum)
             .filter(|value: &f64| value.is_finite()),
-        unit: unit.map(ToString::to_string),
+        unit: Some(unit.to_string()),
         extended_statistics: (!extended_statistics.is_empty()).then_some(extended_statistics),
     }
 }

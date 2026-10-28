@@ -203,6 +203,31 @@ impl Emulator {
             .await
     }
 
+    /// `PUT /policy/generation` with the given request body.
+    pub async fn start_policy_generation(&self, body: Value) -> Reply {
+        self.send("PUT", "/policy/generation", Some(body)).await
+    }
+
+    /// `GET /policy/generation/{jobId}{query}`.
+    pub async fn get_generated_policy(&self, job_id: &str, query: &str) -> Reply {
+        self.send(
+            "GET",
+            &format!("/policy/generation/{}{query}", label(job_id)),
+            None,
+        )
+        .await
+    }
+
+    /// `PUT /policy/generation/{jobId}`.
+    pub async fn cancel_policy_generation(&self, job_id: &str) -> Reply {
+        self.send(
+            "PUT",
+            &format!("/policy/generation/{}", label(job_id)),
+            None,
+        )
+        .await
+    }
+
     /// `POST /resource/scan` with the given request body.
     pub async fn start_resource_scan(&self, body: Value) -> Reply {
         self.send("POST", "/resource/scan", Some(body)).await
@@ -239,6 +264,15 @@ impl Emulator {
         )
         .await
     }
+}
+
+/// A member of a projected structure, treating JSON `null` as absent the way an omitted
+/// optional member is.
+///
+/// The sibling of [`Reply::member`] for a structure NESTED in a reply — an analyzer, a
+/// job's details, a listing entry — so every suite reads an optional member the same way.
+pub fn member<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
+    value.get(name).filter(|value| !value.is_null())
 }
 
 /// A value encoded for an `@httpLabel` or an `@httpQuery` entry the way an SDK encodes

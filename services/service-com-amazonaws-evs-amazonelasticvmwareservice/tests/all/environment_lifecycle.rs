@@ -156,6 +156,31 @@ pub(crate) fn register_network(
     );
 }
 
+/// Write one route server peer per id into the account's own Amazon EC2 store.
+///
+/// `CreateEnvironment` resolves every `connectivityInfo.privateRouteServerPeerings` entry
+/// against THAT store — a route server peer is an Amazon EC2 resource of the caller's
+/// account and Amazon EVS creates none — so a test whose create carries the member and
+/// expects to be served registers the peers it names here first, exactly as
+/// [`register_network`] registers the VPC and the service access subnet.
+/// `tests/all/route_server_peer_references.rs` owns that rule and mints its peers through
+/// Amazon EC2's own `CreateRouteServerPeer`.
+pub(crate) fn register_route_server_peers(engine: &engine::InMemoryEngine, peer_ids: &[&str]) {
+    let ec2_state = ec2::state::service_state(engine)
+        .expect("the in-memory engine carries the account's EC2 store");
+    let mut store = ec2_state.lock();
+    for peer_id in peer_ids {
+        store.route_server_peers.insert(
+            (*peer_id).to_string(),
+            ec2::ops::types::RouteServerPeer {
+                route_server_peer_id: Some((*peer_id).to_string()),
+                state: Some(ec2::state::ROUTE_SERVER_PEER_STATE_AVAILABLE.to_string()),
+                ..Default::default()
+            },
+        );
+    }
+}
+
 /// The IPv4 CIDR block of the VPC [`register_network`] writes: every VLAN subnet block
 /// a test uses is a block OF it, because Amazon EVS provisions the VLAN subnets inside
 /// that VPC.
@@ -666,7 +691,11 @@ async fn create_environment_enforces_the_documented_request_rules() {
         "nsxManager3": "nsxm3", "nsxEdge1": "nsxe1", "nsxEdge2": "nsxe2",
         "sddcManager": "sddc", "cloudBuilder": "builder",
     });
-    let connectivity = json!({ "privateRouteServerPeerings": ["rsp-1", "rsp-2"] });
+    // The two route server peers the `connectivityInfo` rows name. Every row registers
+    // them in the account's own EC2 store below, because an installed version resolves
+    // them there (`tests/all/route_server_peer_references.rs` owns that rule).
+    const PEERINGS: [&str; 2] = ["rsp-0123456789abcdef0", "rsp-00fedcba98765432"];
+    let connectivity = json!({ "privateRouteServerPeerings": PEERINGS });
 
     let mut overlapping = vlans();
     // vmManagement's /24 swallows vMotion's /28 — the same addresses twice.
@@ -789,6 +818,7 @@ async fn create_environment_enforces_the_documented_request_rules() {
 
     for (case, overrides, expected_status) in rows {
         let router = emulator();
+        register_route_server_peers(&router.engine, &PEERINGS);
         let mut request = router.create_request(None);
         for (member, value) in overrides.as_object().expect("the overrides are an object") {
             request[member] = value.clone();
