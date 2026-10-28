@@ -2014,21 +2014,50 @@ pub fn page_matching<T: Clone>(
     (page, next)
 }
 
+/// One VALUE written into a page context: the string with its byte length in front of
+/// it, so the value cannot be read as anything but itself.
+///
+/// A context has to name its sequence INJECTIVELY — two requests paging different
+/// sequences must never produce the same string — because [`decode_next_token`] can only
+/// compare the two strings and a collision is exactly the resume-the-wrong-sequence
+/// confusion the context is in the token to prevent. The values that go into one are
+/// request data under no syntactic constraint (the model puts a `@pattern` on none of
+/// these members), so a value can spell any separator the context uses and any word that
+/// stands for something else in it; a length-prefixed value is self-delimiting and
+/// therefore cannot.
+fn context_value(value: &str) -> String {
+    format!(":{}:{value}", value.len())
+}
+
+/// One FILTER written into a page context: its value ([`context_value`]) when the request
+/// carried the filter, and otherwise a marker that no present value renders as — a bare
+/// `-` where a value always starts with its decimal length.
+///
+/// Spelling "no filter" with an in-band word instead would make the unfiltered sequence's
+/// context byte-identical to the one a request carrying that very word as its filter
+/// value produces, so a token issued for either would resume the other.
+fn context_filter(value: Option<&str>) -> String {
+    match value {
+        Some(value) => context_value(value),
+        None => ":-".to_string(),
+    }
+}
+
 /// The sequence a `ListSearchJobs` page indexes: the jobs in this status, or every job
 /// when the request carries no `ByStatus`. Part of the page's `NextToken`, so a token
 /// cannot resume a differently filtered listing.
 pub fn jobs_page_context(by_status: Option<&str>) -> String {
-    format!("jobs:{}", by_status.unwrap_or("ALL"))
+    format!("jobs{}", context_filter(by_status))
 }
 
 /// The sequence a `ListSearchJobResults` page indexes: one search job's results.
 pub fn results_page_context(identifier: &str) -> String {
-    format!("results:{identifier}")
+    format!("results{}", context_value(identifier))
 }
 
 /// The sequence a `ListSearchJobBackups` page indexes: one search job's backups.
 pub fn backups_page_context(identifier: &str) -> String {
-    format!("backups:{identifier}")
+    format!("backups{}", context_value(identifier))
 }
 
 /// The sequence a `ListSearchResultExportJobs` page indexes: the export jobs left by
@@ -2037,9 +2066,9 @@ pub fn backups_page_context(identifier: &str) -> String {
 /// indexes.
 pub fn export_jobs_page_context(by_status: Option<&str>, by_search_job: Option<&str>) -> String {
     format!(
-        "export-jobs:{}:{}",
-        by_status.unwrap_or("ALL"),
-        by_search_job.unwrap_or("ALL")
+        "export-jobs{}{}",
+        context_filter(by_status),
+        context_filter(by_search_job)
     )
 }
 
