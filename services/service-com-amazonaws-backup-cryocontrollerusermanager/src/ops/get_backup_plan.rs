@@ -12,9 +12,13 @@
 //! `ScheduledRunsPreview` is reported only for a caller that asks for one
 //! (`MaxScheduledRunsPreview` defaults to 0, and the model documents the member
 //! as "only included when MaxScheduledRunsPreview parameter is greater than
-//! 0"); this reader computes no upcoming runs, so it leaves the member unset
-//! rather than reporting execution times nothing worked out. That one member is
-//! what keeps this operation's own issue open.
+//! 0"). The runs it reports are COMPUTED from the stored plan and the clock:
+//! each rule's `ScheduleExpression` is the cron expression its jobs are
+//! initiated by, read in the rule's `ScheduleExpressionTimezone` (UTC where the
+//! rule names none), and the plan's preview is the earliest upcoming executions
+//! of all its rules merged into one chronological list. A rule whose stored
+//! schedule or time zone cannot be read names no execution, so it contributes
+//! none rather than an invented one.
 //!
 //! ## Shape of an operation
 //!
@@ -112,6 +116,188 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use ::std::time::SystemTime;
+
+/// The cron expression a rule's jobs are initiated by when the rule carries
+/// none: "When no CRON expression is provided, Backup will use the default
+/// expression `cron(0 5 ? * * *)`" (model doc for
+/// `BackupRule$ScheduleExpression`).
+const DEFAULT_SCHEDULE_EXPRESSION: &str = "cron(0 5 ? * * *)";
+
+/// How many whitespace-separated fields a rule's cron expression carries: the
+/// minute, hour, day-of-month, month, day-of-week and year of an Amazon Web
+/// Services cron expression (the model's own examples for
+/// `BackupRule$ScheduleExpression`, `0 12 * * ? *` and `15 * ? * * *`, carry six
+/// each).
+const CRON_FIELDS: usize = 6;
+
+/// The cron fields a `?` ("no specific value") may stand in, as positions within
+/// the six: the day-of-month and the day-of-week, the pair the model's examples
+/// put it in.
+const NO_SPECIFIC_VALUE_FIELDS: [usize; 2] = [2, 4];
+
+/// `RuleExecutionType` of a rule that creates continuous backups: "True causes
+/// Backup to create continuous backups capable of point-in-time restore (PITR)"
+/// (model doc for `BackupRule$EnableContinuousBackup`); the enum documents
+/// `CONTINUOUS` as "point-in-time recovery".
+const RULE_EXECUTION_TYPE_CONTINUOUS: &str = "CONTINUOUS";
+
+/// `RuleExecutionType` of a rule that creates snapshot backups: "False (or not
+/// specified) causes Backup to create snapshot backups" (model doc for the same
+/// member); the enum documents `SNAPSHOTS` as "snapshot backups".
+const RULE_EXECUTION_TYPE_SNAPSHOTS: &str = "SNAPSHOTS";
+
+/// The most upcoming runs a preview reports: the maximum of the model's
+/// `@range` on `MaxScheduledRunsPreview`, which the member's own doc states as
+/// "Contains up to 10 future backup executions".
+const MAX_SCHEDULED_RUNS_PREVIEW: usize = 10;
+
+/// The upcoming scheduled runs of `plan` a caller asking for `max_runs` of them
+/// is reported, or `None` for a caller that asked for none: the member is "only
+/// included when MaxScheduledRunsPreview parameter is greater than 0" (model
+/// doc).
+///
+/// A plan schedules its jobs through its rules, so the preview is every rule's
+/// upcoming executions merged into ONE chronological list and cut at `max_runs`
+/// — no rule can contribute more than that many, which is what bounds the walk.
+/// Two rules due at the same instant are reported in the order the plan carries
+/// them, so one stored plan always reads back in one order.
+fn upcoming_runs(
+    plan: &crate::state::BackupPlanRecord,
+    max_runs: i32,
+    now: SystemTime,
+) -> Option<Vec<ScheduledPlanExecutionMember>> {
+    let max_runs = usize::try_from(max_runs)
+        .unwrap_or_default()
+        .min(MAX_SCHEDULED_RUNS_PREVIEW);
+    if max_runs == 0 {
+        return None;
+    }
+    let mut runs: Vec<(SystemTime, usize, &BackupRule)> = Vec::new();
+    for (position, rule) in plan.rules.iter().enumerate() {
+        let Some(schedule) = parse_schedule_expression(
+            rule.schedule_expression
+                .as_deref()
+                .unwrap_or(DEFAULT_SCHEDULE_EXPRESSION),
+        ) else {
+            continue;
+        };
+        let Some(timezone) = schedule_timezone(rule.schedule_expression_timezone.as_deref()) else {
+            continue;
+        };
+        runs.extend(
+            next_executions(&schedule, timezone, now, max_runs)
+                .into_iter()
+                .map(|execution| (execution, position, rule)),
+        );
+    }
+    runs.sort_by_key(|(execution, position, _)| (*execution, *position));
+    Some(
+        runs.into_iter()
+            .take(max_runs)
+            .map(|(execution, _, rule)| ScheduledPlanExecutionMember {
+                execution_time: Some(::aws_smithy_types::DateTime::from(execution)),
+                rule_id: rule.rule_id.clone(),
+                rule_execution_type: Some(rule_execution_type(rule).to_string()),
+            })
+            .collect(),
+    )
+}
+
+/// The `RuleExecutionType` the runs of `rule` carry, which is what the rule
+/// creates: continuous backups when it enables them, snapshot backups when it
+/// does not (model doc for `BackupRule$EnableContinuousBackup`).
+fn rule_execution_type(rule: &BackupRule) -> &'static str {
+    if rule.enable_continuous_backup == Some(true) {
+        RULE_EXECUTION_TYPE_CONTINUOUS
+    } else {
+        RULE_EXECUTION_TYPE_SNAPSHOTS
+    }
+}
+
+/// A rule's `ScheduleExpression` as a parsed schedule, or `None` when it is not
+/// an expression this service can compute an execution from.
+///
+/// "A cron expression in UTC specifying when Backup initiates a backup job" —
+/// six fields (minute, hour, day-of-month, month, day-of-week, year), which the
+/// model writes both wrapped in `cron(…)` (its default expression) and bare (its
+/// two examples), so both spellings read as the same schedule. The `cron` crate
+/// parses the seven-field form that starts with seconds, so a literal `0`
+/// seconds field is prepended; a `?` is "no specific value", which that grammar
+/// spells `*`, and states nothing outside the day fields.
+fn parse_schedule_expression(expression: &str) -> Option<::cron::Schedule> {
+    let expression = expression.trim();
+    let body = expression
+        .strip_prefix("cron(")
+        .and_then(|rest| rest.strip_suffix(')'))
+        .unwrap_or(expression);
+    let fields: Vec<&str> = body.split_whitespace().collect();
+    if fields.len() != CRON_FIELDS {
+        return None;
+    }
+    let seconds = ::std::iter::once("0");
+    let normalised: Vec<&str> = seconds
+        .chain(fields.iter().enumerate().map(|(position, field)| {
+            if *field == "?" && NO_SPECIFIC_VALUE_FIELDS.contains(&position) {
+                "*"
+            } else {
+                *field
+            }
+        }))
+        .collect();
+    normalised.join(" ").parse::<::cron::Schedule>().ok()
+}
+
+/// The time zone a rule's schedule is read in: "The timezone in which the
+/// schedule expression is set. By default, ScheduleExpressions are in UTC"
+/// (model doc for `BackupRule$ScheduleExpressionTimezone`). `None` when the
+/// stored name resolves to no zone at all.
+fn schedule_timezone(timezone: Option<&str>) -> Option<::chrono_tz::Tz> {
+    match timezone {
+        None => Some(::chrono_tz::UTC),
+        Some(name) => name.parse::<::chrono_tz::Tz>().ok(),
+    }
+}
+
+/// The first `count` instants `schedule` fires at strictly after `after`, read
+/// in `timezone`.
+///
+/// Every conversion is fallible on purpose: the schedule and the zone come from
+/// a stored request, so an instant that cannot be represented drops out of the
+/// preview instead of being reported as some other instant.
+fn next_executions(
+    schedule: &::cron::Schedule,
+    timezone: ::chrono_tz::Tz,
+    after: SystemTime,
+    count: usize,
+) -> Vec<SystemTime> {
+    use ::chrono::TimeZone;
+
+    let Some(after) = datetime_of(after) else {
+        return Vec::new();
+    };
+    let after = timezone.from_utc_datetime(&after.naive_utc());
+    schedule
+        .after(&after)
+        .take(count)
+        .filter_map(instant_of)
+        .collect()
+}
+
+/// `at` as a UTC date and time, or `None` when it is outside the range a date
+/// and time can represent.
+fn datetime_of(at: SystemTime) -> Option<::chrono::DateTime<::chrono::Utc>> {
+    let seconds = at.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_secs();
+    ::chrono::DateTime::from_timestamp(i64::try_from(seconds).ok()?, 0)
+}
+
+/// A zoned date and time as a `SystemTime`, or `None` when it is before the
+/// epoch and so outside the range this service computes in.
+fn instant_of<Tz: ::chrono::TimeZone>(at: ::chrono::DateTime<Tz>) -> Option<SystemTime> {
+    let seconds = u64::try_from(at.timestamp()).ok()?;
+    SystemTime::UNIX_EPOCH.checked_add(::std::time::Duration::from_secs(seconds))
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -191,6 +377,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        let now = SystemTime::now();
         let store = state.lock();
         // A read, so nothing here writes: the plan is reported exactly as it was
         // stored. `MaxScheduledRunsPreview`'s range is enforced by the framework
@@ -211,9 +398,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .last_execution_date
                 .map(::aws_smithy_types::DateTime::from),
             advanced_backup_settings: plan.advanced_backup_settings_view(),
-            // See the module docs: no upcoming run is computed, so none is
-            // reported, whatever preview size the caller asked for.
-            scheduled_runs_preview: None,
+            // Computed from the plan's own rules and the clock, for a caller
+            // that asked for a preview at all.
+            scheduled_runs_preview: upcoming_runs(plan, input.max_scheduled_runs_preview, now),
         })
     }
 }

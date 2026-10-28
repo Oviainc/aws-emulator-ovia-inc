@@ -23,6 +23,14 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # Opaque, URL-safe encoding for the pagination cursors this service vends.
 hex = { workspace = true }
+# Parses the cron expression a backup rule schedules its jobs with, so a plan's
+# upcoming runs are computed from that expression (and `chrono`, which it is
+# built on, carries the date and time arithmetic).
+cron = "0.15"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+# Resolves the IANA time zone a backup rule names, so its schedule is read in
+# that zone rather than only in UTC.
+chrono-tz = { version = "0.10", default-features = false, features = ["std"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
