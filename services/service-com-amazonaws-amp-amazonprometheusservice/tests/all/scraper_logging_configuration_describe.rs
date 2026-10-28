@@ -8,10 +8,9 @@
 //!
 //! The store is seeded directly here, through the same engine the mounted service reads
 //! ([`Amp::store`]) and with the builders the deletion suite shares
-//! ([`crate::scraper_logging_configuration_deletion`]): `UpdateScraperLoggingConfiguration`
-//! is still scaffolded (its own stub issue), so seeding is how a scraper with a logging
-//! configuration exists to describe at all — and it is the same record the handler reads,
-//! not a second copy of it.
+//! ([`crate::scraper_logging_configuration_deletion`]): this model binds no operation that
+//! CREATES a scraper logging configuration, so seeding is how a scraper holds one to
+//! describe at all — and it is the same record the handler reads, not a second copy of it.
 
 use crate::scraper_listing::{dataset_destination, eks_source, scraper, seed};
 use crate::scraper_logging_configuration_deletion::{
@@ -52,7 +51,12 @@ async fn describe(amp: &Amp, region: &str, scraper_id: &str) -> Reply {
 }
 
 /// One instant as the epoch seconds a `Timestamp` is carried as on this protocol.
-fn seconds_since_epoch(instant: SystemTime) -> f64 {
+///
+/// `pub(crate)` with the two shape helpers below, because
+/// [`crate::scraper_logging_configuration_update`] reads the same members back off the
+/// same record: a second copy of them is a second set of rules about the wire form of a
+/// stored scraper logging configuration.
+pub(crate) fn seconds_since_epoch(instant: SystemTime) -> f64 {
     instant
         .duration_since(UNIX_EPOCH)
         .expect("a stored instant is after the epoch")
@@ -61,7 +65,7 @@ fn seconds_since_epoch(instant: SystemTime) -> f64 {
 
 /// The `loggingDestination` a stored destination is reported as — the one variant
 /// `ScraperLoggingDestination` models, as the union's JSON form.
-fn expected_destination(destination: &ScraperLoggingDestination) -> serde_json::Value {
+pub(crate) fn expected_destination(destination: &ScraperLoggingDestination) -> serde_json::Value {
     let ScraperLoggingDestination::cloudWatchLogs(cloud_watch_logs) = destination;
     serde_json::json!({
         "cloudWatchLogs": { "logGroupArn": cloud_watch_logs.log_group_arn }
@@ -70,7 +74,7 @@ fn expected_destination(destination: &ScraperLoggingDestination) -> serde_json::
 
 /// The `scraperComponents` a stored component list is reported as, in the order the
 /// record holds them.
-fn expected_components(scraper_components: &[ScraperComponent]) -> serde_json::Value {
+pub(crate) fn expected_components(scraper_components: &[ScraperComponent]) -> serde_json::Value {
     serde_json::Value::Array(
         scraper_components
             .iter()

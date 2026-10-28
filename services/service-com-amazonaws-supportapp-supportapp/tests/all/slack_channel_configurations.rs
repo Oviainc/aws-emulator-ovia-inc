@@ -32,6 +32,12 @@ use smithy_server_runtime::MultiServiceRouter;
 /// no assertion depends on it.
 const REGION: &str = "us-east-1";
 
+/// The `X-Amz-Target` prefix the Organizations emulator mounted beside this service
+/// routes on (that crate's `OPERATIONS.md`, "Wire protocol"). Registering a Slack
+/// workspace is an Organizations-scoped call, so the harness drives that service's own
+/// `CreateOrganization` to arrange the precondition.
+const ORGANIZATIONS_TARGET_PREFIX: &str = "AWSOrganizationsV20161128";
+
 /// The account's documented maximum number of Slack channel configurations
 /// (`CreateSlackChannelConfiguration` doc: "You can add up to 20 Slack channels for
 /// your account"). It bounds the whole listing, which is why the listing is reported
@@ -77,8 +83,14 @@ impl Reply {
     }
 }
 
-/// An emulator with just this service mounted on a fresh engine, driven in-process
-/// through the production router.
+/// An emulator with this service and the Organizations control plane mounted on one
+/// fresh engine, driven in-process through the production router.
+///
+/// Organizations is mounted because registering a Slack workspace is an
+/// Organizations-scoped call: the account has to be in an organization first, and
+/// [`Emulator::create_organization`] puts it in one through that service's OWN
+/// `CreateOrganization` over the wire, so no test reaches into a state struct to
+/// arrange the precondition.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
@@ -90,7 +102,12 @@ impl Emulator {
         // Signatures are not what these tests are about; the router still routes by the
         // SigV4 credential scope below.
         router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
+        router.register_service(EmulatedService::new(engine.clone()));
+        router.register_service(
+            service_com_amazonaws_organizations_awsorganizationsv20161128::EmulatedService::new(
+                engine,
+            ),
+        );
         Self { router }
     }
 
@@ -135,9 +152,97 @@ impl Emulator {
         self.call("create-slack-channel-configuration", body).await
     }
 
+    /// Call one operation of the Organizations control plane mounted beside this
+    /// service, over THAT service's wire protocol (`awsJson1_1`, routed by
+    /// `X-Amz-Target`).
+    ///
+    /// The answer is returned as-is so a caller can assert on it; `error_type` carries
+    /// the awsJson `__type` of a failure, which is where that protocol puts the error
+    /// code.
+    pub(crate) async fn organizations(&self, operation: &str, body: Value) -> Reply {
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/organizations/aws4_request, \
+             SignedHeaders=host;x-amz-target, Signature=deadbeef"
+        );
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", format!("organizations.{REGION}.amazonaws.com"))
+            .header("authorization", authorization)
+            .header("content-type", "application/x-amz-json-1.1")
+            .header(
+                "x-amz-target",
+                format!("{ORGANIZATIONS_TARGET_PREFIX}.{operation}"),
+            )
+            .body(Bytes::from(
+                serde_json::to_vec(&body).expect("serialize body"),
+            ))
+            .expect("build request");
+
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let header_error = response
+            .headers()
+            .get("x-amzn-errortype")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let bytes = response.into_body();
+        let body = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+        };
+        let error_type = if header_error.is_empty() {
+            body.get("__type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        } else {
+            header_error
+        };
+        Reply {
+            status,
+            error_type,
+            body,
+        }
+    }
+
+    /// Put this account in an organization through the Organizations emulator's own
+    /// `CreateOrganization`, with `feature_set` when the caller names one.
+    pub(crate) async fn create_organization(&self, feature_set: Option<&str>) -> Reply {
+        let body = match feature_set {
+            Some(value) => json!({ "FeatureSet": value }),
+            None => json!({}),
+        };
+        self.organizations("CreateOrganization", body).await
+    }
+
+    /// Make sure this account is in an organization, which is what
+    /// `RegisterSlackWorkspaceForOrganization` requires of the caller.
+    ///
+    /// Idempotent: an account that is already in one answers
+    /// `AlreadyInOrganizationException`, which leaves the same end state, so a table may
+    /// call this once per row.
+    pub(crate) async fn ensure_organization(&self) {
+        let reply = self.create_organization(None).await;
+        assert!(
+            reply.status == 200 || reply.error_type.ends_with("AlreadyInOrganizationException"),
+            "the account must be in an organization: CreateOrganization answered {} / {} / {}",
+            reply.status,
+            reply.error_type,
+            reply.body
+        );
+    }
+
     /// Register `team_id` as a Slack workspace of this account — the precondition
     /// `CreateSlackChannelConfiguration` enforces.
+    ///
+    /// Registering is itself an Organizations-scoped call, so the account is put in an
+    /// organization first; the membership precondition is covered in
+    /// [`crate::organization_membership`].
     pub(crate) async fn register_workspace(&self, team_id: &str) -> Reply {
+        self.ensure_organization().await;
         self.call(
             "register-slack-workspace-for-organization",
             json!({ "teamId": team_id }),

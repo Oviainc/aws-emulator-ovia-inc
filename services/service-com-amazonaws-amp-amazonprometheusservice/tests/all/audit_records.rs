@@ -1006,14 +1006,15 @@ async fn scraper_mutations_are_audited() {
     assert_not_audited(capture, "a replayed scraper delete");
 }
 
-/// `DeleteScraperLoggingConfiguration` records the SCRAPER it belongs to, and its repeat
-/// — which writes nothing while the removal is already owed — records nothing.
+/// `UpdateScraperLoggingConfiguration` and `DeleteScraperLoggingConfiguration` record the
+/// SCRAPER the configuration belongs to — it has no ARN of its own — and the delete's
+/// repeat, which writes nothing while the removal is already owed, records nothing.
 ///
 /// The pair is seeded through the engine the mounted service reads, with the builders the
-/// deletion suite uses: `UpdateScraperLoggingConfiguration` is still scaffolded, so
-/// seeding is how a scraper with a logging configuration exists to delete at all.
+/// deletion suite uses: this model binds no operation that CREATES a scraper logging
+/// configuration, so seeding is how a scraper holds one at all.
 #[tokio::test]
-async fn scraper_logging_configuration_deletion_is_audited() {
+async fn scraper_logging_configuration_mutations_are_audited() {
     let region = "us-west-2";
     let amp = Amp::new();
     let scraper_id = "s-audited1-1111-1111-1111-111111111111";
@@ -1034,6 +1035,33 @@ async fn scraper_logging_configuration_deletion_is_audited() {
     let described = amp.call("GET", &uri, region, "").await;
     assert_status("DescribeScraperLoggingConfiguration", &described, 200);
     assert_not_audited(capture, "DescribeScraperLoggingConfiguration");
+
+    let updated = amp
+        .call(
+            "PUT",
+            &uri,
+            region,
+            &serde_json::json!({
+                "loggingDestination": {
+                    "cloudWatchLogs": {
+                        "logGroupArn": format!(
+                            "arn:aws:logs:{region}:{}:log-group:aws/prometheus/audited-2:*",
+                            engine::emulator_account_id()
+                        )
+                    }
+                },
+                "scraperComponents": [{ "type": "EXPORTER" }]
+            })
+            .to_string(),
+        )
+        .await;
+    assert_status("UpdateScraperLoggingConfiguration", &updated, 202);
+    assert_audited(
+        capture,
+        "a scraper logging update",
+        "UpdateScraperLoggingConfiguration",
+        &host.arn,
+    );
 
     let deleted = amp
         .call("DELETE", &format!("{uri}?clientToken=scraper-log"), region, "")

@@ -9,6 +9,12 @@
 //! to apply, so a request naming one is refused with `ValidationException` (HTTP 400) and
 //! nothing is written.
 //!
+//! Tags are a change applied to the environment the ARN resolves to, so the environment
+//! has to be one a change can be applied to: a record whose teardown has already started
+//! still reads back but takes none ([`crate::state::EnvironmentRecord::accepts_change`]),
+//! and a write that reached one is refused with `ValidationException` (HTTP 400) and the
+//! tag map left exactly as it was.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -176,6 +182,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 crate::scaffolded::Scaffolded::not_found(crate::state::RESOURCE_NOT_FOUND_MESSAGE)
             })?;
+
+        // An environment on its way out takes no change: the write would be applied to a
+        // record the clock is about to remove, so it would vanish with it. Checked AFTER
+        // the lookup, so an ARN that resolves to nothing is still a 404, and before
+        // anything is written.
+        if let Some(message) = stored.change_refusal() {
+            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+            .into());
+        }
 
         // How many DISTINCT keys the environment would end up carrying. `TagMap` is
         // `@length(1, 50)`, so a merge that would take the environment past 50 tags is a

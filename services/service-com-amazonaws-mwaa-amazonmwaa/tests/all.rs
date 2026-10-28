@@ -31,6 +31,8 @@ mod environment_lifecycle;
 mod environment_region_scoping;
 #[path = "all/environment_service_defaults.rs"]
 mod environment_service_defaults;
+#[path = "all/environment_teardown_write_gate.rs"]
+mod environment_teardown_write_gate;
 #[path = "all/environment_unit_count_ranges.rs"]
 mod environment_unit_count_ranges;
 #[path = "all/environment_update_status_sequence.rs"]
