@@ -13,6 +13,12 @@
 //! [`crate::state::TRANSITION_SPAN`] later, materialised by the first request at or
 //! after that instant.
 //!
+//! What the registration declares twice it declares once: the credentials it carries are
+//! applied by credential identity ([`crate::state::credentials_with`]), exactly as its
+//! components ([`crate::state::registered_components`]), its EC2 instance ids and its
+//! databases are, so the stored application holds one credential per SAP HANA database
+//! and `CredentialType`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -296,7 +302,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             sid: input.sid,
             sap_instance_number: input.sap_instance_number,
             instances: input.instances,
-            credentials: input.credentials.unwrap_or_default(),
+            // The credentials the registration declared, applied in the order it named
+            // them (`crate::state::credentials_with`): a credential is identified by the
+            // SAP HANA database it reaches and its `CredentialType`, so two declarations
+            // naming that same credential are ONE credential whose secret is the one the
+            // later declaration named — the way a repeated component declaration is one
+            // component (`crate::state::registered_components`). The application
+            // therefore never starts out holding two contradictory secrets for one
+            // database and type, which is the invariant every later read and every
+            // `UpdateApplicationSettings` maintains.
+            credentials: crate::state::credentials_with(
+                &[],
+                input.credentials.as_deref().unwrap_or_default(),
+            ),
             // The SAP HANA database the registration named by ARN: one of this
             // application's databases, which `ListDatabases` reports under that ARN
             // (`crate::state::StoredApplication::databases`).

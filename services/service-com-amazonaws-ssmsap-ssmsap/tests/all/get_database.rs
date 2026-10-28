@@ -21,7 +21,7 @@
 //! The table spans what that rule generalises over: how the database was named by the
 //! registration (by credential, by `DatabaseArn`, by both), how the request names it (by
 //! id under its application, by id alone, by ARN, narrowed by component), database count
-//! and type, credential count per database, application type, and whether the
+//! and type, how many declarations name one database, application type, and whether the
 //! registration named a System ID or declared the HANA component at all.
 
 use std::collections::BTreeMap;
@@ -223,8 +223,9 @@ const CASES: &[Case] = &[
             },
         ],
     },
-    // Two credentials naming ONE database: one database, reporting both credentials that
-    // reach it.
+    // Two declarations naming ONE database: a credential is identified by the database it
+    // reaches and its type, so these are one credential declared twice — one database,
+    // reporting the ONE credential that reaches it, with the secret declared last.
     Case {
         name: "two credentials naming one database",
         application_id: "hdb-two-credentials",
@@ -240,7 +241,7 @@ const CASES: &[Case] = &[
             database_type: "TENANT",
             arn: None,
             component_id: Some("TWO-HANA"),
-            credentials: &[("TNT1", "sap/two/first"), ("TNT1", "sap/two/second")],
+            credentials: &[("TNT1", "sap/two/second")],
             connected_components: &["TWO-HANA"],
         }],
     },

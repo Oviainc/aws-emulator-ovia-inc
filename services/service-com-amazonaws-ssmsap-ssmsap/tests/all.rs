@@ -61,6 +61,8 @@ mod list_operations;
 mod pattern_violation_messages;
 #[path = "all/register_application_conditional_requirements.rs"]
 mod register_application_conditional_requirements;
+#[path = "all/registered_credential_identity.rs"]
+mod registered_credential_identity;
 #[path = "all/registered_database_arn.rs"]
 mod registered_database_arn;
 #[path = "all/region_partition_reclamation.rs"]

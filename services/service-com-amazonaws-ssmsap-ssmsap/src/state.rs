@@ -612,8 +612,10 @@ impl StoredApplication {
     /// ([`database_id_from_name`]), so a credential named for the database and type of
     /// one this application already holds REPLACES it (the secret the new one names is
     /// the one that reaches that database from then on) and one naming a database and
-    /// type it holds none for is ADDED, after the ones it keeps. Removal drops the
-    /// credential of that database and type.
+    /// type it holds none for is ADDED, after the ones it keeps ([`credentials_with`], the
+    /// one place a list of credential declarations is applied, so two declarations naming
+    /// the same credential leave one credential here too). Removal drops the credential of
+    /// that database and type.
     ///
     /// Refuses with the modelled `ValidationException` (HTTP 400), and computes nothing,
     /// when the call asks for a change the application cannot take: a credential named
@@ -649,34 +651,25 @@ impl StoredApplication {
                 )));
             }
         }
-        let mut credentials: Vec<ApplicationCredential> = self
+        let kept: Vec<ApplicationCredential> = self
             .credentials
             .iter()
             .filter(|held| !remove.iter().any(|removed| same_credential(held, removed)))
             .cloned()
             .collect();
-        // Only a credential this application holds none for grows the set; one it holds
-        // is replaced in place. The emulator's own per-application ceiling is what stops
-        // a caller looping with fresh database names growing this record without bound.
-        let added = add_or_update
-            .iter()
-            .filter(|named| !credentials.iter().any(|held| same_credential(held, named)))
-            .count();
-        let would_hold = credentials.len() + added;
+        // Only a credential of an identity the set holds none of grows it; one of an
+        // identity already there — held before the call, or declared earlier in this very
+        // list — is replaced in place ([`credentials_with`]), so what the call would leave
+        // the application holding is the length of that result. The emulator's own
+        // per-application ceiling is what stops a caller looping with fresh database names
+        // growing this record without bound.
+        let credentials = credentials_with(&kept, add_or_update);
+        let would_hold = credentials.len();
         if would_hold > MAX_CREDENTIALS_PER_APPLICATION {
             return Err(validation(format!(
                 "this emulator holds at most {MAX_CREDENTIALS_PER_APPLICATION} credentials per application, but this request would leave {} holding {would_hold}",
                 self.id
             )));
-        }
-        for named in add_or_update {
-            match credentials
-                .iter_mut()
-                .find(|held| same_credential(held, named))
-            {
-                Some(held) => *held = named.clone(),
-                None => credentials.push(named.clone()),
-            }
         }
         Ok(credentials)
     }
@@ -3495,6 +3488,37 @@ pub fn database_id_from_name(database_name: &str) -> String {
 pub fn same_credential(one: &ApplicationCredential, other: &ApplicationCredential) -> bool {
     one.credential_type == other.credential_type
         && database_id_from_name(&one.database_name) == database_id_from_name(&other.database_name)
+}
+
+/// The credentials an application holds once the declarations `declared` are applied, in
+/// the order the request named them, to the credentials `held`.
+///
+/// A declaration names a credential by the SAP HANA database it reaches and its
+/// `CredentialType` ([`same_credential`]) and carries the `SecretId` that reaches it, so
+/// one naming a credential the set already holds REPLACES it (the secret the latest
+/// declaration names is the one that reaches that database from then on) and one naming a
+/// credential it holds none of is ADDED after the ones it keeps. Two declarations in ONE
+/// list naming the same credential are therefore that one credential, declared twice —
+/// exactly as a repeated component declaration is one component
+/// ([`registered_components`]) — so no list of declarations can leave an application
+/// holding two credentials of one identity, and the same declarations leave the same
+/// credentials whichever call carried them (`RegisterApplication$Credentials`,
+/// `UpdateApplicationSettings$CredentialsToAddOrUpdate`).
+pub fn credentials_with(
+    held: &[ApplicationCredential],
+    declared: &[ApplicationCredential],
+) -> Vec<ApplicationCredential> {
+    let mut credentials = held.to_vec();
+    for named in declared {
+        match credentials
+            .iter_mut()
+            .find(|holding| same_credential(holding, named))
+        {
+            Some(holding) => *holding = named.clone(),
+            None => credentials.push(named.clone()),
+        }
+    }
+    credentials
 }
 
 /// The name the SAP HANA database ARN `database_arn` names its database by: the last
