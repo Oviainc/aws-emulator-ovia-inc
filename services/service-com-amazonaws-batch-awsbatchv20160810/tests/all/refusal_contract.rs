@@ -43,7 +43,7 @@ use crate::job_lifecycle::{
 const ENVELOPE_PREFIX: &str = "Error executing request, Exception : ";
 
 /// The segment the envelope names the refused call's request id in.
-const ENVELOPE_REQUEST_ID: &str = ", RequestId: ";
+pub(crate) const ENVELOPE_REQUEST_ID: &str = ", RequestId: ";
 
 /// Assert `message` is Batch's frontend envelope and answer `(detail, request id)`.
 ///
