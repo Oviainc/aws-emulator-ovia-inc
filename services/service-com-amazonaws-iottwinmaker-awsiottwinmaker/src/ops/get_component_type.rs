@@ -511,7 +511,8 @@ fn function_response<'a>(
 /// The declarations that reach one property group, nearest first, as the
 /// modelled `PropertyGroupResponse` — `None` when there are none.
 ///
-/// The same fold the other parts of the schema get: `groupType` is the one the
+/// The fold the other parts of the schema get
+/// ([`crate::state::refined_property_group`]): `groupType` is the one the
 /// nearest declaration that carries it names, and `propertyNames` the list of
 /// the nearest declaration that carries any — the record stores an absent list
 /// as the empty one, so a declaration with no names sets nothing and leaves the
@@ -525,19 +526,12 @@ fn property_group_response<'a>(
     declarations: impl IntoIterator<Item = &'a crate::state::PropertyGroupRecord>,
     is_inherited: bool,
 ) -> Option<PropertyGroupResponse> {
-    let mut group_type: Option<String> = None;
-    let mut property_names: Option<Vec<String>> = None;
-    let mut declared = false;
-    for declaration in declarations {
-        declared = true;
-        group_type = group_type.or_else(|| declaration.group_type.clone());
-        if property_names.is_none() && !declaration.property_names.is_empty() {
-            property_names = Some(declaration.property_names.clone());
-        }
-    }
-    declared.then(|| PropertyGroupResponse {
-        group_type: group_type.unwrap_or_else(|| crate::state::TABULAR_GROUP_TYPE.to_string()),
-        property_names: property_names.unwrap_or_default(),
+    let group = crate::state::refined_property_group(declarations)?;
+    Some(PropertyGroupResponse {
+        group_type: group
+            .group_type
+            .unwrap_or_else(|| crate::state::TABULAR_GROUP_TYPE.to_string()),
+        property_names: group.property_names,
         is_inherited,
     })
 }

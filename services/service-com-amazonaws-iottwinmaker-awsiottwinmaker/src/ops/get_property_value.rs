@@ -625,22 +625,29 @@ fn addresses_property(
 }
 
 /// The property names in the group `group_name` of what the request addressed.
+///
+/// Resolved the way every reader of a group resolves one
+/// ([`crate::state::refined_property_group`]): the declarations that reach the
+/// group are folded, so a declaration that restates only the group's `groupType`
+/// keeps the names it inherits instead of resolving to none.
 fn property_group_names(
     workspace: &crate::state::Workspace,
     query: &Query<'_>,
     group_name: &str,
 ) -> Result<Vec<String>, GetPropertyValueError> {
     if let Some(component_type_id) = query.component_type_id() {
-        return workspace
-            .component_type_chain(component_type_id)
-            .into_iter()
-            .find_map(|component_type| component_type.property_groups.get(group_name))
-            .map(|group| group.property_names.clone())
-            .ok_or_else(|| {
-                not_found(format!(
-                    "componentType {component_type_id} has no propertyGroup {group_name}"
-                ))
-            });
+        return crate::state::refined_property_group(
+            workspace
+                .component_type_chain(component_type_id)
+                .into_iter()
+                .filter_map(|component_type| component_type.property_groups.get(group_name)),
+        )
+        .map(|group| group.property_names)
+        .ok_or_else(|| {
+            not_found(format!(
+                "componentType {component_type_id} has no propertyGroup {group_name}"
+            ))
+        });
     }
     let Some(component) = query.components().first() else {
         return Err(invalid(format!(
@@ -653,7 +660,7 @@ fn property_group_names(
             component.property_groups,
             group_name,
         )
-        .map(|group| group.property_names.clone())
+        .map(|group| group.property_names)
         .ok_or_else(|| {
             not_found(format!(
                 "component {} of entity {} has no propertyGroup {group_name}",
