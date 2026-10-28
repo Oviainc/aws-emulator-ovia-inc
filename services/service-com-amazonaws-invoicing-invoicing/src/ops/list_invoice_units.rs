@@ -130,11 +130,6 @@ const MAX_PAGE_SIZE: usize = 500;
 /// than silently resuming from arbitrary bytes.
 const NEXT_TOKEN_PREFIX: &str = "invoice-units:";
 
-/// The `NextToken` that resumes the walk at `arn`.
-fn encode_next_token(arn: &str) -> String {
-    crate::state::encode_page_token(NEXT_TOKEN_PREFIX, arn)
-}
-
 /// The ARN a caller's `NextToken` resumes at, or `None` when it asked for the first
 /// page. A token this operation did not mint is refused with the model's own
 /// `invalidNextToken` reason — the one rendering every paginated walk of this service
@@ -275,12 +270,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
 
         let resume_at = decode_next_token(input.next_token.as_deref())?;
-        // The boundary validator already refused a `MaxResults` outside `@range(1..500)`
-        // and the deserializer filled the `@default: 500` in, so this only guards the
-        // conversion.
-        let page_size = usize::try_from(input.max_results)
-            .unwrap_or(MAX_PAGE_SIZE)
-            .clamp(1, MAX_PAGE_SIZE);
+        // The walk's maximum, and the page size this request resolves to inside it: the
+        // rule every paginated listing of this service shares
+        // ([`crate::state::resolve_page_size`]). The boundary validator already refused a
+        // `MaxResults` outside `@range(1..500)` and the deserializer filled the
+        // `@default: 500` in.
+        let page_size = crate::state::resolve_page_size(Some(input.max_results), MAX_PAGE_SIZE);
         // Built once, before the walk: see [`FilterSets`] for the bound this puts on the
         // matching work.
         let filters = FilterSets::new(input.filters.as_ref());
@@ -289,38 +284,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let store = state.lock();
 
-        let mut invoice_units = Vec::new();
-        let mut next_token = None;
-        // `invoice_units` is a BTreeMap keyed by ARN, so this walk is in one stable
-        // order and a token (the ARN the next page starts at) stays meaningful: the
-        // token is a POSITION in that order, so the resumed page seeks straight to it
-        // rather than re-walking the units the earlier pages already reported.
-        let page = match resume_at.as_deref() {
-            Some(from) => store.invoice_units.range(from.to_string()..),
-            None => store.invoice_units.range::<String, _>(..),
-        };
-        for unit in page.map(|(_, unit)| unit) {
-            // A unit that did not exist at `AsOf` is not part of the answer for that
-            // instant: one created after it, and one deleted at or before it. A listing
-            // with no `AsOf` is a listing of NOW, which the units a delete has retired
-            // are not part of — while a listing at an instant between a unit's creation
-            // and its deletion still reports it, with the configuration from then.
-            let Some(version) = unit.version_as_of(input.as_of.as_ref()) else {
-                continue;
-            };
-            if !filters.matches(unit, version) {
-                continue;
-            }
-            if invoice_units.len() == page_size {
-                next_token = Some(encode_next_token(&unit.arn));
-                break;
-            }
-            invoice_units.push(unit.to_invoice_unit(version));
-        }
+        // `invoice_units` is a BTreeMap keyed by ARN, so the shared walk
+        // ([`crate::state::page_by_key`]) takes this page in one stable order and the
+        // token it mints is a POSITION in that order — the ARN the next page resumes at.
+        let page = crate::state::page_by_key(
+            &store.invoice_units,
+            resume_at.as_deref(),
+            page_size,
+            NEXT_TOKEN_PREFIX,
+            |unit| {
+                // A unit that did not exist at `AsOf` is not part of the answer for that
+                // instant: one created after it, and one deleted at or before it. A
+                // listing with no `AsOf` is a listing of NOW, which the units a delete
+                // has retired are not part of — while a listing at an instant between a
+                // unit's creation and its deletion still reports it, with the
+                // configuration from then.
+                let version = unit.version_as_of(input.as_of.as_ref())?;
+                filters
+                    .matches(unit, version)
+                    .then(|| unit.to_invoice_unit(version))
+            },
+        );
 
         Ok(ListInvoiceUnitsOutput {
-            invoice_units: Some(invoice_units),
-            next_token,
+            invoice_units: Some(page.items),
+            next_token: page.next_token,
         })
     }
 }

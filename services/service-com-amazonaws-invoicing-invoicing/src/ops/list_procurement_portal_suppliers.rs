@@ -212,12 +212,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::invalid_next_token(MessageKey::Capitalised),
                 )
             })?;
-        // The boundary validator already refused a `MaxResults` outside `@range(1..100)`
-        // and the deserializer filled the `@default: 100` in, so this only guards the
-        // conversion.
-        let page_size = usize::try_from(input.max_results)
-            .unwrap_or(MAX_PAGE_SIZE)
-            .clamp(1, MAX_PAGE_SIZE);
+        // The walk's maximum, and the page size this request resolves to inside it: the
+        // rule every paginated listing of this service shares
+        // ([`crate::state::resolve_page_size`]). The boundary validator already refused a
+        // `MaxResults` outside `@range(1..100)` and the deserializer filled the
+        // `@default: 100` in.
+        let page_size = crate::state::resolve_page_size(Some(input.max_results), MAX_PAGE_SIZE);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListProcurementPortalSuppliersErrorModeled::InternalServerException(
                 crate::state::state_unavailable(),
@@ -226,9 +226,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
 
         // One stable, deterministic order (the `BTreeMap` key
-        // `crate::state::procurement_portal_supplier_key` builds), so a token — a
-        // POSITION in that order — stays meaningful across calls and the resumed page
-        // seeks straight to it rather than re-reporting what the earlier pages reported.
+        // `crate::state::procurement_portal_supplier_key` builds), so the shared walk
+        // ([`crate::state::page_by_offset`]) mints a token that is a POSITION in that
+        // order and the resumed page seeks straight to it rather than re-reporting what
+        // the earlier pages reported.
         //
         // The derived set is bounded by the registry and the model, not by the request:
         // at most `crate::state::MAX_PROCUREMENT_PORTAL_PREFERENCES` preferences, each
@@ -236,23 +237,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `@length(min: 0, max: 100)` (see `procurement_portal_suppliers`). Deriving it
         // per call is what keeps this read from caching — and so from writing — anything.
         let configured = store.procurement_portal_suppliers(portal_name);
-        let resume_at = resume_at.unwrap_or(0);
-        let procurement_portal_suppliers: Vec<ProcurementPortalSupplier> = configured
-            .values()
-            .skip(resume_at)
-            .take(page_size)
-            .cloned()
-            .collect();
-        // Where the next page resumes: past everything reported through this one. A token
-        // is minted only while suppliers remain, so the last page of a walk carries none
-        // and a position past the end of the listing is an empty last page.
-        let reported_through = resume_at.saturating_add(procurement_portal_suppliers.len());
-        let next_token = (reported_through < configured.len())
-            .then(|| crate::state::encode_page_offset(&token_prefix, reported_through));
+        let page = crate::state::page_by_offset(&configured, resume_at, page_size, &token_prefix);
 
         Ok(ListProcurementPortalSuppliersOutput {
-            procurement_portal_suppliers,
-            next_token,
+            procurement_portal_suppliers: page.items,
+            next_token: page.next_token,
         })
     }
 }

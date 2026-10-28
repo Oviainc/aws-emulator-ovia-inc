@@ -1309,6 +1309,104 @@ pub fn decode_page_token(
         .ok_or(InvalidPageToken)
 }
 
+/// What one page of a paginated listing holds, and where the walk resumes after it.
+///
+/// Every paginated listing of this service answers ONE rule, which is why it is stated
+/// here beside the token codecs rather than in each listing's own module: a page holds at
+/// most the page size the request resolved to, taken in the walk's own order from the
+/// position the caller's `NextToken` named, and it carries a token naming the first entry
+/// that did NOT fit — so the next call resumes exactly there and the last page of a walk
+/// carries none. A listing differs only in the registry it walks and what it reports per
+/// entry, so neither the page's cut nor the position its token names can drift between
+/// them.
+#[derive(Debug)]
+pub struct Page<Item> {
+    /// The entries this page reports, in the walk's order, at most `page_size` of them.
+    pub items: Vec<Item>,
+    /// The `NextToken` that resumes the walk at the first entry this page did not hold,
+    /// or `None` when it held the last of them.
+    pub next_token: Option<String>,
+}
+
+/// How many entries one page of a walk holds: what the request's `MaxResults` asked for,
+/// bounded by that walk's own maximum.
+///
+/// `requested` is `None` for a request that omitted a `MaxResults` the model gives no
+/// `@default` — which asks for a full page — and the boundary validator has already
+/// refused a value outside the member's `@range`, so this only guards the conversion and
+/// keeps a page inside `max_page_size` whatever arrived.
+pub fn resolve_page_size(requested: Option<i32>, max_page_size: usize) -> usize {
+    requested
+        .and_then(|requested| usize::try_from(requested).ok())
+        .unwrap_or(max_page_size)
+        .clamp(1, max_page_size)
+}
+
+/// The [`Page`] a walk of `entries` reports, resuming at the key `resume_at` names and
+/// reporting each admitted entry under `token_prefix`'s own token.
+///
+/// `entries` is one of this service's `BTreeMap` registries, so the walk is in one
+/// stable, deterministic order and a token — the KEY the next page starts at — stays
+/// meaningful across calls: a resumed page seeks straight to that key rather than
+/// re-walking what the earlier pages already reported. `admit` answers `None` for an
+/// entry this listing does not report (one a filter excludes, or one that did not exist
+/// at a point-in-time read's instant), which takes no room in the page and is not what a
+/// token names.
+pub fn page_by_key<Entry, Item>(
+    entries: &BTreeMap<String, Entry>,
+    resume_at: Option<&str>,
+    page_size: usize,
+    token_prefix: &str,
+    mut admit: impl FnMut(&Entry) -> Option<Item>,
+) -> Page<Item> {
+    let walk = match resume_at {
+        Some(from) => entries.range(from.to_string()..),
+        None => entries.range::<String, _>(..),
+    };
+    let mut items = Vec::new();
+    let mut next_token = None;
+    for (key, entry) in walk {
+        let Some(item) = admit(entry) else {
+            continue;
+        };
+        if items.len() == page_size {
+            next_token = Some(encode_page_token(token_prefix, key));
+            break;
+        }
+        items.push(item);
+    }
+    Page { items, next_token }
+}
+
+/// The [`Page`] a walk whose position is an ORDINAL reports, resuming at the entry
+/// `resume_at` names and minting its token under `token_prefix`.
+///
+/// Same rule as [`page_by_key`], for a walk whose order is keyed by caller-supplied text:
+/// there the position a token names is the ordinal of the entry the next page starts at
+/// rather than that key, so the token stays inside the `NextToken` member's modelled
+/// maximum whatever a caller stored (see [`encode_page_offset`]).
+pub fn page_by_offset<Entry: Clone>(
+    entries: &BTreeMap<String, Entry>,
+    resume_at: Option<usize>,
+    page_size: usize,
+    token_prefix: &str,
+) -> Page<Entry> {
+    let resume_at = resume_at.unwrap_or(0);
+    let items: Vec<Entry> = entries
+        .values()
+        .skip(resume_at)
+        .take(page_size)
+        .cloned()
+        .collect();
+    // Where the next page resumes: past everything reported through this one. A token is
+    // minted only while entries remain, so the last page of a walk carries none and a
+    // position past the end of the listing is an empty last page.
+    let reported_through = resume_at.saturating_add(items.len());
+    let next_token = (reported_through < entries.len())
+        .then(|| encode_page_offset(token_prefix, reported_through));
+    Page { items, next_token }
+}
+
 /// The 400 any paginated operation of this service answers for a `NextToken` it did not
 /// mint: the model's own `invalidNextToken` reason
 /// ([`crate::ops::types::VALIDATION_EXCEPTION_REASON_VALUES`]), so a client branches on
