@@ -23,6 +23,9 @@ mod refused_sampling_leaves_no_trajectory;
 #[path = "all/rejected_value_echo.rs"]
 mod rejected_value_echo;
 
+#[path = "all/rollout_operations_resolve_the_job.rs"]
+mod rollout_operations_resolve_the_job;
+
 #[path = "all/sampling_path_is_shared.rs"]
 mod sampling_path_is_shared;
 
