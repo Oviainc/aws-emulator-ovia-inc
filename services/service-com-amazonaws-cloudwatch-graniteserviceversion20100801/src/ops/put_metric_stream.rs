@@ -205,16 +205,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        let region = crate::state::request_region(ctx.parts());
+
         // Each rule below is one the MODEL cannot express, so the request reaches this
         // handler having satisfied every modelled constraint already: `Name`'s 1..255
         // length, both ARNs' 1..1024 length, and `OutputFormat` being one of
         // `METRIC_STREAM_OUTPUT_FORMAT_VALUES`. None of those is re-checked here.
         validate_name(&input.name)?;
+        validate_arn_scope(&input, &region)?;
         let (include_filters, exclude_filters) = validate_filters(&input)?;
         validate_statistics_configurations(&input)?;
         validate_tags(input.tags.as_deref())?;
 
-        let region = crate::state::request_region(ctx.parts());
         let now = crate::state::now_secs();
         let mut store = state.lock();
 
@@ -270,8 +272,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     creation_date,
                     last_update_date: Some(crate::state::to_timestamp(now)),
                     output_format: Some(input.output_format.clone()),
-                    statistics_configurations: input.statistics_configurations.clone(),
-                    include_linked_accounts_metrics: input.include_linked_accounts_metrics,
+                    statistics_configurations: non_empty(
+                        input.statistics_configurations.clone(),
+                    ),
+                    // "If you are creating a metric stream in a monitoring account, specify
+                    // true to include metrics from source accounts in the metric stream."
+                    // (`PutMetricStreamInput$IncludeLinkedAccountsMetrics`) — the member is a
+                    // boolean a request asks for the non-default behaviour with, so a stream
+                    // configured without it streams no source-account metrics. The stream
+                    // HAS that setting either way, which is why the value is materialised
+                    // here rather than left for a reader to guess.
+                    include_linked_accounts_metrics: Some(
+                        input.include_linked_accounts_metrics.unwrap_or(false),
+                    ),
                 },
                 tags,
             },
@@ -309,6 +322,67 @@ fn validate_name(name: &str) -> Result<(), PutMetricStreamError> {
 /// Either of the two namespace filter lists a stream can carry.
 type Filters = Option<Vec<MetricStreamFilter>>;
 
+/// Refuse an ARN member naming a resource outside the scope of the stream being configured.
+///
+/// Judged BEFORE the filter rules below, so a request whose destination the stream could never
+/// reach is told about that destination rather than about a filter: there is no stream to
+/// configure filters for until the configuration names a reachable one.
+///
+/// "This Amazon Kinesis Data Firehose delivery stream must already exist and must be in the
+/// same account as the metric stream." (`PutMetricStreamInput$FirehoseArn`) and "This IAM role
+/// must already exist and must be in the same account as the metric stream."
+/// (`PutMetricStreamInput$RoleArn`) — and a stream delivers through a Firehose delivery stream
+/// of its own Region and partition, so an ARN naming another names a destination this stream
+/// could never deliver to. CloudWatch states each half as one sentence naming the member that
+/// carried the ARN and the resource it has to match, so both members are refused in the same
+/// words; the judgement itself is [`crate::state::foreign_arn_scope`], shared so every member
+/// of this service naming another resource by ARN is judged by one rule — and an ARN that
+/// names no Region (an IAM role's) is judged on its partition and account alone.
+fn validate_arn_scope(
+    input: &PutMetricStreamInput,
+    region: &str,
+) -> Result<(), PutMetricStreamError> {
+    for (parameter, value) in [
+        ("FirehoseArn", &input.firehose_arn),
+        ("RoleArn", &input.role_arn),
+    ] {
+        let message = match crate::state::foreign_arn_scope(value, region) {
+            None => continue,
+            Some(crate::state::ForeignArnScope::Location) => format!(
+                "{parameter} must be in the same region and AWS partition as the Metric Stream"
+            ),
+            Some(crate::state::ForeignArnScope::Account) => {
+                format!("{parameter} must be in the same account as the Metric Stream")
+            }
+        };
+        return Err(invalid_parameter_value(message));
+    }
+    Ok(())
+}
+
+/// `collection` when it carries an entry, and `None` when it arrived EMPTY.
+///
+/// A collection member of this configuration constrains what the stream sends, so a list of
+/// no entries constrains nothing — which is exactly what leaving the member out means. The
+/// two forms are stored alike, so a client comparing the configuration it submitted against
+/// the one `GetMetricStream` reads back sees no difference between them.
+fn non_empty<T>(collection: Option<Vec<T>>) -> Option<Vec<T>> {
+    collection.filter(|entries| !entries.is_empty())
+}
+
+/// How CloudWatch writes [`MAX_FILTER_NAMES`] in the refusal of a filter list that broke it:
+/// the same number, written with the thousands separator. The two are held equal by
+/// [`tests::the_stated_cap_is_the_cap_enforced`], so neither can be changed alone.
+const MAX_FILTER_NAMES_STATED: &str = "1,000";
+
+/// How CloudWatch states a request carrying BOTH namespace filter lists.
+///
+/// The RULE is the member documentation's ("You cannot include ExcludeFilters and
+/// IncludeFilters in the same operation.", `PutMetricStreamInput$ExcludeFilters`); the WORDS
+/// are the recorded refusal's, which name the two members and say that one request cannot hold
+/// both, and carry nothing of what either of them held.
+const FILTERS_NOT_BOTH: &str = "IncludeFilters and ExcludeFilters cannot both be present";
+
 /// A metric stream's filters can name at most this many names in total: "A metric stream's
 /// filters can include up to 1000 total names. This limit applies to the sum of namespace
 /// names and metric names in the filters. For example, this could include 10 metric
@@ -332,10 +406,7 @@ fn validate_filters(
         return Err(
             PutMetricStreamErrorModeled::InvalidParameterCombinationException(
                 InvalidParameterCombinationException {
-                    message: Some(
-                        "IncludeFilters and ExcludeFilters cannot be used in the same operation"
-                            .into(),
-                    ),
+                    message: Some(FILTERS_NOT_BOTH.into()),
                 },
             )
             .into(),
@@ -363,17 +434,29 @@ fn validate_filter_names(
     if names <= MAX_FILTER_NAMES {
         return Ok(());
     }
+    // The refusal names the member that broke the cap and the cap itself, and nothing of the
+    // names submitted: the member is what a client attributes the failure to.
     Err(invalid_parameter_value(format!(
-        "{member} can name at most {MAX_FILTER_NAMES} namespaces and metrics in total; \
-         got {names}"
+        "{member} greater than {MAX_FILTER_NAMES_STATED}"
     )))
 }
 
 /// A filter list the request actually constrains the stream with, or `None`.
 fn filters_given(filters: Option<&[MetricStreamFilter]>) -> Filters {
-    filters
-        .filter(|list| !list.is_empty())
-        .map(<[MetricStreamFilter]>::to_vec)
+    non_empty(filters.map(|list| list.iter().map(stored_filter).collect()))
+}
+
+/// One filter as the stream holds it.
+///
+/// "If you omit this parameter, all metrics in the namespace are included or excluded"
+/// (`MetricStreamFilter$MetricNames`) — a `MetricNames` list that arrived empty singles out no
+/// metric of the namespace, which is what omitting it means, so it is stored as omitted
+/// ([`non_empty`]).
+fn stored_filter(filter: &MetricStreamFilter) -> MetricStreamFilter {
+    MetricStreamFilter {
+        namespace: filter.namespace.clone(),
+        metric_names: non_empty(filter.metric_names.clone()),
+    }
 }
 
 /// "This array can have up to 100 members." (`PutMetricStreamInput$StatisticsConfigurations`)
@@ -486,6 +569,20 @@ fn is_opentelemetry_format(format: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// RULE: the cap the refusal STATES is the cap the handler ENFORCES — the grouped
+    /// rendering is how AWS writes the number, not a second number.
+    #[test]
+    fn the_stated_cap_is_the_cap_enforced() {
+        let stated = super::MAX_FILTER_NAMES_STATED.replace(',', "");
+        assert_eq!(
+            stated.parse::<usize>().ok(),
+            Some(super::MAX_FILTER_NAMES),
+            "the stated cap {:?} must be the enforced cap {}",
+            super::MAX_FILTER_NAMES_STATED,
+            super::MAX_FILTER_NAMES
+        );
+    }
+
     #[test]
     fn percentile_statistics_are_recognised_by_form() {
         for statistic in ["p0", "p90", "p99.9", "p100", "P95"] {

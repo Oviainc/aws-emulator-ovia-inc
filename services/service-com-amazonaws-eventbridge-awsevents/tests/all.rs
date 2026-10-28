@@ -63,6 +63,8 @@ mod partner_event_source;
 mod pattern_and_connection_filters;
 #[path = "all/pattern_preflight.rs"]
 mod pattern_preflight;
+#[path = "all/pattern_refusal_location.rs"]
+mod pattern_refusal_location;
 #[path = "all/pattern_refusal_wording.rs"]
 mod pattern_refusal_wording;
 #[path = "all/regional_bus_namespace.rs"]

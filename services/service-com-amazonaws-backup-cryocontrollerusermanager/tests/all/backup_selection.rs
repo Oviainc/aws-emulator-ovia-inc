@@ -184,7 +184,7 @@ fn round_trip_cases() -> Vec<(&'static str, Value)> {
                 "SelectionName": "by-arn",
                 "IamRoleArn": role_arn("S3Access"),
                 "Resources": [
-                    format!("arn:aws:s3:::probe-bucket"),
+                    "arn:aws:s3:::probe-bucket".to_string(),
                     format!("arn:aws:dynamodb:us-west-2:{ACCOUNT}:table/probe"),
                 ],
             }),

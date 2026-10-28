@@ -111,11 +111,14 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 ///   ([`dimension_cap_refusal`]);
 /// * a value inside a LIST that is outside the enumerated type the list's member names — a
 ///   percentile passed in `Statistics`, whose place is `ExtendedStatistics` — named as the
-///   request member path it arrived on and the value set the type declares.
+///   request member path it arrived on and the value set the type declares;
+/// * a SCALAR member outside the enumerated type it is modelled as, which keeps the
+///   framework's own clause and carries this service's validation code
+///   ([`scalar_enum_refusal`]).
 ///
 /// Every other violation keeps the framework's code and wording: a scalar outside its own
-/// bound or enum is what this service is recorded answering `ValidationException` for, and a
-/// code a client branches on is not changed without a recording that shows it.
+/// LENGTH or range bound is what this service is recorded answering `ValidationException`
+/// for, and a code a client branches on is not changed without a recording that shows it.
 fn parameter_fault(refusal: &Refusal) -> Option<Refused> {
     let Refusal::Invalid(violations) = refusal else {
         return None;
@@ -124,6 +127,32 @@ fn parameter_fault(refusal: &Refusal) -> Option<Refused> {
         .iter()
         .find_map(dimension_cap_refusal)
         .or_else(|| violations.iter().find_map(list_element_enum_refusal))
+        .or_else(|| scalar_enum_refusal(violations))
+}
+
+/// The refusal of a SCALAR member carrying a value outside the enumerated type it is
+/// modelled as, or `None` when no violation of the refusal is one.
+///
+/// CloudWatch judges a request against its model before any handler runs and answers what it
+/// found under its OWN validation code ([`VALIDATION_ERROR`], the code
+/// [`crate::scaffolded::Scaffolded::validation_error`] already answers this service's
+/// handler-side validation refusals with), so a client branches on one code whichever layer
+/// refused the request. Only the code is this service's: the message is the framework's own
+/// counting envelope, naming the member path and the values the type admits, so the two
+/// cannot drift.
+fn scalar_enum_refusal(violations: &[aws_smithy_schema_server::Violation]) -> Option<Refused> {
+    if !violations.iter().any(|violation| {
+        matches!(
+            violation.kind,
+            aws_smithy_schema_server::ViolationKind::EnumValue(_)
+        ) && !is_list_element(&violation.path)
+    }) {
+        return None;
+    }
+    Some(Refused {
+        code: VALIDATION_ERROR.to_string(),
+        message: aws_smithy_schema_server::envelope(violations)?,
+    })
 }
 
 /// The refusal of a `Dimensions` collection longer than the dimensions it may carry, or
@@ -187,6 +216,11 @@ fn list_element_enum_refusal(violation: &aws_smithy_schema_server::Violation) ->
 /// input parameter is bad or out-of-range"): its `awsQueryError` code, which is what a client
 /// of this service branches on.
 const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
+
+/// The wire error code CloudWatch answers a request its model refuses with — the code this
+/// service's own validation refusals carry (`crate::scaffolded`), so a boundary refusal and a
+/// handler refusal of the same class read alike.
+const VALIDATION_ERROR: &str = "ValidationError";
 
 /// Whether `path` points at a request's `Dimensions` collection — of any operation, and at
 /// any depth, since a metric's dimension set is one shape wherever it is submitted.

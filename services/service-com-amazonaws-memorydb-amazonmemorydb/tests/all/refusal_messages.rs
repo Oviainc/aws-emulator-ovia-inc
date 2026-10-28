@@ -487,7 +487,7 @@ async fn an_already_exists_refusal_uses_the_template_of_its_resource_kind() {
         for spelling in [
             name.to_string(),
             name.to_ascii_uppercase(),
-            format!("{}{}", &name[..1].to_ascii_uppercase(), &name[1..]),
+            format!("{}{}", name[..1].to_ascii_uppercase(), &name[1..]),
         ] {
             let case = format!("{create}/{spelling}");
             let (status, code, message) =
@@ -592,7 +592,7 @@ async fn a_built_in_resource_refuses_every_mutation_by_its_own_name() {
             built_in.to_ascii_uppercase(),
             format!(
                 "{}{}",
-                &built_in[..1].to_ascii_uppercase(),
+                built_in[..1].to_ascii_uppercase(),
                 &built_in[1..]
             ),
         ] {

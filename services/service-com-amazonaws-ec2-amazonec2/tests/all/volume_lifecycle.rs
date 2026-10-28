@@ -1046,8 +1046,9 @@ async fn describe_volumes_narrows_by_id_filter_and_page() {
         );
     }
 
-    // `MaxResults` outside what this service pages by is refused.
-    for (case, max_results) in [("zero", "0"), ("negative", "-1"), ("past the cap", "1001")] {
+    // A `MaxResults` that asks for a page of none is refused; one above the largest page
+    // this service serves is not — the model declares no `@range` on the member.
+    for (case, max_results) in [("zero", "0"), ("negative", "-1")] {
         let (status, body) = describe(&router, &[p("MaxResults", max_results)]).await;
         assert_eq!(
             status, 400,
@@ -1057,6 +1058,13 @@ async fn describe_volumes_narrows_by_id_filter_and_page() {
             error_code(&body),
             "InvalidParameterValue",
             "case {case:?}: expected InvalidParameterValue, got {body}"
+        );
+    }
+    for (case, max_results) in [("the cap", "1000"), ("past the cap", "1001")] {
+        let (status, body) = describe(&router, &[p("MaxResults", max_results)]).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} with body {body}"
         );
     }
 }

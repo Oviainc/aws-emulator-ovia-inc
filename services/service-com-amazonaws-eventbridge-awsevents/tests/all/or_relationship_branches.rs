@@ -142,6 +142,30 @@ fn refusal(reason: &str) -> String {
     format!("Event pattern is not valid. Reason: {reason}")
 }
 
+/// Assert that `body` refuses `pattern` for `reason`: the opening and the reason,
+/// then the source location naming the pattern as submitted and a position inside
+/// it (which character, row by row, is `pattern_refusal_location`'s table).
+fn assert_refusal(case: &str, body: &Value, pattern: &str, reason: &str) {
+    let message = error_message(body);
+    // Every pattern here is written on one line, so the position is a column of
+    // line 1, naming a character of the submitted pattern or the one just past
+    // its end where the reader ran out of text.
+    let opening = format!(
+        "{}\n at [Source: (String)\"{pattern}\"; line: 1, column: ",
+        refusal(reason)
+    );
+    let column = message
+        .strip_prefix(&opening)
+        .and_then(|rest| rest.strip_suffix(']'))
+        .and_then(|column| column.parse::<usize>().ok())
+        .unwrap_or_else(|| panic!("case {case:?}: expected {opening:?}<column>], got {message:?}"));
+    assert!(
+        (1..=pattern.chars().count() + 1).contains(&column),
+        "case {case:?}: column {column} must name a character of the submitted pattern \
+         {pattern:?}"
+    );
+}
+
 /// A queue called `name`; answers its url and the ARN a rule names it by.
 async fn given_queue(emulator: &Emulator, name: &str) -> (String, String) {
     let (status, body) = sqs(emulator, "CreateQueue", &json!({ "QueueName": name })).await;
@@ -467,12 +491,7 @@ async fn an_or_relating_fewer_than_two_objects_is_refused_by_both_validators() {
             "InvalidEventPatternException",
             "case {case:?}: expected InvalidEventPatternException, got {body}"
         );
-        assert_eq!(
-            error_message(&body),
-            refusal(&compiled),
-            "case {case:?}: expected PutRule to state {:?}, got {body}",
-            refusal(&compiled)
-        );
+        assert_refusal(case, &body, &pattern, &compiled);
 
         let (status, body) = events(
             &emulator,
@@ -489,12 +508,7 @@ async fn an_or_relating_fewer_than_two_objects_is_refused_by_both_validators() {
             "InvalidEventPatternException",
             "case {case:?}: expected InvalidEventPatternException, got {body}"
         );
-        assert_eq!(
-            error_message(&body),
-            refusal(&checked),
-            "case {case:?}: expected TestEventPattern to state {:?}, got {body}",
-            refusal(&checked)
-        );
+        assert_refusal(case, &body, &pattern, &checked);
     }
 
     // None of the refusals above stored a rule.
