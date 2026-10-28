@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchCreateFirewallRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchCreateFirewallRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchCreateFirewallRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! SCAFFOLD REPLACED: implemented. Each entry is decided on its own through the
+//! one firewall-rule create the store owns
+//! ([`crate::state::ComAmazonawsRoute53resolverRoute53resolverState::create_firewall_rule`]),
+//! so a rule this call creates is the rule `CreateFirewallRule` would have
+//! created for that entry, and an entry it cannot create is reported in the
+//! response body instead of failing the whole call. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +151,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchCreateFirewallRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchCreateFirewallRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchCreateFirewallRule"))
+        // The engine is reachable from `&self` (constructor-injected); a rule is
+        // not an ARN-bearing resource of its own, so this operation takes
+        // nothing from `ctx`.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                BatchCreateFirewallRuleErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some("the Route 53 Resolver store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // One request asks for a bounded number of rules, so no single call can
+        // ask this emulator for unbounded work. Past that bound the request is
+        // refused WHOLE, which leaves the stored rules exactly as they were.
+        let asked_for = input.create_firewall_rule_entries.len();
+        if asked_for > crate::state::MAX_FIREWALL_RULE_ENTRIES_PER_BATCH {
+            return Err(BatchCreateFirewallRuleErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "This emulator creates at most {} firewall rules in one batch; this \
+                         request carries {asked_for}",
+                        crate::state::MAX_FIREWALL_RULE_ENTRIES_PER_BATCH
+                    )),
+                    resource_type: Some(
+                        crate::state::RESOURCE_TYPE_FIREWALL_RULE_GROUP.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::Instant::now();
+        let mut created_firewall_rules = Vec::new();
+        let mut create_errors = Vec::new();
+        let mut store = state.lock();
+
+        // The entries are decided IN ORDER, each against the store as the
+        // entries before it left it: a rule one entry created is a rule the next
+        // entry's priority has to be unique against. An entry the create refuses
+        // is reported with the code and the sentence the single create answers
+        // for it, beside the entry that caused it — and the entries around it
+        // are created all the same, which is what makes one call able to succeed
+        // in part.
+        for entry in &input.create_firewall_rule_entries {
+            let request = crate::state::FirewallRuleCreate {
+                creator_request_id: &entry.creator_request_id,
+                firewall_rule_group_id: &entry.firewall_rule_group_id,
+                firewall_domain_list_id: entry.firewall_domain_list_id.as_deref(),
+                priority: entry.priority,
+                action: &entry.action,
+                block_response: entry.block_response.as_deref(),
+                block_override_domain: entry.block_override_domain.as_deref(),
+                block_override_dns_type: entry.block_override_dns_type.as_deref(),
+                block_override_ttl: entry.block_override_ttl,
+                name: &entry.name,
+                firewall_domain_redirection_action: entry
+                    .firewall_domain_redirection_action
+                    .as_deref(),
+                qtype: entry.qtype.as_deref(),
+                dns_threat_protection: entry.dns_threat_protection.as_deref(),
+                confidence_threshold: entry.confidence_threshold.as_deref(),
+                firewall_rule_type: entry.firewall_rule_type.as_ref(),
+            };
+
+            match store.create_firewall_rule(request, now) {
+                Ok(rule) => created_firewall_rules.push(rule),
+                // "The firewall rule entry that caused the error", as the
+                // request stated it.
+                Err(refusal) => create_errors.push(BatchCreateFirewallRuleError2 {
+                    firewall_rule: Some(entry.clone()),
+                    code: Some(refusal.code().to_string()),
+                    message: refusal.message(),
+                }),
+            }
+        }
+
+        Ok(BatchCreateFirewallRuleOutput {
+            // Both lists are reported for every call, so a caller reads the
+            // rules this request created and the entries it could not create
+            // from the same two members whether either is empty or not.
+            created_firewall_rules: Some(created_firewall_rules),
+            create_errors: Some(create_errors),
+        })
     }
 }
