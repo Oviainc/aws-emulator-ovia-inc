@@ -138,6 +138,8 @@ pub const REPLICATE_TO_NONE: &str = "NONE";
 /// exposure or overrides and to the one that stops it, and are recorded by those
 /// operations, each of which spells its own value where it writes its entry.
 pub const EVENT_RUN_STARTED: &str = "RUN_STARTED";
+/// See [`EVENT_RUN_STARTED`]: the entry the call that stops the run writes.
+pub const EVENT_RUN_STOPPED: &str = "RUN_STOPPED";
 
 /// `DeploymentEventType` values this service records, from
 /// `DEPLOYMENT_EVENT_TYPE_VALUES` in `crate::ops::types`.
@@ -866,6 +868,8 @@ const DESCRIPTION_REVERT_COMPLETED: &str = "Deployment reverted";
 /// ([`DESCRIPTION_DEPLOYMENT_STARTED`]): the action the entry records, with no trailing
 /// stop.
 const DESCRIPTION_RUN_STARTED: &str = "Experiment run started";
+/// See [`DESCRIPTION_RUN_STARTED`].
+const DESCRIPTION_RUN_STOPPED: &str = "Experiment run stopped";
 
 /// How long after it completed a deployment may still be reverted: "AppConfig only
 /// allows a revert within 72 hours of deployment completion", from the model's own
@@ -1361,6 +1365,30 @@ impl ExperimentRun {
     /// definition conflicts with it.
     pub fn is_active(&self) -> bool {
         self.status == EXPERIMENT_RUN_RUNNING
+    }
+
+    /// End this run: it stops delivering treatments at `now`, which is also the instant
+    /// the record was last written and the instant its timeline reports the stop at.
+    ///
+    /// `result` is the experiment's conclusion as the stopping call stated it; a call that
+    /// stated none leaves the conclusion the record already held, so stopping a run does
+    /// not erase a result something else wrote. The exposure and the overrides are left as
+    /// they stand: they are what the run was delivering when it ended.
+    pub fn end(&mut self, now: SystemTime, result: Option<ExperimentRunResult>) {
+        self.status = EXPERIMENT_RUN_DONE.to_string();
+        self.ended_at = Some(now);
+        self.updated_at = now;
+        if result.is_some() {
+            self.result = result;
+        }
+        self.event_log.push(experiment_run_event(
+            EVENT_RUN_STOPPED,
+            TRIGGERED_BY_USER,
+            DESCRIPTION_RUN_STOPPED.to_string(),
+            now,
+            self.exposure_percentage,
+            self.treatment_overrides.clone(),
+        ));
     }
 
     /// Record the first entry on this run's timeline: a caller started the run.
@@ -2554,6 +2582,20 @@ pub fn experiment_run_already_active(experiment_definition_identifier: &str) -> 
     )
 }
 
+/// `Message` for a delete of an experiment definition refused because an experiment of
+/// that definition is still running.
+///
+/// Derived from the request alone — the definition the delete addressed, echoed as the
+/// caller wrote it — wrapped in the fixed sentence naming the live experiment that is in
+/// the way. The run itself is NOT disclosed: neither its number nor its status is part of
+/// this refusal, so a caller learns that an experiment is running and nothing about it.
+pub fn experiment_definition_not_deletable(experiment_definition_identifier: &str) -> String {
+    format!(
+        "Experiment definition {experiment_definition_identifier} cannot be deleted while an \
+         experiment is running."
+    )
+}
+
 /// `Message` for an update of an experiment definition refused because the lifecycle the
 /// definition is in does not take one.
 ///
@@ -2582,6 +2624,21 @@ pub fn experiment_run_not_running(
     format!(
         "Run {run} of experiment definition {experiment_definition_id} is {status}, so it \
          cannot be updated: only a running experiment can be updated."
+    )
+}
+
+/// `Message` for a stop refused because the run it addressed is no longer running.
+///
+/// Derived from the state that refused it — the run addressed and the status it holds —
+/// so the caller can see that the experiment it asked to stop has already ended.
+pub fn experiment_run_not_stoppable(
+    experiment_definition_id: &str,
+    run: i32,
+    status: &str,
+) -> String {
+    format!(
+        "Run {run} of experiment definition {experiment_definition_id} is {status}, so it \
+         cannot be stopped: only a running experiment can be stopped."
     )
 }
 
