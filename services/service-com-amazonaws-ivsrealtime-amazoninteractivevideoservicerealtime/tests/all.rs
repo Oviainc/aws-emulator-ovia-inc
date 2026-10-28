@@ -35,6 +35,8 @@ mod create_storage_configuration_inputs;
 mod delete_ingest_configuration;
 #[path = "all/delete_stage_associations.rs"]
 mod delete_stage_associations;
+#[path = "all/delete_stage_ends_replications.rs"]
+mod delete_stage_ends_replications;
 #[path = "all/delete_storage_configuration.rs"]
 mod delete_storage_configuration;
 #[path = "all/disconnect_participant.rs"]

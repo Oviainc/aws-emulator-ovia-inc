@@ -2906,6 +2906,87 @@ pub fn leave_stage_session(
     true
 }
 
+/// Take the replica a now-ENDED replication put into its destination stage back out of
+/// that stage's session.
+///
+/// The ONE place an ended replication's replica leaves, whichever way the replication
+/// ended — a caller stopping it, or a stage it names being deleted — so no participant
+/// stays [`PARTICIPANT_STATE_CONNECTED`] in a stage on behalf of a replication this store
+/// no longer runs. The departure itself is [`leave_stage_session`]: the record stays and is
+/// reported [`PARTICIPANT_STATE_DISCONNECTED`], and the destination session ends when it
+/// held nobody else. The publisher in the SOURCE stage is untouched — it is publishing
+/// there whether or not anything replicates it.
+///
+/// `ended` must already have stopped being [`REPLICATION_STATE_ACTIVE`] in this store (the
+/// caller has stopped it, or is about to drop its record), because the replica stays in the
+/// destination stage while ANY replication still running puts that same participant into
+/// that same session: only the last one to end takes the replica out.
+///
+/// `false` — nothing recorded — when another running replication still puts that
+/// participant there, or when there is no such departure to record.
+pub fn release_ended_replica(
+    state: &mut ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+    ended: &ParticipantReplicaRecord,
+) -> bool {
+    let still_replicated = state.participant_replicas.values().flatten().any(|replica| {
+        replica.participant_id == ended.participant_id
+            && replica.destination_stage_arn == ended.destination_stage_arn
+            && replica.destination_session_id == ended.destination_session_id
+            && replica.replication_state == REPLICATION_STATE_ACTIVE
+    });
+    if still_replicated {
+        return false;
+    }
+    leave_stage_session(
+        state,
+        &ended.destination_stage_arn,
+        &ended.destination_session_id,
+        &ended.participant_id,
+    )
+}
+
+/// End every replication the stage `stage_arn` is an end of, and drop the records of them.
+///
+/// A replica is a participant of its source stage replicated into its destination stage, so
+/// neither end of a replication can outlive the stage it names: a stage going away ends
+/// every replication it sources and every replication into it. Ending one is not just
+/// dropping its record — the replica that replication put into the DESTINATION stage leaves
+/// that stage's session, through the one place an ended replication's replica leaves
+/// ([`release_ended_replica`]) — so the stage that survives this delete is left exactly as
+/// it would be had each of those replications been stopped instead.
+///
+/// The replicas replicated INTO `stage_arn` need no departure: those records are records of
+/// this stage's own sessions, which go with the stage.
+pub fn end_replications_of_stage(
+    state: &mut ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+    stage_arn: &str,
+) {
+    // Each replication this stage sources reaches its stopped state FIRST, as a caller
+    // stopping it would leave it: that is what makes it no longer one of the running
+    // replications [`release_ended_replica`] keeps a replica in a stage for, and it is
+    // still the record every report of that departing participant reads its replication
+    // members off.
+    let mut ended: Vec<ParticipantReplicaRecord> = Vec::new();
+    if let Some(sourced) = state.participant_replicas.get_mut(stage_arn) {
+        for replication in sourced
+            .iter_mut()
+            .filter(|replication| replication.replication_state == REPLICATION_STATE_ACTIVE)
+        {
+            replication.replication_state = REPLICATION_STATE_STOPPED.to_string();
+            ended.push(replication.clone());
+        }
+    }
+    for replication in &ended {
+        release_ended_replica(state, replication);
+    }
+    // The replications sourced from this stage go with its key; the ones replicated INTO it
+    // are dropped from the stages that source them.
+    state.participant_replicas.remove(stage_arn);
+    for replicas in state.participant_replicas.values_mut() {
+        replicas.retain(|replica| replica.destination_stage_arn != stage_arn);
+    }
+}
+
 /// The sessions of the stage `stage_arn` in which `participant_id` is still
 /// [`PARTICIPANT_STATE_CONNECTED`], in the order the stage holds them.
 ///
