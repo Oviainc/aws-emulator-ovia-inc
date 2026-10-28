@@ -194,7 +194,11 @@ fn reported_parts(answer: &Answer) -> usize {
 }
 
 /// The text of the first `<name>` element in `document`.
-fn element_of(document: &str, name: &str) -> Option<String> {
+///
+/// `pub(crate)`: the multipart notification suite
+/// ([`super::multipart_upload_event_notifications`]) reads an initiation's upload id out of
+/// its body through this one reader rather than slicing the document a second way.
+pub(crate) fn element_of(document: &str, name: &str) -> Option<String> {
     document
         .split_once(&format!("<{name}>"))
         .and_then(|(_, rest)| rest.split_once(&format!("</{name}>")))
