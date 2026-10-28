@@ -219,10 +219,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .identified_managed_endpoint(&region, &virtual_cluster_id, &input.endpoint_identifier)
             .map(|record| (record.id.clone(), record.state.clone()))
         else {
-            return Err(endpoint_not_found(
-                &input.endpoint_identifier,
-                &input.virtual_cluster_identifier,
-            ));
+            return Err(endpoint_not_found(&input.endpoint_identifier));
         };
         // A session connects a client THROUGH the endpoint's gateway, and only an ACTIVE
         // endpoint has one: an endpoint still being provisioned, or one that has been torn
@@ -364,28 +361,29 @@ fn server_error(message: &str) -> GetManagedEndpointSessionCredentialsError {
 }
 
 /// The modelled refusal for a `virtualClusterIdentifier` that names no virtual cluster of
-/// this region, worded the way every read of a virtual cluster in this service words it.
+/// this region, worded the way every read of a virtual cluster in this service words it
+/// ([`crate::state::ResourceKind`]). The identifier is reported as the request spelled it,
+/// an id or the cluster's own ARN.
 fn cluster_not_found(identifier: &str) -> GetManagedEndpointSessionCredentialsError {
     GetManagedEndpointSessionCredentialsErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {
-            message: Some(format!("Virtual cluster {identifier} was not found")),
+            message: Some(
+                crate::state::ResourceKind::VirtualCluster.not_found_message(identifier),
+            ),
         },
     )
     .into()
 }
 
 /// The modelled refusal for an `endpointIdentifier` that names no managed endpoint of this
-/// cluster, worded the way `DescribeManagedEndpoint` words it. The identifiers are reported
-/// as the request spelled them, so a caller sees which pair was not found.
-fn endpoint_not_found(
-    identifier: &str,
-    virtual_cluster_identifier: &str,
-) -> GetManagedEndpointSessionCredentialsError {
+/// cluster, worded the way `DescribeManagedEndpoint` words it
+/// ([`crate::state::ResourceKind`]). The identifier is reported as the request spelled it.
+fn endpoint_not_found(identifier: &str) -> GetManagedEndpointSessionCredentialsError {
     GetManagedEndpointSessionCredentialsErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {
-            message: Some(format!(
-                "Endpoint {identifier} was not found in virtual cluster {virtual_cluster_identifier}"
-            )),
+            message: Some(
+                crate::state::ResourceKind::ManagedEndpoint.not_found_message(identifier),
+            ),
         },
     )
     .into()

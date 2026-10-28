@@ -31,6 +31,8 @@ mod managed_endpoint_listing;
 mod managed_endpoint_session_credentials;
 #[path = "all/managed_endpoint_wire_form.rs"]
 mod managed_endpoint_wire_form;
+#[path = "all/not_found_message.rs"]
+mod not_found_message;
 #[path = "all/paginated_page_bounds.rs"]
 mod paginated_page_bounds;
 #[path = "all/region_isolation.rs"]

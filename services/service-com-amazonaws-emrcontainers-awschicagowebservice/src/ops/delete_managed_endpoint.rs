@@ -160,10 +160,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(DeleteManagedEndpointErrorModeled::ValidationException(
                 ValidationException {
-                    message: Some(format!(
-                        "Endpoint {} was not found in virtual cluster {}",
-                        input.id, input.virtual_cluster_id
-                    )),
+                    // The one not-found wording of this service
+                    // ([`crate::state::ResourceKind`]), built from the requested id: the
+                    // refusal is carried by this operation's own modelled error, but what
+                    // it SAYS is that the endpoint does not exist.
+                    message: Some(
+                        crate::state::ResourceKind::ManagedEndpoint
+                            .not_found_message(&input.id),
+                    ),
                 },
             )
             .into());

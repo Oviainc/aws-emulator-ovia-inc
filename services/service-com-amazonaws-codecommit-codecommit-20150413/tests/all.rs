@@ -115,6 +115,8 @@ mod object_store_bounds;
 mod path_depth_bound;
 #[path = "all/pull_request_approval_rule_evaluation.rs"]
 mod pull_request_approval_rule_evaluation;
+#[path = "all/pull_request_approval_rule_override.rs"]
+mod pull_request_approval_rule_override;
 #[path = "all/pull_request_approval_rules.rs"]
 mod pull_request_approval_rules;
 #[path = "all/pull_request_approval_state.rs"]

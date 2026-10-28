@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op OverridePullRequestApprovalRules
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `OverridePullRequestApprovalRules`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`OverridePullRequestApprovalRules::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: records on the stored pull request in `crate::state` whether its
+//! approval rule requirements are set aside, so a merge of it reads the override
+//! the caller asked for, and appends the change to the pull request's event log
+//! (`DescribePullRequestEvents`) attributed to the calling identity.
 //!
 //! ## Shape of an operation
 //!
@@ -201,18 +196,167 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `OverridePullRequestApprovalRules` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(OverridePullRequestApprovalRulesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("OverridePullRequestApprovalRules"))
+        // Which ids address a pull request is `crate::state`'s rule, so every
+        // operation taking a `pullRequestId` agrees about it; this only maps each
+        // outcome onto the error THIS operation models for it.
+        let pull_request_id = crate::state::normalize_pull_request_id(&input.pull_request_id)
+            .map_err(|problem| match problem {
+                crate::state::PullRequestIdProblem::Missing => {
+                    OverridePullRequestApprovalRulesErrorModeled::PullRequestIdRequiredException(
+                        PullRequestIdRequiredException {
+                            message: Some(
+                                crate::state::PULL_REQUEST_ID_REQUIRED_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                }
+                crate::state::PullRequestIdProblem::Invalid => {
+                    OverridePullRequestApprovalRulesErrorModeled::InvalidPullRequestIdException(
+                        InvalidPullRequestIdException {
+                            message: Some(
+                                crate::state::INVALID_PULL_REQUEST_ID_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                }
+            })?;
+
+        // Which values can name a revision of a pull request is likewise
+        // `crate::state`'s rule.
+        let revision_id = crate::state::normalize_revision_id(&input.revision_id).map_err(
+            |problem| match problem {
+                crate::state::RevisionIdProblem::Missing => {
+                    OverridePullRequestApprovalRulesErrorModeled::RevisionIdRequiredException(
+                        RevisionIdRequiredException {
+                            message: Some(crate::state::REVISION_ID_REQUIRED_MESSAGE.to_string()),
+                        },
+                    )
+                }
+                crate::state::RevisionIdProblem::Invalid => {
+                    OverridePullRequestApprovalRulesErrorModeled::InvalidRevisionIdException(
+                        InvalidRevisionIdException {
+                            message: Some(crate::state::INVALID_REVISION_ID_MESSAGE.to_string()),
+                        },
+                    )
+                }
+            },
+        )?;
+
+        // `overrideStatus` is a modelled enum, so a value outside it is already
+        // refused at the boundary (`crate::service` words that code); classifying it
+        // here as well is what keeps the handler total without a 501.
+        let requested = match input.override_status.as_str() {
+            status @ (crate::state::OVERRIDE_STATUS_OVERRIDE
+            | crate::state::OVERRIDE_STATUS_REVOKE) => status,
+            _ => {
+                return Err(
+                    OverridePullRequestApprovalRulesErrorModeled::InvalidOverrideStatusException(
+                        InvalidOverrideStatusException {
+                            message: Some(
+                                crate::state::INVALID_OVERRIDE_STATUS_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        };
+
+        // An override is an act of the identity that MADE the call, never of
+        // anything the request names, so the log attributes it to that identity.
+        let overrider = crate::state::caller_identity_arn(&*self.engine, ctx);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let mut store = state.lock();
+        let pull_request = store.pull_request_mut(pull_request_id).ok_or_else(|| {
+            OverridePullRequestApprovalRulesErrorModeled::PullRequestDoesNotExistException(
+                PullRequestDoesNotExistException {
+                    message: Some(crate::state::pull_request_does_not_exist_message(
+                        &pull_request_id.to_string(),
+                    )),
+                },
+            )
+        })?;
+
+        // The rules are set aside only while the pull request is open: one that is
+        // no longer open takes no further review, so it has no requirements left to
+        // set aside or to hold again.
+        if pull_request.status != crate::state::PULL_REQUEST_STATUS_OPEN {
+            return Err(
+                OverridePullRequestApprovalRulesErrorModeled::PullRequestAlreadyClosedException(
+                    PullRequestAlreadyClosedException {
+                        message: Some(
+                            crate::state::PULL_REQUEST_ALREADY_CLOSED_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "You cannot override approval rules for anything but the most recent
+        // revision of a pull request": a request naming a revision the pull request
+        // has moved past records nothing.
+        if !pull_request.is_current_revision(&revision_id) {
+            return Err(
+                OverridePullRequestApprovalRulesErrorModeled::RevisionNotCurrentException(
+                    RevisionNotCurrentException {
+                        message: Some(crate::state::REVISION_NOT_CURRENT_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let overridden = requested == crate::state::OVERRIDE_STATUS_OVERRIDE;
+        if pull_request.approval_rules_overridden() == overridden {
+            // Setting rules aside that are already set aside is the one of the two
+            // the model names an error for. Asking for requirements that already
+            // apply is the state the pull request already holds, so it is accepted
+            // and changes NOTHING — no event, because the log records only changes
+            // that happened, and so no move of "the day and time of the last user or
+            // system activity on the pull request" either.
+            if overridden {
+                return Err(
+                    OverridePullRequestApprovalRulesErrorModeled::OverrideAlreadySetException(
+                        OverrideAlreadySetException {
+                            message: Some(crate::state::OVERRIDE_ALREADY_SET_MESSAGE.to_string()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            return Ok(OverridePullRequestApprovalRulesOutput);
+        }
+
+        // The override the pull request HOLDS is what a merge of it reads, so setting
+        // its rules aside is what lets that merge go through while a rule still
+        // states conditions its approvals do not meet; revoking the override holds
+        // those conditions again, which is why a revoke leaves no override stored
+        // rather than storing a status of its own. Who set them aside is stored with
+        // it, because that identity is what a reader of the override state reports.
+        pull_request.approval_rules_overridden_by = if overridden {
+            Some(overrider.clone())
+        } else {
+            None
+        };
+        // The override moved, so the pull request's event log records it through the
+        // one place an entry is appended — which also moves `lastActivityDate` onto
+        // this call. An override is not a revision of the pull request, so the
+        // revision it was given on stays the current one.
+        pull_request.record_event(
+            ::std::time::SystemTime::now(),
+            Some(overrider),
+            crate::state::PullRequestEventDetail::ApprovalRuleOverridden {
+                revision_id,
+                override_status: requested.to_string(),
+            },
+        );
+
+        Ok(OverridePullRequestApprovalRulesOutput)
     }
 }
