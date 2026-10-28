@@ -32,7 +32,7 @@ use service_com_amazonaws_accessanalyzer_accessanalyzer::state::{
 
 use super::analyzer_lifecycle::ANALYZER_TYPES;
 use crate::harness::{
-    expected_arn, is_timestamp, timestamp_at_least, wire_reason, Emulator, Reply,
+    expected_arn, is_timestamp, member, timestamp_at_least, wire_reason, Emulator, Reply,
 };
 
 /// How long a case waits PAST [`RESOURCE_SCAN_SPAN`] before reading the analyzer back, so
@@ -90,11 +90,6 @@ fn listed_analyzer(reply: &Reply, name: &str) -> Value {
         })
         .cloned()
         .unwrap_or_else(|| panic!("expected {name} in the listing {:?}", reply.body))
-}
-
-/// A member of a projected analyzer, treating JSON `null` as absent.
-fn member<'a>(analyzer: &'a Value, name: &str) -> Option<&'a Value> {
-    analyzer.get(name).filter(|value| !value.is_null())
 }
 
 /// The `lastResourceAnalyzed` a projected analyzer reports, `None` when it reports none.

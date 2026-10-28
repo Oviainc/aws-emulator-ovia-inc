@@ -414,13 +414,13 @@ pub(super) fn due_order<'name>(
 
 /// Whether `datum` is one the alarm's `Unit` selects ([`alarm_grades_unit`]).
 fn carries_alarm_unit(alarm: &MetricAlarm, datum: &StoredDatum) -> bool {
-    alarm_grades_unit(alarm, datum.unit.as_deref())
+    alarm_grades_unit(alarm, datum.unit())
 }
 
 /// Whether a datapoint carrying `unit` is one this alarm GRADES: "If you specify a unit, the
 /// operation returns only data that was collected with that unit specified." An alarm naming no
 /// unit grades every datapoint of the series it watches.
-fn alarm_grades_unit(alarm: &MetricAlarm, unit: Option<&str>) -> bool {
+fn alarm_grades_unit(alarm: &MetricAlarm, unit: &str) -> bool {
     grades_unit(alarm.unit.as_deref(), unit)
 }
 
@@ -428,11 +428,16 @@ fn alarm_grades_unit(alarm: &MetricAlarm, unit: Option<&str>) -> bool {
 /// specify a unit, the operation returns only data that was collected with that unit
 /// specified." A reader naming no unit grades every datapoint of the series.
 ///
+/// `unit` is the unit the datapoint is STORED under ([`StoredDatum::unit`]), which every
+/// datapoint has: one whose publisher named none carries the value the enumerated type declares
+/// for a measurement with no unit, so an alarm selecting THAT value grades it and an alarm
+/// selecting any other does not.
+///
 /// The one definition of that selector, so the evaluation fold, the forced-state span and
 /// [`State::make_alarms_due`] cannot answer "is this data for this alarm?" three ways —
 /// whether the unit is the alarm's own or the one its query names.
-pub(super) fn grades_unit(selector: Option<&str>, unit: Option<&str>) -> bool {
-    selector.is_none_or(|wanted| unit == Some(wanted))
+pub(super) fn grades_unit(selector: Option<&str>, unit: &str) -> bool {
+    selector.is_none_or(|wanted| unit == wanted)
 }
 
 /// One window of the series an alarm GRADES: the value it took, and how many observations it

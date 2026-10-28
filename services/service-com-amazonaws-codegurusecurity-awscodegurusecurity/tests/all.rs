@@ -33,6 +33,8 @@ mod metrics_summary;
 mod reserved_tag_keys;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
+#[path = "all/scan_arn_region.rs"]
+mod scan_arn_region;
 #[path = "all/scan_completion.rs"]
 mod scan_completion;
 #[path = "all/scan_lifecycle.rs"]

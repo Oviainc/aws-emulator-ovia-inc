@@ -500,11 +500,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let mut store = state.lock();
             let mut written: Vec<crate::state::WrittenSeries> = Vec::with_capacity(ingest.len());
             for (key, observations) in ingest {
-                // The units these datapoints carry, which is what decides whether an alarm
-                // over this series would grade any of them.
-                let units: Vec<Option<String>> = observations
+                // The units these datapoints carry — each as the store holds it, so a datum
+                // whose publisher declared none carries the value the enumerated type declares
+                // for a measurement with no unit — which is what decides whether an alarm over
+                // this series would grade any of them.
+                let units: Vec<String> = observations
                     .iter()
-                    .map(|datum| datum.unit.clone())
+                    .map(|datum| datum.unit().to_string())
                     .collect();
                 let watched = key.clone();
                 if store.append_datapoints(key, observations).is_err() {

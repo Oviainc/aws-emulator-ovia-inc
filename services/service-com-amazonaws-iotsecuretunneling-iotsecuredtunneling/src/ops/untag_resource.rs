@@ -3,7 +3,9 @@
 //! @op UntagResource
 //!
 //! Removes the named tag keys from the tag store of the tunnel `resourceArn`
-//! names; a key that is not set is left alone. A key in the reserved
+//! names; a key that is not set is left alone. A removal that changes the
+//! tunnel's tag set stamps the record's `lastUpdatedAt`, which the tunnel
+//! reports beside those tags. A key in the reserved
 //! [`crate::state::RESERVED_TAG_KEY_PREFIX`] namespace is refused with HTTP 400
 //! `ValidationException` and removes nothing.
 //!
@@ -133,12 +135,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A resource is untagged through the endpoint of its own Region: an ARN of
         // another Region names nothing this endpoint holds.
+        let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx);
         let mut store = state.lock();
-        if store
-            .tunnel_id_for_arn(&region, &input.resource_arn)
-            .is_none()
-        {
+        // A tunnel whose lifetime has already run out is closed by the clock
+        // before this call writes its own stamp, so the stamp this call leaves
+        // is never overtaken by a close that was owed earlier.
+        store.materialize_expired_tunnels(now);
+        let Some(tunnel_id) = store.tunnel_id_for_arn(&region, &input.resource_arn) else {
             return Err(UntagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     // The tunnel the ARN names, named the way every other
@@ -149,7 +153,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
-        }
+        };
 
         // A tag key in the reserved `aws:` namespace belongs to AWS, which a
         // caller may no more delete than set, and the modelled `TagKey` pattern
@@ -164,10 +168,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        if let Some(stored) = store.tags.get_mut(&input.resource_arn) {
-            for key in &input.tag_keys {
-                stored.remove(key);
-            }
+        // `DescribeTunnel` reports the tag store inside the same `Tunnel` shape
+        // as `lastUpdatedAt` ("The last time the tunnel was updated"), so
+        // removing a tag the tunnel reported IS an update of the tunnel and is
+        // stamped on the record. A request that names only keys the tunnel does
+        // not carry changes nothing, and so stamps nothing.
+        if store.remove_tags(&input.resource_arn, input.tag_keys.iter().map(String::as_str)) {
+            store.stamp_tunnel_updated(&region, &tunnel_id, now);
         }
         drop(store);
 
