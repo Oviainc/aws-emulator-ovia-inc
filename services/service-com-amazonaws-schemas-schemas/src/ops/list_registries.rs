@@ -176,17 +176,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ListRegistriesError::from(ListRegistriesErrorModeled::BadRequestException(refusal))
         })?;
 
-        // The members that decide WHICH registries this listing contains. Bound into
-        // the `NextToken`, so a token cannot resume a differently-selected listing.
-        let selection = format!(
-            "registryNamePrefix={};scope={}",
-            input.registry_name_prefix.as_deref().unwrap_or_default(),
-            match selected_scope {
-                None => "all",
-                Some(crate::state::RegistryScope::Local) => "Local",
-                Some(crate::state::RegistryScope::Aws) => "AWS",
-            }
+        // The members that decide WHICH registries this listing contains, with the
+        // listing itself. Bound into the `NextToken`, so a token cannot resume a
+        // differently-selected listing, rendered by
+        // `crate::state::selection_fingerprint` so no value a caller can send renders
+        // the fingerprint of another selection.
+        let selection = crate::state::selection_fingerprint(
+            Self::NAME,
+            &[
+                (
+                    "registryNamePrefix",
+                    input.registry_name_prefix.as_deref().unwrap_or_default(),
+                ),
+                (
+                    "scope",
+                    match selected_scope {
+                        None => "all",
+                        Some(crate::state::RegistryScope::Local) => "Local",
+                        Some(crate::state::RegistryScope::Aws) => "AWS",
+                    },
+                ),
+            ],
         );
+
+        // ONE clock reading for the whole call: the instant this listing is served, so
+        // the token this page mints says when it was issued and the one this request
+        // presented is aged against the same instant.
+        let now = ::std::time::SystemTime::now();
 
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListRegistriesError::from(ListRegistriesErrorModeled::InternalServerErrorException(
@@ -207,6 +223,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &selection,
             input.next_token.as_deref(),
             page_size,
+            now,
         )
         .map_err(|_| {
             ListRegistriesError::from(ListRegistriesErrorModeled::BadRequestException(

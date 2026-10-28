@@ -156,13 +156,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ListDiscoverersError::from(ListDiscoverersErrorModeled::BadRequestException(refusal))
         })?;
 
-        // The members that decide WHICH discoverers this listing contains. Bound into
-        // the `NextToken`, so a token cannot resume a differently-selected listing.
-        let selection = format!(
-            "discovererIdPrefix={};sourceArnPrefix={}",
-            input.discoverer_id_prefix.as_deref().unwrap_or_default(),
-            input.source_arn_prefix.as_deref().unwrap_or_default(),
+        // The members that decide WHICH discoverers this listing contains, with the
+        // listing itself. Bound into the `NextToken`, so a token cannot resume a
+        // differently-selected listing: both members are free-form strings, so the
+        // fingerprint is rendered by `crate::state::selection_fingerprint`, which no
+        // value a caller can send renders ambiguously.
+        let selection = crate::state::selection_fingerprint(
+            Self::NAME,
+            &[
+                (
+                    "discovererIdPrefix",
+                    input.discoverer_id_prefix.as_deref().unwrap_or_default(),
+                ),
+                (
+                    "sourceArnPrefix",
+                    input.source_arn_prefix.as_deref().unwrap_or_default(),
+                ),
+            ],
         );
+
+        // ONE clock reading for the whole call: the instant this listing is served, so
+        // the token this page mints says when it was issued and the one this request
+        // presented is aged against the same instant.
+        let now = ::std::time::SystemTime::now();
 
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListDiscoverersError::from(ListDiscoverersErrorModeled::InternalServerErrorException(
@@ -190,6 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &selection,
             input.next_token.as_deref(),
             page_size,
+            now,
         )
         .map_err(|_| {
             ListDiscoverersError::from(ListDiscoverersErrorModeled::BadRequestException(

@@ -3233,27 +3233,94 @@ pub fn schema_name_order_key(schema_name: &str) -> String {
 /// prefix of another, which this byte makes the shorter one.
 const COLLATION_TIEBREAK_SEPARATOR: char = '\u{1}';
 
-/// Mint a `NextToken` that resumes strictly after `last_key`, for a listing selected
-/// by `selection`.
+/// Render the fingerprint of a listing's selection: the listing itself, and the
+/// request members that decide WHICH items it contains, each with the value this
+/// request sent (an absent member and the value that selects the same items render
+/// alike, because they ARE the same listing).
 ///
-/// Both halves are hex, so the token is a single opaque word: it is safe in a query
+/// The rendering is UNAMBIGUOUS — two selections that differ in any value, in the
+/// member a value was sent for, or in the listing they select, render different
+/// fingerprints — because every value is preceded by its length in bytes, so a
+/// reader knows where it ends. Separating the values alone cannot promise that: a
+/// member modelled as a free-form string may hold the separator itself, and then one
+/// member's value runs into the next member's name and two different selections
+/// render alike — the very confusion binding the selection into a `NextToken` exists
+/// to prevent.
+pub fn selection_fingerprint(listing: &str, members: &[(&str, &str)]) -> String {
+    let mut fingerprint = String::new();
+    let mut push_field = |name: &str, value: &str| {
+        fingerprint.push_str(name);
+        fingerprint.push('=');
+        fingerprint.push_str(&value.len().to_string());
+        fingerprint.push(':');
+        fingerprint.push_str(value);
+        fingerprint.push(';');
+    };
+    push_field("listing", listing);
+    for (member, value) in members {
+        push_field(member, value);
+    }
+    fingerprint
+}
+
+/// How long a `NextToken` this service mints resumes its listing for.
+///
+/// The window is the model's, not a number the emulator picked: the documentation of
+/// every `NextToken` member of this service states that the token expires in 24
+/// hours. A token therefore carries the instant it was minted at, and one presented
+/// once this much has passed no longer names a position in any listing — it is
+/// refused, like any other token this service will not resume.
+pub const NEXT_TOKEN_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Mint a `NextToken` that resumes strictly after `last_key`, for a listing selected
+/// by `selection` and served at `issued_at`.
+///
+/// Every field is hex, so the token is a single opaque word: it is safe in a query
 /// string whatever the key or the selection contains, a client cannot mistake it for
-/// a value it may construct, and the two halves cannot run into each other.
+/// a value it may construct, and the fields cannot run into each other.
 ///
 /// The selection is carried IN the token because a token names a position within one
 /// listing: resuming a differently-filtered listing from it would skip or repeat
 /// items with no error. A token presented with another selection is therefore not a
 /// token for that listing, and is refused.
-fn encode_next_token(selection: &str, last_key: &str) -> String {
-    format!("{}.{}", ::hex::encode(selection), ::hex::encode(last_key))
+///
+/// The issue instant is carried for the same kind of reason: a position is only
+/// meaningful for as long as the token lives, which is [`NEXT_TOKEN_TTL`], so the
+/// token has to say when it was minted. Handlers reach this through [`page_by_key`];
+/// it is public so a test can mint a token for a chosen instant.
+pub fn encode_next_token(selection: &str, last_key: &str, issued_at: SystemTime) -> String {
+    let issued_at_seconds = issued_at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format!(
+        "{}.{}.{issued_at_seconds:016x}",
+        ::hex::encode(selection),
+        ::hex::encode(last_key),
+    )
 }
 
 /// Read back the key a `NextToken` [`encode_next_token`] minted for `selection`
-/// resumes after. `None` for anything else, including a token minted for a different
-/// selection.
-fn decode_next_token(selection: &str, token: &str) -> Option<String> {
-    let (encoded_selection, encoded_key) = token.split_once('.')?;
+/// resumes after, as of `now`. `None` for anything else: a token minted for a
+/// different selection, one this service never minted, and one minted more than
+/// [`NEXT_TOKEN_TTL`] before `now`.
+fn decode_next_token(selection: &str, token: &str, now: SystemTime) -> Option<String> {
+    let mut fields = token.split('.');
+    let (encoded_selection, encoded_key, encoded_issued_at) =
+        match (fields.next(), fields.next(), fields.next(), fields.next()) {
+            (Some(selection), Some(key), Some(issued_at), None) => (selection, key, issued_at),
+            _ => return None,
+        };
     if ::hex::decode(encoded_selection).ok()? != selection.as_bytes() {
+        return None;
+    }
+    let issued_at = SystemTime::UNIX_EPOCH
+        .checked_add(Duration::from_secs(
+            u64::from_str_radix(encoded_issued_at, 16).ok()?,
+        ))?;
+    // The age runs forward from the instant in the token, so a token the clock has
+    // not reached yet is as young as a fresh one rather than older than any.
+    if now.duration_since(issued_at).unwrap_or_default() >= NEXT_TOKEN_TTL {
         return None;
     }
     String::from_utf8(::hex::decode(encoded_key).ok()?).ok()
@@ -3271,22 +3338,28 @@ fn decode_next_token(selection: &str, token: &str) -> Option<String> {
 /// selection into one response would be a response-amplification path out of a store
 /// the caller fills. Callers resolve it through [`requested_page_size`].
 ///
-/// `selection` identifies the listing being walked — every request member that
-/// decides WHICH items it contains (the parent resource, a name prefix, a scope).
-/// It is bound into the token and checked when one comes back, so a token cannot
-/// resume a listing it was not issued for.
+/// `selection` identifies the listing being walked — the listing itself and every
+/// request member that decides WHICH items it contains (the parent resource, a name
+/// prefix, a scope), as [`selection_fingerprint`] renders them. It is bound into the
+/// token and checked when one comes back, so a token cannot resume a listing it was
+/// not issued for.
 ///
-/// Returns `Err` for a token this service did not mint for this selection — the
-/// caller answers that with its own modelled client error.
+/// `now` is the instant this request is served: it stamps the token this page mints
+/// and ages the one it was given, so a token older than [`NEXT_TOKEN_TTL`] resumes
+/// nothing.
+///
+/// Returns `Err` for a token this service did not mint for this selection, and for
+/// one that has expired — the caller answers that with its own modelled client error.
 pub fn page_by_key<K: AsRef<str>, V>(
     entries: impl Iterator<Item = (K, V)>,
     selection: &str,
     token: Option<&str>,
     page_size: usize,
+    now: SystemTime,
 ) -> Result<Page<V>, InvalidToken> {
     let after = match token {
         None => None,
-        Some(token) => Some(decode_next_token(selection, token).ok_or(InvalidToken)?),
+        Some(token) => Some(decode_next_token(selection, token, now).ok_or(InvalidToken)?),
     };
     let mut remaining =
         entries.filter(|(key, _)| after.as_deref().is_none_or(|after| key.as_ref() > after));
@@ -3314,11 +3387,12 @@ pub fn page_by_key<K: AsRef<str>, V>(
     // that would resolve to an empty page.
     let next_token = remaining
         .next()
-        .map(|_| encode_next_token(selection, &last_key));
+        .map(|_| encode_next_token(selection, &last_key, now));
     Ok(Page { items, next_token })
 }
 
-/// A `NextToken` this service did not mint for the listing it was presented to.
+/// A `NextToken` the listing it was presented to will not resume from: one this
+/// service did not mint for that listing's selection, or one that has expired.
 #[derive(Debug)]
 pub struct InvalidToken;
 
@@ -3937,14 +4011,16 @@ pub fn too_many_keywords(named: usize) -> BadRequestException {
     ))
 }
 
-/// Refuse a `NextToken` this service did not mint for this listing, without echoing
-/// it back.
+/// Refuse a `NextToken` this listing will not resume from — one this service did not
+/// mint for this selection, or one that has expired — without echoing it back.
 pub fn invalid_next_token() -> BadRequestException {
-    bad_request(
+    let hours = NEXT_TOKEN_TTL.as_secs() / 3600;
+    bad_request(format!(
         "The NextToken provided is not a token this service issued for this listing. \
          A NextToken resumes the listing it was returned by, so every request that \
-         follows it must repeat that listing's selection unchanged.",
-    )
+         follows it must repeat that listing's selection unchanged, and it expires \
+         {hours} hours after the listing returned it."
+    ))
 }
 
 #[cfg(test)]
@@ -3956,6 +4032,12 @@ mod tests {
     /// The selection the helper's own tests page under; its shape does not matter
     /// here, only that it is the same one on both sides of a token.
     const SELECTION: &str = "prefix=;scope=Local";
+
+    /// The instant the helper's own tests serve a listing at. Fixed, so a case ages a
+    /// token by the amount it names rather than by waiting for a clock.
+    fn served_at() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+    }
 
     /// The collation a listing of schemas serves is the order of each name's letters
     /// and digits, case-folded, with the raw name breaking a tie — and comparing the
@@ -4059,7 +4141,8 @@ mod tests {
     #[test]
     fn a_single_short_page_has_no_token() {
         let entries = vec![("a", 1), ("b", 2)];
-        let page = page_by_key(entries.into_iter(), SELECTION, None, 10).expect("fresh token");
+        let page =
+            page_by_key(entries.into_iter(), SELECTION, None, 10, served_at()).expect("fresh token");
         assert_eq!(page.items, vec![1, 2], "every entry is on the page");
         assert!(
             page.next_token.is_none(),
@@ -4073,7 +4156,8 @@ mod tests {
     #[test]
     fn an_exactly_filled_final_page_has_no_token() {
         let entries = vec![("a", 1), ("b", 2)];
-        let page = page_by_key(entries.into_iter(), SELECTION, None, 2).expect("fresh token");
+        let page =
+            page_by_key(entries.into_iter(), SELECTION, None, 2, served_at()).expect("fresh token");
         assert!(
             page.next_token.is_none(),
             "an exactly-filled final page must not carry a token, got {:?}",
@@ -4085,12 +4169,12 @@ mod tests {
     #[test]
     fn the_token_resumes_after_the_last_item() {
         let entries = vec![("a", 1), ("b", 2), ("c", 3)];
-        let first =
-            page_by_key(entries.clone().into_iter(), SELECTION, None, 2).expect("fresh token");
+        let first = page_by_key(entries.clone().into_iter(), SELECTION, None, 2, served_at())
+            .expect("fresh token");
         assert_eq!(first.items, vec![1, 2]);
         let token = first.next_token.expect("a further entry remains");
-        let second =
-            page_by_key(entries.into_iter(), SELECTION, Some(&token), 2).expect("own token");
+        let second = page_by_key(entries.into_iter(), SELECTION, Some(&token), 2, served_at())
+            .expect("own token");
         assert_eq!(second.items, vec![3], "the next page resumes after 'b'");
         assert!(second.next_token.is_none(), "and terminates");
     }
@@ -4100,10 +4184,43 @@ mod tests {
     #[test]
     fn a_foreign_token_is_refused() {
         let entries = vec![("a", 1)];
-        for foreign in ["not-a-token", "zz", "6162", "", "."] {
+        for foreign in ["not-a-token", "zz", "6162", "", ".", "..", "6162.6162"] {
             assert!(
-                page_by_key(entries.clone().into_iter(), SELECTION, Some(foreign), 10).is_err(),
+                page_by_key(
+                    entries.clone().into_iter(),
+                    SELECTION,
+                    Some(foreign),
+                    10,
+                    served_at()
+                )
+                .is_err(),
                 "case {foreign:?}: a token this service did not mint must be refused"
+            );
+        }
+
+        // And a token of this service's own shape whose issue instant names no instant
+        // a clock can represent, is not a number, or is followed by a field this
+        // service does not mint: a value a caller sends is never trusted to be one of
+        // this service's own.
+        let selection = ::hex::encode(SELECTION);
+        let key = ::hex::encode("a");
+        for malformed in [
+            format!("{selection}.{key}.ffffffffffffffff"),
+            format!("{selection}.{key}.-1"),
+            format!("{selection}.{key}.zz"),
+            format!("{selection}.{key}."),
+            format!("{selection}.{key}.{:016x}.0", 0),
+        ] {
+            assert!(
+                page_by_key(
+                    entries.clone().into_iter(),
+                    SELECTION,
+                    Some(&malformed),
+                    10,
+                    served_at()
+                )
+                .is_err(),
+                "case {malformed:?}: a token this service did not mint must be refused"
             );
         }
     }
@@ -4114,19 +4231,167 @@ mod tests {
     #[test]
     fn a_token_does_not_resume_a_differently_selected_listing() {
         let entries = vec![("a", 1), ("b", 2), ("c", 3)];
-        let first =
-            page_by_key(entries.clone().into_iter(), SELECTION, None, 1).expect("fresh token");
+        let first = page_by_key(entries.clone().into_iter(), SELECTION, None, 1, served_at())
+            .expect("fresh token");
         let token = first.next_token.expect("further entries remain");
         assert!(
             page_by_key(
                 entries.into_iter(),
                 "prefix=b;scope=Local",
                 Some(&token),
-                1
+                1,
+                served_at()
             )
             .is_err(),
             "a token issued for one selection must not resume another"
         );
+    }
+
+    /// A token resumes its listing for as long as it lives and no longer: the instant
+    /// it was minted at travels in it, and a request made once [`NEXT_TOKEN_TTL`] has
+    /// passed is refused rather than served from a position that is no longer current.
+    ///
+    /// Driven over the ages the rule generalises over: the instant of issue, inside the
+    /// window, each side of the published bound, far past it, and a request whose clock
+    /// stands before the token was minted.
+    #[test]
+    fn a_token_resumes_its_listing_only_until_it_expires() {
+        let entries = vec![("a", 1), ("b", 2), ("c", 3)];
+        let issued = page_by_key(entries.clone().into_iter(), SELECTION, None, 1, served_at())
+            .expect("fresh token");
+        let token = issued.next_token.expect("further entries remain");
+
+        for (case, presented_at, resumes) in [
+            ("at the instant of issue", served_at(), true),
+            (
+                "half the window later",
+                served_at() + NEXT_TOKEN_TTL / 2,
+                true,
+            ),
+            (
+                "a second before the window closes",
+                served_at() + NEXT_TOKEN_TTL - Duration::from_secs(1),
+                true,
+            ),
+            ("the window exactly", served_at() + NEXT_TOKEN_TTL, false),
+            (
+                "a second past the window",
+                served_at() + NEXT_TOKEN_TTL + Duration::from_secs(1),
+                false,
+            ),
+            (
+                "a week past the window",
+                served_at() + NEXT_TOKEN_TTL + Duration::from_secs(7 * 24 * 60 * 60),
+                false,
+            ),
+            (
+                "a clock standing before the token was minted",
+                served_at() - Duration::from_secs(60),
+                true,
+            ),
+        ] {
+            let resumed = page_by_key(
+                entries.clone().into_iter(),
+                SELECTION,
+                Some(&token),
+                1,
+                presented_at,
+            );
+            assert_eq!(
+                resumed.is_ok(),
+                resumes,
+                "case {case:?}: expected the token to resume: {resumes}, got {resumed:?}"
+            );
+            if let Ok(page) = resumed {
+                assert_eq!(
+                    page.items,
+                    vec![2],
+                    "case {case:?}: a living token resumes after the page it was minted for"
+                );
+            }
+        }
+    }
+
+    /// A selection fingerprint is UNAMBIGUOUS: two selections render the same
+    /// fingerprint only when they are the same listing with the same values, whatever
+    /// characters those values hold — so a token minted for one selection never
+    /// resumes another.
+    ///
+    /// Driven over a cross product of values that hold the characters a rendering
+    /// separates fields with, in each member slot, plus the member names themselves as
+    /// values.
+    #[test]
+    fn two_different_selections_cannot_render_one_fingerprint() {
+        let values = [
+            "",
+            "a",
+            "b",
+            ";",
+            "=",
+            ":",
+            "a;",
+            "a;b",
+            "a;second=b",
+            "a;second=b;second=",
+            "1:a",
+            "second",
+            "listing",
+        ];
+
+        let mut rendered: BTreeMap<String, (&str, &str, &str)> = BTreeMap::new();
+        for listing in ["FirstListing", "SecondListing"] {
+            for first in values {
+                for second in values {
+                    let case = (listing, first, second);
+                    let fingerprint = selection_fingerprint(
+                        listing,
+                        &[("first", first), ("second", second)],
+                    );
+                    if let Some(other) = rendered.insert(fingerprint.clone(), case) {
+                        panic!(
+                            "case {case:?}: renders the fingerprint {fingerprint:?} that \
+                             {other:?} renders, so a token for one would resume the other"
+                        );
+                    }
+                }
+            }
+        }
+
+        // And a token minted for one of them resumes none of the others.
+        let entries = vec![("a", 1), ("b", 2)];
+        let own = selection_fingerprint("FirstListing", &[("first", "a;second=b"), ("second", "")]);
+        let token = page_by_key(entries.clone().into_iter(), &own, None, 1, served_at())
+            .expect("fresh token")
+            .next_token
+            .expect("a further entry remains");
+        for (case, other) in [
+            (
+                "the separator moved into the other member",
+                selection_fingerprint(
+                    "FirstListing",
+                    &[("first", "a"), ("second", "b;second=")],
+                ),
+            ),
+            (
+                "the same values under another listing",
+                selection_fingerprint(
+                    "SecondListing",
+                    &[("first", "a;second=b"), ("second", "")],
+                ),
+            ),
+        ] {
+            assert!(
+                page_by_key(
+                    entries.clone().into_iter(),
+                    &other,
+                    Some(&token),
+                    1,
+                    served_at()
+                )
+                .is_err(),
+                "case {case:?}: a token minted for {own:?} must not resume {other:?}"
+            );
+        }
     }
 
     /// `Limit` resolves to a page size that is never zero and never larger than the

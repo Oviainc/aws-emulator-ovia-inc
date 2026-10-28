@@ -190,13 +190,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ))
             })?;
 
-        // The members that decide WHICH schemas this listing contains. Bound into the
-        // `NextToken`, so a token cannot resume a differently-selected listing.
-        let selection = format!(
-            "registryName={};schemaNamePrefix={}",
-            input.registry_name,
-            input.schema_name_prefix.as_deref().unwrap_or_default()
+        // The members that decide WHICH schemas this listing contains, with the
+        // listing itself. Bound into the `NextToken`, so a token cannot resume a
+        // differently-selected listing, rendered by
+        // `crate::state::selection_fingerprint` so no value a caller can send renders
+        // the fingerprint of another selection.
+        let selection = crate::state::selection_fingerprint(
+            Self::NAME,
+            &[
+                ("registryName", input.registry_name.as_str()),
+                (
+                    "schemaNamePrefix",
+                    input.schema_name_prefix.as_deref().unwrap_or_default(),
+                ),
+            ],
         );
+
+        // ONE clock reading for the whole call: the instant this listing is served, so
+        // the token this page mints says when it was issued and the one this request
+        // presented is aged against the same instant.
+        let now = ::std::time::SystemTime::now();
 
         // Selected first (a prefix is a test on the name alone), then COLLATED: the
         // order a registry's schemas come back in is the collation
@@ -216,6 +229,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &selection,
             input.next_token.as_deref(),
             page_size,
+            now,
         )
         .map_err(|_| {
             ListSchemasError::from(ListSchemasErrorModeled::BadRequestException(

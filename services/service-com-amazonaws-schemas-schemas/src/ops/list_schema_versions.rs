@@ -189,12 +189,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ))
             })?;
 
-        // The members that decide WHICH versions this listing contains. Bound into the
-        // `NextToken`, so a token cannot resume a differently-selected listing.
-        let selection = format!(
-            "registryName={};schemaName={}",
-            input.registry_name, input.schema_name
+        // The members that decide WHICH versions this listing contains, with the
+        // listing itself. Bound into the `NextToken`, so a token cannot resume a
+        // differently-selected listing, rendered by
+        // `crate::state::selection_fingerprint` so no value a caller can send renders
+        // the fingerprint of another selection.
+        let selection = crate::state::selection_fingerprint(
+            Self::NAME,
+            &[
+                ("registryName", input.registry_name.as_str()),
+                ("schemaName", input.schema_name.as_str()),
+            ],
         );
+
+        // ONE clock reading for the whole call: the instant this listing is served, so
+        // the token this page mints says when it was issued and the one this request
+        // presented is aged against the same instant.
+        let now = ::std::time::SystemTime::now();
 
         // The paging key is the version number, zero-padded: the pager resumes after
         // the last key it handed out by STRING comparison, and unpadded decimals would
@@ -209,6 +220,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &selection,
             input.next_token.as_deref(),
             page_size,
+            now,
         )
         .map_err(|_| {
             ListSchemaVersionsError::from(ListSchemaVersionsErrorModeled::BadRequestException(

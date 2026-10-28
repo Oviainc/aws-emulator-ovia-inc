@@ -227,12 +227,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ))
             })?;
 
-        // The members that decide WHICH schemas this search contains. Bound into the
-        // `NextToken`, so a token cannot resume a differently-selected search.
-        let selection = format!(
-            "registryName={};keywords={}",
-            input.registry_name, input.keywords
+        // The members that decide WHICH schemas this search contains, with the search
+        // itself. Bound into the `NextToken`, so a token cannot resume a
+        // differently-selected search: `Keywords` is a free-form string, so the
+        // fingerprint is rendered by `crate::state::selection_fingerprint`, which no
+        // value a caller can send renders ambiguously.
+        let selection = crate::state::selection_fingerprint(
+            Self::NAME,
+            &[
+                ("registryName", input.registry_name.as_str()),
+                ("keywords", input.keywords.as_str()),
+            ],
         );
+
+        // ONE clock reading for the whole call: the instant this search is served, so
+        // the token this page mints says when it was issued and the one this request
+        // presented is aged against the same instant.
+        let now = ::std::time::SystemTime::now();
 
         // The schemas are COLLATED first — a search of a registry reports its matches
         // in the same order a listing of it does, the collation
@@ -249,6 +260,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &selection,
             input.next_token.as_deref(),
             page_size,
+            now,
         )
         .map_err(|_| {
             SearchSchemasError::from(SearchSchemasErrorModeled::BadRequestException(

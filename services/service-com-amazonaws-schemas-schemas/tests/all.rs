@@ -51,6 +51,8 @@ mod list_discoverers;
 mod malformed_content_and_policy_deletion;
 #[path = "all/name_constraints.rs"]
 mod name_constraints;
+#[path = "all/next_token_lifetime.rs"]
+mod next_token_lifetime;
 #[path = "all/published_document_bytes.rs"]
 mod published_document_bytes;
 #[path = "all/registry_schema_lifecycle.rs"]
