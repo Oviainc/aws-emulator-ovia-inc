@@ -5,10 +5,11 @@
 //! public key contained in the certificate") and `CertificateDetail$Issuer` ("the name
 //! of the certificate authority that issued and signed the certificate").
 //!
-//! RULE under test: a reported distinguished name lists the certificate's relative
-//! distinguished names in the order its DER carries them, each written `Type=Value` and
-//! separated by commas — so the name begins with the component the certificate encodes
-//! FIRST, whichever component that is.
+//! RULE under test: a reported SUBJECT lists the certificate's relative distinguished
+//! names in the order its DER carries them, each written `Type=Value` and separated by
+//! commas — so the name begins with the component the certificate encodes FIRST,
+//! whichever component that is. The reported ISSUER is the issuing authority's own
+//! NAME: the common-name value its issuer field carries, alone.
 //!
 //! Every certificate here is built by `rcgen` — something other than the code under
 //! test — with its subject components pushed in a chosen order, and every assertion
@@ -50,6 +51,15 @@ fn rendered(components: &[(rcgen::DnType, &str)]) -> String {
         .join(",")
 }
 
+/// The common-name value `components` carries, which is the name an authority with
+/// that name is reported under.
+fn common_name(components: &[(rcgen::DnType, &str)]) -> Option<String> {
+    components
+        .iter()
+        .find(|(attribute, _)| matches!(attribute, rcgen::DnType::CommonName))
+        .map(|(_, value)| (*value).to_string())
+}
+
 /// `rcgen`'s subject name for `components`, pushed in the order given — which is the
 /// order the generated certificate's DER carries them in.
 fn subject_name(components: &[(rcgen::DnType, &str)]) -> rcgen::DistinguishedName {
@@ -72,13 +82,13 @@ fn params(components: &[(rcgen::DnType, &str)], dns_names: &[&str]) -> rcgen::Ce
 }
 
 /// One generated certificate: the two PEM bodies an import carries.
-struct Minted {
-    certificate: String,
-    private_key: String,
+pub(crate) struct Minted {
+    pub(crate) certificate: String,
+    pub(crate) private_key: String,
 }
 
 /// The `ImportCertificate` request body for one generated certificate.
-fn import_body(minted: &Minted) -> serde_json::Value {
+pub(crate) fn import_body(minted: &Minted) -> serde_json::Value {
     json!({
         "Certificate": blob(&minted.certificate),
         "PrivateKey": blob(&minted.private_key),
@@ -97,14 +107,17 @@ fn self_signed(components: &[(rcgen::DnType, &str)], dns_names: &[&str]) -> Mint
 
 /// A certificate authority a leaf can be signed by: its own subject components, the
 /// certificate itself and the key that signs with it.
-struct Authority {
+///
+/// Shared with the suites that need a leaf whose issuer field names someone other than
+/// itself, so one authority helper serves them all.
+pub(crate) struct Authority {
     certificate: rcgen::Certificate,
     key: rcgen::KeyPair,
 }
 
 impl Authority {
     /// Generate a real certificate authority whose subject is `components`.
-    fn new(components: &[(rcgen::DnType, &str)]) -> Self {
+    pub(crate) fn new(components: &[(rcgen::DnType, &str)]) -> Self {
         let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("a key pair");
         let mut params = params(components, &[]);
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -114,7 +127,7 @@ impl Authority {
 
     /// Generate a real leaf certificate whose subject is `components`, signed by this
     /// authority — so the leaf's issuer name is this authority's subject name.
-    fn sign(&self, components: &[(rcgen::DnType, &str)], dns_names: &[&str]) -> Minted {
+    pub(crate) fn sign(&self, components: &[(rcgen::DnType, &str)], dns_names: &[&str]) -> Minted {
         let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("a key pair");
         let certificate = params(components, dns_names)
             .signed_by(&key, &self.certificate, &self.key)
@@ -198,11 +211,15 @@ async fn the_subject_is_reported_in_the_order_the_certificate_encodes_it() {
         let detail = describe(&router, &arn).await;
 
         let expected = rendered(components);
-        // A self-signed certificate is its own issuer, so both names are this subject.
-        for member in ["Subject", "Issuer"] {
+        // A self-signed certificate is its own issuer: the subject is reported in full,
+        // and the issuer is that same authority's name — its common name alone, or the
+        // whole name where the components carry none.
+        let expected_issuer = common_name(components).unwrap_or_else(|| expected.clone());
+        for (member, expected) in [("Subject", &expected), ("Issuer", &expected_issuer)] {
             let actual = detail[member].as_str().unwrap_or_default();
             assert_eq!(
-                actual, expected,
+                actual,
+                expected.as_str(),
                 "case {case:?}: expected {member} {expected:?}, got {actual:?}"
             );
         }
@@ -217,9 +234,10 @@ async fn the_subject_is_reported_in_the_order_the_certificate_encodes_it() {
     }
 }
 
-/// RULE: the same ordering holds for `Issuer`, which is the SIGNING authority's name
-/// read out of the certificate — so a leaf signed by another authority reports two
-/// different names, each in its own encoding order.
+/// RULE: the subject ordering holds whatever the certificate's own encoding order, and
+/// `Issuer` is the SIGNING authority's NAME read out of the certificate — so a leaf
+/// signed by another authority reports two different names: its own subject in full and
+/// the authority's common name.
 #[tokio::test]
 async fn the_issuer_is_the_signing_authoritys_name_in_its_own_order() {
     // The two names are ordered differently, so neither can be the other's rendering
@@ -249,7 +267,7 @@ async fn the_issuer_is_the_signing_authoritys_name_in_its_own_order() {
 
     let detail = describe(&router, &arn).await;
     let expected_subject = rendered(leaf_name);
-    let expected_issuer = rendered(authority_name);
+    let expected_issuer = common_name(authority_name).expect("the authority names itself");
     let subject = detail["Subject"].as_str().unwrap_or_default();
     let issuer = detail["Issuer"].as_str().unwrap_or_default();
     assert_eq!(
