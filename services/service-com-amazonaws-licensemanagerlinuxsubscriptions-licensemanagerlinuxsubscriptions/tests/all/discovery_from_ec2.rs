@@ -23,6 +23,11 @@
 //! through the Marketplace), how many instances share one subscription, the state EC2
 //! reports them in (`running`, `stopped`, `terminated`), and the Region they run in against
 //! the Regions the settings name.
+//!
+//! What both lists report is therefore the inventory of the Regions the account's CURRENT
+//! settings discover — the `SourceRegions` they name while `LinuxSubscriptionsDiscovery` is
+//! enabled, and no Region at all while it is not — so the rows also walk that switch back
+//! and forth with the fleet changing under it.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -62,6 +67,11 @@ const STATE_TERMINATED: &str = "terminated";
 /// (`ProductCodeValues`: devpay | marketplace —
 /// `smithy_query(query="shape",shape="ProductCodeValues")` on EC2's model).
 const PRODUCT_CODE_TYPE_MARKETPLACE: &str = "marketplace";
+
+/// The two values of the account's discovery switch
+/// (`smithy_query(query="shape",shape="LinuxSubscriptionsDiscovery")`: Enabled | Disabled).
+const ENABLED: &str = "Enabled";
+const DISABLED: &str = "Disabled";
 
 /// One AMI the account launches from, and the subscription discovering its instances must
 /// report.
@@ -353,13 +363,20 @@ impl Fleet {
 
     /// Enable discovery for `source_regions`, the way a client onboards the account.
     async fn enable_discovery(&self, source_regions: &[&str]) {
-        let case = &format!("UpdateServiceSettings for {source_regions:?}");
+        self.set_discovery(ENABLED, source_regions).await;
+    }
+
+    /// Persist `discovery` as this account's `LinuxSubscriptionsDiscovery`, with
+    /// `source_regions` as the `SourceRegions` beside it: the one call a client onboards
+    /// the account with and the one it later turns discovery off again with.
+    async fn set_discovery(&self, discovery: &str, source_regions: &[&str]) {
+        let case = &format!("UpdateServiceSettings {discovery} for {source_regions:?}");
         let reply = call_in_region(
             &self.h,
             REGION,
             "/subscription/UpdateServiceSettings",
             &json!({
-                "LinuxSubscriptionsDiscovery": "Enabled",
+                "LinuxSubscriptionsDiscovery": discovery,
                 "LinuxSubscriptionsDiscoverySettings": {
                     "OrganizationIntegration": "Disabled",
                     "SourceRegions": source_regions,
@@ -371,8 +388,9 @@ impl Fleet {
         let settings = reply.ok(case);
         assert_eq!(
             settings.get("LinuxSubscriptionsDiscovery"),
-            Some(&json!("Enabled")),
-            "case {case:?}: discovery must be enabled, got {settings:?}"
+            Some(&json!(discovery)),
+            "case {case:?}: the persisted discovery switch must be {discovery:?}, got \
+             {settings:?}"
         );
     }
 
@@ -731,4 +749,105 @@ async fn nothing_is_discovered_until_the_account_enables_discovery() {
              {listed:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn both_lists_report_the_inventory_of_the_regions_the_settings_discover_now() {
+    let fleet = Fleet::new();
+    let image_id = fleet.publish_image(RHEL);
+    let here = fleet.launch(REGION, &image_id, 1).await;
+    let elsewhere = fleet.launch(OTHER_REGION, &image_id, 1).await;
+    let both: Vec<String> = here.iter().chain(elsewhere.iter()).cloned().collect();
+    let nothing: Vec<String> = Vec::new();
+
+    // (the discovery switch the settings now carry, their `SourceRegions`, the instances
+    // both lists must then report). The rows walk the switch back and forth and change the
+    // Regions under each value, so every answer is read against settings the account
+    // reached from the other value: what decides is the setting the account holds now, not
+    // what some earlier pass found while it held another.
+    let cases: &[(&str, &[&str], &Vec<String>)] = &[
+        (ENABLED, &[REGION, OTHER_REGION], &both),
+        (DISABLED, &[REGION, OTHER_REGION], &nothing),
+        (ENABLED, &[REGION], &here),
+        (DISABLED, &[REGION], &nothing),
+        (DISABLED, &[OTHER_REGION], &nothing),
+        (ENABLED, &[OTHER_REGION], &elsewhere),
+        (DISABLED, &[REGION, OTHER_REGION], &nothing),
+        (ENABLED, &[REGION, OTHER_REGION], &both),
+    ];
+    for (discovery, source_regions, expected) in cases {
+        let case = &format!("{discovery} with SourceRegions {source_regions:?}");
+        fleet.set_discovery(discovery, source_regions).await;
+
+        let reply = fleet.instances(&json!({})).await;
+        let mut listed = reported_instance_ids(&reply, case);
+        listed.sort();
+        let mut expected_ids = (*expected).clone();
+        expected_ids.sort();
+        assert_eq!(
+            listed, expected_ids,
+            "case {case:?}: expected the discovered instances {expected_ids:?}, got {listed:?}"
+        );
+
+        // The sibling list aggregates the same store, so it reports the subscription of
+        // exactly those instances, counting the running ones.
+        let (name, subscription_type) = RHEL.subscription.expect("the row carries a subscription");
+        let expected_subscriptions: Vec<(String, String, i64)> = if expected_ids.is_empty() {
+            Vec::new()
+        } else {
+            vec![(
+                name.to_string(),
+                subscription_type.to_string(),
+                i64::try_from(expected_ids.len()).expect("a small instance count"),
+            )]
+        };
+        let subscriptions = reported_subscriptions(&fleet.subscriptions(&json!({})).await, case);
+        assert_eq!(
+            subscriptions, expected_subscriptions,
+            "case {case:?}: expected {expected_subscriptions:?}, got {subscriptions:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_fleet_that_changed_while_discovery_was_off_is_reported_as_it_is_now() {
+    let fleet = Fleet::new();
+    fleet.set_discovery(ENABLED, &[REGION]).await;
+    let image_id = fleet.publish_image(RHEL);
+    let mut ids = fleet.launch(REGION, &image_id, 2).await;
+    ids.sort();
+
+    let discovered = "the fleet of an enabled account";
+    let mut listed = reported_instance_ids(&fleet.instances(&json!({})).await, discovered);
+    listed.sort();
+    assert_eq!(
+        listed, ids,
+        "case {discovered:?}: expected {ids:?}, got {listed:?}"
+    );
+
+    fleet.set_discovery(DISABLED, &[REGION]).await;
+    for (path, key) in [(SUBSCRIPTIONS, "Subscriptions"), (INSTANCES, "Instances")] {
+        let case = &format!("{path} after the account disabled discovery");
+        let reply = call_in_region(&fleet.h, REGION, path, &json!({})).await;
+        let listed = entries(&reply, key, case);
+        assert!(
+            listed.is_empty(),
+            "case {case:?}: an account whose discovery is not enabled discovers nothing, got \
+             {listed:?}"
+        );
+    }
+
+    // The account's fleet changes while no pass runs, so nothing refreshed what an earlier
+    // pass had found: an instance that is gone must not come back when discovery is
+    // enabled again, because the next pass reports the inventory as it is then.
+    fleet.terminate(REGION, &ids[0]).await;
+    fleet.set_discovery(ENABLED, &[REGION]).await;
+
+    let again = "the fleet after discovery was enabled again";
+    let listed = reported_instance_ids(&fleet.instances(&json!({})).await, again);
+    let expected = vec![ids[1].clone()];
+    assert_eq!(
+        listed, expected,
+        "case {again:?}: expected {expected:?}, got {listed:?}"
+    );
 }

@@ -23,8 +23,8 @@ use std::collections::BTreeMap;
 use serde_json::{json, Map, Value};
 
 use crate::harness::{
-    call, harness, list_tags, provider_arn_for, seed_discovered_instance, seed_provider, tag,
-    Harness, Reply,
+    call, enable_discovery, harness, list_tags, provider_arn_for, seed_discovered_instance,
+    seed_provider, tag, Harness, Reply,
 };
 use service_com_amazonaws_licensemanagerlinuxsubscriptions_licensemanagerlinuxsubscriptions::state::DiscoveredInstanceRecord;
 
@@ -148,8 +148,15 @@ fn reported_tags(reply: &Reply, case: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// Put `DISCOVERED` in the store through the shared seeding seam.
-fn discover(h: &Harness) {
+/// The Region `DISCOVERED` was found in, which is therefore the one the account's settings
+/// discover.
+const DISCOVERED_REGION: &str = "us-west-2";
+
+/// Put `DISCOVERED` in the store through the shared seeding seam, under the settings that
+/// make those records discovered data: discovery enabled for the Region they were found in,
+/// because what the lists report is the inventory of the Regions the settings discover now.
+async fn discover(h: &Harness) {
+    enable_discovery(h, &[DISCOVERED_REGION]).await;
     for (instance_id, status, subscription_name, subscription_type) in DISCOVERED {
         seed_discovered_instance(
             h,
@@ -159,7 +166,7 @@ fn discover(h: &Harness) {
                 ami_id: "ami-0001".to_string(),
                 instance_type: "t3.micro".to_string(),
                 status: (*status).to_string(),
-                region: "us-west-2".to_string(),
+                region: DISCOVERED_REGION.to_string(),
                 usage_operation: "RunInstances:0010".to_string(),
                 subscription_name: (*subscription_name).to_string(),
                 subscription_type: (*subscription_type).to_string(),
@@ -232,7 +239,7 @@ async fn the_shared_harness_round_trips_the_tag_operations() {
 #[tokio::test]
 async fn the_shared_harness_drives_both_discovery_lists() {
     let h = harness();
-    discover(&h);
+    discover(&h).await;
 
     let case = "ListLinuxSubscriptions over the seeded store";
     let reply = call(&h, SUBSCRIPTIONS, &json!({})).await;
@@ -284,7 +291,7 @@ async fn the_shared_harness_drives_both_discovery_lists() {
 #[tokio::test]
 async fn the_shared_harness_reads_the_wire_error_code_of_every_refusal() {
     let h = harness();
-    discover(&h);
+    discover(&h).await;
     let live = seed_provider(&h, "00000000-0000-4000-8000-0000000000ff", SECRET_ARN, &[]);
     let absent = provider_arn_for("55555555-5555-4555-8555-555555555555");
 

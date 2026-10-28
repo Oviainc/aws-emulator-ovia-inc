@@ -274,6 +274,30 @@ pub async fn update_settings(h: &Harness, body: &Value) -> Reply {
     call(h, "/subscription/UpdateServiceSettings", body).await
 }
 
+/// Persist this account's settings with `LinuxSubscriptionsDiscovery` ENABLED for
+/// `source_regions`, over the wire, the way a client onboards the account.
+///
+/// A suite that places discovered records itself needs the settings that make them
+/// discovered data: what the two lists report is the inventory of the Regions the account's
+/// settings currently discover, so records held for a Region those settings do not name are
+/// a state no discovery pass could have left behind.
+pub async fn enable_discovery(h: &Harness, source_regions: &[&str]) {
+    let case = &format!("UpdateServiceSettings enabling discovery for {source_regions:?}");
+    let reply = update_settings(
+        h,
+        &json!({
+            "LinuxSubscriptionsDiscovery": "Enabled",
+            "LinuxSubscriptionsDiscoverySettings": {
+                "OrganizationIntegration": "Disabled",
+                "SourceRegions": source_regions,
+            },
+            "AllowUpdate": true,
+        }),
+    )
+    .await;
+    reply.ok(case);
+}
+
 /// `ListTagsForResource`: `GET /tags/{resourceArn}`.
 pub async fn list_tags(h: &Harness, resource_arn: &str) -> Reply {
     send(

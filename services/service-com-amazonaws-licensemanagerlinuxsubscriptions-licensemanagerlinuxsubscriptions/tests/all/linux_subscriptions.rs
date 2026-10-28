@@ -30,7 +30,7 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::{call, harness, seed_discovered_instance, Harness, Reply};
+use crate::harness::{call, enable_discovery, harness, seed_discovered_instance, Harness, Reply};
 use service_com_amazonaws_licensemanagerlinuxsubscriptions_licensemanagerlinuxsubscriptions::state::DiscoveredInstanceRecord;
 
 /// `POST /subscription/ListLinuxSubscriptions` (`OPERATIONS.md`).
@@ -163,7 +163,15 @@ const EXPECTED_SUBSCRIPTIONS: &[(&str, &str, i64)] = &[
 /// discovery reads the account's EC2 inventory, which no operation of THIS service writes,
 /// so the store is pre-filled to exercise the projection the two list operations perform
 /// over it.
-fn discover(h: &Harness, rows: &[Row]) {
+///
+/// The account's settings are the ones that make those records discovered data — discovery
+/// enabled for exactly the Regions the rows were found in — because what the two lists
+/// report is the inventory of the Regions the settings discover NOW.
+async fn discover(h: &Harness, rows: &[Row]) {
+    let mut regions: Vec<&str> = rows.iter().map(|row| row.5).collect();
+    regions.sort_unstable();
+    regions.dedup();
+    enable_discovery(h, &regions).await;
     for row in rows {
         let (
             instance_id,
@@ -274,7 +282,7 @@ async fn an_account_that_discovered_nothing_reports_nothing() {
 #[tokio::test]
 async fn subscriptions_aggregate_the_discovered_instances() {
     let h = harness();
-    discover(&h, DISCOVERED);
+    discover(&h, DISCOVERED).await;
 
     let case = "every discovered subscription";
     let reply = call(&h, SUBSCRIPTIONS, &json!({})).await;
@@ -311,7 +319,7 @@ async fn subscriptions_aggregate_the_discovered_instances() {
 #[tokio::test]
 async fn every_member_of_a_discovered_instance_is_reported_from_state() {
     let h = harness();
-    discover(&h, DISCOVERED);
+    discover(&h, DISCOVERED).await;
 
     let case = "instance members";
     let reply = call(&h, INSTANCES, &json!({})).await;
@@ -373,7 +381,7 @@ async fn every_member_of_a_discovered_instance_is_reported_from_state() {
 #[tokio::test]
 async fn a_subscription_filter_selects_along_its_operator() {
     let h = harness();
-    discover(&h, DISCOVERED);
+    discover(&h, DISCOVERED).await;
 
     // (operator — `None` is an absent `Operator`, values, the subscription names expected
     // in (name, type) order). `Subscription` is the only `Name` this list documents, and
@@ -431,7 +439,7 @@ async fn a_subscription_filter_selects_along_its_operator() {
 #[tokio::test]
 async fn an_instance_filter_selects_on_the_member_it_names() {
     let h = harness();
-    discover(&h, DISCOVERED);
+    discover(&h, DISCOVERED).await;
 
     // Every `Filter$Name` the model documents for this list, with the instance ids it
     // selects (in instance-id order).
@@ -554,7 +562,7 @@ fn held_values(entry: &Value, name: &str) -> Vec<String> {
 #[tokio::test]
 async fn a_filter_cannot_select_an_instance_whose_member_holds_nothing() {
     let h = harness();
-    discover(&h, DISCOVERED);
+    discover(&h, DISCOVERED).await;
 
     // (the filter's Name, its Operator — `None` is an absent one, its Values, the
     // instance ids it selects in instance-id order). Only the records that HOLD a value
@@ -650,7 +658,7 @@ fn member_of(name: &str) -> &'static str {
 #[tokio::test]
 async fn equal_and_not_equal_partition_the_instances_that_hold_the_member() {
     let h = harness();
-    discover(&h, DISCOVERED);
+    discover(&h, DISCOVERED).await;
 
     let unfiltered = call(&h, INSTANCES, &json!({})).await;
     let all = entries(&unfiltered, "Instances", "every discovered instance").clone();
@@ -706,7 +714,7 @@ async fn equal_and_not_equal_partition_the_instances_that_hold_the_member() {
 #[tokio::test]
 async fn max_results_pages_each_list_exactly_once() {
     let h = harness();
-    discover(&h, DISCOVERED);
+    discover(&h, DISCOVERED).await;
 
     for (path, key, total) in [
         (SUBSCRIPTIONS, "Subscriptions", EXPECTED_SUBSCRIPTIONS.len()),
@@ -797,7 +805,7 @@ async fn max_results_pages_each_list_exactly_once() {
 #[tokio::test]
 async fn a_filter_a_list_cannot_apply_is_refused() {
     let h = harness();
-    discover(&h, DISCOVERED);
+    discover(&h, DISCOVERED).await;
 
     // (the list, the filter, why it cannot be applied).
     let cases: &[(&str, Value, &str)] = &[

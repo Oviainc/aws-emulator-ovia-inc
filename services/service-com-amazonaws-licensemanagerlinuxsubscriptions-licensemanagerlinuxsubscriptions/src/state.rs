@@ -494,10 +494,12 @@ impl ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscription
 
     /// Drop what was discovered in a Region this account no longer discovers.
     ///
-    /// `discovered_regions` are the source Regions the settings name, so discovery holds
-    /// data for exactly those: a Region taken out of `SourceRegions` is one nothing reads
-    /// any more, and the instances a previous pass found there stop being reported rather
-    /// than staying in the store as an inventory nothing refreshes.
+    /// `discovered_regions` are the Regions the account discovers NOW, so discovery holds
+    /// data for exactly those: a Region taken out of `SourceRegions` — or every Region at
+    /// once, for an account whose discovery is no longer enabled and which therefore
+    /// discovers none — is one nothing reads any more, and the instances a previous pass
+    /// found there stop being reported rather than staying in the store as an inventory
+    /// nothing refreshes.
     pub fn retain_discovered_regions(&mut self, discovered_regions: &[&str]) {
         self.discovered_instances
             .retain(|_, record| discovered_regions.contains(&record.region.as_str()));

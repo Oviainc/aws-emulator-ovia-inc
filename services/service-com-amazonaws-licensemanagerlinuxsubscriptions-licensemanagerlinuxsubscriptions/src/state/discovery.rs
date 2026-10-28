@@ -146,9 +146,13 @@ fn ec2(ctx: &smithy_server_runtime::OperationContext<'_>, region: &str) -> ::aws
 
 /// Run the discovery pass this account's settings ask for, and record what it found.
 ///
-/// Nothing happens for an account whose `LinuxSubscriptionsDiscovery` is not enabled: there
-/// is no discovery to run, so the store is left exactly as it is rather than being filled
-/// from an inventory the account did not ask to have discovered.
+/// What the store holds afterwards is what the account's CURRENT settings say is discovered:
+/// the inventory of the source Regions they name while `LinuxSubscriptionsDiscovery` is
+/// enabled, and nothing at all while it is not. No hop is made for an account that did not
+/// ask for its inventory to be discovered, so the store is never FILLED from one — and
+/// nothing a pass made while discovery was enabled stays behind either, because no later
+/// pass refreshes it and a report of it would answer from history rather than from the
+/// setting.
 ///
 /// One hop per configured source Region (the modelled `SourceRegions` list bounds that at
 /// 100 entries), plus the AMI hops the instances found there need, all bounded by the
@@ -171,20 +175,22 @@ pub async fn refresh_discovered_instances<Eng: Send + Sync + 'static>(
             )
         })
     };
-    let Some((discovery, source_regions)) = settings else {
-        return;
+    // The Regions this account discovers RIGHT NOW. A Region named twice is one Region, so
+    // the pass asks about each distinct source Region once, in a stable order — and an
+    // account whose `LinuxSubscriptionsDiscovery` is not enabled, or which has no settings
+    // at all, discovers NO Region, which is both why no hop is made for it and why nothing
+    // stays discovered for it below.
+    let discovered_regions: BTreeSet<String> = match settings {
+        Some((discovery, source_regions)) if discovery == DISCOVERY_ENABLED => {
+            source_regions.into_iter().collect()
+        }
+        _ => BTreeSet::new(),
     };
-    if discovery != DISCOVERY_ENABLED {
-        return;
-    }
 
     let mut budget = Budget {
         pages: MAX_INVENTORY_PAGES,
         records: MAX_DISCOVERED_INSTANCES,
     };
-    // A Region named twice is one Region: the pass asks about each distinct source Region
-    // once, in a stable order.
-    let discovered_regions: BTreeSet<&String> = source_regions.iter().collect();
     for region in &discovered_regions {
         if budget.spent() {
             break;
@@ -210,7 +216,7 @@ pub async fn refresh_discovered_instances<Eng: Send + Sync + 'static>(
     }
     // Discovery holds data for the Regions it discovers and no others, so a Region the
     // settings no longer name is dropped — including one dropped while this pass was
-    // reading another.
+    // reading another, and every Region at once for an account that discovers none.
     let retained: Vec<&str> = discovered_regions
         .iter()
         .map(|region| region.as_str())
