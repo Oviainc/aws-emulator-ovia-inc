@@ -494,7 +494,7 @@ fn expired_session() -> RespondToAuthChallengeError {
 fn password_reset_required() -> RespondToAuthChallengeError {
     RespondToAuthChallengeErrorModeled::PasswordResetRequiredException(
         PasswordResetRequiredException {
-            message: Some("Password reset required for the user.".to_string()),
+            message: Some(crate::state::PASSWORD_RESET_REQUIRED_MESSAGE.to_string()),
         },
     )
     .into()

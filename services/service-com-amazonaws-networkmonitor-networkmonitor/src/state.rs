@@ -1396,6 +1396,41 @@ impl ComAmazonawsNetworkmonitorNetworkmonitorState {
         None
     }
 
+    /// Which stored resource a MUTATING call's `resource_arn` names: the lookup
+    /// [`Self::resolve_tagged_resource`] performs, minus a resource whose
+    /// teardown has already been accepted.
+    ///
+    /// A resource on its way out ([`Probe::is_being_torn_down`]) is no longer a
+    /// target for a call that would change what it still reports: the teardown
+    /// is irreversible, so nothing puts the resource back into service, and the
+    /// record leaves the store once the clock has carried it through, so a write
+    /// to it would persist nothing a caller can read back. Such an ARN resolves
+    /// to nothing here, which is what makes a mutation of it refused exactly as
+    /// an ARN no stored resource carries is. The reporting resolver still
+    /// answers with it, because a read still reports it — in the teardown state
+    /// it has reached — until the record is gone.
+    pub fn resolve_tagged_resource_for_mutation(
+        &self,
+        region: &str,
+        resource_arn: &str,
+    ) -> Option<TaggedResource> {
+        let resource = self.resolve_tagged_resource(region, resource_arn)?;
+        let being_torn_down = match &resource {
+            // A monitor's removal is immediate ([`Self::remove_monitor`]): a
+            // monitor the store still holds has no teardown under way.
+            TaggedResource::Monitor { .. } => false,
+            TaggedResource::Probe {
+                region,
+                monitor_name,
+                probe_id,
+            } => self
+                .monitor(region, monitor_name)
+                .and_then(|monitor| monitor.probes.get(probe_id))
+                .is_some_and(Probe::is_being_torn_down),
+        };
+        (!being_torn_down).then_some(resource)
+    }
+
     /// The tag map stored on one resolved resource, for reporting.
     ///
     /// The same single map [`Self::tags_mut`] hands a tagging write, so what

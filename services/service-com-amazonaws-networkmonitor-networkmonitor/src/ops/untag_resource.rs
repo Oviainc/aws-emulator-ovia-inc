@@ -7,6 +7,12 @@
 //! The target is addressed by the ARN this service MINTED and stores on the
 //! record ([`crate::state::ComAmazonawsNetworkmonitorNetworkmonitorState::resolve_tagged_resource`]),
 //! so an ARN no stored resource carries is a 404 `ResourceNotFoundException`.
+//! A resource whose teardown has already been accepted is refused with the same
+//! 404
+//! ([`crate::state::ComAmazonawsNetworkmonitorNetworkmonitorState::resolve_tagged_resource_for_mutation`]):
+//! it is on its way out, so it is no longer a target for a call that would
+//! change what it still reports, exactly as `UpdateProbe` refuses an update of
+//! it.
 //! Removal is idempotent — a key the resource does not carry is simply not
 //! there afterwards — and the keys that remain are the ones every later read of
 //! that resource (`GetMonitor`'s `tags`, and its `probes[].tags`) reports,
@@ -202,8 +208,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ARN is resolved against the store — the same write every read of this
         // service performs.
         store.settle_monitors_in(&region, now);
+        // A resource whose teardown has been accepted is on its way out, and
+        // its teardown is irreversible, so it is no longer a target for a call
+        // that would change what it still reports: the ARN names a resource
+        // this service is giving up, which is what the not-found answer tells
+        // the caller — the same answer an ARN no stored resource carries gets.
+        // Reads still report it, with the tags it still carries, until the clock
+        // has carried the teardown through.
         let target = store
-            .resolve_tagged_resource(&region, &input.resource_arn)
+            .resolve_tagged_resource_for_mutation(&region, &input.resource_arn)
             .ok_or_else(|| {
                 UntagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                     message: Some(format!(

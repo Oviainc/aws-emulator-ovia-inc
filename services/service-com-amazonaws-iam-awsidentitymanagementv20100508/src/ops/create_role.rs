@@ -198,9 +198,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; nothing in `CreateRole` depends on it —
-        // IAM is global, so not even the ARN's region segment comes from the request.
-        let _ = ctx;
+        // `ctx` carries request metadata only; what this operation reads out of it is the
+        // signing key id of the caller the request is authorized as. The role is named in
+        // the request — IAM is global, so not even the ARN's region segment comes from it.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateRoleErrorModeled::ServiceFailureException(
                 ServiceFailureException {
@@ -247,6 +247,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
+        let path = input
+            .path
+            .clone()
+            .unwrap_or_else(|| crate::state::DEFAULT_PATH.to_string());
+        // IAM authorizes its own API: the caller's identity-based policies are evaluated
+        // before the role is created and before the store is consulted, on the ARN the
+        // role WOULD carry, with the tags this request attaches handed to the gate — the
+        // same decision `CreateUser` makes for the same reasons. Nothing is created when
+        // it refuses.
+        crate::state::authorization::authorize_written(
+            &store,
+            ctx,
+            crate::state::authorization::CREATE_ROLE,
+            &crate::state::role_arn(&path, &input.role_name),
+            &format!("role {}", input.role_name),
+            crate::state::authorization::WrittenTags::Pairs(
+                tags.as_deref().unwrap_or_default(),
+            ),
+        )?;
+
         // IAM entity names are unique within the account and "are not distinguished
         // by case", so the case-folded name is the identity: a second create under
         // any casing of a held name is a conflict rather than a second role.
@@ -274,9 +294,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let path = input
-            .path
-            .unwrap_or_else(|| crate::state::DEFAULT_PATH.to_string());
         let role = Role {
             arn: crate::state::role_arn(&path, &input.role_name),
             path,

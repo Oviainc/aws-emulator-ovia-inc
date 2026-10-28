@@ -513,53 +513,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Whenever a context key is evaluated in one of the simulated IAM permissions
         // policies, the corresponding value is supplied": the entries the request
-        // carries are the condition values the decision knows.
+        // carries are the condition values the decision knows — and they are the WHOLE
+        // context of the simulated request, since nothing else can put a value in it.
+        // That is what lets IAM's absent-key rule be applied to every key a document
+        // tests, rather than only to the ones a real signed call would carry (see
+        // `decide`).
         let context = supplied_context(input.context_entries.as_deref());
-        // Every context key the documents test that the request did not supply a value
-        // for: a condition over such a key cannot be decided, which is what
-        // `MissingContextValues` reports. The keys are read from the documents as a
-        // whole rather than per (action, resource), because which statements a request
-        // reaches is not what makes a key's value missing — the request either carries
-        // a value for the key or it does not.
-        // Every context key the documents in force test that the request did not
-        // supply a value for: a condition over such a key cannot be decided, which is
-        // what `MissingContextValues` reports. EVERY document that takes part in the
-        // decision is read for them — the principal's own and the supplied ones, the
-        // simulated permissions boundary, and the resource-based policy — because a
-        // condition in any of them is one the simulation could not decide. The keys
-        // are read from the documents as a whole rather than per (action, resource),
-        // because which statements a pair reaches is not what makes a key's value
-        // missing: the request either carries a value for the key or it does not.
-        //
-        // The supplied keys are a SET, so testing a key against them is a lookup
-        // rather than a scan of the request's own entries, and the collection stops
-        // one key past the bound below, so neither the work nor the allocation here is
-        // the product of two things the request chooses.
-        let supplied_keys: ::std::collections::BTreeSet<String> = context
-            .iter()
-            .map(|(key, _)| key.to_ascii_lowercase())
-            .collect();
-        let deciding = documents
-            .iter()
-            .map(String::as_str)
-            .chain(boundary.iter().map(String::as_str))
-            .chain(input.resource_policy.as_deref());
-        let missing: Vec<String> = crate::state::context_keys_in_policies(deciding)
-            .into_iter()
-            .filter(|key| !supplied_keys.contains(&key.to_ascii_lowercase()))
-            .take(MAX_SIMULATED_CONTEXT_KEYS + 1)
-            .collect();
-        // The list is reported on every result the page carries, so its length is a
-        // factor of the response's size: past the bound the request is refused rather
-        // than answered with a report nothing bounds. Truncating the list instead would
-        // be worse — a short list would read as "these are the only keys missing".
-        if missing.len() > MAX_SIMULATED_CONTEXT_KEYS {
-            return Err(invalid_input(format!(
-                "Invalid value for PolicyInputList: the policies in force test more than \
-                 {MAX_SIMULATED_CONTEXT_KEYS} context keys the request supplied no value \
-                 for, and at most that many may be reported in one simulation"
-            )));
-        }
 
         // "If this parameter is not provided, then the value defaults to * (all
         // resources). Each API in the ActionNames parameter is evaluated for each
@@ -646,17 +605,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ::tokio::task::yield_now().await;
                 }
             }
-            // `ResourceSpecificResults` carries "the individual results of the
-            // simulation of the API operation specified in EvalActionName on each
-            // resource", and the action's OWN result aggregates them (see below). The
-            // keys the request supplied no value for are the same for every result (see
-            // above), so the ONE list computed for this request is what each of them
-            // reports.
-            let reported_missing = (!missing.is_empty()).then(|| missing.clone());
-            if reports_each_resource {
+            // "A list of context keys that are required by the included input policies
+            // but that were not provided by one of the input parameters": the keys the
+            // DECISION needed a value for and the request carried none, which each
+            // resource's own result already reports for its own pair ([`decide`]) — a
+            // pair reaches the statements its action and resource match, so two pairs can
+            // need different keys. The action's own result reports the union of its
+            // resources', the way it reports the union of their matched statements; the
+            // per-resource lists are reported only where the response carries the
+            // per-resource results at all. "This list is used when the resource in a
+            // simulation is '*' … if you include a list of resources, then any missing
+            // context values are instead included under the ResourceSpecificResults
+            // section."
+            let missing = folded_keys(
+                per_resource
+                    .iter()
+                    .flat_map(|result| result.missing_context_values.iter().flatten().cloned()),
+            );
+            if !reports_each_resource {
                 for result in &mut per_resource {
-                    result.missing_context_values = reported_missing.clone();
+                    result.missing_context_values = None;
                 }
+            }
+            // The list is reported on every result the page carries, so its length is a
+            // factor of the response's size: past the bound the request is refused rather
+            // than answered with a report nothing bounds. Truncating the list instead
+            // would be worse — a short list would read as "these are the only keys
+            // missing".
+            if missing.len() > MAX_SIMULATED_CONTEXT_KEYS {
+                return Err(invalid_input(format!(
+                    "Invalid value for PolicyInputList: the policies in force test more \
+                     than {MAX_SIMULATED_CONTEXT_KEYS} context keys the request supplied \
+                     no value for, and at most that many may be reported in one simulation"
+                )));
             }
             let first = per_resource.first().cloned().unwrap_or_default();
             // "In the top-level result, this field contains the union of matched
@@ -672,7 +653,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 eval_action_name: action.clone(),
                 eval_resource_name: Some(first.eval_resource_name.clone()),
                 eval_decision: most_restrictive(&per_resource),
-                missing_context_values: reported_missing,
+                missing_context_values: (!missing.is_empty()).then_some(missing),
                 permissions_boundary_decision_detail: boundary_detail(&per_resource),
                 resource_specific_results: reports_each_resource.then_some(per_resource),
                 matched_statements: Some(matched),
@@ -717,7 +698,7 @@ const MAX_SIMULATED_RESOURCES: usize = 1_000;
 /// How many extra policy documents one request may supply in `PolicyInputList`, for
 /// the same reason [`MAX_SIMULATED_RESOURCES`] exists: the documents are the third
 /// factor of that product, each may be 131,072 characters, and every one of them is
-/// read for the context keys it tests.
+/// walked for every pair the page decides.
 const MAX_SIMULATED_DOCUMENTS: usize = 10;
 
 /// How many (action, resource) pairs one PAGE may decide. The page's action count is
@@ -733,8 +714,9 @@ const EVALUATIONS_PER_YIELD: usize = 64;
 /// How many context keys one simulation may report as missing a value.
 ///
 /// The list is reported on every result the page carries, so its length multiplies the
-/// response's size; the keys come from the documents in force, which the request itself
-/// can supply. Past this bound the request is refused rather than answered.
+/// response's size; the keys come from the conditions the deciding documents carry, which
+/// the request itself can supply. Past this bound the request is refused rather than
+/// answered.
 const MAX_SIMULATED_CONTEXT_KEYS: usize = 100;
 
 /// How many condition values one request may supply in `ContextEntries` — counted over
@@ -859,19 +841,25 @@ struct Simulated<'a> {
 /// boundary bounds the result the way IAM's does — a request the boundary does not allow
 /// is denied, and the boundary can only take permission away, never grant it.
 ///
-/// `MissingContextValues` is not filled in here: the keys the request supplied no value
-/// for are the same for every pair, so the caller computes that list ONCE and reports it
-/// on each result rather than this deriving it per pair.
+/// The request is declared to carry its WHOLE condition context, because a simulation's
+/// context is exactly the entries its caller supplied: nothing else can put a value in it.
+/// So IAM's absent-key rule decides a clause over a key the request left out — a positive
+/// comparison does not hold, while a negated one, an `IfExists` spelling and
+/// `Null: {key: true}` do — rather than leaving the statement undecided, and
+/// `MissingContextValues` is what the evaluation says it needed a value for and did not
+/// get.
 fn decide(simulated: &Simulated<'_>, action: &str, resource: &str) -> ResourceSpecificResult {
     use ::service_common::iam_authorization as iam;
 
     let granting = iam::Request::new(action, resource, simulated.granting_principals)
-        .with_context(simulated.context);
+        .with_context(simulated.context)
+        .with_complete_context();
     let identity = iam::identity_outcome_prepared(simulated.documents, &granting);
     let from_resource = match simulated.resource_policy {
         Some(document) => {
             let denying = iam::Request::new(action, resource, simulated.denying_principals)
-                .with_context(simulated.context);
+                .with_context(simulated.context)
+                .with_complete_context();
             let denied = iam::resource_outcome_prepared(document, &denying);
             if denied.decision == iam::Decision::Denied {
                 denied
@@ -886,11 +874,9 @@ fn decide(simulated: &Simulated<'_>, action: &str, resource: &str) -> ResourceSp
 
     // "The permissions boundary sets the maximum permissions that the entity can
     // have": a request outside it is denied even where the identity policies allow it.
+    let from_boundary = iam::identity_outcome_prepared(simulated.boundary, &granting);
     let allowed_by_boundary = simulated.no_boundary
-        || iam::is_allowed(
-            iam::identity_decision_prepared(simulated.boundary, &granting),
-            iam::Decision::NotStated,
-        );
+        || iam::is_allowed(from_boundary.decision, iam::Decision::NotStated);
     let decision = if allowed_by_boundary
         || decision == crate::state::authorization::DECISION_EXPLICIT_DENY
     {
@@ -936,8 +922,26 @@ fn decide(simulated: &Simulated<'_>, action: &str, resource: &str) -> ResourceSp
     ResourceSpecificResult {
         eval_resource_name: resource.to_string(),
         eval_resource_decision: decision.to_string(),
-        // Filled in by the caller, from the one list it computed (see the docs above).
-        missing_context_values: None,
+        // The keys THIS pair's decision needed a value for and the request supplied
+        // none: every document that took part in it is asked, since a condition in any
+        // of them is one the simulation needed the value for. Each of the three answers
+        // is already bounded by the evaluation
+        // (`service_common::iam_authorization::MAX_REQUIRED_CONTEXT_KEYS`), and the list
+        // kept per pair stops one key past the bound this operation reports under, so
+        // the page's retention is its pairs times that bound rather than times what the
+        // documents carry; the handler refuses past it.
+        missing_context_values: {
+            let missing = folded_keys(
+                identity
+                    .required_context_keys
+                    .iter()
+                    .chain(&from_resource.required_context_keys)
+                    .chain(&from_boundary.required_context_keys)
+                    .take(MAX_SIMULATED_CONTEXT_KEYS + 1)
+                    .cloned(),
+            );
+            (!missing.is_empty()).then_some(missing)
+        },
         matched_statements: Some(matched),
         eval_decision_details: None,
         permissions_boundary_decision_detail: (!simulated.no_boundary).then_some(
@@ -946,6 +950,21 @@ fn decide(simulated: &Simulated<'_>, action: &str, resource: &str) -> ResourceSp
             },
         ),
     }
+}
+
+/// `keys` folded to one entry per context key and ordered, the way every report of a set
+/// of context keys this service answers with is ordered
+/// ([`crate::state::context_keys_in_policies`]): names are not distinguished by case, so
+/// the folded name is the identity and the first spelling seen is the one reported.
+fn folded_keys<I: IntoIterator<Item = String>>(keys: I) -> Vec<String> {
+    let mut folded: ::std::collections::BTreeMap<String, String> =
+        ::std::collections::BTreeMap::new();
+    for key in keys {
+        folded
+            .entry(key.to_ascii_lowercase())
+            .or_insert_with(|| key.clone());
+    }
+    folded.into_values().collect()
 }
 
 /// How a `MatchedStatements` entry names an identity-based policy in force on the

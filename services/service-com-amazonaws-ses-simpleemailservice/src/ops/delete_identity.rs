@@ -123,14 +123,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // `ctx` carries only request metadata; this operation needs none of it.
         let _ = ctx;
-        let Some(state) = crate::state::service_state(&*self.engine) else {
+        if crate::state::service_state(&*self.engine).is_none() {
             // See `verify_email_identity.rs`: an engine with no store for this
             // service cannot serve the operation at all, and it models no server
             // error of its own.
             return Err(crate::scaffolded::Scaffolded::not_implemented(
                 "DeleteIdentity",
             ));
-        };
+        }
         // Deleting an identity that is not in the list succeeds: SES answers 200
         // and the operation models no not-found error, so removal is reported the
         // same way whether or not anything was there. What the caller observes is
@@ -139,11 +139,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // Keyed the way the writers key it (by addr-spec, which leaves a domain
         // unchanged), so an identity can be deleted with the value it was
-        // verified with.
-        state
-            .lock()
-            .identities
-            .remove(crate::state::addr_spec(&input.identity));
+        // verified with. Removed from the account's identity registry as well as from
+        // this service's own list, so the v2 surface stops reporting it too.
+        crate::state::forget_identity(&*self.engine, &input.identity);
 
         Ok(DeleteIdentityOutput {})
     }
