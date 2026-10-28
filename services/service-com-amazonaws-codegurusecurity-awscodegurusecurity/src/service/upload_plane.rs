@@ -28,8 +28,9 @@
 //!
 //! The archive is accepted WHATEVER the size of a code archive — a real one is a whole
 //! zipped source tree, and this plane answers the upload of one the way the published
-//! target promises to. What this emulator retains of it is bounded instead of the upload
-//! being refused (see [`crate::state::UploadedResource`]). Two size bounds remain: the
+//! target promises to. What this emulator retains of it, and what it analyses, are bounded
+//! instead of the upload being refused (see [`crate::state::UploadedResource`] and
+//! [`crate::state::analysis`]). Two size bounds remain: the
 //! published maximum of one `PUT` ([`crate::state::S3_SINGLE_PUT_MAX_BYTES`]) and what
 //! this process holds against one target ([`crate::state::UPLOAD_ACCEPTED_MAX_BYTES`]).
 //! Both are judged twice, and the second judgement is the authority:
@@ -43,7 +44,8 @@
 //! Neither judgement decides whether the archive is READ: the framework materialises a
 //! request before it dispatches one, so by the time this function is reached the body is
 //! already in memory and a bound on what one request may buffer belongs to that layer,
-//! not here. What these bounds decide is what the store HOLDS.
+//! not here. What these bounds decide is what the store HOLDS and what the analysis of the
+//! uploaded code reads.
 //!
 //! Every other method on this path space is refused: the published URL describes an
 //! upload, and answering a read on it would serve a resource the URL grants no read of.
@@ -125,7 +127,9 @@ pub fn serve<Eng: Send + Sync + 'static>(
     // And the same bounds on what actually arrived, which is the authority: a declaration
     // is a claim, and this is the length of the archive the store would hold. The body was
     // materialised by the framework before this function was reached (see this module's
-    // header), so what this refusal keeps bounded is the store, not the buffer.
+    // header), so what this refusal keeps bounded is the store, not the buffer. Judged
+    // before anything proportional to the archive runs, so nothing past a bound is
+    // digested, retained or analysed.
     if let Some(max) =
         crate::state::upload_size_bound_exceeded(u64::try_from(body.len()).unwrap_or(u64::MAX))
     {
@@ -140,9 +144,13 @@ pub fn serve<Eng: Send + Sync + 'static>(
         .map(str::to_string);
     let now = crate::state::now_millis();
     // The archive is accounted for BEFORE the lock is taken: the work proportional to what
-    // was uploaded (the digest over every byte, the copy of the retained prefix) is this
-    // request's own, so no other caller waits on it.
-    let received = crate::state::UploadedResource::received(body, content_type, now);
+    // was uploaded (the digest over every byte, the copy of the retained prefix, the
+    // analysis of the code it carries) is this request's own, so no other caller waits on
+    // it. The analysis is recorded against the scan the target was minted for, which is
+    // the only scan a run on this artifact can be started under (`CreateScan` refuses any
+    // other).
+    let received =
+        crate::state::UploadedResource::received(body, content_type, now, &target.scan_name);
     let outcome = state.lock().receive_upload(target, received);
     match outcome {
         UploadOutcome::Stored => stored(),

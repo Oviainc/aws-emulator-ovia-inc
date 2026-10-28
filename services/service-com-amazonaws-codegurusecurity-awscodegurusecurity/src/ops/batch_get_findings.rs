@@ -9,6 +9,12 @@
 //! Each reported entry carries the modelled `ErrorCode` for the reason that identifier
 //! could not be resolved; [`classify_unresolved`] is where that classification lives.
 //!
+//! Reporting only, apart from materialising the run-state transitions the clock already
+//! owes (`state::settle_due_runs`), as every reader of this store does: a run whose
+//! transition was due has recorded what its analysis found by then whichever reader
+//! arrives first, so this operation and `GetFindings` cannot disagree about which
+//! identifiers a scan holds.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -160,7 +166,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let store = state.lock();
+        let mut store = state.lock();
+        store.settle_due_runs(crate::state::now_millis());
 
         let mut findings = Vec::new();
         let mut failed_findings = Vec::new();

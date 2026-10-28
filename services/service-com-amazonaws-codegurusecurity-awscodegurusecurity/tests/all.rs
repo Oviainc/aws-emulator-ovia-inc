@@ -39,6 +39,8 @@ mod resource_tagging;
 mod scan_arn_region;
 #[path = "all/scan_completion.rs"]
 mod scan_completion;
+#[path = "all/scan_findings.rs"]
+mod scan_findings;
 #[path = "all/scan_lifecycle.rs"]
 mod scan_lifecycle;
 #[path = "all/state_roundtrip.rs"]

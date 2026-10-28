@@ -442,6 +442,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // run. Read once, here, so the run reports the resource it was started on
             // however the target is written to afterwards.
             resource_uploaded: artifact.upload.is_some(),
+            // And what the analysis of that resource found, which this run records as the
+            // scan's findings once its transition out of `InProgress` falls due. Taken
+            // from the same reading of the artifact, so a run cannot report the findings
+            // of one revision of the resource and the state of another.
+            pending_analysis: artifact
+                .upload
+                .as_ref()
+                .map(|upload| upload.analysis.clone())
+                .unwrap_or_default(),
             settle_due_millis: now.saturating_add(crate::state::settle_span_millis(&scan_type)),
         };
         let settle_due_millis = run.settle_due_millis;

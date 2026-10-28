@@ -35,8 +35,14 @@
 //! * `idempotency` gains one entry only where a run was created, so it is bounded by the
 //!   same (scans x runs) product, and an entry is dropped once its
 //!   [`CLIENT_TOKEN_WINDOW_MILLIS`] has passed ([`Store::expire_due_client_tokens`]).
-//! * `findings` is written only by a scan run's analysis, so no request path grows it;
-//!   the readers' page sizes are clamped to the modelled `maxResults` maxima.
+//! * `findings` is written only by a scan run's analysis, and [`FINDINGS_PER_SCAN_QUOTA`]
+//!   caps what one scan holds, so with [`SCAN_QUOTA`] the whole store is bounded however
+//!   much code is uploaded; the readers' page sizes are clamped to the modelled
+//!   `maxResults` maxima.
+//! * one archive's analysis is bounded in turn — at most
+//!   [`analysis::FINDINGS_PER_ANALYSIS`] findings over at most
+//!   [`analysis::MAX_SOURCE_BYTES`] of source, both constants — so neither what an upload
+//!   retains nor what a run carries grows with the size of the archive.
 //!
 //! Per-request CPU is bounded too: the clock-owed work the readers do is driven by the
 //! `pending_runs` / `idempotency_expiry` due-queues, so each call touches only the
@@ -47,6 +53,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use crate::ops::types::{
     Finding, FindingMetricsValuePerSeverity, ValidationException, ValidationExceptionField,
 };
+
+pub mod analysis;
+
+use analysis::ArchiveAnalysis;
 
 /// The region an emulated request is for: the region of its SigV4 credential scope,
 /// or the emulator's documented default when the request carries no scope (see
@@ -267,6 +277,13 @@ pub fn tag_quota_refusal(
 /// idempotency ledger and the work the due-queues can hold.
 pub const RUNS_PER_SCAN_QUOTA: usize = 100;
 
+/// The most findings one scan holds, so re-running one scan over code whose weaknesses
+/// keep changing cannot grow the findings store without end. A quota, not a fidelity
+/// claim: AWS publishes no findings-per-scan limit for CodeGuru Security. With
+/// [`SCAN_QUOTA`] it bounds the whole findings store, and one run's analysis is bounded in
+/// turn by [`analysis::FINDINGS_PER_ANALYSIS`].
+pub const FINDINGS_PER_SCAN_QUOTA: usize = 500;
+
 /// How long a `CreateScan` client token stands for the request it was first seen on.
 ///
 /// CHOSEN, not documented: AWS publishes no window for `CreateScanRequest$clientToken`,
@@ -399,12 +416,14 @@ pub struct UploadArtifact {
 }
 
 /// The code resource a caller uploaded to a minted target: the accounting of the archive
-/// that arrived, plus a bounded prefix of its content.
+/// that arrived, a bounded prefix of its content, and what the detectors found in it.
 ///
 /// The archive is not kept in full. An upload is accepted whatever its size, and what the
-/// store keeps of it is its length, a digest over every byte that arrived and at most
+/// store keeps of it is its length, a digest over every byte that arrived, at most
 /// [`UPLOAD_RETAINED_PREFIX_MAX_BYTES`] of its leading content — enough to identify the
-/// resource a run was started on, and bounded whatever was uploaded.
+/// resource a run was started on, and bounded whatever was uploaded — and the ANALYSIS of
+/// the code it carries, which is what a scan run started on this resource reports as its
+/// findings.
 #[derive(Debug, Clone)]
 pub struct UploadedResource {
     /// How many bytes arrived, counted over the whole archive.
@@ -420,17 +439,31 @@ pub struct UploadedResource {
     pub content_type: Option<String>,
     /// Epoch milliseconds at which the upload was received.
     pub received_at_millis: i64,
+    /// What this emulator's detectors found in the code the archive carries, computed when
+    /// the archive arrived — the one moment the whole of it is in hand — and bounded by
+    /// [`analysis::FINDINGS_PER_ANALYSIS`], with whether that analysis covers the whole
+    /// resource ([`analysis::ArchiveAnalysis`]). A run started on this resource records it
+    /// as the scan's findings when it settles ([`Store::apply_run_findings`]); nothing
+    /// reads it before a run is started on the resource.
+    pub analysis: ArchiveAnalysis,
 }
 
 impl UploadedResource {
-    /// Account for the archive `bytes` that arrived at a minted target: its length, its
-    /// digest and the prefix of it this store retains.
+    /// Account for the archive `bytes` that arrived at a minted target for `scan_name`:
+    /// its length, its digest, the prefix of it this store retains and the findings its
+    /// code carries.
     ///
     /// Takes the bytes by reference and copies only the retained prefix, so receiving an
     /// archive costs one pass over the buffered body rather than a second copy of it.
     /// The digest and the hex rendering are both done by maintained crates this crate
-    /// already depends on.
-    pub fn received(bytes: &[u8], content_type: Option<String>, received_at_millis: i64) -> Self {
+    /// already depends on, and reading the archive is the `zip` crate's job (see
+    /// [`analysis`] for the bounds every step of that is subject to).
+    pub fn received(
+        bytes: &[u8],
+        content_type: Option<String>,
+        received_at_millis: i64,
+        scan_name: &str,
+    ) -> Self {
         use ::sha2::Digest;
 
         let mut hasher = ::sha2::Sha256::new();
@@ -442,6 +475,7 @@ impl UploadedResource {
             retained_prefix: bytes[..retained].to_vec(),
             content_type,
             received_at_millis,
+            analysis: analysis::analyse_archive(scan_name, bytes),
         }
     }
 }
@@ -474,6 +508,12 @@ pub struct ScanRun {
     /// start of the run, so what the run reports never changes under a later upload to
     /// the same target.
     pub resource_uploaded: bool,
+    /// What the analysis of the resource this run was started on found, waiting for the
+    /// run to settle. Copied from the resource at the START of the run, for the same
+    /// reason [`Self::resource_uploaded`] is: the findings a run reports are the findings
+    /// of the code it was started on, whatever is uploaded to the same target afterwards.
+    /// Taken by [`Store::settle_due_runs`], so a settled run carries an empty analysis.
+    pub pending_analysis: ArchiveAnalysis,
     /// Epoch milliseconds at which this run's transition out of `InProgress` falls due.
     /// Stored, never slept on: a reader materialises the transition the clock already
     /// owes (see [`Store::settle_due_runs`]).
@@ -626,8 +666,8 @@ pub struct ComAmazonawsCodegurusecurityAwscodegurusecurityState {
     pub pending_runs: BTreeSet<(i64, String, usize)>,
     /// Findings, keyed by `(scanName, findingId)` — the SINGLE store `GetFindings` and
     /// `BatchGetFindings` both read, so an id one returns resolves through the other.
-    /// A run fills it with what its analysis produced; see [`SCAN_NOT_ANALYSED_MESSAGE`]
-    /// for why a run this emulator records produces none.
+    /// A scan's runs fill it with what their analysis of the uploaded code found
+    /// ([`Self::apply_run_findings`]). Bounded by [`FINDINGS_PER_SCAN_QUOTA`] per scan.
     pub findings: BTreeMap<(String, String), Finding>,
     /// `clientToken` -> what the request carrying it asked for and the run it started, so
     /// a retried `CreateScan` answers with that run instead of starting another revision
@@ -674,8 +714,9 @@ impl ComAmazonawsCodegurusecurityAwscodegurusecurityState {
     /// WHICH terminal state a run settles into is decided by what the run had to analyse,
     /// never by a fixed outcome: a run started on a code artifact whose uploaded resource
     /// this store holds was carried out, so it settles into `Successful` carrying no
-    /// `errorMessage`, while a run started on an artifact nothing was uploaded to had no
-    /// resource at all, so it settles into `Failed` and reports why
+    /// `errorMessage` and its analysis becomes the scan's findings
+    /// ([`Self::apply_run_findings`]), while a run started on an artifact nothing was
+    /// uploaded to had no resource at all, so it settles into `Failed` and reports why
     /// ([`SCAN_RESOURCE_NOT_UPLOADED_MESSAGE`]) — `errorMessage` being "Details about the
     /// error that causes a scan to fail" (`GetScanResponse$errorMessage`), it belongs to
     /// the failure and to nothing else.
@@ -686,28 +727,137 @@ impl ComAmazonawsCodegurusecurityAwscodegurusecurityState {
         for key in due {
             self.pending_runs.remove(&key);
             let (due_at, scan_name, run_index) = key;
-            let Some(scan) = self.scans.get_mut(&scan_name) else {
-                continue;
+            // The run's own record is settled under one borrow of the scan, and what its
+            // analysis found is taken out of it here, so the findings are recorded
+            // afterwards against the store as a whole.
+            let analysed = {
+                let Some(scan) = self.scans.get_mut(&scan_name) else {
+                    continue;
+                };
+                let Some(run) = scan.runs.get_mut(run_index) else {
+                    continue;
+                };
+                if run.scan_state != SCAN_STATE_IN_PROGRESS {
+                    continue;
+                }
+                // The run settles into the state its own work reached: carried out where
+                // the resource it was started on exists, failed where there was nothing to
+                // analyse. `errorMessage` goes with the failure only.
+                let analysed = if run.resource_uploaded {
+                    run.scan_state = SCAN_STATE_SUCCESSFUL.to_string();
+                    run.error_message = None;
+                    Some(std::mem::take(&mut run.pending_analysis))
+                } else {
+                    run.scan_state = SCAN_STATE_FAILED.to_string();
+                    run.error_message = Some(SCAN_RESOURCE_NOT_UPLOADED_MESSAGE.to_string());
+                    run.pending_analysis = ArchiveAnalysis::default();
+                    None
+                };
+                run.updated_at_millis = Some(due_at);
+                scan.updated_at_millis =
+                    Some(scan.updated_at_millis.unwrap_or(i64::MIN).max(due_at));
+                analysed
             };
-            let Some(run) = scan.runs.get_mut(run_index) else {
-                continue;
-            };
-            if run.scan_state != SCAN_STATE_IN_PROGRESS {
-                continue;
+            if let Some(analysed) = analysed {
+                self.apply_run_findings(&scan_name, analysed, due_at);
             }
-            // The run settles into the state its own work reached: carried out where the
-            // resource it was started on exists, failed where there was nothing to
-            // analyse. `errorMessage` goes with the failure only.
-            if run.resource_uploaded {
-                run.scan_state = SCAN_STATE_SUCCESSFUL.to_string();
-                run.error_message = None;
-            } else {
-                run.scan_state = SCAN_STATE_FAILED.to_string();
-                run.error_message = Some(SCAN_RESOURCE_NOT_UPLOADED_MESSAGE.to_string());
-            }
-            run.updated_at_millis = Some(due_at);
-            scan.updated_at_millis = Some(scan.updated_at_millis.unwrap_or(i64::MIN).max(due_at));
         }
+    }
+
+    /// Record what one run's analysis found as the findings of `scan_name`, as of
+    /// `at_millis`.
+    ///
+    /// A finding is a weakness IN A PLACE rather than one run's observation of it
+    /// (`analysis::finding_identifier`), so a run's result is reconciled with what the
+    /// scan already holds instead of replacing it:
+    ///
+    /// * a finding this run found and the scan did not hold comes into existence now, so
+    ///   it is `Open` and records this instant as both its `createdAt` and its
+    ///   `updatedAt`;
+    /// * a finding the scan already holds in the same place and still open is unchanged —
+    ///   two runs over unchanged code report the same findings with the same instants,
+    ///   which is what lets a caller tell a finding that moved from one that did not;
+    /// * a finding the scan holds that has MOVED, or that was closed and is detected
+    ///   again, keeps its identifier and its `createdAt` and records this instant as its
+    ///   `updatedAt` ("Findings are updated when you remediate them or when the finding
+    ///   code location changes", `Finding$updatedAt`);
+    /// * a finding the scan holds as `Open` that this run did NOT find has been
+    ///   remediated, so it is closed at this instant — which is what the metrics
+    ///   operations read as the close of an open finding
+    ///   ([`FindingLifetime::closed_at_millis`]) — but ONLY where the run's analysis
+    ///   covers the whole resource ([`analysis::ArchiveAnalysis::complete`]): a run whose
+    ///   archive could not be read, or whose detections were cut at a bound, says nothing
+    ///   about the weaknesses it did not report, so it closes none of them. An upload that
+    ///   could not be read is not a resource whose weaknesses were remediated.
+    ///
+    /// Bounded by [`FINDINGS_PER_SCAN_QUOTA`]: past it a scan takes no further finding,
+    /// so repeatedly re-running one scan over changing code cannot grow the store without
+    /// end. Closing a finding the scan already holds is never refused by that bound — it
+    /// grows nothing.
+    pub fn apply_run_findings(
+        &mut self,
+        scan_name: &str,
+        analysed: ArchiveAnalysis,
+        at_millis: i64,
+    ) {
+        let at = to_timestamp(at_millis);
+        let mut held_count = self.findings_held_by(scan_name);
+        let mut found: BTreeSet<String> = BTreeSet::new();
+        for detection in analysed.detections {
+            found.insert(detection.finding_id.clone());
+            let key = (scan_name.to_string(), detection.finding_id.clone());
+            match self.findings.get_mut(&key) {
+                Some(held) => {
+                    let moved =
+                        analysis::location_of(held) != analysis::location_of(&detection.finding);
+                    let closed = held.status.as_deref() != Some(STATUS_OPEN);
+                    if moved || closed {
+                        let created_at = held.created_at;
+                        *held = detection.finding;
+                        held.created_at = created_at;
+                        held.updated_at = Some(at);
+                    }
+                }
+                None => {
+                    if held_count >= FINDINGS_PER_SCAN_QUOTA {
+                        continue;
+                    }
+                    let mut finding = detection.finding;
+                    finding.created_at = Some(at);
+                    finding.updated_at = Some(at);
+                    self.findings.insert(key, finding);
+                    held_count = held_count.saturating_add(1);
+                }
+            }
+        }
+
+        // What the scan still holds open and this run did not find has been remediated
+        // since the run that found it — a judgement only an analysis that covers the whole
+        // resource can make, so an archive that could not be read, or detections cut at a
+        // bound, closes nothing.
+        if !analysed.complete {
+            return;
+        }
+        let from = (scan_name.to_string(), String::new());
+        for ((_, finding_id), held) in self
+            .findings
+            .range_mut(from..)
+            .take_while(|((name, _), _)| name == scan_name)
+        {
+            if held.status.as_deref() == Some(STATUS_OPEN) && !found.contains(finding_id) {
+                held.status = Some(STATUS_CLOSED.to_string());
+                held.updated_at = Some(at);
+            }
+        }
+    }
+
+    /// How many findings `scan_name` already holds, counted over the store's own key order
+    /// so the count costs only this scan's entries and copies none of them.
+    fn findings_held_by(&self, scan_name: &str) -> usize {
+        self.findings
+            .range((scan_name.to_string(), String::new())..)
+            .take_while(|((name, _), _)| name == scan_name)
+            .count()
     }
 
     /// Forget every client token whose window the clock has already closed at
@@ -1514,16 +1664,40 @@ pub fn mint_uuid() -> String {
     hasher.update(sequence.to_be_bytes());
     hasher.update(nanos.to_be_bytes());
     hasher.update(std::process::id().to_be_bytes());
-    let digest = ::hex::encode(&hasher.finalize()[..16]);
+    uuid_text(hasher.finalize().into())
+}
 
-    format!(
-        "{}-{}-{}-{}-{}",
-        &digest[0..8],
-        &digest[8..12],
-        &digest[12..16],
-        &digest[16..20],
-        &digest[20..32],
-    )
+/// An identifier in the same textual form as [`mint_uuid`], DERIVED from `parts` rather
+/// than minted: the same parts always give the same identifier, and no two different part
+/// lists give one.
+///
+/// This is how an identifier that stands for a THING rather than for a call is built — a
+/// `findingId`, which has to name the same finding every time a scan's analysis finds it
+/// (`analysis::finding_identifier`). Each part is length-prefixed into the digest, so two
+/// different lists of parts cannot hash alike by running into each other.
+pub fn derived_identifier(parts: &[&str]) -> String {
+    use ::sha2::Digest;
+
+    let mut hasher = ::sha2::Sha256::new();
+    for part in parts {
+        hasher.update(u64::try_from(part.len()).unwrap_or(u64::MAX).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    uuid_text(hasher.finalize().into())
+}
+
+/// The first 128 bits of `digest`, in the textual form the `Uuid` shape requires. The ONE
+/// place that form is spelled, so a minted and a derived identifier have the same shape.
+fn uuid_text(digest: [u8; 32]) -> String {
+    let hex = ::hex::encode(&digest[..16]);
+    let mut groups = Vec::with_capacity(UUID_GROUP_WIDTHS.len());
+    let mut rest = hex.as_str();
+    for width in UUID_GROUP_WIDTHS {
+        let (group, remainder) = rest.split_at(width.min(rest.len()));
+        groups.push(group);
+        rest = remainder;
+    }
+    groups.join("-")
 }
 
 /// Encode a page cursor as a `nextToken`.

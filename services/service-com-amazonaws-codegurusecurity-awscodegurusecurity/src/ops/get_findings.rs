@@ -4,7 +4,9 @@
 //!
 //! Pages the findings of one scan out of the SAME store `BatchGetFindings` reads.
 //! Reporting only, apart from materialising the run-state transitions the clock already
-//! owes (`state::settle_due_runs`).
+//! owes (`state::settle_due_runs`) — a settling run records what its analysis of the
+//! uploaded code found, which was owed at that same instant whether or not anybody read
+//! the scan, so two readers of a settled run see the same findings.
 //!
 //! ## Shape of an operation
 //!

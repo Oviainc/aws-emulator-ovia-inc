@@ -359,9 +359,10 @@ async fn reports_one_entry_per_identifier_in_request_order() {
     let (engine, router) = harness();
     start_scan(&router, KNOWN_SCAN).await;
 
-    // A finding as a run's analysis would have stored it, carrying an id in the form this
-    // service issues. Seeded directly: this emulator performs no analysis (see
-    // `state::SCAN_NOT_ANALYSED_MESSAGE`), so no request path writes one.
+    // A finding as a run's analysis stores one, carrying an id in the form this service
+    // issues. Seeded directly, so this suite's rows are about the CLASSIFICATION of an
+    // identifier rather than about what an upload's analysis finds (which
+    // `crate::scan_findings` drives end to end).
     let stored_id = "0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9";
     {
         let store = store_of(&engine);
