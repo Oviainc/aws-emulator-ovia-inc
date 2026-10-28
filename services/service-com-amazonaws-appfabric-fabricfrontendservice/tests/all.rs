@@ -57,6 +57,8 @@ mod nested_resource_arn_region;
 mod oauth2_auth_type_predicate;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/spent_client_token_decision.rs"]
+mod spent_client_token_decision;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/update_app_authorization_contract.rs"]

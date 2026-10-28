@@ -172,24 +172,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // REGION this call was signed for as well as to the operation, because
         // the bundle it mints belongs to that Region (its quota, its ARN): a
         // token spent in another Region is not a retry of this request and must
-        // not replay another Region's bundle.
+        // not replay another Region's bundle. That decision — mismatch, replay,
+        // or a token spent on a resource that is gone — is
+        // [`crate::state::ComAmazonawsAppfabricFabricfrontendserviceState::replay_spent_client_token`],
+        // shared by every create this service models; all that is left here is
+        // which level of the resource chain the token's ARN is resolved in.
         if let Some(token) = input.client_token.as_deref() {
-            let key = crate::state::client_token_key(&region, Self::NAME, token);
-            if let Some(spent) = store.client_tokens.get(&key).cloned() {
-                if spent.fingerprint != fingerprint {
-                    return Err(CreateAppBundleErrorModeled::ConflictException(
-                        crate::state::idempotent_parameter_mismatch(token, "AppBundle"),
-                    )
-                    .into());
-                }
-                if let Some(bundle) = store.resolve_bundle(&spent.arn) {
-                    return Ok(CreateAppBundleOutput {
-                        app_bundle: bundle.to_app_bundle(),
-                    });
-                }
-                // The replayed resource was deleted since; the token is spent on
-                // nothing, so this call creates a new bundle under a new token.
-                store.client_tokens.remove(&key);
+            let replayed = store
+                .replay_spent_client_token(
+                    &region,
+                    Self::NAME,
+                    token,
+                    &fingerprint,
+                    "AppBundle",
+                    |store, arn| {
+                        store
+                            .resolve_bundle(arn)
+                            .map(crate::state::AppBundleRecord::to_app_bundle)
+                    },
+                )
+                .map_err(CreateAppBundleErrorModeled::ConflictException)?;
+            if let Some(app_bundle) = replayed {
+                return Ok(CreateAppBundleOutput { app_bundle });
             }
         }
 

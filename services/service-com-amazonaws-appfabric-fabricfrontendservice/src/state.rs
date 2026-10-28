@@ -884,6 +884,52 @@ impl ComAmazonawsAppfabricFabricfrontendserviceState {
         );
     }
 
+    /// Decide what a spent `@idempotencyToken` says about the call being served,
+    /// for EVERY create this service models.
+    ///
+    /// The decision is one rule, so it lives in one place: a token spent for this
+    /// (Region, operation) pair by a call whose parameters render differently
+    /// (see [`request_fingerprint`]) is the conflict AWS documents as
+    /// `IdempotentParameterMismatch` (returned as the modelled `ConflictException`
+    /// [`idempotent_parameter_mismatch`] builds, which each handler lifts into its
+    /// own error enum); a token spent by the SAME request replays the resource it
+    /// created; and a token whose resource no longer exists is spent on nothing, so
+    /// it is forgotten here and the caller's call goes on to create afresh.
+    ///
+    /// All each handler keeps is its own ARN-to-record resolver, `resolve`: it is
+    /// handed the store and the ARN the token holds and answers with the response
+    /// projection of that record (which level of the resource chain the ARN is
+    /// looked up in, and whether the projection takes a clock, is the part that
+    /// genuinely differs between the creates).
+    ///
+    /// `Ok(Some(_))` is a replay to return as-is, `Ok(None)` means "create", and
+    /// `Err(_)` is the mismatch conflict.
+    pub fn replay_spent_client_token<T>(
+        &mut self,
+        region: &str,
+        operation: &str,
+        token: &str,
+        fingerprint: &str,
+        resource_type: &str,
+        resolve: impl FnOnce(&Self, &str) -> Option<T>,
+    ) -> Result<Option<T>, ConflictException> {
+        let key = client_token_key(region, operation, token);
+        let Some(spent) = self.client_tokens.get(&key) else {
+            return Ok(None);
+        };
+        if spent.fingerprint != fingerprint {
+            return Err(idempotent_parameter_mismatch(token, resource_type));
+        }
+        let arn = spent.arn.clone();
+        if let Some(replayed) = resolve(self, &arn) {
+            return Ok(Some(replayed));
+        }
+        // The resource the token created was deleted since, so the token is spent
+        // on nothing: forget it and let this call create a new resource.
+        self.client_tokens.remove(&key);
+        Ok(None)
+    }
+
     /// How many app bundles this account holds in `region`.
     ///
     /// An app bundle belongs to the Region its create call was signed for, and

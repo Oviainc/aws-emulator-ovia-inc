@@ -265,30 +265,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // documents as IdempotentParameterMismatch. The token is scoped to the
         // REGION this call was signed for as well as to the operation: each
         // Region is its own endpoint with its own resources, so a token spent in
-        // another Region is not a retry of this request.
+        // another Region is not a retry of this request. That decision —
+        // mismatch, replay, or a token spent on a resource that is gone — is
+        // [`crate::state::ComAmazonawsAppfabricFabricfrontendserviceState::replay_spent_client_token`],
+        // shared by every create this service models; all that is left here is
+        // which level of the resource chain the token's ARN is resolved in, and
+        // that an ingestion is reported as of NOW.
         if let Some(token) = input.client_token.as_deref() {
-            let key = crate::state::client_token_key(&signed_region, Self::NAME, token);
-            if let Some(spent) = store.client_tokens.get(&key).cloned() {
-                if spent.fingerprint != fingerprint {
-                    return Err(CreateIngestionErrorModeled::ConflictException(
-                        crate::state::idempotent_parameter_mismatch(token, "Ingestion"),
-                    )
-                    .into());
-                }
-                let replayed = store
-                    .app_bundles
-                    .get(&bundle_key)
-                    .and_then(|bundle| bundle.resolve_ingestion(&spent.arn))
-                    // A replay reports the ingestion as of NOW, exactly as a read
-                    // of it would: a state the clock has moved since the first
-                    // call is part of the record, not of the token.
-                    .map(|ingestion| ingestion.to_ingestion(::std::time::SystemTime::now()));
-                if let Some(ingestion) = replayed {
-                    return Ok(CreateIngestionOutput { ingestion });
-                }
-                // The replayed ingestion was deleted since; the token is spent on
-                // nothing, so this call creates a new one under a new token.
-                store.client_tokens.remove(&key);
+            let replayed = store
+                .replay_spent_client_token(
+                    &signed_region,
+                    Self::NAME,
+                    token,
+                    &fingerprint,
+                    "Ingestion",
+                    |store, arn| {
+                        store
+                            .app_bundles
+                            .get(&bundle_key)
+                            .and_then(|bundle| bundle.resolve_ingestion(arn))
+                            // A replay reports the ingestion as of NOW, exactly
+                            // as a read of it would: a state the clock has moved
+                            // since the first call is part of the record, not of
+                            // the token.
+                            .map(|ingestion| {
+                                ingestion.to_ingestion(::std::time::SystemTime::now())
+                            })
+                    },
+                )
+                .map_err(CreateIngestionErrorModeled::ConflictException)?;
+            if let Some(ingestion) = replayed {
+                return Ok(CreateIngestionOutput { ingestion });
             }
         }
 
