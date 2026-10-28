@@ -348,10 +348,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
         for (index, entitlement) in input.entitlements.iter().flatten().enumerate() {
-            if let Some(rejection) = crate::state::tag_set_rejection(
-                &format!("Entitlements[{index}]"),
-                entitlement.entitlement_tags.as_ref(),
-            ) {
+            let member = format!("Entitlements[{index}]");
+            if let Some(rejection) =
+                crate::state::tag_set_rejection(&member, entitlement.entitlement_tags.as_ref())
+            {
+                return Err(bad_request(rejection));
+            }
+            // An entitlement's `Subscribers` holds the ACCOUNTS the flow's content is
+            // shared with, so each entry has to be able to be an account ID — the one rule
+            // GrantFlowEntitlements and UpdateFlowEntitlement write the list under too (see
+            // `crate::state::subscribers_rejection`).
+            if let Some(rejection) =
+                crate::state::subscribers_rejection(&member, &entitlement.subscribers)
+            {
                 return Err(bad_request(rejection));
             }
         }
