@@ -517,14 +517,11 @@ async fn an_absent_application_version_or_template_is_a_modelled_404() {
          condition, got {}",
         no_versions.at("errorCode")
     );
-    assert!(
-        no_versions
-            .at("message")
-            .as_str()
-            .unwrap_or_default()
-            .contains(&versionless),
-        "preparing a template of a versionless application: the refusal is built from the \
-         request, got {}",
+    assert_eq!(
+        no_versions.at("message").as_str().unwrap_or_default(),
+        "CloudFormation template can't be created from application with no version.",
+        "preparing a template of a versionless application: the refusal carries this \
+         path's own fixed sentence, got {}",
         no_versions.at("message")
     );
 
