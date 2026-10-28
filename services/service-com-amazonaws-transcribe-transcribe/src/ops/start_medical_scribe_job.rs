@@ -9,8 +9,9 @@
 //!
 //! NOTHING IS TRANSCRIBED: no conversation is transcribed, no speaker role is
 //! identified and no clinical note is generated, so the `MedicalScribeOutput` URIs a
-//! completed job reports name locations nothing writes to (see
-//! [`crate::state::medical_scribe_output_uri`]). The job RECORD is what this
+//! completed job reports name locations holding a transcript of no words and a note of
+//! no sections (see [`crate::state::medical_scribe_output_uri`] and
+//! [`crate::state::store_job_outputs`]). The job RECORD is what this
 //! emulates.
 //!
 //! The member combinations the request documents but the model cannot express —
@@ -457,6 +458,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             context_provided: input.medical_scribe_context.is_some(),
             // Filled in when the job completes and the output locations exist.
             output: None,
+            // A job that has not finished owes its output locations nothing, because it
+            // reports none yet (see `crate::state::due_output_objects`).
+            outputs_stored: false,
             failure_reason: None,
             creation_time: now,
             start_time: Some(now),

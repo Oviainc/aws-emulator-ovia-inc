@@ -36,14 +36,20 @@
 //! WITH [`MAX_REGIONS`], the cap on how many Regions hold records of it at all.
 //!
 //! WHAT THIS EMULATES, AND WHAT IT DOES NOT: the job RECORD — its name, its
-//! settings, its status, its timestamps and the location its output would be
-//! written to. No audio is transcribed and no object is ever written at the
-//! reported `Transcript.TranscriptFileUri` / `Transcript.RedactedTranscriptFileUri`
-//! / `SubtitlesOutput.SubtitleFileUris`,
-//! so a completed job means "the control plane finished with this record", never
-//! "a transcript is fetchable from that URI". Nothing invents transcript content: no
+//! settings, its status, its timestamps and the location its output is written to.
+//! No audio is transcribed, and nothing invents transcript content: no
 //! word, sentiment or summary of a call appears anywhere, because no engine produced
-//! one. A member the service itself DETERMINES is reported where the request states
+//! one. The LOCATION a finished job reports is nonetheless one this emulator SERVES:
+//! the output document is stored at the reported
+//! `Transcript.TranscriptFileUri` / `Transcript.RedactedTranscriptFileUri` /
+//! `SubtitlesOutput.SubtitleFileUris`, in this emulator's own object store over the
+//! in-process callback, so the canonical workflow — start a job, poll it until it is
+//! finished, then fetch the location it reports — completes (see
+//! [`store_job_outputs`]). What that document holds is the envelope the service itself
+//! owns (the job, the account, the status) with an EMPTY transcript and no caption,
+//! because no engine read the audio: a transcription that produced no words, never
+//! invented speech ([`transcript_document`], [`subtitle_document`]).
+//! A member the service itself DETERMINES is reported where the request states
 //! what it is determined from, and withheld where only the media could say. The
 //! language a job asked the service to IDENTIFY is of the first kind: `LanguageOptions`
 //! restricts what identification may answer with, so a finished job reports the
@@ -92,7 +98,8 @@
 //! sentiment or summary is derived and no category is matched, so the
 //! `Transcript.TranscriptFileUri` — and, for a job that asked for redaction, the
 //! `RedactedTranscriptFileUri` beside it — a completed one reports names a location
-//! nothing writes to or serves. That family's start request carries no language,
+//! the output document with none of that in it is stored at, like every other
+//! family's ([`store_job_outputs`]). That family's start request carries no language,
 //! media-format or sample-rate member at all, because the service DETERMINES each of
 //! them, so a finished job of it reports the determination this emulator can make
 //! without audio: the language the request narrowed identification to
@@ -109,13 +116,14 @@
 //! RECORD too, and the strongest case of the same limit: no conversation is
 //! transcribed, no speaker role is identified and no clinical note is generated, so
 //! the `MedicalScribeOutput.TranscriptFileUri` / `ClinicalDocumentUri` a completed
-//! job reports name locations nothing writes to or serves (see
-//! [`medical_scribe_output_uri`]), and a `FailureReason` stays absent because nothing
+//! job reports name locations the transcript document and a clinical note of no
+//! sections are stored at (see [`medical_scribe_output_uri`] and
+//! [`clinical_document`]), and a `FailureReason` stays absent because nothing
 //! this emulator does can fail a job it accepted. A MEDICAL transcription job is the
 //! transcription-job RECORD again, under its own name: no audio is transcribed and no
 //! personal health information is identified, so the
 //! `MedicalTranscript.TranscriptFileUri` a completed job reports names a location
-//! nothing writes to or serves (see [`MedicalTranscriptionJobRecord`]).
+//! holding that same contentless transcript (see [`MedicalTranscriptionJobRecord`]).
 //!
 //! The INPUT media is the other half of that: a job's audio is an object in Amazon S3
 //! the caller uploaded before starting the job, and this emulator holds an Amazon S3 of
@@ -140,7 +148,7 @@ use crate::ops::types::{
     MedicalTranscriptionJobSummary, MedicalTranscriptionSetting, ModelSettings, RelativeTimeRange,
     Rule, Settings, SubtitlesOutput, Tag, ToxicityDetectionSettings, Transcript, TranscriptionJob,
     TranscriptionJobSummary, VocabularyFilterInfo, VocabularyInfo, MEDIA_FORMAT_VALUES,
-    MEDICAL_SCRIBE_LANGUAGE_CODE_VALUES, REDACTION_OUTPUT_VALUES,
+    MEDICAL_SCRIBE_LANGUAGE_CODE_VALUES, REDACTION_OUTPUT_VALUES, SUBTITLE_FORMAT_VALUES,
 };
 
 /// `TranscriptionJobStatus` values, from the model's enum
@@ -517,10 +525,11 @@ pub const MEDICAL_SCRIBE_CLINICAL_DOCUMENT_FILE: &str = "summary.json";
 
 /// Where one of a Medical Scribe job's two output files is reported to live.
 ///
-/// Reported, not served — exactly as a transcription job's
-/// `Transcript.TranscriptFileUri` is (see this module's header): nothing writes an
-/// object at this URI, because nothing transcribes the conversation or generates the
-/// clinical note. `OutputBucketName` is REQUIRED for this family
+/// Reported AND served — exactly as a transcription job's
+/// `Transcript.TranscriptFileUri` is (see this module's header): the document a
+/// finished job owes this location is stored at it ([`store_job_outputs`]), and it
+/// holds no transcribed conversation and no generated note, because nothing read the
+/// audio. `OutputBucketName` is REQUIRED for this family
 /// (`smithy_query(query="operation", operation="StartMedicalScribeJob")`), so there is
 /// no service-managed branch as [`output_uri`] has: both files are in the caller's
 /// bucket, under a prefix named for the job so two jobs writing to one bucket do not
@@ -3279,35 +3288,8 @@ pub async fn store_vocabulary_content(
     }
 
     // The file needs a bucket to live in, and this one is the service's own rather
-    // than anything a caller created, so the write stands it up first. The create is
-    // idempotent in effect: a name the one bucket namespace already holds answers
-    // 409, which is this bucket already being there.
-    let configuration = (region != UNCONSTRAINED_BUCKET_REGION).then(|| {
-        ::aws_sdk_s3::types::CreateBucketConfiguration::builder()
-            .location_constraint(::aws_sdk_s3::types::BucketLocationConstraint::from(region))
-            .build()
-    });
-    if let Err(error) = client
-        .create_bucket()
-        .bucket(&bucket)
-        .set_create_bucket_configuration(configuration)
-        .send()
-        .await
-    {
-        use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
-
-        let status = error
-            .raw_response()
-            .map(|response| response.status().as_u16());
-        if status != Some(BUCKET_EXISTS_STATUS) {
-            ::tracing::warn!(
-                bucket = %bucket,
-                code = error.code().unwrap_or_default(),
-                detail = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
-                "the service-managed bucket for custom vocabulary files was not created"
-            );
-        }
-    }
+    // than anything a caller created, so the write stands it up first.
+    create_service_managed_bucket(&client, &bucket, region).await;
 
     let file = vocabulary_content_file(terms);
     match client
@@ -3333,6 +3315,48 @@ pub async fn store_vocabulary_content(
             detail = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
             "the file this resource's DownloadUri names was not stored"
         ),
+    }
+}
+
+/// Stand up the Region's service-managed bucket, so a write into it has a bucket to
+/// live in.
+///
+/// Idempotent in effect: a name the one bucket namespace already holds answers 409
+/// ([`BUCKET_EXISTS_STATUS`]), which is this bucket already being there. Every write
+/// into that bucket calls it — a custom vocabulary's built text file
+/// ([`store_vocabulary_content`]) and the output document of a job that named no bucket
+/// of its own ([`store_job_outputs`]) — so neither depends on the other having gone
+/// first.
+async fn create_service_managed_bucket(
+    client: &::aws_sdk_s3::Client,
+    bucket: &str,
+    region: &str,
+) {
+    let configuration = (region != UNCONSTRAINED_BUCKET_REGION).then(|| {
+        ::aws_sdk_s3::types::CreateBucketConfiguration::builder()
+            .location_constraint(::aws_sdk_s3::types::BucketLocationConstraint::from(region))
+            .build()
+    });
+    if let Err(error) = client
+        .create_bucket()
+        .bucket(bucket)
+        .set_create_bucket_configuration(configuration)
+        .send()
+        .await
+    {
+        use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
+
+        let status = error
+            .raw_response()
+            .map(|response| response.status().as_u16());
+        if status != Some(BUCKET_EXISTS_STATUS) {
+            ::tracing::warn!(
+                bucket = %bucket,
+                code = error.code().unwrap_or_default(),
+                detail = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "the service-managed bucket for this service's own files was not created"
+            );
+        }
     }
 }
 
@@ -3371,7 +3395,8 @@ pub struct TranscriptionJobRecord {
     pub output_bucket_name: Option<String>,
     pub output_key: Option<String>,
     /// `OutputEncryptionKMSKeyId`: the key the transcript would be encrypted with.
-    /// Recorded as asked for; nothing encrypts anything, because nothing is written.
+    /// Recorded as asked for; nothing encrypts anything, because this emulator holds
+    /// no key to encrypt the document it writes with.
     pub output_encryption_kms_key_id: Option<String>,
     /// `KMSEncryptionContext`, recorded for the same reason as
     /// [`Self::output_encryption_kms_key_id`].
@@ -3405,6 +3430,9 @@ pub struct TranscriptionJobRecord {
     pub subtitles: Option<SubtitlesOutput>,
     /// Where the transcript was written; `None` until the job completes.
     pub transcript: Option<Transcript>,
+    /// Whether the documents the locations this job reports serve have already been
+    /// stored there ([`due_output_objects`]).
+    pub outputs_stored: bool,
     pub failure_reason: Option<String>,
     /// The `FailureReason` the clock owes this job INSTEAD of a transcript, established
     /// from the media the start was pointed at ([`media_failure_reason`]); `None` for a
@@ -3430,8 +3458,10 @@ impl TranscriptionJobRecord {
     /// operation (`Get`, `List`) runs this before projecting the record, and that
     /// is the only write it performs.
     ///
-    /// Completing a job records WHERE each output it asked for would be written (see
-    /// the module header); it does not write anything there.
+    /// Completing a job records WHERE each output it asked for is written. Storing the
+    /// document at those locations is the one step this cannot take — it is a call into
+    /// object storage, which only an operation can make — so the operation that finds
+    /// the job finished makes it ([`due_output_objects`], [`store_job_outputs`]).
     pub fn advance_clock(&mut self, now: SystemTime) {
         if self.status == STATUS_QUEUED {
             match self.queued_until {
@@ -3579,12 +3609,12 @@ impl TranscriptionJobRecord {
 
 /// One stored MEDICAL transcription job (Amazon Transcribe Medical): exactly what the
 /// request asked for, plus the lifecycle facts the service itself owns (status,
-/// timestamps and the location its transcript would be written to).
+/// timestamps and the location its transcript is written to).
 ///
 /// NOTHING IS TRANSCRIBED, exactly as for the non-medical family (see this module's
 /// header): the `MedicalTranscript.TranscriptFileUri` a completed job reports names a
-/// location nothing writes to or serves, and no PHI is identified. The job RECORD is
-/// what this emulates.
+/// location holding a transcript with no words in it, and no PHI is identified. The job
+/// RECORD is what this emulates.
 ///
 /// `StartMedicalTranscriptionJob` has no deferred-execution member of any kind
 /// (`smithy_query(query="operation", operation="StartMedicalTranscriptionJob")` lists
@@ -3617,7 +3647,8 @@ pub struct MedicalTranscriptionJobRecord {
     pub output_bucket_name: String,
     pub output_key: Option<String>,
     /// `OutputEncryptionKMSKeyId`: the key the transcript would be encrypted with.
-    /// Recorded as asked for; nothing encrypts anything, because nothing is written.
+    /// Recorded as asked for; nothing encrypts anything, because this emulator holds
+    /// no key to encrypt the document it writes with.
     pub output_encryption_kms_key_id: Option<String>,
     /// `KMSEncryptionContext`, recorded for the same reason as
     /// [`Self::output_encryption_kms_key_id`].
@@ -3630,6 +3661,9 @@ pub struct MedicalTranscriptionJobRecord {
     pub job_type: String,
     /// Where the transcript was written; `None` until the job completes.
     pub transcript: Option<MedicalTranscript>,
+    /// Whether the document the location this job reports serves has already been
+    /// stored there ([`due_output_objects`]).
+    pub outputs_stored: bool,
     /// `FailureReason`, set only on a [`STATUS_FAILED`] job — the reason the clock
     /// materialised from [`Self::failure_due`].
     pub failure_reason: Option<String>,
@@ -3653,8 +3687,9 @@ impl MedicalTranscriptionJobRecord {
     /// (`Get`) runs this before projecting the record, and that is the only write it
     /// performs.
     ///
-    /// Completing a job records WHERE its transcript would be written (see the module
-    /// header); it does not write anything there.
+    /// Completing a job records WHERE its transcript is written; the operation that
+    /// finds the job finished stores the document there, for the reason
+    /// [`TranscriptionJobRecord::advance_clock`] gives.
     pub fn advance_clock(&mut self, now: SystemTime) {
         if self.status != STATUS_IN_PROGRESS || now < self.completion_due {
             return;
@@ -3741,7 +3776,7 @@ impl MedicalTranscriptionJobRecord {
 
 /// One stored Medical Scribe job (AWS HealthScribe): exactly what the request asked
 /// for, plus the lifecycle facts the service itself owns (status, timestamps and the
-/// location its output would be written to).
+/// location its output is written to).
 ///
 /// `StartMedicalScribeJob` has no deferred-execution member of any kind
 /// (`smithy_query(query="operation", operation="StartMedicalScribeJob")`), so a job
@@ -3763,7 +3798,8 @@ pub struct MedicalScribeJobRecord {
     /// reported output URIs name.
     pub output_bucket_name: String,
     /// `OutputEncryptionKMSKeyId`: the key the output would be encrypted with.
-    /// Recorded as asked for; nothing encrypts anything, because nothing is written.
+    /// Recorded as asked for; nothing encrypts anything, because this emulator holds
+    /// no key to encrypt the document it writes with.
     pub output_encryption_kms_key_id: Option<String>,
     /// `KMSEncryptionContext`, recorded for the same reason as
     /// [`Self::output_encryption_kms_key_id`].
@@ -3777,9 +3813,12 @@ pub struct MedicalScribeJobRecord {
     /// itself is not kept: no operation of this service reports it, and its one member
     /// (`MedicalScribePatientContext$Pronouns`) is modelled `@sensitive`.
     pub context_provided: bool,
-    /// Where the transcript and the clinical note would be written; `None` until the
+    /// Where the transcript and the clinical note were written; `None` until the
     /// job completes. See [`medical_scribe_output_uri`].
     pub output: Option<MedicalScribeOutput>,
+    /// Whether the documents the locations this job reports serve have already been
+    /// stored there ([`due_output_objects`]).
+    pub outputs_stored: bool,
     /// `FailureReason`, set only on a `FAILED` job — which none of this emulator's are.
     pub failure_reason: Option<String>,
     pub creation_time: SystemTime,
@@ -3796,8 +3835,9 @@ impl MedicalScribeJobRecord {
     /// (`Get`) runs this before projecting the record, and that is the only write it
     /// performs.
     ///
-    /// Completing a job records WHERE its output would be written (see the module
-    /// header); it does not write anything there.
+    /// Completing a job records WHERE its output is written; the operation that finds
+    /// the job finished stores the documents there, for the reason
+    /// [`TranscriptionJobRecord::advance_clock`] gives.
     pub fn advance_clock(&mut self, now: SystemTime) {
         if self.status != STATUS_IN_PROGRESS || now < self.completion_due {
             return;
@@ -3930,10 +3970,10 @@ pub const REDACTED_OUTPUT_PREFIX: &str = "redacted-";
 /// Where the REDACTED transcript of a job that asked for redaction is reported to
 /// live, beside the unredacted one at `transcript_uri`.
 ///
-/// Reported, not served, exactly as the unredacted location is (see this module's
-/// header): nothing redacts a transcript nothing produced, so what this answers is
-/// WHERE the redacted output would be — a location distinct from the unredacted one,
-/// as the model's two separate members require.
+/// Reported AND served, exactly as the unredacted location is (see this module's
+/// header): nothing redacts a transcript nothing produced, so the document stored
+/// there is the same contentless transcript — at a location distinct from the
+/// unredacted one, as the model's two separate members require.
 pub fn redacted_transcript_uri(transcript_uri: &str) -> String {
     match transcript_uri.rsplit_once('/') {
         Some((parent, file)) => format!("{parent}/{REDACTED_OUTPUT_PREFIX}{file}"),
@@ -4302,7 +4342,7 @@ pub fn identified_languages(language_options: Option<&[String]>) -> Vec<Language
 
 /// One stored Call Analytics job: exactly what the request asked for, plus the
 /// lifecycle facts the service itself owns (status, timestamps and the location its
-/// transcript would be written to).
+/// transcript is written to).
 ///
 /// This family has job QUEUEING, and the operation names the request member that opts
 /// into it: "Job queuing is available for Call Analytics jobs. If you pass a
@@ -4322,7 +4362,7 @@ pub fn identified_languages(language_options: Option<&[String]>) -> Vec<Language
 /// WHAT IT EMULATES is the job RECORD (see the module header): no call is
 /// transcribed, no sentiment or call characteristic is derived and no category is
 /// matched, so the `Transcript.TranscriptFileUri` a completed job reports names a
-/// location nothing writes to or serves.
+/// location holding a transcript with none of that in it.
 #[derive(Debug, Clone)]
 pub struct CallAnalyticsJobRecord {
     /// `CallAnalyticsJobName`, with the Region, this record's key in the store.
@@ -4341,7 +4381,8 @@ pub struct CallAnalyticsJobRecord {
     /// service-managed location (see [`call_analytics_output_uri`]).
     pub output_location: Option<String>,
     /// `OutputEncryptionKMSKeyId`: the key the output would be encrypted with.
-    /// Recorded as asked for; nothing encrypts anything, because nothing is written.
+    /// Recorded as asked for; nothing encrypts anything, because this emulator holds
+    /// no key to encrypt the document it writes with.
     pub output_encryption_kms_key_id: Option<String>,
     /// `DataAccessRoleArn`, "The Amazon Resource Name (ARN) you included in your
     /// request" (model doc for `CallAnalyticsJob$DataAccessRoleArn`) — optional on
@@ -4369,6 +4410,9 @@ pub struct CallAnalyticsJobRecord {
     pub media_sample_rate_hertz: Option<i32>,
     /// Where the transcript was written; `None` until the job completes.
     pub transcript: Option<Transcript>,
+    /// Whether the documents the locations this job reports serve have already been
+    /// stored there ([`due_output_objects`]).
+    pub outputs_stored: bool,
     /// `FailureReason`, set only on a `FAILED` job — which none of this emulator's
     /// are: nothing it does can fail a job it accepted.
     pub failure_reason: Option<String>,
@@ -4393,8 +4437,9 @@ impl CallAnalyticsJobRecord {
     ///
     /// Completing a job records what the service determined while it processed the
     /// call — the language it identified, the format and sample rate of the audio it
-    /// was given, and WHERE each transcript it produced would be written (see the
-    /// module header) — and writes nothing at those locations. Every one of those
+    /// was given, and WHERE each transcript it produced is written (the operation that
+    /// finds the job finished stores the document there, for the reason
+    /// [`TranscriptionJobRecord::advance_clock`] gives). Every one of those
     /// values is a function of the stored record, so a job reports the same ones at
     /// every later read.
     pub fn advance_clock(&mut self, now: SystemTime) {
@@ -4506,7 +4551,8 @@ impl CallAnalyticsJobRecord {
 /// location gets the service-managed location every job family reports
 /// ([`output_uri`]).
 ///
-/// Reported, not served: nothing writes an object there (see the module header).
+/// Reported AND served: the document a finished job owes this location is stored at it
+/// ([`store_job_outputs`]).
 ///
 /// [`output_object_key`] is NOT reused: that rule names an object KEY relative to a
 /// separate `OutputBucketName`, while this member is a whole URI whose bucket is part
@@ -4575,6 +4621,393 @@ pub fn output_uri(
             bucket = service_managed_bucket(region),
             account = ::engine::emulator_account_id(),
         ),
+    }
+}
+
+/// One object a finished job's reported output location names: the address it is
+/// served from and the document stored there.
+///
+/// The location a reader REPORTS and the object a client FETCHES are built from one
+/// value — the URI the record projects ([`output_object_address`]) — so the two cannot
+/// drift apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputObject {
+    /// The bucket the reported URI addresses.
+    pub bucket: String,
+    /// The key it addresses under that bucket.
+    pub key: String,
+    /// The document stored there.
+    pub body: String,
+    /// The `Content-Type` it is stored with.
+    pub content_type: String,
+}
+
+/// The bucket and key a reported output URI addresses, in either of the two forms this
+/// service reports one in: the `s3://BUCKET/KEY` of an output location the request
+/// named ([`output_uri`], [`call_analytics_output_uri`],
+/// [`medical_scribe_output_uri`]) and the path-style
+/// `https://s3.REGION.amazonaws.com/BUCKET/KEY` of a service-managed one — both of
+/// which the modelled `Uri` pattern `^(s3://|http(s*)://).+$` admits.
+///
+/// `None` for a value that addresses no object of this emulator's store, which there is
+/// nothing to write at: one naming a bucket alone, and one of the `http(s)` form whose
+/// authority is not the path-style Amazon S3 endpoint ([`is_path_style_s3_host`]). That
+/// second case is why the two forms are not parsed alike: an output location is
+/// caller-supplied, and a URI of that form naming any other authority addresses a HOST,
+/// which this emulator resolves none of — reading its first path segment as a bucket
+/// would write an object into a bucket the caller never named and this service never
+/// reports.
+fn output_object_address(uri: &str) -> Option<(&str, &str)> {
+    let uri = uri.trim();
+    if let Some(address) = media_object_address(uri) {
+        return Some(address);
+    }
+    let (host, path) = uri.split_once("://")?.1.split_once('/')?;
+    if !is_path_style_s3_host(host) {
+        return None;
+    }
+    let (bucket, key) = path.split_once('/')?;
+    (!bucket.is_empty() && !key.is_empty()).then_some((bucket, key))
+}
+
+/// Whether `host` is the path-style Amazon S3 endpoint this service reports a
+/// service-managed location at: `s3.REGION.amazonaws.com` for a Region-shaped REGION
+/// ([`is_region_like`]), which is the authority [`output_uri`] and
+/// [`vocabulary_download_uri`] build such a URI with.
+fn is_path_style_s3_host(host: &str) -> bool {
+    host.strip_prefix("s3.")
+        .and_then(|rest| rest.strip_suffix(".amazonaws.com"))
+        .is_some_and(is_region_like)
+}
+
+/// The `Content-Type` a JSON output document is stored with.
+const OUTPUT_JSON_CONTENT_TYPE: &str = "application/json";
+
+/// `SubtitleFormat` values, from the model's enum
+/// (`smithy_query(query="shape", shape="SubtitleFormat")`).
+pub const SUBTITLE_FORMAT_SUBRIP: &str = SUBTITLE_FORMAT_VALUES[0];
+/// See [`SUBTITLE_FORMAT_SUBRIP`].
+pub const SUBTITLE_FORMAT_WEBVTT: &str = SUBTITLE_FORMAT_VALUES[1];
+
+/// The first line of every WebVTT file, which is what identifies the format.
+const WEBVTT_SIGNATURE: &str = "WEBVTT";
+
+/// The `Content-Type` a WebVTT subtitle file is stored with: the media type registered
+/// for that format.
+const SUBTITLE_CONTENT_TYPE_WEBVTT: &str = "text/vtt";
+
+/// The `Content-Type` a SubRip subtitle file is stored with. CHOSEN: SubRip has no
+/// registered media type of its own and the file is plain text.
+const SUBTITLE_CONTENT_TYPE_SUBRIP: &str = "text/plain";
+
+/// The transcript document a finished job serves at the location it reports.
+///
+/// There IS a document to fetch there: `Transcript$TranscriptFileUri` is "The Amazon S3
+/// location of your transcript. You can use this URI to access or download your
+/// transcript" (`smithy_query(query="doc", shape="Transcript",
+/// member="TranscriptFileUri")`), and `MedicalTranscript$TranscriptFileUri` says the
+/// same of its own. It is JSON, as every output key this service names ends in `.json`.
+///
+/// Its members are the facts the service itself owns: the job this is the output of,
+/// the account that ran it and the status it finished in. The transcribed text is EMPTY
+/// and the item list holds nothing, because no engine read the audio (see the module
+/// header) — the document is the true envelope of a transcription that produced no
+/// words, not invented speech.
+pub fn transcript_document(job_name: &str, status: &str) -> String {
+    ::serde_json::json!({
+        "jobName": job_name,
+        "accountId": ::engine::emulator_account_id(),
+        "status": status,
+        "results": {"transcripts": [{"transcript": ""}], "items": []},
+    })
+    .to_string()
+}
+
+/// The clinical note a finished Medical Scribe job serves at the location it reports
+/// ([`MEDICAL_SCRIBE_CLINICAL_DOCUMENT_FILE`]).
+///
+/// `MedicalScribeOutput$ClinicalDocumentUri` "Holds the Amazon S3 URI for the Clinical
+/// Document" (`smithy_query(query="shape", shape="MedicalScribeOutput")`), so a
+/// document is fetchable there. It carries NO section: a clinical note is written from
+/// the conversation, and nothing here transcribes one, so what a client reads is a note
+/// with no content rather than an invented summary of a patient.
+pub fn clinical_document() -> String {
+    ::serde_json::json!({"ClinicalDocumentation": {"Sections": []}}).to_string()
+}
+
+/// The subtitle file a finished job serves for one requested format, with the
+/// `Content-Type` it is stored with.
+///
+/// `SubtitleFormat` is `vtt | srt` ([`SUBTITLE_FORMAT_VALUES`]). A WebVTT file is
+/// identified by its own first line, so the one served carries that line and no cue; a
+/// SubRip file is a sequence of cues and nothing else, so one with no cue is empty.
+/// Either way it holds no caption, for the reason [`transcript_document`] gives.
+pub fn subtitle_document(format: &str) -> (String, &'static str) {
+    if format.eq_ignore_ascii_case(SUBTITLE_FORMAT_SUBRIP) {
+        return (String::new(), SUBTITLE_CONTENT_TYPE_SUBRIP);
+    }
+    // The other of the two modelled formats, [`SUBTITLE_FORMAT_WEBVTT`].
+    (
+        format!("{WEBVTT_SIGNATURE}\n\n"),
+        SUBTITLE_CONTENT_TYPE_WEBVTT,
+    )
+}
+
+/// One output object at the address `uri` names, or `None` when that URI addresses no
+/// object an object store could hold ([`output_object_address`]).
+fn output_object(uri: &str, body: String, content_type: &str) -> Option<OutputObject> {
+    let (bucket, key) = output_object_address(uri)?;
+    Some(OutputObject {
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        body,
+        content_type: content_type.to_string(),
+    })
+}
+
+/// The object a reported transcript location serves: the transcript document of the job
+/// named `job_name` at the address `uri` names.
+fn transcript_object(uri: &str, job_name: &str, status: &str) -> Option<OutputObject> {
+    output_object(
+        uri,
+        transcript_document(job_name, status),
+        OUTPUT_JSON_CONTENT_TYPE,
+    )
+}
+
+/// What a job family's record owes the output locations it REPORTS: the documents a
+/// client that follows one of those URIs fetches.
+///
+/// One trait rather than one spelling per family, so "a finished job's reported
+/// location serves the document it names" is written once over any family's record
+/// ([`due_output_objects`], [`store_job_outputs`]): the job families differ in WHICH
+/// locations a finished record reports, not in how the documents reach the object
+/// store. A family added later reaches those helpers only by implementing this.
+pub trait JobOutputs {
+    /// The objects this record's reported output locations serve — empty for a job the
+    /// clock has not finished yet, and for one that finished with no output to report
+    /// (a `FAILED` job produced none).
+    fn output_objects(&self) -> Vec<OutputObject>;
+
+    /// Whether those objects have already been stored.
+    fn outputs_stored_mut(&mut self) -> &mut bool;
+}
+
+/// The objects `record` still owes the locations it reports, taken ONCE.
+///
+/// The write a finished job owes is materialised exactly like the status transition
+/// that finished it: it fell due when the job completed, whether or not anybody called,
+/// so the first operation that finds the job finished takes the documents and stores
+/// them ([`store_job_outputs`]) — and no later call takes them again, so a reader
+/// reports the same locations without touching what is stored there and what a client
+/// fetched once stays what it fetched.
+pub fn due_output_objects<R: JobOutputs>(record: &mut R) -> Vec<OutputObject> {
+    if *record.outputs_stored_mut() {
+        return Vec::new();
+    }
+    let mut objects = record.output_objects();
+    // ONE write per location, however many times the record reports it. A request's
+    // subtitle formats are a list the model gives no length (`SubtitleFormats`), so a
+    // request may name one format over and over — and each naming is the same file:
+    // "if you select both WebVTT (vtt) and SubRip (srt) formats, two output files are
+    // generated" (model doc for `Subtitles$Formats`), so there are as many files as
+    // there are distinct formats. Deduplicating here is what keeps the work one read
+    // does bounded by how many distinct locations a job HAS rather than by how long a
+    // list the request sent.
+    let mut seen = ::std::collections::BTreeSet::new();
+    objects.retain(|object| seen.insert((object.bucket.clone(), object.key.clone())));
+    if !objects.is_empty() {
+        *record.outputs_stored_mut() = true;
+    }
+    objects
+}
+
+/// Store the documents a finished job's reported output locations serve.
+///
+/// The addresses come from the record's own projection, so a client that follows the
+/// URI a reader reported fetches the document stored here — which is what lets the
+/// canonical workflow (start a job, poll it until it is finished, then fetch its
+/// output) complete. The object store is this emulator's own Amazon S3, reached the way
+/// any emulated service reaches another: over the in-process callback ([`s3_client`] —
+/// no socket, no outbound request, no host resolution).
+///
+/// The service-managed bucket is this service's own, so a write into it stands it up
+/// first ([`create_service_managed_bucket`]); a bucket the REQUEST named belongs to the
+/// caller, who created it before starting the job, so nothing is created there.
+///
+/// Nothing is ENCRYPTED: `OutputEncryptionKMSKeyId` is recorded as asked for and the
+/// document is stored as written, because this emulator holds no key to encrypt it
+/// with.
+///
+/// Object storage answering nothing says nothing about this service's record — the
+/// control plane is real whether or not the emulator was assembled with Amazon S3 — so
+/// a failed write is logged and the operation still answers; it never turns a
+/// successful read into a refusal. It is REPORTED, though: the answer is whether every
+/// document was stored, and a caller that hears otherwise gives the documents back to
+/// the record ([`return_due_output_objects`]), because a write the object store did not
+/// take is one the job still owes.
+pub async fn store_job_outputs(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    objects: &[OutputObject],
+) -> bool {
+    if objects.is_empty() {
+        return true;
+    }
+    let client = s3_client(ctx, region);
+    let service_managed = service_managed_bucket(region);
+    let mut stood_up = false;
+    let mut stored_every_one = true;
+    for object in objects {
+        if object.bucket == service_managed && !stood_up {
+            create_service_managed_bucket(&client, &service_managed, region).await;
+            stood_up = true;
+        }
+        match client
+            .put_object()
+            .bucket(&object.bucket)
+            .key(&object.key)
+            .body(::aws_sdk_s3::primitives::ByteStream::from(
+                object.body.clone().into_bytes(),
+            ))
+            .content_type(object.content_type.as_str())
+            .send()
+            .await
+        {
+            Ok(_) => ::tracing::info!(
+                bucket = ?object.bucket,
+                key = ?object.key,
+                "the document this job's reported output location names was stored"
+            ),
+            Err(error) => {
+                stored_every_one = false;
+                ::tracing::warn!(
+                    bucket = ?object.bucket,
+                    key = ?object.key,
+                    detail = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                    "the document this job's reported output location names was not stored"
+                );
+            }
+        }
+    }
+    stored_every_one
+}
+
+/// Give the documents a write did NOT store back to `record`, so the next operation
+/// that reads the job takes them again ([`due_output_objects`]).
+///
+/// What the job owes its reported locations does not stop being owed because one
+/// attempt to store it failed — the bucket the request named may not have existed yet,
+/// or the emulator may have been assembled with no object store at that moment — so the
+/// write stays due rather than being consumed by the attempt. `None` is the job having
+/// been deleted while the write was in flight, which owes nothing.
+pub fn return_due_output_objects<R: JobOutputs>(record: Option<&mut R>) {
+    if let Some(record) = record {
+        *record.outputs_stored_mut() = false;
+    }
+}
+
+// The four job families' output sets, together so what each one owes its reported
+// locations can be read beside the others. Each is a projection of the SAME members the
+// family's reader reports, so no location is written that a client was not told about,
+// and none is reported that holds nothing.
+
+impl JobOutputs for TranscriptionJobRecord {
+    /// The transcript this job produced, at each location it reports one at
+    /// ([`transcript_outputs`]), plus one subtitle file per requested format.
+    fn output_objects(&self) -> Vec<OutputObject> {
+        let Some(transcript) = self.transcript.as_ref() else {
+            return Vec::new();
+        };
+        let mut objects: Vec<OutputObject> = [
+            transcript.transcript_file_uri.as_deref(),
+            transcript.redacted_transcript_file_uri.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|uri| transcript_object(uri, &self.name, &self.status))
+        .collect();
+        // "Your subtitle file is stored in the same location as your transcript. If you
+        // specified both WebVTT and SubRip subtitle formats, two URIs are provided"
+        // (model doc for `SubtitlesOutput$SubtitleFileUris`): one file per requested
+        // format, each at the location reported for that format — the two lists are
+        // built in one order ([`Self::advance_clock`]), so they pair up.
+        if let Some(subtitles) = self.subtitles.as_ref() {
+            let formats = subtitles.formats.iter().flatten();
+            let uris = subtitles.subtitle_file_uris.iter().flatten();
+            objects.extend(formats.zip(uris).filter_map(|(format, uri)| {
+                let (body, content_type) = subtitle_document(format);
+                output_object(uri, body, content_type)
+            }));
+        }
+        objects
+    }
+
+    fn outputs_stored_mut(&mut self) -> &mut bool {
+        &mut self.outputs_stored
+    }
+}
+
+impl JobOutputs for MedicalTranscriptionJobRecord {
+    /// The one transcript this family reports, in the bucket the start named.
+    fn output_objects(&self) -> Vec<OutputObject> {
+        self.transcript
+            .as_ref()
+            .and_then(|transcript| transcript.transcript_file_uri.as_deref())
+            .and_then(|uri| transcript_object(uri, &self.name, &self.status))
+            .into_iter()
+            .collect()
+    }
+
+    fn outputs_stored_mut(&mut self) -> &mut bool {
+        &mut self.outputs_stored
+    }
+}
+
+impl JobOutputs for CallAnalyticsJobRecord {
+    /// The transcript of the call, at each location this job reports one at
+    /// ([`transcript_outputs`]). No analysis of the call is in it, for the reason
+    /// [`transcript_document`] gives: nothing listened to it.
+    fn output_objects(&self) -> Vec<OutputObject> {
+        let Some(transcript) = self.transcript.as_ref() else {
+            return Vec::new();
+        };
+        [
+            transcript.transcript_file_uri.as_deref(),
+            transcript.redacted_transcript_file_uri.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|uri| transcript_object(uri, &self.name, &self.status))
+        .collect()
+    }
+
+    fn outputs_stored_mut(&mut self) -> &mut bool {
+        &mut self.outputs_stored
+    }
+}
+
+impl JobOutputs for MedicalScribeJobRecord {
+    /// Both files this family reports: the transcript and the clinical note.
+    fn output_objects(&self) -> Vec<OutputObject> {
+        let Some(output) = self.output.as_ref() else {
+            return Vec::new();
+        };
+        [
+            transcript_object(&output.transcript_file_uri, &self.name, &self.status),
+            output_object(
+                &output.clinical_document_uri,
+                clinical_document(),
+                OUTPUT_JSON_CONTENT_TYPE,
+            ),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    fn outputs_stored_mut(&mut self) -> &mut bool {
+        &mut self.outputs_stored
     }
 }
 

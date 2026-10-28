@@ -324,7 +324,7 @@ pub fn new_resource_id() -> String {
 pub fn template_object_identifier(template_id: &str) -> String {
     let digits: Vec<u8> = template_id.bytes().filter(u8::is_ascii_hexdigit).collect();
     let mut oid = String::from(AD_TEMPLATE_OID_ARC);
-    for chunk in digits.chunks_exact(4).take(7) {
+    for chunk in digits.as_chunks::<4>().0.iter().take(7) {
         let component = std::str::from_utf8(chunk)
             .ok()
             .and_then(|text| u16::from_str_radix(text, 16).ok())
