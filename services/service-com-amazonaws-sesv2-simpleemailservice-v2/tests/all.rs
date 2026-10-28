@@ -93,6 +93,8 @@ mod message_insights;
 mod metric_data;
 #[path = "all/multi_region_endpoints.rs"]
 mod multi_region_endpoints;
+#[path = "all/recommendations.rs"]
+mod recommendations;
 #[path = "all/reputation_entities.rs"]
 mod reputation_entities;
 #[path = "all/reputation_entity_policy.rs"]

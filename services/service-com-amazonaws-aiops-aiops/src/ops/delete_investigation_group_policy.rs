@@ -157,27 +157,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
 
         let mut store = state.lock();
-        // Which resource is missing decides which 404 this answers, the same way
-        // `GetInvestigationGroupPolicy` reports it: an absent GROUP is reported as the
-        // absent group, and a group that exists while carrying no policy is reported
-        // as the absent policy, so a client can tell the two conditions apart.
-        let group = store.group_mut(&input.identifier, &region).ok_or_else(|| {
-            DeleteInvestigationGroupPolicyErrorModeled::ResourceNotFoundException(
-                crate::state::investigation_group_not_found(),
-            )
-        })?;
-        // Taking the document is the whole delete: the group itself survives, and a
-        // later read of this policy must report it absent. A group that never had a
-        // policy stored has nothing to remove, which is the policy's own 404 rather
-        // than a success that removed nothing.
-        if group.policy.take().is_none() {
-            return Err(
-                DeleteInvestigationGroupPolicyErrorModeled::ResourceNotFoundException(
-                    crate::state::investigation_group_policy_not_found(),
-                )
-                .into(),
-            );
-        }
+        // Resolving the identifier and deciding which of the two resources a 404
+        // reports absent is the store's own two-step, which every policy operation
+        // takes the same way: it hands back a group that carries a policy — so there
+        // is a document to remove — or the modelled not-found answer for whichever
+        // resource is the missing one.
+        let group = store
+            .policy_group_mut(&input.identifier, &region)
+            .map_err(DeleteInvestigationGroupPolicyErrorModeled::ResourceNotFoundException)?;
+        // Dropping the document is the whole delete: the group itself survives, and a
+        // later read of this policy must report it absent.
+        group.policy = None;
         group.touch(&principal, modified_at);
 
         Ok(DeleteInvestigationGroupPolicyOutput {})
