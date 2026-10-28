@@ -51,7 +51,7 @@ use ::aws_smithy_schema_server::constraints::{
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    Code, DefinitionS3Location, EncryptionConfiguration, LoggingConfiguration,
+    Code, ConflictException, DefinitionS3Location, EncryptionConfiguration, LoggingConfiguration,
     NetworkConfiguration, ResourceNotFoundException, ScheduleConfiguration, ValidationException,
     ValidationExceptionField, ENCRYPTION_TYPE_VALUES,
 };
@@ -930,6 +930,100 @@ impl IdempotencyLedger {
             .retain(|_, result| result.workflow_arn() != workflow_arn);
         let live = &self.by_key;
         self.oldest_first.retain(|key| live.contains_key(key));
+    }
+}
+
+/// The `@idempotencyToken` ledger of ONE operation at ONE regional endpoint, and the
+/// whole rule a handler follows with the `ClientToken` a request carries.
+///
+/// Every operation of this service that admits a token takes the same four steps with
+/// it — build the per-operation, per-region ledger key, look the token up, refuse a
+/// first use whose request digests differently, otherwise answer from the record that
+/// first use left — so the four live HERE, once, parameterised by the only two things
+/// an operation differs in: the operation the token was presented to and the
+/// `ResourceType` its refusal reports. A change to the key shape, to the comparison or
+/// to the identity a conflict reports therefore reaches every such operation at once.
+///
+/// The handler keeps only what is its own: the record it writes ([`IdempotentResult`])
+/// and how it answers from a replayed one.
+#[derive(Debug, Clone, Copy)]
+pub struct TokenLedger<'a> {
+    /// The operation the token was presented to. It leads the ledger key — so one
+    /// token used on two operations records two entries — and names the operation a
+    /// mismatch refusal reports.
+    operation: &'static str,
+    /// The `ResourceType` a mismatch refusal reports: the kind of resource this
+    /// operation's first use of a token produced.
+    resource_type: &'static str,
+    /// The endpoint the token was presented at, because a token presented at one
+    /// regional endpoint says nothing about what another endpoint produced.
+    region: &'a str,
+}
+
+impl<'a> TokenLedger<'a> {
+    /// The token ledger of `operation` at `region`'s endpoint, whose mismatch refusals
+    /// report `resource_type`.
+    pub const fn of(operation: &'static str, resource_type: &'static str, region: &'a str) -> Self {
+        Self {
+            operation,
+            resource_type,
+            region,
+        }
+    }
+
+    /// The key a `ClientToken` of this operation and this endpoint is remembered
+    /// under, so one token used on two different operations — or at two different
+    /// regional endpoints — records two entries.
+    pub fn key(&self, client_token: &str) -> String {
+        format!("{}:{}:{}", self.operation, self.region, client_token)
+    }
+
+    /// What the token this request carries already produced: `Some(record)` to replay
+    /// that first answer from, or `None` when the request carries no token or carries
+    /// one nothing is remembered under, so the call does its work.
+    ///
+    /// A token remembered for a request that digests differently is the modelled
+    /// `ConflictException` instead, naming the token, the operation it was first used
+    /// for and the identity of the resource that first use produced; the handler wraps
+    /// it in its own error variant, which is the one thing it cannot share.
+    pub fn replay(
+        &self,
+        ledger: &IdempotencyLedger,
+        client_token: Option<&str>,
+        request_fingerprint: &str,
+    ) -> Result<Option<IdempotentResult>, ConflictException> {
+        let Some(token) = client_token else {
+            return Ok(None);
+        };
+        let Some(recorded) = ledger.get(&self.key(token)) else {
+            return Ok(None);
+        };
+        if recorded.request_fingerprint() != request_fingerprint {
+            return Err(ConflictException {
+                message: format!(
+                    "ClientToken {token} was already used for a {} request with different \
+                     parameters",
+                    self.operation
+                ),
+                resource_id: recorded.workflow_arn().to_string(),
+                resource_type: self.resource_type.to_string(),
+            });
+        }
+        Ok(Some(recorded.clone()))
+    }
+
+    /// Remember `result` under the token this request carries, so repeating the token
+    /// replays that answer through [`Self::replay`]. A request carrying no token
+    /// records nothing: there is nothing for a later call to present.
+    pub fn record(
+        &self,
+        ledger: &mut IdempotencyLedger,
+        client_token: Option<&str>,
+        result: IdempotentResult,
+    ) {
+        if let Some(token) = client_token {
+            ledger.record(self.key(token), result);
+        }
     }
 }
 
