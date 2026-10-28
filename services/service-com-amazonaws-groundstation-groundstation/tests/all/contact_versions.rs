@@ -22,6 +22,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_groundstation_groundstation::state::{self, Contact};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::ephemeris_catalog::program_track_ephemeris;
 use crate::scheduling_loop::{
     create_mission_profile, harness_with_engine, send, Reply, AFTER_SETTLE, REGION,
 };
@@ -142,6 +143,13 @@ async fn each_accepted_update_appends_the_next_version_and_applies_what_it_named
     let third_satellite = satellite_arn("33333333-3333-4333-8333-333333333333");
     let contact_id = reserve_contact(&router, &profile_arn, Some(&first_satellite)).await;
 
+    // One ephemeris of each form a program track may name, stored through
+    // `CreateEphemeris`: a program track is flown from an ephemeris of this account, so an
+    // override naming one has to name a stored one of that form.
+    let az_el_ephemeris = program_track_ephemeris(&router, "azEl").await;
+    let oem_ephemeris = program_track_ephemeris(&router, "oem").await;
+    let tle_ephemeris = program_track_ephemeris(&router, "tle").await;
+
     // One row per form an update takes, chained onto ONE contact so each row also tests
     // what the row before it left behind: which members the request names, and which
     // member of `ProgramTrackSettings` the overrides select (`azEl`, `oem` and `tle` —
@@ -158,11 +166,11 @@ async fn each_accepted_update_appends_the_next_version_and_applies_what_it_named
         (
             "trackingOverrides alone, azEl program track",
             json!({"trackingOverrides": {"programTrackSettings": {
-                "azEl": {"ephemerisId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"},
+                "azEl": {"ephemerisId": az_el_ephemeris},
             }}}),
             Some(second_satellite.clone()),
             Some(json!({"programTrackSettings": {
-                "azEl": {"ephemerisId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"},
+                "azEl": {"ephemerisId": az_el_ephemeris},
             }})),
         ),
         (
@@ -170,22 +178,22 @@ async fn each_accepted_update_appends_the_next_version_and_applies_what_it_named
             json!({
                 "satelliteArn": third_satellite,
                 "trackingOverrides": {"programTrackSettings": {
-                    "oem": {"ephemerisId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"},
+                    "oem": {"ephemerisId": oem_ephemeris},
                 }},
             }),
             Some(third_satellite.clone()),
             Some(json!({"programTrackSettings": {
-                "oem": {"ephemerisId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"},
+                "oem": {"ephemerisId": oem_ephemeris},
             }})),
         ),
         (
             "trackingOverrides alone, tle program track",
             json!({"trackingOverrides": {"programTrackSettings": {
-                "tle": {"ephemerisId": "cccccccc-cccc-4ccc-8ccc-cccccccccccc"},
+                "tle": {"ephemerisId": tle_ephemeris},
             }}}),
             Some(third_satellite.clone()),
             Some(json!({"programTrackSettings": {
-                "tle": {"ephemerisId": "cccccccc-cccc-4ccc-8ccc-cccccccccccc"},
+                "tle": {"ephemerisId": tle_ephemeris},
             }})),
         ),
         (

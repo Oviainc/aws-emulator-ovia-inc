@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteGroupPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteGroupPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteGroupPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the inline policy the request names from the group it names, so the document
+//! `PutGroupPolicy` embedded is gone: `GetGroupPolicy` stops resolving it,
+//! `ListGroupPolicies` stops reporting it, and it no longer holds the group back from
+//! `DeleteGroup`. A group the account does not hold, or a policy name the group does not
+//! embed, is a `NoSuchEntityException`.
 //!
 //! ## Shape of an operation
 //!
@@ -166,20 +163,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
+        // `ctx` carries request metadata only; nothing about this deletion depends on it —
+        // IAM is global, and both the group and the policy are named by the request.
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteGroupPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteGroupPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteGroupPolicy"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteGroupPolicyErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        let not_found = |what: String| -> DeleteGroupPolicyError {
+            DeleteGroupPolicyErrorModeled::NoSuchEntityException(NoSuchEntityException {
+                message: Some(what),
+            })
+            .into()
+        };
+
+        // The group is named (friendly name, not ARN) and IAM entity names "are not
+        // distinguished by case", so the case-folded name is the identity. A name the
+        // account holds no group under "referenced a resource entity that does not
+        // exist", worded as `PutGroupPolicy` and `GetGroupPolicy` word the same absence.
+        let group_key = crate::state::name_key(&input.group_name);
+        if !store.groups.contains_key(&group_key) {
+            return Err(not_found(format!(
+                "The group with name {} cannot be found.",
+                input.group_name
+            )));
+        }
+
+        // "Deletes the specified inline policy that is embedded in the specified IAM
+        // group": the embedded document goes, so the group no longer depends on it —
+        // `GetGroupPolicy` stops resolving it, `ListGroupPolicies` stops reporting it,
+        // and `DeleteGroup`'s conflict guard, which reads this very map, no longer counts
+        // it against the group. The policy name is case-folded for the same reason the
+        // group name is, and a name the group does not embed "referenced a resource
+        // entity that does not exist".
+        let policy_key = crate::state::name_key(&input.policy_name);
+        let deleted = store
+            .group_inline_policies
+            .get_mut(&group_key)
+            .is_some_and(|policies| policies.remove(&policy_key).is_some());
+        if !deleted {
+            return Err(not_found(format!(
+                "The group policy with name {} cannot be found.",
+                input.policy_name
+            )));
+        }
+
+        // A group embedding no inline policy carries no policy map either: an empty one
+        // left behind is bookkeeping for a dependency that no longer exists.
+        if store
+            .group_inline_policies
+            .get(&group_key)
+            .is_some_and(::std::collections::BTreeMap::is_empty)
+        {
+            store.group_inline_policies.remove(&group_key);
+        }
+
+        Ok(DeleteGroupPolicyOutput)
     }
 }
