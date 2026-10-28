@@ -235,28 +235,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // order is TOTAL, which is what `paginate` keys its cursor on.
         listed.sort_by(|left, right| left.0.cmp(&right.0));
 
-        // The same cursor the other listings of this service hand out. `None` means the
+        // The same cursor the other listings of this service hand out. `Err` means the
         // `NextToken` is not one this service minted for THIS listing, which is a bad
         // request rather than "start from the beginning" — answering the first page again
-        // would silently repeat entries the caller already walked.
-        let Some(page) = crate::state::paginate(
+        // would silently repeat entries the caller already walked. The sentence that
+        // reports it is the shared cursor's own, so every listing of this service states
+        // the same rule in the same words.
+        let page = match crate::state::paginate(
             listed,
             crate::state::LISTING_EXTENSION_ASSOCIATIONS,
             input.next_token.as_deref(),
             input.max_results,
-        ) else {
-            return Err(ListExtensionAssociationsErrorModeled::BadRequestException(
-                BadRequestException {
-                    message: Some(
-                        "NextToken is not a token this service issued for an extension \
-                         association listing."
-                            .to_string(),
-                    ),
-                    reason: None,
-                    details: None,
-                },
-            )
-            .into());
+        ) {
+            Ok(page) => page,
+            Err(message) => {
+                return Err(ListExtensionAssociationsErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(message),
+                        reason: None,
+                        details: None,
+                    },
+                )
+                .into())
+            }
         };
 
         Ok(ListExtensionAssociationsOutput {

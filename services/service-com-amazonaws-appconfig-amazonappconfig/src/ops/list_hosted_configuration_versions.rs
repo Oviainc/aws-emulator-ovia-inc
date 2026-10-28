@@ -214,20 +214,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
-        let Some(page) = crate::state::paginate(
+        let page = match crate::state::paginate(
             ordered,
             crate::state::LISTING_HOSTED_CONFIGURATION_VERSIONS,
             input.next_token.as_deref(),
             input.max_results,
-        ) else {
-            return Err(ListHostedConfigurationVersionsErrorModeled::BadRequestException(
-                BadRequestException {
-                    message: Some(crate::state::next_token_not_issued()),
-                    reason: None,
-                    details: None,
-                },
-            )
-            .into());
+        ) {
+            Ok(page) => page,
+            Err(message) => {
+                return Err(
+                    ListHostedConfigurationVersionsErrorModeled::BadRequestException(
+                        BadRequestException {
+                            message: Some(message),
+                            reason: None,
+                            details: None,
+                        },
+                    )
+                    .into(),
+                )
+            }
         };
 
         Ok(ListHostedConfigurationVersionsOutput {

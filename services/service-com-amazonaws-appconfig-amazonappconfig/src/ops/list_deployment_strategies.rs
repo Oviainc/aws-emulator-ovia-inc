@@ -148,20 +148,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             "the catalogue must arrive in ascending key order for a cursor to resume it"
         );
 
-        let Some(page) = crate::state::paginate(
+        let page = match crate::state::paginate(
             ordered,
             crate::state::LISTING_DEPLOYMENT_STRATEGIES,
             input.next_token.as_deref(),
             input.max_results,
-        ) else {
-            return Err(ListDeploymentStrategiesErrorModeled::BadRequestException(
-                BadRequestException {
-                    message: Some(crate::state::next_token_not_issued()),
-                    reason: None,
-                    details: None,
-                },
-            )
-            .into());
+        ) {
+            Ok(page) => page,
+            Err(message) => {
+                return Err(ListDeploymentStrategiesErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(message),
+                        reason: None,
+                        details: None,
+                    },
+                )
+                .into())
+            }
         };
 
         Ok(ListDeploymentStrategiesOutput {

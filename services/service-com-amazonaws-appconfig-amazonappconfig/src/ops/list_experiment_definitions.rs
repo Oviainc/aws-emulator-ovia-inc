@@ -238,24 +238,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // order is TOTAL, which is what `paginate` keys its cursor on.
         ordered.sort_by(|(left, _), (right, _)| left.cmp(right));
 
-        // The same cursor every listing of this service hands out. `None` means the
+        // The same cursor every listing of this service hands out. `Err` means the
         // `NextToken` is not one this listing minted, which is a bad request rather than
         // "start from the beginning": answering the first page again would silently repeat
-        // entries the caller already walked.
-        let Some(page) = crate::state::paginate(
+        // entries the caller already walked. The sentence that reports it is the shared
+        // cursor's own, so every listing words a token it will not resume identically.
+        let page = match crate::state::paginate(
             ordered,
             crate::state::LISTING_EXPERIMENT_DEFINITIONS,
             input.next_token.as_deref(),
             input.max_results,
-        ) else {
-            return Err(ListExperimentDefinitionsErrorModeled::BadRequestException(
-                BadRequestException {
-                    message: Some(crate::state::next_token_not_issued()),
-                    reason: None,
-                    details: None,
-                },
-            )
-            .into());
+        ) {
+            Ok(page) => page,
+            Err(message) => {
+                return Err(ListExperimentDefinitionsErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(message),
+                        reason: None,
+                        details: None,
+                    },
+                )
+                .into())
+            }
         };
 
         Ok(ListExperimentDefinitionsOutput {
