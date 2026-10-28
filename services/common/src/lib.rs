@@ -197,6 +197,9 @@ pub mod rds_cluster_parameters;
 /// reads to resolve the job ARN its callers carry.
 pub mod agentic_rft_jobs;
 pub mod arn;
+/// Serving an operation AUDITED: the ONE wrapper that records every call a service serves
+/// as a management event, so no operation has to record its own and none is forgotten.
+pub mod audited_operation;
 pub mod bedrock;
 /// The ONE definition of the IAM principal this emulator's own long-term credential speaks
 /// for: the user STS reports as the caller and IAM holds among the account's users, so the

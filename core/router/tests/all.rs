@@ -467,6 +467,10 @@ mod cloudformation_provisions_route53resolver_rules;
 mod query_wire;
 #[path = "all/rds_docdb_neptune_signing_name_routing.rs"]
 mod rds_docdb_neptune_signing_name_routing;
+// Declared beside its `rds_*` siblings, in sorted position: this is the quiet span the
+// comment above names, and not the tail every concurrently landing suite appends to.
+#[path = "all/rds_management_events.rs"]
+mod rds_management_events;
 #[path = "all/rds_query_front_door.rs"]
 mod rds_query_front_door;
 #[path = "all/rds_shared_query_front_door_routing.rs"]

@@ -212,10 +212,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "If nextToken is returned, there are more results available. The value of
         // nextToken is a unique pagination token for each page": a token that is not
-        // one this service issued is the modelled `InvalidToken`.
+        // one this service issued is the modelled `InvalidToken`, worded as the
+        // history API words it — the condition alone, see
+        // `crate::state::invalid_history_token_message`.
         let Some(offset) = crate::state::page_offset(input.next_token.as_deref()) else {
             return Err(GetExecutionHistoryErrorModeled::InvalidToken(InvalidToken {
-                message: Some(crate::state::invalid_token_message()),
+                message: Some(crate::state::invalid_history_token_message()),
             })
             .into());
         };
