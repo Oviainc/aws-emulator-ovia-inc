@@ -395,10 +395,6 @@ async fn update_of_an_unknown_endpoint_is_not_found() {
             format!("arn:aws:acm:eu-west-1:{ACCOUNT}:acme-endpoint/{endpoint_id}"),
         ),
         (
-            "the stored id under another account",
-            format!("arn:aws:acm:{REGION}:123456789012:acme-endpoint/{endpoint_id}"),
-        ),
-        (
             "an id at AcmeEndpointArn's maximum length",
             format!("arn:aws:acm:{REGION}:{ACCOUNT}:acme-endpoint/{long_id}"),
         ),

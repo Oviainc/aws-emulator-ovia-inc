@@ -25,6 +25,8 @@ mod channel_configuration_updates;
 mod channel_lifecycle;
 #[path = "all/channel_listing.rs"]
 mod channel_listing;
+#[path = "all/channel_removal.rs"]
+mod channel_removal;
 #[path = "all/data_records.rs"]
 mod data_records;
 #[path = "all/encrypted_records.rs"]
