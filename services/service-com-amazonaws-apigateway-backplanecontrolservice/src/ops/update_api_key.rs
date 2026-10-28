@@ -14,9 +14,8 @@
 //!
 //! A path this operation cannot apply is refused the way API Gateway words that refusal
 //! for this resource: the rejected path quoted, the `op` of the same `patchOperations`
-//! entry, and the paths the operation accepts (`SUPPORTED_PATCH_PATHS` below) — so a
-//! caller reading the message learns which entry of the batch was bad and what it could
-//! have sent instead.
+//! entry, and the paths THAT op accepts (`PATCH_PATHS` below) — so a caller reading the
+//! message learns which entry of the batch was bad and what it could have sent instead.
 //!
 //! ## Shape of an operation
 //!
@@ -103,30 +102,32 @@ use std::collections::BTreeSet;
 
 use crate::state::{
     patch_bool, patch_optional_string, patch_string_set, ApiKeyEntry, InvalidPathRefusal, Patch,
-    PatchFailure, PatchOpKind, MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS,
+    PatchFailure, PatchOpKind, SupportedPatchPaths, MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS,
 };
 
-// The paths `UpdateApiKey` accepts for a `replace` are the `ApiKey`'s single-valued
-// updateable members, the ones the `Replace` arm below has a case for: `id`, `value`,
-// `createdDate` and `lastUpdatedDate` are not patchable (the service assigns them) and
-// `tags` are changed through `TagResource`/`UntagResource`.
-//
-// The paths it accepts for an `add` or a `remove` are the key's COLLECTION members, which
-// are what an element is added to or removed from, so the single-valued members take a
-// `replace` and only those two take an `add` or a `remove`.
-
-/// The paths this operation names in its own refusal of a patch path it cannot apply,
-/// in the order API Gateway prints them — the `ApiKey`'s updateable single-valued
-/// members, which are the cases the `Replace` arm of [`apply_patch`] has.
-const SUPPORTED_PATCH_PATHS: &[&str] = &["/description", "/enabled", "/name", "/customerId"];
+/// The paths an `ApiKey` can be addressed by, per `op`, in the order API Gateway prints
+/// them in its refusal.
+///
+/// A `replace` names one of the key's updateable SINGLE-VALUED members, which are the
+/// cases the `Replace` arm of [`apply_patch`] has: `id`, `value`, `createdDate` and
+/// `lastUpdatedDate` are not patchable (the service assigns them) and `tags` are changed
+/// through `TagResource`/`UntagResource`.
+///
+/// An `add` or a `remove` names one of its MULTI-VALUED members instead — the ones an
+/// element is added to or removed from, which are the cases the `Add | Remove` arm has —
+/// so the two ops accept disjoint sets, and a refusal of either enumerates its own.
+const PATCH_PATHS: SupportedPatchPaths = SupportedPatchPaths {
+    add: &["/stages", "/labels"],
+    remove: &["/stages", "/labels"],
+    replace: &["/description", "/enabled", "/name", "/customerId"],
+};
 
 /// How this operation words a refusal of a patch `path` it cannot apply: the path, the
-/// `op` that named it and the paths it does accept. Reaches every path refusal the
+/// `op` that named it and the paths THAT op does accept. Reaches every path refusal the
 /// request goes on to produce, so one unapplicable pointer reads the same whether it
 /// names no member of the key, reaches into one of its single-valued members, or is no
 /// JSON Pointer at all.
-const INVALID_PATH: InvalidPathRefusal =
-    InvalidPathRefusal::PathOpAndSupported(SUPPORTED_PATCH_PATHS);
+const INVALID_PATH: InvalidPathRefusal = InvalidPathRefusal::PathOpAndSupported(PATCH_PATHS);
 
 /// Apply one patch to a COPY of a stored key.
 ///
@@ -137,31 +138,31 @@ fn apply_patch(
     patch: &Patch,
     apis: &BTreeSet<String>,
 ) -> Result<(), PatchFailure> {
+    // `move`, `copy` and `test` name no member of this resource: "Not all valid
+    // operations are supported for a given resource" (`PatchOperation$op`), so there is
+    // no path set for them to be checked against and the op itself is what is refused.
+    if PATCH_PATHS.for_op(patch.op).is_none() {
+        return Err(patch.unsupported_op());
+    }
+    // The set the refusal enumerates IS the set accepted here, so the two cannot drift: a
+    // path outside the submitted op's own entry of `PATCH_PATHS` is refused before any
+    // member case below is reached, and a case added without the path is refused too.
+    if !PATCH_PATHS.accepts(patch) {
+        return Err(patch.unsupported_path());
+    }
     match patch.op {
         // Which paths an op may name depends on the op: a single-valued member is
         // replaced, a collection has elements added and removed.
-        PatchOpKind::Replace => {
-            // The set the refusal enumerates IS the set accepted here, so the two cannot
-            // drift: a path outside `SUPPORTED_PATCH_PATHS` is refused before any member
-            // case below is reached, and a case added without the path is refused too.
-            if !SUPPORTED_PATCH_PATHS.contains(&patch.path.as_str()) {
-                return Err(patch.unsupported_path());
-            }
-            match patch.member() {
-                "name" => patch_optional_string(&mut entry.name, patch, MAX_STRING_CHARS),
-                "description" => {
-                    patch_optional_string(&mut entry.description, patch, MAX_STRING_CHARS)
-                }
-                "customerId" => {
-                    patch_optional_string(&mut entry.customer_id, patch, MAX_STRING_CHARS)
-                }
-                "enabled" => patch_bool(&mut entry.enabled, patch),
-                // Unreachable while the constant and these cases name the same members,
-                // which is the point of the gate above: a path added to the constant
-                // without a case here is refused rather than silently accepted.
-                _ => Err(patch.unsupported_path()),
-            }
-        }
+        PatchOpKind::Replace => match patch.member() {
+            "name" => patch_optional_string(&mut entry.name, patch, MAX_STRING_CHARS),
+            "description" => patch_optional_string(&mut entry.description, patch, MAX_STRING_CHARS),
+            "customerId" => patch_optional_string(&mut entry.customer_id, patch, MAX_STRING_CHARS),
+            "enabled" => patch_bool(&mut entry.enabled, patch),
+            // Unreachable while the table and these cases name the same members, which
+            // is the point of the gate above: a path added to the table without a case
+            // here is refused rather than silently accepted.
+            _ => Err(patch.unsupported_path()),
+        },
         PatchOpKind::Add | PatchOpKind::Remove => match patch.member() {
             // One entry names one stage of one API, which is how the member is stored
             // and how `stageKeys` reports it: `<restApiId>/<stageName>`.
@@ -202,8 +203,8 @@ fn apply_patch(
             }
             _ => Err(patch.unsupported_path()),
         },
-        // `move`, `copy` and `test` name no member of this resource: "Not all valid
-        // operations are supported for a given resource" (`PatchOperation$op`).
+        // Unreachable: an op with no path set at all was refused by the gate above, and
+        // this arm keeps the match exhaustive over the model's `Op` enum.
         _ => Err(patch.unsupported_op()),
     }
 }

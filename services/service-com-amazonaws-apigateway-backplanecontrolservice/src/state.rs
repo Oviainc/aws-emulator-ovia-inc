@@ -2233,6 +2233,53 @@ pub enum PatchFailure {
     Conflict(String),
 }
 
+/// Which paths ONE resource can be addressed by, PER `op`.
+///
+/// Which paths a patch may name is a property of the op as much as of the resource:
+/// a single-valued member is `replace`d, while an element is `add`ed to or `remove`d from
+/// a multi-valued one, so the two ops accept disjoint sets of pointers. A resource that
+/// enumerates its permitted paths in a refusal ([`InvalidPathRefusal::PathOpAndSupported`])
+/// therefore enumerates the set belonging to the op the request actually sent, and a
+/// handler gates the same op's edits on that same set — one table for both, so the message
+/// cannot name a path the handler refuses, nor omit one it accepts.
+#[derive(Debug, Clone, Copy)]
+pub struct SupportedPatchPaths {
+    /// The paths an `add` names: the resource's multi-valued members, one element at a
+    /// time.
+    pub add: &'static [&'static str],
+    /// The paths a `remove` names, which are multi-valued too — an element goes away.
+    pub remove: &'static [&'static str],
+    /// The paths a `replace` names: the resource's updateable single-valued members.
+    pub replace: &'static [&'static str],
+}
+
+impl SupportedPatchPaths {
+    /// The paths `op` may name on this resource, in the order the service prints them —
+    /// or `None` for an op the resource supports NO path for, which is a refusal of the
+    /// op rather than of the path ([`Patch::unsupported_op`]).
+    pub fn for_op(self, op: PatchOpKind) -> Option<&'static [&'static str]> {
+        match op {
+            PatchOpKind::Add => Some(self.add),
+            PatchOpKind::Remove => Some(self.remove),
+            PatchOpKind::Replace => Some(self.replace),
+            PatchOpKind::Move | PatchOpKind::Copy | PatchOpKind::Test => None,
+        }
+    }
+
+    /// Whether this resource accepts `patch`: its `op` must be one the resource supports
+    /// at all, and the member its `path` names must be in that op's own set. Membership
+    /// is by the member the pointer's FIRST reference token names, so an element of a
+    /// multi-valued member (`/stages/abcde12345~1prod`) is accepted exactly where the
+    /// member itself (`/stages`) is.
+    pub fn accepts(self, patch: &Patch) -> bool {
+        self.for_op(patch.op).is_some_and(|paths| {
+            paths
+                .iter()
+                .any(|supported| supported.strip_prefix('/') == Some(patch.member()))
+        })
+    }
+}
+
 /// How ONE operation words its refusal of a patch `path` it cannot apply.
 ///
 /// API Gateway does not word that refusal the same way for every resource: for some of
@@ -2248,24 +2295,32 @@ pub enum PatchFailure {
 pub enum InvalidPathRefusal {
     /// The fixed sentence and the path the request sent, and nothing else.
     PathOnly,
-    /// The path quoted, the `op` of the same `patchOperations` entry, and the paths the
-    /// operation accepts — in the order the service itself prints them, which is why the
-    /// list is given rather than derived from a handler's match arms.
-    PathOpAndSupported(&'static [&'static str]),
+    /// The path quoted, the `op` of the same `patchOperations` entry, and the paths that
+    /// op accepts on the resource — read from the resource's own [`SupportedPatchPaths`]
+    /// table, in the order the service itself prints them, which is why the table is
+    /// given rather than derived from a handler's match arms.
+    PathOpAndSupported(SupportedPatchPaths),
 }
 
 impl InvalidPathRefusal {
     /// The `BadRequestException` message for `path`, named by `op`.
+    ///
+    /// The enumerated set is the one belonging to `op`, so the sentence never offers a
+    /// path the op that was submitted would refuse; an op the resource supports no path
+    /// for has nothing to enumerate and is refused as an op instead.
     fn message(self, path: &str, op: PatchOpKind) -> String {
         match self {
             Self::PathOnly => invalid_patch_path(path),
-            // The two spaces after `path` are the service's own, as is the bracketed,
-            // comma-separated list.
-            Self::PathOpAndSupported(supported) => format!(
-                "Invalid patch path  '{path}' specified for op '{}'. Must be one of: [{}]",
-                op.as_str(),
-                supported.join(", ")
-            ),
+            Self::PathOpAndSupported(supported) => match supported.for_op(op) {
+                // The two spaces after `path` are the service's own, as is the bracketed,
+                // comma-separated list.
+                Some(paths) => format!(
+                    "Invalid patch path  '{path}' specified for op '{}'. Must be one of: [{}]",
+                    op.as_str(),
+                    paths.join(", ")
+                ),
+                None => INVALID_PATCH_OPERATION.to_string(),
+            },
         }
     }
 }
@@ -2482,14 +2537,10 @@ impl Patch {
     /// "Not all valid operations are supported for a given resource. Support of the
     /// operations depends on specific operational contexts. Attempts to apply an
     /// unsupported operation on a resource will return an error message"
-    /// (`PatchOperation$op`): the ops these resources support are `add`, `remove` and
-    /// `replace` — `move`, `copy` and `test` name nothing on them — and a recorded AWS
-    /// refusal of a `move` says exactly `Invalid patch operation specified. Must be
-    /// 'add'|'remove'|'replace'`, which is the rule reproduced here.
+    /// (`PatchOperation$op`): see [`INVALID_PATCH_OPERATION`] for the ops these
+    /// resources support and the sentence they refuse the others with.
     pub fn unsupported_op(&self) -> PatchFailure {
-        PatchFailure::BadRequest(
-            "Invalid patch operation specified. Must be 'add'|'remove'|'replace'".to_string(),
-        )
+        PatchFailure::BadRequest(INVALID_PATCH_OPERATION.to_string())
     }
 
     /// The entry of a collection member this patch names.
@@ -2528,6 +2579,17 @@ impl Patch {
 pub fn invalid_patch_path(path: &str) -> String {
     format!("Invalid patch path {path}")
 }
+
+/// The `BadRequestException` message for an `op` the targeted resource supports no path
+/// for.
+///
+/// The ops these resources support are `add`, `remove` and `replace` — `move`, `copy` and
+/// `test` name nothing on them — and a recorded AWS refusal of a `move` says exactly this,
+/// naming the three it does take and nothing about the path that rode in on it. One copy
+/// for every resource, so an op outside that set reads the same whichever one it was sent
+/// to and whichever pointer it carried.
+pub const INVALID_PATCH_OPERATION: &str =
+    "Invalid patch operation specified. Must be 'add'|'remove'|'replace'";
 
 /// Parse a request's `patchOperations` into the edits to apply, in request order.
 ///
