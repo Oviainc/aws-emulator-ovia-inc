@@ -15,13 +15,15 @@
 //! the page size asked for (including the published bounds 1 and 25, a size past the
 //! stored count, and one past each bound), and which tags the filter names.
 //!
-//! The blueprints are seeded into the store directly: `CreateBlueprint` is still a
-//! scaffold (its own issue, `glue-createblueprint-stub`), so there is no implemented
-//! operation that registers one yet.
+//! The blueprints are seeded into the store directly, through the same
+//! [`BlueprintEntry::from_create_input`] a `CreateBlueprint` registers one with, so a
+//! listing suite seeds its rows without going through that operation first.
 
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_glue_awsglue::ops::types::CreateBlueprintInput;
 use service_com_amazonaws_glue_awsglue::state::{BlueprintEntry, ComAmazonawsGlueAwsglueState};
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -36,16 +38,21 @@ fn emulator_with_store() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 /// Record one blueprint, with the tags the row asks for.
 fn given_blueprint(engine: &Arc<engine::InMemoryEngine>, name: &str, tags: &[(&str, &str)]) {
     let state = engine.state::<ComAmazonawsGlueAwsglueState>();
-    state.lock().blueprints.insert(
-        name.to_string(),
-        BlueprintEntry {
-            name: name.to_string(),
-            tags: tags
-                .iter()
-                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-                .collect(),
-        },
-    );
+    state
+        .lock()
+        .insert_blueprint(BlueprintEntry::from_create_input(
+            &CreateBlueprintInput {
+                name: name.to_string(),
+                description: None,
+                blueprint_location: format!("s3://glue-blueprints/{name}.zip"),
+                tags: Some(
+                    tags.iter()
+                        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                        .collect(),
+                ),
+            },
+            SystemTime::now(),
+        ));
 }
 
 /// The names one answer reports, in the order the service returned them.

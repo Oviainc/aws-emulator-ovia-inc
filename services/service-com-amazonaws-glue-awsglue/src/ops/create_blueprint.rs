@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBlueprint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateBlueprint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateBlueprint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registers a blueprint in this account's per-account blueprint namespace
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::blueprints`]): the whole registration
+//! comes from the request, the name must be free, and the create answers with the name it
+//! stored. The registration starts out `CREATING` and the clock owes it `ACTIVE`
+//! ([`crate::state::BLUEPRINT_SETTLES_AFTER`]), so a caller that reads the blueprint
+//! straight afterwards still sees it being registered. `GetBlueprint` reads the record
+//! back.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +150,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateBlueprint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateBlueprintErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateBlueprint"))
+        // Blueprints live in one per-account namespace, so nothing here depends on the
+        // request's Region.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on.
+            return Err(CreateBlueprintErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue blueprint store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // `Name` and `BlueprintLocation` are `@required` and their lengths and patterns —
+        // including the S3 path form `BlueprintLocation` has to take — are refused at the
+        // boundary, and the model constrains nothing else this create carries, so the only
+        // checks left are the two the STORE answers.
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A blueprint is addressed by `Name` alone across the whole account, so a create
+        // for a name already taken is refused rather than overwriting the registration
+        // stored under it.
+        if store.blueprint(&input.name).is_some() {
+            return Err(CreateBlueprintErrorModeled::AlreadyExistsException(
+                AlreadyExistsException {
+                    message: Some(crate::state::messages::BLUEPRINT_ALREADY_EXISTS.to_string()),
+                },
+            )
+            .into());
+        }
+        // The store is resident memory and this create is reachable by any caller, so the
+        // number of records one process will hold is bounded. Past the ceiling the request
+        // is refused with the operation's own modelled limit error.
+        if !store.can_store_blueprint() {
+            return Err(
+                CreateBlueprintErrorModeled::ResourceNumberLimitExceededException(
+                    ResourceNumberLimitExceededException {
+                        message: Some(format!(
+                            "This account already holds the maximum of {} blueprints",
+                            crate::state::MAX_BLUEPRINTS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        store.insert_blueprint(crate::state::BlueprintEntry::from_create_input(&input, now));
+        ::tracing::info!(
+            operation = "CreateBlueprint",
+            blueprint = %input.name,
+            "registered a Glue blueprint"
+        );
+
+        // "Returns the name of the blueprint that was registered" — the name the record is
+        // now stored under, which is what a later read addresses it by.
+        Ok(CreateBlueprintOutput {
+            name: Some(input.name),
+        })
     }
 }

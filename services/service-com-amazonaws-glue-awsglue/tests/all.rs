@@ -35,6 +35,8 @@ mod batch_stop_job_run;
 mod batch_update_partition;
 #[path = "all/blueprint_listing.rs"]
 mod blueprint_listing;
+#[path = "all/blueprints.rs"]
+mod blueprints;
 #[path = "all/catalog_encryption.rs"]
 mod catalog_encryption;
 #[path = "all/catalog_identity.rs"]

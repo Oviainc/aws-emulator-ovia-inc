@@ -256,6 +256,7 @@ use crate::ops::types::{
     StartJobRunInput, StorageDescriptor, Table, TableIdentifier, TableInput,
     TableVersion, TargetRedshiftCatalog,
     TransformEncryption, TransformFilterCriteria, TransformParameters, TransformSortCriteria,
+    Blueprint, CreateBlueprintInput,
     Trigger, TriggerNodeDetails,
     Tag, TargetProcessingProperties, TargetTableConfig,
     TriggerUpdate,
@@ -446,6 +447,12 @@ pub const MAX_GLOSSARIES: usize = 1_000;
 /// of records one process will hold is bounded here. A create past the ceiling is refused
 /// with `CreateWorkflow`'s own modelled `ResourceNumberLimitExceededException`.
 pub const MAX_WORKFLOWS: usize = 1_000;
+
+/// Ceiling on the blueprints this emulator will hold, for the same reason as
+/// [`MAX_CRAWLERS`]: `CreateBlueprint` writes a record any caller can reach, so the number
+/// of records one process will hold is bounded here. A create past the ceiling is refused
+/// with `CreateBlueprint`'s own modelled `ResourceNumberLimitExceededException`.
+pub const MAX_BLUEPRINTS: usize = 1_000;
 
 /// Ceiling on the glossary terms this emulator will hold, for the same reason as
 /// [`MAX_GLOSSARIES`]: `CreateGlossaryTerm` writes a record any caller can reach, each one
@@ -1648,6 +1655,27 @@ impl ComAmazonawsGlueAwsglueState {
     /// Whether the store can hold another workflow, i.e. is below [`MAX_WORKFLOWS`].
     pub fn can_store_workflow(&self) -> bool {
         self.workflows.len() < MAX_WORKFLOWS
+    }
+
+    /// Whether the store can hold another blueprint, i.e. is below [`MAX_BLUEPRINTS`].
+    pub fn can_store_blueprint(&self) -> bool {
+        self.blueprints.len() < MAX_BLUEPRINTS
+    }
+
+    /// Register `entry` under its own name, which is the key every blueprint operation
+    /// addresses a blueprint by.
+    pub fn insert_blueprint(&mut self, entry: BlueprintEntry) {
+        self.blueprints.insert(entry.name.clone(), entry);
+    }
+
+    /// The stored blueprint `name`, or `None` when this account holds no such blueprint.
+    pub fn blueprint(&self, name: &str) -> Option<&BlueprintEntry> {
+        self.blueprints.get(name)
+    }
+
+    /// [`Self::blueprint`] mutably: the one record every write to a blueprint lands in.
+    pub fn blueprint_mut(&mut self, name: &str) -> Option<&mut BlueprintEntry> {
+        self.blueprints.get_mut(name)
     }
 
     /// The stored workflow `name`, or `None` when this account holds no such workflow.
@@ -4959,18 +4987,55 @@ impl CustomEntityTypeEntry {
     }
 }
 
+/// The `BlueprintStatus` a blueprint is in the instant its registration is recorded:
+/// "Creating — The blueprint registration is in progress" (`Blueprint$Status`). One of the
+/// modelled `BlueprintStatus` values, whose published list the generated
+/// [`crate::ops::types::BLUEPRINT_STATUS_VALUES`] carries (`ACTIVE`, `CREATING`, `FAILED`,
+/// `UPDATING`).
+pub const BLUEPRINT_STATUS_CREATING: &str = "CREATING";
+
+/// The `BlueprintStatus` of a blueprint whose registration has finished: "Active — The
+/// blueprint has been successfully registered." See [`BLUEPRINT_STATUS_CREATING`].
+pub const BLUEPRINT_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// How long a blueprint stays in the status its registration put it in before the clock
+/// owes it [`BLUEPRINT_STATUS_ACTIVE`].
+///
+/// CHOSEN, not documented: Glue publishes no duration for a blueprint registration, so this
+/// is the emulator's own span — deliberately not zero, so a caller that reads a blueprint
+/// straight after registering it still observes the registration in progress. The due
+/// instant is stored on the record and materialised by whichever later call reads it;
+/// nothing sleeps.
+pub const BLUEPRINT_SETTLES_AFTER: Duration = Duration::from_secs(3);
+
 /// A stored blueprint: the reusable workflow template a blueprint create registers.
 ///
-/// Only what every caller of this record can already observe is held: the name a
-/// blueprint is addressed by, and the `Tags` a create carried, which is what
-/// `ListBlueprints` narrows its answer by. The rest of the modelled `Blueprint` shape —
-/// the S3 location, the description, the status — belongs to the operations that write and
-/// report it, so each is added here by the operation that needs it rather than ahead of it.
+/// Everything a caller of this record can observe through the modelled `Blueprint` shape is
+/// held here — the name it is addressed by, where its archive is published, its
+/// description, when it was registered and the status of that registration — plus the
+/// `Tags` a create carried, which is what `ListBlueprints` narrows its answer by.
 #[derive(Debug, Clone)]
 pub struct BlueprintEntry {
     /// The blueprint's name, which is also its key in
     /// [`ComAmazonawsGlueAwsglueState::blueprints`].
     pub name: String,
+    /// `Blueprint$BlueprintLocation`: "Specifies the path in Amazon S3 where the blueprint
+    /// is published", exactly as the registration sent it.
+    pub blueprint_location: String,
+    /// `Blueprint$Description`: "The description of the blueprint", and `None` when the
+    /// registration carried none.
+    pub description: Option<String>,
+    /// `Blueprint$CreatedOn`: "The date and time the blueprint was registered."
+    pub created_on: SystemTime,
+    /// `Blueprint$LastModifiedOn`: "The date and time the blueprint was last modified",
+    /// which for a blueprint nothing has updated is the instant it was registered.
+    pub last_modified_on: SystemTime,
+    /// One of the modelled `BlueprintStatus` values: the status of this blueprint's
+    /// registration.
+    pub status: String,
+    /// The instant the clock owes this blueprint its next status; `None` once it has
+    /// settled.
+    pub settles_at: Option<SystemTime>,
     /// The tags the blueprint was registered with, which the modelled `Blueprint` shape
     /// does not carry.
     ///
@@ -4979,6 +5044,73 @@ pub struct BlueprintEntry {
     /// through the tagging operations, for the reason [`CustomEntityTypeEntry::tags`]
     /// gives: [`TaggedResourceKind`] carries no blueprint variant yet.
     pub tags: HashMap<String, String>,
+}
+
+impl BlueprintEntry {
+    /// Record the blueprint a `CreateBlueprint` describes, in
+    /// [`BLUEPRINT_STATUS_CREATING`] with [`BLUEPRINT_STATUS_ACTIVE`] due
+    /// [`BLUEPRINT_SETTLES_AFTER`] out — "Creating — The blueprint registration is in
+    /// progress" — and every other member taken from the request, which carries the whole
+    /// registration.
+    pub fn from_create_input(input: &CreateBlueprintInput, now: SystemTime) -> Self {
+        Self {
+            name: input.name.clone(),
+            blueprint_location: input.blueprint_location.clone(),
+            description: input.description.clone(),
+            created_on: now,
+            last_modified_on: now,
+            status: BLUEPRINT_STATUS_CREATING.to_string(),
+            settles_at: Some(now.checked_add(BLUEPRINT_SETTLES_AFTER).unwrap_or(now)),
+            tags: input.tags.clone().unwrap_or_default(),
+        }
+    }
+
+    /// Move this blueprint into the status the clock owed it at `now`, if it owed one.
+    ///
+    /// The registration was due to finish at [`Self::settles_at`] whether or not anybody
+    /// called, so materialising it on a read reports the status the clock had already
+    /// reached, and two reads of a settled blueprint report the same record.
+    /// [`Self::last_modified_on`] does not move with it: the registration finishing is the
+    /// create completing, not a later modification of the blueprint.
+    pub fn settle_if_due(&mut self, now: SystemTime) {
+        let Some(due) = self.settles_at else {
+            return;
+        };
+        if due > now {
+            return;
+        }
+        self.settles_at = None;
+        self.status = BLUEPRINT_STATUS_ACTIVE.to_string();
+    }
+
+    /// Rebuild the modelled `Blueprint` shape from what is stored, so every reader of a
+    /// blueprint reports the same registration.
+    pub fn to_blueprint(&self) -> Blueprint {
+        Blueprint {
+            name: Some(self.name.clone()),
+            description: self.description.clone(),
+            created_on: Some(to_date_time(self.created_on)),
+            last_modified_on: Some(to_date_time(self.last_modified_on)),
+            // "A JSON string that indicates the list of parameter specifications for the
+            // blueprint": Glue reads that list out of the blueprint ARCHIVE published at
+            // `BlueprintLocation`. Nothing here reads that archive, so there is no
+            // parameter list to report rather than one invented for it.
+            parameter_spec: None,
+            blueprint_location: Some(self.blueprint_location.clone()),
+            // "Specifies a path in Amazon S3 where the blueprint is copied when you call
+            // CreateBlueprint/UpdateBlueprint to register the blueprint in Glue": nothing
+            // here copies the archive, so there is no such path a caller could read.
+            blueprint_service_location: None,
+            status: Some(self.status.clone()),
+            // "An error message": a registration this store accepted has none.
+            error_message: None,
+            // "When there are multiple versions of a blueprint and the latest version has
+            // some errors, this attribute indicates the last successful blueprint
+            // definition": the registration stored here is itself the latest and has no
+            // error, so there is no earlier definition to fall back to.
+            last_active_definition: None,
+        }
+    }
 }
 
 /// How many integration resource property ids this process has minted.
@@ -9388,6 +9520,21 @@ pub mod messages {
     /// [`REGISTRY_ALREADY_EXISTS`] — 400, `AlreadyExistsException`, and no disclosure of
     /// the requested name.
     pub const WORKFLOW_ALREADY_EXISTS: &str = "Workflow already exists.";
+
+    /// `CreateBlueprint` for a `Name` this account already holds a blueprint under. NOT
+    /// recorded: inferred from the recorded `CreateDatabase` duplicate, like
+    /// [`WORKFLOW_ALREADY_EXISTS`] — 400, `AlreadyExistsException`, and no disclosure of
+    /// the requested name.
+    pub const BLUEPRINT_ALREADY_EXISTS: &str = "Blueprint already exists.";
+
+    /// Any blueprint operation whose `Name` names no blueprint this account holds
+    /// (`GetBlueprint`, and the same miss on every sibling that addresses one by name).
+    /// NOT recorded: what is pinned is the behaviour — 400 with the operation's modelled
+    /// `EntityNotFoundException` — and the sentence follows [`database_not_found`]'s
+    /// per-resource template, built from the requested name alone.
+    pub fn blueprint_not_found(name: &str) -> String {
+        format!("Blueprint {name} not found.")
+    }
 
     /// Any workflow operation whose `Name` names no workflow this account holds
     /// (`GetWorkflow`, and the same miss on every sibling that addresses one by name). NOT
