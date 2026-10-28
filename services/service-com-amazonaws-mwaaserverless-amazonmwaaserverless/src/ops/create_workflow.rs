@@ -175,7 +175,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 use std::collections::BTreeMap;
-use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -264,7 +263,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let region = crate::state::request_region(ctx.parts());
-        let now = SystemTime::now();
         let fingerprint = request_fingerprint(&input);
 
         // "Amazon Managed Workflows for Apache Airflow Serverless takes a snapshot of
@@ -285,8 +283,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Finish every workflow teardown the clock already made due, so a name held
         // by a workflow whose `DELETING` span has elapsed is free for this create and
         // one still tearing down still holds it; every automated run already owed is
-        // materialised in the same step.
-        store.advance_clock(now);
+        // materialised in the same step. The instant comes from the store — sampled
+        // with it held, so the definition read above cannot leave this handler
+        // materialising an instant that is already past, and the timestamps stamped
+        // from `now` below are the instant this create took the store at.
+        let now = store.advance_clock();
 
         // A repeated @idempotencyToken replays its first answer rather than minting a
         // second workflow; the same token with a different request is a conflict. Both

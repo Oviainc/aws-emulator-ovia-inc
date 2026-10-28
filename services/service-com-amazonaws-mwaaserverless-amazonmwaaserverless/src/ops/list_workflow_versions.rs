@@ -94,8 +94,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use std::time::SystemTime;
-
 /// The list this operation's pagination cursors belong to, so a cursor issued for
 /// another paginated list of this service is refused here.
 const PAGE_KIND: &str = "WorkflowVersions";
@@ -201,14 +199,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 retry_after_seconds: None,
             })
         })?;
-        let now = SystemTime::now();
         let mut store = state.lock();
 
         // The writes a read may make, each a change the clock already owed: finish
         // every workflow teardown due and fire every automated run due, so the
         // versions of a workflow past its `DELETING` span are gone with it — the same
-        // step every handler that touches `workflows` takes.
-        store.advance_clock(now);
+        // step every handler that touches `workflows` takes, from the instant the store
+        // itself samples while held.
+        store.advance_clock();
 
         // The cursor is the APPEND POSITION of the last item on the previous page
         // (`crate::state::WorkflowVersionRecord::sequence`) scoped to the workflow it was

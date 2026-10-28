@@ -95,7 +95,6 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -184,14 +183,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
-        let now = SystemTime::now();
         let mut store = state.lock();
 
         // Finish every workflow teardown the clock already made due, and fire every
         // automated run it already owed, so a run of a workflow past its `DELETING`
         // span is gone with it and is not stoppable here, while a run the workflow's
-        // own trigger produced is.
-        store.advance_clock(now);
+        // own trigger produced is. The instant comes from the store — sampled with it
+        // held — and is the one this stop is dated from.
+        let now = store.advance_clock();
 
         // The run is what this operation resolves: a workflow the store does not hold
         // — including one of ANOTHER region, which this endpoint does not serve — holds

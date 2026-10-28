@@ -19,6 +19,8 @@ mod child_listing_absent_parent_walk;
 mod child_listing_cursor_scope;
 #[path = "all/child_listing_error_set.rs"]
 mod child_listing_error_set;
+#[path = "all/clock_sampled_under_the_store_lock.rs"]
+mod clock_sampled_under_the_store_lock;
 #[path = "all/definition_declared_schedule_trigger.rs"]
 mod definition_declared_schedule_trigger;
 #[path = "all/deleted_workflow_run_cleanup.rs"]

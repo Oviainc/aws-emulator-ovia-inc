@@ -1216,16 +1216,29 @@ impl ComAmazonawsMwaaserverlessAmazonmwaaserverlessState {
 
     /// Apply EVERY change the clock already owed this store — the workflow teardowns
     /// whose removal has fallen due ([`Self::reap_deleted_workflows`]) and the
-    /// automated runs whose firing has ([`Self::fire_due_scheduled_runs`]) — and report
-    /// whether anything changed.
+    /// automated runs whose firing has ([`Self::fire_due_scheduled_runs`]) — and answer
+    /// the instant that was done AT.
     ///
     /// Every handler that touches [`Self::workflows`] calls this FIRST, so what it
     /// answers is what the store would hold unpolled: a workflow never outlives its
     /// teardown, and a trigger never fails to fire, just because the next request
     /// happened to be a different operation.
-    pub fn advance_clock(&mut self, now: SystemTime) -> bool {
-        let reaped = self.reap_deleted_workflows(now);
-        self.fire_due_scheduled_runs(now) > 0 || reaped
+    ///
+    /// The instant is sampled HERE, with this store already locked, and is also the
+    /// instant the calling handler stamps its own writes with — this is the ONLY place
+    /// this service reads the wall clock while serving a request. A handler that sampled
+    /// it earlier would materialise an instant that is already past by the time it
+    /// reaches the store, so anything that fell due in between (a teardown that frees a
+    /// workflow's name, a trigger firing) would stay unapplied under a record the
+    /// handler then reads, and a timestamp it stamps could land before one a writer that
+    /// held the store in between had already stamped. Sampling under the lock is what
+    /// keeps both true however long the handler took to get here — including across an
+    /// awaited call into another emulated service.
+    pub fn advance_clock(&mut self) -> SystemTime {
+        let now = SystemTime::now();
+        self.reap_deleted_workflows(now);
+        self.fire_due_scheduled_runs(now);
+        now
     }
 
     /// The workflow `arn` names AS SEEN FROM `region`'s endpoint: the stored record

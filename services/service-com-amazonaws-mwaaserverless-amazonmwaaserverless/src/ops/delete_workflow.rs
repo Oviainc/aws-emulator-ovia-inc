@@ -109,7 +109,6 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -204,13 +203,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 retry_after_seconds: None,
             })
         })?;
-        let now = SystemTime::now();
         let mut store = state.lock();
 
         // Finish every teardown the clock already made due, and fire every automated
         // run it already owed, so a workflow whose `DELETING` span has elapsed is as
-        // absent to this call as to any other.
-        store.advance_clock(now);
+        // absent to this call as to any other. The instant comes from the store —
+        // sampled with it held — and is the one the removal deadline stamped below is
+        // measured from.
+        let now = store.advance_clock();
 
         // A reference that resolves to nothing is a lookup miss, and the entity THIS
         // operation resolves is the workflow itself. A workflow of ANOTHER region is

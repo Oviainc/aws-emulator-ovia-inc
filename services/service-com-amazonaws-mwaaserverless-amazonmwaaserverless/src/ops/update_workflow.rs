@@ -127,7 +127,6 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -218,7 +217,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
-        let now = SystemTime::now();
         let fingerprint = request_fingerprint(&input);
 
         // An update "creates a new version with the updated configuration", and a
@@ -237,8 +235,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Finish every workflow teardown the clock already made due, so a workflow
         // past its `DELETING` span is a lookup miss here too, and materialise every
-        // automated run already owed before this update re-points the trigger.
-        store.advance_clock(now);
+        // automated run already owed before this update re-points the trigger. The
+        // instant comes from the store — sampled with it held, so the definition read
+        // above cannot leave this handler materialising an instant that is already
+        // past, and the version and `ModifiedAt` stamped from `now` below are the
+        // instant this update took the store at.
+        let now = store.advance_clock();
 
         // A reference that resolves to nothing is a lookup miss, and the entity THIS
         // operation resolves is the workflow itself. A workflow of ANOTHER region is

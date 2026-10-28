@@ -136,7 +136,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 use std::collections::BTreeMap;
-use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -227,15 +226,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
-        let now = SystemTime::now();
         let fingerprint = request_fingerprint(&input);
         let mut store = state.lock();
 
         // Finish every workflow teardown the clock already made due, so a workflow
         // past its `DELETING` span holds no runnable version here either, and fire
         // every automated run it already owed, so this run joins a history that
-        // already holds the ones the workflow's trigger produced.
-        store.advance_clock(now);
+        // already holds the ones the workflow's trigger produced. The instant comes
+        // from the store — sampled with it held — and is the one this run is dated
+        // from below.
+        let now = store.advance_clock();
 
         // The version this run would execute: the one the request names, else the
         // workflow's latest. It is the entity THIS operation has to resolve, so a
