@@ -8,10 +8,11 @@
 //! UPDATES that record and a put under a new pair adds one; the operation is
 //! `@idempotent`, and repeating it stores the same single record.
 //!
-//! An instance with no finished onboarding job holds no config to integrate anything
-//! with, so the put is the modelled `ResourceNotFoundException` (HTTP 404) and stores
-//! nothing — the same gate, over the same store, that `CreateCampaign` and
-//! `GetConnectInstanceConfig` ask.
+//! An instance the account's Amazon Connect registry does not hold, or one with no
+//! finished onboarding job, is not usable by Campaigns and holds no config to integrate
+//! anything with, so the put is the modelled `ResourceNotFoundException` (HTTP 404) and
+//! stores nothing — the same two-halved gate `CreateCampaign` and
+//! `StartInstanceOnboardingJob` ask.
 //!
 //! ## Shape of an operation
 //!
@@ -190,12 +191,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The instance and its integrations are the ones the region this request was
         // signed for holds.
         let region = crate::state::request_region(ctx);
+
+        // An integration belongs to an instance that is USABLE by Campaigns, which
+        // takes both halves of that. The registry half first, with no guard of this
+        // service's store held (the lock order that read requires): an id the account's
+        // Amazon Connect registry no longer holds has nothing to integrate, however
+        // this service's own onboarding store still reads.
+        match crate::state::connect_instance_registry_refusal(
+            &*self.engine,
+            &input.connect_instance_id,
+        ) {
+            None => {}
+            Some(crate::state::InstanceRegistryRefusal::NoSuchInstance) => {
+                crate::state::audit_onboarding_change(
+                    ctx.parts(),
+                    Self::NAME,
+                    &input.connect_instance_id,
+                    "ResourceNotFoundException",
+                );
+                return Err(
+                    PutConnectInstanceIntegrationErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: crate::state::INSTANCE_NOT_FOUND_MESSAGE.to_string(),
+                            x_amz_error_type: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+            Some(crate::state::InstanceRegistryRefusal::Unavailable) => {
+                return Err(
+                    PutConnectInstanceIntegrationErrorModeled::InternalServerException(
+                        InternalServerException {
+                            message: crate::state::INSTANCE_REGISTRY_UNAVAILABLE_MESSAGE
+                                .to_string(),
+                            x_amz_error_type: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
         let mut store = state.lock();
 
-        // An integration belongs to a Connect instance onboarded to Campaigns: the
-        // instance-onboarding store is the one record of which instances those are,
-        // so an instance whose onboarding job has not finished there has nothing to
-        // integrate and the put is refused BEFORE anything is stored.
+        // The other half: an integration belongs to a Connect instance onboarded to
+        // Campaigns: the instance-onboarding store is the one record of which instances
+        // those are, so an instance whose onboarding job has not finished there has
+        // nothing to integrate and the put is refused BEFORE anything is stored.
         if !store.is_onboarded(&region, &input.connect_instance_id, now) {
             crate::state::audit_onboarding_change(
                 ctx.parts(),

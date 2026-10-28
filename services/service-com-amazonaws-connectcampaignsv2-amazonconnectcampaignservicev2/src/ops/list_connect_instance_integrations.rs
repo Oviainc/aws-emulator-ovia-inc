@@ -6,7 +6,8 @@
 //! integration, in the order they were first put, paged by `maxResults` with a
 //! `nextToken` naming the record the page ended at.
 //!
-//! An instance with no finished onboarding job is the modelled
+//! An instance that is not usable by Campaigns — one the account's Amazon Connect
+//! registry does not hold, or one with no finished onboarding job — is the modelled
 //! `ResourceNotFoundException` (HTTP 404) — the same gate the put asks — while an
 //! onboarded instance that holds no integration is an empty list.
 //!
@@ -170,12 +171,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The instance and its integrations are the ones the region this request was
         // signed for holds.
         let region = crate::state::request_region(ctx);
+
+        // Whether the instance exists at all takes both halves of being USABLE by
+        // Campaigns, the same two the put asks. The registry half first, with no guard
+        // of this service's store held (the lock order that read requires): an id the
+        // account's Amazon Connect registry no longer holds is not found, however this
+        // service's own onboarding store still reads.
+        match crate::state::connect_instance_registry_refusal(
+            &*self.engine,
+            &input.connect_instance_id,
+        ) {
+            None => {}
+            Some(crate::state::InstanceRegistryRefusal::NoSuchInstance) => {
+                return Err(
+                    ListConnectInstanceIntegrationsErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: crate::state::INSTANCE_NOT_FOUND_MESSAGE.to_string(),
+                            x_amz_error_type: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+            Some(crate::state::InstanceRegistryRefusal::Unavailable) => {
+                return Err(
+                    ListConnectInstanceIntegrationsErrorModeled::InternalServerException(
+                        InternalServerException {
+                            message: crate::state::INSTANCE_REGISTRY_UNAVAILABLE_MESSAGE
+                                .to_string(),
+                            x_amz_error_type: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
         let store = state.lock();
 
-        // Whether the instance exists at all is the instance-onboarding store's
-        // answer, the same one the put asks: an instance with no finished onboarding
-        // job is not found, which is a different answer from an onboarded instance
-        // that holds no integration (an empty list).
+        // The other half: an instance with no finished onboarding job is not found,
+        // which is a different answer from an onboarded instance that holds no
+        // integration (an empty list).
         if !store.is_onboarded(&region, &input.connect_instance_id, now) {
             return Err(
                 ListConnectInstanceIntegrationsErrorModeled::ResourceNotFoundException(

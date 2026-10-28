@@ -6,7 +6,7 @@
 //! which starts `IN_PROGRESS` and the clock moves to `SUCCEEDED`.
 //!
 //! The onboarding is GATED on the Connect instance existing: Amazon Connect owns the
-//! instance registry (`crate::state::connect_instance_exists` reads it), and a
+//! instance registry (`crate::state::connect_instance_registry_refusal` reads it), and a
 //! `connectInstanceId` that account holds no instance for is answered with the modelled
 //! `ResourceNotFoundException` (HTTP 404) with nothing persisted.
 //!
@@ -236,34 +236,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reader of that record (`GetInstanceOnboardingJobStatus`,
         // `GetConnectInstanceConfig`, `CreateCampaign`'s gate) reporting only on
         // instances the account really has. The registry is Amazon Connect's own, read
-        // through the shared engine; unreachable means this emulator cannot answer the
-        // existence question at all, which is a server error and not an absent
-        // instance.
-        let Some(instance_exists) =
-            crate::state::connect_instance_exists(&*self.engine, &input.connect_instance_id)
-        else {
-            return Err(StartInstanceOnboardingJobErrorModeled::InternalServerException(
-                InternalServerException {
-                    message: "the Amazon Connect instance registry is unavailable".to_string(),
-                    x_amz_error_type: None,
-                },
-            )
-            .into());
-        };
-        if !instance_exists {
-            crate::state::audit_onboarding_change(
-                ctx.parts(),
-                Self::NAME,
-                &input.connect_instance_id,
-                "ResourceNotFoundException",
-            );
-            return Err(StartInstanceOnboardingJobErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: crate::state::INSTANCE_NOT_FOUND_MESSAGE.to_string(),
-                    x_amz_error_type: None,
-                },
-            )
-            .into());
+        // through the shared engine by the one helper every operation of this refusal
+        // class asks; unreachable means this emulator cannot answer the existence
+        // question at all, which is a server error and not an absent instance.
+        match crate::state::connect_instance_registry_refusal(
+            &*self.engine,
+            &input.connect_instance_id,
+        ) {
+            None => {}
+            Some(crate::state::InstanceRegistryRefusal::NoSuchInstance) => {
+                crate::state::audit_onboarding_change(
+                    ctx.parts(),
+                    Self::NAME,
+                    &input.connect_instance_id,
+                    "ResourceNotFoundException",
+                );
+                return Err(StartInstanceOnboardingJobErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::INSTANCE_NOT_FOUND_MESSAGE.to_string(),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into());
+            }
+            Some(crate::state::InstanceRegistryRefusal::Unavailable) => {
+                return Err(StartInstanceOnboardingJobErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: crate::state::INSTANCE_REGISTRY_UNAVAILABLE_MESSAGE.to_string(),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into());
+            }
         }
 
         // Starting the job is what persists the instance's config, so the write

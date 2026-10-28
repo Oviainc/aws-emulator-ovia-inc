@@ -75,6 +75,11 @@ impl Harness {
     pub fn register_connect_instance(&self, region: &str, instance: &str) {
         register_connect_instance(&self.engine, region, instance);
     }
+
+    /// [`deregister_connect_instance`] against the engine this harness was built over.
+    pub fn deregister_connect_instance(&self, instance: &str) -> bool {
+        deregister_connect_instance(&self.engine, instance)
+    }
 }
 
 /// Give the account a Connect instance with id `instance` in `region`, in Amazon
@@ -124,6 +129,20 @@ pub fn register_connect_instance(
             hours_of_operations: BTreeMap::new(),
         },
     );
+}
+
+/// Take the account's instance `instance` back out of Amazon Connect's own instance
+/// registry inside `engine`, reporting whether a record was removed — the effect
+/// Connect's `DeleteInstance` has on the registry every Campaigns instance gate is
+/// resolved against, which is how a case reaches an id the account no longer holds.
+///
+/// The registry is keyed by instance id, as every Connect operation that takes an
+/// `InstanceId` resolves one, so no region is needed.
+pub fn deregister_connect_instance(engine: &engine::InMemoryEngine, instance: &str) -> bool {
+    let state = connect_state::service_state(engine)
+        .expect("the shared in-memory engine carries Amazon Connect's store");
+    let mut store = state.lock();
+    store.instances.remove(instance).is_some()
 }
 
 /// Drive one request and return its status and parsed JSON body (`Value::Null` for

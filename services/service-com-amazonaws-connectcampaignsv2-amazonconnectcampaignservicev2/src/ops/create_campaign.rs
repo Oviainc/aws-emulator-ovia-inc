@@ -4,8 +4,10 @@
 //! Creates a campaign and stores it: the response's `id`, `arn` and `tags` are read
 //! back out of the record this call wrote, and `DescribeCampaign` /
 //! `GetCampaignState` serve the same record. The create is GATED on the Connect
-//! instance it names being onboarded to Campaigns — the instance store
-//! `StartInstanceOnboardingJob` writes and `GetConnectInstanceConfig` reads — and
+//! instance it names being USABLE by Campaigns — one the account's Amazon Connect
+//! registry holds (`crate::state::connect_instance_registry_refusal` reads it) AND one
+//! onboarded to Campaigns in the request's region (the instance store
+//! `StartInstanceOnboardingJob` writes and `GetConnectInstanceConfig` reads) — and
 //! answers the modelled `ResourceNotFoundException` (HTTP 404) when it is not. A
 //! campaign name identifies a campaign within its Connect instance, so a create for
 //! a name that instance already holds mints nothing and answers the modelled
@@ -249,16 +251,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // One guard spans minting the id and taking the record, so two concurrent
         // creates can never be handed the same id.
         let region = crate::state::request_region(ctx);
+
+        // A campaign target is an instance that is USABLE by Campaigns, which takes
+        // both halves of that: one the account's Amazon Connect registry holds, AND one
+        // a finished onboarding job has enabled for Campaigns in the request's region.
+        // The registry is Amazon Connect's own — `CreateInstance` mints an id and
+        // `DeleteInstance` drops it — so an id it no longer holds names nothing to
+        // target, however this service's own onboarding store still reads, and the
+        // create is refused exactly as `StartInstanceOnboardingJob` refuses it. Asked
+        // before this service's store is locked, which is the lock order the registry
+        // read requires; a registry that cannot be read answers the existence question
+        // not at all, which is a server error and never an absent instance.
+        match crate::state::connect_instance_registry_refusal(
+            &*self.engine,
+            &input.connect_instance_id,
+        ) {
+            None => {}
+            Some(crate::state::InstanceRegistryRefusal::NoSuchInstance) => {
+                return Err(CreateCampaignErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::INSTANCE_NOT_FOUND_MESSAGE.to_string(),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into())
+            }
+            Some(crate::state::InstanceRegistryRefusal::Unavailable) => {
+                return Err(CreateCampaignErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: crate::state::INSTANCE_REGISTRY_UNAVAILABLE_MESSAGE.to_string(),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into())
+            }
+        }
+
         let mut store = state.lock();
 
-        // A campaign belongs to a Connect instance that is onboarded to Campaigns in
-        // the region this request was signed for: the instance-onboarding store of
-        // that region is the one record of which instances those are, and an id whose
-        // onboarding job has not finished there is not a campaign target, so the
-        // create is refused with the error the model declares for a resource that was
-        // not found BEFORE anything is stored. The campaign the create mints is this
-        // region's resource too — the region its ARN names below — so it is stored
-        // under that region alone.
+        // The other half: a campaign belongs to a Connect instance that is onboarded to
+        // Campaigns in the region this request was signed for: the instance-onboarding
+        // store of that region is the one record of which instances those are, and an
+        // id whose onboarding job has not finished there is not a campaign target, so
+        // the create is refused with the error the model declares for a resource that
+        // was not found BEFORE anything is stored. The campaign the create mints is
+        // this region's resource too — the region its ARN names below — so it is
+        // stored under that region alone.
         if !store.is_onboarded(&region, &input.connect_instance_id, ::std::time::SystemTime::now())
         {
             return Err(CreateCampaignErrorModeled::ResourceNotFoundException(

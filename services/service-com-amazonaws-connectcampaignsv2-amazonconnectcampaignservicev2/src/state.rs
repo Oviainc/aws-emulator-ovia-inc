@@ -1331,6 +1331,56 @@ pub fn connect_instance_exists<Eng: Send + Sync + 'static>(
     Some(store.instances.contains_key(connect_instance_id))
 }
 
+/// What a request's Connect instance being unusable on REGISTRY grounds is, for the
+/// operations that merely require a usable instance (see
+/// [`INSTANCE_NOT_FOUND_MESSAGE`]).
+///
+/// Two outcomes, because they are answered differently: an id the account's registry
+/// does not hold is a request fault, while a registry this emulator cannot read at all
+/// is a server fault and never a reason to treat the instance as absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstanceRegistryRefusal {
+    /// The account's Amazon Connect registry holds no instance under the id the
+    /// request names, so there is no usable campaign target: the modelled
+    /// `ResourceNotFoundException` carrying [`INSTANCE_NOT_FOUND_MESSAGE`].
+    NoSuchInstance,
+    /// The registry could not be read, so the existence question has no answer here:
+    /// the modelled server error carrying
+    /// [`INSTANCE_REGISTRY_UNAVAILABLE_MESSAGE`].
+    Unavailable,
+}
+
+/// What this service answers when the Amazon Connect instance registry — another
+/// service's store, reached through the shared engine — cannot be read at all, so the
+/// one text is shared by every operation that resolves an instance against it.
+pub const INSTANCE_REGISTRY_UNAVAILABLE_MESSAGE: &str =
+    "the Amazon Connect instance registry is unavailable";
+
+/// The registry half of the usability class [`INSTANCE_NOT_FOUND_MESSAGE`] describes:
+/// `None` when `connect_instance_id` names an instance the account holds, and
+/// otherwise which refusal the caller owes.
+///
+/// The one place that half is decided, so the operations that merely require a usable
+/// instance cannot disagree about a request they all refuse. The other half — whether
+/// a finished onboarding job has enabled the instance for Campaigns in the request's
+/// region — is this service's own store's answer
+/// ([`ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State::is_onboarded`]),
+/// and both refuse with the same text.
+///
+/// LOCK ORDER: this reads the Connect store (see [`connect_instance_exists`]), so it is
+/// called with NO guard of this service's store held — which is why a handler asks it
+/// BEFORE locking its own store.
+pub fn connect_instance_registry_refusal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    connect_instance_id: &str,
+) -> Option<InstanceRegistryRefusal> {
+    match connect_instance_exists(engine, connect_instance_id) {
+        Some(true) => None,
+        Some(false) => Some(InstanceRegistryRefusal::NoSuchInstance),
+        None => Some(InstanceRegistryRefusal::Unavailable),
+    }
+}
+
 /// The most integrations one Connect instance's store holds, after which a further
 /// put is refused rather than taken.
 ///

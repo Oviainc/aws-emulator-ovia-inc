@@ -9,10 +9,12 @@
 //! identity a put stores under, so the delete reaches exactly the record a put of
 //! that identity wrote and leaves every other integration of the instance in place.
 //!
-//! An instance with no finished onboarding job holds no integration at all, and an
+//! An instance that is not usable by Campaigns — one the account's Amazon Connect
+//! registry does not hold, or one with no finished onboarding job — holds no
+//! integration at all, and an
 //! onboarded instance that holds none under that identity has nothing to remove:
 //! either is the modelled `ResourceNotFoundException` (HTTP 404) and removes nothing —
-//! the same gate, over the same store, that `PutConnectInstanceIntegration` and
+//! the same gate that `PutConnectInstanceIntegration` and
 //! `ListConnectInstanceIntegrations` ask.
 //!
 //! ## Shape of an operation
@@ -193,14 +195,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The instance and its integrations are the ones the region this request was
         // signed for holds.
         let region = crate::state::request_region(ctx);
+
+        // An integration belongs to an instance that is USABLE by Campaigns, which
+        // takes both halves of that. The registry half first, with no guard of this
+        // service's store held (the lock order that read requires): an id the account's
+        // Amazon Connect registry no longer holds has no integrations to delete,
+        // however this service's own onboarding store still reads.
+        match crate::state::connect_instance_registry_refusal(
+            &*self.engine,
+            &input.connect_instance_id,
+        ) {
+            None => {}
+            Some(crate::state::InstanceRegistryRefusal::NoSuchInstance) => {
+                crate::state::audit_onboarding_change(
+                    ctx.parts(),
+                    Self::NAME,
+                    &input.connect_instance_id,
+                    "ResourceNotFoundException",
+                );
+                return Err(
+                    DeleteConnectInstanceIntegrationErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: crate::state::INSTANCE_NOT_FOUND_MESSAGE.to_string(),
+                            x_amz_error_type: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+            Some(crate::state::InstanceRegistryRefusal::Unavailable) => {
+                return Err(
+                    DeleteConnectInstanceIntegrationErrorModeled::InternalServerException(
+                        InternalServerException {
+                            message: crate::state::INSTANCE_REGISTRY_UNAVAILABLE_MESSAGE
+                                .to_string(),
+                            x_amz_error_type: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
         // One guard spans the onboarding check and the removal, so a concurrent change
         // to the instance cannot leave this delete applied to a store the instance is
         // no longer in.
         let mut store = state.lock();
 
-        // An integration belongs to a Connect instance onboarded to Campaigns: the
-        // instance-onboarding store is the one record of which instances those are, so
-        // an instance whose onboarding job has not finished holds nothing to delete.
+        // The other half: an integration belongs to a Connect instance onboarded to
+        // Campaigns: the instance-onboarding store is the one record of which instances
+        // those are, so an instance whose onboarding job has not finished holds nothing
+        // to delete.
         if !store.is_onboarded(&region, &input.connect_instance_id, now) {
             crate::state::audit_onboarding_change(
                 ctx.parts(),
