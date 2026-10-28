@@ -472,6 +472,7 @@ async fn a_reference_the_account_no_longer_holds_is_refused() {
     let (flow_arn, flow_output_arn) = minted_flow_output(&emulator, "flow-ri-gone").await;
 
     // While the account holds them, both configurations are accepted.
+    let mut accepted: Vec<(&str, String)> = Vec::new();
     for (name, configuration) in [
         ("ri-gone-standard", standard(&interface_arn)),
         (
@@ -486,6 +487,13 @@ async fn a_reference_the_account_no_longer_holds_is_refused() {
             (201, None),
             "the create of {name:?} expected 201, got {status} {code:?}: {created}"
         );
+        accepted.push((
+            name,
+            created["routerInput"]["arn"]
+                .as_str()
+                .unwrap_or_else(|| panic!("the create of {name:?} answers an ARN: {created}"))
+                .to_string(),
+        ));
     }
 
     // The association is readable from the interface the accepted input ingests on, which is
@@ -502,6 +510,20 @@ async fn a_reference_the_account_no_longer_holds_is_refused() {
         (200, Some(1)),
         "the interface the accepted input ingests on counts it, got {read}"
     );
+
+    // An interface cannot be taken away while an input still ingests on it (see
+    // `tests/all/router_network_interface_association_integrity.rs`), so the association is
+    // cleared first: the input is deleted and its removal left to come due.
+    let (name, standard_input_arn) = &accepted[0];
+    let (status, code, deleted_input) = emulator
+        .send("DELETE", &format!("/v1/routerInput/{standard_input_arn}"), None)
+        .await;
+    assert_eq!(
+        (status, code.as_deref()),
+        (200, None),
+        "the delete of {name:?} expected 200, got {status} {code:?}: {deleted_input}"
+    );
+    tokio::time::sleep(mc::TRANSITION_SPAN * 2).await;
 
     // The interface leaves the store one transition span after its delete is accepted.
     let (status, code, deleted) = emulator

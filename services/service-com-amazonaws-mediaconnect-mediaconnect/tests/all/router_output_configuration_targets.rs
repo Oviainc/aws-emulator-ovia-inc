@@ -474,7 +474,7 @@ async fn a_target_the_account_no_longer_holds_is_refused() {
         "destinationPort": 5008}});
 
     // While the account holds them, both configurations are accepted.
-    created_output(
+    let (standard_output_arn, standard_output_name) = created_output(
         &emulator,
         "ro-gone-standard",
         standard(&interface_arn, protocol.clone()),
@@ -486,6 +486,24 @@ async fn a_target_the_account_no_longer_holds_is_refused() {
         mediaconnect_flow(Some(&flow_arn), Some(&flow_source_arn)),
     )
     .await;
+
+    // An interface cannot be taken away while an output still egresses from it (see
+    // `tests/all/router_network_interface_association_integrity.rs`), so the association is
+    // cleared first: the output is deleted and its removal left to come due.
+    let (status, code, deleted_output) = emulator
+        .send(
+            "DELETE",
+            &format!("/v1/routerOutput/{standard_output_arn}"),
+            None,
+        )
+        .await;
+    assert_eq!(
+        (status, code.as_deref()),
+        (200, None),
+        "the delete of {standard_output_name:?} expected 200, got {status} {code:?}: \
+         {deleted_output}"
+    );
+    tokio::time::sleep(mc::TRANSITION_SPAN * 2).await;
 
     // The interface leaves the store one transition span after its delete is accepted.
     let (status, code, deleted) = emulator

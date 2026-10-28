@@ -19,6 +19,13 @@
 //! model's `@idempotent` on this operation requires. After it, the batch read reports that
 //! ARN as an error entry and a delete answers `NotFoundException`.
 //!
+//! A delete is refused `ConflictException` (409) while a router input or a router output the
+//! store holds still names the interface in its configuration: that reference is a required
+//! member of the stored configuration, so removing the interface would leave those records
+//! pointing at nothing. The caller deletes them, or points them at another interface, and
+//! retries — see
+//! [`crate::state::ComAmazonawsMediaconnectMediaconnectState::associated_router_resource_rejection`].
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -105,6 +112,22 @@ use super::types::*;
 fn not_found(arn: &str) -> DeleteRouterNetworkInterfaceError {
     DeleteRouterNetworkInterfaceErrorModeled::NotFoundException(NotFoundException {
         message: crate::state::not_found_message(arn),
+    })
+    .into()
+}
+
+/// The modelled refusal for a delete the store's own references forbid: `ConflictException`
+/// (HTTP 409, retryable), "the requested operation would cause a conflict with the current
+/// state of a service resource associated with the request. Resolve the conflict before
+/// retrying this request" — which is what a router input or router output still associated
+/// with the addressed interface is. `detail` is the store's own reading of that association
+/// ([`crate::state::ComAmazonawsMediaconnectMediaconnectState::associated_router_resource_rejection`]);
+/// it carries neither of this service's refusal envelopes, as the other conflicts this
+/// service words (UpdateRouterNetworkInterface's, DeregisterGatewayInstance's) carry
+/// neither.
+fn still_associated(detail: String) -> DeleteRouterNetworkInterfaceError {
+    DeleteRouterNetworkInterfaceErrorModeled::ConflictException(ConflictException {
+        message: detail,
     })
     .into()
 }
@@ -208,8 +231,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // not-found rather than the subject of a second delete.
         store.settle_due_transitions(now);
 
-        let Some(interface) = store.router_network_interfaces.get_mut(&input.arn) else {
+        if !store.router_network_interfaces.contains_key(&input.arn) {
             return Err(not_found(&input.arn));
+        }
+
+        // A router input's and a router output's stored configuration names the interface it
+        // ingests on or egresses from in a REQUIRED member, and every write path resolves
+        // that member against this store, so an interface taken away while such a record
+        // still names it would leave that record pointing at nothing. The store's one reading
+        // of the association is what decides, so the refusal states exactly what
+        // `RouterNetworkInterface$AssociatedInputCount` / `AssociatedOutputCount` report.
+        if let Some(detail) = store.associated_router_resource_rejection(&input.arn) {
+            return Err(still_associated(detail));
+        }
+
+        let Some(interface) = store.router_network_interfaces.get_mut(&input.arn) else {
+            return Err(store_unavailable(
+                "the router network interface could not be read back after it was read",
+            ));
         };
 
         // An interface already on its way out keeps the deletion it has: a repeat of this

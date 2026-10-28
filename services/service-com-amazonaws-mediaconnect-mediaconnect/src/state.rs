@@ -5560,6 +5560,36 @@ impl ComAmazonawsMediaconnectMediaconnectState {
         i32::try_from(associated).unwrap_or(i32::MAX)
     }
 
+    /// Why the router network interface `interface_arn` cannot be removed from the store
+    /// yet, or `None` when no router input and no router output is associated with it.
+    ///
+    /// A router input ingests on, and a router output egresses from, the interface its
+    /// STORED configuration names in a REQUIRED member
+    /// ([`router_input_network_interface_arn`], [`router_output_network_interface_arn`]) —
+    /// the same two readings the two association counts above are taken from — and every
+    /// operation that stores such a configuration resolves that member against this store
+    /// rather than taking it on trust
+    /// ([`Self::unknown_router_network_interface_rejection`]). Taking the interface away
+    /// while an input or an output still names it would therefore leave records holding a
+    /// reference nothing resolves, which no later call could even restate; and unlike a
+    /// router output's route to a router input, which is optional and so is cleared when the
+    /// input goes ([`Self::settle_due_transitions`]), the reference cannot be dropped off the
+    /// record. So the removal is refused while any holder is in the store, and the caller
+    /// clears the association first by deleting those records or pointing their configuration
+    /// at another interface.
+    pub fn associated_router_resource_rejection(&self, interface_arn: &str) -> Option<String> {
+        let inputs = self.associated_router_input_count(interface_arn);
+        let outputs = self.associated_router_output_count(interface_arn);
+        if inputs == 0 && outputs == 0 {
+            return None;
+        }
+        Some(format!(
+            "Router network interface {interface_arn} still has {inputs} associated router \
+             input(s) and {outputs} associated router output(s). Delete them, or point their \
+             configuration at another router network interface, before deleting the interface."
+        ))
+    }
+
     /// Why `arn` names no router network interface this account holds, or `None` when the
     /// store holds one for it. `member` is the request member that named it, so the refusal
     /// states which reference did not resolve.
@@ -5570,12 +5600,22 @@ impl ComAmazonawsMediaconnectMediaconnectState {
     /// against the store rather than taken on trust: an ARN of the right shape for an
     /// interface the account never created names nothing. The detail is the sentence the
     /// refusal's envelope carries ([`validation_failed_message`]).
+    ///
+    /// An interface whose deletion has already been accepted does not resolve either: the
+    /// clock owes its removal whether or not anybody calls
+    /// ([`StoredRouterNetworkInterface::removal_due_at`]), so a configuration stored against
+    /// it would name nothing a moment later — the same unresolvable reference
+    /// [`Self::associated_router_resource_rejection`] keeps a delete from creating.
     pub fn unknown_router_network_interface_rejection(
         &self,
         member: &str,
         arn: &str,
     ) -> Option<String> {
-        if self.router_network_interfaces.contains_key(arn) {
+        if self
+            .router_network_interfaces
+            .get(arn)
+            .is_some_and(|interface| !interface.is_deleting())
+        {
             return None;
         }
         Some(format!(

@@ -187,3 +187,5 @@ mod router_input_stop;
 mod router_output_take_input;
 #[path = "all/failover_primary_source.rs"]
 mod failover_primary_source;
+#[path = "all/router_network_interface_association_integrity.rs"]
+mod router_network_interface_association_integrity;
