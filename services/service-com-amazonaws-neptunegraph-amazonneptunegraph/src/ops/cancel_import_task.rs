@@ -191,18 +191,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Only a task whose import is still in flight has work to stop: one that has
         // already stopped, and one that is already winding down, is a conflict rather
-        // than a second cancellation.
+        // than a second cancellation. The wording is the service's one precondition
+        // refusal (`crate::state::import_task_state_conflict`), which fronts no
+        // identifier: the task was addressed by one the caller sent.
         let status = task.status;
         if !status.is_cancellable() {
-            let task_id = task.id.clone();
             return Err(CancelImportTaskErrorModeled::ConflictException(
-                ConflictException {
-                    message: format!(
-                        "import task {task_id} is in status {} and cannot be cancelled",
-                        status.as_wire()
-                    ),
-                    reason: None,
-                },
+                crate::state::import_task_state_conflict("cancel", status),
             )
             .into());
         }

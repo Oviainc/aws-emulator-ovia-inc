@@ -302,16 +302,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The graph needs to be empty and in the AVAILABLE state" — the STATUS half of
         // that sentence: while an earlier transition is still outstanding the graph's
         // data is in flight, which is the same precondition `UpdateGraph` and
-        // `CreateGraphSnapshot` state.
+        // `CreateGraphSnapshot` state. The wording is the service's one precondition
+        // refusal (`crate::state::graph_status_precondition_conflict`), so this half
+        // reads as the sibling of the emptiness half below rather than as a second
+        // grammar, and it fronts no identifier: the graph was addressed by one the
+        // caller sent.
         if graph_status != crate::state::GraphStatus::Available {
             return Err(StartImportTaskErrorModeled::ConflictException(
-                ConflictException {
-                    message: format!(
-                        "graph {graph_id} is in status {} and cannot accept an import task",
-                        graph_status.as_wire()
-                    ),
-                    reason: None,
-                },
+                crate::state::graph_status_precondition_conflict(
+                    "start the import task",
+                    graph_status,
+                ),
             )
             .into());
         }

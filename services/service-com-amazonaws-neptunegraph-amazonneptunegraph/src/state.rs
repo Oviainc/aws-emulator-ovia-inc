@@ -2789,6 +2789,36 @@ pub fn snapshot_name_conflict(snapshot_name: &str) -> ConflictException {
     duplicate_name_conflict("Snapshot", snapshot_name)
 }
 
+/// The ONE grammar this service words a refused precondition with: what the call could
+/// not do, and the condition on a stored record that held it back.
+///
+/// `action` is what the service could not do, `subject` is what the condition speaks
+/// about — "it" where `action` already named that record, and the record's kind where
+/// the call was asking for something else — and `condition` is the condition that held
+/// the request back. No half of it names a resource identifier: every one of these calls
+/// addressed its record by an identifier the caller sent, so the facts the caller does
+/// not already hold are the action and the condition. The modelled shape carries only
+/// `message` and `reason`
+/// (`smithy_query(query="shape",shape="ConflictException")`), so the message is the only
+/// place any of them can go. Written once here and reached by every precondition gate in
+/// this service, so no two of them word the same refusal differently.
+fn precondition_conflict(action: &str, subject: &str, condition: &str) -> ConflictException {
+    ConflictException {
+        message: format!("Unable to {action} because {subject} {condition}."),
+        // The modelled `reason` enum carries one value, `CONCURRENT_MODIFICATION`
+        // (`smithy_query(query="shape",shape="ConflictExceptionReason")`), and a record
+        // that simply does not meet a precondition is not a concurrent modification of
+        // anything, so the member is left absent.
+        reason: None,
+    }
+}
+
+/// The [`precondition_conflict`] condition of the commonest precondition of all: the
+/// status the stored record was in when the call reached it.
+fn status_condition(status: &str) -> String {
+    format!("is in the {status} state")
+}
+
 /// The modelled `ConflictException` for a call that would transition THE GRAPH ITSELF
 /// (`StartGraph`, `StopGraph`, `UpdateGraph`, `DeleteGraph`, `ResetGraph`) while the
 /// graph's current status does not permit that transition.
@@ -2798,22 +2828,33 @@ pub fn snapshot_name_conflict(snapshot_name: &str) -> ConflictException {
 /// The service words this refusal as what it could not do and the state that stopped it
 /// — and nothing else: the graph was addressed by an identifier the caller sent, so the
 /// refusal does not front it, and the current status is the one fact the caller does
-/// not already hold. The modelled shape carries only `message` and `reason`
-/// (`smithy_query(query="shape",shape="ConflictException")`), so the message is the only
-/// place either fact can go. Written once here and reached by every one of those state
-/// gates, so no two of them word the same refusal differently.
+/// not already hold. Worded by the one template
+/// [`precondition_conflict`] every state gate here reaches, so no two of them word the
+/// same refusal differently.
 pub fn graph_state_conflict(action: &str, status: GraphStatus) -> ConflictException {
-    ConflictException {
-        message: format!(
-            "Unable to {action} the graph because it is in the {} state.",
-            status.as_wire()
-        ),
-        // The modelled `reason` enum carries one value, `CONCURRENT_MODIFICATION`
-        // (`smithy_query(query="shape",shape="ConflictExceptionReason")`), and a status
-        // that simply does not permit the transition is not a concurrent modification
-        // of the graph, so the member is left absent.
-        reason: None,
-    }
+    precondition_conflict(
+        &format!("{action} the graph"),
+        "it",
+        &status_condition(status.as_wire()),
+    )
+}
+
+/// The modelled `ConflictException` for a call on ANOTHER resource whose precondition is
+/// the status of the graph it names (`StartImportTask`, `StartExportTask`,
+/// `CreateGraphSnapshot`, `CreatePrivateGraphEndpoint`), made while that graph is not
+/// serving.
+///
+/// `action` is the whole phrase of what the call could not do ("start the import task",
+/// "create the graph snapshot"), because the refusal is not about a transition of the
+/// graph but about something else the graph had to be serving for, and `status` is the
+/// status that held the request back. Worded by the same template
+/// [`graph_state_conflict`] words the graph's own transitions with, with the graph as
+/// the subject of the condition rather than of the action, and for the same reasons: the
+/// graph was addressed by an identifier the caller sent, so the refusal does not front
+/// it. Written once here and reached by every one of those gates, so no two of them word
+/// the same refusal differently.
+pub fn graph_status_precondition_conflict(action: &str, status: GraphStatus) -> ConflictException {
+    precondition_conflict(action, "the graph", &status_condition(status.as_wire()))
 }
 
 /// The modelled `ValidationException` for a call on the graph's OWN data plane — an
@@ -2854,21 +2895,31 @@ pub fn graph_data_plane_unavailable(
 /// `StartImportTask` states two preconditions on the graph it loads into — "The graph
 /// needs to be empty and in the AVAILABLE state"
 /// (`smithy_query(query="doc",shape="StartImportTask")`) — and this is the refusal of the
-/// emptiness half, the sibling of the status half [`graph_state_conflict`] words: a bulk
-/// load FILLS a graph rather than merging into the data it already holds, so a graph
-/// holding any node or edge ([`GraphData::is_empty`]) cannot take one. Worded by the
-/// template this service refuses a precondition with — what it could not do and the
-/// condition that held it back, and no resource identifier, since the graph was addressed
-/// by an identifier the caller sent. Written once here so every operation that needs an
-/// empty target graph words this refusal the same way.
+/// emptiness half, the sibling of the status half [`graph_status_precondition_conflict`]
+/// words: a bulk load FILLS a graph rather than merging into the data it already holds,
+/// so a graph holding any node or edge ([`GraphData::is_empty`]) cannot take one. Worded
+/// by the one template [`precondition_conflict`] this service refuses a precondition
+/// with — what it could not do and the condition that held it back, and no resource
+/// identifier, since the graph was addressed by an identifier the caller sent — so the
+/// two halves of that one documented sentence read as the one sentence they are. Written
+/// once here so every operation that needs an empty target graph words this refusal the
+/// same way.
 pub fn graph_not_empty_conflict() -> ConflictException {
-    ConflictException {
-        message: "Unable to start the import task because the graph is not empty.".to_string(),
-        // The modelled `reason` enum carries one value, `CONCURRENT_MODIFICATION`, and a
-        // graph that simply holds data is not a concurrent modification of anything, so
-        // the member is left absent — as it is for every other precondition refusal here.
-        reason: None,
-    }
+    precondition_conflict("start the import task", "the graph", "is not empty")
+}
+
+/// The modelled `ConflictException` for a `DeleteGraph` call on a graph whose stored
+/// `deletionProtection` flag is set — "Graphs cannot be deleted if delete-protection is
+/// enabled." (`smithy_query(query="doc",shape="DeleteGraph")`).
+///
+/// Worded by the one template [`precondition_conflict`] this service refuses a
+/// precondition with, so a delete held back by the flag and one held back by the graph's
+/// status ([`graph_state_conflict`]) read as the one refusal grammar: what the call could
+/// not do, and the condition that held it back. The graph was addressed by an identifier
+/// the caller sent, so the refusal does not front it, and the flag is a setting the
+/// caller can turn off, which is the fact the refusal does carry.
+pub fn graph_deletion_protected_conflict() -> ConflictException {
+    precondition_conflict("delete the graph", "deletion protection", "is enabled")
 }
 
 /// The modelled `ConflictException` for a call on a GRAPH SNAPSHOT (`DeleteGraphSnapshot`,
@@ -2882,16 +2933,58 @@ pub fn graph_not_empty_conflict() -> ConflictException {
 /// hold. Written once here and reached by every snapshot state gate, so no two of them
 /// word the same refusal differently.
 pub fn snapshot_state_conflict(action: &str, status: SnapshotStatus) -> ConflictException {
-    ConflictException {
-        message: format!(
-            "Unable to {action} the graph snapshot because it is in the {} state.",
-            status.as_wire()
-        ),
-        // The modelled `reason` enum carries one value, `CONCURRENT_MODIFICATION`, and a
-        // status that simply does not permit the call is not a concurrent modification
-        // of the snapshot, so the member is left absent.
-        reason: None,
-    }
+    precondition_conflict(
+        &format!("{action} the graph snapshot"),
+        "it",
+        &status_condition(status.as_wire()),
+    )
+}
+
+/// The modelled `ConflictException` for a call on an IMPORT TASK (`CancelImportTask`)
+/// whose current status does not permit what was asked.
+///
+/// `action` is the verb of the operation ("cancel"), and `status` is the status that
+/// held the request back — the status the task had settled into by the time the call
+/// reached it. Worded by the same template [`graph_state_conflict`] words the graph's
+/// half of this rule with, and for the same reasons: the task was addressed by an
+/// identifier the caller sent, so the refusal does not front it.
+pub fn import_task_state_conflict(action: &str, status: ImportTaskStatus) -> ConflictException {
+    precondition_conflict(
+        &format!("{action} the import task"),
+        "it",
+        &status_condition(status.as_wire()),
+    )
+}
+
+/// The modelled `ConflictException` for a call on an EXPORT TASK (`CancelExportTask`)
+/// whose current status does not permit what was asked — the export namespace's half of
+/// the rule [`import_task_state_conflict`] states for imports, worded by the same
+/// template for the same reasons.
+pub fn export_task_state_conflict(action: &str, status: ExportTaskStatus) -> ConflictException {
+    precondition_conflict(
+        &format!("{action} the export task"),
+        "it",
+        &status_condition(status.as_wire()),
+    )
+}
+
+/// The modelled `ConflictException` for a call on a PRIVATE GRAPH ENDPOINT
+/// (`DeletePrivateGraphEndpoint`) whose current status does not permit what was asked.
+///
+/// `action` is the verb of the operation ("delete"), and `status` is the status that
+/// held the request back. Worded by the same template [`graph_state_conflict`] words the
+/// graph's half of this rule with, and for the same reasons: the endpoint was addressed
+/// by the graph identifier and VPC id the caller sent, so the refusal does not front
+/// either of them.
+pub fn private_graph_endpoint_state_conflict(
+    action: &str,
+    status: PrivateGraphEndpointStatus,
+) -> ConflictException {
+    precondition_conflict(
+        &format!("{action} the private graph endpoint"),
+        "it",
+        &status_condition(status.as_wire()),
+    )
 }
 
 /// Refuse more tag entries on one resource than it may hold ([`MAX_TAGS`]).

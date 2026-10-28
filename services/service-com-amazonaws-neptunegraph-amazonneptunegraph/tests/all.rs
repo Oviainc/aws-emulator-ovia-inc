@@ -63,6 +63,8 @@ mod import_task_read;
 mod pagination_token_codec;
 #[path = "all/pass_role_authorization.rs"]
 mod pass_role_authorization;
+#[path = "all/precondition_refusal_grammar.rs"]
+mod precondition_refusal_grammar;
 #[path = "all/private_graph_endpoint_lifecycle.rs"]
 mod private_graph_endpoint_lifecycle;
 #[path = "all/private_graph_endpoint_listing.rs"]

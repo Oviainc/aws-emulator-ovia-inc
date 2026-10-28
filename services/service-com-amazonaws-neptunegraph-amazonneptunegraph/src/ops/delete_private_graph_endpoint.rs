@@ -198,18 +198,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // either still being attached (`CREATING`) or already on its way out
         // (`DELETING`), which is the same precondition `DeleteGraph` states for a graph
         // whose status change is in flight. `AVAILABLE` is the only status an endpoint
-        // rests in, and deletion is how it goes away.
+        // rests in, and deletion is how it goes away. The wording is the service's one
+        // precondition refusal
+        // (`crate::state::private_graph_endpoint_state_conflict`), which fronts no
+        // identifier: the endpoint was addressed by the graph identifier and VPC id the
+        // caller sent.
         if endpoint.status != crate::state::PrivateGraphEndpointStatus::Available {
-            let status = endpoint.status.as_wire();
+            let status = endpoint.status;
             return Err(
-                DeletePrivateGraphEndpointErrorModeled::ConflictException(ConflictException {
-                    message: format!(
-                        "the private graph endpoint of graph {} in vpc {} is in status \
-                         {status} and cannot be deleted",
-                        input.graph_identifier, input.vpc_id
-                    ),
-                    reason: None,
-                })
+                DeletePrivateGraphEndpointErrorModeled::ConflictException(
+                    crate::state::private_graph_endpoint_state_conflict("delete", status),
+                )
                 .into(),
             );
         }

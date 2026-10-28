@@ -196,14 +196,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let graph_status = graph.status;
         let deletion_protection = graph.deletion_protection;
 
-        // "Graphs cannot be deleted if delete-protection is enabled."
+        // "Graphs cannot be deleted if delete-protection is enabled." The wording is the
+        // service's one precondition refusal
+        // (`crate::state::graph_deletion_protected_conflict`), which fronts no
+        // identifier: the graph was addressed by one the caller sent.
         if deletion_protection {
-            return Err(DeleteGraphErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "graph {graph_id} cannot be deleted because deletion protection is enabled"
-                ),
-                reason: None,
-            })
+            return Err(DeleteGraphErrorModeled::ConflictException(
+                crate::state::graph_deletion_protected_conflict(),
+            )
             .into());
         }
         // A graph whose status change is still in flight cannot be deleted yet — which
