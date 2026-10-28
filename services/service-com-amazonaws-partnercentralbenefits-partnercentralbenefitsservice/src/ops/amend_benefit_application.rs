@@ -242,22 +242,19 @@ fn length_clause(value: &str, min: usize, max: usize) -> Option<String> {
 
 /// One refusal of an input member, as this operation's modelled `ValidationException`.
 ///
-/// The message is rendered by the same two helpers the centralized walk's refusals go
-/// through ([`crate::service::member_clause`] and
-/// [`crate::service::validation_envelope`]): it names the member path and the
-/// requirement it failed, and echoes NOTHING of the rejected value.
+/// Built by the one construction every member refusal of this crate goes through
+/// ([`crate::state::member_validation_exception`], which renders the message with
+/// [`crate::service::member_clause`] and [`crate::service::validation_envelope`] — the
+/// same two helpers the centralized walk's refusals go through): it names the member path
+/// and the requirement it failed, and echoes NOTHING of the rejected value.
 fn refused(member: &str, clause: &str) -> AmendBenefitApplicationError {
-    let rendered = crate::service::member_clause(member, clause, false);
-    AmendBenefitApplicationErrorModeled::ValidationException(ValidationException {
-        message: crate::service::validation_envelope(std::slice::from_ref(&rendered))
-            .unwrap_or(rendered),
-        reason: crate::state::VALIDATION_REASON_FIELD.to_string(),
-        field_list: Some(crate::state::validation_field(
+    AmendBenefitApplicationErrorModeled::ValidationException(
+        crate::state::member_validation_exception(
             member,
             clause,
-            crate::state::VALIDATION_CODE_INVALID_VALUE,
-        )),
-    })
+            crate::state::VALIDATION_REASON_FIELD,
+        ),
+    )
     .into()
 }
 

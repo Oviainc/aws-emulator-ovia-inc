@@ -80,6 +80,7 @@ pub const MAX_MATCH_STEPS_PER_REQUEST: u64 = 4_000_000;
 pub struct MatchBudget {
     limit: u64,
     remaining: u64,
+    stopped: bool,
 }
 
 impl MatchBudget {
@@ -88,12 +89,23 @@ impl MatchBudget {
         Self {
             limit: steps,
             remaining: steps,
+            stopped: false,
         }
     }
 
     /// Whether the budget is spent, so the caller can stop offering work.
     pub fn exhausted(&self) -> bool {
         self.remaining == 0
+    }
+
+    /// Whether a charge this budget could NOT cover has cut a walk short, which
+    /// is what tells an answer the walk did not finish from one it did.
+    ///
+    /// Distinct from [`MatchBudget::exhausted`]: a walk whose charges fit
+    /// exactly leaves nothing remaining and still decided everything it was
+    /// asked, so the work the budget did buy is not discarded.
+    pub fn stopped(&self) -> bool {
+        self.stopped
     }
 
     /// How much work has been charged so far — what makes the COST of a match
@@ -111,6 +123,7 @@ impl MatchBudget {
         let steps = u64::try_from(steps).unwrap_or(u64::MAX).max(1);
         if steps > self.remaining {
             self.remaining = 0;
+            self.stopped = true;
             return false;
         }
         self.remaining -= steps;
@@ -444,7 +457,8 @@ fn filter_matches(filter: &Map<String, Value>, observed: &Value, budget: &mut Ma
         return false;
     };
     match operator.as_str() {
-        "exists" => argument.as_bool() == Some(!observed.is_null()),
+        // Reading the field's presence is a step like any other node visited.
+        "exists" => budget.spend(1) && argument.as_bool() == Some(!observed.is_null()),
         "prefix" => affix_matches(argument, observed, Affix::Prefix, budget),
         "suffix" => affix_matches(argument, observed, Affix::Suffix, budget),
         IGNORE_CASE => match (argument.as_str(), observed.as_str()) {
@@ -471,7 +485,15 @@ fn filter_matches(filter: &Map<String, Value>, observed: &Value, budget: &mut Ma
             _ => false,
         },
         "numeric" => numeric_matches(argument, observed, budget),
-        "anything-but" => !excluded(argument, observed, budget),
+        "anything-but" => {
+            // The only filter whose answer is a NEGATION, so it is the one place
+            // a walk cut short could be read as a match: a walk the budget
+            // stopped decided nothing, and an undecided walk reports no match.
+            // A walk whose charges fitted exactly decided everything, so its
+            // answer stands.
+            let is_excluded = excluded(argument, observed, budget);
+            !is_excluded && !budget.stopped()
+        }
         _ => false,
     }
 }
@@ -609,6 +631,9 @@ fn numeric_matches(argument: &Value, observed: &Value, budget: &mut MatchBudget)
 }
 
 /// Whether `observed` is one of the values an `anything-but` argument excludes.
+///
+/// Each value visited costs a step of its own, so a long exclusion list is
+/// walked no more cheaply than the pattern that carries it.
 fn excluded(argument: &Value, observed: &Value, budget: &mut MatchBudget) -> bool {
     match argument {
         Value::Array(values) => any_element(values, budget, |value, budget| {

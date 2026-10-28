@@ -201,9 +201,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // Only the types the store holds a setting for are reported: `EnableLDAPS`
-        // (still scaffolded) is what records one, so a directory nothing has enabled
-        // LDAPS for reports an empty list rather than an invented status.
+        // Only the types the store holds a setting for are reported: `EnableLDAPS` and
+        // `DisableLDAPS` are what record one, so a directory nothing has enabled LDAPS
+        // for reports an empty list rather than an invented status.
         let mut page: Vec<(String, LDAPSSettingInfo)> = directory
             .ldaps_settings
             .iter()

@@ -32,9 +32,9 @@ use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_groundstation_groundstation::state::{
-    AGENT_INACTIVE, BAD_REQUEST_ERROR_CODE, ENDPOINT_CREATED, ENDPOINT_CREATING, HEALTH_HEALTHY,
-    HEALTH_UNHEALTHY, INVALID_REQUEST_BODY, REASON_HEALTHY, REASON_INITIALIZING_DATAPLANE,
-    REASON_NO_REGISTERED_AGENT,
+    AGENT_INACTIVE, BAD_REQUEST_ERROR_CODE, ENDPOINT_CREATED, ENDPOINT_CREATING,
+    ENDPOINT_CREATION_SETTLES_AFTER, HEALTH_HEALTHY, HEALTH_UNHEALTHY, INVALID_REQUEST_BODY,
+    REASON_HEALTHY, REASON_INITIALIZING_DATAPLANE, REASON_NO_REGISTERED_AGENT,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -43,12 +43,14 @@ use crate::dataflow_endpoint_group_listing::listed_ids;
 use crate::scheduling_loop::{harness, is_uuid, send, Reply, ABSENT_UUID, REGION};
 
 /// Longer than this service's chosen `creating` -> `created` endpoint settle span, so a
-/// read taken after it observes the move the service owed.
+/// read taken after it observes the move the service owed. Derived from that span rather
+/// than written out, so it cannot drift from what the service actually owes.
 ///
 /// Waited out with `std::thread::sleep` rather than `tokio::time::sleep`: the emulator
 /// stores a due instant and never arms a timer, so there is no task to drive while
 /// waiting, and this workspace's `tokio` carries no `time` feature.
-const AFTER_SETTLE: Duration = Duration::from_millis(600);
+const AFTER_SETTLE: Duration =
+    ENDPOINT_CREATION_SETTLES_AFTER.saturating_add(Duration::from_millis(600));
 
 /// The published bounds of `DataflowEndpointGroupDurationInSeconds` (range 30..480 —
 /// `smithy_query(query="shape", shape="DataflowEndpointGroupDurationInSeconds")`).

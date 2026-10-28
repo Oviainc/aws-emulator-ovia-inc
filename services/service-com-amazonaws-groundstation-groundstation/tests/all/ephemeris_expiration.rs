@@ -42,6 +42,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 use service_com_amazonaws_groundstation_groundstation::state::{
     EPHEMERIS_DISABLED, EPHEMERIS_ENABLED, EPHEMERIS_EXPIRED, EPHEMERIS_VALIDATING,
+    EPHEMERIS_VALIDATION_SETTLES_AFTER,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -252,10 +253,11 @@ async fn describe_ephemeris_reports_expired_exactly_when_the_expiration_in_force
     }
 }
 
-/// How far ahead the suite below puts the expiration it then waits out: long enough that
-/// the read taken once the validation has fallen due is still inside it on a loaded
-/// machine, short enough to wait for.
-const EXPIRES_IN: Duration = Duration::from_secs(3);
+/// How far ahead the suite below puts the expiration it then waits out: past the span the
+/// service gives the validation, so the read taken once that validation has fallen due is
+/// still inside the expiration on a loaded machine, and short enough to wait for.
+const EXPIRES_IN: Duration =
+    EPHEMERIS_VALIDATION_SETTLES_AFTER.saturating_add(Duration::from_secs(3));
 
 #[tokio::test]
 async fn an_ephemeris_moves_to_expired_on_the_clock_alone() {

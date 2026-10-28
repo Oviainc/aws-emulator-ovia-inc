@@ -185,6 +185,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // still being created or already being deleted, and one whose own encryption
         // change has not settled yet, are both "already in use and not available for this
         // operation" — the same two refusals `StartDeliveryStreamEncryption` makes.
+        //
+        // Both are worded from the one vocabulary this service refuses an encryption
+        // change in (`crate::service`): the change the call asked for, the stream it
+        // named, and the state that blocks it.
         if stream.status != crate::state::StreamStatus::Active {
             return Err(in_use(crate::service::encryption_blocked_by_stream_message(
                 crate::service::EncryptionChange::Disable,
@@ -197,7 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::service::encryption_blocked_by_encryption_message(
                     crate::service::EncryptionChange::Disable,
                     &stream.name,
-                    stream.encryption_status().unwrap_or_default(),
+                    stream.reported_encryption_status(),
                 ),
             ));
         }
@@ -223,9 +227,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             crate::service::encryption_blocked_by_encryption_message(
                                 crate::service::EncryptionChange::Disable,
                                 &stream.name,
-                                stream
-                                    .encryption_status()
-                                    .unwrap_or(crate::state::ENCRYPTION_DISABLED),
+                                stream.reported_encryption_status(),
                             ),
                         ),
                     },

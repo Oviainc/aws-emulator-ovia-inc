@@ -14,9 +14,11 @@
 //!   as a refusal.
 //! * an operation addressed by the PAIR `UserPoolId` + `Domain`
 //!   (`DeleteUserPoolDomain`, `UpdateUserPoolDomain`) resolves that pair as a
-//!   unit, so a pair holding no stored domain — whichever half of it is wrong —
-//!   is refused `400 InvalidParameterException` with the one sentence that
-//!   reports the pair and names neither half.
+//!   unit, so a pair holding no stored domain is refused the same way whichever
+//!   half of it is wrong, with one sentence that reports the pair and names
+//!   neither half — `404 ResourceNotFoundException` where the operation
+//!   reconfigures an existing domain record, and `400
+//!   InvalidParameterException` where it removes one.
 //! * the device surface of a pool that set no `DeviceConfiguration` is refused
 //!   `400 InvalidUserPoolConfigurationException` with ONE fixed sentence, the
 //!   same for every device operation and every pool, embedding no request value.
@@ -49,9 +51,13 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 const CERTIFICATE: &str =
     "arn:aws:acm:us-east-1:000000000000:certificate/11111111-2222-3333-4444-555555555555";
 
-/// The sentence AWS answers when the `UserPoolId` + `Domain` pair an operation
-/// is addressed by holds no stored domain.
+/// The sentence AWS answers when the `UserPoolId` + `Domain` pair a REMOVAL is
+/// addressed by holds no stored domain.
 const NO_SUCH_DOMAIN: &str = "No such domain or user pool exists.";
+
+/// The sentence AWS answers when the `UserPoolId` + `Domain` pair a
+/// RECONFIGURATION of an existing domain is addressed by holds no stored domain.
+const DOMAIN_NOT_FOUND: &str = "User pool domain was not found.";
 
 /// The sentence AWS answers on the device surface of a pool that activated no
 /// device remembering.
@@ -308,11 +314,14 @@ async fn a_read_of_a_domain_no_pool_holds_reports_an_empty_description() {
 }
 
 /// RULE: an operation addressed by the `UserPoolId` + `Domain` pair resolves
-/// that pair as a unit, so a pair holding no stored domain is refused as a bad
-/// parameter with one sentence that names neither half — over a table spanning
-/// both such operations and every way the pair can fail to resolve.
+/// that pair as a unit, so every way the pair can fail to resolve is refused
+/// identically for that operation, with one sentence that names neither half:
+/// the operation that reconfigures an existing domain answers the resource it
+/// cannot find (404), and the one that removes a domain answers its bad-parameter
+/// refusal (400). Over a table spanning both operations and every way the pair
+/// can fail to resolve.
 #[tokio::test]
-async fn an_unresolved_pool_and_domain_pair_is_refused_as_a_bad_parameter() {
+async fn an_unresolved_pool_and_domain_pair_is_refused_the_same_way_however_it_fails() {
     let router = router();
     let user_pool_id = pool(&router, "pair-pool", None).await;
     let other_pool_id = pool(&router, "pair-other-pool", None).await;
@@ -362,24 +371,41 @@ async fn an_unresolved_pool_and_domain_pair_is_refused_as_a_bad_parameter() {
         ),
     ];
 
+    // Each operation's own refusal of an unresolvable pair: the status, the
+    // error code and the one sentence it carries.
+    let refusals = [
+        (
+            "DeleteUserPoolDomain",
+            400,
+            "InvalidParameterException",
+            NO_SUCH_DOMAIN,
+        ),
+        (
+            "UpdateUserPoolDomain",
+            404,
+            "ResourceNotFoundException",
+            DOMAIN_NOT_FOUND,
+        ),
+    ];
+
     for (label, pair) in &pairs {
-        for operation in ["DeleteUserPoolDomain", "UpdateUserPoolDomain"] {
+        for (operation, expected_status, expected_code, expected_message) in &refusals {
             // The update carries a member to change, so the row measures the
             // pair and not an empty request.
             let mut body = pair.as_object().expect("the pair is an object").clone();
-            if operation == "UpdateUserPoolDomain" {
+            if *operation == "UpdateUserPoolDomain" {
                 body.insert("ManagedLoginVersion".to_string(), json!(1));
             }
             let (status, payload) = call(&router, operation, &Value::Object(body)).await;
             assert_eq!(
                 (status, error_code(&payload)),
-                (400, "InvalidParameterException"),
-                "case {label:?} on {operation}: expected a 400 InvalidParameterException, \
-                 got {status} with {payload}"
+                (*expected_status, *expected_code),
+                "case {label:?} on {operation}: expected a {expected_status} \
+                 {expected_code}, got {status} with {payload}"
             );
             assert_eq!(
                 error_message(&payload),
-                NO_SUCH_DOMAIN,
+                *expected_message,
                 "case {label:?} on {operation}: expected the one sentence for an \
                  unresolved pair, got {payload}"
             );

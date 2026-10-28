@@ -228,6 +228,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(number_of_bytes) = input.number_of_bytes else {
             return Err(member_must_not_be_null("NumberOfBytes"));
         };
+
+        // `GenerateRandom` names no KMS key, so no key policy is in force: its permission
+        // is the caller's own ("Required permissions: kms:GenerateRandom (IAM policy)"),
+        // and a principal whose identity policies do not allow it is refused before any
+        // bytes are drawn.
+        crate::state::authorization::check_account_action(&*self.engine, ctx, Self::NAME)?;
+
         // `NumberOfBytesType`'s modelled range is already enforced before this handler
         // runs, and the length is clamped to it here as well, so the number of bytes
         // drawn below is never a raw request value however the handler is reached.

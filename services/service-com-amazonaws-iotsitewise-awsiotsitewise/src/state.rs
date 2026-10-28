@@ -311,12 +311,12 @@ pub const MAX_PIPELINES_PER_WORKSPACE: usize = 100;
 
 /// How many pipelines the store holds in total, across every workspace.
 ///
-/// The per-workspace cap above cannot bound the store on its own: `workspaceName`
-/// is a caller-supplied string and this service holds no workspace registry to
-/// resolve it against, so a caller naming a fresh workspace each time would open a
-/// new per-workspace bucket. This is the whole map's entry count, refused past the
-/// cap with the modelled `LimitExceededException` (HTTP 410) — the same bound, and
-/// for the same reason, as [`MAX_GATEWAYS`].
+/// The per-workspace cap above does not bound the store on its own: it bounds one
+/// workspace's pipelines, and the number of workspaces is bounded in turn by
+/// [`MAX_WORKSPACES`], so this cap is what states the whole map's own limit
+/// directly. This is the whole map's entry count, refused past the cap with the
+/// modelled `LimitExceededException` (HTTP 410) — the same bound, and for the same
+/// reason, as [`MAX_GATEWAYS`].
 pub const MAX_PIPELINES: usize = 1_000;
 
 /// How many versions one pipeline keeps.
@@ -351,10 +351,9 @@ pub const MAX_TASKS_PER_WORKSPACE: usize = 100;
 
 /// How many tasks the store holds in total, across every workspace.
 ///
-/// The per-workspace cap above cannot bound the store on its own, for the reason
-/// [`MAX_PIPELINES`] states: `workspaceName` is a caller-supplied string this
-/// service holds no workspace registry to resolve, so a caller naming a fresh
-/// workspace each time would open a new per-workspace bucket every time.
+/// The whole map's own limit, for the reason [`MAX_PIPELINES`] states: the
+/// per-workspace cap above bounds one workspace's tasks, and this one bounds the
+/// map every workspace's tasks share.
 pub const MAX_TASKS: usize = 1_000;
 
 /// How many versions one task keeps.
@@ -3351,10 +3350,9 @@ pub const MAX_DATASET_EXPORT_JOBS_PER_WORKSPACE: usize = 100;
 /// How many dataset export jobs the store holds in total, across every
 /// workspace.
 ///
-/// The per-workspace cap above cannot bound the store on its own, for the reason
-/// [`MAX_PIPELINES`] states: `workspaceName` is a caller-supplied string this
-/// service holds no workspace registry to resolve, so a caller naming a fresh
-/// workspace each time would open one more per-workspace bucket every time.
+/// The whole map's own limit, for the reason [`MAX_PIPELINES`] states: the
+/// per-workspace cap above bounds one workspace's jobs, and this one bounds the
+/// map every workspace's jobs share.
 pub const MAX_DATASET_EXPORT_JOBS: usize = 1_000;
 
 /// One dataset export job, as `CreateDatasetExportJob` starts it and

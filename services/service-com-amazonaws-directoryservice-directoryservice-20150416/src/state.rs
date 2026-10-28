@@ -19,6 +19,7 @@
 //!   (and a removed one leaving the store), a
 //!   trust leaving `Creating` or `Verifying` (and a deleted one leaving the store), an
 //!   assessment leaving `IN_PROGRESS`, a directory's data access leaving `Enabling`, a
+//!   directory's LDAP security leaving `Enabling`, a
 //!   registered certificate leaving `Registering`, an organization directory share
 //!   leaving `Sharing` (and an unshared one leaving the store), a schema extension
 //!   leaving `Initializing`).
@@ -416,11 +417,54 @@ pub const CERTIFICATE_STATE_REGISTERING: &str = "Registering";
 /// [`TRANSITION_SPAN`] has elapsed: the modelled enum's `Registered` value.
 pub const CERTIFICATE_STATE_REGISTERED: &str = "Registered";
 
+/// The `CertificateType` a certificate that secures LDAP calls performs: the
+/// `ClientLDAPS` value of the modelled `CertificateType` enum
+/// (`smithy_query(query="shape", shape="CertificateType")` answers `["ClientCertAuth",
+/// "ClientLDAPS"]`).
+///
+/// This is the certificate a directory has to hold before LDAP secure calls can be
+/// activated for it, so `EnableLDAPS` resolves the registrations of this type and
+/// `RegisterCertificate` performs it by default.
+pub const CERTIFICATE_TYPE_CLIENT_LDAPS: &str = "ClientLDAPS";
+
 /// The `CertificateType` a registration that names none performs.
 ///
 /// From the `Type` member's own documentation: "Valid values include `ClientLDAPS` or
 /// `ClientCertAuth`. The default value is `ClientLDAPS`."
-pub const DEFAULT_CERTIFICATE_TYPE: &str = "ClientLDAPS";
+pub const DEFAULT_CERTIFICATE_TYPE: &str = CERTIFICATE_TYPE_CLIENT_LDAPS;
+
+/// The `LDAPSStatus` a directory's LDAP security carries between `EnableLDAPS` and
+/// [`TRANSITION_SPAN`]: the first value of the modelled `LDAPSStatus` enum
+/// (`smithy_query(query="shape", shape="LDAPSStatus")` answers `["Enabling", "Enabled",
+/// "EnableFailed", "Disabled"]`).
+///
+/// `EnableLDAPS` "activates the switch for the specific directory to always use LDAP
+/// secure calls" and answers before that switch is in service — the enum carries both
+/// the transient `Enabling` and the settled `Enabled` — so the move to
+/// [`LDAPS_STATUS_ENABLED`] is owed by the clock, on the same span a create's stage
+/// transition uses.
+pub const LDAPS_STATUS_ENABLING: &str = "Enabling";
+
+/// The `LDAPSStatus` a directory's LDAP security reaches once the enable's
+/// [`TRANSITION_SPAN`] has elapsed: the modelled enum's `Enabled` value.
+pub const LDAPS_STATUS_ENABLED: &str = "Enabled";
+
+/// The `LDAPSStatus` LDAP security carries once `DisableLDAPS` has deactivated it: the
+/// modelled enum's `Disabled` value.
+///
+/// The enum carries no transient value on the way down — there is no `Disabling` — so a
+/// deactivation settles the instant it is recorded and owes the clock nothing.
+pub const LDAPS_STATUS_DISABLED: &str = "Disabled";
+
+/// The `DirectoryType` values LDAP secure calls can be activated for.
+///
+/// LDAPS secures the LDAP traffic between a directory and its clients, which is a
+/// feature of the directory types that expose a directory server to them: AWS Managed
+/// Microsoft AD (server-side LDAPS) and AD Connector (client-side LDAPS). A Simple AD
+/// directory serves no LDAPS endpoint, so activating it there asks for something that
+/// directory type does not support — which is what `EnableLDAPS` and `DisableLDAPS`
+/// refuse with the modelled `UnsupportedOperationException`.
+pub const LDAPS_SUPPORTED_DIRECTORY_TYPES: [&str; 2] = [TYPE_MICROSOFT_AD, TYPE_AD_CONNECTOR];
 
 /// The most certificates this emulator will register with one directory.
 ///
@@ -698,9 +742,9 @@ impl IpRouteRecord {
 /// The LDAPS security recorded for one `LDAPSType` of a directory, as
 /// `DescribeLDAPSSettings` reports it.
 ///
-/// `EnableLDAPS` and `DisableLDAPS` (both still scaffolded) are what record and
-/// change one, so a directory nothing has enabled LDAPS for carries no entry at all —
-/// which is what `DescribeLDAPSSettings` then reports: an empty list.
+/// `EnableLDAPS` and `DisableLDAPS` are what record and change one, so a directory
+/// nothing has enabled LDAPS for carries no entry at all — which is what
+/// `DescribeLDAPSSettings` then reports: an empty list.
 #[derive(Debug, Clone)]
 pub struct LdapsSetting {
     /// One of the modelled `LDAPSStatus` values.
@@ -709,6 +753,9 @@ pub struct LdapsSetting {
     pub status_reason: Option<String>,
     /// When this setting last changed, as `LastUpdatedDateTime` reports it.
     pub last_updated: SystemTime,
+    /// When the status transition the enable owes falls due; `None` once there is none
+    /// left to make. See [`TRANSITION_SPAN`].
+    pub status_due_at: Option<SystemTime>,
 }
 
 impl LdapsSetting {
@@ -1231,6 +1278,25 @@ impl Directory {
         let mut ordered: Vec<&CertificateRecord> = self.certificates.values().collect();
         ordered.sort_by_key(|certificate| certificate.seq);
         ordered
+    }
+
+    /// Whether this directory holds a certificate that is in service and performs
+    /// `certificate_type` — the registrations an operation that needs such a
+    /// certificate (`EnableLDAPS`) can rely on.
+    ///
+    /// A registration still being made ([`CERTIFICATE_STATE_REGISTERING`]) does not
+    /// count: it is not in service until the transition the register owes falls due.
+    pub fn has_certificate_in_service(&self, certificate_type: &str) -> bool {
+        self.certificates.values().any(|certificate| {
+            certificate.certificate_type == certificate_type
+                && certificate.state == CERTIFICATE_STATE_REGISTERED
+        })
+    }
+
+    /// Whether LDAP secure calls can be activated for this directory's type at all:
+    /// whether it is one of [`LDAPS_SUPPORTED_DIRECTORY_TYPES`].
+    pub fn supports_ldaps(&self) -> bool {
+        LDAPS_SUPPORTED_DIRECTORY_TYPES.contains(&self.directory_type.as_str())
     }
 
     /// The key [`Self::conditional_forwarders`] holds `remote_domain_name` under:
@@ -1874,7 +1940,8 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     /// route's status when `AddIpRoutes` or `RemoveIpRoutes` ran, an assessment's
     /// status when
     /// `StartADAssessment` ran, a directory's data-access status when
-    /// `EnableDirectoryDataAccess` ran.
+    /// `EnableDirectoryDataAccess` ran, a directory's LDAPS status when `EnableLDAPS`
+    /// ran.
     pub fn advance_clock(&mut self, now: SystemTime) {
         for directory in self.directories.values_mut() {
             if let Some(due) = directory.stage_due_at {
@@ -1927,6 +1994,20 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
                 if now >= due && certificate.state == CERTIFICATE_STATE_REGISTERING {
                     certificate.state = CERTIFICATE_STATE_REGISTERED.to_string();
                     certificate.state_due_at = None;
+                }
+            }
+            // The status transition `EnableLDAPS` owes: the transient `Enabling`
+            // settles on `Enabled`. A deactivation has no transient status to settle
+            // out of — the modelled enum carries no `Disabling` — so `DisableLDAPS`
+            // records the settled status itself and leaves nothing here to do.
+            for setting in directory.ldaps_settings.values_mut() {
+                let Some(due) = setting.status_due_at else {
+                    continue;
+                };
+                if now >= due && setting.status == LDAPS_STATUS_ENABLING {
+                    setting.status = LDAPS_STATUS_ENABLED.to_string();
+                    setting.last_updated = due;
+                    setting.status_due_at = None;
                 }
             }
             // The status transition `StartSchemaExtension` owes: the transient

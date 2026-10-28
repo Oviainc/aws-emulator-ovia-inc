@@ -137,11 +137,17 @@ fn s3_mount(name: &str, relative_path: &str, prefix: Option<&str>) -> Value {
 }
 
 /// `CreateTask` with `body`.
+///
+/// A task is created INSIDE a workspace, which the create resolves through the
+/// workspace registry, so this helper opens the workspace it is pointed at first.
+/// A suite that is about an unopened workspace addresses the route directly
+/// instead.
 pub(crate) async fn create(
     router: &MultiServiceRouter,
     workspace: &str,
     body: Value,
 ) -> (u16, Value) {
+    crate::support::ensure_workspace(router, workspace).await;
     call(router, "POST", &tasks_uri(workspace), Some(body)).await
 }
 

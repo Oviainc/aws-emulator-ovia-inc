@@ -12,6 +12,11 @@
 //! the state's `Next`, exactly as [`crate::state::plan_reply`] computes it. The task is
 //! then closed, so one token answers one task and no later reply resolves it.
 //!
+//! An execution of a state machine on a customer managed KMS key has the `output` this
+//! reply carries SEALED under that key, so the reply is refused with
+//! `KmsAccessDeniedException` unless KMS lets this caller have the key used for it
+//! ([`crate::state::encryption`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -192,6 +197,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = crate::state::now();
+
+        // An execution of a state machine on a customer managed KMS key has
+        // everything it retains sealed under that key, and the reply's `output` is
+        // recorded as the task's result, so that document is sealed under the key too:
+        // KMS decides whether this caller may have the key used for it before anything
+        // is written. `output` is required of this operation, so there is no reply here
+        // that seals nothing. The decision is made with no store of this service
+        // locked.
+        if let Some(why) =
+            crate::state::encryption::task_reply_write_denied(&*self.engine, ctx, &input.task_token)
+        {
+            return Err(SendTaskSuccessErrorModeled::KmsAccessDeniedException(
+                KmsAccessDeniedException { message: Some(why) },
+            )
+            .into());
+        }
 
         // Phase 1, under the lock: resolve the task, refuse what cannot be answered,
         // and read what the continuation needs. The lock is released before the walk,

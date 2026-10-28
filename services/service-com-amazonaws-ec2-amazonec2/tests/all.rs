@@ -17,6 +17,12 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// What `SendDiagnosticInterrupt` delivers to one instance, which states it can be sent
+// from, and what it refuses. Declared beside `prefix_lists` for the reason the note above
+// gives: the sorted neighbourhood and the tail of this file are where every new ec2 suite
+// inserts its lines.
+#[path = "all/send_diagnostic_interrupt.rs"]
+mod send_diagnostic_interrupt;
 // What `CreateLocalGatewayRoute` writes into one local gateway route table, what the clock
 // then owes the route, and what the create refuses. Declared beside `prefix_lists` for the
 // reason the note above gives: the sorted neighbourhood and the tail of this file are where

@@ -25,6 +25,8 @@ mod export_task_lifecycle;
 mod export_task_listing;
 #[path = "all/final_snapshot_rule.rs"]
 mod final_snapshot_rule;
+#[path = "all/graph_data_plane_gate.rs"]
+mod graph_data_plane_gate;
 #[path = "all/graph_deletion.rs"]
 mod graph_deletion;
 #[path = "all/graph_lifecycle.rs"]

@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetModelTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetModelTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: generates the sample mapping template of the [`crate::state::ModelEntry`]
+//! the requested `RestApi` holds under the requested model NAME — the
+//! `#set($inputRoot = $input.path('$'))` preamble followed by an example of the payload the
+//! model's JSON Schema declares. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetModelTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The generation is a pure function of the stored schema ([`generate_sample_payload`]), so
+//! the operation is REPORTING: it reads the store and writes nothing, and two calls on an
+//! unchanged model answer the same template. The model references a schema of this API may
+//! carry are resolved from stored state first — the same resolution `GetModel`'s `flatten`
+//! performs — because such a reference addresses another model by its URL, which the
+//! generator itself cannot read. Everything the call reports on is copied out from under
+//! the state guard before anything is generated, so the generation holds no lock, and it is
+//! bounded in descent ([`MAX_DEPTH`]), in steps ([`MAX_STEPS`] — every value rendered,
+//! property name considered and reference segment walked) and in output
+//! ([`MAX_TEMPLATE_BYTES`]) — a schema that does not fit those bounds is refused, so one
+//! request costs a fixed amount of work and returns a fixed amount of output however the
+//! stored schema branches or refers back into itself.
 //!
 //! ## Shape of an operation
 //!
@@ -76,6 +84,14 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The reading of a model's JSON Schema document and the sample payload generated from it,
+/// stated in the shared service crate because BOTH gateway control planes read that one
+/// schema language — and re-exported here so the module docs above and the suite that
+/// asserts the bounds a template is generated within name one definition of them.
+pub use ::service_common::model_mapping_template::{
+    generate_sample_payload, Exhausted, MAX_DEPTH, MAX_STEPS, MAX_TEMPLATE_BYTES,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -148,18 +164,128 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetModelTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetModelTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetModelTemplate"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        // The store is READ and what this call reports on is copied out of it, under a
+        // guard that lives no longer than that read: the generation below is bounded CPU
+        // work with nothing to synchronise, so it must not hold the state another request
+        // needs. Nothing here writes — the operation reports.
+        let model = {
+            let store = state.lock();
+            // Every identifier the request carries is resolved against stored state, each
+            // naming its own record so the refusal says which one was not found. A model
+            // belongs to ONE API, so the name is resolved inside the API that holds it and
+            // never account-wide — the addressing `GetModel` reports on.
+            let api = store.rest_apis.get(&input.rest_api_id).ok_or_else(|| {
+                GetModelTemplateErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
+                })
+            })?;
+            let model = api.models.get(&input.model_name).ok_or_else(|| {
+                GetModelTemplateErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::no_such_model(&input.model_name)),
+                })
+            })?;
+            // A schema of this API may reference another model of it by that model's own
+            // URL, which is no fragment the generator can resolve, so the references are
+            // inlined from stored state first — the one resolution `GetModel`'s `flatten`
+            // performs, bounded there, so the document generated from is at most a bounded
+            // number of model schemas larger than the one stored. A schema that references
+            // nothing is the stored document itself.
+            TemplatedModel {
+                name: model.name.clone(),
+                content_type: model.content_type.clone(),
+                schema: model.schema.as_deref().map(|schema| {
+                    super::get_model::flattened_schema(api, &input.rest_api_id, schema)
+                }),
+            }
+        };
+
+        // The sample is generated FROM the model's schema, and the one schema language it
+        // is generated from is JSON Schema — the language of a JSON model's schema ("For
+        // application/json models, this should be JSON schema draft 4 model",
+        // `CreateModel$schema`), which is what `CreateModel` held a JSON model's schema to.
+        // A model typed as something else carries its schema in that content type's own
+        // language, which nothing here can describe a payload from, and a model created
+        // without a schema declares no structure to map onto at all: either way the request
+        // is refused rather than answered with a template nothing generated.
+        let document = model
+            .json_schema()
+            .and_then(|schema| ::serde_json::from_str::<::serde_json::Value>(schema).ok())
+            .filter(::serde_json::Value::is_object)
+            .ok_or_else(|| {
+                GetModelTemplateErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(model.no_json_schema()),
+                })
+            })?;
+
+        // Generation is bounded in descent, in steps and in output size, and a
+        // schema that does not fit those bounds is REFUSED rather than expanded: one
+        // request therefore costs at most a fixed amount of work and returns at most a
+        // fixed amount of output, however the stored schema branches or refers back to
+        // itself.
+        let value = generate_sample_payload(&document).map_err(|exhausted| {
+            GetModelTemplateErrorModeled::BadRequestException(BadRequestException {
+                message: Some(format!(
+                    "Unable to generate a template for model {}: its schema expands past \
+                     {}, the bound a template is generated within.",
+                    model.name,
+                    exhausted.bound()
+                )),
+            })
+        })?;
+
+        Ok(GetModelTemplateOutput {
+            value: Some(value),
+        })
+    }
+}
+
+/// What a generation needs of the stored model: its name, for the refusal that names it,
+/// the content type whose language its schema is written in, and the schema itself with
+/// this API's model references already resolved.
+///
+/// Copied out of the store so the generation runs on an owned record and holds no lock.
+#[derive(Debug)]
+struct TemplatedModel {
+    name: String,
+    content_type: String,
+    schema: Option<String>,
+}
+
+impl TemplatedModel {
+    /// The model's schema, when that schema is a JSON Schema document — which it is for a
+    /// model typed as JSON, the content-type family whose schema language the sentence on
+    /// `CreateModel$schema` names.
+    fn json_schema(&self) -> Option<&str> {
+        let content_type: ::mime::Mime = self.content_type.parse().ok()?;
+        self.schema
+            .as_deref()
+            .filter(|_| super::create_model::is_json_media_type(&content_type))
+    }
+
+    /// Why no template was generated for this model: it declares no structure a payload can
+    /// be described from — it carries no schema at all, its schema is written in the
+    /// language of a content type that is not JSON, or the schema it carries is not a
+    /// readable JSON Schema document. BUILT FROM the record, so the sentence names the model
+    /// addressed and which of those three the caller has to fix.
+    fn no_json_schema(&self) -> String {
+        let detail = match (&self.schema, self.json_schema()) {
+            (None, _) => "and this model carries no schema".to_string(),
+            // A schema this service would read as JSON Schema, which it could not read.
+            (Some(_), Some(_)) => {
+                "and this model's schema is not a readable JSON Schema document".to_string()
+            }
+            (Some(_), None) => format!(
+                "and this model's schema is written in the language of its content type, {}",
+                self.content_type
+            ),
+        };
+        format!(
+            "Unable to generate a template for model {}: a template is generated from a \
+             JSON Schema document, {detail}.",
+            self.name
+        )
     }
 }

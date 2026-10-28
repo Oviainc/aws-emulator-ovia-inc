@@ -164,18 +164,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The listing is scoped to ONE workspace, so a workspace this service holds no
         // record of is the modelled refusal rather than an empty page, which would
-        // report absence as success. "Holds" is decided by the STORE, and a pipeline
-        // stored under a workspace is such a record: the writes of this slice key a
-        // pipeline by `(workspaceName, pipelineName)` without consulting the workspace
-        // registry, so refusing on the registry alone would hide pipelines this service
-        // really holds. Resolved BEFORE the page is cut, so a request that is wrong in
-        // both ways reports the resource that is absent.
-        let holds_workspace = store.workspaces.contains_key(&input.workspace_name)
-            || store
-                .pipelines
-                .keys()
-                .any(|(workspace, _)| *workspace == input.workspace_name);
-        if !holds_workspace {
+        // report absence as success. The workspace registry is the one place that says
+        // which workspaces exist — a create inside a workspace resolves it there too, so
+        // no pipeline can be stored under a workspace the registry does not hold.
+        // Resolved BEFORE the page is cut, so a request that is wrong in both ways
+        // reports the resource that is absent.
+        if !store.workspaces.contains_key(&input.workspace_name) {
             return Err(not_found(crate::state::not_found_message(
                 crate::state::RESOURCE_WORKSPACE,
                 &input.workspace_name,

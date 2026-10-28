@@ -1323,6 +1323,39 @@ pub fn paginate<T>(all: Vec<T>, offset: usize, page_size: usize, prefix: &str) -
     }
 }
 
+/// The page of items a `MaxResults` asks for, or the modelled
+/// `ValidationException` that refuses it.
+///
+/// Every paginated operation of this service models `MaxResults` with a
+/// `@range(min: 1, max: <limit>)`, so a requested size inside that range is the
+/// size served, one outside it is refused under the member it is about, and a
+/// request naming none serves the largest page the range allows. This is the one
+/// place that decision is made, so each paginated operation judges a page size
+/// the same way: `operation` is the operation being called, `items` the noun it
+/// pages (what one page holds) and `limit` the maximum its own range declares.
+///
+/// `requested` is `None` for the operations whose `MaxResults` is optional; the
+/// ones that model a `@default` are handed the value the boundary already
+/// applied.
+pub fn page_size(
+    operation: &str,
+    items: &str,
+    limit: i32,
+    requested: Option<i32>,
+) -> Result<usize, ValidationException> {
+    let serving = match requested {
+        None => limit,
+        Some(requested) if (1..=limit).contains(&requested) => requested,
+        Some(requested) => {
+            return Err(validation(
+                "MaxResults",
+                format!("{operation} serves between 1 and {limit} {items} a page, not {requested}"),
+            ))
+        }
+    };
+    Ok(usize::try_from(serving).expect("a page size inside the modelled range fits in usize"))
+}
+
 /// Per-service state for com-amazonaws-marketplacecatalog-awsmpseymour. A handler reaches it through [`service_state`].
 ///
 /// There is one store rather than one per catalog because every operation's
