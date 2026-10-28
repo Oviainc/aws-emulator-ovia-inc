@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetIdentityDkimAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetIdentityDkimAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetIdentityDkimAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the Easy DKIM state of each identity named, read from that
+//! identity's own record: whether DKIM signing is on for it, whether Amazon SES
+//! has verified the published CNAME records, and the tokens of the Easy DKIM
+//! setup that covers it — its own for a domain, its domain's for an email
+//! address. An identity this account has not verified is absent from the report.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +138,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetIdentityDkimAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetIdentityDkimAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetIdentityDkimAttributes"))
+        // `ctx` carries only request metadata; this operation needs none of it.
+        let _ = ctx;
+        // "Can only get DKIM attributes for up to 100 identities at a time"
+        // (this operation's own documentation), read from the one bound every
+        // per-identity reporting operation of this service shares. Refused with
+        // the code the query API answers a parameter value it does not accept,
+        // as its siblings refuse the same request.
+        if input.identities.len() > crate::state::MAX_IDENTITIES_PER_CALL {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                format!(
+                    "Identities may name at most {} identities per call, got {}",
+                    crate::state::MAX_IDENTITIES_PER_CALL,
+                    input.identities.len()
+                ),
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // See `verify_email_identity.rs`: an engine with no store for this
+            // service cannot serve the operation at all, and it models no server
+            // error of its own.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetIdentityDkimAttributes",
+            ));
+        };
+        let state = state.lock();
+
+        // Only identities that are actually in the list get an entry, the way
+        // `GetIdentityVerificationAttributes` reports: an identity that was
+        // never verified is ABSENT from the map rather than reported with an
+        // invented status.
+        let mut dkim_attributes = std::collections::HashMap::new();
+        for requested in &input.identities {
+            // Normalised the same way the writers normalise: an identity is
+            // keyed by its addr-spec, so it reads back under the value it was
+            // verified with (`addr_spec` leaves a domain unchanged).
+            let Some(identity) = state.identities.get(crate::state::addr_spec(requested)) else {
+                continue;
+            };
+            let name = identity.name.clone();
+            let dkim_enabled = identity.dkim_enabled;
+            // The setup that COVERS the identity: its own for a domain, and its
+            // domain's for an email address, since "if the identity is an email
+            // address, the tokens represent the domain of that address".
+            let covering = state.easy_dkim_for(&name);
+            dkim_attributes.insert(
+                name,
+                IdentityDkimAttributes {
+                    dkim_enabled,
+                    dkim_verification_status: covering
+                        .map_or(crate::state::VerificationStatus::NotStarted, |dkim| {
+                            dkim.status
+                        })
+                        .as_wire()
+                        .to_string(),
+                    // `DkimTokens` is optional, and an identity no Easy DKIM
+                    // setup covers has none to report — there is nothing stored
+                    // to publish, rather than an empty set of records.
+                    dkim_tokens: covering.map(|dkim| dkim.tokens.clone()),
+                },
+            );
+        }
+
+        Ok(GetIdentityDkimAttributesOutput { dkim_attributes })
     }
 }

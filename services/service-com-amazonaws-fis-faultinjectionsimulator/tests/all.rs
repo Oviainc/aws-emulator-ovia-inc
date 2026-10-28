@@ -83,5 +83,7 @@ mod template_admissibility_sequence;
 mod template_target_and_action_rules;
 #[path = "all/template_target_resource_type_rules.rs"]
 mod template_target_resource_type_rules;
+#[path = "all/untag_resource.rs"]
+mod untag_resource;
 #[path = "all/update_experiment_template.rs"]
 mod update_experiment_template;

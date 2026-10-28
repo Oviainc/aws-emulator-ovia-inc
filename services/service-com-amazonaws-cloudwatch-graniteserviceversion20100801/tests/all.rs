@@ -25,6 +25,8 @@ mod alarm_action_region;
 mod alarm_actions_switch;
 #[path = "all/alarm_configuration.rs"]
 mod alarm_configuration;
+#[path = "all/alarm_configuration_refusal_messages.rs"]
+mod alarm_configuration_refusal_messages;
 #[path = "all/alarm_delete_semantics.rs"]
 mod alarm_delete_semantics;
 #[path = "all/alarm_document_timestamps.rs"]

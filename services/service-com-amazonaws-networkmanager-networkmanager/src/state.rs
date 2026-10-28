@@ -4693,6 +4693,33 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
             .remove(&telemetry_key(global_network_id, resource_arn))
     }
 
+    /// Drop every record the store holds that exists only as a TIE to the Connect peer
+    /// `connect_peer_id` — the association keyed by that peer
+    /// ([`Self::connect_peer_associations`]) and the telemetry registration that
+    /// association made under the peer's ARN in the global network it tied the peer to —
+    /// answering the association that was dropped, or `None` where the peer held none.
+    ///
+    /// Removing the TIE (`DisassociateConnectPeer`) and removing the PEER
+    /// (`DeleteConnectPeer`) both untie the peer through here, so the two records can never
+    /// come apart: no reader of the ties reports an association for a peer that is gone,
+    /// and no registration is left behind with nothing able to remove it.
+    ///
+    /// The ARN the registration is keyed by is computed from the id — the one name every
+    /// Connect peer carries ([`Self::resource_arn`] over [`CONNECT_PEER_KIND`], which is
+    /// how the create mints it) — rather than read out of the peer record, so untying works
+    /// whether or not that record is still stored.
+    pub fn untie_connect_peer(
+        &mut self,
+        connect_peer_id: &str,
+    ) -> Option<ConnectPeerAssociationRecord> {
+        let removed = self.connect_peer_associations.remove(connect_peer_id)?;
+        self.deregister_telemetry_resource(
+            &removed.global_network_id,
+            &Self::resource_arn(CONNECT_PEER_KIND, connect_peer_id),
+        );
+        Some(removed)
+    }
+
     /// How many route analyses the global network `global_network_id` holds, for the
     /// per-global-network quota ([`MAX_ROUTE_ANALYSES_PER_GLOBAL_NETWORK`]).
     pub fn route_analysis_count_of(&self, global_network_id: &str) -> usize {

@@ -204,6 +204,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(crate::scaffolded::Scaffolded::validation)?;
 
+        // The same class of rule on the location: `CodeLocation.ClassName` is required for
+        // one value of its sibling `Language`, so the documented requirement is enforced
+        // here too and refused with 400, as it is on the create that would have stored such
+        // a location.
+        if let Some(refusal) =
+            crate::state::identified_location_refusal(&input.location_identifier)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(refusal));
+        }
+
         let status = input
             .status
             .clone()

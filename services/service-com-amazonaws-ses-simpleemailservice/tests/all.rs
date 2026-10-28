@@ -43,6 +43,8 @@ mod ses_create_receipt_rule;
 mod ses_custom_verification_email_send;
 #[path = "all/ses_custom_verification_email_templates.rs"]
 mod ses_custom_verification_email_templates;
+#[path = "all/ses_identity_dkim.rs"]
+mod ses_identity_dkim;
 #[path = "all/ses_identity_policies.rs"]
 mod ses_identity_policies;
 #[path = "all/ses_identity_policy_delete.rs"]

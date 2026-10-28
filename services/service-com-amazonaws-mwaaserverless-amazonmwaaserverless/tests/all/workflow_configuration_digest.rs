@@ -98,9 +98,9 @@ fn configuration_cases() -> Vec<(&'static str, serde_json::Value)> {
             serde_json::json!({"Description": null}),
         ),
         (
-            // `TriggerMode` is `@length(1..255)`, `^.*$`; `SCHEDULED` is the mode that
-            // asks the service to execute the workflow on its own.
-            "the trigger mode that asks the service to run the workflow",
+            // `TriggerMode` is `@length(1..255)`, `^.*$`: a free string the model
+            // documents no value for, so a row walks one of them as text.
+            "a trigger mode",
             serde_json::json!({"TriggerMode": "SCHEDULED"}),
         ),
         (

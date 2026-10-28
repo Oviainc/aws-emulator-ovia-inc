@@ -206,6 +206,7 @@ async fn create_instrumentation(router: &MultiServiceRouter) {
             "SignalType": "SNAPSHOT",
             "Location": { "CodeLocation": {
                 "Language": "Java",
+                "ClassName": "PaymentProcessor",
                 "FilePath": "src/payment/PaymentProcessor.java",
                 "LineNumber": 42
             }},
