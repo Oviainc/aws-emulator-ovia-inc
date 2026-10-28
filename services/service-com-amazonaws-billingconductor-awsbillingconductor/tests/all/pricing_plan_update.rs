@@ -23,8 +23,9 @@
 //! members the request names (none, one, both), the member class they fall in (a name
 //! under a pattern, a free-text description, including the empty string a length of 0
 //! admits), how the `Arn` is spelled, how many pricing rules the plan associates (0, 1,
-//! two spellings of one rule, 3, the modelled create maximum of 30), and which class the
-//! addressed plan falls in (this account's, nobody's, Amazon Web Services').
+//! 2 in the two spellings the rule-ARN pattern admits, 3, the modelled create maximum of
+//! 30), and which class the addressed plan falls in (this account's, nobody's, Amazon
+//! Web Services').
 //!
 //! Each row's result is read back out of state through a SECOND call rather than taken
 //! from the response of the call under test, so an assertion passes only if the change
@@ -55,6 +56,10 @@ const UPDATE_PATH: &str = "/update-pricing-plan";
 
 /// `POST /create-pricing-plan`, which gives this suite something to update.
 const CREATE_PATH: &str = "/create-pricing-plan";
+
+/// `POST /create-pricing-rule`, which gives a plan rules it may associate: a create
+/// names only rules that exist.
+const CREATE_RULE_PATH: &str = "/create-pricing-rule";
 
 /// `POST /list-pricing-rules-associated-to-pricing-plan` — the read-only reader of the
 /// associations `Size` counts.
@@ -143,6 +148,32 @@ impl Emulator {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string()
+    }
+
+    /// `CreatePricingRule`: the created rule's full ARN. A plan associates only rules
+    /// that EXIST, so every rule a case names is minted here first.
+    async fn create_rule(&self, name: &str) -> String {
+        let body = json!({"Name": name, "Scope": "GLOBAL", "Type": "MARKUP",
+                          "ModifierPercentage": 10.0});
+        let (status, parsed) = self.call("POST", CREATE_RULE_PATH, Some(&body)).await;
+        assert_eq!(
+            status, 200,
+            "setup CreatePricingRule {body}: expected 200, got {status} with {parsed}"
+        );
+        parsed
+            .get("Arn")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// `CreatePricingRule` for `count` rules, in the order the service minted them.
+    async fn create_rules(&self, prefix: &str, count: usize) -> Vec<String> {
+        let mut minted = Vec::with_capacity(count);
+        for index in 0..count {
+            minted.push(self.create_rule(&format!("{prefix}{index}")).await);
+        }
+        minted
     }
 
     /// `CreatePricingPlan` without asserting it succeeded — the probe that reads the
@@ -235,11 +266,6 @@ fn plan_arn(id: &str) -> String {
     format!("arn:aws:billingconductor::{}:pricingplan/{id}", account())
 }
 
-/// The full `PricingRuleArn` of a rule id held by this account.
-fn rule_arn(id: &str) -> String {
-    format!("arn:aws:billingconductor::{}:pricingrule/{id}", account())
-}
-
 /// The full ARN of an AWS-managed pricing plan: the `PricingPlanArn` pattern spells the
 /// account segment of those as the literal `aws`.
 fn managed_plan_arn(id: &str) -> String {
@@ -250,11 +276,6 @@ fn managed_plan_arn(id: &str) -> String {
 /// the same resource.
 fn bare_id(arn: &str) -> String {
     arn.rsplit('/').next().unwrap_or_default().to_string()
-}
-
-/// A well-formed 10-character rule id (`[a-zA-Z0-9]{10}`) derived from `index`.
-fn rule_id(index: usize) -> String {
-    format!("RULE{index:06}")
 }
 
 /// A member of a response body, as a string (absent reads as `None`).
@@ -281,12 +302,14 @@ fn now_millis() -> i64 {
 
 /// The request that creates the plan the member tables start from: both members
 /// `UpdatePricingPlan` can change carry a known starting value, and the plan also holds
-/// state no update may touch (two rule associations and a tag).
-fn base_plan(name: &str) -> Value {
+/// state no update may touch (two rule associations — named in the two spellings the
+/// modelled `PricingRuleArn` pattern admits, out of `rules`, which the caller created
+/// through `CreatePricingRule` — and a tag).
+fn base_plan(name: &str, rules: &[String]) -> Value {
     json!({
         "Name": name,
         "Description": "the plan as created",
-        "PricingRuleArns": [rule_id(1), rule_arn(&rule_id(2))],
+        "PricingRuleArns": [bare_id(&rules[0]), rules[1]],
         "Tags": { "team": "billing" },
     })
 }
@@ -363,7 +386,8 @@ async fn update_replaces_the_members_it_names_and_keeps_the_rest() {
     let long_description = "d".repeat(1024);
     for (index, case) in cases.iter().enumerate() {
         let em = Emulator::new();
-        let arn = em.create_plan(&base_plan("BasePlan")).await;
+        let rules = em.create_rules("BaseRule", 2).await;
+        let arn = em.create_plan(&base_plan("BasePlan", &rules)).await;
         let expected_description = case
             .description
             .map_or(long_description.as_str(), |value| value);
@@ -419,7 +443,7 @@ async fn update_replaces_the_members_it_names_and_keeps_the_rest() {
 
         // Everything the operation does NOT own is as the create left it: the plan's
         // associations and its tags, each read through its own read-only operation.
-        let mut expected_rules = vec![rule_arn(&rule_id(1)), rule_arn(&rule_id(2))];
+        let mut expected_rules = rules.clone();
         expected_rules.sort();
         assert_eq!(
             em.associated_rules(&arn).await,
@@ -438,33 +462,38 @@ async fn update_replaces_the_members_it_names_and_keeps_the_rest() {
 
 #[tokio::test]
 async fn size_reports_the_number_of_associated_pricing_rules() {
-    // (case, the spellings the plan was created with, the count `Size` owes back). Two
-    // spellings of ONE rule are ONE association, so the count is of RULES, not of
-    // recorded strings.
-    let many: Vec<String> = (0..MAX_ASSOCIATIONS_PER_CREATE).map(rule_id).collect();
-    let rows: Vec<(&str, Vec<String>, i64)> = vec![
-        ("no association at all", vec![], 0),
-        ("one bare rule id", vec![rule_id(7)], 1),
-        ("one full rule ARN", vec![rule_arn(&rule_id(8))], 1),
+    // (case, which of the row's own pricing rules the plan was created with — in either
+    // spelling the modelled `PricingRuleArn` pattern admits — and the count `Size` owes
+    // back). `Size` counts the RULES a plan associates, not the strings the create
+    // carried, and a create names only rules that exist.
+    type Spellings = fn(&[String]) -> Vec<String>;
+    let rows: Vec<(&str, Spellings, i64)> = vec![
+        ("no association at all", |_| Vec::new(), 0),
+        ("one bare rule id", |rules| vec![bare_id(&rules[0])], 1),
+        ("one full rule ARN", |rules| vec![rules[1].clone()], 1),
         (
-            "both spellings of one rule",
-            vec![rule_id(9), rule_arn(&rule_id(9))],
-            1,
+            "two rules, one in each spelling",
+            |rules| vec![bare_id(&rules[2]), rules[3].clone()],
+            2,
         ),
         (
             "three distinct rules",
-            vec![rule_id(3), rule_id(4), rule_arn(&rule_id(5))],
+            |rules| vec![rules[4].clone(), bare_id(&rules[5]), rules[6].clone()],
             3,
         ),
         (
             "the modelled create maximum",
-            many.clone(),
+            |rules| rules[..MAX_ASSOCIATIONS_PER_CREATE].to_vec(),
             i64::try_from(MAX_ASSOCIATIONS_PER_CREATE).expect("30 fits in an i64"),
         ),
     ];
 
-    for (case, created_with, expected) in &rows {
+    for (case, spellings, expected) in &rows {
         let em = Emulator::new();
+        let rules = em
+            .create_rules("SizeRule", MAX_ASSOCIATIONS_PER_CREATE)
+            .await;
+        let created_with = spellings(&rules);
         let arn = em
             .create_plan(&json!({ "Name": "SizedPlan", "PricingRuleArns": created_with }))
             .await;
@@ -506,7 +535,8 @@ async fn either_spelling_of_the_arn_addresses_the_same_plan() {
 
     for (case, spell) in &spellings {
         let em = Emulator::new();
-        let arn = em.create_plan(&base_plan("BasePlan")).await;
+        let rules = em.create_rules("SpellingRule", 2).await;
+        let arn = em.create_plan(&base_plan("BasePlan", &rules)).await;
         let addressed = spell(&arn);
 
         let (status, body) = em
@@ -537,7 +567,8 @@ async fn either_spelling_of_the_arn_addresses_the_same_plan() {
 #[tokio::test]
 async fn last_modified_time_moves_to_now_on_every_update() {
     let em = Emulator::new();
-    let arn = em.create_plan(&base_plan("BasePlan")).await;
+    let rules = em.create_rules("TimedRule", 2).await;
+    let arn = em.create_plan(&base_plan("BasePlan", &rules)).await;
 
     // (case, the patch the update carries) — a rename, a description change and an
     // update that names nothing all move the timestamp, because the call is the event.
@@ -574,7 +605,8 @@ async fn last_modified_time_moves_to_now_on_every_update() {
 #[tokio::test]
 async fn a_rename_moves_the_name_uniqueness_index() {
     let em = Emulator::new();
-    let first = em.create_plan(&base_plan("FirstPlan")).await;
+    let rules = em.create_rules("RenameRule", 2).await;
+    let first = em.create_plan(&base_plan("FirstPlan", &rules)).await;
     let second = em.create_plan(&json!({ "Name": "SecondPlan" })).await;
 
     // Renaming the first plan frees the name it held and takes the new one.
@@ -706,9 +738,10 @@ async fn a_plan_this_account_cannot_update_is_refused_and_nothing_is_written() {
     }
 
     let em = Emulator::new();
+    let rules = em.create_rules("RefusalRule", 2).await;
     // One plan of this account's own, so each row can also show the refusal wrote
     // nothing anywhere.
-    let own = em.create_plan(&base_plan("UntouchedPlan")).await;
+    let own = em.create_plan(&base_plan("UntouchedPlan", &rules)).await;
 
     for row in &rows {
         let (status, answered) = em.update_plan(&row.arn, &row.patch).await;

@@ -45,6 +45,8 @@ mod billing_transfer_identity;
 mod billing_transfer_preference;
 #[path = "all/create_custom_line_item_billing_period_window.rs"]
 mod create_custom_line_item_billing_period_window;
+#[path = "all/create_pricing_plan_rule_references.rs"]
+mod create_pricing_plan_rule_references;
 #[path = "all/custom_line_item_and_create_name_refusals.rs"]
 mod custom_line_item_and_create_name_refusals;
 #[path = "all/custom_line_item_associations_accumulate.rs"]

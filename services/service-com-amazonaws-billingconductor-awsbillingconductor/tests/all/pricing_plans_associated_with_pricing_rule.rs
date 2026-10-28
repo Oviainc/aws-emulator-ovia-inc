@@ -15,7 +15,7 @@
 //!
 //! Every table's rows differ along what the rule generalises over: how many plans
 //! associate the rule (0, 1, 2, 3, 12), the spelling each association was recorded
-//! with (bare id vs full ARN, both spellings in one plan), whether the associating
+//! with (bare id vs full ARN), whether the associating
 //! plan also associates other rules, the page size, the rule spelling the read uses,
 //! the period asked about, and which account the rule ARN names.
 
@@ -229,8 +229,6 @@ enum Spelling {
     BareId,
     /// The full `arn:aws:billingconductor::<account>:pricingrule/<id>` ARN.
     FullArn,
-    /// BOTH spellings, in one plan's `PricingRuleArns` — one association, twice named.
-    BothSpellings,
 }
 
 impl Spelling {
@@ -240,7 +238,6 @@ impl Spelling {
         match self {
             Spelling::BareId => vec![bare],
             Spelling::FullArn => vec![rule_arn.to_string()],
-            Spelling::BothSpellings => vec![bare, rule_arn.to_string()],
         }
     }
 }
@@ -261,8 +258,8 @@ struct AssociationRow {
 }
 
 /// The table: rows differ along how many plans associate the rule, the spelling each
-/// association was recorded with, whether one plan names the rule twice, and whether
-/// the associating plan also associates other rules.
+/// association was recorded with, and whether the associating plan also associates
+/// other rules.
 fn association_table() -> Vec<AssociationRow> {
     vec![
         AssociationRow {
@@ -280,13 +277,6 @@ fn association_table() -> Vec<AssociationRow> {
             case: "one plan, the association recorded as a full rule ARN",
             plans: vec![PlanSpec {
                 spelling: Spelling::FullArn,
-                other_rules: 0,
-            }],
-        },
-        AssociationRow {
-            case: "both spellings in ONE plan is ONE association",
-            plans: vec![PlanSpec {
-                spelling: Spelling::BothSpellings,
                 other_rules: 0,
             }],
         },
@@ -315,7 +305,7 @@ fn association_table() -> Vec<AssociationRow> {
                     other_rules: 1,
                 },
                 PlanSpec {
-                    spelling: Spelling::BothSpellings,
+                    spelling: Spelling::BareId,
                     other_rules: 0,
                 },
             ],

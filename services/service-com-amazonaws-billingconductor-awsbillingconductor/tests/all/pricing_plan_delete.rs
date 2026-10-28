@@ -50,6 +50,9 @@ const DELETE_PATH: &str = "/delete-pricing-plan";
 /// `POST /create-pricing-plan`, which gives this suite something to delete.
 const CREATE_PLAN_PATH: &str = "/create-pricing-plan";
 
+/// `POST /create-pricing-rule`, which gives a plan rules it may associate.
+const CREATE_RULE_PATH: &str = "/create-pricing-rule";
+
 /// `POST /create-billing-group`, which gives a plan a holder.
 const CREATE_GROUP_PATH: &str = "/create-billing-group";
 
@@ -134,6 +137,23 @@ impl Emulator {
         parsed["Arn"]
             .as_str()
             .expect("setup CreatePricingPlan: no Arn in the response")
+            .to_string()
+    }
+
+    /// `CreatePricingRule`, asserting the setup succeeded: the created rule's full ARN.
+    /// A plan may only associate rules that EXIST, so every rule a row names is minted
+    /// here first.
+    async fn create_rule(&self, name: &str) -> String {
+        let body = json!({"Name": name, "Scope": "GLOBAL", "Type": "MARKUP",
+                          "ModifierPercentage": 10.0});
+        let (status, parsed) = self.call("POST", CREATE_RULE_PATH, &body).await;
+        assert_eq!(
+            status, 200,
+            "setup CreatePricingRule {body}: expected 200, got {status} with {parsed:?}"
+        );
+        parsed["Arn"]
+            .as_str()
+            .expect("setup CreatePricingRule: no Arn in the response")
             .to_string()
     }
 
@@ -239,11 +259,6 @@ fn account() -> &'static str {
     ::engine::emulator_account_id()
 }
 
-/// The full `PricingRuleArn` of a rule id held by this account.
-fn rule_arn(id: &str) -> String {
-    format!("arn:aws:billingconductor::{}:pricingrule/{id}", account())
-}
-
 /// The full ARN of an AWS-managed pricing plan: the `PricingPlanArn` pattern spells the
 /// account segment of those as the literal `aws`.
 fn managed_plan_arn(id: &str) -> String {
@@ -265,11 +280,6 @@ fn as_full_arn(arn: &str) -> String {
     arn.to_string()
 }
 
-/// A well-formed 10-character rule id (`[a-zA-Z0-9]{10}`) derived from `index`.
-fn rule_id(index: usize) -> String {
-    format!("RULE{index:06}")
-}
-
 /// One row of the delete table.
 struct DeleteCase {
     label: &'static str,
@@ -278,12 +288,19 @@ struct DeleteCase {
     /// How the `DeletePricingPlan` request spells the plan's ARN.
     spelling: ArnSpelling,
 }
-
 /// RULE: `DeletePricingPlan` removes the plan its `Arn` identifies — in either spelling
 /// the modelled pattern admits — answers with that plan's FULL ARN, frees its name and
 /// leaves every other plan in state.
 #[tokio::test]
 async fn delete_removes_the_addressed_plan_and_frees_its_name() {
+    let em = Emulator::new();
+    // A plan associates only rules that EXIST, so the rows that associate any name
+    // rules minted here — in both spellings the modelled `PricingRuleArn` pattern
+    // admits.
+    let mut rules: Vec<String> = Vec::new();
+    for index in 0..4 {
+        rules.push(em.create_rule(&format!("DeleteRule{index}")).await);
+    }
     let cases = [
         DeleteCase {
             label: "a plan with nothing but a name, by full ARN",
@@ -307,23 +324,22 @@ async fn delete_removes_the_addressed_plan_and_frees_its_name() {
         },
         DeleteCase {
             label: "a plan associating one pricing rule, by full ARN",
-            plan: json!({ "PricingRuleArns": [rule_arn(&rule_id(1))] }),
+            plan: json!({ "PricingRuleArns": [rules[0]] }),
             spelling: as_full_arn,
         },
         DeleteCase {
             label: "a plan associating three pricing rules, by bare id",
             plan: json!({
                 "PricingRuleArns": [
-                    rule_arn(&rule_id(2)),
-                    rule_arn(&rule_id(3)),
-                    rule_id(4),
+                    rules[1],
+                    rules[2],
+                    bare_id(&rules[3]),
                 ],
             }),
             spelling: bare_id,
         },
     ];
 
-    let em = Emulator::new();
     // A plan no row addresses: the delete must leave it alone.
     let bystander = em
         .create_plan("bystander", &json!({ "Name": "BystanderPlan" }))

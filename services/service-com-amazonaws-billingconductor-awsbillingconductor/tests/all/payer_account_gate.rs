@@ -724,9 +724,11 @@ async fn the_gate_precedes_semantic_validation_resource_lookup_and_the_scaffold(
             method: "POST",
             uri: "/create-pricing-plan",
             body: json!({ "Name": "GatedPlan", "PricingRuleArns": ["BOGUS00001"] }),
-            // Reaches the operation for the payer account; the reference check is that
-            // operation's own concern, not the gate's.
-            payer_status: 200,
+            // The payer account reaches this operation's own reference check: a pricing
+            // rule that exists nowhere is its modelled 400 `ValidationException` with the
+            // `PRICINGRULES_NOT_EXIST` reason — a different 400 from the boundary's, and
+            // still a 403 for everyone else.
+            payer_status: 400,
         },
         Row {
             case: "a filter-less ListBillingGroups",

@@ -19,8 +19,9 @@
 //!
 //! Every table's rows differ along what the rule generalises over: which optional
 //! members a plan carries (no description, a description, the empty description a
-//! length of 0 admits, tags), how many pricing rules it associates (0, 1, two
-//! spellings of one rule, 3, the modelled create maximum of 30), how the filter spells
+//! length of 0 admits, tags), how many pricing rules it associates (0, 1, 2 in the two
+//! spellings the modelled rule-ARN pattern admits, 3, the modelled create maximum of
+//! 30), how the filter spells
 //! an ARN and how many it names, which class an ARN falls in (this account's, nobody's,
 //! another account's, Amazon Web Services'), the page size (the modelled bounds, sizes
 //! that do and do not divide the set, none at all) and the billing period asked for.
@@ -47,6 +48,10 @@ const LIST_PATH: &str = "/list-pricing-plans";
 
 /// `POST /create-pricing-plan`, which gives this suite something to list.
 const CREATE_PATH: &str = "/create-pricing-plan";
+
+/// `POST /create-pricing-rule`, which gives a plan rules it may associate: a create
+/// names only rules that exist.
+const CREATE_RULE_PATH: &str = "/create-pricing-rule";
 
 /// `PUT /update-pricing-plan` — the operation that moves a plan's `Name`,
 /// `Description` and `LastModifiedTime`.
@@ -143,6 +148,32 @@ impl Emulator {
         arn
     }
 
+    /// `CreatePricingRule`: the full ARN of a rule this account holds. A plan may only
+    /// associate rules that EXIST, so every rule a row names is minted here first.
+    async fn create_rule(&self, name: &str) -> String {
+        let body = json!({"Name": name, "Scope": "GLOBAL", "Type": "MARKUP",
+                          "ModifierPercentage": 10.0});
+        let (status, parsed) = self.call("POST", CREATE_RULE_PATH, &body).await;
+        assert_eq!(
+            status, 200,
+            "setup CreatePricingRule {body}: expected 200, got {status} with {parsed}"
+        );
+        parsed
+            .get("Arn")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// `CreatePricingRule` for `count` rules, in the order the service minted them.
+    async fn create_rules(&self, prefix: &str, count: usize) -> Vec<String> {
+        let mut minted = Vec::with_capacity(count);
+        for index in 0..count {
+            minted.push(self.create_rule(&format!("{prefix}{index}")).await);
+        }
+        minted
+    }
+
     /// `ListPricingPlans` with the optional members a row sets.
     async fn list(
         &self,
@@ -201,24 +232,9 @@ impl Emulator {
     }
 }
 
-/// The emulator's account id — the account every ARN this service mints carries.
-fn account() -> &'static str {
-    engine::emulator_account_id()
-}
-
 /// The full `PricingPlanArn` of a plan id held by `account_id`.
 fn plan_arn_in(account_id: &str, id: &str) -> String {
     format!("arn:aws:billingconductor::{account_id}:pricingplan/{id}")
-}
-
-/// The full `PricingRuleArn` of a rule id held by this account.
-fn rule_arn(id: &str) -> String {
-    format!("arn:aws:billingconductor::{}:pricingrule/{id}", account())
-}
-
-/// A well-formed 10-character rule id (`[a-zA-Z0-9]{10}`) derived from `index`.
-fn rule_id(index: usize) -> String {
-    format!("RULE{index:06}")
 }
 
 /// Does `value` match the FULL form of the modelled `PricingPlanArn` pattern,
@@ -337,9 +353,14 @@ struct PlanRow {
 }
 
 /// The table: rows differ along which optional members the create carries and how
-/// many distinct pricing rules the plan associates.
-fn plan_table() -> Vec<PlanRow> {
-    let many: Vec<String> = (0..MAX_ASSOCIATIONS_PER_CREATE).map(rule_id).collect();
+/// many distinct pricing rules the plan associates. `rules` holds the FULL ARNs of
+/// rules this account already has — a create may name no other.
+fn plan_table(rules: &[String]) -> Vec<PlanRow> {
+    let many: Vec<String> = rules
+        .iter()
+        .take(MAX_ASSOCIATIONS_PER_CREATE)
+        .cloned()
+        .collect();
     vec![
         PlanRow {
             case: "the smallest request the model accepts",
@@ -358,25 +379,25 @@ fn plan_table() -> Vec<PlanRow> {
         },
         PlanRow {
             case: "one association, recorded as a bare rule id",
-            request: json!({ "Name": "One_Rule", "PricingRuleArns": ["AAAAAAAAA1"] }),
+            request: json!({ "Name": "One_Rule", "PricingRuleArns": [bare_id(&rules[0])] }),
             expected_size: 1,
         },
         PlanRow {
             case: "one association, recorded as a full rule ARN",
             request: json!({ "Name": "One+Rule+Arn",
-                             "PricingRuleArns": [rule_arn("BBBBBBBBB2")] }),
+                             "PricingRuleArns": [rules[1]] }),
             expected_size: 1,
         },
         PlanRow {
-            case: "both spellings of ONE rule is ONE association",
-            request: json!({ "Name": "Deduplicated",
-                             "PricingRuleArns": ["CCCCCCCCC3", rule_arn("CCCCCCCCC3")] }),
-            expected_size: 1,
+            case: "two associations, one in each spelling the rule-ARN pattern admits",
+            request: json!({ "Name": "Both.Spellings",
+                             "PricingRuleArns": [bare_id(&rules[2]), rules[3]] }),
+            expected_size: 2,
         },
         PlanRow {
             case: "three associations, with tags beside them",
             request: json!({ "Name": "Three-Rules", "Description": "three",
-                             "PricingRuleArns": ["DDDDDDDDD4", "EEEEEEEEE5", "FFFFFFFFF6"],
+                             "PricingRuleArns": [rules[4], rules[5], rules[6]],
                              "Tags": { "team": "finance" } }),
             expected_size: 3,
         },
@@ -397,9 +418,10 @@ fn plan_table() -> Vec<PlanRow> {
 #[tokio::test]
 async fn every_created_pricing_plan_reads_back_out_of_state_member_for_member() {
     let em = Emulator::new();
+    let rules = em.create_rules("ListRule", MAX_ASSOCIATIONS_PER_CREATE).await;
     let mut minted: Vec<String> = Vec::new();
 
-    for row in plan_table() {
+    for row in plan_table(&rules) {
         let arn = em.create_plan(&row.request).await;
         assert!(
             !minted.contains(&arn),
@@ -474,9 +496,10 @@ async fn every_created_pricing_plan_reads_back_out_of_state_member_for_member() 
 #[tokio::test]
 async fn the_arn_filter_selects_exactly_the_plans_it_names() {
     let em = Emulator::new();
+    let rule = em.create_rule("FilterRule").await;
     let first = em.create_plan(&json!({ "Name": "Filter-First" })).await;
     let second = em
-        .create_plan(&json!({ "Name": "Filter-Second", "PricingRuleArns": ["AAAAAAAAA1"] }))
+        .create_plan(&json!({ "Name": "Filter-Second", "PricingRuleArns": [rule] }))
         .await;
     let third = em.create_plan(&json!({ "Name": "Filter-Third" })).await;
     let mut all = vec![first.clone(), second.clone(), third.clone()];
@@ -726,9 +749,10 @@ async fn a_page_size_outside_the_modelled_range_is_refused_and_the_bounds_are_se
 #[tokio::test]
 async fn the_listing_follows_the_writes_that_moved_the_plans() {
     let em = Emulator::new();
+    let rule = em.create_rule("WritesRule").await;
     let kept = em
         .create_plan(&json!({ "Name": "Kept", "Description": "kept",
-                              "PricingRuleArns": ["AAAAAAAAA1"] }))
+                              "PricingRuleArns": [rule] }))
         .await;
     let moved = em
         .create_plan(&json!({ "Name": "Moved", "Description": "before" }))
@@ -836,8 +860,9 @@ async fn the_listing_follows_the_writes_that_moved_the_plans() {
 #[tokio::test]
 async fn reading_the_plans_changes_nothing_a_later_caller_sees() {
     let em = Emulator::new();
+    let rule = em.create_rule("ReadRule").await;
     let first = em
-        .create_plan(&json!({ "Name": "Read-First", "PricingRuleArns": ["AAAAAAAAA1"] }))
+        .create_plan(&json!({ "Name": "Read-First", "PricingRuleArns": [rule] }))
         .await;
     let second = em
         .create_plan(&json!({ "Name": "Read-Second", "Description": "second" }))

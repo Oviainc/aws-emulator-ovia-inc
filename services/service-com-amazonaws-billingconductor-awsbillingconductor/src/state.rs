@@ -3039,6 +3039,56 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
         }
     }
 
+    /// The rules a request's `PricingRuleArns` names, as FULL rule ARNs — or the
+    /// modelled refusal the list earns.
+    ///
+    /// Every operation that takes a list of pricing rule ARNs resolves it here, so one
+    /// rule named in two spellings is one rule everywhere and a list that names no real
+    /// rule is refused the same way whichever operation carried it:
+    ///
+    /// * the `PricingRuleArn` pattern accepts the full ARN or the bare id, so each entry
+    ///   is normalised FIRST and every decision below is about the RULE rather than the
+    ///   spelling ([`normalize_pricing_rule_arn`]);
+    /// * one rule named twice — in either spelling — is a fault in the input, which
+    ///   `ValidationExceptionReason` enumerates by name (`DUPLICATE_PRICINGRULE_ARNS`);
+    /// * there are no AWS-managed pricing rules (the `PricingRuleArn` pattern allows only
+    ///   a 12-digit account segment), so what is stored is the whole universe of rules
+    ///   and an entry naming none of them is refused with the reason the model
+    ///   enumerates for exactly that (`PRICINGRULES_NOT_EXIST`).
+    ///
+    /// `Err` carries the `(reason, member, message)` of the modelled `ValidationException`
+    /// the calling operation refuses the whole request with, so nothing is stored for a
+    /// list that is partly resolvable; `field` names the input member that carried the
+    /// list.
+    pub fn resolve_pricing_rule_arns<'a>(
+        &self,
+        field: &'static str,
+        arns: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Vec<String>, ValidationRefusal> {
+        let requested: Vec<String> = arns
+            .into_iter()
+            .map(normalize_pricing_rule_arn)
+            .collect::<Vec<String>>();
+        if let Some(duplicate) = first_duplicate(&requested) {
+            return Err((
+                "DUPLICATE_PRICINGRULE_ARNS",
+                field,
+                format!("the pricing rule {duplicate} is named more than once in this request"),
+            ));
+        }
+        if let Some(missing) = requested
+            .iter()
+            .find(|arn| !self.pricing_rules.contains_key(*arn))
+        {
+            return Err((
+                "PRICINGRULES_NOT_EXIST",
+                field,
+                format!("the pricing rule {missing} does not exist"),
+            ));
+        }
+        Ok(requested)
+    }
+
     /// The pricing rule a name is taken by, when it is not `rule_arn`'s own name.
     pub fn conflicting_pricing_rule_name(&self, name: &str, rule_arn: &str) -> Option<&str> {
         self.pricing_rule_names

@@ -150,6 +150,27 @@ async fn create_plan(em: &Emulator, name: &str) -> String {
         .to_string()
 }
 
+/// `CreatePricingRule`: the full ARN of a rule the service minted — the only kind of
+/// rule ARN a pricing plan may associate, since a plan's `PricingRuleArns` must name
+/// rules that exist.
+async fn create_pricing_rule(em: &Emulator, name: &str) -> String {
+    let (status, body) = em
+        .post(
+            "/create-pricing-rule",
+            &json!({"Name": name, "Scope": "GLOBAL", "Type": "MARKUP",
+                    "ModifierPercentage": 10.0}),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "setup CreatePricingRule {name:?}: expected 200, got {status} with {body:?}"
+    );
+    body["Arn"]
+        .as_str()
+        .expect("setup CreatePricingRule: no Arn in the response")
+        .to_string()
+}
+
 async fn create_group(
     em: &Emulator,
     name: &str,
@@ -222,6 +243,10 @@ async fn list_all_association_ids(em: &Emulator, input: &Value) -> Vec<String> {
 /// plan, whatever optional members the request carries.
 #[tokio::test]
 async fn create_pricing_plan_mints_a_fresh_stored_arn_for_every_shape_of_input() {
+    let em = Emulator::new();
+    // A plan may only associate a pricing rule that EXISTS, so the row carrying
+    // `PricingRuleArns` names a rule this call created.
+    let rule_arn = create_pricing_rule(&em, "RuleForPlan").await;
     let long_name = "P".repeat(128);
     // Rows differ along the name's form and length and along which optional members
     // are present. Bounds are the modelled ones: Name len 1..128 with pattern
@@ -244,7 +269,7 @@ async fn create_pricing_plan_mints_a_fresh_stored_arn_for_every_shape_of_input()
             "with pricing rule arns",
             json!({
                 "Name": "PlanWithRules",
-                "PricingRuleArns": ["arn:aws:billingconductor::000000000000:pricingrule/0123456789"],
+                "PricingRuleArns": [rule_arn],
             }),
         ),
         (
@@ -258,7 +283,6 @@ async fn create_pricing_plan_mints_a_fresh_stored_arn_for_every_shape_of_input()
         ("single-character name", json!({"Name": "x"})),
     ];
 
-    let em = Emulator::new();
     let mut minted: Vec<String> = Vec::new();
     for (case, input) in cases {
         let (status, body) = em.post("/create-pricing-plan", &input).await;

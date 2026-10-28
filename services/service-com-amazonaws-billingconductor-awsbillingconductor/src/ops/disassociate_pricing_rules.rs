@@ -199,44 +199,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // Each requested rule is normalised FIRST, so every decision below is about the
-        // RULE rather than the spelling the request named it with: the `PricingRuleArn`
-        // pattern accepts the full ARN or the bare id, and both name one rule.
-        let requested: Vec<String> = input
-            .pricing_rule_arns
-            .iter()
-            .map(|arn| crate::state::normalize_pricing_rule_arn(arn))
-            .collect();
-
-        // One request naming one rule twice — in either spelling — is a fault in the
-        // input, and `ValidationExceptionReason` enumerates it by name
-        // (`DUPLICATE_PRICINGRULE_ARNS`), the same refusal `AssociatePricingRules`
-        // gives for it.
-        if let Some(duplicate) = crate::state::first_duplicate(&requested) {
-            return Err(validation(
-                "DUPLICATE_PRICINGRULE_ARNS",
-                "PricingRuleArns",
-                format!("the pricing rule {duplicate} is named more than once in this request"),
-            ));
-        }
-
-        // There are no AWS-managed pricing rules (the `PricingRuleArn` pattern allows
-        // only a 12-digit account segment), so what is stored is the whole universe of
-        // rules and an ARN naming none of them is refused with the reason the model
-        // enumerates for exactly that (`PRICINGRULES_NOT_EXIST`). A rule a plan
-        // associates in the current period cannot be deleted
+        // The requested rules are resolved through the one predicate every operation
+        // taking a list of pricing rule ARNs uses: each entry is normalised first (the
+        // `PricingRuleArn` pattern accepts the full ARN or the bare id, and both name one
+        // rule), a rule named twice is refused `DUPLICATE_PRICINGRULE_ARNS` and a rule
+        // that does not exist `PRICINGRULES_NOT_EXIST`. A rule a plan associates in the
+        // current period cannot be deleted
         // (`DeletePricingRule`'s `PRICING_RULE_ATTACHED_TO_PRICING_PLAN_DELETE_CONFLICT`),
         // so no association the next check looks at can name a rule that is gone.
-        if let Some(missing) = requested
-            .iter()
-            .find(|arn| !state.pricing_rules.contains_key(*arn))
-        {
-            return Err(validation(
-                "PRICINGRULES_NOT_EXIST",
-                "PricingRuleArns",
-                format!("the pricing rule {missing} does not exist"),
-            ));
-        }
+        let requested = match state.resolve_pricing_rule_arns(
+            "PricingRuleArns",
+            input.pricing_rule_arns.iter().map(String::as_str),
+        ) {
+            Ok(resolved) => resolved,
+            Err((reason, field, message)) => return Err(validation(reason, field, message)),
+        };
 
         // What the plan associates NOW, as full rule ARNs: read through the one state
         // method every other reader of the association uses, so this decision cannot

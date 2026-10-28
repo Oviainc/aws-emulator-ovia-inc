@@ -16,6 +16,13 @@
 //! `ValidationException` and nothing is minted (see
 //! [`crate::state::check_tag_keys_not_reserved`]).
 //!
+//! The `PricingRuleArns` the create associates are resolved through the one predicate
+//! every operation taking a list of pricing rule ARNs uses
+//! ([`crate::state::ComAmazonawsBillingconductorAwsbillingconductorState::resolve_pricing_rule_arns`]):
+//! a list naming a rule that does not exist, or naming one rule twice, is refused with
+//! the modelled 400 `ValidationException` and nothing is minted, so a stored plan never
+//! holds an association to a rule that was never created.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -172,8 +179,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
-
         // Tag-on-create takes caller-supplied tag keys, so the reserved `aws:` namespace
         // is refused here exactly as `TagResource` refuses it: from the request alone,
         // before anything is minted, so a create naming such a key leaves no resource
@@ -234,6 +239,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A plan's associations are resolved before anything is minted, through the one
+        // predicate `AssociatePricingRules` and `DisassociatePricingRules` resolve their
+        // own rule lists with: a rule that does not exist and a rule named twice are
+        // both faults in the input, each with the reason `ValidationExceptionReason`
+        // enumerates for it, and the whole request is refused — so a plan this service
+        // stores cannot associate a rule no `CreatePricingRule` ever made, which the
+        // readers of its associations would otherwise report as real.
+        let pricing_rule_arns = match state.resolve_pricing_rule_arns(
+            "PricingRuleArns",
+            input
+                .pricing_rule_arns
+                .iter()
+                .flatten()
+                .map(String::as_str),
+        ) {
+            Ok(resolved) => resolved,
+            Err((reason, field, message)) => return Err(validation(reason, field, message)),
+        };
+
         // Exactly 10 characters: the customer-minted form of the `PricingPlanArn`
         // pattern is `[a-zA-Z0-9]{10}`.
         let id = state.mint_resource_id(10);
@@ -246,9 +270,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Each rule the create names is associated FROM the billing period this
             // call is made in: a read scoped to an earlier period reports no
             // association, because there was none then.
-            pricing_rule_associations: input
-                .pricing_rule_arns
-                .unwrap_or_default()
+            pricing_rule_associations: pricing_rule_arns
                 .iter()
                 .map(|arn| crate::state::PricingRuleAssociationRecord::started_now(arn))
                 .collect(),
@@ -263,6 +285,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.pricing_plan_names.insert(input.name, arn.clone());
         state.record_idempotent_arn(Self::NAME, input.client_token.as_deref(), &arn);
 
+        // The audit record for a state-changing call, as `CreatePricingRule` writes it
+        // for the sibling resource: who asked, what was minted and that it succeeded.
+        // Never a secret, and never a `@sensitive` member (the plan's name and
+        // description) — only the access key id the caller presented, the ARN this call
+        // created and how many rules it associated.
+        ::tracing::info!(
+            operation = Self::NAME,
+            akid = %::engine::extract_akid(&ctx.parts().headers),
+            pricing_plan_arn = %arn,
+            associated_rules = pricing_rule_arns.len(),
+            outcome = "created",
+            "pricing plan created"
+        );
         Ok(CreatePricingPlanOutput { arn: Some(arn) })
     }
+}
+
+/// Refuse the request with this operation's modelled 400 `ValidationException`.
+fn validation(reason: &str, field: &str, message: String) -> CreatePricingPlanError {
+    CreatePricingPlanErrorModeled::ValidationException(crate::state::validation_exception(
+        reason, field, message,
+    ))
+    .into()
 }

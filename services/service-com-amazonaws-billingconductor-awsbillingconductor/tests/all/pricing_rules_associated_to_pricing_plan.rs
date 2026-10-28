@@ -17,7 +17,7 @@
 //!
 //! Every table's rows differ along what the rule generalises over: how many rules a
 //! plan associates (0, 1, 2, 3, 30 — the modelled input maximum), the spelling each
-//! association was recorded with (bare id vs full ARN, both spellings of one rule),
+//! association was recorded with (bare id vs full ARN, mixed within one create),
 //! the order they were recorded in, the page size, the plan spelling the read uses,
 //! and which account the plan ARN names.
 
@@ -117,6 +117,37 @@ impl Emulator {
             .to_string()
     }
 
+    /// Create a pricing rule and answer the full ARN the service minted. A plan
+    /// associates only rules that EXIST, so every rule a row names is minted here
+    /// first.
+    async fn create_rule(&self, name: &str) -> String {
+        let (status, body) = self
+            .post(
+                "/create-pricing-rule",
+                &json!({"Name": name, "Scope": "GLOBAL", "Type": "MARKUP",
+                        "ModifierPercentage": 10.0}),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "setup CreatePricingRule {name:?}: expected 200, got {status} with {body:?}"
+        );
+        body["Arn"]
+            .as_str()
+            .expect("setup CreatePricingRule: no Arn in the response")
+            .to_string()
+    }
+
+    /// `count` pricing rules, in the order the service minted them — which is ARN
+    /// order, since the ids are minted monotonically.
+    async fn create_rules(&self, prefix: &str, count: usize) -> Vec<String> {
+        let mut minted = Vec::with_capacity(count);
+        for index in 0..count {
+            minted.push(self.create_rule(&format!("{prefix}{index}")).await);
+        }
+        minted
+    }
+
     /// `ListPricingRulesAssociatedToPricingPlan` for one plan, with the optional
     /// members a row sets.
     async fn list(
@@ -156,21 +187,15 @@ fn account() -> &'static str {
     engine::emulator_account_id()
 }
 
-/// The full `PricingRuleArn` of a rule id, in the form the modelled pattern
-/// `^(arn:aws(-cn)?:billingconductor::[0-9]{12}:pricingrule/)?[a-zA-Z0-9]{10}$`
-/// spells it.
-fn rule_arn(id: &str) -> String {
-    format!("arn:aws:billingconductor::{}:pricingrule/{id}", account())
-}
-
 /// The full `PricingPlanArn` of a plan id held by `account_id`.
 fn plan_arn_in(account_id: &str, id: &str) -> String {
     format!("arn:aws:billingconductor::{account_id}:pricingplan/{id}")
 }
 
-/// A well-formed 10-character rule id (`[a-zA-Z0-9]{10}`) derived from `index`.
-fn rule_id(index: usize) -> String {
-    format!("RULE{index:06}")
+/// The bare resource id of a full ARN — the other spelling the modelled
+/// `PricingRuleArn` pattern admits for the same rule.
+fn bare_id(arn: &str) -> String {
+    arn.rsplit('/').next().unwrap_or_default().to_string()
 }
 
 /// The `PricingRuleArns` a response reports, as owned strings (an absent member is
@@ -233,12 +258,15 @@ struct AssociationRow {
 }
 
 /// The table: rows differ along the number of associations, the spelling each was
-/// recorded with, whether two spellings name one rule, and the order they arrived
-/// in.
-fn association_table() -> Vec<AssociationRow> {
-    let many: Vec<String> = (0..MAX_ASSOCIATIONS_PER_CREATE).map(rule_id).collect();
-    let mut many_expected: Vec<String> = many.iter().map(|id| rule_arn(id)).collect();
+/// recorded with, and the order they arrived in. `rules` holds the FULL ARNs of rules
+/// this account already has — a create may name no other.
+fn association_table(rules: &[String]) -> Vec<AssociationRow> {
+    let mut many_expected: Vec<String> = rules.to_vec();
     many_expected.sort();
+    let mut two_expected = vec![rules[2].clone(), rules[3].clone()];
+    two_expected.sort();
+    let mut three_expected = vec![rules[8].clone(), rules[4].clone(), rules[6].clone()];
+    three_expected.sort();
     vec![
         AssociationRow {
             case: "no association at all",
@@ -247,40 +275,27 @@ fn association_table() -> Vec<AssociationRow> {
         },
         AssociationRow {
             case: "one association, recorded as a bare rule id",
-            created_with: vec!["AAAAAAAAA1".to_string()],
-            expected: vec![rule_arn("AAAAAAAAA1")],
+            created_with: vec![bare_id(&rules[0])],
+            expected: vec![rules[0].clone()],
         },
         AssociationRow {
             case: "one association, recorded as a full rule ARN",
-            created_with: vec![rule_arn("BBBBBBBBB2")],
-            expected: vec![rule_arn("BBBBBBBBB2")],
+            created_with: vec![rules[1].clone()],
+            expected: vec![rules[1].clone()],
         },
         AssociationRow {
             case: "two associations in mixed spellings",
-            created_with: vec!["CCCCCCCCC3".to_string(), rule_arn("DDDDDDDDD4")],
-            expected: vec![rule_arn("CCCCCCCCC3"), rule_arn("DDDDDDDDD4")],
-        },
-        AssociationRow {
-            case: "both spellings of ONE rule is ONE association",
-            created_with: vec!["EEEEEEEEE5".to_string(), rule_arn("EEEEEEEEE5")],
-            expected: vec![rule_arn("EEEEEEEEE5")],
+            created_with: vec![bare_id(&rules[2]), rules[3].clone()],
+            expected: two_expected,
         },
         AssociationRow {
             case: "three associations recorded out of ARN order",
-            created_with: vec![
-                "ZZZZZZZZZ9".to_string(),
-                "AAAAAAAAA0".to_string(),
-                "MMMMMMMMM5".to_string(),
-            ],
-            expected: vec![
-                rule_arn("AAAAAAAAA0"),
-                rule_arn("MMMMMMMMM5"),
-                rule_arn("ZZZZZZZZZ9"),
-            ],
+            created_with: vec![rules[8].clone(), rules[4].clone(), bare_id(&rules[6])],
+            expected: three_expected,
         },
         AssociationRow {
             case: "the modelled maximum of thirty associations",
-            created_with: many,
+            created_with: rules.to_vec(),
             expected: many_expected,
         },
     ]
@@ -289,7 +304,10 @@ fn association_table() -> Vec<AssociationRow> {
 #[tokio::test]
 async fn a_plan_reports_exactly_the_rules_it_associates_as_full_arns_in_arn_order() {
     let em = Emulator::new();
-    for (index, row) in association_table().into_iter().enumerate() {
+    let rules = em
+        .create_rules("AssociatedRule", MAX_ASSOCIATIONS_PER_CREATE)
+        .await;
+    for (index, row) in association_table(&rules).into_iter().enumerate() {
         let plan_arn = em
             .create_plan(&format!("plan-{index}"), &row.created_with)
             .await;
@@ -345,9 +363,8 @@ async fn a_plan_reports_exactly_the_rules_it_associates_as_full_arns_in_arn_orde
 #[tokio::test]
 async fn the_reported_period_is_the_one_the_request_named_and_otherwise_absent() {
     let em = Emulator::new();
-    let plan = em
-        .create_plan("period-plan", &["AAAAAAAAA1".to_string()])
-        .await;
+    let rule = em.create_rule("PeriodRule").await;
+    let plan = em.create_plan("period-plan", &[bare_id(&rule)]).await;
 
     // The association this test made starts in the billing period the create ran in,
     // so a period before that reports it not at all and a period from it onward
@@ -375,7 +392,7 @@ async fn the_reported_period_is_the_one_the_request_named_and_otherwise_absent()
              got {body:?}"
         );
         let expected: Vec<String> = if period_at_or_after(period, &started_in) {
-            vec![rule_arn("AAAAAAAAA1")]
+            vec![rule.clone()]
         } else {
             vec![]
         };
@@ -402,7 +419,7 @@ async fn the_reported_period_is_the_one_the_request_named_and_otherwise_absent()
     );
     assert_eq!(
         reported(&body),
-        vec![rule_arn("AAAAAAAAA1")],
+        vec![rule.clone()],
         "case \"no BillingPeriod\": the associations must still be reported, got {body:?}"
     );
 }
@@ -410,9 +427,11 @@ async fn the_reported_period_is_the_one_the_request_named_and_otherwise_absent()
 #[tokio::test]
 async fn every_page_size_pages_the_whole_association_set_exactly_once() {
     let em = Emulator::new();
-    let created: Vec<String> = (0..MAX_ASSOCIATIONS_PER_CREATE).map(rule_id).collect();
+    let created = em
+        .create_rules("PagedRule", MAX_ASSOCIATIONS_PER_CREATE)
+        .await;
     let plan = em.create_plan("paged-plan", &created).await;
-    let mut expected: Vec<String> = created.iter().map(|id| rule_arn(id)).collect();
+    let mut expected: Vec<String> = created.clone();
     expected.sort();
 
     // Rows differ along the page size: the modelled minimum, sizes that do and do
@@ -463,9 +482,8 @@ async fn every_page_size_pages_the_whole_association_set_exactly_once() {
 #[tokio::test]
 async fn a_page_size_outside_the_modelled_range_is_refused_and_the_bounds_are_served() {
     let em = Emulator::new();
-    let plan = em
-        .create_plan("bounds-plan", &["AAAAAAAAA1".to_string()])
-        .await;
+    let rule = em.create_rule("BoundsRule").await;
+    let plan = em.create_plan("bounds-plan", &[rule]).await;
 
     // The published bounds of `MaxPricingPlanResults` (range 1..100) and one past
     // each of them.
@@ -514,10 +532,11 @@ async fn an_aws_managed_plan_exists_and_associates_no_rule_of_the_callers() {
 #[tokio::test]
 async fn a_plan_this_account_does_not_hold_is_refused_with_the_modelled_not_found() {
     let em = Emulator::new();
+    let rule = em.create_rule("ExistingRule").await;
     // One plan DOES exist, so the refusals below are about the plan asked for and
     // not about an empty store.
     let existing = em
-        .create_plan("existing-plan", &["AAAAAAAAA1".to_string()])
+        .create_plan("existing-plan", std::slice::from_ref(&rule))
         .await;
 
     // Rows differ along the spelling of the plan that was never created.
@@ -563,7 +582,7 @@ async fn a_plan_this_account_does_not_hold_is_refused_with_the_modelled_not_foun
     );
     assert_eq!(
         reported(&body),
-        vec![rule_arn("AAAAAAAAA1")],
+        vec![rule.clone()],
         "the existing plan must still report its association, got {body:?}"
     );
 }
@@ -571,8 +590,9 @@ async fn a_plan_this_account_does_not_hold_is_refused_with_the_modelled_not_foun
 #[tokio::test]
 async fn a_plan_arn_naming_another_account_holds_nothing_this_caller_can_read() {
     let em = Emulator::new();
+    let rule = em.create_rule("OwnedRule").await;
     let plan_arn = em
-        .create_plan("owned-plan", &["AAAAAAAAA1".to_string()])
+        .create_plan("owned-plan", std::slice::from_ref(&rule))
         .await;
     let owned_id = plan_arn
         .rsplit('/')
@@ -616,7 +636,7 @@ async fn a_plan_arn_naming_another_account_holds_nothing_this_caller_can_read() 
     );
     assert_eq!(
         reported(&body),
-        vec![rule_arn("AAAAAAAAA1")],
+        vec![rule.clone()],
         "the caller's own plan must still report its association, got {body:?}"
     );
 }
@@ -624,12 +644,12 @@ async fn a_plan_arn_naming_another_account_holds_nothing_this_caller_can_read() 
 #[tokio::test]
 async fn reading_the_associations_changes_nothing_a_later_caller_sees() {
     let em = Emulator::new();
+    let rules = em.create_rules("StableRule", 2).await;
     let plan = em
-        .create_plan(
-            "stable-plan",
-            &["AAAAAAAAA1".to_string(), rule_arn("BBBBBBBBB2")],
-        )
+        .create_plan("stable-plan", &[bare_id(&rules[0]), rules[1].clone()])
         .await;
+    let mut expected = rules.clone();
+    expected.sort();
 
     // Rows differ along the read that comes before: a full read, a paged read, a
     // read for another period, a refused read of a plan that does not exist, and a
@@ -658,7 +678,7 @@ async fn reading_the_associations_changes_nothing_a_later_caller_sees() {
     );
     assert_eq!(
         reported(&last),
-        vec![rule_arn("AAAAAAAAA1"), rule_arn("BBBBBBBBB2")],
+        expected,
         "the plan must still report exactly the rules it associates, got {last:?}"
     );
 
