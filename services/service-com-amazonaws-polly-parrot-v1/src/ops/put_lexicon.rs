@@ -349,6 +349,10 @@ fn character_data_outside_the_document() -> PlsRejection {
 /// The reader is a real, NAMESPACE-AWARE XML parser, so any well-formed PLS document
 /// is accepted whatever prefix it spells its elements with, and any malformed one is
 /// refused — the shape of the examples this emulator has seen does not enter into it.
+/// Well-formedness is the whole of the XML document rule: a document has EXACTLY ONE
+/// root element, and outside it XML admits nothing but whitespace, comments and
+/// processing instructions, so a second top-level element, or character data at the top
+/// level, is refused rather than read as a document.
 /// The document element is checked by [`read_document_element`] before anything in
 /// the document is read, and the WHOLE content has to be one XML document around it:
 /// XML admits exactly one document element and nothing but whitespace outside it, so
@@ -477,9 +481,12 @@ pub fn parse_pls(content: &str) -> Result<ParsedLexicon, PlsRejection> {
             }
             Event::Text(ref text) if open_elements == 0 => {
                 // Character data belongs to no document once every element has
-                // closed, and to none before the first one opens; only WHITESPACE may
-                // sit around a document element, which is what XML allows there.
-                if !String::from_utf8_lossy(text.as_ref()).trim().is_empty() {
+                // closed, and to none before the first one opens; only the whitespace
+                // XML ITSELF admits ([`crate::service::xml::is_xml_whitespace`]) may
+                // sit around a document element.
+                if !crate::service::xml::is_xml_whitespace(&String::from_utf8_lossy(
+                    text.as_ref(),
+                )) {
                     return Err(character_data_outside_the_document());
                 }
             }

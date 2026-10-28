@@ -28,10 +28,13 @@
 //!   `LanguageNotSupportedException`. A voice the seeded catalog does not carry is not
 //!   narrowed, because that catalog is a stated subset;
 //! * `ContentType` is the `OutputFormat`'s documented media type;
-//! * `ssml` input is checked against the SSML vocabulary Amazon Polly publishes — its
+//! * `ssml` input is read as an XML DOCUMENT — exactly one root element, and nothing
+//!   but whitespace, comments and processing instructions around it — and checked
+//!   against the SSML vocabulary Amazon Polly publishes — its
 //!   tag set, each tag's attributes and each attribute's value domain (see
-//!   [`ssml::SUPPORTED_ELEMENTS`]) — so markup outside it is `InvalidSsmlException`
-//!   rather than a green light for a document the real service refuses;
+//!   [`ssml::SUPPORTED_ELEMENTS`]) — so a document that is not well-formed, or markup
+//!   outside that vocabulary, is `InvalidSsmlException` rather than a green light for a
+//!   document the real service refuses;
 //! * `RequestCharacters` is the billed character count — every character of plain
 //!   text, and for `ssml` the text content only, because "SSML tags are not counted
 //!   as billed characters";
@@ -689,7 +692,9 @@ pub mod ssml {
 /// `InvalidSsmlException`. Well-formed means one whole XML document: exactly one
 /// document element, every element closed, and nothing but whitespace outside the
 /// document element, so a second root element or character data before or after it is
-/// refused rather than billed.
+/// refused rather than billed. The whitespace XML admits there is XML's own
+/// ([`crate::service::xml::is_xml_whitespace`]), not every character Unicode calls
+/// blank.
 pub fn billed_characters(text: &str, text_type: &str) -> Result<usize, String> {
     if text_type != "ssml" {
         return Ok(text.chars().count());
@@ -714,9 +719,9 @@ pub fn billed_characters(text: &str, text_type: &str) -> Result<usize, String> {
             Event::End(_) => depth -= 1,
             Event::Text(ref t) if depth == 0 => {
                 // Character data belongs to no document before the document element
-                // opens or after it closes; XML admits only whitespace there, so what
-                // is left once the whitespace is trimmed off is not well-formed.
-                if !String::from_utf8_lossy(t.as_ref()).trim().is_empty() {
+                // opens or after it closes; XML admits only ITS OWN whitespace there,
+                // so anything else is not well-formed.
+                if !crate::service::xml::is_xml_whitespace(&String::from_utf8_lossy(t.as_ref())) {
                     return Err(CHARACTER_DATA_OUTSIDE_THE_DOCUMENT.to_string());
                 }
             }
@@ -729,8 +734,7 @@ pub fn billed_characters(text: &str, text_type: &str) -> Result<usize, String> {
                 // Entities count as the character they stand for, so the raw bytes
                 // are unescaped before counting.
                 let raw = String::from_utf8_lossy(t.as_ref()).to_string();
-                let decoded =
-                    quick_xml::escape::unescape(&raw).map_err(|e| e.to_string())?;
+                let decoded = quick_xml::escape::unescape(&raw).map_err(|e| e.to_string())?;
                 billed = billed.saturating_add(decoded.chars().count());
             }
             Event::CData(ref c) => {

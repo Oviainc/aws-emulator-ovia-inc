@@ -55,6 +55,8 @@ use smithy_server_runtime::{
 use std::sync::Arc;
 
 pub mod wire;
+/// What XML itself admits around a document element, for the operations that read one.
+pub mod xml;
 
 /// The `com-amazonaws-polly-parrot-v1` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
