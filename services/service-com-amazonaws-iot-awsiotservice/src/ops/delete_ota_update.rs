@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteOTAUpdate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteOTAUpdate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteOTAUpdate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the OTA update the request names, together with the AWS IoT job the OTA
+//! Update Manager deployed it through ([`crate::state::ota_update_job_id`]) and that
+//! job's per-thing executions in the shared store the IoT Jobs data plane serves — the
+//! three records `CreateOTAUpdate` wrote. Afterwards no reader of any of them finds
+//! anything: `GetOTAUpdate` and `GetJobDocument` both answer the modelled 404, and a
+//! targeted device polls no execution of the deleted job.
+//!
+//! An `otaUpdateId` the account holds no update under is the modelled 404 rather than
+//! an empty 200, so a caller learns the id named nothing.
+//!
+//! `forceDeleteAWSJob` is what the documented refusal turns on: "deletes the IoT job
+//! created by the OTAUpdate process even if it is `IN_PROGRESS`. Otherwise, if the job
+//! is not in a terminal state … an exception will occur". A job is still running
+//! exactly while one of its executions has not finished, which is the same test
+//! `DeleteJob`'s own `force` is read against, so without the flag such a request is
+//! refused with the modelled `InvalidRequestException` and NOTHING is removed.
+//!
+//! `deleteStream` deletes "the stream created by the OTAUpdate process … Ignored if the
+//! stream specified in the OTAUpdate is supplied by the user": the only stream an
+//! update here can name is one its request supplied (`CreateStream` creates none), so
+//! the flag is accepted and ignored for exactly the reason the member documents.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +165,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteOTAUpdate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteOTAUpdateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteOTAUpdate"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+        let unavailable = || -> DeleteOTAUpdateError {
+            DeleteOTAUpdateErrorModeled::ServiceUnavailableException(ServiceUnavailableException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+            .into()
+        };
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(unavailable());
+        };
+        // The deployed job's executions are the device-facing records the IoT Jobs data
+        // plane serves, so removing the update reaches into the SHARED store they live
+        // in, the same one `CreateOTAUpdate` wrote them to.
+        let Some(executions) = crate::state::job_execution_store(&*self.engine) else {
+            return Err(unavailable());
+        };
+
+        // The lock order is this service's state first and the shared execution store
+        // second, the order `CreateOTAUpdate` takes.
+        let mut store = state.lock();
+        let Some(ota_update) = store.ota_updates.get(&input.ota_update_id) else {
+            return Err(DeleteOTAUpdateErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::missing_ota_update_message(
+                        &input.ota_update_id,
+                    )),
+                },
+            )
+            .into());
+        };
+        let job_id = ota_update.aws_iot_job_id.clone();
+
+        let mut pending = executions.lock();
+        // "if the job is not in a terminal state ("COMPLETED" or "CANCELED") an
+        // exception will occur": the deployed job is still running exactly while one of
+        // its executions has not finished, and `forceDeleteAWSJob` is what waives that.
+        let still_running = pending.pending_executions_of_job(&job_id);
+        if still_running > 0 && !input.force_delete_aws_job {
+            return Err(DeleteOTAUpdateErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "OTA update {} is deployed by the job {job_id}, which has \
+                         {still_running} job execution(s) that have not finished; delete \
+                         it with forceDeleteAWSJob to delete the job too",
+                        input.ota_update_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Nothing was removed until here, so a refused delete leaves the update, its
+        // job and every execution exactly as they were.
+        pending.remove_job_executions(&job_id);
+        store.jobs.remove(&job_id);
+        store.ota_updates.remove(&input.ota_update_id);
+        Ok(DeleteOTAUpdateOutput {})
     }
 }

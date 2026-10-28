@@ -198,7 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ValidationException` (HTTP 400, "The request is not valid").
         let package = store.packages.get_mut(&input.package_name).ok_or_else(|| {
             CreatePackageVersionErrorModeled::ValidationException(ValidationException {
-                message: Some(format!("Package {} does not exist", input.package_name)),
+                message: Some(crate::state::missing_package_message(&input.package_name)),
             })
         })?;
 
