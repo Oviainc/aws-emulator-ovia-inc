@@ -19,9 +19,9 @@
 //! ended and one that has not, one with a status reason and one without, and failed-instance
 //! counts of none, zero and several.
 //!
-//! The store's WRITERS are `CreateStackSet`, `CreateStackInstances`, `DeleteStackInstances`
-//! and `DetectStackSetDrift`, beside `UpdateStackSet`, still a scaffold with its own stub
-//! issue; the records below span operation shapes no single call sequence produces, so they
+//! The store's WRITERS are `CreateStackSet`, `CreateStackInstances`, `DeleteStackInstances`,
+//! `UpdateStackSet`, `UpdateStackInstances` and `DetectStackSetDrift`; the records below span
+//! operation shapes no single call sequence produces, so they
 //! are seeded straight into the store through
 //! `state::ComAmazonawsCloudformationCloudformationState::record_stack_set` — the same device
 //! `list_stack_instances.rs` and `extension_registry.rs` use for records whose writers are
