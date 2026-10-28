@@ -96,3 +96,5 @@ mod no_op_write_commits_nothing;
 mod shared_entity_tag_precondition;
 #[path = "all/shared_manifest_count_builder.rs"]
 mod shared_manifest_count_builder;
+#[path = "all/create_idempotency_optional_members.rs"]
+mod create_idempotency_optional_members;

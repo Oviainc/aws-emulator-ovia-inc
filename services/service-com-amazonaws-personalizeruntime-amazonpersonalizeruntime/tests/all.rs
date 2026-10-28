@@ -19,6 +19,8 @@ mod action_filter_value_forms;
 mod filter_value_quoting;
 #[path = "all/inference.rs"]
 mod inference;
+#[path = "all/metadata_member_presence.rs"]
+mod metadata_member_presence;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
 #[path = "all/request_only_refusal_order.rs"]

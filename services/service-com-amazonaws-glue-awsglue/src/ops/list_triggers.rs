@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTriggers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTriggers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the NAMES of the triggers this Region's store holds
+//! (`crate::state::ComAmazonawsGlueAwsglueState::triggers`), in name order, one bounded
+//! page at a time, optionally narrowed to the triggers carrying every tag `Tags` names and
+//! to the ones that can start the job `DependentJobName` names.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTriggers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The names come from the same records `CreateTrigger` wrote and `GetTrigger` reads back,
+//! so a client that lists before it reads sees exactly the triggers that exist, and a
+//! trigger this listing reports is one `GetTrigger` resolves.
 //!
 //! ## Shape of an operation
 //!
@@ -84,6 +83,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The largest page `MaxResults` accepts, from the member's own range
+/// (`ListTriggersRequest$MaxResults`, `OrchestrationPageSize200` range 1..200) — and so
+/// the page size for a request that names none.
+const MAX_PAGE_SIZE: i32 = 200;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -155,18 +159,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTriggers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTriggersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTriggers"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // An unreachable store is an internal mounting fault, reported through this
+            // operation's own server error.
+            return Err(ListTriggersErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue trigger store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // "The maximum size of a list to return" (`MaxResults`, range 1..200). Absent, the
+        // page is the largest the model accepts for it; the clamp re-states that range here
+        // so the page size is never 0 even if the boundary validator ever stops enforcing
+        // it.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(MAX_PAGE_SIZE as usize)
+            .clamp(1, MAX_PAGE_SIZE as usize);
+        // "Specifies to return only these tagged resources": a trigger qualifies only when
+        // it carries EVERY pair named, which is what "only resources with the tag are
+        // retrieved" asks for. An empty map narrows nothing.
+        let required_tags = input.tags.unwrap_or_default();
+
+        let region = crate::state::request_region(ctx.parts());
+        let store = state.lock();
+        // Only THIS Region's triggers are listed: a trigger is served only through the
+        // endpoint that created it.
+        let tagged: Vec<&crate::state::TriggerEntry> = store
+            .triggers_in(&region)
+            .into_iter()
+            .filter(|trigger| {
+                required_tags
+                    .iter()
+                    .all(|(key, value)| trigger.tags.get(key) == Some(value))
+            })
+            .collect();
+
+        // "The name of the job for which to retrieve triggers. The trigger that can start
+        // this job is returned. If there is no such trigger, all triggers are returned"
+        // (`DependentJobName`): the filter narrows the set to the triggers whose actions
+        // run that job, and falls back to the whole set when it would narrow it to nothing.
+        let selected: Vec<&crate::state::TriggerEntry> =
+            match input.dependent_job_name.as_deref() {
+                Some(job_name) => {
+                    let dependent: Vec<&crate::state::TriggerEntry> = tagged
+                        .iter()
+                        .copied()
+                        .filter(|trigger| trigger.starts_job(job_name))
+                        .collect();
+                    if dependent.is_empty() {
+                        tagged
+                    } else {
+                        dependent
+                    }
+                }
+                None => tagged,
+            };
+
+        // Already in name order: the set comes from `triggers_in`, whose order is the
+        // store's own key order, and neither filter above reorders it — so one page follows
+        // another deterministically.
+        let names: Vec<&String> = selected.iter().map(|trigger| &trigger.name).collect();
+
+        // The token is the last name of the previous page, so the page resumes at the first
+        // stored name strictly after it — which stays correct across triggers created or
+        // deleted between two calls.
+        let start = match input.next_token.as_deref() {
+            Some(cursor) => names.partition_point(|name| name.as_str() <= cursor),
+            None => 0,
+        };
+        // Taken with `skip`/`take` rather than by slicing, so a cursor the request chose
+        // can never index outside the set.
+        let page: Vec<String> = names
+            .iter()
+            .skip(start)
+            .take(page_size)
+            .map(|name| (*name).clone())
+            .collect();
+        let end = start.saturating_add(page.len());
+        // The token names the last entry of the page, taken from the page itself so there
+        // is no index arithmetic to underflow on an empty page.
+        let next_token = if end < names.len() {
+            page.last().cloned()
+        } else {
+            None
+        };
+
+        Ok(ListTriggersOutput {
+            trigger_names: Some(page),
+            next_token,
+        })
     }
 }

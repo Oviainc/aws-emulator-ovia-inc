@@ -1,0 +1,229 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The sentence a control-plane lookup that resolved no stream answers with.
+//!
+//! One rule, asserted over a SET of inputs: every control-plane operation that resolves a
+//! stream by name refuses a name no stream has with `ResourceNotFoundException` and one
+//! sentence naming the account the lookup was scoped to — "Firehose under account
+//! `<account>` not found." — whichever operation did the resolving and whatever name it
+//! was given. The recorded case (a describe of one absent name) is one row of the table
+//! below.
+//!
+//! The data plane states the same fact in its own wording, which is asserted here too so
+//! the two sentences cannot drift into each other.
+//!
+//! Every request goes through the real router, so what is asserted is the body a client
+//! reads. The harness is the lifecycle suite's.
+
+use serde_json::{json, Value};
+
+use super::delivery_stream_lifecycle::{error_code, error_message, Emulator, PAST_THE_TRANSITION};
+
+/// One operation that resolves a stream by name, and the request that probes `name` with
+/// every OTHER member of that request valid, so the lookup is what refuses it.
+struct Probe {
+    case: &'static str,
+    operation: &'static str,
+    request: fn(&str) -> Value,
+}
+
+/// Every control-plane operation that takes a `DeliveryStreamName` and resolves it
+/// (`smithy_query(query="digest")`): the reads, the delete, the tag changes, the two
+/// encryption changes and the destination update.
+fn control_plane_probes() -> Vec<Probe> {
+    vec![
+        Probe {
+            case: "describe",
+            operation: "DescribeDeliveryStream",
+            request: |name| json!({ "DeliveryStreamName": name }),
+        },
+        Probe {
+            case: "describe from a start id",
+            operation: "DescribeDeliveryStream",
+            request: |name| json!({
+                "DeliveryStreamName": name,
+                "Limit": 1,
+                "ExclusiveStartDestinationId": "destinationId-000000000001",
+            }),
+        },
+        Probe {
+            case: "delete",
+            operation: "DeleteDeliveryStream",
+            request: |name| json!({ "DeliveryStreamName": name }),
+        },
+        Probe {
+            case: "delete without allowing a force",
+            operation: "DeleteDeliveryStream",
+            request: |name| json!({ "DeliveryStreamName": name, "AllowForceDelete": false }),
+        },
+        Probe {
+            case: "list tags",
+            operation: "ListTagsForDeliveryStream",
+            request: |name| json!({ "DeliveryStreamName": name }),
+        },
+        Probe {
+            case: "add a tag",
+            operation: "TagDeliveryStream",
+            request: |name| json!({
+                "DeliveryStreamName": name,
+                "Tags": [{ "Key": "owner", "Value": "team" }],
+            }),
+        },
+        Probe {
+            case: "remove a tag",
+            operation: "UntagDeliveryStream",
+            request: |name| json!({ "DeliveryStreamName": name, "TagKeys": ["owner"] }),
+        },
+        Probe {
+            case: "start encryption",
+            operation: "StartDeliveryStreamEncryption",
+            request: |name| json!({ "DeliveryStreamName": name }),
+        },
+        Probe {
+            case: "stop encryption",
+            operation: "StopDeliveryStreamEncryption",
+            request: |name| json!({ "DeliveryStreamName": name }),
+        },
+        Probe {
+            case: "update a destination",
+            operation: "UpdateDestination",
+            request: |name| json!({
+                "DeliveryStreamName": name,
+                "CurrentDeliveryStreamVersionId": "1",
+                "DestinationId": "destinationId-000000000001",
+                "S3DestinationUpdate": { "Prefix": "x/" },
+            }),
+        },
+    ]
+}
+
+/// Names differing in every way a `DeliveryStreamName` can — length (its 1-character
+/// minimum and its 64-character maximum), the characters it is spelled with, and how
+/// closely it resembles a name that DOES exist. None of them occurs inside the expected
+/// sentence, so the "never echoed" assertion below means what it says.
+fn probed_names() -> Vec<String> {
+    vec![
+        "q".to_string(),
+        "ghost-stream".to_string(),
+        "ghost.stream".to_string(),
+        "GHOST_1".to_string(),
+        "present-stream-2".to_string(),
+        "z".repeat(64),
+    ]
+}
+
+#[tokio::test]
+async fn every_control_plane_lookup_of_an_absent_stream_states_the_account_and_not_the_name() {
+    let emulator = Emulator::new();
+    let account = engine::emulator_account_id();
+    let expected = format!("Firehose under account {account} not found.");
+
+    // One stream exists and is past its `CREATING` span, so each refusal below is a
+    // lookup that resolved nothing rather than an empty register, and a probe that
+    // resembles that stream's name still resolves nothing.
+    emulator.create_stream("present-stream", None).await;
+    tokio::time::sleep(PAST_THE_TRANSITION).await;
+
+    for probe in control_plane_probes() {
+        for name in probed_names() {
+            let case = format!("{} of {name:?}", probe.case);
+            let (status, refused) = emulator.call(probe.operation, (probe.request)(&name)).await;
+            assert_eq!(status, 400, "case {case:?}: got {refused:?}");
+            let code = error_code(&refused);
+            assert_eq!(
+                code, "ResourceNotFoundException",
+                "case {case:?}: expected \"ResourceNotFoundException\", got {code:?}"
+            );
+            let message = error_message(&refused);
+            assert_eq!(
+                message, expected,
+                "case {case:?}: expected {expected:?}, got {message:?}"
+            );
+            assert!(
+                !message.contains(&name),
+                "case {case:?}: the probed name must not be echoed, got {message:?}"
+            );
+        }
+    }
+
+    // The stream that DOES exist is untouched by all of that: it still resolves.
+    let (status, described) = emulator
+        .call(
+            "DescribeDeliveryStream",
+            json!({ "DeliveryStreamName": "present-stream" }),
+        )
+        .await;
+    assert_eq!(status, 200, "the present stream still resolves: {described:?}");
+    let name = described["DeliveryStreamDescription"]["DeliveryStreamName"].as_str();
+    assert_eq!(
+        name,
+        Some("present-stream"),
+        "the present stream still resolves: got {described:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_put_to_an_absent_stream_states_the_account_in_the_data_plane_wording() {
+    let emulator = Emulator::new();
+    let account = engine::emulator_account_id();
+    let expected = format!("Firehose not found under account {account}.");
+
+    // (case, operation, request for a probed name)
+    let puts: Vec<Probe> = vec![
+        Probe {
+            case: "put a record",
+            operation: "PutRecord",
+            request: |name| json!({ "DeliveryStreamName": name, "Record": { "Data": "eA==" } }),
+        },
+        Probe {
+            case: "put a batch",
+            operation: "PutRecordBatch",
+            request: |name| json!({
+                "DeliveryStreamName": name,
+                "Records": [{ "Data": "eA==" }, { "Data": "eQ==" }],
+            }),
+        },
+    ];
+
+    emulator.create_stream("present-stream", None).await;
+    tokio::time::sleep(PAST_THE_TRANSITION).await;
+
+    for put in puts {
+        for name in probed_names() {
+            let case = format!("{} of {name:?}", put.case);
+            let (status, refused) = emulator.call(put.operation, (put.request)(&name)).await;
+            assert_eq!(status, 400, "case {case:?}: got {refused:?}");
+            let code = error_code(&refused);
+            assert_eq!(
+                code, "ResourceNotFoundException",
+                "case {case:?}: expected \"ResourceNotFoundException\", got {code:?}"
+            );
+            let message = error_message(&refused);
+            assert_eq!(
+                message, expected,
+                "case {case:?}: expected {expected:?}, got {message:?}"
+            );
+            assert!(
+                !message.contains(&name),
+                "case {case:?}: the probed name must not be echoed, got {message:?}"
+            );
+        }
+    }
+
+    // A put to the stream that exists is accepted, so the refusals above are the lookup
+    // and not the put path itself.
+    let (status, accepted) = emulator
+        .call(
+            "PutRecord",
+            json!({
+                "DeliveryStreamName": "present-stream",
+                "Record": { "Data": "eA==" },
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "a put to the present stream: got {accepted:?}");
+    assert!(
+        accepted["RecordId"].as_str().is_some_and(|id| !id.is_empty()),
+        "a put to the present stream answers a record id, got {accepted:?}"
+    );
+}

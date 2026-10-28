@@ -366,21 +366,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(CreateOriginEndpointErrorModeled::ValidationException(rejection).into());
         }
+        // Every OPTIONAL member is rendered so that ABSENT and present-but-default stay
+        // apart: each of them admits its own type default as a submitted value
+        // (`Description` is `@length 0..1024`, so `""`; `StartoverWindowSeconds` is
+        // `@range 0..1209600`, so `0`), and the two store different endpoints, because
+        // what a request leaves out is materialised to the service's own default. Were
+        // they flattened to one rendering, a repeat that now SENDS that value would share
+        // the first attempt's fingerprint and be replayed instead of refused.
         let fingerprint = crate::state::request_fingerprint(&[
             input.channel_group_name.clone(),
             input.channel_name.clone(),
             input.origin_endpoint_name.clone(),
             input.container_type.clone(),
-            input.description.clone().unwrap_or_default(),
-            input.startover_window_seconds.unwrap_or_default().to_string(),
+            format!("{:?}", input.description),
+            format!("{:?}", input.startover_window_seconds),
             format!("{:?}", input.segment),
             format!("{:?}", input.hls_manifests),
             format!("{:?}", input.low_latency_hls_manifests),
             format!("{:?}", input.dash_manifests),
             format!("{:?}", input.mss_manifests),
             format!("{:?}", input.force_endpoint_error_configuration),
-            input.uri_separator.clone().unwrap_or_default(),
-            input.stream_name_output_mode.clone().unwrap_or_default(),
+            format!("{:?}", input.uri_separator),
+            format!("{:?}", input.stream_name_output_mode),
             crate::state::tag_fingerprint(&tags),
         ]);
 

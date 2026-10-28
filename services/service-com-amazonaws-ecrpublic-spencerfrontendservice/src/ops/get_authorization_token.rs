@@ -162,6 +162,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // so nothing here reads the Region the request was signed for — see
         // `crate::state::unsupported_in_region` for the one call that is Region-scoped.
 
+        // Authorization comes first: this action takes no resource type, so it is decided
+        // against every resource of this account, and a caller whose identity-based
+        // policies do not allow it is refused rather than handed a registry credential.
+        if let Some(denied) =
+            crate::state::authorization::denied_on_registry(&*self.engine, ctx, Self::NAME)
+        {
+            return Err(denied);
+        }
+
         // The token authorizes `docker login` against the registry this store holds, so
         // an unreachable store means there is no registry to authorize access to. The
         // router builds the one engine that carries the store, so this is unreachable

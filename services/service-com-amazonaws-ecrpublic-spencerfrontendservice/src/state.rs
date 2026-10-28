@@ -26,6 +26,10 @@
 //! key-ordered sequence and a pagination token naming the last key of a page resumes
 //! exactly after it.
 
+/// Who a request speaks for, and whether IAM lets it do what it asks — the gate every
+/// operation of this service consults before it reads or writes anything.
+pub mod authorization;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
@@ -750,16 +754,9 @@ impl Default for ComAmazonawsEcrpublicSpencerfrontendserviceState {
 }
 
 impl ComAmazonawsEcrpublicSpencerfrontendserviceState {
-    /// The ARN a repository of this registry carries.
-    ///
-    /// ECR Public is a global (partition-wide) service, so the region segment is empty;
-    /// the account segment is the registry id.
+    /// The ARN a repository of this registry carries ([`repository_arn`]).
     pub fn repository_arn(&self, repository_name: &str) -> String {
-        ::engine::emulator_arn(
-            ARN_NAMESPACE,
-            "",
-            &format!("repository/{repository_name}"),
-        )
+        repository_arn(repository_name)
     }
 
     /// The ARN of the registry itself.
@@ -910,6 +907,18 @@ pub enum ResourceArnProblem {
     Malformed(String),
     /// Well-formed, but nothing stored answers to it.
     RepositoryNotFound(String),
+}
+
+/// The ARN a repository of this registry carries.
+///
+/// ECR Public is a global (partition-wide) service, so the region segment is empty; the
+/// account segment is the registry id, which is this account's id
+/// (`engine::emulator_arn`). The ONE place a repository ARN is minted: the reporting
+/// operations read the ARN stored on the repository, and the authorization gate
+/// ([`authorization::repository_resource`]) builds the one a decision is made about for a
+/// repository that may not exist yet, so neither can spell it differently.
+pub fn repository_arn(repository_name: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, "", &format!("repository/{repository_name}"))
 }
 
 /// The registry and repository a well-formed ECR Public repository ARN names.

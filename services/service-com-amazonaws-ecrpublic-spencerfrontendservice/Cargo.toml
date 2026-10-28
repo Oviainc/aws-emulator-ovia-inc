@@ -25,6 +25,14 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 # Hex encoding for the manifest digest and for the opaque pagination tokens.
 hex = { workspace = true }
+# `iam_authorization`: the shared evaluation of IAM policy documents against
+# (action, resource), which every operation's authorization gate runs.
+service-common = { path = "../common" }
+# The IAM store holds the identity-based policies of the principal a request speaks
+# for, and the STS store resolves which principal that is: this service reads both
+# services' OWN state accessors rather than keeping a second copy of either fact.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

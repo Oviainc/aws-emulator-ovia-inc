@@ -31,8 +31,11 @@
 //!    cardinality, same item ids, ordered by score descending. With a `filterArn`
 //!    ("a filter you created to include items or exclude items from recommendations
 //!    for a given user") the entries the filter removes are not in the ranking.
-//! 5. `metadataColumns` is served from the stored item attributes; with no
-//!    `metadataColumns` the `metadata` member is omitted entirely.
+//! 5. `metadataColumns` is served from the stored item attributes, for EVERY entry
+//!    the response reports: with no `metadataColumns` the `metadata` member is
+//!    omitted entirely, and with `metadataColumns` it is present on every entry,
+//!    holding only the requested columns that entry stores — so an appended entry,
+//!    which stores none, reports an empty map rather than no member.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
@@ -305,7 +308,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     item_id: Some(item.item_id.clone()),
                     score: Some(*score),
                     promotion_name: None,
-                    metadata: registry::metadata_for(item, metadata_columns.as_deref()),
+                    metadata: registry::metadata_for(&item.attributes, metadata_columns.as_deref()),
                     reason: None,
                 }
             })
@@ -313,11 +316,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "If an item was not included in the training dataset, the item is appended
         // to the end of the reranked list" — with no relevance score for the user, so
         // the list stays ordered by score descending.
+        // Whether `metadata` is reported is a fact about the REQUEST, so an appended
+        // entry is reported through the same helper, with the empty attribute set it
+        // stores: a request that asked for metadata gets the member on every entry,
+        // holding only the requested columns the entry actually carries — none, here.
         personalized_ranking.extend(appended.into_iter().map(|item_id| PredictedItem {
             item_id: Some(item_id),
             score: Some(0.0),
             promotion_name: None,
-            metadata: None,
+            metadata: registry::metadata_for(&no_attributes, metadata_columns.as_deref()),
             reason: None,
         }));
 

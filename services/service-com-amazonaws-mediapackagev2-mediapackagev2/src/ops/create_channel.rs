@@ -406,12 +406,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(CreateChannelErrorModeled::ValidationException(rejection).into());
         }
+        // Every OPTIONAL member is rendered so that ABSENT and present-but-default stay
+        // apart: a member the request leaves out is materialised to the service's own
+        // default, so a repeat that now SENDS that same value asks for a DIFFERENT
+        // channel and must be read as a changed request rather than a retry.
         let fingerprint = crate::state::request_fingerprint(&[
             input.channel_group_name.clone(),
             input.channel_name.clone(),
-            input.description.clone().unwrap_or_default(),
-            input.input_type.clone().unwrap_or_default(),
-            input.output_locking_mode.clone().unwrap_or_default(),
+            format!("{:?}", input.description),
+            format!("{:?}", input.input_type),
+            format!("{:?}", input.output_locking_mode),
             format!("{:?}", input.input_switch_configuration),
             format!("{:?}", input.output_header_configuration),
             format!("{:?}", input.multiview_configuration),

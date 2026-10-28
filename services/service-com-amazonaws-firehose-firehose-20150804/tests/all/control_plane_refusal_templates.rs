@@ -291,7 +291,7 @@ struct RefusalCase {
 async fn a_control_plane_refusal_renders_one_template_from_the_request_and_the_state() {
     let emulator = Emulator::new();
     let account = engine::emulator_account_id();
-    let not_found = format!("Firehose under accountId {account} not found");
+    let not_found = format!("Firehose under account {account} not found.");
 
     // A stream the refusals below are asserted against in each state: one that stays
     // `ACTIVE`, one still being created, and one already being deleted. The two transient
