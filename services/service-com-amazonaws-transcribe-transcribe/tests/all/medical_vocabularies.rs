@@ -13,11 +13,12 @@
 //!
 //! WHAT A MEDICAL VOCABULARY IS HERE: its terms can only come from the table file at
 //! `VocabularyFileUri`, which `CreateMedicalVocabulary` models `@required` with no
-//! inline alternative, and this emulator reads no object store. So the RECORD is
-//! real — name, language, state, timestamps, tags, and every listing and filter over
-//! them — while the build it cannot run ends in the service's own modelled `FAILED`
-//! state with a `FailureReason`. These tests assert exactly that, and never a
-//! `READY` medical vocabulary.
+//! inline alternative, and NO Amazon S3 is mounted beside the service in this suite,
+//! so no file any row names is served. So the RECORD is real — name, language, state,
+//! timestamps, tags, and every listing and filter over them — while the build that
+//! loaded no terms ends in the service's own modelled `FAILED` state with a
+//! `FailureReason`. These tests assert exactly that; what a build settles on when the
+//! object store DOES serve its file is `crate::vocabulary_file_objects`' subject.
 
 use std::time::Duration;
 
@@ -144,8 +145,8 @@ pub(crate) fn listed_names(reply: &Reply, case: &str) -> Vec<String> {
 }
 
 /// A created medical vocabulary is stored, reported back as `PENDING`, readable
-/// through `GetMedicalVocabulary`, and ends `FAILED` with a reason naming the file
-/// this emulator does not read once the clock makes that transition due.
+/// through `GetMedicalVocabulary`, and ends `FAILED` with a reason naming the file no
+/// object store served once the clock makes that transition due.
 #[tokio::test]
 async fn a_created_medical_vocabulary_is_pending_then_fails_and_reads_back() {
     let transcribe = Transcribe::new();
@@ -234,8 +235,8 @@ async fn a_created_medical_vocabulary_is_pending_then_fails_and_reads_back() {
         assert_eq!(
             got.member(case, "VocabularyState"),
             "FAILED",
-            "case {case:?}: a medical vocabulary whose file is never read must end \
-             FAILED, got {:?}",
+            "case {case:?}: a medical vocabulary whose file no object store served \
+             must end FAILED, got {:?}",
             got.body
         );
         let reason = got.member(case, "FailureReason");

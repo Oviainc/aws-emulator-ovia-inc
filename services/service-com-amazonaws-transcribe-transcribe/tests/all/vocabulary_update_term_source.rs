@@ -15,10 +15,11 @@
 //! starts the rebuild the record's next state follows from. Which alternative the
 //! update chose changes only where the rebuild lands: a vocabulary rebuilt from the
 //! terms the request listed becomes `READY` with a `DownloadUri`, while one whose
-//! terms would have had to be READ from a file ends in the service's own modelled
-//! `FAILED` state with a `FailureReason` naming that file — this emulator reads no
-//! object store and makes no outbound request, so nothing built it and nothing may
-//! report it as usable.
+//! terms were to be READ from a file no object store served ends in the service's own
+//! modelled `FAILED` state with a `FailureReason` naming that file, since nothing
+//! loaded its terms. No Amazon S3 is mounted beside the service in this suite, so no
+//! file any row names is served; a rebuild from one that IS served is
+//! `crate::vocabulary_file_objects`' subject.
 //!
 //! What this suite pins that `crate::vocabulary_file_uri` does not: every row starts
 //! from a vocabulary whose build has already SETTLED (from each of the two terminal

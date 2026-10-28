@@ -83,9 +83,10 @@ struct Clocked {
 ///
 /// The `pending` and `settled` states are those of this emulator's own recorded
 /// lifecycle: a job processes and then completes; a custom vocabulary built from the
-/// terms the request listed becomes usable, while one whose terms would have had to be
-/// READ from a file (every medical one, which models no inline alternative) ends in the
-/// service's modelled failure state, because nothing read that file.
+/// terms the request listed becomes usable, while one whose terms were to be READ from
+/// a file (every medical one, which models no inline alternative) ends in the service's
+/// modelled failure state here, because no object store is mounted beside the service
+/// in this suite to serve that file.
 fn clocked_families() -> Vec<Clocked> {
     vec![
         Clocked {

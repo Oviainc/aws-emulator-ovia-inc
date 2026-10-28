@@ -98,8 +98,8 @@ impl Transcribe {
 
     /// Poll `GetVocabulary` until the build of the custom vocabulary `name`, held in
     /// `region`, has FINISHED, and answer the `VocabularyState` it settled in — `READY`
-    /// for one built from the terms the request listed, `FAILED` for one whose terms
-    /// were to be read from a file.
+    /// for one whose terms were loaded, `FAILED` for one whose terms were to be read
+    /// from a file no object store served.
     ///
     /// The one home for "wait out a vocabulary's build": [`Self::vocabulary_ready`] is
     /// this plus the assertion that the build succeeded.

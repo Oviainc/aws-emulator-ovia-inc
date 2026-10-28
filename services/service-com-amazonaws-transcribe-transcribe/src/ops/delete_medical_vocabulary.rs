@@ -184,69 +184,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // through this Region's endpoint are this call's to delete.
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
-        // The clock-owed transition is materialised FIRST, so a medical vocabulary
-        // whose build was already due is deleted rather than refused for a state it had
-        // left. The stored state is copied out of the lookup so the removal below does
-        // not hold the borrow the lookup took.
-        let stored_state = store
-            .medical_vocabulary_mut(&region, &input.vocabulary_name, now)
-            .map(|record| record.state.clone());
+        // The guard is SCOPED: the store lock is released before this handler awaits
+        // the withdrawal of the file the vocabulary's `DownloadUri` named, which is a
+        // call out to another emulated service and reaches none of this state.
+        {
+            let mut store = state.lock();
+            // The clock-owed transition is materialised FIRST, so a medical vocabulary
+            // whose build was already due is deleted rather than refused for a state it
+            // had left. The stored state is copied out of the lookup so the removal
+            // below does not hold the borrow the lookup took.
+            let stored_state = store
+                .medical_vocabulary_mut(&region, &input.vocabulary_name, now)
+                .map(|record| record.state.clone());
 
-        match stored_state {
-            // "Your request didn't pass one or more validation tests. This can occur
-            // when the entity you're trying to delete doesn't exist or if it's in a
-            // non-terminal state (such as IN PROGRESS)" (`BadRequestException`'s own
-            // documentation): a resource the service is still processing is not
-            // deletable, exactly as the non-medical family's delete refuses it.
-            Some(vocabulary_state)
-                if !crate::state::is_terminal_vocabulary_state(&vocabulary_state) =>
-            {
-                return Err(DeleteMedicalVocabularyErrorModeled::BadRequestException(
-                    BadRequestException {
-                        message: Some(format!(
-                            "The custom medical vocabulary {name} is in the \
-                             {vocabulary_state} state and can't be deleted. Wait until \
-                             it is no longer being processed and try your request again.",
-                            name = input.vocabulary_name,
-                        )),
-                    },
-                )
-                .into());
-            }
-            Some(_) => {
-                store
-                    .medical_vocabularies
-                    .remove(&region, &input.vocabulary_name);
-                ::tracing::info!(
-                    operation = "DeleteMedicalVocabulary",
-                    vocabulary = %input.vocabulary_name,
-                    "custom medical vocabulary deleted"
-                );
-            }
-            // A DELETE IS NOT IDEMPOTENT: the entity has to be there. The same
-            // `BadRequestException` sentence covers it — "This can occur when the
-            // entity you're trying to delete doesn't exist OR if it's in a non-terminal
-            // state" — so a name this Region holds no medical vocabulary under is
-            // refused with this service's own absent-resource text
-            // (`crate::state::not_found_message`), exactly as this family's reader
-            // answers it, and nothing is stored or removed.
-            None => {
-                ::tracing::info!(
-                    operation = "DeleteMedicalVocabulary",
-                    vocabulary = %input.vocabulary_name,
-                    "no custom medical vocabulary of that name; the delete is refused"
-                );
-                return Err(DeleteMedicalVocabularyErrorModeled::BadRequestException(
-                    BadRequestException {
-                        message: Some(crate::state::not_found_message(
-                            crate::state::KIND_MEDICAL_VOCABULARY,
-                        )),
-                    },
-                )
-                .into());
+            match stored_state {
+                // "Your request didn't pass one or more validation tests. This can occur
+                // when the entity you're trying to delete doesn't exist or if it's in a
+                // non-terminal state (such as IN PROGRESS)" (`BadRequestException`'s own
+                // documentation): a resource the service is still processing is not
+                // deletable, exactly as the non-medical family's delete refuses it.
+                Some(vocabulary_state)
+                    if !crate::state::is_terminal_vocabulary_state(&vocabulary_state) =>
+                {
+                    return Err(DeleteMedicalVocabularyErrorModeled::BadRequestException(
+                        BadRequestException {
+                            message: Some(format!(
+                                "The custom medical vocabulary {name} is in the \
+                                 {vocabulary_state} state and can't be deleted. Wait \
+                                 until it is no longer being processed and try your \
+                                 request again.",
+                                name = input.vocabulary_name,
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                Some(_) => {
+                    store
+                        .medical_vocabularies
+                        .remove(&region, &input.vocabulary_name);
+                    ::tracing::info!(
+                        operation = "DeleteMedicalVocabulary",
+                        vocabulary = %input.vocabulary_name,
+                        "custom medical vocabulary deleted"
+                    );
+                }
+                // A DELETE IS NOT IDEMPOTENT: the entity has to be there. The same
+                // `BadRequestException` sentence covers it — "This can occur when the
+                // entity you're trying to delete doesn't exist OR if it's in a
+                // non-terminal state" — so a name this Region holds no medical
+                // vocabulary under is refused with this service's own absent-resource
+                // text (`crate::state::not_found_message`), exactly as this family's
+                // reader answers it, and nothing is stored or removed.
+                None => {
+                    ::tracing::info!(
+                        operation = "DeleteMedicalVocabulary",
+                        vocabulary = %input.vocabulary_name,
+                        "no custom medical vocabulary of that name; the delete is refused"
+                    );
+                    return Err(DeleteMedicalVocabularyErrorModeled::BadRequestException(
+                        BadRequestException {
+                            message: Some(crate::state::not_found_message(
+                                crate::state::KIND_MEDICAL_VOCABULARY,
+                            )),
+                        },
+                    )
+                    .into());
+                }
             }
         }
+
+        // The vocabulary is gone, so the location its `DownloadUri` named serves
+        // nothing: the file its build left is withdrawn with it
+        // (`crate::state::store_vocabulary_content`).
+        crate::state::store_vocabulary_content(
+            ctx,
+            &region,
+            crate::state::RESOURCE_TYPE_MEDICAL_VOCABULARY,
+            &input.vocabulary_name,
+            &[],
+        )
+        .await;
 
         Ok(DeleteMedicalVocabularyOutput)
     }

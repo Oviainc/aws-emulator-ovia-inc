@@ -10,11 +10,12 @@
 //! the file at `VocabularyFileUri` — and a request choosing EITHER is accepted and
 //! recorded, so every later operation of the family finds the resource. Only the one
 //! transition the clock owes the build differs: a vocabulary built from the terms the
-//! request listed becomes `READY`, while one whose terms would have had to be READ
-//! from a file ends in the service's own modelled `FAILED` state with a
-//! `FailureReason` naming that file — this emulator reads no object store and makes
-//! no outbound request, so nothing built it and nothing may report it as usable. The
-//! refusals that remain (neither alternative, or both at once) are
+//! request listed becomes `READY`, while one whose terms were to be READ from a file
+//! NO OBJECT STORE SERVED ends in the service's own modelled `FAILED` state with a
+//! `FailureReason` naming that file, since nothing loaded its terms. No Amazon S3 is
+//! mounted beside the service in this suite, so no file any row names is served; what
+//! a build settles on when one IS served is `crate::vocabulary_file_objects`' subject.
+//! The refusals that remain (neither alternative, or both at once) are
 //! `crate::vocabularies`' subject; the medical family, whose terms can only come from
 //! such a file, is `crate::medical_vocabularies`'.
 //!
@@ -143,8 +144,8 @@ fn listed_names(reply: &Reply, case: &str) -> Vec<String> {
 
 /// A create that names a file is ACCEPTED and recorded: it answers 200 with the
 /// vocabulary `PENDING`, the record reads back through `GetVocabulary`, and the build
-/// this emulator cannot perform ends `FAILED` with a reason naming the file nothing
-/// read once the clock makes that transition due.
+/// no object store served ends `FAILED` with a reason naming the file nothing read
+/// once the clock makes that transition due.
 #[tokio::test]
 async fn a_file_backed_vocabulary_is_recorded_pending_then_fails_and_reads_back() {
     let transcribe = Transcribe::new();
@@ -201,8 +202,8 @@ async fn a_file_backed_vocabulary_is_recorded_pending_then_fails_and_reads_back(
         );
         assert!(
             is_absent(&got, "DownloadUri"),
-            "case {case:?}: nothing read this vocabulary's file, so there is no file to \
-             download, got {:?}",
+            "case {case:?}: no object store served this vocabulary's file, so there is \
+             no file to download, got {:?}",
             got.body
         );
         if let Some(role) = request.get("DataAccessRoleArn").and_then(Value::as_str) {
@@ -229,7 +230,8 @@ async fn a_file_backed_vocabulary_is_recorded_pending_then_fails_and_reads_back(
         assert_eq!(
             got.member(case, "VocabularyState"),
             "FAILED",
-            "case {case:?}: a vocabulary whose file is never read must end FAILED, got {:?}",
+            "case {case:?}: a vocabulary whose file no object store served must end \
+             FAILED, got {:?}",
             got.body
         );
         let reason = got.member(case, "FailureReason");
@@ -271,7 +273,7 @@ async fn a_file_backed_vocabulary_is_recorded_pending_then_fails_and_reads_back(
     assert_eq!(
         listed_names(&ready, "StateEquals READY"),
         Vec::<String>::new(),
-        "no vocabulary built from a file this emulator never read may be READY, got {:?}",
+        "no vocabulary whose file no object store served may be READY, got {:?}",
         ready.body
     );
 

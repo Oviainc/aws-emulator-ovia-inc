@@ -226,7 +226,7 @@ async fn reading_a_medical_vocabulary_changes_nothing_a_later_caller_sees() {
     assert_eq!(
         first.member("the first read past the due instant", "VocabularyState"),
         "FAILED",
-        "a medical vocabulary whose file is never read must end FAILED, got {:?}",
+        "a medical vocabulary whose file no object store served must end FAILED, got {:?}",
         first.body
     );
     assert!(

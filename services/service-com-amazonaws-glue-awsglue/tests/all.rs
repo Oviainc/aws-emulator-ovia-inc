@@ -21,6 +21,8 @@ mod assets;
 mod batch_delete_connection;
 #[path = "all/batch_get_crawlers.rs"]
 mod batch_get_crawlers;
+#[path = "all/batch_get_custom_entity_types.rs"]
+mod batch_get_custom_entity_types;
 #[path = "all/batch_get_jobs.rs"]
 mod batch_get_jobs;
 #[path = "all/batch_get_partition.rs"]
