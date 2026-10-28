@@ -12,9 +12,12 @@
 //! resolves a named resource answers such a value with `BadRequestException` (400) naming
 //! the member, and leaves the store exactly as it was.
 //!
-//! The rule holds at every depth a queue reference arrives at: the last case below drives
-//! it through `HopDestination$Queue`, which points at a queue resource exactly as the
-//! top-level `Queue` does, on all three operations that accept a hop list.
+//! The rule holds at every depth a queue reference arrives at: the hop-destination case
+//! below drives it through `HopDestination$Queue`, which points at a queue resource exactly
+//! as the top-level `Queue` does, on all three operations that accept a hop list. It holds
+//! for a reference whatever the request does with the resource it resolves to, so the
+//! share-and-tagging case covers `CreateResourceShare$JobId` and the `Arn` of the three
+//! tagging doors as well.
 //!
 //! The other side of the same rule is that a value which DOES carry characters is never
 //! normalised: surrounding whitespace is part of the key, so a padded name creates its own
@@ -30,6 +33,7 @@ use service_com_amazonaws_mediaconvert_mediaconvert::state::not_found_message;
 
 use super::job_lifecycle::{settings as job_settings, Emulator, Reply, ROLE};
 use super::job_template_crud::settings as template_settings;
+use super::resource_tagging::encode_label;
 
 /// A value a resource-naming member can be made ENTIRELY of, which is what the rule
 /// generalises over: whether there are any characters at all, which whitespace character is
@@ -431,6 +435,157 @@ async fn a_resource_reference_carrying_no_characters_is_refused() {
         "a refused update must change nothing, got body {}",
         after.body
     );
+}
+
+/// The doors whose reference member arrives in the REQUEST BODY or as a path label but
+/// does not mint or address a named resource of its own: the job a share names and the
+/// resource a tagging call works on. Both are references exactly as `CreateJob$Queue` is,
+/// so the same rule holds — a value carrying no characters is the modelled bad request
+/// naming the member, never a lookup of a value nothing could hold.
+///
+/// The table spans every blank form, both reference-carrying members of
+/// `CreateResourceShare` crossed (so the refusal of one does not depend on the other), and
+/// all three tagging doors; the boundary rows at the end are references that DO carry
+/// characters, which the same doors serve.
+#[tokio::test]
+async fn a_reference_carrying_no_characters_is_refused_by_the_share_and_tagging_doors() {
+    let emulator = Emulator::new();
+
+    // One stored job and one stored queue, so every refusal below is about the reference
+    // and not about an empty store.
+    let created = emulator
+        .create_job(json!({
+            "role": ROLE,
+            "settings": job_settings("s3://example-bucket/in/a.mp4", "_out"),
+        }))
+        .await;
+    assert_eq!(
+        created.status, 201,
+        "the fixture job must be created: got {} with body {}",
+        created.status, created.body
+    );
+    let job_id = created.string("/job/id");
+    let queue = emulator.create_queue(json!({ "name": "tagged-queue" })).await;
+    assert_eq!(
+        queue.status, 201,
+        "the fixture queue must be created: got {} with body {}",
+        queue.status, queue.body
+    );
+    let queue_arn = queue.string("/queue/arn");
+
+    for blank in blanks() {
+        // `CreateResourceShare$JobId` is "Specify MediaConvert Job ID or ARN to share": a
+        // value with no characters is neither, so it names no job. The sibling
+        // `SupportCaseId` is well-formed here, and blank in the second row, so neither
+        // refusal depends on the other member's value.
+        for (row, support_case_id) in [
+            ("a well-formed support case", "case-42"),
+            ("a blank support case too", blank.value),
+        ] {
+            let refused = share_request(&emulator, blank.value, support_case_id).await;
+            assert_blank_refusal(
+                &format!(
+                    "CreateResourceShare with a job id of {} and {row}",
+                    blank.label
+                ),
+                "JobId",
+                &refused,
+            );
+        }
+
+        // Nothing was recorded against the job the refused request could not name.
+        let read = emulator.get_job(&job_id).await;
+        assert_eq!(
+            read.at("/job/lastShareDetails"),
+            &Value::Null,
+            "case CreateResourceShare with a job id of {}: a refused share must record \
+             nothing, got body {}",
+            blank.label,
+            read.body
+        );
+
+        // `TagResource$Arn` arrives in the body; `ListTagsForResource` and
+        // `UntagResource` carry it as a path label, which only a value with at least one
+        // character is addressable as at all.
+        assert_blank_refusal(
+            &format!("TagResource with an arn of {}", blank.label),
+            "Arn",
+            &emulator
+                .send(
+                    "POST",
+                    TAGS_URI,
+                    Some(json!({ "arn": blank.value, "tags": { "env": "prod" } })),
+                )
+                .await,
+        );
+        if !blank.path.is_empty() {
+            let addressed = format!("{TAGS_URI}/{}", blank.path);
+            assert_blank_refusal(
+                &format!("ListTagsForResource with an arn of {}", blank.label),
+                "Arn",
+                &emulator.send("GET", &addressed, None).await,
+            );
+            assert_blank_refusal(
+                &format!("UntagResource with an arn of {}", blank.label),
+                "Arn",
+                &emulator
+                    .send("PUT", &addressed, Some(json!({ "tagKeys": ["env"] })))
+                    .await,
+            );
+        }
+    }
+
+    // The boundary of the same rule on these doors: a reference that carries characters is
+    // served. The share is recorded against the job the request named, and the tagging
+    // doors reach the queue the ARN names.
+    let accepted = share_request(&emulator, &job_id, "case-42").await;
+    assert_eq!(
+        accepted.status, 202,
+        "case \"a job id that carries characters\": expected HTTP 202, got {} with body {}",
+        accepted.status, accepted.body
+    );
+    let read = emulator.get_job(&job_id).await;
+    assert!(
+        read.string("/job/lastShareDetails").contains("case-42"),
+        "case \"a job id that carries characters\": the share must be recorded against the \
+         job, got body {}",
+        read.body
+    );
+    let tagged = emulator
+        .send(
+            "POST",
+            TAGS_URI,
+            Some(json!({ "arn": queue_arn, "tags": { "env": "prod" } })),
+        )
+        .await;
+    assert_eq!(
+        tagged.status, 200,
+        "case \"an arn that carries characters\": expected HTTP 200, got {} with body {}",
+        tagged.status, tagged.body
+    );
+    let listed = emulator
+        .send("GET", &format!("{TAGS_URI}/{}", encode_label(&queue_arn)), None)
+        .await;
+    assert_eq!(
+        listed.at("/resourceTags/tags/env"),
+        &json!("prod"),
+        "case \"an arn that carries characters\": the stored tag must read back, got body {}",
+        listed.body
+    );
+}
+
+/// The tagging collection every tagging door hangs off.
+const TAGS_URI: &str = "/2017-08-29/tags";
+
+/// `CreateResourceShare` for `job_reference` and `support_case_id`.
+async fn share_request(emulator: &Emulator, job_reference: &str, support_case_id: &str) -> Reply {
+    emulator
+        .send(
+            "POST",
+            "/2017-08-29/resourceShares",
+            Some(json!({ "jobId": job_reference, "supportCaseId": support_case_id })),
+        )
+        .await
 }
 
 /// The queue the jobs in the hop-destination case are submitted to. A hop destination
