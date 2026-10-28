@@ -519,10 +519,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The job quota is a CONCURRENCY one, per account per Region: the service runs
         // at most `MAX_CONCURRENT_TRANSCRIPTION_JOBS` jobs of this family at a time in
-        // one Region, so only the jobs it is still working on THERE count against it and
-        // a job that has reached
+        // one Region, so only the jobs it is actually working on THERE count against it
+        // and a job that has reached
         // a terminal status has released its slot (see
-        // [`crate::state::jobs_in_flight`], which materialises the transitions the
+        // [`crate::state::jobs_being_processed`], which materialises the transitions the
         // clock already owed each record before counting).
         //
         // Reaching it is not by itself a refusal, because this family has job queueing
@@ -534,7 +534,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // LimitExceededException error" (model doc for
         // `JobExecutionSettings$AllowDeferredExecution`). So at the ceiling a start that
         // deferred its execution is accepted into that queue while the queue has room
-        // for it — a waiting job holds no running slot, so it is bounded by the queue's
+        // for it — a waiting job holds no running slot, so it is counted against no
+        // ceiling and is bounded by the queue's
         // own depth, [`crate::state::MAX_QUEUED_TRANSCRIPTION_JOBS`] — and a start that
         // deferred nothing is refused with the error this operation models for an
         // exceeded quota. Below the ceiling there is nothing to wait for, so the member
@@ -655,7 +656,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         let name = record.name.clone();
         store.transcription_jobs.insert(&region, &name, record);
-        // The quota above counts only the jobs in flight, so it is this that keeps
+        // The quota above counts only the jobs being processed, so it is this that keeps
         // the store bounded: the oldest records the service has finished with make
         // way for the new one (see [`crate::state::evict_oldest_finished_jobs`]).
         crate::state::evict_oldest_finished_jobs(&mut store.transcription_jobs, &region);
