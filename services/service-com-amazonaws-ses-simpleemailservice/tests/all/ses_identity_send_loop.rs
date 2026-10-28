@@ -18,7 +18,10 @@
 //! * a refusal carries the modeled error code and HTTP 400, and leaves the send
 //!   log alone.
 
-use crate::harness::{call, element, elements, emulator, field, map_entries, Field};
+use crate::harness::{
+    call, element, elements, emulator, emulator_and_engine, field, map_entries,
+    settle_verifications, Field,
+};
 use service_com_amazonaws_ses_simpleemailservice::ops::IDENTITY_TYPE_VALUES;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -180,7 +183,7 @@ const EMAIL_IDENTITIES: &[&str] = &[
 
 #[tokio::test]
 async fn the_identity_and_send_loop_is_stateful_end_to_end() {
-    let router = emulator();
+    let (router, engine) = emulator_and_engine();
 
     // Nothing is verified yet, so the list is empty and nothing has been sent:
     // the reads report state, never a canned answer.
@@ -235,10 +238,12 @@ async fn the_identity_and_send_loop_is_stateful_end_to_end() {
         "case {asked:?}: expected an entry only for the verified identities, got {attributes:?}"
     );
     for (identity, value) in &attributes {
+        // The request above only ASKED for the verification: nobody has followed
+        // the link in the message yet, so the identity is pending.
         assert_eq!(
             element(value, "VerificationStatus").as_deref(),
-            Some("Success"),
-            "case {identity:?}: expected a VerificationStatus, got {value:?}"
+            Some("Pending"),
+            "case {identity:?}: expected a pending identity, got {value:?}"
         );
         assert!(
             element(value, "VerificationToken").is_none(),
@@ -252,6 +257,18 @@ async fn the_identity_and_send_loop_is_stateful_end_to_end() {
             .any(|(identity, _)| identity == "never-verified@example.net"),
         "case never-verified@example.net: expected no entry at all, got {attributes:?}"
     );
+
+    // Once the move the clock owes each record falls due, the same read reports
+    // it verified — and only then is the address a sender.
+    settle_verifications(&engine);
+    let attributes = verification_attributes(&router, EMAIL_IDENTITIES).await;
+    for (identity, value) in &attributes {
+        assert_eq!(
+            element(value, "VerificationStatus").as_deref(),
+            Some("Success"),
+            "case {identity:?} past the span: expected a verified identity, got {value:?}"
+        );
+    }
 
     // A send from each verified address is accepted, logged, and answered with a
     // fresh id.
@@ -445,7 +462,7 @@ async fn list_identities_filters_by_type_and_pages_over_every_page_size() {
 
 #[tokio::test]
 async fn a_domain_identity_carries_a_stable_token_and_covers_its_mailboxes() {
-    let router = emulator();
+    let (router, engine) = emulator_and_engine();
     let (status, body) = verify_domain(&router, "example.org").await;
     assert_eq!(
         status, 200,
@@ -478,7 +495,9 @@ async fn a_domain_identity_carries_a_stable_token_and_covers_its_mailboxes() {
 
     // "The message must be sent from a verified email address or domain": a
     // verified domain covers the mailboxes in it and under its subdomains, and
-    // nothing else.
+    // nothing else. The request above only asked for the verification, so the
+    // store is settled past the span the clock owes that record first.
+    settle_verifications(&engine);
     let cases: &[(&str, u16)] = &[
         ("anyone@example.org", 200),
         ("anyone@mail.example.org", 200),
@@ -513,8 +532,9 @@ async fn a_domain_identity_carries_a_stable_token_and_covers_its_mailboxes() {
 
 #[tokio::test]
 async fn the_quota_counts_every_recipient_of_every_send() {
-    let router = emulator();
+    let (router, engine) = emulator_and_engine();
     verify_email(&router, "sender@example.com").await;
+    settle_verifications(&engine);
 
     // Each row differs in HOW the recipients are spread across To:/CC:/BCC:; the
     // rule is that every one of them counts once, because SES counts "the total
@@ -571,8 +591,9 @@ async fn the_quota_counts_every_recipient_of_every_send() {
 
 #[tokio::test]
 async fn a_send_is_refused_with_the_modeled_error_and_leaves_the_log_alone() {
-    let router = emulator();
+    let (router, engine) = emulator_and_engine();
     verify_email(&router, "sender@example.com").await;
+    settle_verifications(&engine);
 
     let many: Vec<String> = (0..51).map(|n| format!("r{n}@example.net")).collect();
     let many: Vec<&str> = many.iter().map(String::as_str).collect();
@@ -706,8 +727,9 @@ async fn a_listing_with_no_max_items_is_still_one_bounded_page() {
 
 #[tokio::test]
 async fn a_send_past_the_accounts_24_hour_quota_is_refused() {
-    let router = emulator();
+    let (router, engine) = emulator_and_engine();
     verify_email(&router, "sender@example.com").await;
+    settle_verifications(&engine);
     let (quota, _, _) = send_quota(&router).await;
 
     // Fill the quota exactly, in the largest messages a send may carry (50

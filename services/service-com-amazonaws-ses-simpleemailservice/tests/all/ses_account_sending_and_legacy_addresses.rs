@@ -22,7 +22,10 @@
 //! * the sending statistics are the send log bucketed into the 15-minute periods
 //!   the operation documents, over its two-week window.
 
-use crate::harness::{call, element, elements, emulator, emulator_over, field, Field};
+use crate::harness::{
+    call, element, elements, emulator, emulator_and_engine, emulator_over, field,
+    settle_verifications, Field,
+};
 use service_com_amazonaws_ses_simpleemailservice::state::{
     self, SentMessage, SEND_STATISTICS_PERIOD, SEND_STATISTICS_WINDOW,
 };
@@ -191,13 +194,17 @@ async fn the_account_sending_flag_is_whatever_the_last_write_left() {
 
 #[tokio::test]
 async fn a_disabled_account_refuses_a_send_and_serving_it_again_restores_sending() {
-    let router = emulator();
+    let (router, engine) = emulator_and_engine();
     ok(
         &router,
         "VerifyEmailIdentity",
         &[field("EmailAddress", "sender@example.com")],
     )
     .await;
+    // The request only ASKS for the verification; this case is about the
+    // account-wide flag, so the store is settled past the span the clock owes
+    // that record rather than slept through.
+    settle_verifications(&engine);
 
     // The flag is not just reported back: it is the account state a send is
     // checked against, which is what the operation it belongs to documents
@@ -227,7 +234,7 @@ async fn a_disabled_account_refuses_a_send_and_serving_it_again_restores_sending
 
 #[tokio::test]
 async fn the_deprecated_address_apis_share_the_one_identity_list() {
-    let router = emulator();
+    let (router, engine) = emulator_and_engine();
 
     assert!(
         verified_addresses(&router).await.is_empty(),
@@ -255,6 +262,11 @@ async fn the_deprecated_address_apis_share_the_one_identity_list() {
                 &[field("EmailAddress", address)],
             )
             .await;
+            // The listing reports the addresses whose verification has GONE
+            // THROUGH, and the request above only asks for it: the store is
+            // settled past the span the clock owes each record, because this
+            // case is about the one list both spellings write.
+            settle_verifications(&engine);
             let listed = verified_addresses(&router).await;
             assert_eq!(
                 listed.iter().filter(|listed| *listed == address).count(),
@@ -279,6 +291,7 @@ async fn the_deprecated_address_apis_share_the_one_identity_list() {
         &[field("Domain", "example.com")],
     )
     .await;
+    settle_verifications(&engine);
 
     let mut expected: Vec<String> = addresses
         .iter()
@@ -413,6 +426,7 @@ async fn send_statistics_bucket_the_send_log_into_fifteen_minute_periods() {
         &[field("EmailAddress", "sender@example.com")],
     )
     .await;
+    settle_verifications(&engine);
     ok(&router, "SendEmail", &send_params()).await;
     let sent_period = wire_timestamp(period_start(SystemTime::now()));
     let after = send_statistics(&router).await;

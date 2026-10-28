@@ -173,6 +173,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut state = state.lock();
 
+        // The verification move the clock already owes each identity,
+        // materialised before the tracking domain is checked against them: a
+        // custom tracking domain has to be one this account has verified, so the
+        // check reads the verification the clock has carried through.
+        state.settle_identities(std::time::SystemTime::now());
+
         // The tracking options the request SUPPLIES are read first, through the
         // one shared rule both tracking-options writers follow — see
         // `update_configuration_set_tracking_options.rs` for why that order is

@@ -4,7 +4,9 @@
 //!
 //! Adds the address to this account's identity list, idempotently: the record it
 //! writes is what `ListIdentities` and `GetIdentityVerificationAttributes` read
-//! back, and what `SendEmail` checks a `Source` against.
+//! back, and what `SendEmail` checks a `Source` against. The call only ASKS for
+//! verification — "a verification email is sent to the specified address" — so
+//! the record starts out pending ([`crate::state::IDENTITY_VERIFICATION_SPAN`]).
 //!
 //! ## Shape of an operation
 //!
@@ -148,7 +150,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
         // Idempotent: a second call for the same address leaves the existing record
-        // (and its `verified_at`) alone, so the identity list never doubles up.
+        // (and its `verified_at`, and whatever is left of the span its pending
+        // verification started) alone, so the identity list never doubles up.
         // `None` means the account is already at its identity limit, which is a
         // refusal, not a server fault.
         if state
