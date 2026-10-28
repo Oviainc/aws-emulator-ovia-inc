@@ -199,6 +199,8 @@ mod stack_role_trust;
 mod stack_set_drift_lifecycle;
 #[path = "all/stack_set_lifecycle.rs"]
 mod stack_set_lifecycle;
+#[path = "all/stack_set_mutations.rs"]
+mod stack_set_mutations;
 #[path = "all/stack_status_accepts_an_update.rs"]
 mod stack_status_accepts_an_update;
 #[path = "all/stack_tag_propagation.rs"]

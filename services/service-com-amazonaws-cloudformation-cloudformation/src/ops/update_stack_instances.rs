@@ -134,8 +134,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 use crate::state::stack_sets::{
-    detailed_status, instance_status, operation_action, operation_status, target_accounts,
-    StoredStackInstance, StoredStackSetOperation,
+    detailed_status, distinct, instance_status, operation_action, operation_id_already_exists,
+    operation_status, parameters_with_overrides, refuse_oversized_parameters,
+    refuse_oversized_selection, region_does_not_exist, requested_targets,
+    stack_set_has_no_template, unknown_target_region, StoredStackInstance,
+    StoredStackSetOperation,
 };
 use crate::state::{status, StoredParameter, StoredResource};
 
@@ -192,42 +195,6 @@ struct Resolved {
     /// The stage the StackSet's template takes under those values, which is what the
     /// instance's stack deploys.
     processed: crate::state::template::Processed,
-}
-
-/// The parameter values in force on one stack instance: the StackSet's own values, with the
-/// instance's overrides applied on top.
-///
-/// "Any overridden parameter values will be applied to all stack instances in the specified
-/// accounts and Amazon Web Services Regions" — an override replaces the StackSet's value for
-/// that parameter and nothing else, so every parameter the StackSet states that the instance
-/// does not override keeps the StackSet's value.
-///
-/// The overrides are INDEXED once rather than scanned per stated parameter, so the two counts
-/// a request chooses (how many instances it selects and how many parameters it overrides) add
-/// rather than multiply.
-fn with_overrides(
-    stack_set: &[StoredParameter],
-    overrides: &[StoredParameter],
-) -> Vec<StoredParameter> {
-    let mut by_key: ::std::collections::BTreeMap<&str, &StoredParameter> = overrides
-        .iter()
-        .map(|overridden| (overridden.key.as_str(), overridden))
-        .collect();
-    let mut in_force: Vec<StoredParameter> = stack_set
-        .iter()
-        .map(|held| match by_key.remove(held.key.as_str()) {
-            Some(overridden) => StoredParameter {
-                key: held.key.clone(),
-                value: overridden.value.clone(),
-                no_echo: held.no_echo,
-            },
-            None => held.clone(),
-        })
-        .collect();
-    // An override naming a parameter the StackSet states no value for is kept rather than
-    // dropped: whether the template declares it is what `parameters_in_force` resolves.
-    in_force.extend(by_key.into_values().cloned());
-    in_force
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -310,8 +277,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "UpdateStackInstances",
             ));
         };
-        let accounts =
-            target_accounts(input.accounts.as_deref(), input.deployment_targets.as_ref())
+        // "You can specify Accounts or DeploymentTargets, but not both": the request's own
+        // shape is judged before any stack set is resolved; what the targeting means for the
+        // stack set named is resolved under the lock below.
+        let targets =
+            requested_targets(input.accounts.as_deref(), input.deployment_targets.as_ref())
                 .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         // "The names of one or more Amazon Web Services Regions in which you want to update
         // parameter values for stack instances."
@@ -320,54 +290,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "You must specify at least one value for Regions",
             ));
         }
+        // Every Region named has to be a Region that exists: an update targeting one that
+        // does not could never reach a stack, so the whole request is refused and no
+        // instance in the Regions beside it is updated either.
+        if let Some(unknown) = unknown_target_region(&input.regions) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                region_does_not_exist(unknown),
+            ));
+        }
         // "Updates the parameter values for stack instances for the specified accounts,
         // within the specified Amazon Web Services Regions": one instance per account and
-        // Region pair, so the PRODUCT of the two lists is what this request asks the store to
-        // walk — and both lists are the caller's. A product past the ceiling one StackSet's
-        // instances are bounded by names more pairs than that StackSet can hold an instance
-        // for, so it is refused HERE, before the store is read at all, and no oversized
-        // request drives work under the store lock. The model declares no
+        // Region pair, so the PRODUCT of the two lists — over their DISTINCT values, since a
+        // repeated account or Region names the same pair — is what this request asks the
+        // store to walk, and both lists are the caller's. A product past the ceiling one
+        // StackSet's instances are bounded by names more pairs than that StackSet can hold an
+        // instance for, so it is refused HERE, before the store is read at all, and again
+        // under the lock once the stack set has resolved what the targeting selects — so no
+        // oversized request drives work under the store lock. The model declares no
         // `LimitExceededException` for this operation, so the refusal is a bad request rather
         // than a modelled quota failure.
-        if accounts.len().saturating_mul(input.regions.len())
-            > crate::state::stack_sets::MAX_INSTANCES_PER_STACK_SET
-        {
-            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                "Accounts and Regions select more than the {} stack instances a StackSet can \
-                 hold",
-                crate::state::stack_sets::MAX_INSTANCES_PER_STACK_SET
-            )));
-        }
+        let regions = distinct(input.regions.clone());
+        refuse_oversized_selection(targets.accounts.len(), regions.len())
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         // "You can only override the parameter values that are specified in the StackSet. To
         // add or delete a parameter itself, use UpdateStackSet": a StackSet's template
         // declares at most the documented per-template parameter quota, so a request naming
         // more overrides than that names parameters no template it could deploy can declare.
         // Refused HERE, before the store is read, which is also what keeps the walk below
         // linear in a bounded count rather than in the caller's two counts multiplied.
-        let named_overrides = input
-            .parameter_overrides
-            .as_deref()
-            .unwrap_or_default()
-            .len();
-        if named_overrides > crate::state::template::MAX_PARAMETERS_PER_TEMPLATE {
-            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                "ParameterOverrides names more than the {} parameters a template can declare",
-                crate::state::template::MAX_PARAMETERS_PER_TEMPLATE
-            )));
-        }
-        // The DISTINCT pairs the request selects: a repeated account or Region names the same
-        // account and Region pair, which carries at most ONE instance of a StackSet, so the
-        // walk below costs one lookup per distinct pair however often a request repeats one.
-        // Bounded by the product refused above.
-        let requested: ::std::collections::BTreeSet<(&str, &str)> = accounts
-            .iter()
-            .flat_map(|account| {
-                input
-                    .regions
-                    .iter()
-                    .map(move |target_region| (account.as_str(), target_region.as_str()))
-            })
-            .collect();
+        refuse_oversized_parameters("ParameterOverrides", input.parameter_overrides.as_deref())
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         // "The operation ID also functions as an idempotency token": the caller's when it
@@ -394,6 +346,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         },
                     )
                 })?;
+            // Which accounts this targeting really selects for THIS stack set: the
+            // permission model the stack set carries is what says whether organizational
+            // units are targets of it at all.
+            let accounts = targets
+                .accounts_in(stack_set)
+                .map_err(|refusal| refusal.refuse("UpdateStackInstances"))?;
+            // Re-asserted over what the targeting REALLY selects for this stack set: the
+            // walk below covers this product, not the request's literal account list.
+            refuse_oversized_selection(accounts.len(), regions.len())
+                .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+            // The DISTINCT pairs the request selects: a pair carries at most ONE instance of
+            // a StackSet, so the selection costs one lookup per distinct pair.
+            let requested: ::std::collections::BTreeSet<(&str, &str)> = accounts
+                .iter()
+                .flat_map(|account| {
+                    regions
+                        .iter()
+                        .map(move |target_region| (account.as_str(), target_region.as_str()))
+                })
+                .collect();
             // "Only one operation can be performed for a stack set at a given time": the
             // refusal names the StackSet it is about and the operation that still holds it.
             if let Some(in_flight) = stack_set.operation_in_flight() {
@@ -417,7 +389,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     UpdateStackInstancesErrorModeled::OperationIdAlreadyExistsException(
                         OperationIdAlreadyExistsException {
-                            message: Some(format!("Operation id {operation_id} already exists")),
+                            message: Some(operation_id_already_exists(&operation_id)),
                         },
                     )
                     .into(),
@@ -473,10 +445,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     UpdateStackInstancesErrorModeled::InvalidOperationException(
                         InvalidOperationException {
-                            message: Some(format!(
-                                "StackSet {} has no template to deploy",
-                                stack_set.stack_set_name
-                            )),
+                            message: Some(stack_set_has_no_template(&stack_set.stack_set_name)),
                         },
                     )
                     .into(),
@@ -512,7 +481,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.parameter_overrides.as_deref(),
             )
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
-            let effective = with_overrides(&stack_set_parameters, &overrides);
+            let effective = parameters_with_overrides(&stack_set_parameters, &overrides);
             planned.push(Planned {
                 account,
                 region: target_region,
@@ -581,7 +550,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     UpdateStackInstancesErrorModeled::OperationIdAlreadyExistsException(
                         OperationIdAlreadyExistsException {
-                            message: Some(format!("Operation id {operation_id} already exists")),
+                            message: Some(operation_id_already_exists(&operation_id)),
                         },
                     )
                     .into(),
