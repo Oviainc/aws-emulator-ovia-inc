@@ -34,7 +34,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::ephemeris_catalog::{az_el_inline, create_ok, onboard, wait_out_validation, FUTURE};
 use crate::ephemeris_deletion::{put_in_status, satellite_arn, CONTACT_STATUSES};
 use crate::scheduling_loop::{
-    create_mission_profile, harness_with_engine, send, Reply, ABSENT_UUID, AFTER_SETTLE, REGION,
+    create_mission_profile, harness_with_engine, send, Reply, ABSENT_UUID, AFTER_SETTLE,
 };
 
 /// The ground station every contact here is reserved at, and the station
@@ -43,9 +43,9 @@ use crate::scheduling_loop::{
 /// (`smithy_query(query="shape", shape="GroundStationName")`).
 const GROUND_STATION: &str = "Ohio 1";
 
-/// The NORAD catalogue numbers this suite's two satellites are on-boarded under, inside
+/// The NORAD catalogue numbers this suite's three satellites are on-boarded under, inside
 /// `state::NORAD_SATELLITE_ID_RANGE`.
-const NORAD: (i32, i32) = (25_994, 27_424);
+const NORAD: (i32, i32, i32) = (25_994, 27_424, 43_013);
 
 /// The validity range the pointing data every ephemeris here carries declares.
 const DATA_RANGE: (i64, i64) = (1_800_000_000, 1_800_086_400);
@@ -54,19 +54,6 @@ const DATA_RANGE: (i64, i64) = (1_800_000_000, 1_800_086_400);
 /// reserved below, so what one row's answer differs from another's by is the filter and not
 /// the window.
 const WINDOW: (i64, i64) = (1_799_000_000, 1_803_000_000);
-
-/// A satellite ARN of this account that no onboarding names, for the contacts coupled to an
-/// ephemeris only by their program track: no ephemeris applies to a satellite this account
-/// is not on-boarded to, so such a contact is pointed by exactly the ephemeris it names.
-///
-/// `satelliteArn` is `arn:aws:groundstation:<region>:<account>:satellite/<Uuid>`
-/// (`smithy_query(query="shape", shape="satelliteArn")`).
-fn untracked_satellite_arn() -> String {
-    format!(
-        "arn:aws:groundstation:{REGION}:{}:satellite/22222222-2222-2222-2222-222222222222",
-        engine::emulator_account_id()
-    )
-}
 
 /// `TrackingOverrides` whose program track names the azimuth-elevation ephemeris
 /// `ephemeris_id` — the `azEl` member of `ProgramTrackSettings`
@@ -210,10 +197,13 @@ async fn the_ephemeris_filter_selects_by_pointing_in_every_contact_status() {
     let (router, engine) = harness_with_engine();
     let onboarded = onboard(
         &engine,
-        &format!("{}={GROUND_STATION},{}={GROUND_STATION}", NORAD.0, NORAD.1),
+        &format!(
+            "{}={GROUND_STATION},{}={GROUND_STATION},{}={GROUND_STATION}",
+            NORAD.0, NORAD.1, NORAD.2
+        ),
     );
-    let [flown, unflown] =
-        <[String; 2]>::try_from(onboarded).expect("two satellites are on-boarded");
+    let [flown, unflown, untracked_satellite] =
+        <[String; 3]>::try_from(onboarded).expect("three satellites are on-boarded");
     let flown_arn = satellite_arn(&engine, &flown);
     let profile_arn =
         create_mission_profile(&router, "ephemeris filter statuses", 60, None, None).await;
@@ -245,7 +235,12 @@ async fn the_ephemeris_filter_selects_by_pointing_in_every_contact_status() {
 
     // One contact per row, each in its own window: the status filter is what isolates a
     // row's contact in the answer, and both couplings are stored for every status.
-    let untracked = untracked_satellite_arn();
+    //
+    // The second coupling's contacts are flown against the third onboarding, which no
+    // ephemeris here applies to: a contact is flown against a satellite of this account, and
+    // one whose satellite has no ephemeris in force is pointed by exactly the ephemeris its
+    // program track names.
+    let untracked = satellite_arn(&engine, &untracked_satellite);
     let mut rows: Vec<Row> = Vec::new();
     for (slot, status) in CONTACT_STATUSES.iter().enumerate() {
         let satellite_row = Row {

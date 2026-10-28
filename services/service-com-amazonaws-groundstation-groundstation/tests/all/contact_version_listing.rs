@@ -39,10 +39,11 @@ use serde_json::{json, Value};
 use service_com_amazonaws_groundstation_groundstation::state;
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::contact_satellite_reference_integrity::onboard_satellite_arns;
 use crate::ephemeris_catalog::program_track_ephemeris;
 use crate::scheduling_loop::{
     create_mission_profile, harness_with_engine, list_pages, send, Reply, ABSENT_UUID,
-    AFTER_SETTLE, REGION,
+    AFTER_SETTLE,
 };
 
 /// The window every reservation in this suite books: long enough for the profile's
@@ -50,19 +51,14 @@ use crate::scheduling_loop::{
 const CONTACT_START: i64 = 1_950_000_000;
 const CONTACT_END: i64 = CONTACT_START + 600;
 
-/// A well-formed `satelliteArn` for the satellite `uuid` (model pattern
-/// `^arn:aws:groundstation:([-a-z0-9]{1,50})?:[0-9]{12}:satellite/<uuid>$`).
-fn satellite_arn(uuid: &str) -> String {
-    format!(
-        "arn:aws:groundstation:{REGION}:{}:satellite/{uuid}",
-        engine::EMULATOR_ACCOUNT_ID
-    )
-}
-
-/// `ReserveContact`, answering the `contactId` of a contact at version
+/// `ReserveContact` against `satellite`, answering the `contactId` of a contact at version
 /// [`state::FIRST_VERSION_ID`].
-async fn reserve_contact(router: &MultiServiceRouter, profile_arn: &str) -> String {
-    reserve_contact_in_slot(router, profile_arn, 0).await
+async fn reserve_contact(
+    router: &MultiServiceRouter,
+    profile_arn: &str,
+    satellite: &str,
+) -> String {
+    reserve_contact_in_slot(router, profile_arn, satellite, 0).await
 }
 
 /// `ReserveContact` for the pass a day per `slot` after [`CONTACT_START`], so two
@@ -71,6 +67,7 @@ async fn reserve_contact(router: &MultiServiceRouter, profile_arn: &str) -> Stri
 async fn reserve_contact_in_slot(
     router: &MultiServiceRouter,
     profile_arn: &str,
+    satellite: &str,
     slot: i64,
 ) -> String {
     let shift = slot * 86_400;
@@ -83,7 +80,7 @@ async fn reserve_contact_in_slot(
             "groundStation": "Ohio-1",
             "startTime": CONTACT_START + shift,
             "endTime": CONTACT_END + shift,
-            "satelliteArn": satellite_arn("11111111-1111-4111-8111-111111111111"),
+            "satelliteArn": satellite,
         })),
     )
     .await;
@@ -143,15 +140,16 @@ impl ProgramTracks {
 
 /// The bodies this suite chains onto one contact, differing along which members an update
 /// names and which `ProgramTrackSettings` member its overrides select
-/// (`smithy_query(query="shape", shape="ProgramTrackSettings")`).
-fn update_bodies(tracks: &ProgramTracks) -> Vec<Value> {
+/// (`smithy_query(query="shape", shape="ProgramTrackSettings")`). The satellites are
+/// on-boarded ones, since a contact is flown against a satellite of this account.
+fn update_bodies(tracks: &ProgramTracks, satellites: &[String]) -> Vec<Value> {
     vec![
-        json!({"satelliteArn": satellite_arn("22222222-2222-4222-8222-222222222222")}),
+        json!({"satelliteArn": satellites[1]}),
         json!({"trackingOverrides": {"programTrackSettings": {
             "azEl": {"ephemerisId": tracks.az_el},
         }}}),
         json!({
-            "satelliteArn": satellite_arn("33333333-3333-4333-8333-333333333333"),
+            "satelliteArn": satellites[2],
             "trackingOverrides": {"programTrackSettings": {
                 "oem": {"ephemerisId": tracks.oem},
             }},
@@ -159,7 +157,7 @@ fn update_bodies(tracks: &ProgramTracks) -> Vec<Value> {
         json!({"trackingOverrides": {"programTrackSettings": {
             "tle": {"ephemerisId": tracks.tle},
         }}}),
-        json!({"satelliteArn": satellite_arn("44444444-4444-4444-8444-444444444444")}),
+        json!({"satelliteArn": satellites[3]}),
         json!({"trackingOverrides": {}}),
     ]
 }
@@ -215,10 +213,13 @@ fn version_ids(versions: &[Value], case: &str) -> Vec<i64> {
 
 #[tokio::test]
 async fn every_version_the_store_holds_is_listed_oldest_first() {
-    let (router, _engine) = harness_with_engine();
+    let (router, engine) = harness_with_engine();
+    // A contact is flown against a satellite of THIS account, so the satellites the rows
+    // below name are on-boarded first (`crate::contact_satellite_reference_integrity`).
+    let satellites = onboard_satellite_arns(&engine, 4);
     let profile_arn =
         create_mission_profile(&router, "version listing", 180, Some(60), Some(30)).await;
-    let contact_id = reserve_contact(&router, &profile_arn).await;
+    let contact_id = reserve_contact(&router, &profile_arn, &satellites[0]).await;
     let tracks = ProgramTracks::create(&router).await;
 
     // Rows of growing history: the reservation's version alone, then one more version per
@@ -228,7 +229,7 @@ async fn every_version_the_store_holds_is_listed_oldest_first() {
     let mut case = "reserved only".to_string();
     for (index, body) in [None]
         .into_iter()
-        .chain(update_bodies(&tracks).into_iter().map(Some))
+        .chain(update_bodies(&tracks, &satellites).into_iter().map(Some))
         .enumerate()
     {
         if let Some(body) = body {
@@ -310,11 +311,12 @@ async fn every_version_the_store_holds_is_listed_oldest_first() {
 
 #[tokio::test]
 async fn the_history_pages_the_same_way_at_every_page_size() {
-    let (router, _engine) = harness_with_engine();
+    let (router, engine) = harness_with_engine();
+    let satellites = onboard_satellite_arns(&engine, 4);
     let profile_arn = create_mission_profile(&router, "version paging", 180, None, None).await;
-    let contact_id = reserve_contact(&router, &profile_arn).await;
+    let contact_id = reserve_contact(&router, &profile_arn, &satellites[0]).await;
     let tracks = ProgramTracks::create(&router).await;
-    let bodies = update_bodies(&tracks);
+    let bodies = update_bodies(&tracks, &satellites);
     for body in bodies.clone() {
         append_version(&router, &contact_id, body).await;
     }
@@ -375,12 +377,13 @@ async fn the_history_pages_the_same_way_at_every_page_size() {
 
 #[tokio::test]
 async fn a_token_this_listing_did_not_issue_for_this_contact_is_refused() {
-    let (router, _engine) = harness_with_engine();
+    let (router, engine) = harness_with_engine();
+    let satellites = onboard_satellite_arns(&engine, 4);
     let profile_arn = create_mission_profile(&router, "version tokens", 180, None, None).await;
-    let first_contact = reserve_contact(&router, &profile_arn).await;
-    let second_contact = reserve_contact_in_slot(&router, &profile_arn, 1).await;
+    let first_contact = reserve_contact(&router, &profile_arn, &satellites[0]).await;
+    let second_contact = reserve_contact_in_slot(&router, &profile_arn, &satellites[0], 1).await;
     let tracks = ProgramTracks::create(&router).await;
-    for body in update_bodies(&tracks) {
+    for body in update_bodies(&tracks, &satellites) {
         append_version(&router, &first_contact, body.clone()).await;
         append_version(&router, &second_contact, body).await;
     }
@@ -469,11 +472,12 @@ async fn a_token_this_listing_did_not_issue_for_this_contact_is_refused() {
 
 #[tokio::test]
 async fn a_contact_that_does_not_exist_is_not_an_empty_history() {
-    let (router, _engine) = harness_with_engine();
+    let (router, engine) = harness_with_engine();
+    let satellites = onboard_satellite_arns(&engine, 1);
     let profile_arn = create_mission_profile(&router, "version not found", 180, None, None).await;
     // One contact exists, so a refusal below is about the id that was asked for rather
     // than about an empty store.
-    let existing = reserve_contact(&router, &profile_arn).await;
+    let existing = reserve_contact(&router, &profile_arn, &satellites[0]).await;
 
     // Well-formed `Uuid`s naming nothing: a run of zeros, a run of `f`s and a mixed one,
     // so the refusal cannot be passing on one id's shape.
@@ -512,9 +516,10 @@ async fn a_contact_that_does_not_exist_is_not_an_empty_history() {
 
 #[tokio::test]
 async fn listing_versions_changes_nothing_a_later_caller_sees() {
-    let (router, _engine) = harness_with_engine();
+    let (router, engine) = harness_with_engine();
+    let satellites = onboard_satellite_arns(&engine, 2);
     let profile_arn = create_mission_profile(&router, "version reads", 180, None, None).await;
-    let contact_id = reserve_contact(&router, &profile_arn).await;
+    let contact_id = reserve_contact(&router, &profile_arn, &satellites[0]).await;
     std::thread::sleep(AFTER_SETTLE);
 
     let first = versions_of(
@@ -538,7 +543,7 @@ async fn listing_versions_changes_nothing_a_later_caller_sees() {
     append_version(
         &router,
         &contact_id,
-        json!({"satelliteArn": satellite_arn("55555555-5555-4555-8555-555555555555")}),
+        json!({"satelliteArn": satellites[1]}),
     )
     .await;
     let pending = versions_of(

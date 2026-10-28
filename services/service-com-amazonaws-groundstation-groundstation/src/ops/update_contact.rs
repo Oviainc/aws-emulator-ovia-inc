@@ -258,6 +258,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // And WHAT the antenna is pointed at is resolved the same way: a contact is flown
+        // against a satellite of this account, so an ARN no onboarding of this account
+        // carries references nothing and is refused rather than appended — the rule both
+        // writers of a contact version are held to
+        // (`crate::state::satellite_reference_fault`).
+        if let Some(error) = guard.satellite_reference_fault(input.satellite_arn.as_deref()) {
+            return Err(UpdateContactErrorModeled::ResourceNotFoundException(error).into());
+        }
+
         // Accepted: the contact takes a new version, carrying what this request named
         // over what its newest version already held. The version is admitted UPDATING —
         // the service owes it its move to ACTIVE, which is when the contact is flown

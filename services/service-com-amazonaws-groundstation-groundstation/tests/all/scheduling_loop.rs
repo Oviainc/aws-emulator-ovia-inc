@@ -1058,10 +1058,12 @@ async fn a_reserved_contact_settles_into_scheduled_and_reads_back_from_state() {
 
     let start = 1_800_000_000_i64;
     let end = start + 600;
-    let satellite_arn = format!(
-        "arn:aws:groundstation:{REGION}:{}:satellite/11111111-1111-1111-1111-111111111111",
-        engine::EMULATOR_ACCOUNT_ID
-    );
+    // A contact is flown against a satellite of THIS account, so the reservation names an
+    // on-boarded one (`crate::contact_satellite_reference_integrity`): an ARN no onboarding
+    // carries references nothing and is refused.
+    let satellite_arn =
+        crate::contact_satellite_reference_integrity::onboard_satellite_arns(&engine, 1)[0]
+            .clone();
     let reserve = send(
         &router,
         "POST",
@@ -1402,13 +1404,14 @@ async fn reserve_contact_enforces_the_window_the_mission_profile_requires() {
 
 #[tokio::test]
 async fn list_contacts_returns_exactly_the_contacts_its_filters_select() {
-    let router = harness();
+    let (router, engine) = harness_with_engine();
     let profile_a = create_mission_profile(&router, "filters a", 60, None, None).await;
     let profile_b = create_mission_profile(&router, "filters b", 60, None, None).await;
-    let satellite_arn = format!(
-        "arn:aws:groundstation:{REGION}:{}:satellite/22222222-2222-2222-2222-222222222222",
-        engine::EMULATOR_ACCOUNT_ID
-    );
+    // The one contact of the table below that names a satellite is flown against an
+    // on-boarded one; the availability rows further down filter on the same ARN.
+    let satellite_arn =
+        crate::contact_satellite_reference_integrity::onboard_satellite_arns(&engine, 1)[0]
+            .clone();
     let start = 1_800_000_000_i64;
 
     // Three contacts differing in ground station, mission profile, satellite and
@@ -1547,10 +1550,7 @@ async fn list_contacts_returns_exactly_the_contacts_its_filters_select() {
     // name the ground station, mission profile and satellite it is an availability
     // search for ("If statusList contains AVAILABLE, the request must include
     // groundStation, missionprofileArn, and satelliteArn" — the ListContacts doc).
-    let satellite_filter = format!(
-        "arn:aws:groundstation:{REGION}:{}:satellite/22222222-2222-2222-2222-222222222222",
-        engine::EMULATOR_ACCOUNT_ID
-    );
+    let satellite_filter = satellite_arn.clone();
     let refusals: Vec<(&str, Value, &str)> = vec![
         (
             "window-runs-backwards",
@@ -1617,9 +1617,9 @@ async fn list_contacts_returns_exactly_the_contacts_its_filters_select() {
     }
 
     // An AVAILABLE search that names all three is a well-formed request; no pointing data
-    // is in force for the pairing it names — this account is on-boarded to no satellite
-    // here and holds no ephemeris — so that pairing can fly nothing and no window is
-    // offered. The windows a pairing that HAS pointing data is offered are
+    // is in force for the pairing it names — this account holds no ephemeris here, so the
+    // satellite it is on-boarded to has no trajectory — so that pairing can fly nothing and
+    // no window is offered. The windows a pairing that HAS pointing data is offered are
     // `crate::available_contacts`'s subject.
     let available = send(
         &router,

@@ -22,9 +22,10 @@ use serde_json::{json, Value};
 use service_com_amazonaws_groundstation_groundstation::state::{self, Contact};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::contact_satellite_reference_integrity::onboard_satellite_arns;
 use crate::ephemeris_catalog::program_track_ephemeris;
 use crate::scheduling_loop::{
-    create_mission_profile, harness_with_engine, send, Reply, AFTER_SETTLE, REGION,
+    create_mission_profile, harness_with_engine, send, Reply, AFTER_SETTLE,
 };
 
 /// The contact window every reservation in this suite books.
@@ -40,16 +41,6 @@ const ABSENT_CONTACT_IDS: &[&str] = &[
     "ffffffff-ffff-4fff-bfff-ffffffffffff",
     "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
 ];
-
-/// A well-formed `satelliteArn` for the satellite `uuid`: the model's pattern
-/// `^arn:aws:groundstation:([-a-z0-9]{1,50})?:[0-9]{12}:satellite/<uuid>$`, length
-/// 82..132 (`smithy_query(query="operation", operation="UpdateContact")`).
-fn satellite_arn(uuid: &str) -> String {
-    format!(
-        "arn:aws:groundstation:{REGION}:{}:satellite/{uuid}",
-        engine::EMULATOR_ACCOUNT_ID
-    )
-}
 
 /// `UpdateContact` as the model routes it: `POST /contact/{contactId}/versions`.
 async fn update_contact(router: &MultiServiceRouter, contact_id: &str, body: Value) -> Reply {
@@ -138,9 +129,13 @@ async fn each_accepted_update_appends_the_next_version_and_applies_what_it_named
     let profile_arn =
         create_mission_profile(&router, "contact-versions", 180, Some(60), Some(30)).await;
 
-    let first_satellite = satellite_arn("11111111-1111-4111-8111-111111111111");
-    let second_satellite = satellite_arn("22222222-2222-4222-8222-222222222222");
-    let third_satellite = satellite_arn("33333333-3333-4333-8333-333333333333");
+    // A contact is flown against a satellite of THIS account, so the satellites the rows
+    // below name are on-boarded first (`crate::contact_satellite_reference_integrity`): an
+    // ARN no onboarding carries references nothing and is refused.
+    let satellites = onboard_satellite_arns(&engine, 3);
+    let first_satellite = satellites[0].clone();
+    let second_satellite = satellites[1].clone();
+    let third_satellite = satellites[2].clone();
     let contact_id = reserve_contact(&router, &profile_arn, Some(&first_satellite)).await;
 
     // One ephemeris of each form a program track may name, stored through
@@ -330,11 +325,12 @@ async fn each_accepted_update_appends_the_next_version_and_applies_what_it_named
 
 #[tokio::test]
 async fn a_contact_is_listed_under_the_satellite_its_active_version_names() {
-    let (router, _engine) = harness_with_engine();
+    let (router, engine) = harness_with_engine();
     let profile_arn = create_mission_profile(&router, "listed-by-version", 180, None, None).await;
 
-    let reserved_satellite = satellite_arn("44444444-4444-4444-8444-444444444444");
-    let updated_satellite = satellite_arn("55555555-5555-4555-8555-555555555555");
+    let satellites = onboard_satellite_arns(&engine, 2);
+    let reserved_satellite = satellites[0].clone();
+    let updated_satellite = satellites[1].clone();
     let contact_id = reserve_contact(&router, &profile_arn, Some(&reserved_satellite)).await;
 
     let updated = update_contact(
@@ -402,7 +398,7 @@ async fn a_contact_is_listed_under_the_satellite_its_active_version_names() {
 async fn an_update_the_contact_cannot_take_is_refused_and_appends_nothing() {
     let (router, engine) = harness_with_engine();
     let profile_arn = create_mission_profile(&router, "refused-updates", 180, None, None).await;
-    let satellite = satellite_arn("66666666-6666-4666-8666-666666666666");
+    let satellite = onboard_satellite_arns(&engine, 1)[0].clone();
     let contact_id = reserve_contact(&router, &profile_arn, Some(&satellite)).await;
 
     // An id that names no contact: the MUTATION path's text, which names the id the
@@ -494,8 +490,9 @@ async fn an_update_the_contact_cannot_take_is_refused_and_appends_nothing() {
 async fn a_replayed_client_token_appends_no_second_version() {
     let (router, engine) = harness_with_engine();
     let profile_arn = create_mission_profile(&router, "idempotent-updates", 180, None, None).await;
-    let reserved_satellite = satellite_arn("77777777-7777-4777-8777-777777777777");
-    let updated_satellite = satellite_arn("88888888-8888-4888-8888-888888888888");
+    let satellites = onboard_satellite_arns(&engine, 2);
+    let reserved_satellite = satellites[0].clone();
+    let updated_satellite = satellites[1].clone();
 
     // One row per form the modelled `ClientToken` admits — length 1..64, pattern
     // `^[!-~]{1,64}$` (`smithy_query(query="shape", shape="ClientToken")`): the shortest
@@ -583,8 +580,9 @@ async fn a_replayed_client_token_appends_no_second_version() {
 async fn a_contact_takes_no_more_versions_than_the_modelled_maximum() {
     let (router, engine) = harness_with_engine();
     let profile_arn = create_mission_profile(&router, "version-ceiling", 180, None, None).await;
-    let even_satellite = satellite_arn("99999999-9999-4999-8999-999999999999");
-    let odd_satellite = satellite_arn("aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa");
+    let satellites = onboard_satellite_arns(&engine, 2);
+    let even_satellite = satellites[0].clone();
+    let odd_satellite = satellites[1].clone();
     let contact_id = reserve_contact(&router, &profile_arn, Some(&odd_satellite)).await;
 
     // Every version the model's `VersionId` admits past the first (range 1..128 —

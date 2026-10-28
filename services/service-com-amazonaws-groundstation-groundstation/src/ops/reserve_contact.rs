@@ -250,6 +250,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // And WHAT the antenna is pointed at is resolved the same way: a contact is flown
+        // against a satellite of this account, so an ARN no onboarding of this account
+        // carries references nothing and is refused rather than reserved — the rule both
+        // writers of a contact version are held to
+        // (`crate::state::satellite_reference_fault`).
+        if let Some(error) = guard.satellite_reference_fault(input.satellite_arn.as_deref()) {
+            return Err(ReserveContactErrorModeled::ResourceNotFoundException(error).into());
+        }
+
         // The antenna this pass is placed on. A reservation holds an antenna for its
         // window and an antenna serves one pass at a time, so the scheduler places the
         // contact on the first antenna of the ground station nothing else holds for that

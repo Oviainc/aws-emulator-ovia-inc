@@ -36,10 +36,11 @@ use serde_json::{json, Value};
 use service_com_amazonaws_groundstation_groundstation::state;
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::contact_satellite_reference_integrity::onboard_satellite_arns;
 use crate::ephemeris_catalog::program_track_ephemeris;
 use crate::scheduling_loop::{
     create_config, create_tracking_config, harness_with_engine, send, spectrum_config, Reply,
-    ABSENT_UUID, AFTER_SETTLE, RECORDING_BUCKET, REGION,
+    ABSENT_UUID, AFTER_SETTLE, RECORDING_BUCKET,
 };
 
 /// The window every reservation in this suite books: far enough ahead that the contact
@@ -87,16 +88,6 @@ const UNFLOWN_MEMBERS: &[&str] = &[
     "visibilityEndTime",
     "ephemeris",
 ];
-
-/// A well-formed `satelliteArn` for the satellite `uuid`: the model's pattern
-/// `^arn:aws:groundstation:([-a-z0-9]{1,50})?:[0-9]{12}:satellite/<uuid>$`, length
-/// 82..132 (`smithy_query(query="operation", operation="UpdateContact")`).
-fn satellite_arn(uuid: &str) -> String {
-    format!(
-        "arn:aws:groundstation:{REGION}:{}:satellite/{uuid}",
-        engine::EMULATOR_ACCOUNT_ID
-    )
-}
 
 /// `TrackingOverrides` selecting the `azEl`, `oem` or `tle` member of
 /// `ProgramTrackSettings` (`smithy_query(query="shape", shape="ProgramTrackSettings")` —
@@ -389,12 +380,16 @@ async fn assert_every_version_describes_its_own_configuration(
 
 #[tokio::test]
 async fn every_version_is_described_with_the_configuration_that_version_carried() {
-    let (router, _engine) = harness_with_engine();
+    let (router, engine) = harness_with_engine();
     let profile_arn = create_profile_with_an_edge(&router, "version description").await;
 
-    let first_satellite = satellite_arn("11111111-1111-4111-8111-111111111111");
-    let second_satellite = satellite_arn("22222222-2222-4222-8222-222222222222");
-    let third_satellite = satellite_arn("33333333-3333-4333-8333-333333333333");
+    // A contact is flown against a satellite of THIS account, so the satellites the rows
+    // below name are on-boarded first (`crate::contact_satellite_reference_integrity`): an
+    // ARN no onboarding carries references nothing and is refused.
+    let satellites = onboard_satellite_arns(&engine, 3);
+    let first_satellite = satellites[0].clone();
+    let second_satellite = satellites[1].clone();
+    let third_satellite = satellites[2].clone();
     // One ephemeris of each form a program track may name, stored through
     // `CreateEphemeris`: the reference a contact version carries has to resolve to an
     // ephemeris this account holds, of the form the member naming it requires.
@@ -482,7 +477,7 @@ async fn every_version_is_described_with_the_configuration_that_version_carried(
 
 #[tokio::test]
 async fn a_version_scoped_member_no_version_named_is_reported_absent_and_then_inherited() {
-    let (router, _engine) = harness_with_engine();
+    let (router, engine) = harness_with_engine();
     let profile_arn = create_profile_with_an_edge(&router, "absent configuration").await;
     // Reserved with neither a satellite nor overrides, so the first version carries none.
     let contact_id = reserve_contact(&router, &profile_arn, None, None).await;
@@ -500,7 +495,7 @@ async fn a_version_scoped_member_no_version_named_is_reported_absent_and_then_in
     // An update naming ONLY the overrides leaves the satellite absent, because no version
     // up to it named one; the next one names a satellite and inherits those overrides.
     let tracking = overrides("azEl", &program_track_ephemeris(&router, "azEl").await);
-    let satellite = satellite_arn("44444444-4444-4444-8444-444444444444");
+    let satellite = onboard_satellite_arns(&engine, 1)[0].clone();
     for (case, body, expected_row) in [
         (
             "overrides alone, still no satellite",
@@ -523,7 +518,7 @@ async fn a_version_scoped_member_no_version_named_is_reported_absent_and_then_in
 
 #[tokio::test]
 async fn a_version_the_contact_does_not_hold_is_not_described() {
-    let (router, _engine) = harness_with_engine();
+    let (router, engine) = harness_with_engine();
     let profile_arn = create_profile_with_an_edge(&router, "version not found").await;
     let contact_id = reserve_contact(&router, &profile_arn, None, None).await;
     std::thread::sleep(AFTER_SETTLE);
@@ -586,7 +581,7 @@ async fn a_version_the_contact_does_not_hold_is_not_described() {
         &router,
         &contact_id,
         "boundary moves",
-        json!({"satelliteArn": satellite_arn("55555555-5555-4555-8555-555555555555")}),
+        json!({"satelliteArn": onboard_satellite_arns(&engine, 1)[0].clone()}),
     )
     .await;
     std::thread::sleep(AFTER_SETTLE);
@@ -682,9 +677,10 @@ async fn a_version_id_outside_the_modelled_range_is_a_bad_request() {
 
 #[tokio::test]
 async fn describing_a_version_changes_nothing_a_later_caller_sees() {
-    let (router, _engine) = harness_with_engine();
+    let (router, engine) = harness_with_engine();
     let profile_arn = create_profile_with_an_edge(&router, "version reads").await;
-    let reserved_satellite = satellite_arn("66666666-6666-4666-8666-666666666666");
+    let satellites = onboard_satellite_arns(&engine, 2);
+    let reserved_satellite = satellites[0].clone();
     let contact_id =
         reserve_contact(&router, &profile_arn, Some(&reserved_satellite), None).await;
     std::thread::sleep(AFTER_SETTLE);
@@ -707,7 +703,7 @@ async fn describing_a_version_changes_nothing_a_later_caller_sees() {
     // the appended version is in one of the two statuses that move spans; the version
     // before it keeps the configuration IT carried either way. The reads materialise that
     // move; they do not cause it.
-    let updated_satellite = satellite_arn("77777777-7777-4777-8777-777777777777");
+    let updated_satellite = satellites[1].clone();
     append_version(
         &router,
         &contact_id,

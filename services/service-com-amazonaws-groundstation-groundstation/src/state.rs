@@ -3637,6 +3637,35 @@ pub fn satellite_not_found_message(satellite_id: &str) -> String {
     format!("No satellite found with id {satellite_id}")
 }
 
+/// The `satelliteId` a `satelliteArn` addresses, or `None` when `arn` names no satellite
+/// resource.
+///
+/// The modelled `satelliteArn` pattern ends in `satellite/<uuid>`
+/// (`smithy_query(query="shape", shape="satelliteArn")`), and that uuid is the very key
+/// [`ComAmazonawsGroundstationGroundstationState::satellites`] is keyed on — which is what
+/// lets an ARN-valued satellite reference be reported by the id it names rather than
+/// echoed back whole, exactly as a config reference is ([`config_arn_parts`]).
+pub fn satellite_arn_id(arn: &str) -> Option<String> {
+    let (_, satellite_id) = arn.split_once(":satellite/")?;
+    (!satellite_id.is_empty()).then(|| satellite_id.to_string())
+}
+
+/// The message an operation that resolves a satellite BY ARN — the `satelliteArn` a
+/// contact version is flown against — carries when that reference resolves to nothing.
+///
+/// It identifies the satellite the lookup looked FOR, by the id the ARN names
+/// ([`satellite_arn_id`]), under the text this service already answers for a `satelliteId`
+/// naming no onboarding of this account ([`satellite_not_found_message`]): the two ways a
+/// request references a satellite then answer one text. An ARN that names no satellite id
+/// has none to report, so the ARN is all there is to say — the shape
+/// [`config_reference_not_found_message`] takes for the same case.
+pub fn satellite_reference_not_found_message(arn: &str) -> String {
+    match satellite_arn_id(arn) {
+        Some(satellite_id) => satellite_not_found_message(&satellite_id),
+        None => format!("Unable to find Satellite with ARN: {arn}"),
+    }
+}
+
 /// Per-service state for com-amazonaws-groundstation-groundstation. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsGroundstationGroundstationState {
@@ -4457,6 +4486,51 @@ impl ComAmazonawsGroundstationGroundstationState {
         let removed = self.mission_profiles.remove(mission_profile_id)?;
         self.arn_index.remove(&removed.mission_profile_arn);
         Some(removed)
+    }
+
+    /// The satellite `arn` names, if this account is on-boarded to one.
+    ///
+    /// Resolved by the ARN each onboarding CARRIES, which is the key every rule of this
+    /// service that couples a satellite to something else is written against — the pointing
+    /// data an availability search reads ([`Self::pointing_passes`]) and the ephemeris a
+    /// contact holds through its satellite ([`Self::contacts_using_ephemeris`]) both select
+    /// on `satellite_arn` — so a reference that resolves here resolves for them too.
+    /// Satellites are not minted by this API, so they carry no [`Self::arn_index`] entry
+    /// and the lookup is over the onboardings themselves.
+    ///
+    /// [`Self::pointing_passes`]: Self::pointing_passes
+    pub fn satellite_by_arn(&self, arn: &str) -> Option<&Satellite> {
+        self.satellites
+            .values()
+            .find(|satellite| satellite.satellite_arn == arn)
+    }
+
+    /// Why the satellite a write's `satelliteArn` names cannot be flown, as the modelled
+    /// `ResourceNotFoundException` (HTTP 434) to answer with; `None` when it names a
+    /// satellite this account is on-boarded to and when the write names no satellite at
+    /// all (the member is optional on both writers — `smithy_query(query="operation",
+    /// operation="ReserveContact,UpdateContact")`).
+    ///
+    /// A contact is flown against a satellite of THIS account, so the reference is resolved
+    /// before a contact version carrying it is stored — which is what every other reference
+    /// this service's writes take is held to: a config ARN ([`Self::resolves_config`]), an
+    /// ephemeris id ([`Self::program_track_fault`]) and an ephemeris's own `satelliteId`.
+    /// An ARN no onboarding of this account carries references nothing.
+    ///
+    /// Shared by both writers of a contact version, so a contact cannot be left flown
+    /// against a satellite the other writer would have refused.
+    ///
+    /// [`Self::resolves_config`]: Self::resolves_config
+    pub fn satellite_reference_fault(
+        &self,
+        satellite_arn: Option<&str>,
+    ) -> Option<ResourceNotFoundException> {
+        let arn = satellite_arn?;
+        self.satellite_by_arn(arn)
+            .is_none()
+            .then(|| ResourceNotFoundException {
+                message: Some(satellite_reference_not_found_message(arn)),
+            })
     }
 
     /// The mission profile `arn` names, if it names one.

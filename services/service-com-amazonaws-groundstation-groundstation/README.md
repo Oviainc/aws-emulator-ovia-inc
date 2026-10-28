@@ -136,7 +136,11 @@ which is why they are settings rather than operations:
   that reports one other than `ListSatellites`/`GetSatellite` themselves. So an account
   starts on-boarded to no satellite and `ListSatellites` answers an empty list until an
   onboarding is listed here; each entry is minted a `satelliteId` and a region-less
-  `satelliteArn` when the store is created.
+  `satelliteArn` when the store is created. A contact is flown against a satellite of the
+  account, so `ReserveContact` and `UpdateContact` resolve the `satelliteArn` they are
+  given against those onboardings and refuse one that names none with
+  `ResourceNotFoundException`, exactly as `CreateEphemeris` and `ListEphemerides` refuse a
+  `satelliteId` no onboarding carries.
 
 - Ground station maintenance is scheduled by AWS on its own antennas: the model declares no
   operation that schedules it and none that reports it other than
