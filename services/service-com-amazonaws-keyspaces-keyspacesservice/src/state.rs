@@ -572,8 +572,9 @@ pub const CQL_TYPE_CONSTRUCTORS: &[&str] = &["frozen", "list", "map", "set", "tu
 /// table can grow along after it exists: `addColumns` is modelled `len 1..`, with no
 /// maximum, and `UpdateTable` appends to a schema that never shrinks. Both the create
 /// and the update refuse past this cap, so neither one oversized request nor a run of
-/// updates can grow a stored schema without bound. It also caps the duplicate-name scan
-/// an `addColumns` update runs while holding the state lock.
+/// updates can grow a stored schema without bound. Both check it BEFORE they walk the
+/// columns the request carries, so it also caps the per-column scans — the duplicate-name
+/// scan, and the type-resolution scan each of them runs while holding the state lock.
 pub const MAX_COLUMNS_PER_TABLE: usize = 1024;
 
 /// The most tags one Amazon Keyspaces resource holds.

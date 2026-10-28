@@ -17,6 +17,8 @@ mod auto_scaling_propagation;
 mod cdc_stream_tag_lifetime;
 #[path = "all/cdc_streams.rs"]
 mod cdc_streams;
+#[path = "all/column_cap_precedes_column_scans.rs"]
+mod column_cap_precedes_column_scans;
 #[path = "all/column_name_identifier_identity.rs"]
 mod column_name_identifier_identity;
 #[path = "all/column_types_and_auto_scaling.rs"]

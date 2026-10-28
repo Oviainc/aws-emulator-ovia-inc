@@ -262,6 +262,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into()
         };
+        // A table's schema is the store's third caller-driven growth dimension, and
+        // `allColumns` is modelled `len 1..` with NO maximum, so it is capped the same way
+        // — here, and in `UpdateTable`, which is the only operation that can grow it
+        // afterwards. How long that list is depends on the REQUEST ALONE, so it is decided
+        // BEFORE every refusal that depends on what the store holds, and before the two
+        // per-column scans this handler runs over it: the duplicate-name scan just below
+        // and the type-resolution scan further down, which walks the same list while the
+        // state lock is held. That keeps what a refused oversized request costs
+        // proportional to the cap, and grades this pair of faults in the order
+        // `UpdateTable` and `CreateType` grade it, so one request shape never gets two
+        // different answers depending on which sibling served it.
+        if input.schema_definition.all_columns.len() > crate::state::MAX_COLUMNS_PER_TABLE {
+            return Err(CreateTableErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "the number of columns in table '{}.{}' would exceed the limit of {}",
+                        input.keyspace_name,
+                        input.table_name,
+                        crate::state::MAX_COLUMNS_PER_TABLE
+                    )),
+                },
+            )
+            .into());
+        }
         crate::state::validate_schema(&input.schema_definition).map_err(invalid)?;
         let capacity_specification =
             crate::state::resolve_capacity(input.capacity_specification).map_err(invalid)?;
@@ -386,23 +410,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         "the number of tables in keyspace '{}' would exceed the limit of {}",
                         input.keyspace_name,
                         crate::state::MAX_TABLES_PER_KEYSPACE
-                    )),
-                },
-            )
-            .into());
-        }
-
-        // A table's schema is the store's third caller-driven growth dimension, and
-        // `allColumns` is modelled with no maximum, so it is capped the same way — here,
-        // and in `UpdateTable`, which is the only operation that can grow it afterwards.
-        if input.schema_definition.all_columns.len() > crate::state::MAX_COLUMNS_PER_TABLE {
-            return Err(CreateTableErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    message: Some(format!(
-                        "the number of columns in table '{}.{}' would exceed the limit of {}",
-                        input.keyspace_name,
-                        input.table_name,
-                        crate::state::MAX_COLUMNS_PER_TABLE
                     )),
                 },
             )
