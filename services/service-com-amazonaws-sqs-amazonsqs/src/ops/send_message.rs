@@ -517,6 +517,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             available_at: sqs::after(now, delay),
             invisible_until: None,
             receive_count: 0,
+            queue_receive_count: 0,
             first_received_at: None,
             last_received_at: None,
             moved_by_task: None,

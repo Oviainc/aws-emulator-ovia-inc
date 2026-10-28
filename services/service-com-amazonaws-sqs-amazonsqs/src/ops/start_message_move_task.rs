@@ -423,7 +423,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // deliverable at the instant this task's rate schedules it. The message keeps its
         // id, body and attributes — it is the same message in another queue — and its
         // receive count, which counts receives "across all queues"; retention in the
-        // destination runs from the move, which is when that queue took it.
+        // destination runs from the move, which is when that queue took it, and so does
+        // the per-queue delivery count the destination's own `RedrivePolicy` bounds,
+        // because the deliveries the source queue made were not deliveries of this one.
         let destination = state.queue_mut(&region, &destination_name).ok_or_else(|| {
             StartMessageMoveTaskErrorModeled::ResourceNotFoundException(sqs::resource_not_found(
                 "DestinationArn",
@@ -434,6 +436,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 sent_at: now,
                 available_at: task.delivery_instant(u64::try_from(index).unwrap_or(u64::MAX)),
                 invisible_until: None,
+                queue_receive_count: 0,
                 // Until its slot comes round the message is one this task still owes the
                 // destination queue, which is what a cancellation of this task takes back.
                 moved_by_task: Some(task.task_handle.clone()),
