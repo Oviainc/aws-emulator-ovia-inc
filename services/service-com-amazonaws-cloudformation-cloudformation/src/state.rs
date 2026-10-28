@@ -41,7 +41,7 @@
 //! exported output values the stack's deployed template resolved a `Fn::ImportValue`
 //! against, so [`ComAmazonawsCloudformationCloudformationState::importing_stacks`] is what
 //! `ListImports` answers from and
-//! [`ComAmazonawsCloudformationCloudformationState::export_in_use`] is what CANCELS a
+//! [`ComAmazonawsCloudformationCloudformationState::export_in_use`] is what FAILS a
 //! deletion that would remove an export another stack still imports. Both halves are
 //! derived from the stacks themselves rather than from an index of their own, so an export
 //! and its importers appear when a deployment completes and go when the stack goes.
@@ -933,9 +933,8 @@ pub const USER_INITIATED: &str = "User Initiated";
 
 /// The suffix every status of an operation that has STARTED and not concluded carries —
 /// the `*_IN_PROGRESS` statuses of [`status`] and of [`resource_status`]. A stack whose
-/// operation is still in flight is never LEFT in one of them, which is what a writer
-/// putting a stack back where it was has to test against
-/// ([`StoredStack::begin_canceled_deletion`]).
+/// operation is still in flight is never LEFT in one of them, which is what a reader of a
+/// resource's current status tests against ([`StoredStack::record_rollback_resource_statuses`]).
 pub const IN_PROGRESS_SUFFIX: &str = "_IN_PROGRESS";
 
 /// The suffix every status of a transition that did NOT go through carries — the
@@ -3356,55 +3355,37 @@ impl StoredStack {
         self.reevaluate_outputs();
     }
 
-    /// Open a deletion CloudFormation then cancels, leaving the stack where it was.
+    /// Open a deletion that cannot be carried out: the attempt runs and then FAILS.
     ///
     /// "Once the call completes successfully, stack deletion starts": the call is taken and
     /// the stack reports `DELETE_IN_PROGRESS` ("User Initiated") like any other delete, and
-    /// the condition that makes the deletion impossible is resolved by the workflow rather
-    /// than by the call — so the stack goes back to the status it was in, carrying `reason`
-    /// as its `StackStatusReason`, once the clock makes that due. Nothing of the stack is
-    /// disposed of: this is the deletion DECLINED, so the caller that polls it reads the
-    /// attempt and then the healthy stack with the reason the attempt was abandoned for.
+    /// the condition that makes the deletion impossible is reported by the workflow rather
+    /// than by the call — so the stack lands in the TERMINAL `DELETE_FAILED` status carrying
+    /// `reason` as its `StackStatusReason` once the clock makes that due. Nothing of the
+    /// stack is disposed of: a deletion that failed removed nothing, so every resource and
+    /// every exported output value it published is still there, and the identical call
+    /// succeeds once what blocked it is gone.
     ///
-    /// The restored status is the one the stack would have been left in had the deletion
-    /// never been asked for ([`Self::settled_status`]): the status it carries when nothing
-    /// is in flight, else the terminal status the operation in flight is headed for.
-    pub fn begin_canceled_deletion(
+    /// A terminal status is what a caller polling the deletion can stop on: a deletion the
+    /// service answered 200 for always concludes in one.
+    pub fn begin_failing_deletion(
         &mut self,
         now: SystemTime,
         reason: String,
         operation_id: Option<String>,
         client_request_token: Option<String>,
     ) {
-        let restored = self.settled_status();
         self.begin_transition(
             now,
             status::DELETE_IN_PROGRESS,
-            &restored,
+            status::DELETE_FAILED,
             operation_id,
             client_request_token,
         );
-        // The status the cancelled deletion leaves the stack in says WHY it was abandoned,
-        // which is the only place a client can read which reference blocked it.
+        // The failed status says WHY the deletion could not be carried out, which is where a
+        // client polling the delete reads what blocked it.
         if let Some(pending) = self.pending.as_mut() {
             pending.status_reason = Some(reason);
-        }
-    }
-
-    /// The status this stack SETTLES to: the terminal status the operation in flight is
-    /// headed for while the stack carries that operation's `*_IN_PROGRESS` status, else the
-    /// status it carries.
-    ///
-    /// A stack whose operation is still in flight is not left in the status of that
-    /// operation, so a writer putting the stack back where it was has to put it back to
-    /// what that operation settles to. With nothing in flight the status the stack carries
-    /// IS the one it rests in — `REVIEW_IN_PROGRESS`, the status of a stack a `CREATE`
-    /// change set made and nothing has deployed, among them — and is answered as it stands
-    /// rather than replaced by a status no operation of this stack produced.
-    fn settled_status(&self) -> String {
-        match self.pending.as_ref() {
-            Some(pending) if self.status.ends_with(IN_PROGRESS_SUFFIX) => pending.status.clone(),
-            _ => self.status.clone(),
         }
     }
 
@@ -4871,9 +4852,9 @@ impl ComAmazonawsCloudformationCloudformationState {
     /// the pair (export name, importing stack name).
     ///
     /// An exported output value that is in use cannot be removed: deleting the stack that
-    /// publishes it would break every stack that imported it, so CloudFormation abandons
-    /// the deletion it took ([`StoredStack::begin_canceled_deletion`]). `None` when nothing
-    /// the stack exports is imported, which is when its deletion is free to proceed.
+    /// publishes it would break every stack that imported it, so the deletion CloudFormation
+    /// took FAILS ([`StoredStack::begin_failing_deletion`]). `None` when nothing the stack
+    /// exports is imported, which is when its deletion is free to proceed.
     pub fn export_in_use(&self, stack: &StoredStack) -> Option<(String, String)> {
         for output in &stack.outputs {
             let Some(export_name) = &output.export_name else {
@@ -6019,22 +6000,19 @@ pub fn stack_instance_does_not_exist() -> &'static str {
 pub const ONE_TEMPLATE_SOURCE: &str =
     "You must specify exactly one of TemplateBody, TemplateURL or UsePreviousTemplate";
 
-/// The `StackStatusReason` a deletion CloudFormation CANCELLED because it would have
-/// removed an exported output value another stack still imports: the export, and the stack
-/// that is still consuming it.
+/// The `StackStatusReason` of a deletion that FAILED because it would have removed an
+/// exported output value another stack still imports: the export, and the stack that is
+/// still consuming it.
 ///
 /// An export in use cannot be removed — deleting the stack that publishes it would break
-/// the reference every importing stack resolved — so the deletion is abandoned and the
-/// stack says so, naming both halves of the reference, taken from the stack being deleted
-/// and from this store's index, never from any one recorded run.
-pub fn delete_canceled_export_in_use_reason(
+/// the reference every importing stack resolved — so the deletion fails and the stack says
+/// so, naming both halves of the reference, taken from the stack being deleted and from
+/// this store's index, never from any one recorded run.
+pub fn export_in_use_delete_failure_reason(
     export_name: &str,
     importing_stack_name: &str,
 ) -> String {
-    format!(
-        "Delete canceled. Cannot delete export {export_name} as it is in use by \
-         {importing_stack_name}."
-    )
+    format!("Export {export_name} cannot be deleted as it is in use by {importing_stack_name}")
 }
 
 /// The message answered when a request names a `LogicalResourceId` the stack it selected
