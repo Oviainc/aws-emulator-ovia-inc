@@ -47,6 +47,8 @@ mod graph_snapshot_listing;
 mod graph_state_gate_messages;
 #[path = "all/graph_summary.rs"]
 mod graph_summary;
+#[path = "all/import_requires_an_empty_graph.rs"]
+mod import_requires_an_empty_graph;
 #[path = "all/import_task_lifecycle.rs"]
 mod import_task_lifecycle;
 #[path = "all/import_task_listing.rs"]
