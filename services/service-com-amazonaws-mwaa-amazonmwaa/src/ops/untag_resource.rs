@@ -10,6 +10,12 @@
 //! caller's to remove any more than it is the caller's to create, so a request naming one
 //! is refused with `ValidationException` (HTTP 400) and nothing is removed.
 //!
+//! Removing a tag is a change applied to the environment the ARN resolves to, so the
+//! environment has to be one a change can be applied to: a record whose teardown has
+//! already started still reads back but takes none
+//! ([`crate::state::EnvironmentRecord::accepts_change`]), and a write that reached one is
+//! refused with `ValidationException` (HTTP 400) and the tag map left exactly as it was.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -174,6 +180,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 crate::scaffolded::Scaffolded::not_found(crate::state::RESOURCE_NOT_FOUND_MESSAGE)
             })?;
+
+        // The same state gate `TagResource` applies, for the same reason: an environment
+        // on its way out takes no change, so nothing is removed from a record the clock is
+        // about to remove. Checked AFTER the lookup, so an ARN that resolves to nothing is
+        // still a 404.
+        if let Some(message) = stored.change_refusal() {
+            return Err(UntagResourceErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+            .into());
+        }
 
         // `@idempotent`: a key the environment does not carry is simply not there to
         // remove, which is the state the caller asked for.
