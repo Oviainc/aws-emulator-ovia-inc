@@ -322,6 +322,11 @@ mod guardduty_runtime_coverage;
 // conflicts with all of them, while these neighbouring lines are stable.
 #[path = "all/sagemaker_feature_store_control_plane_handoff.rs"]
 mod sagemaker_feature_store_control_plane_handoff;
+// Declared beside the feature-store hand-off suite it is the counterpart of, rather than
+// appended at the end of this file, for the same reason the line above gives: the tail is
+// where every concurrently landing router suite appends its line.
+#[path = "all/sagemaker_agentic_rft_job_runtime_handoff.rs"]
+mod sagemaker_agentic_rft_job_runtime_handoff;
 #[path = "all/iam_and_signer_signing_name_routing.rs"]
 mod iam_and_signer_signing_name_routing;
 #[path = "all/iam_role_id_agrees_with_sts.rs"]

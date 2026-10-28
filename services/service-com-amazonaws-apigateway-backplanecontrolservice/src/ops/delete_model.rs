@@ -4,6 +4,8 @@
 //! IMPLEMENTED: removes the `Model` stored under `modelName` on the API named by
 //! `restApiId`, so a later `GetModel` for that name no longer finds one, a schema of the
 //! API that referenced it no longer resolves it, and the name is free for a new create.
+//! A model a `Method` of the API still names in its `requestModels` is refused with the
+//! modelled `ConflictException` instead, until that reference is cleared.
 //!
 //! ## Shape of an operation
 //!
@@ -182,19 +184,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // new `CreateModel` and what stops a `flatten`ed read of another model inlining
         // this schema.
         //
-        // A `Method` naming this model in its `requestModels`, or a method response in its
-        // `responseModels`, is left exactly as the caller wrote it: those members map a
-        // content type to a model NAME, and `PutMethod`/`PutMethodResponse` store the name
-        // they are given without requiring it to resolve — a method may be written before
-        // the model it names exists — so no stored record of this service DEPENDS on this
-        // one and the modelled `ConflictException` has no documented rule to answer for
-        // here. Nothing documents this call as rewriting the API's methods either.
-        if api.models.remove(&input.model_name).is_none() {
+        // A `Method` of the API that still names this model in its `requestModels`
+        // DEPENDS on it: that map is what the method's request validator validates a
+        // payload against, so deleting the model would leave the method naming a schema
+        // the API no longer holds. The delete is refused with the modelled
+        // `ConflictException` while the reference stands — the way this service refuses
+        // every delete a stored record still depends on
+        // (`crate::ops::delete_authorizer`) — and the methods are left exactly as the
+        // caller wrote them, so clearing the reference is the caller's own `UpdateMethod`
+        // or `DeleteMethod`. The model is resolved FIRST, so a name that names no model is
+        // the not-found it always was whether or not a method carries that name.
+        if !api.models.contains_key(&input.model_name) {
             return Err(DeleteModelErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::no_such_model(&input.model_name)),
             })
             .into());
         }
+        if let Some(referencing) = api.method_referencing_model(&input.model_name) {
+            return Err(DeleteModelErrorModeled::ConflictException(ConflictException {
+                message: Some(crate::state::model_in_use(&input.model_name, &referencing)),
+            })
+            .into());
+        }
+        api.models.remove(&input.model_name);
         // The store lock is released before the access record is written: the critical
         // section covers the state change only.
         drop(store);
