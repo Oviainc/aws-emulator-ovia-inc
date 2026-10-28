@@ -1,0 +1,352 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! WHOSE login a token this service minted is.
+//!
+//! RULE: a token this service mints is minted FOR one identity — "If the token is for
+//! cognito-identity.amazonaws.com, it will be passed through to Security Token Service with
+//! the appropriate role for the token" (`GetCredentialsForIdentity`, this service's model),
+//! and the issuance records which identity that is — so presenting it under this service's
+//! own provider name is a login of THAT identity and of no other: a request naming any other
+//! identity is refused with the modelled `NotAuthorizedException` (HTTP 403) and vends
+//! nothing, and an identity belonging to the pool that minted it, that is also what keeps a
+//! token minted in one identity pool out of every other pool's identities. The refusal is
+//! answered before any role is resolved and before any session is minted, and it costs the
+//! token nothing: presented for the identity it WAS minted for, the same token is still
+//! exchanged.
+//!
+//! The rows differ along what the rule generalises over: which identity the presented token
+//! names against which the request names (the same one, another of the same pool, one of
+//! another pool, in both directions), how the token was minted
+//! (`GetOpenIdToken` for an unauthenticated identity, `GetOpenIdToken` for a federated one,
+//! `GetOpenIdTokenForDeveloperIdentity` for a backend-authenticated one), and whether the
+//! `Logins` map presents the token alone or beside a login of another provider.
+//!
+//! The harness is `identity_pool_flow`'s: one shared engine behind the same
+//! `MultiServiceRouter` the production router builds, with the role each vend assumes seeded
+//! into the IAM store of that same engine.
+
+use serde_json::{json, Value};
+
+use crate::developer_identity_tokens::{pool_with_developer_provider, token_request};
+use crate::identity_pool_flow::{
+    cognito_trust_policy, error_code, seeded_role_arn, Emulator,
+};
+
+/// The operation the rule is asserted at.
+const OPERATION: &str = "GetCredentialsForIdentity";
+
+/// The `Logins` provider name a token minted by THIS service is presented under. Spelled as
+/// a literal here so the wire-visible name is pinned by the test, not by the code under
+/// test.
+const COGNITO_IDENTITY_PROVIDER: &str = "cognito-identity.amazonaws.com";
+
+/// A public login provider, for the row that presents a login of another provider beside
+/// the minted token.
+const PUBLIC_PROVIDER: &str = "graph.facebook.com";
+
+/// The message the refusal of a request none of whose logins is one of the identity it names
+/// carries (`crate::state::UNMATCHED_LOGINS_MESSAGE`) — pinned here as a literal for the
+/// same reason. Fixed text: it carries no part taken from the request or from stored state.
+const UNMATCHED_LOGINS_MESSAGE: &str = "Logins don't match. Please include at least one \
+                                        valid login for this identity or identity pool.";
+
+/// A pool that can both mint tokens and vend credentials: it names a developer provider, and
+/// its two roles are seeded into the IAM store of the same engine and configured on it —
+/// the shape a pool has to be in for an exchange to be served at all. Answers its
+/// `IdentityPoolId`.
+async fn vending_pool(emulator: &Emulator, name: &str, developer_provider: &str) -> String {
+    let pool_id = pool_with_developer_provider(emulator, name, Some(developer_provider)).await;
+    let authenticated =
+        emulator.seed_role(&seeded_role_arn(name, "auth"), cognito_trust_policy(&pool_id));
+    let unauthenticated = emulator.seed_role(
+        &seeded_role_arn(name, "unauth"),
+        cognito_trust_policy(&pool_id),
+    );
+    emulator
+        .ok(
+            "SetIdentityPoolRoles",
+            &json!({
+                "IdentityPoolId": &pool_id,
+                "Roles": {
+                    "authenticated": authenticated,
+                    "unauthenticated": unauthenticated,
+                },
+            }),
+        )
+        .await;
+    pool_id
+}
+
+/// How the token of one row was minted.
+enum Mint<'a> {
+    /// `GetOpenIdToken` for an identity that presented no login: an unauthenticated one.
+    Anonymous,
+    /// `GetOpenIdToken` for an identity reached through a login of this public provider.
+    Federated(&'a str),
+    /// `GetOpenIdTokenForDeveloperIdentity` for this developer user identifier.
+    Developer(&'a str),
+}
+
+/// Mint one token in `pool_id` and answer the identity it names with the token itself.
+async fn mint(
+    emulator: &Emulator,
+    case: &str,
+    pool_id: &str,
+    developer_provider: &str,
+    how: &Mint<'_>,
+) -> (String, String) {
+    let answered = match how {
+        Mint::Anonymous => {
+            let identity_id = emulator.identity(pool_id, None).await;
+            emulator
+                .ok("GetOpenIdToken", &json!({"IdentityId": identity_id}))
+                .await
+        }
+        Mint::Federated(login) => {
+            let logins = json!({PUBLIC_PROVIDER: login});
+            let identity_id = emulator.identity(pool_id, Some(logins.clone())).await;
+            emulator
+                .ok(
+                    "GetOpenIdToken",
+                    &json!({"IdentityId": identity_id, "Logins": logins}),
+                )
+                .await
+        }
+        Mint::Developer(user) => {
+            emulator
+                .ok(
+                    "GetOpenIdTokenForDeveloperIdentity",
+                    &token_request(pool_id, &[(developer_provider, user)], None, None),
+                )
+                .await
+        }
+    };
+    let identity_id = answered["IdentityId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: a mint answers an IdentityId: {answered}"))
+        .to_string();
+    let token = answered["Token"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: a mint answers a Token: {answered}"))
+        .to_string();
+    (identity_id, token)
+}
+
+/// The exchange itself: `GetCredentialsForIdentity` for `identity_id`, presenting `logins`.
+async fn exchange(emulator: &Emulator, identity_id: &str, logins: &Value) -> (u16, Value) {
+    emulator
+        .call(
+            OPERATION,
+            &json!({"IdentityId": identity_id, "Logins": logins}),
+        )
+        .await
+}
+
+/// Assert that the exchange was SERVED: a complete credential set for the identity asked
+/// for.
+fn assert_served(case: &str, identity_id: &str, status: u16, body: &Value) {
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected the HTTP 200 of a served exchange, got {status} with {body}"
+    );
+    assert_eq!(
+        body["IdentityId"].as_str(),
+        Some(identity_id),
+        "case {case:?}: a served exchange answers the identity it was made for, got {body}"
+    );
+    for member in ["AccessKeyId", "SecretKey", "SessionToken", "Expiration"] {
+        assert!(
+            !body["Credentials"][member].is_null(),
+            "case {case:?}: a served exchange carries Credentials.{member}, got {body}"
+        );
+    }
+}
+
+/// Assert that the exchange was REFUSED for a login that is none of the identity's, with no
+/// credential in the answer.
+fn assert_refused(case: &str, status: u16, body: &Value) {
+    assert_eq!(
+        status, 403,
+        "case {case:?}: expected the HTTP 403 of a refused exchange, got {status} with {body}"
+    );
+    let code = error_code(body);
+    assert!(
+        code.ends_with("NotAuthorizedException"),
+        "case {case:?}: expected NotAuthorizedException, got {code:?} in {body}"
+    );
+    assert_eq!(
+        body["message"].as_str(),
+        Some(UNMATCHED_LOGINS_MESSAGE),
+        "case {case:?}: expected the fixed login-mismatch message, got {body}"
+    );
+    assert!(
+        body.get("Credentials").is_none(),
+        "case {case:?}: a refused exchange carries no credential, got {body}"
+    );
+}
+
+/// RULE: the token is a login of the identity its issuance names, so the exchange is served
+/// for that identity and refused for every other — in the same pool and in another one.
+#[tokio::test]
+async fn a_minted_token_is_a_login_of_the_identity_it_was_minted_for_and_of_no_other() {
+    let emulator = Emulator::new();
+    let developer_provider = "login.example.com";
+    let here = vending_pool(&emulator, "token-binding-here", developer_provider).await;
+    let there = vending_pool(&emulator, "token-binding-there", developer_provider).await;
+
+    // One identity per way a token is minted, in each of the two pools, so every row below
+    // differs only in WHOSE token is presented for WHICH identity.
+    let minted: Vec<(&str, &str, Mint<'_>)> = vec![
+        ("an anonymous identity of this pool", &here, Mint::Anonymous),
+        (
+            "a federated identity of this pool",
+            &here,
+            Mint::Federated("federated-user-here"),
+        ),
+        (
+            "a developer-authenticated identity of this pool",
+            &here,
+            Mint::Developer("backend-user-here"),
+        ),
+        (
+            "an anonymous identity of the other pool",
+            &there,
+            Mint::Anonymous,
+        ),
+        (
+            "a developer-authenticated identity of the other pool",
+            &there,
+            Mint::Developer("backend-user-there"),
+        ),
+    ];
+    let mut tokens: Vec<(&str, String, String)> = Vec::new();
+    for (case, pool_id, how) in &minted {
+        let (identity_id, token) =
+            mint(&emulator, case, pool_id, developer_provider, how).await;
+        tokens.push((case, identity_id, token));
+    }
+
+    // Its OWN token is exchanged for every identity, whichever way it was minted and
+    // whichever pool it belongs to.
+    for (case, identity_id, token) in &tokens {
+        let logins = json!({COGNITO_IDENTITY_PROVIDER: token});
+        let (status, body) = exchange(&emulator, identity_id, &logins).await;
+        assert_served(case, identity_id, status, &body);
+    }
+
+    // And ANOTHER identity's token is refused for it — every pair of the table, which spans
+    // two identities of one pool as well as two of different pools.
+    for (identity_case, identity_id, _) in &tokens {
+        for (token_case, token_identity, token) in &tokens {
+            if token_identity == identity_id {
+                continue;
+            }
+            let case = format!("{identity_case:?} presenting the token of {token_case:?}");
+            let logins = json!({COGNITO_IDENTITY_PROVIDER: token});
+            let (status, body) = exchange(&emulator, identity_id, &logins).await;
+            assert_refused(&case, status, &body);
+        }
+    }
+
+    // The refusals cost the tokens nothing: each is still the login of its own identity.
+    for (case, identity_id, token) in &tokens {
+        let logins = json!({COGNITO_IDENTITY_PROVIDER: token});
+        let (status, body) = exchange(&emulator, identity_id, &logins).await;
+        assert_served(
+            &format!("{case:?}, after the refusals"),
+            identity_id,
+            status,
+            &body,
+        );
+    }
+}
+
+/// RULE, over the shape of the `Logins` map: the token is decided wherever it is presented,
+/// so a map carrying another identity's token BESIDE a login of another provider is refused
+/// just the same — and the same map carrying the identity's own token is served.
+#[tokio::test]
+async fn another_identitys_token_is_refused_whatever_else_the_logins_map_carries() {
+    let emulator = Emulator::new();
+    let developer_provider = "login.example.com";
+    let pool_id = vending_pool(&emulator, "token-binding-map", developer_provider).await;
+    let other_pool_id = vending_pool(&emulator, "token-binding-map-other", developer_provider)
+        .await;
+
+    let (identity_id, own_token) = mint(
+        &emulator,
+        "the identity under test",
+        &pool_id,
+        developer_provider,
+        &Mint::Federated("map-user"),
+    )
+    .await;
+    let (_, sibling_token) = mint(
+        &emulator,
+        "another identity of the same pool",
+        &pool_id,
+        developer_provider,
+        &Mint::Developer("map-backend-user"),
+    )
+    .await;
+    let (_, foreign_token) = mint(
+        &emulator,
+        "an identity of another pool",
+        &other_pool_id,
+        developer_provider,
+        &Mint::Anonymous,
+    )
+    .await;
+
+    // The rows differ along which token the map carries under this service's provider name
+    // and what else it carries beside it.
+    let rows: Vec<(&str, Value, bool)> = vec![
+        (
+            "its own token alone",
+            json!({COGNITO_IDENTITY_PROVIDER: &own_token}),
+            true,
+        ),
+        (
+            "its own token beside a login of the public provider",
+            json!({
+                COGNITO_IDENTITY_PROVIDER: &own_token,
+                PUBLIC_PROVIDER: "map-user",
+            }),
+            true,
+        ),
+        (
+            "a sibling identity's token alone",
+            json!({COGNITO_IDENTITY_PROVIDER: &sibling_token}),
+            false,
+        ),
+        (
+            "a sibling identity's token beside a login of the public provider",
+            json!({
+                COGNITO_IDENTITY_PROVIDER: &sibling_token,
+                PUBLIC_PROVIDER: "map-user",
+            }),
+            false,
+        ),
+        (
+            "another pool's token alone",
+            json!({COGNITO_IDENTITY_PROVIDER: &foreign_token}),
+            false,
+        ),
+        (
+            "another pool's token beside a login of the public provider",
+            json!({
+                COGNITO_IDENTITY_PROVIDER: &foreign_token,
+                PUBLIC_PROVIDER: "map-user",
+            }),
+            false,
+        ),
+    ];
+
+    for (case, logins, served) in &rows {
+        let (status, body) = exchange(&emulator, &identity_id, logins).await;
+        if *served {
+            assert_served(case, &identity_id, status, &body);
+        } else {
+            assert_refused(case, status, &body);
+        }
+    }
+}

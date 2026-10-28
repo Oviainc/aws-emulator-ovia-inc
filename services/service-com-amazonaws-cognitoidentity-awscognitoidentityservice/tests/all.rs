@@ -11,6 +11,8 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+#[path = "all/ambiguous_role_resolution.rs"]
+mod ambiguous_role_resolution;
 #[path = "all/anonymous_credential_exchange.rs"]
 mod anonymous_credential_exchange;
 #[path = "all/anonymous_credential_vend.rs"]
@@ -49,6 +51,8 @@ mod mapped_role_resolution;
 mod merge_developer_identities;
 #[path = "all/merged_identity_retention.rs"]
 mod merged_identity_retention;
+#[path = "all/minted_token_identity_binding.rs"]
+mod minted_token_identity_binding;
 #[path = "all/open_id_token.rs"]
 mod open_id_token;
 #[path = "all/principal_tag_attribute_map.rs"]

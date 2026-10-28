@@ -790,9 +790,8 @@ impl IdentityPoolRoles {
         self.roles.get(role_type).map(String::as_str)
     }
 
-    /// The role the IDENTITY PROVIDER's own mapping resolves for an exchange presenting
-    /// `logins` against `pool`, and `None` when no mapping of this configuration resolves
-    /// one.
+    /// What the IDENTITY PROVIDER's own mapping decides for an exchange presenting `logins`
+    /// against `pool`.
     ///
     /// A `RoleMappings` entry is how a pool has the SERVICE pick the role from the token
     /// the exchange presents, so it decides the vend before the pool-wide
@@ -801,24 +800,53 @@ impl IdentityPoolRoles {
     /// the login was made under ([`mapping_key_names_provider`]), and what it resolves is
     /// read from that token's claims ([`mapping_resolved_role_arn`]).
     ///
-    /// The logins are considered in provider-name order, so which mapping decides an
-    /// exchange presenting several logins does not depend on the iteration order of the
-    /// request's map.
-    pub fn mapped_role_arn(
+    /// A mapping that decides the exchange and resolves NO role is the case its
+    /// `AmbiguousRoleResolution` states the outcome of — "Specifies the action to be taken
+    /// if either no rules match the claim value for the `Rules` type, or there is no
+    /// `cognito:preferred_role` claim and there are multiple `cognito:roles` matches for
+    /// the `Token` type" (`RoleMapping$AmbiguousRoleResolution`, this service's model) — so
+    /// that value is read here and answered as [`MappedRole`] rather than silently falling
+    /// through to the pool-wide role.
+    ///
+    /// The logins are considered in provider-name order and the mappings in key order, so
+    /// which mapping decides an exchange presenting several logins does not depend on the
+    /// iteration order of the request's map.
+    pub fn mapped_role(
         &self,
         pool: &IdentityPool,
         logins: &HashMap<String, String>,
-    ) -> Option<String> {
-        let role_mappings = self.role_mappings.as_ref()?;
+    ) -> MappedRole {
+        let Some(role_mappings) = self.role_mappings.as_ref() else {
+            return MappedRole::Unmapped;
+        };
         let mut presented: Vec<(&String, &String)> = logins.iter().collect();
         presented.sort();
-        presented.into_iter().find_map(|(provider, token)| {
-            let claims = presented_token_claims(token)?;
-            role_mappings
+        // What the FIRST mapping that decided the exchange without resolving a role states
+        // for that case, kept until a later mapping resolves one: a resolved role is what
+        // the exchange assumes, whichever mapping resolved it.
+        let mut unresolved: Option<MappedRole> = None;
+        for (provider, token) in presented {
+            // A login whose presented value carries no claim set states nothing a mapping
+            // rule reads, so no mapping of it decides anything here: what such a token says
+            // is decided by the provider that issued it, which this emulator does not reach.
+            let Some(claims) = presented_token_claims(token) else {
+                continue;
+            };
+            for mapping in role_mappings
                 .iter()
                 .filter(|(key, _)| mapping_key_names_provider(key, provider, pool, &claims))
-                .find_map(|(_, mapping)| mapping_resolved_role_arn(mapping, &claims))
-        })
+                .map(|(_, mapping)| mapping)
+            {
+                match mapping_resolved_role_arn(mapping, &claims) {
+                    Some(role_arn) => return MappedRole::Resolved(role_arn),
+                    None if unresolved.is_none() => {
+                        unresolved = Some(ambiguous_role_resolution(mapping));
+                    }
+                    None => {}
+                }
+            }
+        }
+        unresolved.unwrap_or(MappedRole::Unmapped)
     }
 
     /// Whether this configuration names `role_arn` — as one of the pool's two roles, or
@@ -837,36 +865,105 @@ impl IdentityPoolRoles {
     }
 }
 
-/// The `RoleMappingType` this emulator resolves a role for: "Rules will attempt to match
-/// claims from the token to map to a role" (`RoleMapping$Type`, this service's model).
-///
-/// The other modelled type, `Token`, maps the user's GROUPS to roles through the
-/// `cognito:roles`/`cognito:preferred_role` claims of a user-pool token, which the tokens
-/// this emulator's user pools mint do not carry yet, so no such mapping resolves a role
-/// here and the pool's own role for the flow stays the one assumed.
+/// The `RoleMappingType` values this emulator resolves a role for, from `RoleMapping$Type`
+/// (this service's model): "Token will use `cognito:roles` and `cognito:preferred_role`
+/// claims from the Cognito identity provider token to map groups to roles. Rules will
+/// attempt to match claims from the token to map to a role."
 const RULES_ROLE_MAPPING_TYPE: &str = "Rules";
+const TOKEN_ROLE_MAPPING_TYPE: &str = "Token";
+
+/// The claims a `Token` mapping maps a user's GROUPS to a role through, as
+/// `RoleMapping$Type` names them: the roles the user's groups grant, and the one of them
+/// the user prefers.
+const ROLES_CLAIM: &str = "cognito:roles";
+const PREFERRED_ROLE_CLAIM: &str = "cognito:preferred_role";
+
+/// What a pool's `RoleMappings` decide about one exchange
+/// ([`IdentityPoolRoles::mapped_role`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MappedRole {
+    /// No mapping of the configuration decides the exchange: none is keyed by an identity
+    /// provider a presented login was made under, or the login presenting one carries no
+    /// claim set for a mapping to read. The pool-wide role for the flow the request is in
+    /// is what such an exchange assumes.
+    Unmapped,
+    /// The ARN of the role a mapping resolved from the presented token's claims.
+    Resolved(String),
+    /// A mapping decides the exchange, resolves no role from the presented token, and
+    /// states the `AuthenticatedRole` resolution for that case: the pool's own
+    /// `authenticated` role is what the exchange assumes.
+    AuthenticatedRole,
+    /// The same, with the `Deny` resolution: the exchange is refused and nothing is vended.
+    Denied,
+}
+
+/// What ONE mapping states for the case its rules resolve no role: its
+/// `AmbiguousRoleResolution` value, which `SetIdentityPoolRoles` stores only as one of the
+/// two values the modelled `AmbiguousRoleResolutionType` enum admits
+/// ([`crate::ops::types::AMBIGUOUS_ROLE_RESOLUTION_TYPE_VALUES`]).
+///
+/// A mapping stored with no resolution at all — which `SetIdentityPoolRoles` refuses for
+/// the two types that require one — states no `Deny`, so it leaves the exchange to the
+/// pool-wide role rather than refusing it.
+fn ambiguous_role_resolution(mapping: &RoleMapping) -> MappedRole {
+    match mapping.ambiguous_role_resolution.as_deref() {
+        Some(DENY_ROLE_RESOLUTION) => MappedRole::Denied,
+        Some(AUTHENTICATED_ROLE_RESOLUTION) => MappedRole::AuthenticatedRole,
+        _ => MappedRole::Unmapped,
+    }
+}
+
+/// The `AmbiguousRoleResolutionType` values, from the model
+/// ([`crate::ops::types::AMBIGUOUS_ROLE_RESOLUTION_TYPE_VALUES`]).
+const AUTHENTICATED_ROLE_RESOLUTION: &str = "AuthenticatedRole";
+const DENY_ROLE_RESOLUTION: &str = "Deny";
 
 /// The role ONE mapping resolves for a token carrying `claims`, and `None` when it
-/// resolves none — the case the mapping's `AmbiguousRoleResolution` decides, whose
-/// `AuthenticatedRole` value is the pool's own authenticated role this falls back to.
+/// resolves none — the case the mapping's `AmbiguousRoleResolution` decides
+/// ([`ambiguous_role_resolution`]).
 ///
 /// For a `Rules` mapping that is the first rule to match: "Rules are evaluated in order.
 /// The first one to match specifies the role" (`RulesConfigurationType$Rules`, this
-/// service's model), in the DECLARED order the list was stored in.
+/// service's model), in the DECLARED order the list was stored in. For a `Token` mapping it
+/// is the role the token's own group claims name ([`token_mapped_role_arn`]). A type the
+/// model does not define resolves nothing.
 fn mapping_resolved_role_arn(
     mapping: &RoleMapping,
     claims: &::serde_json::Map<String, ::serde_json::Value>,
 ) -> Option<String> {
-    if mapping.r#type != RULES_ROLE_MAPPING_TYPE {
-        return None;
+    match mapping.r#type.as_str() {
+        RULES_ROLE_MAPPING_TYPE => mapping
+            .rules_configuration
+            .as_ref()?
+            .rules
+            .iter()
+            .find(|rule| rule_matches_claims(rule, claims))
+            .map(|rule| rule.role_arn.clone()),
+        TOKEN_ROLE_MAPPING_TYPE => token_mapped_role_arn(claims),
+        _ => None,
     }
-    mapping
-        .rules_configuration
-        .as_ref()?
-        .rules
-        .iter()
-        .find(|rule| rule_matches_claims(rule, claims))
-        .map(|rule| rule.role_arn.clone())
+}
+
+/// The role a `Token` mapping resolves from a token's own group claims: the type that
+/// "will use `cognito:roles` and `cognito:preferred_role` claims from the Cognito identity
+/// provider token to map groups to roles" (`RoleMapping$Type`, this service's model).
+///
+/// The preferred role is what the user's token asks for, so it decides where it names one;
+/// otherwise the single role the user's groups grant is the one mapped. A token naming no
+/// role, and one naming several with no preference among them, resolve NONE — "there is no
+/// `cognito:preferred_role` claim and there are multiple `cognito:roles` matches"
+/// (`RoleMapping$AmbiguousRoleResolution`) is the very case that mapping's resolution
+/// states the outcome of.
+fn token_mapped_role_arn(
+    claims: &::serde_json::Map<String, ::serde_json::Value>,
+) -> Option<String> {
+    if let [preferred] = claim_values(claims, PREFERRED_ROLE_CLAIM).as_slice() {
+        return Some(preferred.clone());
+    }
+    match claim_values(claims, ROLES_CLAIM).as_slice() {
+        [role_arn] => Some(role_arn.clone()),
+        _ => None,
+    }
 }
 
 /// Whether `rule`'s match condition holds for `claims`: "the match condition that specifies
@@ -1117,6 +1214,11 @@ pub enum LoginTokenRefusal {
     Expired,
     /// This service holds no issuance for the token.
     Unverifiable,
+    /// The issuance names ANOTHER identity than the one the request was made for, so the
+    /// token is no login of that identity — which is also what keeps a token one identity
+    /// pool minted out of another pool's identities, since an identity belongs to the pool
+    /// that minted it.
+    AnotherIdentity,
 }
 
 impl LoginTokenRefusal {
@@ -1125,6 +1227,7 @@ impl LoginTokenRefusal {
         match self {
             Self::Expired => EXPIRED_LOGIN_TOKEN_MESSAGE,
             Self::Unverifiable => UNVERIFIABLE_LOGIN_TOKEN_MESSAGE,
+            Self::AnotherIdentity => UNMATCHED_LOGINS_MESSAGE,
         }
     }
 }
@@ -1524,20 +1627,29 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
         }
     }
 
-    /// Why the `Logins` map of a request authorizes nothing, if so: every token it presents
-    /// under this service's own provider name has to resolve to an issuance whose window is
-    /// still open ([`Self::resolve_login_token`]). A map presenting none is decided by the
-    /// providers that issued its tokens, which this emulator does not reach, so it is not
-    /// refused here.
+    /// Why the `Logins` map of a request made for `identity_id` authorizes nothing, if so.
+    ///
+    /// The one entry the map can carry under this service's own provider name has to resolve
+    /// to an issuance whose window is still open ([`Self::resolve_login_token`]) AND whose
+    /// identity is the one the request was made for: such a token was minted FOR one
+    /// identity, so it is a login of that identity alone and of no other — which is what
+    /// keeps a token minted in one identity pool from reaching an identity of another, each
+    /// identity belonging to the pool that minted it.
+    ///
+    /// A map presenting no token of this service's is decided by the providers that issued
+    /// its tokens, which this emulator does not reach, so it is not refused here.
     pub fn refuse_presented_login_tokens(
         &self,
+        identity_id: &str,
         logins: &HashMap<String, String>,
         now: SystemTime,
     ) -> Option<LoginTokenRefusal> {
-        logins
-            .iter()
-            .filter(|(provider, _)| provider.as_str() == COGNITO_IDENTITY_LOGIN_PROVIDER)
-            .find_map(|(_, token)| self.resolve_login_token(token, now).err())
+        let token = logins.get(COGNITO_IDENTITY_LOGIN_PROVIDER)?;
+        match self.resolve_login_token(token, now) {
+            Err(refusal) => Some(refusal),
+            Ok(issued) => (issued.identity_id != identity_id)
+                .then_some(LoginTokenRefusal::AnotherIdentity),
+        }
     }
 
     /// Whether `logins` presents at least one login OF `identity_id`: a `(provider, login)`

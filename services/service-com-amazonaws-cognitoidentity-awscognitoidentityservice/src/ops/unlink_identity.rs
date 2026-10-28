@@ -326,9 +326,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UnlinkIdentity<En
         }
         // A token presented under this service's OWN provider name names an issuance this
         // service recorded, so its validity is readable here exactly as it is at the
-        // credential exchange: one outside the window its issuance recorded, or one this
-        // service never issued, authorizes nothing either.
-        if let Some(refusal) = store.refuse_presented_login_tokens(&input.logins, now) {
+        // credential exchange: one outside the window its issuance recorded, one this
+        // service never issued, and one minted for ANOTHER identity authorize nothing
+        // either.
+        if let Some(refusal) =
+            store.refuse_presented_login_tokens(&input.identity_id, &input.logins, now)
+        {
             return Err(UnlinkIdentityErrorModeled::NotAuthorizedException(
                 NotAuthorizedException {
                     message: Some(refusal.message().to_string()),

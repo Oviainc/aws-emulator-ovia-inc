@@ -32,24 +32,29 @@ const COGNITO_PRINCIPAL: &str = "cognito-identity.amazonaws.com";
 
 /// The `Logins` provider name of the Amazon Cognito user pool the fixture pool trusts: a
 /// user pool is named `cognito-idp.<region>.amazonaws.com/<UserPoolId>` (`GetId.Logins`).
-const USER_POOL_PROVIDER: &str = "cognito-idp.us-east-1.amazonaws.com/us-east-1_mapped01";
+///
+/// `pub(crate)` — with the fixture helpers below — so the sibling suite that asserts what
+/// becomes of an exchange a mapping resolves NO role for drives the same fixture rather
+/// than a second copy of it.
+pub(crate) const USER_POOL_PROVIDER: &str =
+    "cognito-idp.us-east-1.amazonaws.com/us-east-1_mapped01";
 
 /// The app client of that user pool the fixture pool trusts, which the identifier a role
 /// mapping of that provider is keyed by names beside the provider name.
-const CLIENT_ID: &str = "mappedclient1";
+pub(crate) const CLIENT_ID: &str = "mappedclient1";
 
 /// A SECOND app client of the same user pool the fixture pool trusts, so a mapping keyed by
 /// one client is told apart from a mapping keyed by the other.
 const OTHER_CLIENT_ID: &str = "otherclient22";
 
 /// A public login provider the fixture pool accepts, identified by its NAME alone.
-const PUBLIC_PROVIDER: &str = "graph.facebook.com";
+pub(crate) const PUBLIC_PROVIDER: &str = "graph.facebook.com";
 
 /// One role of the fixture, by the two things a row needs: the ARN a mapping rule names it
 /// by and the NAME the assumed-role ARN of a session of it carries.
-struct Role {
-    name: String,
-    arn: String,
+pub(crate) struct Role {
+    pub(crate) name: String,
+    pub(crate) arn: String,
 }
 
 /// One base64url segment, unpadded, as a compact JWS carries it (RFC 7515 §2).
@@ -64,7 +69,7 @@ fn segment(value: &str) -> String {
 /// algorithm, whose payload is `claims` and whose signature segment is not empty (RFC 7515
 /// §3.1, RFC 7519 §3). Nothing in this emulator can verify the signature — that needs the
 /// issuer's published key — so the claims are what a role mapping reads.
-fn identity_token(claims: &Value) -> String {
+pub(crate) fn identity_token(claims: &Value) -> String {
     format!(
         "{}.{}.{}",
         segment(r#"{"alg":"RS256","kid":"kid-1","typ":"JWT"}"#),
@@ -75,7 +80,7 @@ fn identity_token(claims: &Value) -> String {
 
 /// The claim set of a user-pool ID token for `subject`, carrying the audience claim naming
 /// the app client it was issued to and the extra `claims` a row's rules are written against.
-fn user_pool_claims(subject: &str, claims: &Value) -> Value {
+pub(crate) fn user_pool_claims(subject: &str, claims: &Value) -> Value {
     let mut token_claims = json!({
         "iss": format!("https://{USER_POOL_PROVIDER}"),
         "sub": subject,
@@ -108,7 +113,7 @@ fn trust_policy(audience: &str) -> Value {
 /// clients, so a mapping keyed by either is one the pool stores — accepting the public
 /// provider too and allowing unauthenticated identities, so every flow below is one it
 /// serves. Answers its minted `IdentityPoolId`.
-async fn pool(emulator: &Emulator, name: &str) -> String {
+pub(crate) async fn pool(emulator: &Emulator, name: &str) -> String {
     let created = emulator
         .ok(
             "CreateIdentityPool",
@@ -131,7 +136,7 @@ async fn pool(emulator: &Emulator, name: &str) -> String {
 
 /// The roles a suite needs, each seeded into the IAM store of the same shared engine with a
 /// trust policy that admits `pool_id`'s users, in the order the names are given.
-fn seeded_roles(emulator: &Emulator, pool_id: &str, names: &[&str]) -> Vec<Role> {
+pub(crate) fn seeded_roles(emulator: &Emulator, pool_id: &str, names: &[&str]) -> Vec<Role> {
     names
         .iter()
         .map(|name| Role {
@@ -143,7 +148,7 @@ fn seeded_roles(emulator: &Emulator, pool_id: &str, names: &[&str]) -> Vec<Role>
 
 /// Replace `pool_id`'s whole role configuration: the pool's two roles, and `role_mappings`
 /// when the row configures one.
-async fn set_roles(
+pub(crate) async fn set_roles(
     emulator: &Emulator,
     pool_id: &str,
     authenticated: &Role,
@@ -166,7 +171,7 @@ async fn set_roles(
 }
 
 /// One `MappingRule`, as `SetIdentityPoolRoles` carries one.
-fn rule(claim: &str, match_type: &str, value: &str, role: &Role) -> Value {
+pub(crate) fn rule(claim: &str, match_type: &str, value: &str, role: &Role) -> Value {
     json!({
         "Claim": claim,
         "MatchType": match_type,
@@ -190,7 +195,7 @@ fn rules_mapping(key: &str, rules: Vec<Value>) -> Value {
 /// Vend for an identity of `pool_id` presenting `logins`, and answer the assumed-role ARN
 /// `sts:GetCallerIdentity` reports under the vended credential — which is what the vended
 /// session STANDS FOR.
-async fn vended_session_arn(
+pub(crate) async fn vended_session_arn(
     emulator: &Emulator,
     case: &str,
     pool_id: &str,

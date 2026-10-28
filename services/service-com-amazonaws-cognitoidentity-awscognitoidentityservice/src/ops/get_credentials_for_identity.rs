@@ -11,9 +11,12 @@
 //! `CustomRoleArn` picks one of the roles the pool names instead. Where the pool carries a
 //! `RoleMappings` entry for the identity provider the presented login was made under, that
 //! mapping is what resolves the role — for a rules mapping, the role the first rule to
-//! match the presented token's claims names — and the pool-wide authenticated or
-//! unauthenticated role is the fallback for an exchange no mapping of the pool's resolves a
-//! role for. This handler resolves that role and assumes it: the session it mints is
+//! match the presented token's claims names, and for a token mapping the role the token's
+//! own group claims name — and a mapping that resolves none states, in its
+//! `AmbiguousRoleResolution`, what becomes of that exchange: the pool's authenticated role,
+//! or a refusal that vends nothing at all. The pool-wide authenticated or unauthenticated
+//! role is the fallback for an exchange no mapping of the pool's decides. This handler
+//! resolves that role and assumes it: the session it mints is
 //! recorded in the STS session registry in the same engine, so
 //! `sts:GetCallerIdentity` under the vended credential answers
 //! `arn:<partition>:sts::<account>:assumed-role/<role>/CognitoIdentityCredentials`, and the
@@ -21,16 +24,17 @@
 //! `AssumeRoleWithWebIdentity` event.
 //!
 //! The assume happens only where the role admits it. A pool that names no role for the
-//! request, a role the account does not hold, and a role whose trust policy does not admit
-//! an assume by THIS pool's users — the `cognito-identity.amazonaws.com:aud` condition
-//! that keeps one identity pool out of another pool's role — are each answered with the
-//! modelled `InvalidIdentityPoolConfigurationException` (HTTP 400), the error the real
-//! service raises when it has no role it can assume for the request, rather than with a
-//! session that stands for nothing.
+//! request — a pool whose role mapping DENIES the exchange among them — a role the account
+//! does not hold, and a role whose trust policy does not admit an assume by THIS pool's
+//! users — the `cognito-identity.amazonaws.com:aud` condition that keeps one identity pool
+//! out of another pool's role — are each answered with the modelled
+//! `InvalidIdentityPoolConfigurationException` (HTTP 400), the error the real service
+//! raises when it has no role it can assume for the request, rather than with a session
+//! that stands for nothing.
 //!
 //! `Logins` selects WHICH flow the exchange is: a request that presents a login is an
 //! authenticated one, and the pool's `authenticated` role is the one assumed where no
-//! mapping of the pool's resolves a role for the login it presents.
+//! mapping of the pool's decides the login it presents.
 //!
 //! The authentication methods the trust-policy decision is made with — the
 //! `cognito-identity.amazonaws.com:amr` condition values — come from the LOGIN rather than
@@ -42,13 +46,16 @@
 //! ## The login the exchange is made with
 //!
 //! An entry presented under this service's own provider name carries a token THIS service
-//! minted, so its validity window is one the service recorded and can read: such a token
-//! is a time-bounded credential and is honoured only inside that window. The window is
-//! read before any role is resolved and before any session is minted or handed back, and a
-//! request presenting a token whose window has closed — or one this service cannot resolve
-//! at all — is answered with the modelled `NotAuthorizedException` (HTTP 403) instead of a
-//! credential. A token of any other provider is decided by the provider that issued it,
-//! which this emulator does not reach.
+//! minted FOR one identity, so both its validity window and the identity it stands for are
+//! ones the service recorded and can read: such a token is a time-bounded credential of
+//! that identity, and it is honoured only inside that window and only for that identity.
+//! Both are read before any role is resolved and before any session is minted or handed
+//! back, and a request presenting a token whose window has closed, one this service cannot
+//! resolve at all, or one minted for another identity — the token of another identity pool
+//! among them, each identity belonging to the pool that minted it — is answered with the
+//! modelled `NotAuthorizedException` (HTTP 403) instead of a credential. A token of any
+//! other provider is decided by the provider that issued it, which this emulator does not
+//! reach.
 //!
 //! ## Shape of an operation
 //!
@@ -250,7 +257,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetCredentialsFor
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<GetCredentialsForIdentityOutput, GetCredentialsForIdentityError> {
         use crate::state::{
-            IssuedCredentials, VendedAssume, INVALID_POOL_CONFIGURATION_MESSAGE,
+            IssuedCredentials, MappedRole, VendedAssume, INVALID_POOL_CONFIGURATION_MESSAGE,
         };
         use ::std::collections::HashMap;
 
@@ -342,13 +349,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetCredentialsFor
                 // token this service minted — "If the token is for
                 // cognito-identity.amazonaws.com, it will be passed through to Security
                 // Token Service with the appropriate role for the token" (this operation's
-                // own doc) — and such a token is a time-bounded credential: it buys an
-                // exchange only inside the validity window its issuance recorded. The
-                // window is read HERE, before any role is resolved and before any session
-                // is minted or handed back, so a token whose window the clock has closed —
-                // and a token this service cannot resolve at all — is refused rather than
-                // vended for.
-                if let Some(refusal) = store.refuse_presented_login_tokens(&logins, now) {
+                // own doc) — and such a token is a time-bounded credential minted FOR one
+                // identity: it buys an exchange only inside the validity window its
+                // issuance recorded, and only for the identity that issuance names. Both
+                // are read HERE, before any role is resolved and before any session is
+                // minted or handed back, so a token whose window the clock has closed, a
+                // token this service cannot resolve at all, and a token minted for another
+                // identity — the token of another identity pool among them, each identity
+                // belonging to the pool that minted it — are refused rather than vended
+                // for.
+                if let Some(refusal) =
+                    store.refuse_presented_login_tokens(&input.identity_id, &logins, now)
+                {
                     return Err(GetCredentialsForIdentityErrorModeled::NotAuthorizedException(
                         NotAuthorizedException {
                             message: Some(refusal.message().to_string()),
@@ -371,19 +383,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetCredentialsFor
             // this exchange. A `RoleMappings` entry for the identity provider the login was
             // made under is what resolves it there, and the pool-wide role for the flow the
             // request is in is the fallback when no mapping of the pool's resolves one.
+            // A mapping that DECIDES the exchange without resolving a role is the case its
+            // `AmbiguousRoleResolution` states the outcome of: `AuthenticatedRole` names the
+            // pool's own authenticated role, while `Deny` is a decision to vend NOTHING, so
+            // the exchange resolves no role at all and is answered with the refusal below —
+            // the modelled error whose own doc states the pool has no role configured for
+            // the request — instead of falling back to a role the mapping refused.
             let configured = store.identity_pool_roles.get(&identity_pool_id);
             let role_arn = match &input.custom_role_arn {
                 Some(custom_role_arn) => configured
                     .filter(|configured| configured.names_role_arn(custom_role_arn))
                     .map(|_| custom_role_arn.clone()),
-                None => configured
-                    .zip(store.identity_pools.get(&identity_pool_id))
-                    .and_then(|(configured, pool)| configured.mapped_role_arn(pool, &logins))
-                    .or_else(|| {
-                        configured
+                None => {
+                    let mapped = configured
+                        .zip(store.identity_pools.get(&identity_pool_id))
+                        .map(|(configured, pool)| configured.mapped_role(pool, &logins))
+                        .unwrap_or(MappedRole::Unmapped);
+                    match mapped {
+                        MappedRole::Denied => None,
+                        MappedRole::Resolved(role_arn) => Some(role_arn),
+                        MappedRole::AuthenticatedRole => configured
+                            .and_then(|configured| configured.role_for(true))
+                            .map(ToString::to_string),
+                        MappedRole::Unmapped => configured
                             .and_then(|configured| configured.role_for(!providers.is_empty()))
-                            .map(ToString::to_string)
-                    }),
+                            .map(ToString::to_string),
+                    }
+                }
             };
             let Some(role_arn) = role_arn else {
                 return Err(
