@@ -60,7 +60,11 @@
 //!   service puts in one response. A token is emitted only while unreported
 //!   records remain, and a token that does not parse, or that was issued over a
 //!   different filter, is refused with `ValidationException` rather than silently
-//!   restarting the listing.
+//!   restarting the listing. The two refusals are different answers and carry
+//!   different modelled `reason`s: a token this service did not mint could not be
+//!   read at all, so it is `cannotParse`; a token that WAS read and names another
+//!   selection is a value `nextToken` does not accept for this request, so it is
+//!   `fieldValidationFailed`, like every other member-level refusal here.
 //!
 //! ## Shape of an operation
 //!
@@ -173,7 +177,8 @@ impl From<ListRecommendedActionsErrorModeled> for ListRecommendedActionsError {
 /// service could not read at all (here: a malformed `nextToken`).
 const REASON_CANNOT_PARSE: &str = "cannotParse";
 /// `ValidationExceptionReason$fieldValidationFailed` — a named member carries a
-/// value outside what the service accepts.
+/// value the service read and does not accept (here: a `nextToken` read as a
+/// position in a different listing).
 const REASON_FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
 
 /// The modelled `MaxResults` range (`smithy_query(query="shape",
@@ -231,21 +236,55 @@ pub fn field_validation_failed(violations: &[Violation]) -> ListRecommendedActio
     })
 }
 
-/// A 400 `ValidationException` for a value the service could not read at all —
-/// `ValidationExceptionReason$cannotParse` — naming the member it could not read.
-fn cannot_parse(
+/// A 400 `ValidationException` about ONE named member: `message` is the
+/// overarching explanation, `reason` says which KIND of validation failure it was,
+/// and the single `fieldList` entry names the member and why it failed.
+///
+/// The reason is a parameter because it is the one member of the refusal that
+/// cannot be derived from the wording: it classifies the failure, so each caller
+/// states the class it actually found ([`cannot_parse`] for a value that could not
+/// be read, [`member_value_refused`] for one that was read and then refused).
+fn member_refusal(
+    reason: &str,
     message: impl Into<String>,
     field: (String, String),
 ) -> ListRecommendedActionsError {
     ListRecommendedActionsErrorModeled::ValidationException(ValidationException {
         message: message.into(),
-        reason: REASON_CANNOT_PARSE.to_string(),
+        reason: reason.to_string(),
         field_list: Some(vec![ValidationExceptionField {
             name: field.0,
             message: field.1,
         }]),
     })
     .into()
+}
+
+/// A 400 `ValidationException` for a value the service could not read at all —
+/// `ValidationExceptionReason$cannotParse` — naming the member it could not read.
+fn cannot_parse(
+    message: impl Into<String>,
+    field: (String, String),
+) -> ListRecommendedActionsError {
+    member_refusal(REASON_CANNOT_PARSE, message, field)
+}
+
+/// A 400 `ValidationException` for a value the service DID read and then refused
+/// because it is not one this member accepts for this request —
+/// `ValidationExceptionReason$fieldValidationFailed`, the same reason every other
+/// member-level refusal of this operation carries ([`field_validation_failed`]) —
+/// naming the member it refused.
+///
+/// Separate from [`cannot_parse`] because the two are different answers to a
+/// client: `cannotParse` says the value was unreadable, so there is nothing to act
+/// on but the member's syntax, while this says the value was understood and is
+/// wrong for this request, which a client can correct by changing the request it
+/// accompanies.
+fn member_value_refused(
+    message: impl Into<String>,
+    field: (String, String),
+) -> ListRecommendedActionsError {
+    member_refusal(REASON_FIELD_VALIDATION_FAILED, message, field)
 }
 
 /// The dotted path of a member of the `index`-th `ActionFilter` in the request,
@@ -505,9 +544,13 @@ fn parse_token(token: &str, fingerprint: &str) -> Result<usize, ListRecommendedA
     if token.len() != TOKEN_LEN || !token.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')) {
         return Err(malformed());
     }
+    // READ, then refused: the token parsed into a fingerprint and an offset, and the
+    // fingerprint names another selection — a value this member does not accept for
+    // THIS request, not a value the service could not read. So it is stated as the
+    // member-level validation failure it is, never as `cannotParse`.
     let (token_fingerprint, offset) = token.split_at(TOKEN_FINGERPRINT_LEN);
     if token_fingerprint != fingerprint {
-        return Err(cannot_parse(
+        return Err(member_value_refused(
             "The nextToken was issued for a different request. Repeat the original filter when paginating.",
             (
                 "nextToken".to_string(),

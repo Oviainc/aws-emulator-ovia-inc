@@ -1985,10 +1985,13 @@ async fn a_token_names_one_selection_whatever_characters_its_values_carry() {
                 "ValidationException",
                 "case {case:?}: expected a ValidationException, got {body}"
             );
+            // The token WAS read — split into a fingerprint and an offset and
+            // compared — so the refusal is the member-level validation failure
+            // `fieldValidationFailed`, not `cannotParse`.
             assert_eq!(
                 body.get("reason").and_then(Value::as_str),
-                Some("cannotParse"),
-                "case {case:?}: expected reason cannotParse, got {body}"
+                Some("fieldValidationFailed"),
+                "case {case:?}: expected reason fieldValidationFailed, got {body}"
             );
             let names: Vec<&str> = body
                 .get("fieldList")
@@ -2323,10 +2326,12 @@ async fn a_next_token_is_accepted_by_exactly_the_selection_it_was_issued_over() 
                     "ValidationException",
                     "case {case:?}: expected a ValidationException, got {body}"
                 );
+                // A readable token naming another selection is a value this member
+                // does not accept, so the reason is `fieldValidationFailed`.
                 assert_eq!(
                     body.get("reason").and_then(Value::as_str),
-                    Some("cannotParse"),
-                    "case {case:?}: expected reason cannotParse, got {body}"
+                    Some("fieldValidationFailed"),
+                    "case {case:?}: expected reason fieldValidationFailed, got {body}"
                 );
                 let names: Vec<&str> = body
                     .get("fieldList")
@@ -2349,5 +2354,242 @@ async fn a_next_token_is_accepted_by_exactly_the_selection_it_was_issued_over() 
                 );
             }
         }
+    }
+}
+
+/// One `reason` case: a refused request, the modelled
+/// `ValidationExceptionReason` its refusal must state, and the member its
+/// `fieldList` must name.
+struct ReasonCase {
+    case: String,
+    request: Value,
+    reason: &'static str,
+    field: &'static str,
+}
+
+#[tokio::test]
+async fn the_reason_states_whether_the_refused_value_could_be_read() {
+    let emulator = Emulator::empty();
+    emulator.seed(fixture());
+
+    // Three selections, each served one record a page so each mints a token. A token
+    // is READ by this service only when it is one this service could have minted, so
+    // the rows below are built from real tokens: damaged into something unreadable,
+    // or carried over to another selection intact.
+    let selections: Vec<(&str, Value)> = vec![
+        (
+            "no filter",
+            json!({"maxResults": 1}),
+        ),
+        (
+            "FEATURE EQUALS BUDGETS",
+            json!({"maxResults": 1, "filter": {"actions": [
+                {"key": "FEATURE", "matchOption": "EQUALS", "values": ["BUDGETS"]}
+            ]}}),
+        ),
+        (
+            "SEVERITY EQUALS CRITICAL",
+            json!({"maxResults": 1, "filter": {"actions": [
+                {"key": "SEVERITY", "matchOption": "EQUALS", "values": ["CRITICAL"]}
+            ]}}),
+        ),
+    ];
+
+    let mut tokens: Vec<(&str, Value, String)> = Vec::with_capacity(selections.len());
+    for (label, selection) in &selections {
+        let (status, body) = emulator.list(selection).await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: minting a token expected 200, got {status} with {body}"
+        );
+        let token = body
+            .get("nextToken")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("case {label:?}: expected a nextToken, got {body}"))
+            .to_string();
+        tokens.push((label, selection.clone(), token));
+    }
+
+    let (first_label, first_selection, first_token) = tokens[0].clone();
+    let mut cases: Vec<ReasonCase> = Vec::new();
+
+    // CLASS 1 — a value this service could not read at all. Each row is presented
+    // WITH the selection its token was minted over, so unreadability is the only
+    // thing wrong with it; the rows differ along every way a token can fail to be
+    // one this service mints: its length (one character short, one character long),
+    // its alphabet (a non-hex character, an upper-cased copy), and a value that is no
+    // token at all.
+    let damaged: Vec<(String, String)> = vec![
+        (
+            "a real token with its last character replaced by a non-hex one".to_string(),
+            format!("{}g", &first_token[..first_token.len() - 1]),
+        ),
+        (
+            "an upper-cased copy of a real token".to_string(),
+            first_token.to_uppercase(),
+        ),
+        (
+            "a real token with one character dropped".to_string(),
+            first_token[..first_token.len() - 1].to_string(),
+        ),
+        (
+            "a real token with one character appended".to_string(),
+            format!("{first_token}0"),
+        ),
+        ("a value that is no token at all".to_string(), "not-a-real-token".to_string()),
+        (
+            "a token-length value outside the hex alphabet".to_string(),
+            "z".repeat(first_token.len()),
+        ),
+    ];
+    for (label, token) in damaged {
+        cases.push(ReasonCase {
+            case: format!("{label} (presented with {first_label:?})"),
+            request: with_member(&label, &first_selection, "nextToken", json!(token)),
+            reason: "cannotParse",
+            field: "nextToken",
+        });
+    }
+
+    // CLASS 2 — a value this service DID read and then refused: a token whose
+    // fingerprint it split out and compared, naming a selection other than the one
+    // the request names. Rows: every ordered pair of different selections, plus
+    // token-shaped values of the right length and alphabet whose fingerprint names no
+    // selection at all, at several offsets.
+    for (minted_label, _, token) in &tokens {
+        for (presented_label, presented_selection) in &selections {
+            if minted_label == presented_label {
+                continue;
+            }
+            cases.push(ReasonCase {
+                case: format!(
+                    "a token minted over {minted_label:?} presented with {presented_label:?}"
+                ),
+                request: with_member(
+                    presented_label,
+                    presented_selection,
+                    "nextToken",
+                    json!(token),
+                ),
+                reason: "fieldValidationFailed",
+                field: "nextToken",
+            });
+        }
+    }
+    for offset in ["00000000", "00000001", "ffffffff"] {
+        let synthetic = format!("{}{offset}", "0123456789abcdef".repeat(2));
+        cases.push(ReasonCase {
+            case: format!("a well-formed token whose fingerprint names no selection, offset {offset}"),
+            request: with_member("synthetic token", &first_selection, "nextToken", json!(synthetic)),
+            reason: "fieldValidationFailed",
+            field: "nextToken",
+        });
+    }
+
+    // CLASS 3 — the same reason for the same kind of failure elsewhere in the input:
+    // a member whose value the service read and then refused against a modelled
+    // constraint. Rows span a value set the model closes, a modelled minimum length,
+    // and a modelled numeric range at each end.
+    for (label, request, field) in [
+        (
+            "an unmodelled filter key",
+            json!({"filter": {"actions": [
+                {"key": "ACCOUNT_ID", "matchOption": "EQUALS", "values": ["BUDGETS"]}
+            ]}}),
+            "filter.actions.1.member.key",
+        ),
+        (
+            "an unmodelled match option",
+            json!({"filter": {"actions": [
+                {"key": "FEATURE", "matchOption": "CONTAINS", "values": ["BUDGETS"]}
+            ]}}),
+            "filter.actions.1.member.matchOption",
+        ),
+        (
+            "an empty values list",
+            json!({"filter": {"actions": [
+                {"key": "FEATURE", "matchOption": "EQUALS", "values": []}
+            ]}}),
+            "filter.actions.1.member.values",
+        ),
+        (
+            "maxResults below the modelled range",
+            json!({"maxResults": 0}),
+            "maxResults",
+        ),
+        // `NextToken` is modelled `length: {min: 1, max: 8192}`
+        // (`smithy_query(query="operation", operation="ListRecommendedActions")`), so an
+        // empty token fails that modelled minimum before it is ever read as a token.
+        (
+            "an empty token",
+            json!({"maxResults": 1, "nextToken": ""}),
+            "nextToken",
+        ),
+        (
+            "maxResults past the modelled range",
+            json!({"maxResults": 1001}),
+            "maxResults",
+        ),
+    ] {
+        cases.push(ReasonCase {
+            case: label.to_string(),
+            request,
+            reason: "fieldValidationFailed",
+            field,
+        });
+    }
+
+    for ReasonCase {
+        case,
+        request,
+        reason,
+        field,
+    } in cases
+    {
+        let (status, body) = emulator.list(&request).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with {body}"
+        );
+        assert_eq!(
+            error_code(&case, &body),
+            "ValidationException",
+            "case {case:?}: expected a ValidationException, got {body}"
+        );
+        // `ValidationException$reason` is modelled REQUIRED and typed by
+        // `ValidationExceptionReason` ("Provides a single, overarching explanation
+        // for the validation failure"), whose value set the crate carries from the
+        // model (`VALIDATION_EXCEPTION_REASON_VALUES`).
+        let stated = body
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("case {case:?}: a refusal must state a reason, got {body}"));
+        assert!(
+            bcm::ops::types::VALIDATION_EXCEPTION_REASON_VALUES.contains(&stated),
+            "case {case:?}: expected a modelled reason out of {:?}, got {stated:?}",
+            bcm::ops::types::VALIDATION_EXCEPTION_REASON_VALUES
+        );
+        assert_eq!(
+            stated, reason,
+            "case {case:?}: expected reason {reason:?}, got {stated:?} in {body}"
+        );
+        // `fieldList` "lists each problematic field and why it failed validation", so
+        // the member the refusal is about is named whichever class it belongs to.
+        let names: Vec<&str> = body
+            .get("fieldList")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("case {case:?}: expected a fieldList array, got {body}"))
+            .iter()
+            .filter_map(|entry| entry.get("name").and_then(Value::as_str))
+            .collect();
+        assert_eq!(
+            names,
+            vec![field],
+            "case {case:?}: expected the refusal to name {field:?}, got {names:?} in {body}"
+        );
+        assert!(
+            body.get("recommendedActions").is_none(),
+            "case {case:?}: a refused request must not return a listing, got {body}"
+        );
     }
 }
