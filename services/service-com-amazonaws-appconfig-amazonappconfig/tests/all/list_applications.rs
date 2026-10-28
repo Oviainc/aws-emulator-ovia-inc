@@ -11,10 +11,12 @@
 //! The tables span what the rule generalises over: HOW MANY applications the account
 //! holds (none, one, several, and one past the service's page size), WHICH page size the
 //! request asks for (absent, both published bounds of `MaxResults` and values in
-//! between), and WHAT each application carries (`Name` and `Description` present or
-//! absent and at their published length bounds). Every entry is checked against the
-//! record a `GetApplication` of it answers, so the listing reports stored state rather
-//! than anything derived from the request that asked for it.
+//! between), WHAT each application carries (`Name` and `Description` present or absent
+//! and at their published length bounds), and WHICH mutation last changed the collection
+//! (a create, an update of a record in it, a delete — including one taken out midway
+//! through a paginated traversal). Every entry is checked against the record a
+//! `GetApplication` of it answers, so the listing reports stored state rather than
+//! anything derived from the request that asked for it.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -452,6 +454,209 @@ async fn a_next_token_this_listing_did_not_mint_is_refused() {
             items(&answer).is_empty(),
             "case {case:?}: a refused request reports nothing, got {:?}",
             items(&answer)
+        );
+    }
+}
+
+/// One mutation of the account's applications, applied by
+/// [`the_listing_tracks_every_mutation_of_the_account`]. `Describe` and `Delete` address
+/// an application by its position in the live collection, so a row names a resource that
+/// earlier rows created rather than an id written into the test.
+#[derive(Debug)]
+enum Mutation {
+    /// `CreateApplication` with this name.
+    Create(&'static str),
+    /// `UpdateApplication` writing this `Description` onto the live application at this
+    /// position.
+    Describe(usize, &'static str),
+    /// `DeleteApplication` of the live application at this position.
+    Delete(usize),
+}
+
+/// The listing is a report over the applications the account holds AT THE TIME OF THE
+/// CALL, so every mutation of that collection — a create, an update of a record in it, a
+/// delete — shows in the next listing, by one call and by a paginated walk alike.
+#[tokio::test]
+async fn the_listing_tracks_every_mutation_of_the_account() {
+    let router = router();
+
+    // Rows differ along WHICH mutation is applied and along what it does to the
+    // collection: grow it, change a record inside it, shrink it (including back to
+    // empty), and grow it again after a delete.
+    let mutations = [
+        ("a first create", Mutation::Create("alpha")),
+        ("a second create", Mutation::Create("beta")),
+        ("a third create", Mutation::Create("gamma")),
+        (
+            "a description written onto a listed application",
+            Mutation::Describe(0, "described after it was listed"),
+        ),
+        ("a delete from the middle", Mutation::Delete(1)),
+        ("a create after a delete", Mutation::Create("delta")),
+        (
+            "a description written onto the application created after the delete",
+            Mutation::Describe(2, "described after the delete"),
+        ),
+        ("a delete of the first", Mutation::Delete(0)),
+        ("a delete of the last", Mutation::Delete(1)),
+        ("a delete back to an empty account", Mutation::Delete(0)),
+    ];
+
+    let mut live: Vec<String> = Vec::new();
+    let mut deleted: Vec<String> = Vec::new();
+    for (case, mutation) in &mutations {
+        match mutation {
+            Mutation::Create(name) => live.push(create_application(&router, name).await),
+            Mutation::Describe(position, description) => {
+                let id = &live[*position];
+                let answer = json_call(
+                    &router,
+                    "PATCH",
+                    &format!("/applications/{id}"),
+                    &json!({ "Description": description }),
+                )
+                .await;
+                assert_eq!(
+                    answer.status,
+                    200,
+                    "case {case:?}: UpdateApplication must answer 200, got {} / {}",
+                    answer.status,
+                    String::from_utf8_lossy(&answer.body)
+                );
+            }
+            Mutation::Delete(position) => {
+                let id = live.remove(*position);
+                let answer =
+                    json_call(&router, "DELETE", &format!("/applications/{id}"), &Value::Null).await;
+                assert_eq!(
+                    answer.status,
+                    204,
+                    "case {case:?}: DeleteApplication must answer 204, got {} / {}",
+                    answer.status,
+                    String::from_utf8_lossy(&answer.body)
+                );
+                deleted.push(id);
+            }
+        }
+
+        // The single-call listing holds exactly the live applications.
+        let answer = list(&router, "").await;
+        let mut reported = listed_ids(&answer);
+        let mut expected = live.clone();
+        reported.sort();
+        expected.sort();
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: the listing must hold exactly the live applications {expected:?}, \
+             got {reported:?}"
+        );
+        // And nothing that was deleted, however small the pages are.
+        let walked = walk(&router, case, Some(1)).await;
+        let mut walked_sorted = walked.clone();
+        walked_sorted.sort();
+        assert_eq!(
+            walked_sorted, expected,
+            "case {case:?}: a paginated walk must hold exactly the live applications \
+             {expected:?}, got {walked:?}"
+        );
+        for id in &deleted {
+            assert!(
+                !walked.contains(id),
+                "case {case:?}: the deleted application {id:?} must be gone from the listing, \
+                 got {walked:?}"
+            );
+        }
+        // Every surviving entry still reports the stored record, so an update to one of
+        // them shows in the listing rather than only in a Get of it.
+        for entry in items(&answer) {
+            let id = entry
+                .get("Id")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("case {case:?}: a listed application must carry an Id"));
+            let fetched =
+                json_call(&router, "GET", &format!("/applications/{id}"), &Value::Null).await;
+            assert_eq!(
+                entry,
+                fetched.json(),
+                "case {case:?}: the listed entry must be the record GetApplication answers {}, \
+                 got {entry}",
+                fetched.json()
+            );
+        }
+    }
+}
+
+/// An application deleted midway through a paginated traversal is simply absent from the
+/// pages still to come: the cursor the earlier page handed back still resumes, and no
+/// surviving application is skipped or served twice.
+#[tokio::test]
+async fn a_delete_midway_through_a_walk_drops_only_the_deleted_application() {
+    // Rows differ along WHICH entry of the remaining traversal is deleted after the first
+    // page of one: the very next one served, one in the middle, and the last one of the
+    // collection.
+    for target in [1_usize, 2, 3] {
+        // A fresh account per row, so the row's deletes are the only ones in play.
+        let router = router();
+        for index in 0..4 {
+            create_application(&router, &format!("midway-{index}")).await;
+        }
+        // The traversal order is the listing's own, so take it from the listing rather
+        // than from the order the applications were created in.
+        let order_now = listed_ids(&list(&router, "").await);
+        assert_eq!(
+            order_now.len(),
+            4,
+            "case \"delete entry {target}\": expected 4 entries, got {order_now:?}"
+        );
+
+        let first = list(&router, "max_results=1").await;
+        let served = listed_ids(&first);
+        let token = first.string("NextToken").unwrap_or_else(|| {
+            panic!("case \"delete entry {target}\": a truncated listing carries a NextToken")
+        });
+
+        let doomed = order_now[target].clone();
+        let answer = json_call(
+            &router,
+            "DELETE",
+            &format!("/applications/{doomed}"),
+            &Value::Null,
+        )
+        .await;
+        assert_eq!(
+            answer.status,
+            204,
+            "case \"delete entry {target}\": DeleteApplication must answer 204, got {} / {}",
+            answer.status,
+            String::from_utf8_lossy(&answer.body)
+        );
+
+        // Resume the walk from the token minted before the delete.
+        let mut collected = served.clone();
+        let mut token = Some(token);
+        while let Some(cursor) = token {
+            let page = list(&router, &format!("max_results=1&next_token={cursor}")).await;
+            assert_eq!(
+                page.status,
+                200,
+                "case \"delete entry {target}\": a cursor minted before the delete must still \
+                 resume, got {} / {}",
+                page.status,
+                String::from_utf8_lossy(&page.body)
+            );
+            collected.extend(listed_ids(&page));
+            token = page.string("NextToken");
+        }
+
+        let expected: Vec<String> = order_now
+            .iter()
+            .filter(|id| **id != doomed)
+            .cloned()
+            .collect();
+        assert_eq!(
+            collected, expected,
+            "case \"delete entry {target}\": the resumed walk must serve every surviving \
+             application exactly once {expected:?}, got {collected:?}"
         );
     }
 }
