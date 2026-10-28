@@ -823,8 +823,11 @@ async fn a_schedule_states_when_to_create_in_exactly_one_form() {
 /// The rows span: neither mode, each mode alone, the age-based mode missing each
 /// of the two members it requires, both modes at once in each way they can be
 /// stated, and the retention interval of `0` the documentation admits. The
-/// absence of a `RetainRule` is not refused: the model declares no retention
-/// rule for a schedule, and nothing in the documentation requires one.
+/// absence of a `RetainRule` is not refused for a schedule carrying no rule that
+/// acts on the snapshots it retains: the model declares no retention rule for a
+/// schedule, and nothing else in the documentation requires one of such a
+/// schedule (the schedule that DOES carry such a rule is in
+/// `tests/all/schedule_retention_floor.rs`).
 #[tokio::test]
 async fn a_retain_rule_retains_by_exactly_one_mode() {
     assert_rule_cases(vec![

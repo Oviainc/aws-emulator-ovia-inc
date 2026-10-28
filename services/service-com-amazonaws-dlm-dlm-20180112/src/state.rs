@@ -1645,7 +1645,11 @@ fn plural(count: usize) -> (&'static str, &'static str) {
 ///   retention: You must specify Interval and IntervalUnit." A retention rule
 ///   states exactly one of the two modes, and the retention that mode states
 ///   meets the floor the OTHER rules of the same schedule raise — see
-///   [`retention_floor_violation`].
+///   [`retention_floor_violation`]. Those same rules are what make stating a
+///   retention mandatory in the first place ("If you specify a FastRestoreRule,
+///   ShareRule, or a CrossRegionCopyRule, then you must specify a retention
+///   count of `1` or more"), so a schedule carrying one of them and no
+///   `RetainRule` is refused too — see [`retention_required_violation`].
 pub fn schedule_rule_violation(details: Option<&PolicyDetails>) -> Option<InvalidRequestException> {
     details?
         .schedules
@@ -1728,17 +1732,18 @@ fn create_rule_violation(
 /// the request asked for: a unit, or any other interval, is what states the
 /// age-based mode.
 ///
-/// The whole `schedule` is judged, not the retention rule alone: the floor on how
-/// much a rule may retain depends on which OTHER rules the same schedule carries
-/// ([`retention_floor_violation`]). A schedule carrying no retention rule is
-/// refused nothing here — the model declares none for a schedule, and no
-/// documented sentence requires one.
+/// The whole `schedule` is judged, not the retention rule alone: the rules the
+/// schedule carries beside it decide both whether a retention must be stated at
+/// all ([`retention_required_violation`]) and the floor on how little a stated
+/// one may retain ([`retention_floor_violation`]).
 fn retain_rule_violation(
     label: &str,
     path: &str,
     schedule: &Schedule,
 ) -> Option<InvalidRequestException> {
-    let rule = schedule.retain_rule.as_ref()?;
+    let Some(rule) = schedule.retain_rule.as_ref() else {
+        return retention_required_violation(label, path, schedule);
+    };
     let count_based = rule.count.is_some();
     let age_based = rule.interval_unit.is_some()
         || rule.interval.is_some_and(|value| value != UNSET_RULE_INTERVAL);
@@ -1796,6 +1801,42 @@ fn retain_rule_violation(
             )
         }
     }
+}
+
+/// Why a schedule that states NO retention at all is refused, or `None` when
+/// every other rule it carries acts on creation alone.
+///
+/// The documented requirement is on what the schedule SPECIFIES — "If you
+/// specify a FastRestoreRule, ShareRule, or a CrossRegionCopyRule, then you must
+/// specify a retention count of `1` or more", and the same for a retention
+/// interval — so a schedule carrying one of those rules and NO retention rule
+/// meets it no better than one stating a retention of nothing: it specifies no
+/// retention whatsoever, and the rule has nothing kept to act on
+/// ([`retention_floor_violation`]). The refusal is the omitted-parameter class,
+/// since the member the sentence requires is the one that is missing, and it
+/// names the rules that require it.
+///
+/// A schedule carrying none of those rules is refused nothing: the model
+/// declares no retention rule for a schedule, and no other documented sentence
+/// requires one.
+fn retention_required_violation(
+    label: &str,
+    path: &str,
+    schedule: &Schedule,
+) -> Option<InvalidRequestException> {
+    let dependent = rules_requiring_retention(schedule);
+    if dependent.is_empty() {
+        return None;
+    }
+    Some(required_in_schedule(
+        label,
+        vec![format!("{path}.RetainRule")],
+        &format!(
+            "a schedule that specifies {} must specify a retention count of \
+             {RETENTION_FLOOR_WITH_DEPENDENT_RULE} or more",
+            named_in_prose(&dependent)
+        ),
+    ))
 }
 
 /// Why `retained` — the retention the schedule's `member` states, in the mode it
@@ -1871,8 +1912,8 @@ fn rules_requiring_retention(schedule: &Schedule) -> Vec<&'static str> {
 
 /// `names` as a refusal reads them: `a X`, `a X and a Y`, `a X, a Y and a Z`.
 ///
-/// The empty arm is defensive: the only caller refuses nothing when the schedule
-/// carries none of the rules, so it never reaches this with an empty slice.
+/// The empty arm is defensive: every caller refuses nothing when the schedule
+/// carries none of the rules, so none of them reaches this with an empty slice.
 fn named_in_prose(names: &[&str]) -> String {
     match names {
         [] => String::new(),
