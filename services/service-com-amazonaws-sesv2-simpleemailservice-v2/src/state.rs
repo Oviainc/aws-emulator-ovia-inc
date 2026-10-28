@@ -276,6 +276,118 @@ pub const MAX_MULTI_REGION_ENDPOINTS: usize = 1_000;
 /// From the model's `Tag` documentation: "A resource can have as many as 50 tags."
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
+/// The longest a tag key may be, in characters.
+///
+/// From `Tag$Key`: "The maximum length of a tag key is 128 characters. The minimum
+/// length is 1 character." `TagKey` is a plain string in the model, so the bound is
+/// the handler's to enforce. Characters, not bytes: the documentation states what the
+/// key "can contain", and it may contain "Unicode letters".
+pub const MAX_TAG_KEY_CHARS: usize = 128;
+
+/// The shortest a tag key may be, in characters: `Tag$Key`'s "The minimum length is 1
+/// character" — a tag is keyed by its key, so there is no tag without one.
+pub const MIN_TAG_KEY_CHARS: usize = 1;
+
+/// The longest a tag value may be, in characters.
+///
+/// From `Tag$Value`: "The maximum length of a tag value is 256 characters. The minimum
+/// length is 0 characters" — so a key with no value is a tag, and `TagValue` carries no
+/// bound of its own in the model.
+pub const MAX_TAG_VALUE_CHARS: usize = 256;
+
+/// The prefix the model's `Tag` documentation reserves: "The `aws:` prefix is reserved
+/// for use by Amazon Web Services; you can't use it in any tag keys or values that you
+/// define."
+pub const RESERVED_TAG_PREFIX: &str = "aws:";
+
+/// The symbols a tag key or value may carry besides letters, digits and white space.
+///
+/// The model's `Tag` documentation lists "Unicode letters, digits, white space, or one
+/// of the following symbols: _ . : / = + -", and the service's own refusal for a tag
+/// outside the set ([`tag_refusal`]) names those seven and `@` as well, so `@` is in
+/// the set the surface accepts. Written in the order that sentence names them.
+pub const TAG_SYMBOLS: &str = "_.:/=+-@";
+
+/// Whether `text` is in the character set a tag key or a tag value may be written in.
+///
+/// The set the surface states: letters, digits, white space and [`TAG_SYMBOLS`].
+/// Letters and digits are read as the Unicode properties the model's `Tag`
+/// documentation names them by ("Unicode letters, digits"), not as ASCII, so a key or
+/// value written in any script is in the set while punctuation and symbols outside the
+/// listed ones are not.
+pub fn tag_text_is_in_charset(text: &str) -> bool {
+    text.chars()
+        .all(|c| c.is_alphanumeric() || c.is_whitespace() || TAG_SYMBOLS.contains(c))
+}
+
+/// How this service words `BadRequestException` for a tag whose key or value is one no
+/// caller may define, or `None` when the pair satisfies every restriction the model's
+/// `Tag` documentation states for a tag a caller defines.
+///
+/// Stated once, so every operation that accepts a `TagList` can read those
+/// restrictions the same way rather than disagree about which tags it will store: the
+/// key's documented length ([`MIN_TAG_KEY_CHARS`]..=[`MAX_TAG_KEY_CHARS`] characters),
+/// the value's ([`MAX_TAG_VALUE_CHARS`]), the character set both are written in
+/// ([`tag_text_is_in_charset`]) and the [`RESERVED_TAG_PREFIX`] neither may carry. The
+/// sentences are fixed text: each refusal is about the FORM of what the request
+/// carried, and the bounds and the symbol set are named from the constants above. The
+/// character-set sentence is the one this surface answers a tag outside the set with,
+/// listing the symbols separated by spaces.
+pub fn tag_refusal(key: &str, value: &str) -> Option<String> {
+    let key_chars = key.chars().count();
+    if !(MIN_TAG_KEY_CHARS..=MAX_TAG_KEY_CHARS).contains(&key_chars) {
+        return Some(format!(
+            "A tag key must be between {MIN_TAG_KEY_CHARS} and {MAX_TAG_KEY_CHARS} \
+             characters long."
+        ));
+    }
+    if value.chars().count() > MAX_TAG_VALUE_CHARS {
+        return Some(format!(
+            "A tag value must be no more than {MAX_TAG_VALUE_CHARS} characters long."
+        ));
+    }
+    if !tag_text_is_in_charset(key) || !tag_text_is_in_charset(value) {
+        return Some(tag_charset_refusal());
+    }
+    if key.starts_with(RESERVED_TAG_PREFIX) || value.starts_with(RESERVED_TAG_PREFIX) {
+        return Some(format!(
+            "The {RESERVED_TAG_PREFIX} prefix is reserved and cannot be used in a tag \
+             key or value."
+        ));
+    }
+    None
+}
+
+/// The sentence a tag key or value outside [`tag_text_is_in_charset`] is refused with.
+///
+/// Fixed text: the refusal is about the character set, which is the same whichever tag
+/// of the request carried a character outside it. The special characters are listed
+/// from [`TAG_SYMBOLS`], separated by spaces, so the sentence and the set the handler
+/// enforces cannot drift apart.
+pub fn tag_charset_refusal() -> String {
+    let symbols = TAG_SYMBOLS
+        .chars()
+        .map(|symbol| symbol.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "Tags can only contain letters, numbers, spaces, and the following special \
+         characters: {symbols}"
+    )
+}
+
+/// How this service words `BadRequestException` for a request that would leave one
+/// resource carrying `total` tags, more than [`MAX_TAGS_PER_RESOURCE`].
+///
+/// Neither the model nor a recording of this surface states the sentence, so it is the
+/// one `CreateDedicatedIpPool` already answers a create carrying more tags than a
+/// resource may hold with — the model's own "A resource can have as many as 50 tags",
+/// with the count the request would leave behind as its only variable part — so the
+/// service words the one condition the same way whichever operation reads it.
+pub fn too_many_tags(total: usize) -> String {
+    format!("A resource can have as many as {MAX_TAGS_PER_RESOURCE} tags, got {total}.")
+}
+
 /// The resource TYPE the ARN `resource_arn` names and the id it addresses within that
 /// type, or `None` when the value is not a resource ARN of this service naming a
 /// resource at all.
@@ -1142,6 +1254,50 @@ impl ComAmazonawsSesv2SimpleemailserviceV2State {
     /// Reporting only: the resolution reads the tables and writes nothing.
     pub fn holds_resource(&self, resource_arn: &str, scope: &CallerScope) -> bool {
         self.resource_tags(resource_arn, scope).is_some()
+    }
+
+    /// The tags STORED on the resource `resource_arn` names, for a write that has to
+    /// change them; `None` when the call `scope` describes holds no such resource.
+    ///
+    /// The ARN is resolved exactly as [`Self::resource_tags`] resolves one — the same
+    /// scope check, the same resource types, the same per-type keying — so a write can
+    /// only reach a resource a read of the same ARN would have reported, and the tags
+    /// it changes are the ones that read reports. The pairs are handed back in the
+    /// order they were supplied, which is the order the tagging surface reports them
+    /// in, so a caller that replaces one tag's value does not see the rest reorder.
+    pub fn resource_tags_mut(
+        &mut self,
+        resource_arn: &str,
+        scope: &CallerScope,
+    ) -> Option<&mut Vec<(String, String)>> {
+        if !scope.covers_resource(resource_arn) {
+            return None;
+        }
+        let (resource_type, resource_id) = ses_resource_of(resource_arn)?;
+        match resource_type {
+            "identity" => self
+                .identities
+                .get_mut(&identity_key(resource_id))
+                .map(|identity| &mut identity.tags),
+            "contact-list" => self
+                .contact_lists
+                .get_mut(resource_id)
+                .map(|contact_list| &mut contact_list.tags),
+            "configuration-set" => self
+                .configuration_sets
+                .get_mut(resource_id)
+                .map(|configuration_set| &mut configuration_set.tags),
+            "tenant" => self
+                .tenants
+                .values_mut()
+                .find(|tenant| tenant.arn == resource_arn)
+                .map(|tenant| &mut tenant.tags),
+            "dedicated-ip-pool" => self
+                .dedicated_ip_pools
+                .get_mut(resource_id)
+                .map(|pool| &mut pool.tags),
+            _ => None,
+        }
     }
 
     /// Put `record` on the suppression list `key` names, refusing a NEW entry once
