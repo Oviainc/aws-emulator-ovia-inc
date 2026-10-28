@@ -160,6 +160,19 @@ fn no_such_association(name: &str) -> (Option<String>, Option<String>) {
     )
 }
 
+/// The refusal a create answers for a set that ALREADY carries an association:
+/// the modelled `TrackingOptionsAlreadyExistsException`, which SES renders on the
+/// query wire as `<Code>TrackingOptionsAlreadyExists</Code>`, and the one sentence
+/// it reports the conflict with, naming the set the request supplied.
+fn already_an_association(name: &str) -> (Option<String>, Option<String>) {
+    (
+        Some("TrackingOptionsAlreadyExists".to_string()),
+        Some(format!(
+            "There is already a tracking options for configuration set <{name}>"
+        )),
+    )
+}
+
 /// A set with an existing tracking-options association, over an engine that
 /// already holds a verified domain identity: the fixture every case about
 /// MODIFYING an association starts from.
@@ -397,13 +410,7 @@ async fn an_association_must_exist_before_an_update_modifies_it() {
     );
     assert_eq!(
         refusal(&body),
-        (
-            Some("TrackingOptionsAlreadyExistsException".to_string()),
-            Some(
-                "The configuration set you specified already contains a TrackingOptions object."
-                    .to_string()
-            )
-        ),
+        already_an_association("fresh-set"),
         "case create tracking options twice: expected the already-exists refusal, got {body}"
     );
     let reported = described_tracking_domain(&router, "fresh-set").await;

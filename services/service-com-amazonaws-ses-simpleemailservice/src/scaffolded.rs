@@ -235,6 +235,22 @@ pub enum Scaffolded<E> {
     /// single `message` member; only the wire code differs from
     /// [`Scaffolded::ValidationException`].
     InvalidParameterValue(ValidationException),
+    /// A modeled error answered under the `Error.Code` the REAL service puts on the
+    /// query wire, where that is not the code this service's model annotates the
+    /// error shape with.
+    ///
+    /// The status and the body are the model's own; only the code a query client
+    /// branches on is the handler's. Every other refusal of this surface carries its
+    /// shape name with the trailing `Exception` dropped (`ConfigurationSetDoesNotExist`,
+    /// `InvalidTrackingOptions`, `TrackingOptionsDoesNotExist`), and a few shapes are
+    /// annotated with the undropped spelling, which is not what a client sees. Reach
+    /// for this ONLY with recorded evidence of the code the service answers with, and
+    /// cite it where you construct it: a code chosen without evidence silently
+    /// contradicts the model.
+    ModeledWithQueryCode {
+        error: E,
+        query_code: &'static str,
+    },
 }
 
 impl<E> Scaffolded<E> {
@@ -273,13 +289,19 @@ impl<E> Scaffolded<E> {
     pub fn invalid_parameter_value(message: impl Into<String>) -> Self {
         Self::InvalidParameterValue(ValidationException::new(message))
     }
+
+    /// Answer `error` under the query `Error.Code` `query_code` rather than the code
+    /// its own shape is annotated with. See [`Scaffolded::ModeledWithQueryCode`].
+    pub fn modeled_with_query_code(error: E, query_code: &'static str) -> Self {
+        Self::ModeledWithQueryCode { error, query_code }
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotImplemented(e) => write!(f, "{e}"),
-            Self::Modeled(e) => write!(f, "{e}"),
+            Self::Modeled(e) | Self::ModeledWithQueryCode { error: e, .. } => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
             Self::InvalidParameterValue(e) => write!(f, "{e}"),
         }
@@ -292,7 +314,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::NotImplemented(e) => e.source(),
-            Self::Modeled(e) => e.source(),
+            Self::Modeled(e) | Self::ModeledWithQueryCode { error: e, .. } => e.source(),
             Self::ValidationException(e) => e.source(),
             Self::InvalidParameterValue(e) => e.source(),
         }
@@ -307,7 +329,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
     fn as_serializable(&self) -> &dyn SerializableStruct {
         match self {
             Self::NotImplemented(e) => e,
-            Self::Modeled(e) => e.as_serializable(),
+            Self::Modeled(e) | Self::ModeledWithQueryCode { error: e, .. } => e.as_serializable(),
             Self::ValidationException(e) => e,
             Self::InvalidParameterValue(e) => e,
         }
@@ -316,7 +338,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
     fn variant_schema(&self) -> &'static Schema {
         match self {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
-            Self::Modeled(e) => e.variant_schema(),
+            Self::Modeled(e) | Self::ModeledWithQueryCode { error: e, .. } => e.variant_schema(),
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
             Self::InvalidParameterValue(_) => &INVALID_PARAMETER_VALUE_SCHEMA,
         }
@@ -329,7 +351,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
     fn shape_name(&self) -> &'static str {
         match self {
             Self::NotImplemented(_) => "NotImplemented",
-            Self::Modeled(e) => e.shape_name(),
+            Self::Modeled(e) | Self::ModeledWithQueryCode { error: e, .. } => e.shape_name(),
             Self::ValidationException(_) => "ValidationException",
             Self::InvalidParameterValue(_) => "InvalidParameterValue",
         }
@@ -342,7 +364,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
     fn http_status(&self) -> u16 {
         match self {
             Self::NotImplemented(_) => 501,
-            Self::Modeled(e) => e.http_status(),
+            Self::Modeled(e) | Self::ModeledWithQueryCode { error: e, .. } => e.http_status(),
             Self::ValidationException(_) => 400,
             Self::InvalidParameterValue(_) => 400,
         }
@@ -355,6 +377,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // envelope carries the signal on the query protocols too.
             Self::NotImplemented(_) => None,
             Self::Modeled(e) => e.query_error_code(),
+            // The code the service answers this refusal with, in place of the one the
+            // error shape is annotated with.
+            Self::ModeledWithQueryCode { query_code, .. } => Some(query_code),
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
             // Same reason again — and none is needed: the `<Code>` the query

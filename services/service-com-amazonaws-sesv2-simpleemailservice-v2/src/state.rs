@@ -3523,6 +3523,17 @@ pub fn configuration_set_not_found(configuration_set_name: &str) -> String {
     format!("Configuration set <{configuration_set_name}> does not exist.")
 }
 
+/// How this service words the refusal of a send whose configuration set has sending
+/// disabled (`SendingOptions$SendingEnabled` false, which
+/// `PutConfigurationSetSendingOptions` is what turns off).
+///
+/// One wording for every send path that resolves a `ConfigurationSetName`, so whichever
+/// send a client tries while the set is paused reports the pause in the same sentence.
+/// The set's name is the only variable part, taken from the request.
+pub fn configuration_set_sending_paused(configuration_set_name: &str) -> String {
+    format!("Sending is paused for configuration set {configuration_set_name}")
+}
+
 /// One dedicated IP pool: "a pool can include one or more dedicated IP addresses that
 /// are associated with your Amazon Web Services account"
 /// (`CreateDedicatedIpPool`'s own documentation).

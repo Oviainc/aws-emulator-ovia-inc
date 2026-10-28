@@ -93,6 +93,8 @@ mod ses_template_deletion;
 mod ses_template_listing;
 #[path = "all/ses_template_update.rs"]
 mod ses_template_update;
+#[path = "all/ses_tracking_options_conflict_refusal.rs"]
+mod ses_tracking_options_conflict_refusal;
 #[path = "all/ses_unverified_sender_refusal.rs"]
 mod ses_unverified_sender_refusal;
 #[path = "all/ses_unverified_sender_region.rs"]

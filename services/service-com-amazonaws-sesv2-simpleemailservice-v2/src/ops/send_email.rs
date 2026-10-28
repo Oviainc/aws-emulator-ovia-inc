@@ -2,11 +2,12 @@
 
 //! @op SendEmail
 //! Accepts an outbound message from a verified identity while the account's
-//! sending switch is on, appends it to this service's outbound-message log with a
-//! fresh unique `MessageId`, and bumps the account's send counters. A message that
-//! carries list-management options is resolved against the contact lists first, and
-//! its recipients become contacts of the list it belongs to. This is the
-//! ONLY file to touch for this operation.
+//! sending switch is on — and, where the message names a configuration set, while
+//! that set's own sending switch is on too — appends it to this service's
+//! outbound-message log with a fresh unique `MessageId`, and bumps the account's
+//! send counters. A message that carries list-management options is resolved
+//! against the contact lists first, and its recipients become contacts of the list
+//! it belongs to. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -337,6 +338,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+
+        // The configuration set the message names is a resource of this account, and
+        // the set's own sending switch (`SendingOptions$SendingEnabled`, which
+        // `PutConfigurationSetSendingOptions` writes and `GetConfigurationSet`
+        // reports) gates every message that uses that set: while it is off, a send
+        // naming the set has no ability to send, whatever the account-wide switch
+        // says. Both switches are read before the message is minted, so a send
+        // refused for either appends nothing to the log and mints no `MessageId`.
+        if let Some(set_name) = input.configuration_set_name.as_deref() {
+            let Some(configuration_set) = store.configuration_sets.get(set_name) else {
+                return Err(SendEmailErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::configuration_set_not_found(set_name)),
+                })
+                .into());
+            };
+            if !configuration_set.sending_enabled {
+                return Err(SendEmailErrorModeled::SendingPausedException(
+                    SendingPausedException {
+                        message: Some(crate::state::configuration_set_sending_paused(set_name)),
+                    },
+                )
+                .into());
+            }
         }
 
         // "The address that you specify has to be verified." An address identity

@@ -45,6 +45,8 @@ mod configuration_set_message_security;
 mod configuration_set_not_found_message;
 #[path = "all/configuration_set_sending_options.rs"]
 mod configuration_set_sending_options;
+#[path = "all/configuration_set_sending_pause.rs"]
+mod configuration_set_sending_pause;
 #[path = "all/configuration_set_sns_event_destinations.rs"]
 mod configuration_set_sns_event_destinations;
 #[path = "all/configuration_sets.rs"]
