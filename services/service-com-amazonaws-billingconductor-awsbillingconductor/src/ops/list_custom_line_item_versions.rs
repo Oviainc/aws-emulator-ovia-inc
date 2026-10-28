@@ -336,8 +336,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             selected.push((format!("{index:010}"), element(&item_arn, version, end)));
         }
 
-        let (custom_line_item_versions, next_token) =
-            crate::state::paginate(selected, input.next_token.as_deref(), input.max_results);
+        let (custom_line_item_versions, next_token) = crate::state::paginate(
+            &crate::state::page_scope_within(Self::NAME, &item_arn),
+            selected,
+            input.next_token.as_deref(),
+            input.max_results,
+        )
+        .map_err(ListCustomLineItemVersionsErrorModeled::ValidationException)?;
 
         Ok(ListCustomLineItemVersionsOutput {
             custom_line_item_versions: Some(custom_line_item_versions),
