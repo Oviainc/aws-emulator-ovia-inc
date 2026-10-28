@@ -4795,10 +4795,7 @@ pub fn read_taggable_arn(arn: &str, endpoint_region: &str) -> Result<TaggableRes
         )?));
     }
     if kind != ACTIVITY_RESOURCE {
-        return Err(invalid_arn_message(format!(
-            "Invalid ARN resource type: {kind}, expected {STATE_MACHINE_RESOURCE} or \
-             {ACTIVITY_RESOURCE}"
-        )));
+        return Err(resource_type_not_valid_message(kind));
     }
     Ok(TaggableResource::Activity(activity_resource(
         resource, &mut parts,
@@ -4841,9 +4838,7 @@ pub fn read_activity_arn(arn: &str, endpoint_region: &str) -> Result<String, Str
     let mut parts = resource.splitn(3, ':');
     let kind = parts.next().unwrap_or_default();
     if kind != ACTIVITY_RESOURCE {
-        return Err(invalid_arn_message(format!(
-            "Invalid ARN resource type: {kind}, expected {ACTIVITY_RESOURCE}"
-        )));
+        return Err(resource_type_not_valid_message(kind));
     }
     activity_resource(resource, &mut parts)
 }
@@ -5074,6 +5069,19 @@ pub const INVALID_TOKEN_DETAIL: &str = "Invalid token";
 /// differently.
 pub fn invalid_token_message() -> String {
     resource_error_message(INVALID_TOKEN, INVALID_TOKEN_DETAIL)
+}
+
+/// What the EXECUTION HISTORY answers for a pagination token it did not issue: the
+/// condition ALONE, with nothing quoted after it.
+///
+/// RECORDED text (`sfn.get-execution-history-invalid-token` records `Invalid Token`):
+/// the history cursor's refusal is the condition name and nothing more — no detail of
+/// the service's own and, as everywhere here, no echo of the token — where the paged
+/// lists of this API quote [`INVALID_TOKEN_DETAIL`] after it. Each operation words
+/// this refusal as the service words it for THAT operation, which is why there are
+/// two constructions and not one.
+pub fn invalid_history_token_message() -> String {
+    INVALID_TOKEN.to_string()
 }
 
 /// `TaskTimedOut`'s own condition name, as its message spells it, for
@@ -5508,6 +5516,20 @@ pub fn invalid_arn_message(diagnosis: String) -> String {
     format!("Invalid Arn: '{diagnosis}'")
 }
 
+/// What the modelled `InvalidArn` says about an ARN whose RESOURCE TYPE is not one
+/// the operation reading it accepts.
+///
+/// RECORDED text (`sfn.express-sync-failure-returns-a-result-not-an-error-with-billing-details`
+/// records `Invalid Arn: 'Resource type not valid in this context: express'` for a
+/// synchronous Express execution ARN handed to `GetExecutionHistory`): the service
+/// states that the type the ARN names is not valid HERE — it does not name the type
+/// the operation wanted — and the one value in the sentence is that type, read off
+/// the ARN the request carried. ONE construction, so every reader of an ARN in this
+/// service words that refusal the same way, whichever resource type it accepts.
+pub fn resource_type_not_valid_message(kind: &str) -> String {
+    invalid_arn_message(format!("Resource type not valid in this context: {kind}"))
+}
+
 /// The resource portion of `arn`, which must be the ARN of a resource of THIS
 /// service in `endpoint_region`, or the message the modelled `InvalidArn` carries.
 ///
@@ -5579,9 +5601,7 @@ pub fn read_state_machine_arn(arn: &str, endpoint_region: &str) -> Result<StateM
     let mut parts = resource.splitn(3, ':');
     let kind = parts.next().unwrap_or_default();
     if kind != STATE_MACHINE_RESOURCE {
-        return Err(invalid_arn_message(format!(
-            "Invalid ARN resource type: {kind}, expected {STATE_MACHINE_RESOURCE}"
-        )));
+        return Err(resource_type_not_valid_message(kind));
     }
     state_machine_resource(arn, &mut parts)
 }
@@ -5594,9 +5614,7 @@ pub fn read_execution_arn(arn: &str, endpoint_region: &str) -> Result<(String, S
     let mut parts = resource.splitn(3, ':');
     let kind = parts.next().unwrap_or_default();
     if kind != EXECUTION_RESOURCE {
-        return Err(invalid_arn_message(format!(
-            "Invalid ARN resource type: {kind}, expected {EXECUTION_RESOURCE}"
-        )));
+        return Err(resource_type_not_valid_message(kind));
     }
     let state_machine = parts.next().unwrap_or_default();
     let execution = parts.next().unwrap_or_default();
@@ -5619,9 +5637,7 @@ pub fn read_map_run_arn(arn: &str, endpoint_region: &str) -> Result<(), String> 
     let mut parts = resource.splitn(2, ':');
     let kind = parts.next().unwrap_or_default();
     if kind != MAP_RUN_RESOURCE {
-        return Err(invalid_arn_message(format!(
-            "Invalid ARN resource type: {kind}, expected {MAP_RUN_RESOURCE}"
-        )));
+        return Err(resource_type_not_valid_message(kind));
     }
     if parts.next().is_none_or(str::is_empty) {
         return Err(invalid_arn_message(format!(
