@@ -7,8 +7,9 @@
 //! then makes the underlying service calls to provision your resources" — so the stack's view
 //! and the owning service's view of the resource cannot disagree, and a client that deploys a
 //! database by template can address it through that service's own API afterwards. Deleting
-//! the stack deletes it again, and a resource the owning service refuses leaves the stack in
-//! `*_FAILED` with that refusal as the reason, never in `*_COMPLETE`.
+//! the stack deletes it again, and a resource the owning service refuses fails the stack's
+//! operation with that refusal as the reason — a failed create rolled back and a failed update
+//! undone — never a `*_COMPLETE` reporting work that service rejected.
 //!
 //! The types here are `AWS::RDS::DBInstance` (whose documented `Ref` return value is the
 //! `DBInstanceIdentifier`), the `AWS::RDS::DBSubnetGroup` a DB instance's
@@ -1152,9 +1153,9 @@ async fn an_updated_declaration_changes_the_groups_parameters_in_rds() {
     }
 }
 
-/// A value Amazon RDS refuses leaves the update FAILED with that service's own refusal as the
-/// resource's reason, and leaves the group carrying the value that was in force — never a
-/// stack that completed while the write was rejected.
+/// A value Amazon RDS refuses fails the update — with that service's own refusal as the
+/// resource's reason — and the failed update is rolled back, leaving the group carrying the
+/// value that was in force; never a stack that completed while the write was rejected.
 #[tokio::test]
 async fn a_parameter_value_rds_refuses_fails_the_update_and_leaves_the_group_unchanged() {
     let router = router();
@@ -1208,13 +1209,13 @@ async fn a_parameter_value_rds_refuses_fails_the_update_and_leaves_the_group_unc
     wait_for_the_transition().await;
 
     let (_, described) = describe_stack(&router, case.stack_name).await;
-    // The refusal came on the first resource the update asked anything of, so nothing was
-    // changed in any service and the previous configuration is the one in force: the stack
-    // stops at the failure rather than reporting a completed update.
+    // The refusal came on the first resource the update asked anything of, so the rollback
+    // has nothing to put back — and the stack still goes through the rollback: a failed
+    // update is undone, which is the terminal status a client waiting on one reads.
     assert_eq!(
         xml_text(&described, "StackStatus").as_deref(),
-        Some(status::UPDATE_FAILED),
-        "case {:?}: a refused change must fail the update, got {described}",
+        Some(status::UPDATE_ROLLBACK_COMPLETE),
+        "case {:?}: a refused change must fail the update and roll it back, got {described}",
         case.case
     );
     // WHY it failed is the resource's own diagnosis: the refusal Amazon RDS answered.

@@ -648,9 +648,9 @@ async fn an_update_that_drops_a_declared_property_is_refused_rather_than_dropped
     .await;
     assert_eq!(
         xml_text(&body, "StackStatus").as_deref(),
-        Some("UPDATE_FAILED"),
-        "case {case:?}: expected the update to be refused rather than silently dropped, got \
-         {body}"
+        Some("UPDATE_ROLLBACK_COMPLETE"),
+        "case {case:?}: expected the update to be refused and rolled back rather than \
+         silently dropped, got {body}"
     );
     // The STACK's reason summarises which resource the update failed on; the property it
     // will not reset is that resource's own diagnosis, on its event.

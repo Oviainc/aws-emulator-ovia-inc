@@ -1192,11 +1192,13 @@ async fn an_update_that_would_change_an_existing_resource_in_place_fails_the_sta
     tokio::time::sleep(PAST_BOTH_SPANS).await;
 
     let body = describe_stack(&router, case, stack_name).await;
+    // The refused change fails the update, and a failed update is ROLLED BACK: rollback is at
+    // its default here, so the stack's terminal status is the rolled-back one.
     assert_eq!(
         xml_text(&body, "StackStatus").as_deref(),
-        Some("UPDATE_FAILED"),
-        "case {case:?}: expected the update to fail rather than drop the caller's change, \
-         got {body}"
+        Some("UPDATE_ROLLBACK_COMPLETE"),
+        "case {case:?}: expected the update to fail and roll back rather than drop the \
+         caller's change, got {body}"
     );
     // The STACK's reason summarises which resource the update failed on; the change it
     // will not make is that resource's own diagnosis, on its event.

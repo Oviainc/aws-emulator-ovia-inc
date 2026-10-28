@@ -274,10 +274,13 @@ async fn a_failed_update_reports_the_summary_sentence_alone() {
     wait_for_the_transition().await;
 
     let (_, described) = describe_stack(&router, stack).await;
+    // The refused change failed the update, and a failed update is rolled back: the stack's
+    // terminal status is the rolled-back one, still carrying the failure's own reason.
     assert_eq!(
         xml_text(&described, "StackStatus").as_deref(),
-        Some(status::UPDATE_FAILED),
-        "case {case:?}: expected the refused change to fail the update, got {described}"
+        Some(status::UPDATE_ROLLBACK_COMPLETE),
+        "case {case:?}: expected the refused change to fail the update and roll it back, got \
+         {described}"
     );
     let reason = xml_text(&described, "StackStatusReason").unwrap_or_default();
     let expected = resource_failure_summary(failed_action::UPDATE, ["Store"]);
