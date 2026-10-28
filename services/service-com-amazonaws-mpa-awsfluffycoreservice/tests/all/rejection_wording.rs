@@ -12,7 +12,9 @@
 //!    called and whichever ARN it was given, so the refusal names nothing the request
 //!    carried. The rows cross the operations that resolve a resource by ARN with ARNs
 //!    that resolve to nothing, varied along the resource name (shortest, longest,
-//!    punctuated), the region and the resource kind. `GetResourcePolicy` additionally
+//!    punctuated), the region, the partition, the resource kind (a team, a policy, one
+//!    version of a policy) and, where the ARN carries one, the version qualifier.
+//!    `GetResourcePolicy` additionally
 //!    resolves its `ResourceArn` BEFORE it matches `PolicyName`/`PolicyType`, so its
 //!    answer for an unrecorded resource is byte-identical across the whole product of
 //!    those two members.
@@ -143,14 +145,28 @@ enum Lookup {
     UpdateApprovalTeam,
     StartActiveApprovalTeamDeletion,
     ListPolicyVersions,
+    GetPolicyVersion,
     GetResourcePolicy,
 }
 
+/// The kind of ARN an operation of the table addresses, which is what decides the shape
+/// of the ARNs its rows carry: a team ARN, a policy's own unqualified ARN, or a policy
+/// ARN qualified by a version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Addressed {
+    Team,
+    Policy,
+    PolicyVersion,
+}
+
 impl Lookup {
-    /// Whether this operation addresses an approval team (as opposed to a policy), which
-    /// is what decides the shape of the ARNs its rows carry.
-    fn addresses_a_team(self) -> bool {
-        self != Lookup::ListPolicyVersions
+    /// What this operation resolves its ARN against.
+    fn addresses(self) -> Addressed {
+        match self {
+            Lookup::ListPolicyVersions => Addressed::Policy,
+            Lookup::GetPolicyVersion => Addressed::PolicyVersion,
+            _ => Addressed::Team,
+        }
     }
 }
 
@@ -176,6 +192,11 @@ async fn lookup(harness: &Harness, op: Lookup, arn: &str) -> (u16, Value) {
         Lookup::ListPolicyVersions => {
             harness
                 .call("POST", &format!("/policies/{label}/?List"), None)
+                .await
+        }
+        Lookup::GetPolicyVersion => {
+            harness
+                .call("GET", &format!("/policy-versions/{label}"), None)
                 .await
         }
         Lookup::GetResourcePolicy => {
@@ -232,6 +253,47 @@ fn unrecorded_policy_arns() -> Vec<(String, String)> {
     ]
 }
 
+/// Qualified policy ARNs that satisfy `QualifiedPolicyArn`'s pattern and name no version
+/// the catalog holds. Rows differ along the version qualifier (a version id the policy
+/// does not hold, a multi-digit one, `$DEFAULT`), the policy name and category, and the
+/// partition.
+fn unrecorded_policy_version_arns() -> Vec<(String, String)> {
+    let seeded = state::policy_arn(SEEDED_POLICY.0, SEEDED_POLICY.1);
+    vec![
+        (
+            "a version the seeded policy does not hold".to_string(),
+            state::policy_version_arn(&seeded, 2),
+        ),
+        (
+            "a multi-digit version past every one held".to_string(),
+            state::policy_version_arn(&seeded, 4096),
+        ),
+        (
+            "a policy name no catalog entry carries".to_string(),
+            state::policy_version_arn(&state::policy_arn(SEEDED_POLICY.0, "NeverSeeded"), 1),
+        ),
+        (
+            "a category no catalog entry carries".to_string(),
+            state::policy_version_arn(&state::policy_arn("NoSuchCategory", SEEDED_POLICY.1), 1),
+        ),
+        (
+            "the default qualifier of a policy no catalog entry carries".to_string(),
+            format!(
+                "{}/{}",
+                state::policy_arn(SEEDED_POLICY.0, "NeverSeeded"),
+                state::DEFAULT_POLICY_VERSION
+            ),
+        ),
+        (
+            "the seeded policy's first version in another partition".to_string(),
+            format!(
+                "arn:aws-us-gov:mpa:::aws:policy/{}/{}/1",
+                SEEDED_POLICY.0, SEEDED_POLICY.1
+            ),
+        ),
+    ]
+}
+
 /// Rule 1: the answer to a resource lookup that resolves to nothing is 404
 /// `ResourceNotFoundException` with ONE service-wide message, identical across every
 /// operation and every ARN.
@@ -247,6 +309,7 @@ async fn every_resource_lookup_that_resolves_to_nothing_answers_the_same_message
         Lookup::UpdateApprovalTeam,
         Lookup::StartActiveApprovalTeamDeletion,
         Lookup::ListPolicyVersions,
+        Lookup::GetPolicyVersion,
         Lookup::GetResourcePolicy,
     ];
 
@@ -255,10 +318,10 @@ async fn every_resource_lookup_that_resolves_to_nothing_answers_the_same_message
     let mut answers: BTreeSet<(u16, String, String)> = BTreeSet::new();
 
     for op in operations {
-        let rows = if op.addresses_a_team() {
-            unrecorded_team_arns()
-        } else {
-            unrecorded_policy_arns()
+        let rows = match op.addresses() {
+            Addressed::Team => unrecorded_team_arns(),
+            Addressed::Policy => unrecorded_policy_arns(),
+            Addressed::PolicyVersion => unrecorded_policy_version_arns(),
         };
         for (case, arn) in rows {
             let case = format!("{op:?} / {case}");

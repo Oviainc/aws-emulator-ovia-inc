@@ -15,12 +15,17 @@
 //! pass it.
 //!
 //! The table spans the class the rule generalises over: which operation answers
-//! (`CreateApprovalTeam`, `UpdateApprovalTeam`, `GetPolicyVersion`, `ListSessions`),
-//! which error shape carries the message (`ValidationException` 400,
-//! `ResourceNotFoundException` 404), which member is quoted back, and — the thing the
-//! bound keys on — how long that value is: an ordinary short value (the message names it
-//! in full and is NOT cut), a value at its member's published maximum, and a value just
-//! short of and just past the length that makes the message overflow.
+//! (`CreateApprovalTeam`, `UpdateApprovalTeam`, `ListSessions`), which member is quoted
+//! back, and — the thing the bound keys on — how long that value is: an ordinary short
+//! value (the message names it in full and is NOT cut), a value at its member's published
+//! maximum, and a value just short of and just past the length that makes the message
+//! overflow.
+//!
+//! `GetPolicyVersion` rows (`ResourceNotFoundException` 404, beside the
+//! `ValidationException` 400 the other rows carry) are the CONTROL: a refusal this service
+//! states with a fixed sentence quotes nothing the request carried, so its message is the
+//! same length whatever the value was — the bound is a property of the messages BUILT from
+//! a request, not of every refusal.
 //!
 //! Every request goes over the wire through the `MultiServiceRouter` the harness in
 //! `approval_team_lifecycle.rs` mounts, so the route, the URI bindings, the error envelope
@@ -129,7 +134,9 @@ enum Probe {
     /// `UpdateApprovalTeam$Approvers` naming one identity twice — the same refusal, from
     /// the other write path that takes an approver list.
     UpdateRepeatedIdentity { id: String, source: String },
-    /// `GetPolicyVersion` for a reference the catalog holds no version for.
+    /// `GetPolicyVersion` for a reference the catalog holds no version for: the control,
+    /// whose message is this service's fixed not-found sentence and therefore quotes none
+    /// of the reference.
     AbsentPolicyVersion(String),
     /// `ListSessions` filtering `SessionStatus` on a value the enum does not declare.
     UnknownStatusFilter(String),
@@ -150,9 +157,7 @@ impl Probe {
                 "Approvers names the same identity more than once ({id} from {source}); each \
                  approver must be a distinct identity."
             ),
-            Self::AbsentPolicyVersion(reference) => {
-                format!("No policy version found for ARN '{reference}'.")
-            }
+            Self::AbsentPolicyVersion(_) => state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
             Self::UnknownStatusFilter(value) => format!(
                 "Filters[0].Value '{value}' is not a status a session can be in; the \
                  SessionStatus filter accepts {}.",
@@ -248,7 +253,8 @@ impl Probe {
 }
 
 /// The table: the same rule, over four operations, two error shapes, and values from an
-/// ordinary length up to each member's published maximum.
+/// ordinary length up to each member's published maximum, plus the control rows whose
+/// refusal is a fixed sentence that quotes nothing.
 fn cases() -> Vec<(String, Probe)> {
     // The length of reference that lands a refusal exactly ON the bound, derived from the
     // sentence the rule words rather than written out, so the rows either side of the
@@ -316,11 +322,12 @@ fn cases() -> Vec<(String, Probe)> {
             },
         ),
         (
-            "a policy version reference of ordinary length".to_string(),
+            "the control: a policy version reference of ordinary length".to_string(),
             Probe::AbsentPolicyVersion(absent_policy_reference(70)),
         ),
         (
-            "a policy version reference at QualifiedPolicyArn's maximum".to_string(),
+            "the control: a policy version reference at QualifiedPolicyArn's maximum"
+                .to_string(),
             Probe::AbsentPolicyVersion(absent_policy_reference(1224)),
         ),
         (
