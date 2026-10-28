@@ -18,7 +18,10 @@
 //!    an instance id that resolves to no instance, a location or an Outpost this emulator
 //!    has none of, a value outside a modelled enum's catalog (refused by the enum itself,
 //!    one step before the handler), and a `DryRun` that reports whether the call would have
-//!    worked.
+//!    worked;
+//! 5. EVERY LAUNCH GIVES ITS INSTANCE ONE EBS ROOT VOLUME for the set to cover — off the
+//!    AMI's root block device mapping where the account can see that AMI, and off the
+//!    crate's default EBS-backed Linux image where it cannot.
 //!
 //! Each table row is a distinct input along what the rule generalises over — how many
 //! volumes the instance holds, each one's size and encryption state, which exclusion names
@@ -36,9 +39,10 @@ use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 
 use ec2::state::{
-    ComAmazonawsEc2Amazonec2State as Ec2State, MAX_EXCLUDED_DATA_VOLUME_IDS,
-    SNAPSHOT_PROGRESS_COMPLETED, SNAPSHOT_PROGRESS_PENDING, SNAPSHOT_STATE_COMPLETED,
-    SNAPSHOT_STATE_PENDING, SNAPSHOT_STORAGE_TIER_STANDARD, SnapshotView,
+    ComAmazonawsEc2Amazonec2State as Ec2State, LINUX_ROOT_DEVICE_NAME, LINUX_ROOT_VOLUME_SIZE,
+    MAX_EXCLUDED_DATA_VOLUME_IDS, SNAPSHOT_PROGRESS_COMPLETED, SNAPSHOT_PROGRESS_PENDING,
+    SNAPSHOT_STATE_COMPLETED, SNAPSHOT_STATE_PENDING, SNAPSHOT_STORAGE_TIER_STANDARD,
+    SnapshotView, WINDOWS_ROOT_DEVICE_NAME,
 };
 
 use super::ec2_query::{element, elements, error_code, error_message};
@@ -57,10 +61,18 @@ type TagRow = (&'static str, Params, Vec<(&'static str, &'static str)>);
 const UNKNOWN_INSTANCE_ID: &str = "i-0123456789abcdef0";
 
 /// An AMI id of the long form that no image of the account carries. A launch does not
-/// resolve the image it names, so an instance launched from this one has no published root
-/// device and therefore no root volume: the volumes it holds are exactly the ones a row
-/// attaches.
+/// resolve the image it names, so an instance launched from this one is still stored — and
+/// still gets the ONE root volume every launch creates, off the crate's default EBS-backed
+/// Linux image rather than off a mapping no image published.
 const UNKNOWN_AMI: &str = "ami-0123456789abcdef0";
+
+/// The `InstanceSpecification` field that drops the instance's boot volume from the set, for
+/// the tables whose subject is something other than which volumes the set covers: every
+/// instance holds the root volume its launch gave it, so excluding it leaves exactly the
+/// volumes the row attached.
+fn exclude_boot_volume() -> (String, String) {
+    p("InstanceSpecification.ExcludeBootVolume", "true")
+}
 
 /// One `action` call signed for the Region the suite works in.
 async fn op(
@@ -170,6 +182,123 @@ fn instance_spec(instance_id: &str) -> Params {
     vec![p("InstanceSpecification.InstanceId", instance_id)]
 }
 
+/// The text of the `name` child element of `node`, or the empty string when it has none.
+fn child_text(node: roxmltree::Node<'_, '_>, name: &str) -> String {
+    node.children()
+        .find(|child| child.is_element() && child.tag_name().name() == name)
+        .and_then(|child| child.text())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// One Amazon-published AMI of the catalog, read over the wire: `(image id, root device
+/// name, root volume size, root snapshot id)` — the facts a launch from it restores its root
+/// volume from, so a row names no image id and no size of its own. `narrowing` picks the
+/// image a row wants out of the catalog; the FIRST image reported is the one answered.
+async fn published_image(
+    router: &MultiServiceRouter,
+    case: &str,
+    narrowing: &[(&str, &[&str])],
+) -> (String, String, String, String) {
+    let mut params = super::ec2_query::filters(narrowing);
+    params.push(p("Owner.1", "amazon"));
+    let (status, body) = op(router, "DescribeImages", &params).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: DescribeImages must succeed, got {status} with body {body}"
+    );
+    let document = super::wire::document(case, &body);
+    let image = document
+        .root_element()
+        .children()
+        .find(|node| node.is_element() && node.tag_name().name() == "imagesSet")
+        .and_then(|set| set.children().find(roxmltree::Node::is_element))
+        .unwrap_or_else(|| panic!("case {case:?}: the account must see a matching AMI: {body}"));
+    let ebs = image
+        .children()
+        .find(|node| node.is_element() && node.tag_name().name() == "blockDeviceMapping")
+        .and_then(|set| set.children().find(roxmltree::Node::is_element))
+        .and_then(|mapping| {
+            mapping
+                .children()
+                .find(|node| node.is_element() && node.tag_name().name() == "ebs")
+        })
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: an EBS-backed AMI publishes a root mapping: {body}")
+        });
+    let answered = (
+        child_text(image, "imageId"),
+        child_text(image, "rootDeviceName"),
+        child_text(ebs, "volumeSize"),
+        child_text(ebs, "snapshotId"),
+    );
+    assert!(
+        !answered.0.is_empty() && !answered.1.is_empty() && !answered.2.is_empty(),
+        "case {case:?}: the AMI must publish its id, root device and root volume size: {body}"
+    );
+    answered
+}
+
+/// Every volume `DescribeVolumes` reports as the instance's, as `(volume id, size,
+/// encrypted, device)` in the order the report carried them.
+async fn volumes_of(
+    router: &MultiServiceRouter,
+    case: &str,
+    instance_id: &str,
+) -> Vec<(String, i32, bool, String)> {
+    let (status, body) = op(
+        router,
+        "DescribeVolumes",
+        &super::ec2_query::filters(&[("attachment.instance-id", &[instance_id])]),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: DescribeVolumes must succeed, got {status} with body {body}"
+    );
+    let document = super::wire::document(case, &body);
+    document
+        .root_element()
+        .children()
+        .filter(|node| node.is_element() && node.tag_name().name() == "volumeSet")
+        .flat_map(|set| set.children().filter(roxmltree::Node::is_element))
+        .map(|volume| {
+            let device = volume
+                .children()
+                .find(|node| node.is_element() && node.tag_name().name() == "attachmentSet")
+                .and_then(|set| set.children().find(roxmltree::Node::is_element))
+                .map(|attachment| child_text(attachment, "device"))
+                .unwrap_or_default();
+            (
+                child_text(volume, "volumeId"),
+                child_text(volume, "size").parse::<i32>().unwrap_or_else(|_| {
+                    panic!("case {case:?}: a volume reports its size in GiB: {body}")
+                }),
+                child_text(volume, "encrypted") == "true",
+                device,
+            )
+        })
+        .collect()
+}
+
+/// The ONE volume the LAUNCH gave `instance_id`, as `(volume id, size, encrypted)`: every
+/// launch of this emulator creates exactly one root volume, so a snapshot set of the
+/// instance covers it unless the request excludes it.
+async fn launched_root_volume(
+    router: &MultiServiceRouter,
+    case: &str,
+    instance_id: &str,
+) -> (String, i32, bool) {
+    let reported = volumes_of(router, case, instance_id).await;
+    assert_eq!(
+        reported.len(),
+        1,
+        "case {case:?}: the launch gives the instance exactly one volume, got {reported:?}"
+    );
+    let (volume_id, size, encrypted, _) = reported[0].clone();
+    (volume_id, size, encrypted)
+}
+
 /// Every snapshot id the store holds, in store order.
 fn stored_snapshot_ids(engine: &engine::InMemoryEngine) -> Vec<String> {
     let store = engine.state::<Ec2State>();
@@ -189,21 +318,22 @@ fn stored_snapshot(engine: &engine::InMemoryEngine, snapshot_id: &str) -> Snapsh
 }
 
 /// RULE 1: one snapshot per volume the instance holds an attachment of, each read off that
-/// volume. The rows differ in how many volumes the instance holds and in each volume's size
-/// and encryption state, and every row also holds an unattached volume and a volume of
-/// another instance, neither of which may ever be snapshotted.
+/// volume. The rows differ in how many DATA volumes the instance holds beside the root volume
+/// its launch created, and in each volume's size and encryption state; every row also holds
+/// an unattached volume and another instance (with a root volume of its own), none of which
+/// may ever be snapshotted.
 #[tokio::test]
 async fn one_snapshot_is_made_of_every_volume_the_instance_holds() {
-    // `(case, the attached volumes as (size, encrypted))`
+    // `(case, the attached data volumes as (size, encrypted))`
     let rows: Vec<(&str, Vec<(i32, bool)>)> = vec![
-        ("an instance holding no volume", vec![]),
-        ("one unencrypted volume", vec![(8, false)]),
+        ("an instance holding only its root volume", vec![]),
+        ("one unencrypted data volume", vec![(8, false)]),
         (
-            "two volumes of different sizes, one of them encrypted",
+            "two data volumes of different sizes, one of them encrypted",
             vec![(1, false), (16, true)],
         ),
         (
-            "three volumes, every one a different size",
+            "three data volumes, every one a different size",
             vec![(4, true), (32, false), (125, true)],
         ),
     ];
@@ -214,15 +344,19 @@ async fn one_snapshot_is_made_of_every_volume_the_instance_holds() {
         let other_instance_id = launch_from(&router, UNKNOWN_AMI).await;
 
         // What the instance holds, as (volume id, size, encrypted), in the id order the
-        // store walks — which is the order the answer reports them in.
-        let mut held: Vec<(String, i32, bool)> = Vec::new();
+        // store walks — which is the order the answer reports them in. The launch's own root
+        // volume is one of them, read back over the wire rather than written here.
+        let mut held: Vec<(String, i32, bool)> =
+            vec![launched_root_volume(&router, case, &instance_id).await];
         for (size, encrypted) in &attached {
             let volume_id = create_volume(&router, *size, *encrypted).await;
             attach_in_store(&engine, &volume_id, &instance_id, "/dev/sdf");
             held.push((volume_id, *size, *encrypted));
         }
         held.sort_by(|left, right| left.0.cmp(&right.0));
-        // Neither of these is the instance's, so neither may be snapshotted.
+        // None of these is the instance's, so none may be snapshotted: a volume attached to
+        // nothing, one of another instance, and that instance's own root volume.
+        let (other_root, _, _) = launched_root_volume(&router, case, &other_instance_id).await;
         let unattached = create_volume(&router, 64, false).await;
         let other_volume = create_volume(&router, 2, false).await;
         attach_in_store(&engine, &other_volume, &other_instance_id, "/dev/sdf");
@@ -239,7 +373,8 @@ async fn one_snapshot_is_made_of_every_volume_the_instance_holds() {
         assert_eq!(
             reported.len(),
             held.len(),
-            "case {case:?}: expected one snapshot per attached volume ({}), got {:?}",
+            "case {case:?}: expected one snapshot per volume the instance holds ({}), got \
+             {:?}",
             held.len(),
             reported
         );
@@ -254,10 +389,12 @@ async fn one_snapshot_is_made_of_every_volume_the_instance_holds() {
             "case {case:?}: the snapshots name the instance's own volumes, got {body}"
         );
         assert!(
-            !reported
-                .iter()
-                .any(|snapshot| [unattached.as_str(), other_volume.as_str()]
-                    .contains(&snapshot.member("volumeId"))),
+            !reported.iter().any(|snapshot| [
+                unattached.as_str(),
+                other_volume.as_str(),
+                other_root.as_str()
+            ]
+            .contains(&snapshot.member("volumeId"))),
             "case {case:?}: no volume of another instance and no unattached volume is \
              snapshotted, got {body}"
         );
@@ -350,42 +487,8 @@ async fn the_exclusions_narrow_the_set_and_the_root_volume_is_not_a_data_volume(
 
     // One AMI the account can see, and the root device and size it publishes: the facts the
     // launch's root volume is restored from, read off the image rather than written here.
-    let (status, images) = op(&router, "DescribeImages", &[p("Owner.1", "amazon")]).await;
-    assert_eq!(
-        status, 200,
-        "DescribeImages must succeed, got {status} with body {images}"
-    );
-    let document = super::wire::document("the published catalog", &images);
-    let image = document
-        .root_element()
-        .children()
-        .find(|node| node.is_element() && node.tag_name().name() == "imagesSet")
-        .and_then(|set| set.children().find(roxmltree::Node::is_element))
-        .unwrap_or_else(|| panic!("the account must see at least one AMI: {images}"));
-    let child_text = |node: roxmltree::Node, name: &str| {
-        node.children()
-            .find(|child| child.is_element() && child.tag_name().name() == name)
-            .and_then(|child| child.text())
-            .unwrap_or_default()
-            .to_string()
-    };
-    let image_id = child_text(image, "imageId");
-    let root_device = child_text(image, "rootDeviceName");
-    let root_mapping = image
-        .children()
-        .find(|node| node.is_element() && node.tag_name().name() == "blockDeviceMapping")
-        .and_then(|set| set.children().find(roxmltree::Node::is_element))
-        .unwrap_or_else(|| panic!("an EBS-backed AMI publishes a root mapping: {images}"));
-    let ebs = root_mapping
-        .children()
-        .find(|node| node.is_element() && node.tag_name().name() == "ebs")
-        .unwrap_or_else(|| panic!("the root mapping carries its EBS parameters: {images}"));
-    let root_size = child_text(ebs, "volumeSize");
-    let root_snapshot = child_text(ebs, "snapshotId");
-    assert!(
-        !image_id.is_empty() && !root_device.is_empty() && !root_size.is_empty(),
-        "the catalog AMI must publish its id, root device and root volume size: {images}"
-    );
+    let (image_id, root_device, root_size, root_snapshot) =
+        published_image(&router, "the published catalog", &[]).await;
 
     let instance_id = launch_from(&router, &image_id).await;
 
@@ -622,7 +725,10 @@ async fn the_snapshots_carry_the_requested_tags_and_optionally_the_volumes_own()
     ];
 
     for (case, tags, expected) in rows {
+        // The subject here is the TAGS, so the boot volume the launch created is excluded
+        // and every snapshot of the set is of the one tagged volume.
         let mut params = instance_spec(&instance_id);
+        params.push(exclude_boot_volume());
         params.extend(tags);
         let (status, body) = op(&router, "CreateSnapshots", &params).await;
         assert_eq!(
@@ -633,7 +739,7 @@ async fn the_snapshots_carry_the_requested_tags_and_optionally_the_volumes_own()
         assert_eq!(
             reported.len(),
             1,
-            "case {case:?}: the instance holds one volume, got {body}"
+            "case {case:?}: the instance holds one data volume, got {body}"
         );
         let expected: Vec<(String, String)> = expected
             .iter()
@@ -861,8 +967,119 @@ async fn a_request_that_cannot_be_served_is_refused_and_stores_nothing() {
     );
     assert_eq!(
         stored_snapshot_ids(&engine).len(),
-        1,
-        "exactly one snapshot was stored, got {:?}",
+        2,
+        "one snapshot per volume the instance holds — its root volume and the attached \
+         one — was stored, got {:?}",
         stored_snapshot_ids(&engine)
     );
+}
+
+/// RULE 5: EVERY launch gives its instance exactly one EBS root volume, and the snapshot set
+/// of that instance covers it — the device and the size come off the AMI's root block device
+/// mapping when the account can see that AMI, and off the crate's default EBS-backed Linux
+/// image when it cannot, so no instance this emulator stores is one whose volumes a snapshot
+/// call cannot find. The rows differ in the AMI the launch named: the published Linux catalog
+/// image, the published Windows one (a different root device and a bigger root volume) and an
+/// id no image of the account has.
+#[tokio::test]
+async fn every_launch_gets_one_root_volume_the_snapshot_set_covers() {
+    let (router, _engine) = emulator();
+
+    // What each catalog AMI publishes, read over the wire, so no row writes a size of its
+    // own. The default row's device and size are the crate's constants for a published Linux
+    // image ([`LINUX_ROOT_DEVICE_NAME`], [`LINUX_ROOT_VOLUME_SIZE`]) — the one definition the
+    // catalog rows above are built from too.
+    let (linux_image, linux_device, linux_size, _) = published_image(
+        &router,
+        "the published Linux image",
+        &[("root-device-name", &[LINUX_ROOT_DEVICE_NAME])],
+    )
+    .await;
+    let (windows_image, windows_device, windows_size, _) = published_image(
+        &router,
+        "the published Windows image",
+        &[("root-device-name", &[WINDOWS_ROOT_DEVICE_NAME])],
+    )
+    .await;
+    let gib = |case: &str, size: &str| -> i32 {
+        size.parse()
+            .unwrap_or_else(|_| panic!("case {case:?}: a published size is a number: {size:?}"))
+    };
+
+    // `(case, the AMI the launch names, the device its root volume sits at, its size in GiB)`
+    let rows: Vec<(&str, String, String, i32)> = vec![
+        (
+            "a published Linux AMI",
+            linux_image,
+            linux_device,
+            gib("a published Linux AMI", &linux_size),
+        ),
+        (
+            "a published Windows AMI",
+            windows_image,
+            windows_device,
+            gib("a published Windows AMI", &windows_size),
+        ),
+        (
+            "an AMI the account cannot see",
+            UNKNOWN_AMI.to_string(),
+            LINUX_ROOT_DEVICE_NAME.to_string(),
+            LINUX_ROOT_VOLUME_SIZE,
+        ),
+    ];
+
+    for (case, image_id, device, size) in rows {
+        let instance_id = launch_from(&router, &image_id).await;
+
+        // The launch created exactly one volume, and `DescribeVolumes` reports it as the
+        // instance's: the wire read-back of what the launch stored.
+        let held = volumes_of(&router, case, &instance_id).await;
+        assert_eq!(
+            held.len(),
+            1,
+            "case {case:?}: the launch gives the instance exactly one volume, got {held:?}"
+        );
+        let (volume_id, reported_size, encrypted, reported_device) = held[0].clone();
+        assert_eq!(
+            (reported_device.as_str(), reported_size, encrypted),
+            (device.as_str(), size, false),
+            "case {case:?}: expected a {size} GiB unencrypted volume at {device}, got {held:?}"
+        );
+
+        // The snapshot set of the instance is exactly that volume, sized off it.
+        let (status, body) = op(&router, "CreateSnapshots", &instance_spec(&instance_id)).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} with body {body}"
+        );
+        let reported = reported_snapshots(case, &body);
+        assert_eq!(
+            reported
+                .iter()
+                .map(|snapshot| snapshot.member("volumeId").to_string())
+                .collect::<Vec<String>>(),
+            vec![volume_id.clone()],
+            "case {case:?}: expected one snapshot of {volume_id}, got {body}"
+        );
+        assert_eq!(
+            reported[0].member("volumeSize"),
+            size.to_string(),
+            "case {case:?}: the snapshot is sized off the volume, got {body}"
+        );
+
+        // And that volume is the BOOT volume, so the exclusion drops it: the device the
+        // launch used is the one `ExcludeBootVolume` is about.
+        let mut params = instance_spec(&instance_id);
+        params.push(exclude_boot_volume());
+        let (status, body) = op(&router, "CreateSnapshots", &params).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} with body {body}"
+        );
+        assert!(
+            reported_snapshots(case, &body).is_empty(),
+            "case {case:?}: the instance holds nothing but its boot volume, so excluding it \
+             leaves no snapshot to make, got {body}"
+        );
+    }
 }
