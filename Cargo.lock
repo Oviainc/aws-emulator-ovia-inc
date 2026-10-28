@@ -9394,6 +9394,7 @@ dependencies = [
  "bytes",
  "hex",
  "http",
+ "percent-encoding",
  "serde_json",
  "service-com-amazonaws-cloudwatchlogs-logs-20140328",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",

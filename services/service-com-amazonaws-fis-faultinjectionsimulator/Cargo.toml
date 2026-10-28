@@ -44,6 +44,9 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# RFC 3986 percent-encoding, so the untag suite can put a tag key carrying a space, a
+# `+` or a non-ASCII character in the `tagKeys` query string the way a client does.
+percent-encoding = "2.3"
 # The experiment-logging and experiment-report suites mount CloudWatch Logs and Amazon S3
 # beside FIS on one engine, because a started experiment delivers its log records to them
 # and an ended experiment's report is written to object storage — what the assembled
