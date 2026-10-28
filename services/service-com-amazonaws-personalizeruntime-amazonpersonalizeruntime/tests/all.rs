@@ -21,6 +21,8 @@ mod filter_value_quoting;
 mod inference;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
+#[path = "all/request_only_refusal_order.rs"]
+mod request_only_refusal_order;
 #[path = "all/score_denominator.rs"]
 mod score_denominator;
 #[path = "all/state_roundtrip.rs"]

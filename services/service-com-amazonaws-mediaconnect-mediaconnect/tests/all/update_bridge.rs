@@ -205,17 +205,27 @@ fn update_cases() -> Vec<UpdateCase> {
         },
         UpdateCase {
             case: "egress bridge, SourcePriority and State together, window untouched",
-            create: egress("bridge-egress-priority", Some(stored_failover.clone())),
+            // The bridge starts with no source priority at all, so this row writes one —
+            // naming the source the bridge has, because `SourcePriority$PrimarySource` is
+            // "the name of the source you choose as the primary source".
+            create: egress(
+                "bridge-egress-priority",
+                Some(json!({
+                    "failoverMode": "FAILOVER",
+                    "state": mc::STATE_ENABLED,
+                    "recoveryWindow": 4_000,
+                })),
+            ),
             update: json!({ "sourceFailoverConfig": {
                 "state": mc::STATE_DISABLED,
-                "sourcePriority": { "primarySource": "other" },
+                "sourcePriority": { "primarySource": "src" },
             }}),
             egress: json!({ "maxBitrate": 80_000_000 }),
             ingress: Value::Null,
             failover: json!({
                 "failoverMode": "FAILOVER",
                 "state": mc::STATE_DISABLED,
-                "sourcePriority": { "primarySource": "other" },
+                "sourcePriority": { "primarySource": "src" },
                 "recoveryWindow": 4_000,
             }),
         },

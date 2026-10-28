@@ -13,6 +13,9 @@
 //!    active yet" when it resolves to nothing — see
 //!    [`crate::state::Denied::unresolvable`]) and the
 //!    campaign must deploy a `PERSONALIZED_ACTIONS` solution version — otherwise 400.
+//!    `numResults` and the maximum it has to satisfy ("The default is 5. The maximum
+//!    is 100.") are facts about the REQUEST, so that bound is settled before the
+//!    campaign is resolved.
 //! 2. `filterArn` is resolved the same way (400 when unknown) and its expression, bound to
 //!    `filterValues`, decides which stored Actions-catalog entries come back — not
 //!    what any of them scores.
@@ -160,14 +163,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = SystemTime::now();
         let mut guard = state.lock();
 
-        // 1. The campaign. `campaignArn` carries no `@required` in the model, but it
-        //    is "the campaign to use for getting action recommendations" — a request
-        //    that gives no campaign ARN gives this operation nothing to recommend
-        //    from, and the refusal reports the ARN it WAS given (see
-        //    [`invalid_campaign_arn`]).
+        // 1. What the REQUEST alone settles, before anything is resolved.
+        //
+        //    `campaignArn` carries no `@required` in the model, but it is "the campaign
+        //    to use for getting action recommendations" — a request that gives no
+        //    campaign ARN gives this operation nothing to recommend from, and the
+        //    refusal reports the ARN it WAS given (see [`invalid_campaign_arn`]).
         let Some(campaign_arn) = registry::present(input.campaign_arn.as_deref()) else {
             return Err(invalid_campaign_arn(input.campaign_arn.as_deref()));
         };
+        //    `userId` is a fact about the request too: this operation serves
+        //    `PERSONALIZED_ACTIONS` campaigns only ("the user to provide action
+        //    recommendations for"), so the input it needs never depends on what the
+        //    ARN resolves to.
+        let Some(user_id) = registry::present(input.user_id.as_deref()) else {
+            return Err(invalid(
+                "userId is required: it is the user to provide action recommendations for.",
+            ));
+        };
+        //    How many results to compute is the value the caller sent against the
+        //    documented maximum ("The default is 5. The maximum is 100."), both facts
+        //    about the request — so it is answered BEFORE the campaign is resolved,
+        //    exactly as the sibling operations settle their request-only bounds: a
+        //    `numResults` past the bound is refused whatever the campaign turns out to
+        //    be.
+        let num_results = registry::effective_num_results(
+            input.num_results,
+            registry::DEFAULT_NUM_ACTION_RESULTS,
+            registry::MAX_NUM_ACTION_RESULTS,
+        )
+        .map_err(deny)?;
+
+        // 2. The campaign, and the recipe type this operation serves.
         let campaign = guard.campaign(campaign_arn).map_err(deny)?.clone();
         if campaign.recipe_type != RecipeType::PersonalizedActions {
             return Err(invalid(format!(
@@ -178,20 +205,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 RecipeType::PersonalizedActions.as_str()
             )));
         }
-        let Some(user_id) = registry::present(input.user_id.as_deref()) else {
-            return Err(invalid(
-                "userId is required: it is the user to provide action recommendations for.",
-            ));
-        };
 
-        let num_results = registry::effective_num_results(
-            input.num_results,
-            registry::DEFAULT_NUM_ACTION_RESULTS,
-            registry::MAX_NUM_ACTION_RESULTS,
-        )
-        .map_err(deny)?;
-
-        // 2. The request's filter, over the Actions dataset.
+        // 3. The request's filter, over the Actions dataset.
         let request_filter = guard
             .bind_filter(
                 registry::present(input.filter_arn.as_deref()),
@@ -200,7 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .map_err(deny)?;
 
-        // 3. Score every stored action, settle each one's share of the certainty over
+        // 4. Score every stored action, settle each one's share of the certainty over
         //    the whole stored Actions catalog, then let the request's filter and
         //    `numResults` decide which of them come back.
         let mut ranked: Vec<(&Action, f64)> = campaign

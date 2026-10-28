@@ -214,7 +214,7 @@ impl Fixture {
 
 /// `POST /computation-models`, answering the created id. The configuration names
 /// the one computation type the model documents actions for.
-async fn create_computation_model(router: &MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn create_computation_model(router: &MultiServiceRouter, name: &str) -> String {
     let (status, created) = create(
         router,
         json!({

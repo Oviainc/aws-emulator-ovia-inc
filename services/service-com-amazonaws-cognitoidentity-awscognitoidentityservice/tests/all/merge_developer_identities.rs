@@ -9,8 +9,10 @@
 //!   and its federated logins alike — resolves to the SOURCE user's `IdentityId`
 //!   afterwards, which is the id the call answers, and that identity is linked to the union
 //!   of the two users' providers;
-//! * the merged-away identity exists no longer: a listing of the pool stops reporting it and
-//!   a read of it is a 404, while the surviving identity keeps everything it had;
+//! * the merged-away identity keeps none of its own logins and survives as a DISABLED
+//!   identity: a read of its id still describes it, a listing that hides no disabled identity
+//!   still reports it and one that hides them leaves only the survivor, while the surviving
+//!   identity keeps everything it had;
 //! * the call's effect is idempotent — repeating it answers the same identity and changes
 //!   nothing, because the two identifiers are one user by then;
 //! * a call the pool cannot act on is refused with the modelled error for what is wrong with
@@ -91,8 +93,9 @@ fn merge_request(
 /// Register a developer-authenticated user of `pool_id` through the operation that writes
 /// the mappings — the first identifier mints the identity, carrying the federated logins
 /// beside it, and the rest register under the identity it minted — and answer its
-/// `IdentityId`.
-async fn user(
+/// `IdentityId`. `pub(crate)` so a sibling suite in this test target registers a developer
+/// user the same way rather than keeping a second copy of this.
+pub(crate) async fn user(
     emulator: &Emulator,
     pool_id: &str,
     developer_provider: &str,
@@ -433,20 +436,26 @@ async fn merging_two_developer_users_leaves_every_login_on_the_source_identity()
             "case {name:?}: expected the surviving identity linked to {providers:?}"
         );
 
-        // The two users are one user, so the merged-away identity is gone: the listing
-        // reports only the survivor, and a read of the other one is not found.
+        // The two users are one user, and the merged-away identity is still a record of the
+        // pool with no login of its own: the listing reports both identities in the order
+        // they were minted, and a read of the merged-away one still describes it.
         assert_eq!(
             listed_identities(&emulator, &pool_id).await,
-            vec![survivor.clone()],
-            "case {name:?}: expected only {survivor} left in the pool"
+            vec![survivor.clone(), merged_away.clone()],
+            "case {name:?}: expected {survivor} and the merged-away {merged_away} in the pool"
         );
         let (status, body) = emulator
             .call("DescribeIdentity", &json!({"IdentityId": merged_away}))
             .await;
         assert_eq!(
-            status, 404,
-            "case {name:?}: the merged-away identity {merged_away} is gone, got {status} with \
-             {body}"
+            status, 200,
+            "case {name:?}: the merged-away identity {merged_away} is still stored, got {status} \
+             with {body}"
+        );
+        assert_eq!(
+            body["IdentityId"],
+            json!(merged_away),
+            "case {name:?}: expected the description of {merged_away}, got {body}"
         );
 
         // The EFFECT is idempotent: the two identifiers are one user now, so repeating the
@@ -474,8 +483,8 @@ async fn merging_two_developer_users_leaves_every_login_on_the_source_identity()
         );
         assert_eq!(
             listed_identities(&emulator, &pool_id).await,
-            vec![survivor.clone()],
-            "case {name:?}: the repeated merge removes no further identity"
+            vec![survivor.clone(), merged_away.clone()],
+            "case {name:?}: the repeated merge changes no identity of the pool"
         );
     }
 }

@@ -128,6 +128,13 @@ fn validation(message: String) -> UpdateRewardError {
     UpdateRewardErrorModeled::ValidationException(ValidationException { message }).into()
 }
 
+/// This operation's own modelled 404 `ResourceNotFoundException`, which is how it reports
+/// a `(JobArn, TrajectoryId)` pair that names no trajectory of an existing job.
+fn not_found(message: String) -> UpdateRewardError {
+    UpdateRewardErrorModeled::ResourceNotFoundException(ResourceNotFoundException { message })
+        .into()
+}
+
 /// How this service refuses an empty `Rewards` list.
 ///
 /// `Rewards` is `@required` targeting `DoubleList`, which declares no `@length`
@@ -215,15 +222,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(validation(EMPTY_REWARDS_MESSAGE.to_string()));
         }
 
+        // A trajectory belongs to the job its key names, so the `JobArn` is resolved
+        // against the jobs the SageMaker control plane minted before this call touches a
+        // stored trajectory: the crate's one job resolution, shared with the sampling
+        // path, so the two cannot disagree about whether an ARN denotes a job.
+        if let Some(message) = crate::state::unresolved_job_trajectory_message(
+            &*self.engine,
+            &input.job_arn,
+            &input.trajectory_id,
+        ) {
+            return Err(not_found(message));
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut guard = state.lock();
         let Some(trajectory) = guard.trajectory_mut(&input.job_arn, &input.trajectory_id) else {
-            return Err(UpdateRewardErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: crate::state::trajectory_not_found_message(&input.trajectory_id),
-                },
-            )
-            .into());
+            return Err(not_found(crate::state::trajectory_not_found_message(
+                &input.trajectory_id,
+            )));
         };
 
         // "Call this operation after CompleteRollout": a trajectory that has not

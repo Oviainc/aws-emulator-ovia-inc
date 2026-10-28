@@ -370,17 +370,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `SourcePriority$PrimarySource` is "the name of the source you choose as the
-        // primary source for this flow", so it has to name a source the flow has.
-        if let Some(primary) = requested_failover
-            .and_then(|config| config.source_priority.as_ref())
-            .and_then(|priority| priority.primary_source.as_deref())
-        {
-            if !flow.sources.iter().any(|source| source.name == primary) {
-                return Err(bad_request(format!(
-                    "Source {primary:?} is not a source of this flow, so it cannot be its \
-                     primary source."
-                )));
-            }
+        // primary source for this flow", so it has to name a source the flow has —
+        // resolved through the one function every path that writes a source priority
+        // resolves it with (CreateFlow resolves the create shape there too).
+        if let Some(rejection) = crate::state::flow_primary_source_rejection(
+            requested_failover.and_then(|config| config.source_priority.as_ref()),
+            flow.sources.iter().map(|source| source.name.as_str()),
+        ) {
+            return Err(bad_request(rejection));
         }
 
         flow.flow_size = flow_size;

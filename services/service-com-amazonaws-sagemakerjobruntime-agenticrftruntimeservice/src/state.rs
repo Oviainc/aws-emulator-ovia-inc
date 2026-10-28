@@ -23,8 +23,12 @@
 //! the control plane writes when it mints one — see [`job_directory`] and
 //! [`job_not_found_message`]. A `JobArn` the member's own modelled constraints admit
 //! (`@length` 1..256 and the ARN `@pattern`, which allow any partition, region,
-//! account and job name) but that no create ever minted names no job, and a sampling
-//! call for it is refused rather than served. Beside that, a sampling call is refused
+//! account and job name) but that no create ever minted names no job, and EVERY
+//! operation of this data plane refuses a call for it rather than serving it: a
+//! sampling call because the turn can be routed to no model session, and
+//! `CompleteRollout` and `UpdateReward` because a trajectory lives inside the job its
+//! key names, so the pair names no trajectory of it either
+//! ([`unresolved_job_trajectory_message`]). Beside that, a sampling call is refused
 //! on state this service owns: a trajectory `CompleteRollout` has sealed, and the
 //! emulator bounds below.
 
@@ -536,6 +540,30 @@ pub fn job_exists<Eng: Send + Sync + 'static>(engine: &Eng, job_arn: &str) -> bo
 #[must_use]
 pub fn job_not_found_message(job_arn: &str) -> String {
     format!("Could not find job with jobArn {job_arn}")
+}
+
+/// The not-found sentence a trajectory-lifecycle call is refused with when the `JobArn`
+/// it carries names no job, or `None` when the job resolves.
+///
+/// A trajectory exists only inside the job its key names: a sampling call of that job is
+/// what creates it, and nothing of it outlives the job, so a `JobArn` [`job_exists`]
+/// resolves nothing for names no trajectory of that job either, whatever this store still
+/// holds under the pair — the pair is reported absent with the same sentence an id that
+/// was never sampled gets ([`trajectory_not_found_message`]).
+///
+/// `CompleteRollout` and `UpdateReward` both take their job resolution from here, so
+/// neither can disagree with the sampling path about whether an ARN denotes a job.
+#[must_use]
+pub fn unresolved_job_trajectory_message<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    job_arn: &str,
+    trajectory_id: &str,
+) -> Option<String> {
+    if job_exists(engine, job_arn) {
+        None
+    } else {
+        Some(trajectory_not_found_message(trajectory_id))
+    }
 }
 
 // ---------------------------------------------------------------------------

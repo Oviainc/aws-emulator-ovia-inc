@@ -315,10 +315,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !store.admit_invocation(invocation, now) {
             return Err(InvokeDataAutomationAsyncErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
-                    message: Some(format!(
-                        "Cannot have more than {} data automation invocations in progress",
-                        crate::state::MAX_INVOCATIONS
-                    )),
+                    message: Some(crate::state::invocation_quota_message()),
                 },
             )
             .into());

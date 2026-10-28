@@ -5,7 +5,9 @@
 //! Two developer-authenticated users of one identity pool become ONE user: every login the
 //! destination user was reached through resolves to the `IdentityId` of the SOURCE user
 //! afterwards — the id this call answers, as its recorded response does — and the
-//! destination user's own identity exists no longer.
+//! destination user's own identity is left stored with no login of its own, a disabled
+//! identity, since a merge takes an identity's logins away and only `DeleteIdentities`
+//! removes the record.
 //!
 //! ## Shape of an operation
 //!
@@ -389,7 +391,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> MergeDeveloperIde
         // ("Cognito associates the given source user (SourceUserIdentifier) with the
         // IdentityId of the DestinationUserIdentifier"). Every login of the destination
         // user — its other developer user identifiers and its federated logins alike —
-        // resolves to that identity, and the destination identity is one no more.
+        // resolves to that identity, and the destination identity is left with none of its
+        // own: a stored, DISABLED identity of the pool, which a read of its id still
+        // describes and a listing that hides no disabled identity still reports.
         let revoked =
             store.merge_identity_into(&input.identity_pool_id, &destination, &source, now);
         // Both identities were resolved through THIS pool's own login index, which names no
@@ -413,9 +417,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> MergeDeveloperIde
         // written with this lock released, so two of them are never held at once.
         drop(store);
 
-        // The identity the merge gave up exists no longer, so the session issued to it is no
-        // longer a credential this emulator accepts, and the tokens issued for it name
-        // nobody the redeemer of one can resolve.
+        // Nothing reaches the merged-away user any more — its logins are the survivor's —
+        // so the session issued to it is no longer a credential this emulator accepts, and
+        // the tokens issued for it name a user only the survivor's id now stands for.
         for access_key_id in revoked {
             crate::state::discard_vended_role_session(
                 &*self.engine,

@@ -69,12 +69,17 @@
 //!
 //! A statement applies to a request only when the `Condition` block it carries holds for
 //! that request, whichever effect it states — so a statement scoped to one principal
-//! governs that principal alone. The keys this gate can answer EXACTLY are the ones that
-//! name the signing principal, and they are in the request context of every call: the ARN
-//! of the principal that made the request and the account it belongs to
-//! ([`condition_context`]). Every other key — including this service's own `kms:` keys — is
-//! left unpublished, so a statement naming one stays undecided and the shared evaluator
-//! reads it fail-closed.
+//! governs that principal alone, and one scoped to an encryption-context entry governs the
+//! requests carrying that entry alone. The keys this gate can answer EXACTLY are the ones
+//! whose value the REQUEST itself carries, and they are in the request context of every
+//! call ([`request_conditions`]): the ARN of the principal that made the request and the
+//! account it belongs to, and one key per entry of the request's encryption context, beside
+//! the multi-valued key naming those entries. The encryption-context family is answered for
+//! as a WHOLE, so a clause over an entry the request does not carry is decided as absent
+//! rather than left undecided. Every other key is left unpublished, so a statement naming
+//! one stays undecided and the shared evaluator reads it fail-closed; `kms:ViaService` is
+//! one of those, because a request this emulator serves directly is made on no other
+//! service's behalf.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
@@ -89,6 +94,30 @@ use ::service_common::iam_authorization::{self as iam, Decision};
 /// global condition keys).
 const PRINCIPAL_ARN_KEY: &str = "aws:PrincipalArn";
 const PRINCIPAL_ACCOUNT_KEY: &str = "aws:PrincipalAccount";
+
+/// The condition-key FAMILY naming one entry of the request's encryption context:
+/// "kms:EncryptionContext:<context-key> … compares the encryption context pair in the
+/// request with the pair specified in the policy" (KMS's own condition keys). The family is
+/// published WHOLE, because this gate holds the request's entire encryption context — empty
+/// for a request that carries none — and can therefore answer for any member of it,
+/// including answering that the request carries no value for that member.
+const ENCRYPTION_CONTEXT_KEY_FAMILY: &str = "kms:EncryptionContext:";
+
+/// The condition key naming the KEYS of the request's encryption context, one value per
+/// entry: "kms:EncryptionContextKeys … compares the encryption context keys in the request
+/// with those specified in the policy" (KMS's own condition keys). A multi-valued key, so a
+/// statement decides it under one of IAM's set qualifiers.
+const ENCRYPTION_CONTEXT_KEYS_KEY: &str = "kms:EncryptionContextKeys";
+
+/// The most entries of a request's encryption context this gate copies out of the request
+/// to decide a condition over.
+///
+/// A policy scopes a key to a handful of named entries, so this is far above what a
+/// statement is written against; it is here so that what one request makes this gate hold
+/// and scan is bounded by a constant rather than by a count the caller chooses. A request
+/// carrying more entries than this is judged with NO encryption-context key answered for,
+/// so a statement conditioned on one stays undecided and is read fail-closed.
+pub const MAX_PUBLISHED_ENCRYPTION_CONTEXT_ENTRIES: usize = 64;
 
 /// The principal a request speaks for, with everything a decision about it is made from.
 #[derive(Debug, Clone)]
@@ -144,7 +173,8 @@ impl Caller {
 /// records it.
 ///
 /// `context` is the request's encryption context, which a grant's
-/// `EncryptionContextEquals` / `EncryptionContextSubset` constraint is judged against and
+/// `EncryptionContextEquals` / `EncryptionContextSubset` constraint is judged against, which
+/// the `kms:` condition keys of a conditioned policy statement are decided against, and
 /// which an operation that takes none passes as `None`.
 pub fn authorize(
     caller: &Caller,
@@ -157,15 +187,14 @@ pub fn authorize(
 ) -> Result<(), String> {
     let action = format!("{}:{operation}", super::ARN_SERVICE);
 
-    // The condition keys this request answers for, and — since every key it carries is one
-    // this gate knows the request's value for — the keys the request DECLARES it models.
-    // Without them a statement scoped by a condition could not be decided at all, and the
-    // evaluator's fail-closed reading would apply a `Deny` to principals it does not name.
-    let principal_context = condition_context(caller);
-    let published: Vec<&str> = principal_context
-        .iter()
-        .map(|(name, _)| name.as_str())
-        .collect();
+    // The condition keys this request answers for: the values it carries, and the names it
+    // DECLARES it models. Without them a statement scoped by a condition could not be
+    // decided at all, and the evaluator's fail-closed reading would apply a `Deny` to
+    // requests it does not cover — which is what a conditioned statement is written to
+    // exclude.
+    let conditions = request_conditions(caller, context);
+    let request_context = conditions.carried.as_slice();
+    let published = conditions.published.as_slice();
 
     // An explicit `Deny` wins over every grant, whichever document states it, and
     // denying the ACCOUNT denies each of its principals — so the deny is decided against
@@ -173,8 +202,8 @@ pub fn authorize(
     let mut denying = caller.principals.clone();
     denying.extend_from_slice(&caller.account);
     let deny_request = iam::Request::new(&action, &key.arn, &denying)
-        .with_context(&principal_context)
-        .with_published_keys(&published);
+        .with_context(request_context)
+        .with_published_keys(published);
     if iam::resource_decision(&key.policy, &deny_request) == Decision::Denied {
         return Err(explicit_deny_message(
             &caller.arn,
@@ -184,8 +213,8 @@ pub fn authorize(
         ));
     }
     let granting = iam::Request::new(&action, &key.arn, &caller.principals)
-        .with_context(&principal_context)
-        .with_published_keys(&published);
+        .with_context(request_context)
+        .with_published_keys(published);
     let identity_said = iam::identity_decision(&caller.documents, &granting);
     if identity_said == Decision::Denied {
         return Err(explicit_deny_message(
@@ -209,8 +238,8 @@ pub fn authorize(
             && iam::resource_decision(
                 &key.policy,
                 &iam::Request::new(&action, &key.arn, &caller.account)
-                    .with_context(&principal_context)
-                    .with_published_keys(&published),
+                    .with_context(request_context)
+                    .with_published_keys(published),
             ) == Decision::Allowed
     };
     let no_allow_message = |delegates: bool| {
@@ -276,16 +305,14 @@ pub fn authorize_account_action(
     let action = format!("{}:{operation}", super::ARN_SERVICE);
     let resource = account_resource(region);
 
-    // The same request context every key-scoped decision publishes, so one statement
-    // scoped to a principal is read the same way whichever operation asks.
-    let principal_context = condition_context(caller);
-    let published: Vec<&str> = principal_context
-        .iter()
-        .map(|(name, _)| name.as_str())
-        .collect();
+    // The same request context every key-scoped decision answers for, so one statement
+    // scoped to a principal is read the same way whichever operation asks. An operation
+    // that names no key takes no encryption context either, so the request carries no
+    // entry of that family.
+    let conditions = request_conditions(caller, None);
     let request = iam::Request::new(&action, &resource, &caller.principals)
-        .with_context(&principal_context)
-        .with_published_keys(&published);
+        .with_context(&conditions.carried)
+        .with_published_keys(&conditions.published);
 
     match iam::identity_decision(&caller.documents, &request) {
         // An explicit `Deny` wins over every `Allow`, whichever of the caller's documents
@@ -332,27 +359,72 @@ pub fn check_account_action<E, Eng: Send + Sync + 'static>(
         .map_err(crate::scaffolded::Scaffolded::access_denied)
 }
 
-/// The condition keys a statement of these documents is judged under: the keys that name
-/// the signing principal, which every request carries a value for.
+/// The condition keys a statement of these documents is judged under: what the request
+/// carries a value for, and the names it DECLARES it models.
 ///
-/// A key that is in this context is one the request DECLARES it models, so a clause naming
-/// it is DECIDED — which is what scopes a conditioned statement to the principals it names.
+/// A key the request declares is one a clause can be DECIDED over — which is what scopes a
+/// conditioned statement to the principals it names and to the encryption contexts it
+/// covers — while a clause over any other key stays undecided and is read fail-closed. The
+/// declared names are a fixed handful whatever the request carries, so deciding one clause
+/// costs the same whatever the caller sent.
+#[derive(Debug)]
+struct RequestConditions {
+    /// The `(key, value)` pairs the request carries, one pair per value.
+    carried: Vec<(String, String)>,
+    /// The names the request models, each either a key or a whole family.
+    published: Vec<&'static str>,
+}
+
+/// The condition keys THIS request answers for.
+///
 /// A caller that speaks for nobody (an expired session credential) carries no principal
-/// spelling, so there is nothing to compare and the context is empty; the account is read
-/// out of the principal's own ARN through the tree's one ARN parse, so an ARN carrying none
-/// publishes no account key rather than a guess.
-fn condition_context(caller: &Caller) -> Vec<(String, String)> {
-    if caller.principals.is_empty() {
-        return Vec::new();
+/// spelling, so there is nothing to compare and no principal key is declared; the account is
+/// read out of the principal's own ARN through the tree's one ARN parse, so an ARN carrying
+/// none declares no account key rather than a guess.
+///
+/// `context` is the request's encryption context, `None` for an operation that takes none.
+/// Each entry answers for its own key of the [`ENCRYPTION_CONTEXT_KEY_FAMILY`] and
+/// contributes one value of the multi-valued [`ENCRYPTION_CONTEXT_KEYS_KEY`], so a statement
+/// conditioned on an entry decides against the values the REQUEST carried — and the family
+/// is declared as a whole, so a clause over an entry the request does not carry is decided
+/// as absent (IAM: "if the key is not present … a negated condition operator returns true")
+/// rather than left undecided.
+///
+/// Past [`MAX_PUBLISHED_ENCRYPTION_CONTEXT_ENTRIES`] entries none of them is answered for:
+/// what this gate copies out of a request is bounded by that constant rather than by a
+/// count the caller chooses, and a statement conditioned on an encryption context stays
+/// undecided for such a request, which the shared evaluator reads fail-closed.
+fn request_conditions(
+    caller: &Caller,
+    context: Option<&HashMap<String, String>>,
+) -> RequestConditions {
+    let mut carried = Vec::new();
+    let mut published = Vec::new();
+    if !caller.principals.is_empty() {
+        carried.push((PRINCIPAL_ARN_KEY.to_string(), caller.arn.clone()));
+        published.push(PRINCIPAL_ARN_KEY);
+        let account = ::service_common::arn::parse(&caller.arn)
+            .map(|arn| arn.account)
+            .filter(|account| !account.is_empty());
+        if let Some(account) = account {
+            carried.push((PRINCIPAL_ACCOUNT_KEY.to_string(), account.to_string()));
+            published.push(PRINCIPAL_ACCOUNT_KEY);
+        }
     }
-    let mut context = vec![(PRINCIPAL_ARN_KEY.to_string(), caller.arn.clone())];
-    let account = ::service_common::arn::parse(&caller.arn)
-        .map(|arn| arn.account)
-        .filter(|account| !account.is_empty());
-    if let Some(account) = account {
-        context.push((PRINCIPAL_ACCOUNT_KEY.to_string(), account.to_string()));
+    let answerable =
+        context.is_none_or(|held| held.len() <= MAX_PUBLISHED_ENCRYPTION_CONTEXT_ENTRIES);
+    if answerable {
+        for (name, value) in context.into_iter().flatten() {
+            carried.push((
+                format!("{ENCRYPTION_CONTEXT_KEY_FAMILY}{name}"),
+                value.clone(),
+            ));
+            carried.push((ENCRYPTION_CONTEXT_KEYS_KEY.to_string(), name.clone()));
+        }
+        published.push(ENCRYPTION_CONTEXT_KEY_FAMILY);
+        published.push(ENCRYPTION_CONTEXT_KEYS_KEY);
     }
-    context
+    RequestConditions { carried, published }
 }
 
 /// How AWS words an authorization failure that no document allowed: who was refused,

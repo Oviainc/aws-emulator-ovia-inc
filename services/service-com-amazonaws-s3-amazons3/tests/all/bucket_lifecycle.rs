@@ -121,6 +121,10 @@ pub(crate) async fn send(
     send_bytes(router, method, uri, &all, body.as_bytes()).await
 }
 
+/// The endpoint host every request in this crate's suites is addressed to unless it names
+/// another: the Regional one, which carries no bucket, so the request is PATH-STYLE.
+const REGIONAL_ENDPOINT_HOST: &str = "s3.us-east-1.amazonaws.com";
+
 /// Dispatch one request whose body is arbitrary BYTES and whose headers are exactly the
 /// ones given — what an object payload needs.
 pub(crate) async fn send_bytes(
@@ -130,10 +134,24 @@ pub(crate) async fn send_bytes(
     headers: &[(&str, &str)],
     body: &[u8],
 ) -> Answer {
+    send_bytes_to_host(router, method, REGIONAL_ENDPOINT_HOST, uri, headers, body).await
+}
+
+/// [`send_bytes`] addressed to `host` instead of to the Regional endpoint — which is what
+/// makes a request VIRTUAL-HOSTED-STYLE: the bucket is the first label of the host and the
+/// path is the key alone.
+pub(crate) async fn send_bytes_to_host(
+    router: &MultiServiceRouter,
+    method: &str,
+    host: &str,
+    uri: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> Answer {
     let mut builder = http::Request::builder()
         .method(method)
-        .uri(format!("https://s3.us-east-1.amazonaws.com{uri}"))
-        .header("host", "s3.us-east-1.amazonaws.com")
+        .uri(format!("https://{host}{uri}"))
+        .header("host", host)
         .header("authorization", AUTHORIZATION);
     for (name, value) in headers {
         builder = builder.header(*name, *value);

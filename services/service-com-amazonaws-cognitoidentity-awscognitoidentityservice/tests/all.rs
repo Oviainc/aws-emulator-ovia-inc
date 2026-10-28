@@ -47,6 +47,8 @@ mod lookup_developer_identity;
 mod mapped_role_resolution;
 #[path = "all/merge_developer_identities.rs"]
 mod merge_developer_identities;
+#[path = "all/merged_identity_retention.rs"]
+mod merged_identity_retention;
 #[path = "all/open_id_token.rs"]
 mod open_id_token;
 #[path = "all/principal_tag_attribute_map.rs"]

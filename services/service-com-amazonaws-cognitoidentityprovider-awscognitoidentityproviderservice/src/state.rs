@@ -47,6 +47,20 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// The service's SigV4 / endpoint / ARN namespace (OPERATIONS.md "Wire protocol").
 pub const SIGNING_NAME: &str = "cognito-idp";
 
+/// The resource type a user pool's ARN names: a pool is
+/// `arn:<partition>:cognito-idp:<region>:<account>:userpool/<UserPoolId>`, the ARN
+/// form [`UserPool::arn`] carries and the one a tagging operation's `ResourceArn`
+/// addresses a pool by.
+pub const USER_POOL_RESOURCE_TYPE: &str = "userpool";
+
+/// The most tags one user pool holds: "A user pool can have as many as 50 tags"
+/// (`TagResource` in this service's model).
+pub const MAX_TAGS_PER_USER_POOL: usize = 50;
+
+/// The longest a `UserPoolId` is: `UserPoolIdType` is modelled with a maximum
+/// length of 55 (`smithy_query(query="shape",shape="UserPoolIdType")`).
+const USER_POOL_ID_MAX_LENGTH: usize = 55;
+
 /// Amazon Cognito's default password policy for a new user pool: at least 8
 /// characters, with an uppercase letter, a lowercase letter, a number and a
 /// symbol required (Amazon Cognito Developer Guide, "Password policies"). The
@@ -783,6 +797,47 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
     /// The stored pool, mutably.
     pub fn pool_mut(&mut self, user_pool_id: &str) -> Option<&mut UserPool> {
         self.user_pools.get_mut(user_pool_id)
+    }
+
+    /// The tag set of the user pool `user_pool_id` AS IT STANDS IN `region` as of
+    /// `now`, or `None` when this service holds no such pool there.
+    ///
+    /// A pool keeps ONE id across the Regions it is replicated to, and "You can
+    /// maintain tags independently on replica user pools"
+    /// (`CreateUserPoolReplica.UserPoolTags`), so the Region selects WHICH tag set
+    /// is addressed: the pool's own in [`UserPool::region`], and a secondary
+    /// replica's own in the Region it was created in. A replica whose deletion the
+    /// clock has already finished is gone, which is computed here rather than
+    /// written.
+    pub fn pool_tags(
+        &self,
+        region: &str,
+        user_pool_id: &str,
+        now: SystemTime,
+    ) -> Option<&HashMap<String, String>> {
+        let pool = self.pool(user_pool_id)?;
+        if region == pool.region {
+            return Some(&pool.tags);
+        }
+        pool.live_replica(region, now).map(|replica| &replica.tags)
+    }
+
+    /// The same tag set as [`Self::pool_tags`], mutably: what a call that assigns
+    /// or removes tags writes.
+    pub fn pool_tags_mut(
+        &mut self,
+        region: &str,
+        user_pool_id: &str,
+        now: SystemTime,
+    ) -> Option<&mut HashMap<String, String>> {
+        let pool = self.pool_mut(user_pool_id)?;
+        if region == pool.region {
+            return Some(&mut pool.tags);
+        }
+        pool.replicas
+            .get_mut(region)
+            .filter(|replica| !replica.removed(now))
+            .map(|replica| &mut replica.tags)
     }
 
     /// Mark a modification of the branding style `branding_id` of the pool
@@ -6228,6 +6283,80 @@ fn sanitize_region(region: &str) -> String {
 /// modelled pattern `^[\w-]+_[0-9a-zA-Z]+$` and length 1..55.
 fn new_pool_id(region: &str) -> String {
     format!("{region}_{}", random_token(9))
+}
+
+/// Whether `region` can stand in the Region field of an ARN, and in the `^[\w-]+`
+/// half of a `UserPoolId`.
+fn is_region_like(region: &str) -> bool {
+    !region.is_empty()
+        && region
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Whether `user_pool_id` could be a `UserPoolId` at all: the modelled pattern
+/// `^[\w-]+_[0-9a-zA-Z]+$` and length 1..[`USER_POOL_ID_MAX_LENGTH`]
+/// (`smithy_query(query="shape",shape="UserPoolIdType")`). The separator is the
+/// LAST underscore, because `\w` admits one in the first half too.
+pub fn is_user_pool_id_shaped(user_pool_id: &str) -> bool {
+    if user_pool_id.is_empty() || user_pool_id.len() > USER_POOL_ID_MAX_LENGTH {
+        return false;
+    }
+    let Some((region, suffix)) = user_pool_id.rsplit_once('_') else {
+        return false;
+    };
+    is_region_like(region)
+        && !suffix.is_empty()
+        && suffix.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// The Region and the `UserPoolId` the user-pool ARN `arn` names, or `None` when
+/// `arn` names no user pool of this service at all — another ARN namespace or
+/// resource type, a malformed partition, Region or account, or a resource id no
+/// `UserPoolId` could be.
+///
+/// Only the ARN's FORM is read here. Whether this service holds that pool in that
+/// Region is the caller's lookup, which is what separates a `ResourceArn` that
+/// names no user pool (a bad parameter) from one naming a pool that is not stored
+/// (a missing resource).
+pub fn user_pool_arn_parts(arn: &str) -> Option<(&str, &str)> {
+    let mut fields = arn.splitn(6, ':');
+    let (
+        Some("arn"),
+        Some(partition),
+        Some(namespace),
+        Some(region),
+        Some(account),
+        Some(resource),
+    ) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    )
+    else {
+        return None;
+    };
+    let partition_is_named = !partition.is_empty()
+        && partition
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    // An AWS account id is twelve digits.
+    let account_is_an_id = account.len() == 12 && account.bytes().all(|b| b.is_ascii_digit());
+    if namespace != SIGNING_NAME
+        || !partition_is_named
+        || !is_region_like(region)
+        || !account_is_an_id
+    {
+        return None;
+    }
+    let user_pool_id = resource
+        .strip_prefix(USER_POOL_RESOURCE_TYPE)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .filter(|user_pool_id| is_user_pool_id_shaped(user_pool_id))?;
+    Some((region, user_pool_id))
 }
 
 /// A fresh CloudFront endpoint for a custom domain: `<distribution>.cloudfront.net`,

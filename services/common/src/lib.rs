@@ -219,6 +219,11 @@ pub mod chime_tags;
 /// services asked whether CloudWatch Logs could hold a name cannot answer differently.
 pub mod cloudwatch_logs;
 pub mod db_data_sources;
+/// The ONE reading of how a client ADDRESSES an emulated service's DATA plane — the
+/// reserved path namespace, the first path segment, the host without its port, and whether
+/// a host names a service at all — for every service that serves one, so the planes cannot
+/// drift on which requests they claim.
+pub mod data_plane_addressing;
 /// The ONE reading of a caller-supplied EMAIL ADDRESS, for every service whose model
 /// documents a member as one and targets it at a bare string — so two services asked
 /// whether a value is an address cannot answer differently.

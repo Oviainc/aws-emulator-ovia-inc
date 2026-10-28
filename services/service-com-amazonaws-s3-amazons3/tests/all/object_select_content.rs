@@ -21,6 +21,12 @@
 //!   output serializations, a scan range, request-progress or customer-key headers, the
 //!   `select-type` generation, the order of the query parameters — nor on which bucket or
 //!   key it names, nor on whether the emulator holds them.
+//! * Nor does it depend on HOW the object is addressed: a Select request whose bucket
+//!   arrived as the first segment of the path and one whose bucket arrived as the first
+//!   label of the host ("both the virtual-hosted-style requests and the path-style requests
+//!   are supported", `GetObject`'s own documentation) are refused alike, and neither falls
+//!   through to the emulator's generic unrouted-request answer, which names an HTTP method
+//!   and a raw path rather than an S3 error code.
 //! * The refusal reports: every object stored before it reads back byte for byte
 //!   afterwards, and a key no request wrote is still absent.
 //! * It is scoped to the Select data plane: a request that carries `select` where that
@@ -39,7 +45,7 @@ use service_com_amazonaws_s3_amazons3::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::bucket_lifecycle::{router, send_bytes, Answer};
+use super::bucket_lifecycle::{router, send_bytes, send_bytes_to_host, Answer};
 use super::object_and_tagging_roundtrip::{bucket, get_object, put_object};
 
 /// The CSV every row of the table below selects over, so the request meets a real object
@@ -517,6 +523,162 @@ async fn a_select_request_is_refused_whatever_it_addresses() {
     }
 }
 
+/// The bucket the address table below names. Bucket-name shaped (lowercase letters and
+/// hyphens, 3–63 characters), so it can be the first LABEL of a host as well as the first
+/// SEGMENT of a path.
+const ADDRESS_BUCKET: &str = "object-select-address";
+
+/// One row of the address table: the case, the host the request is addressed to, and the
+/// request target under that host.
+///
+/// "Both the virtual-hosted-style requests and the path-style requests are supported"
+/// (`GetObject`'s own documentation): a path-style request carries the bucket as the first
+/// segment of its path, and a virtual-hosted-style request carries it as the first label of
+/// its host, leaving the path to be the key alone. Every row below names the SAME object
+/// one of those two ways.
+struct AddressRow {
+    case: &'static str,
+    host: &'static str,
+    target: &'static str,
+}
+
+/// The rows: both address forms, over both endpoint hosts a client is configured with and a
+/// local endpoint name, with the key nested, at the bucket root and percent-encoded, and
+/// with the subresource flag written both ways round.
+fn address_rows() -> Vec<AddressRow> {
+    vec![
+        AddressRow {
+            case: "path-style under the Regional endpoint, a nested key",
+            host: "s3.us-east-1.amazonaws.com",
+            target: "/object-select-address/data/rows.csv?select&select-type=2",
+        },
+        AddressRow {
+            case: "path-style under the global endpoint, a key at the bucket root",
+            host: "s3.amazonaws.com",
+            target: "/object-select-address/rows.csv?select&select-type=2",
+        },
+        AddressRow {
+            case: "virtual-hosted-style under the Regional endpoint, a nested key",
+            host: "object-select-address.s3.us-east-1.amazonaws.com",
+            target: "/data/rows.csv?select&select-type=2",
+        },
+        AddressRow {
+            case: "virtual-hosted-style under the global endpoint, a key at the bucket root",
+            host: "object-select-address.s3.amazonaws.com",
+            target: "/rows.csv?select&select-type=2",
+        },
+        AddressRow {
+            case: "virtual-hosted-style under a local endpoint name, the query reversed",
+            host: "object-select-address.localhost",
+            target: "/rows.csv?select-type=2&select",
+        },
+        AddressRow {
+            case: "virtual-hosted-style, a key the request URI carries percent-encoded",
+            host: "object-select-address.s3.us-east-1.amazonaws.com",
+            target: "/spaced%20rows.csv?select&select-type=2",
+        },
+        AddressRow {
+            case: "virtual-hosted-style, the subresource flag with no select-type beside it",
+            host: "object-select-address.s3.us-east-1.amazonaws.com",
+            target: "/data/rows.csv?select",
+        },
+        AddressRow {
+            case: "virtual-hosted-style, a key this bucket does not hold",
+            host: "object-select-address.s3.us-east-1.amazonaws.com",
+            target: "/data/never-written.csv?select&select-type=2",
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_select_request_is_refused_however_the_object_is_addressed() {
+    // The address a Select request names it object with is not part of the refusal: the
+    // same 405 answers a request whose bucket arrived as the first segment of the path and
+    // one whose bucket arrived as the first label of the host (the form an SDK sends for an
+    // endpoint addressed by bucket name). Neither form may fall through to the emulator's
+    // generic unrouted-request answer, which names an HTTP method and a raw path instead of
+    // S3's own error code.
+    let router = router();
+    bucket(&router, ADDRESS_BUCKET).await;
+    for key in ["data/rows.csv", "rows.csv", "spaced%20rows.csv"] {
+        let stored = put_object(
+            &router,
+            ADDRESS_BUCKET,
+            key,
+            ROWS_CSV,
+            &[("content-type", "text/csv")],
+        )
+        .await;
+        assert_eq!(
+            stored.status,
+            200,
+            "case {key:?}: the object must be stored first, got {} with body {:?}",
+            stored.status,
+            String::from_utf8_lossy(&stored.body)
+        );
+    }
+
+    let document = select_request(
+        "SELECT s.id, s.name, s.category FROM S3Object s WHERE s.id = '2'",
+        "SQL",
+        "<CSV><FileHeaderInfo>USE</FileHeaderInfo></CSV>",
+        "<CSV></CSV>",
+    );
+    for row in address_rows() {
+        let answer = send_bytes_to_host(
+            &router,
+            "POST",
+            row.host,
+            row.target,
+            &[("content-type", "application/xml")],
+            &document,
+        )
+        .await;
+        assert_is_the_select_refusal(row.case, &answer);
+
+        // The refusal is S3's own, not the emulator's answer to a request it could not
+        // route: that one reports the operation (or the method and path) nobody has written
+        // yet, and this one reports nothing of the request at all.
+        let message = answer.error_message();
+        assert!(
+            !message.contains("not implemented"),
+            "case {:?}: expected S3's own refusal, got the unrouted-request answer {message:?}",
+            row.case
+        );
+        for fragment in ["POST", ADDRESS_BUCKET, "rows.csv", "S3Object"] {
+            assert!(
+                !message.contains(fragment),
+                "case {:?}: the message must carry nothing from the request, but {fragment:?} \
+                 is in {message:?}",
+                row.case
+            );
+        }
+    }
+
+    // The refusals reported nothing: every object the table addressed still reads back byte
+    // for byte, through either address form, and the key one row named but no request ever
+    // wrote is still absent.
+    for key in ["data/rows.csv", "rows.csv", "spaced%20rows.csv"] {
+        let read = get_object(&router, ADDRESS_BUCKET, key, "", &[]).await;
+        assert_eq!(
+            read.body.as_ref(),
+            ROWS_CSV,
+            "case {key:?}: the stored bytes must be unchanged, got {:?} with status {}",
+            String::from_utf8_lossy(&read.body),
+            read.status
+        );
+    }
+    let absent = get_object(&router, ADDRESS_BUCKET, "data/never-written.csv", "", &[]).await;
+    assert_eq!(
+        absent.error_code(),
+        NO_SUCH_KEY_CODE,
+        "case \"a key this bucket does not hold\": the key must still be absent, got {:?} with \
+         status {}",
+        absent.error_code(),
+        absent.status
+    );
+}
+
 #[tokio::test]
 async fn the_select_refusal_is_scoped_to_the_select_subresource() {
     // The seam that answers Select claims only the `select` subresource OF AN OBJECT.
@@ -533,13 +695,29 @@ async fn the_select_refusal_is_scoped_to_the_select_subresource() {
         "<CSV></CSV>",
     );
 
-    for (case, uri) in [
-        ("the select flag on a bucket path", "/object-select-scope?select&select-type=2"),
-        ("the select flag on the service root", "/?select&select-type=2"),
+    for (case, host, uri) in [
+        (
+            "the select flag on a bucket path",
+            "s3.us-east-1.amazonaws.com",
+            "/object-select-scope?select&select-type=2",
+        ),
+        (
+            "the select flag on the service root",
+            "s3.us-east-1.amazonaws.com",
+            "/?select&select-type=2",
+        ),
+        // The same boundary for the other address form: a virtual-hosted-style request
+        // whose path is `/` addresses the BUCKET the host names, not an object under it.
+        (
+            "the select flag on a bucket addressed in the host",
+            "object-select-scope.s3.us-east-1.amazonaws.com",
+            "/?select&select-type=2",
+        ),
     ] {
-        let answer = send_bytes(
+        let answer = send_bytes_to_host(
             &router,
             "POST",
+            host,
             uri,
             &[("content-type", "application/xml")],
             &document,
