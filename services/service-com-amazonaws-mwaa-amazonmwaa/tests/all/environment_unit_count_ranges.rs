@@ -373,6 +373,7 @@ async fn a_patch_whose_unit_count_is_outside_the_stored_classs_range_is_refused(
     // One wait for every row: an update is accepted only once the create has settled.
     tokio::time::sleep(PAST_TRANSITION).await;
 
+    let mut accepted: Vec<(String, String, &str, i32)> = Vec::new();
     for (name, class, member, count) in &rows {
         let (floor, ceiling) = bounds(class);
         // The patch carries ONLY the member under test (plus, for a web-server count, the
@@ -398,13 +399,7 @@ async fn a_patch_whose_unit_count_is_outside_the_stored_classs_range_is_refused(
                 "case {case}: expected UpdateEnvironment 200, got {} {}",
                 answer.status, answer.body
             );
-            let after = harness.environment(&case, name).await;
-            assert_eq!(
-                after.get(*member),
-                Some(&json!(count)),
-                "case {case}: {member} must read back as the patch left it, got {:?}",
-                after.get(*member)
-            );
+            accepted.push((name.clone(), case, member, *count));
         } else {
             assert_refused(&case, member, &answer);
             let after = harness.environment(&case, name).await;
@@ -413,6 +408,20 @@ async fn a_patch_whose_unit_count_is_outside_the_stored_classs_range_is_refused(
                 "case {case}: a refused update must leave the stored record untouched"
             );
         }
+    }
+    // An accepted count is read back only once the phase that APPLIES the update has come
+    // due: the environment's database is snapshotted first, so a read before that reports
+    // the counts the environment is still running on. One wait for every row.
+    tokio::time::sleep(PAST_TRANSITION).await;
+
+    for (name, case, member, count) in &accepted {
+        let after = harness.environment(case, name).await;
+        assert_eq!(
+            after.get(*member),
+            Some(&json!(count)),
+            "case {case}: {member} must read back as the patch left it, got {:?}",
+            after.get(*member)
+        );
     }
 }
 
@@ -480,6 +489,7 @@ async fn a_patch_that_moves_the_class_is_judged_by_the_range_of_the_class_it_mov
     }
     tokio::time::sleep(PAST_TRANSITION).await;
 
+    let mut landed: Vec<(usize, String)> = Vec::new();
     for (index, (label, _, patch, accepted)) in rows.iter().enumerate() {
         let name = env_name("ClassMove", index);
         let case = format!("{label}: {patch}");
@@ -491,15 +501,7 @@ async fn a_patch_that_moves_the_class_is_judged_by_the_range_of_the_class_it_mov
                 "case {case}: expected UpdateEnvironment 200, got {} {}",
                 answer.status, answer.body
             );
-            let after = harness.environment(&case, &name).await;
-            for (member, value) in patch.as_object().expect("an object patch") {
-                assert_eq!(
-                    after.get(member),
-                    Some(value),
-                    "case {case}: {member} must read back as the patch left it, got {:?}",
-                    after.get(member)
-                );
-            }
+            landed.push((index, case));
         } else {
             // The refusal names one of the counts the class it moves to does not run.
             assert_eq!(
@@ -524,6 +526,24 @@ async fn a_patch_that_moves_the_class_is_judged_by_the_range_of_the_class_it_mov
             assert_eq!(
                 after, before,
                 "case {case}: a refused update must leave the stored record untouched"
+            );
+        }
+    }
+    // An accepted class move is read back only once the phase that APPLIES the update has
+    // come due: the environment's database is snapshotted first, so a read before that
+    // reports the class the environment is still running on. One wait for every row.
+    tokio::time::sleep(PAST_TRANSITION).await;
+
+    for (index, case) in &landed {
+        let name = env_name("ClassMove", *index);
+        let (_, _, patch, _) = &rows[*index];
+        let after = harness.environment(case, &name).await;
+        for (member, value) in patch.as_object().expect("an object patch") {
+            assert_eq!(
+                after.get(member),
+                Some(value),
+                "case {case}: {member} must read back as the patch left it, got {:?}",
+                after.get(member)
             );
         }
     }

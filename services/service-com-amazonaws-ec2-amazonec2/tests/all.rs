@@ -193,6 +193,10 @@ mod allowed_images_settings;
 mod application_status;
 #[path = "all/application_status_checks.rs"]
 mod application_status_checks;
+// What `CreateApplicationStatusCheck` stores, the documented defaults it fills in, the
+// published bounds it refuses past, and the check it answers read back through the describe.
+#[path = "all/create_application_status_check.rs"]
+mod create_application_status_check;
 #[path = "all/associate_address.rs"]
 mod associate_address;
 #[path = "all/associate_client_vpn_target_network.rs"]

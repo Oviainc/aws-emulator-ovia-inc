@@ -1,0 +1,167 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The ONE reading of how a client ADDRESSES an emulated service's DATA plane, for every
+//! service that serves one.
+//!
+//! A data plane is reached at a host the OWNING RESOURCE names, not at the service's
+//! endpoint: a load balancer's `DNSName`, a REST API's
+//! `{api-id}.execute-api.{region}.amazonaws.com`, a distribution's domain name. The first
+//! label of such a host names no service, so the emulator's front door can resolve no
+//! target service from the request and answers `404 UnknownService` — for an address the
+//! service itself told the caller to use. Each plane therefore claims its own traffic in
+//! `Service::can_handle`, and a client on the machine this emulator runs on, which resolves
+//! none of those hosts, reaches the emulator's own endpoint and carries in the PATH what it
+//! cannot carry in the host.
+//!
+//! What every one of them needs to read that addressing is the same, and is here so the
+//! planes cannot drift on which requests they claim: the reserved path segment that names a
+//! plane ([`EMULATOR_PATH_NAMESPACE`]), the first path segment and the rest
+//! ([`first_segment`]), the host without its userinfo or port ([`host_only`]), the port a
+//! client addressed ([`addressed_port`]), and whether a host names a SERVICE at all
+//! ([`names_a_service`]) — which is what separates the emulator's own endpoint from
+//! another service's.
+//!
+//! Services still carrying their own copy of these: this module postdates them, and
+//! `grep -rln 'EMULATOR_PATH_NAMESPACE' services/*/src` lists them (today the API Gateway,
+//! API Gateway V2 and CloudFront planes). Those copies are to be MIGRATED onto this module;
+//! they are left in place only because a change does not own those services' issues.
+//! Nothing new inlines the rule again — call this module.
+
+/// The reserved path segment that names a DATA plane on the one endpoint this emulator
+/// serves its whole surface at, ahead of the segment naming WHICH plane:
+/// `/_aws/{plane}/{resource}/{path}`.
+///
+/// It begins with `_`, which no modelled path segment of any service does, so the prefix
+/// collides with no control-plane route however a resource is named — and a path under it
+/// that names ANOTHER plane is that plane's, never this one's.
+pub const EMULATOR_PATH_NAMESPACE: &str = "_aws";
+
+/// The first path segment and the path that follows it, with the leading `/` kept on the
+/// remainder so it stays a path (`/a/b` -> `("a", "/b")`, `/a` -> `("a", "/")`).
+///
+/// `None` for a path that is not absolute, which is no addressing at all.
+#[must_use]
+pub fn first_segment(path: &str) -> Option<(&str, &str)> {
+    let trimmed = path.strip_prefix('/')?;
+    match trimmed.find('/') {
+        Some(end) => Some((&trimmed[..end], &trimmed[end..])),
+        None => Some((trimmed, "/")),
+    }
+}
+
+/// A host with any userinfo and `:port` removed, which is the name a resource publishes.
+/// An IPv6 literal keeps its brackets, which is where its own colons live.
+#[must_use]
+pub fn host_only(host: &str) -> &str {
+    let without_userinfo = host.rsplit('@').next().unwrap_or(host);
+    if let Some(end) = without_userinfo.find(']') {
+        return &without_userinfo[..=end];
+    }
+    without_userinfo
+        .split(':')
+        .next()
+        .unwrap_or(without_userinfo)
+}
+
+/// The port a host names, when it names one: the port the client addressed, which is what
+/// decides which of a resource's listeners or stages the request reached.
+#[must_use]
+pub fn addressed_port(host: Option<&str>) -> Option<i32> {
+    let authority = host?.rsplit('@').next()?;
+    let after_host = match authority.find(']') {
+        Some(end) => &authority[end + 1..],
+        None => authority,
+    };
+    after_host.rsplit_once(':')?.1.parse::<i32>().ok()
+}
+
+/// Whether `host` names some SERVICE: a service's own endpoint, control plane or data
+/// plane. Such a host keeps answering as the service it names, so an addressing that reads
+/// the EMULATOR's own endpoint is read only when it names none.
+///
+/// The front door's OWN host reader decides it for a named host
+/// (`emulator_server::service_from_host`), so a plane reads a host exactly as the router
+/// does. An ADDRESS names no service whatever that reader makes of it: it is the only
+/// endpoint a client on this machine can reach, and a bracketed IPv6 literal carries its
+/// own colons, which that reader's `:port` split does not expect.
+#[must_use]
+pub fn names_a_service(host: &str) -> bool {
+    let host = host_only(host);
+    if host.starts_with('[') || host.parse::<std::net::IpAddr>().is_ok() {
+        return false;
+    }
+    let Ok(value) = ::http::HeaderValue::from_str(host) else {
+        return false;
+    };
+    let mut headers = ::http::HeaderMap::new();
+    headers.insert("host", value);
+    ::emulator_server::service_from_host(&headers).is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_path_splits_into_its_first_segment_and_the_rest() {
+        let cases: &[(&str, Option<(&str, &str)>)] = &[
+            ("/a/b", Some(("a", "/b"))),
+            ("/a", Some(("a", "/"))),
+            ("/", Some(("", "/"))),
+            ("/_aws/execute-api/x", Some(("_aws", "/execute-api/x"))),
+            ("a/b", None),
+        ];
+        for (path, expected) in cases {
+            let split = first_segment(path);
+            assert_eq!(
+                split, *expected,
+                "case {path:?}: expected {expected:?}, got {split:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_host_reads_as_a_name_a_port_and_whether_it_names_a_service() {
+        // The rows span what the reading generalises over: a published resource host, a
+        // service endpoint, every shape of loopback address, and userinfo.
+        let cases: &[(&str, &str, Option<i32>, bool)] = &[
+            (
+                "my-alb-123.us-west-2.elb.amazonaws.com",
+                "my-alb-123.us-west-2.elb.amazonaws.com",
+                None,
+                true,
+            ),
+            (
+                "my-alb-123.us-west-2.elb.amazonaws.com:8080",
+                "my-alb-123.us-west-2.elb.amazonaws.com",
+                Some(8080),
+                true,
+            ),
+            ("127.0.0.1:9297", "127.0.0.1", Some(9297), false),
+            ("localhost:9297", "localhost", Some(9297), false),
+            ("[::1]:9297", "[::1]", Some(9297), false),
+            ("[::1]", "[::1]", None, false),
+            ("user@s3.us-west-2.amazonaws.com", "s3.us-west-2.amazonaws.com", None, true),
+        ];
+        for (host, name, port, service) in cases {
+            assert_eq!(
+                host_only(host),
+                *name,
+                "case {host:?}: expected the name {name:?}, got {:?}",
+                host_only(host)
+            );
+            assert_eq!(
+                addressed_port(Some(host)),
+                *port,
+                "case {host:?}: expected the port {port:?}, got {:?}",
+                addressed_port(Some(host))
+            );
+            assert_eq!(
+                names_a_service(host),
+                *service,
+                "case {host:?}: expected names_a_service {service}, got {}",
+                names_a_service(host)
+            );
+        }
+    }
+}

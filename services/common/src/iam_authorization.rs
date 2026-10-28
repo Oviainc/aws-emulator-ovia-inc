@@ -86,9 +86,10 @@
 //! IAM's `Null` operator asks about a key's PRESENCE rather than its value, so it is decided
 //! under that same declaration and nowhere else: a request that models a key can answer that
 //! it carries no value for it, and one that does not model the key cannot. A caller that
-//! knows every value of a key FAMILY publishes the family — `aws:PrincipalTag/`, a trailing
-//! `/` — which is what lets a statement conditioned on the absence of one principal tag be
-//! decided for a principal whose tags are all known.
+//! knows every value of a key FAMILY publishes the family — `aws:PrincipalTag/`, or
+//! `kms:EncryptionContext:`, written up to and including the separator the family's members
+//! are named after it by — which is what lets a statement conditioned on the absence of one
+//! member of that family be decided for a request whose members are all known.
 //!
 //! ## Policy variables
 //!
@@ -169,6 +170,12 @@ const BOOL_OPERATOR: &str = "Bool";
 /// absence means this emulator does not model the key rather than that the request carries
 /// no value for it.
 const IF_EXISTS_SUFFIX: &str = "IfExists";
+
+/// The characters a condition-key FAMILY's members are named after it by, which is what a
+/// published name ending in one declares the whole family of: IAM's tag families name a
+/// member after a `/` (`aws:PrincipalTag/team`) and a service's per-entry families name one
+/// after a `:` (`kms:EncryptionContext:tenant`).
+const FAMILY_SEPARATORS: [char; 2] = ['/', ':'];
 
 /// The most bytes one policy document this evaluator reads may carry.
 ///
@@ -971,14 +978,16 @@ fn conditions_hold(statement: &::serde_json::Value, request: &Request<'_>) -> Op
 /// Whether the request DECLARES that it models `key`: its own name is published, or a
 /// published FAMILY covers it.
 ///
-/// A published name ending in `/` is a whole key family — `aws:PrincipalTag/` covers
-/// `aws:PrincipalTag/team` and every other tag key — which is what a caller that knows ALL
-/// the values of a family publishes: it can answer for a key of that family whether the
-/// request carries a value for it, including answering that it carries none.
+/// A published name ending in the separator its members are named after it by is a whole
+/// key family — `aws:PrincipalTag/` covers `aws:PrincipalTag/team` and every other tag key,
+/// `kms:EncryptionContext:` covers every entry name of a request's encryption context —
+/// which is what a caller that knows ALL the values of a family publishes: it can answer
+/// for a key of that family whether the request carries a value for it, including answering
+/// that it carries none.
 fn publishes(request: &Request<'_>, key: &str) -> bool {
     request.published.iter().any(|known| {
         known.eq_ignore_ascii_case(key)
-            || (known.ends_with('/')
+            || (known.ends_with(FAMILY_SEPARATORS)
                 && key.len() > known.len()
                 // By `get`, never by a byte-index slice: the key is read verbatim out of a
                 // policy document, so a multi-byte character straddling the family's length
@@ -1695,6 +1704,65 @@ mod tests {
         for (case, condition, expected) in rows {
             let request = Request::new("sqs:SendMessage", RESOURCE, &held)
                 .with_context(&tagged)
+                .with_published_keys(&family);
+            let reached = identity_decision(&[statement(condition)], &request);
+            assert_eq!(
+                reached, *expected,
+                "case {case:?}: expected {expected:?}, got {reached:?}"
+            );
+        }
+    }
+
+    /// A family whose members are named after it by a COLON — the form a service's
+    /// per-entry condition keys take — covers its members the same way a slash-separated
+    /// one does, and covers nothing outside itself.
+    #[test]
+    fn a_colon_separated_published_family_covers_the_keys_under_it() {
+        let statement = |condition: &str| {
+            identity(&format!(
+                "{{\"Effect\":\"Allow\",\"Action\":\"kms:Decrypt\",\"Resource\":\"*\",\
+                 \"Condition\":{condition}}}"
+            ))
+        };
+        let family = ["kms:EncryptionContext:"];
+        let held = principals();
+        let carried = [(
+            "kms:EncryptionContext:tenant".to_string(),
+            "payments".to_string(),
+        )];
+        // (case, the condition, what the document then states)
+        let rows: &[(&str, &str, Decision)] = &[
+            (
+                "a member of the family the request carries",
+                "{\"StringEquals\":{\"kms:EncryptionContext:tenant\":\"payments\"}}",
+                Decision::Allowed,
+            ),
+            (
+                // Decided as absent, which is what declaring the family buys: a negated
+                // operator holds on a member the request carries no value for.
+                "a member of the family the request does not carry",
+                "{\"StringNotEquals\":{\"kms:EncryptionContext:zone\":\"a\"}}",
+                Decision::Allowed,
+            ),
+            (
+                "the same member under a positive operator",
+                "{\"StringEquals\":{\"kms:EncryptionContext:zone\":\"a\"}}",
+                Decision::NotStated,
+            ),
+            (
+                "a member asserted absent through the existence operator",
+                "{\"Null\":{\"kms:EncryptionContext:zone\":\"true\"}}",
+                Decision::Allowed,
+            ),
+            (
+                "a key outside the family",
+                "{\"Null\":{\"kms:ViaService\":\"true\"}}",
+                Decision::NotStated,
+            ),
+        ];
+        for (case, condition, expected) in rows {
+            let request = Request::new("kms:Decrypt", RESOURCE, &held)
+                .with_context(&carried)
                 .with_published_keys(&family);
             let reached = identity_decision(&[statement(condition)], &request);
             assert_eq!(

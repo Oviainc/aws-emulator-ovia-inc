@@ -40,7 +40,7 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 //!
-//! Two of those seams are taken here, for two reasons.
+//! Three of those seams are taken here, for three reasons.
 //!
 //! The first: this model's `endpointPrefix` and SigV4 signing name are the ones the Classic
 //! Elastic Load Balancing model publishes too, so the claim cannot come from the model
@@ -56,6 +56,14 @@
 //! every error response — modelled, refused or unroutable — and leave the status, the
 //! code, the message and the whole success path with the framework renderers that own
 //! them.
+//!
+//! The third: a load balancer this service creates publishes the name a client sends
+//! traffic to, and that name is NOT this API's endpoint — so the front door could resolve
+//! no target service from a request addressed to it and answered `404 UnknownService` for
+//! the one address this service told the caller to use. [`can_handle`](Service::can_handle)
+//! also claims a request addressed to a load balancer this service HOLDS, and
+//! [`override_routing_error`](Service::override_routing_error) answers it out of that load
+//! balancer's listener configuration; [`data_plane`] is what resolves and serves it.
 
 //! One fact about this service's wire identity is read from OUTSIDE this crate: the API
 //! version an awsQuery envelope must name to be served out of this model on the endpoint
@@ -64,6 +72,8 @@
 //! it rather than restating the literal.
 
 pub mod shared_endpoint;
+
+pub mod data_plane;
 
 use service_common::query_error_envelope::{
     RequestIdEnvelopeDefinition, RequestIdEnvelopeOperation,
@@ -115,6 +125,13 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// built once, because `override_operation` hands back a reference borrowed from
     /// `&self`.
     envelope: RequestIdEnvelopeOperation,
+    /// The SAME shared engine the generated entry threads into every operation.
+    ///
+    /// Held here because a LOAD BALANCER's own traffic ([`data_plane`]) is claimed by
+    /// `can_handle` and served from `override_routing_error`, neither of which is an
+    /// operation with a `self.engine` of its own: both must read the one store the
+    /// control-plane operations write, not a second copy.
+    engine: Arc<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -123,8 +140,11 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: RequestIdEnvelopeDefinition::new(crate::ServiceDefinition::new(engine)),
+            entry: RequestIdEnvelopeDefinition::new(crate::ServiceDefinition::new(Arc::clone(
+                &engine,
+            ))),
             envelope: RequestIdEnvelopeOperation,
+            engine,
         }
     }
 }
@@ -152,8 +172,19 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // the shared `elasticloadbalancing` name belongs to the Classic front door, which
         // serves this model's operations for an envelope naming this model's API version.
         match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == ROUTE_KEY,
-            None => false,
+            Some(key) if key == ROUTE_KEY => true,
+            // And a LOAD BALANCER's own traffic: a request addressed to a load balancer
+            // this service holds a record for ([`data_plane::claims_parts`]). Such a
+            // request names no modelled operation and carries no credential scope naming
+            // this service — its host is the load balancer's own published `DNSName`, whose
+            // first label names no service — so the front door could resolve no target
+            // service for it and answered `404 UnknownService`, for the one address this
+            // service told the caller to send traffic to.
+            //
+            // The claim is narrowed to a load balancer this service HOLDS, read from the
+            // one shared store, rather than to a host or a path shape alone, so one request
+            // keeps one claimant.
+            _ => data_plane::claims_parts(&*self.engine, parts),
         }
     }
 
@@ -201,11 +232,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     ) -> Option<aws_smithy_runtime_api::http::Response> {
         // The router calls this when a request reached this service but named no
         // modeled operation — neither `override_operation` nor the generated
-        // routing table resolved it. Returning `None` renders the protocol-correct
-        // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
-        let _ = req;
+        // routing table resolved it. A load balancer's own traffic is exactly that case by
+        // construction (no modelled operation is bound at a load balancer's request path),
+        // so this is where it is served — BEFORE authentication, which is what lets a
+        // client carrying no AWS credential be answered at all.
+        //
+        // Anything else keeps the protocol-correct default for this service's envelope
+        // (query -> 400 InvalidAction text/xml) by returning `None`.
+        if data_plane::claims_request(&*self.engine, req) {
+            return Some(data_plane::serve(&*self.engine, req));
+        }
         None
     }
 

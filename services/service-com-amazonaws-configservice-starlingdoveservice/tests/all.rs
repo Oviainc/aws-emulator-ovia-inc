@@ -162,3 +162,5 @@ mod aggregate_compliance_by_conformance_packs;
 mod get_resource_config_history;
 #[path = "all/config_write_path_validation.rs"]
 mod config_write_path_validation;
+#[path = "all/recorded_inventory_drives_the_read_surface.rs"]
+mod recorded_inventory_drives_the_read_surface;
