@@ -728,9 +728,10 @@ async fn each_finding_reports_the_stored_record_it_was_computed_from() {
             case.case,
             result["Auditor"]
         );
-        // Nothing measured the objective's attainment, so the auditor observed no breached
-        // threshold: the modelled severity for no issue, and the budget status of an
-        // objective with no evaluated datapoint.
+        // Nothing was observed in breach of the objective's threshold, so the budget of the
+        // elapsed, post-creation part of the audited period is intact: the status its
+        // remaining share earns against the goal's warning threshold, and the modelled
+        // severity for no issue.
         assert_eq!(
             result["Severity"].as_str(),
             Some("NONE"),
@@ -740,8 +741,8 @@ async fn each_finding_reports_the_stored_record_it_was_computed_from() {
         );
         assert_eq!(
             result["Data"]["BudgetStatus"].as_str(),
-            Some("INSUFFICIENT_DATA"),
-            "case {:?}: expected budget status INSUFFICIENT_DATA, got {:?}",
+            Some("OK"),
+            "case {:?}: expected budget status OK, got {:?}",
             case.case,
             result["Data"]["BudgetStatus"]
         );

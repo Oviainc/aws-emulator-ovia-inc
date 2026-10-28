@@ -74,8 +74,6 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-// The calendar arithmetic a calendar-month interval is stepped by.
-use ::chrono::Datelike;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -121,47 +119,12 @@ impl From<BatchGetServiceLevelObjectiveBudgetReportErrorModeled> for BatchGetSer
 /// per-item code, names its codes exactly that way).
 const NOT_FOUND_ERROR_CODE: &str = "ResourceNotFoundException";
 
-/// The modelled `ServiceLevelObjectiveBudgetStatus` values
-/// (`smithy_query(shape="ServiceLevelObjectiveBudgetStatus")` -> `["OK", "WARNING",
-/// "BREACHED", "INSUFFICIENT_DATA"]`), each as the member's own doc defines it: `OK` while
-/// the remaining budget is above the warning threshold, `WARNING` once it is below it,
-/// `BREACHED` once the budget is exhausted, and `INSUFFICIENT_DATA` when the requested time
-/// precedes the SLO or attainment data is missing.
-const BUDGET_STATUS_OK: &str = "OK";
-/// [`BUDGET_STATUS_OK`], for a remaining budget under the SLO's warning threshold.
-const BUDGET_STATUS_WARNING: &str = "WARNING";
-/// [`BUDGET_STATUS_OK`], for an exhausted budget.
-const BUDGET_STATUS_BREACHED: &str = "BREACHED";
-/// [`BUDGET_STATUS_OK`], for a report over a window nothing was evaluated in.
-const BUDGET_STATUS_INSUFFICIENT_DATA: &str = "INSUFFICIENT_DATA";
-
-/// The `Attainment` of a period-based SLO whose evaluated window holds no period in breach
-/// of its SLI threshold: every period attained the goal, which is 100% of them.
-///
-/// `Attainment` is "a number between 0 and 100 that represents the success percentage of
-/// your application compared to the goal set by the SLO ... the percentage of time periods
-/// that the service has attained the SLO's attainment goal"
-/// (`smithy_query(query="doc", shape="ServiceLevelObjectiveBudgetReport",
-/// member="Attainment")`).
-const FULL_ATTAINMENT: f64 = 100.0;
-
-/// The seconds a `MINUTE` of interval duration spans, and the units built from it
-/// (`smithy_query(shape="DurationUnit")` -> `["MINUTE", "HOUR", "DAY", "MONTH"]`).
-const MINUTE_SECONDS: i64 = 60;
-/// [`MINUTE_SECONDS`], for `HOUR`.
-const HOUR_SECONDS: i64 = 60 * MINUTE_SECONDS;
-/// [`MINUTE_SECONDS`], for `DAY`.
-const DAY_SECONDS: i64 = 24 * HOUR_SECONDS;
-/// [`MINUTE_SECONDS`], for the ROLLING `MONTH` — the 30-day month this operation's own doc
-/// measures a monthly error budget in ("an error budget of 21.9 minutes of downtime in a
-/// 30-day month").
-///
-/// A CALENDAR month is not a fixed span, so a calendar interval of months is stepped by the
-/// calendar instead ([`calendar_month_interval`]).
-const ROLLING_MONTH_SECONDS: i64 = 30 * DAY_SECONDS;
-
-/// The `DurationUnit` whose span is a calendar month rather than a fixed number of seconds.
-const DURATION_UNIT_MONTH: &str = "MONTH";
+// The modelled `ServiceLevelObjectiveBudgetStatus` values, the `Attainment` of a window
+// nothing was observed in breach of, the evaluation interval an instant falls in and the
+// budget a goal allows over it are all `crate::state`'s: the error budget of one stored SLO
+// over one period is ONE quantity, derived by that module's `budget_assessment` for every
+// read that reports it, so this report and the SLO auditor's finding for the same record
+// cannot disagree about it.
 
 /// The partitions the modelled `ServiceLevelObjectiveArn` pattern admits
 /// (`^arn:(aws|aws-us-gov):application-signals:…`).
@@ -232,242 +195,30 @@ fn is_slo_id(id: &str) -> bool {
         && crate::state::slo_name_in_arn(id).is_some_and(well_formed_slo_name)
 }
 
-/// The seconds `duration` units of `duration_unit` span, or `None` for a unit this service
-/// does not know or a span that is not a forward one.
-fn span_seconds(duration_unit: &str, duration: i32) -> Option<i64> {
-    let unit = match duration_unit {
-        "MINUTE" => MINUTE_SECONDS,
-        "HOUR" => HOUR_SECONDS,
-        "DAY" => DAY_SECONDS,
-        DURATION_UNIT_MONTH => ROLLING_MONTH_SECONDS,
-        _ => return None,
-    };
-    let span = unit.checked_mul(i64::from(duration))?;
-    (span > 0).then_some(span)
-}
-
-/// The evaluation interval of `interval` that the instant `at` falls in, as `(start, end)`
-/// epoch seconds.
-///
-/// A ROLLING interval is the span ending at the instant asked about: "if `Duration` is `7`
-/// and `DurationUnit` is `DAY`, each rolling interval is seven days"
-/// (`smithy_query(shape="RollingInterval")`), and the report is "as of the time that you
-/// specified in `TimeStamp`".
-///
-/// A CALENDAR interval tiles forward from its own `StartTime` — "as soon as one calendar
-/// interval ends, another automatically begins"
-/// (`smithy_query(shape="CalendarInterval")`) — so the interval asked about is the tile that
-/// contains `at`. `None` when `at` precedes the first tile: no interval has begun yet, so
-/// there is nothing to report a budget for.
-fn evaluation_interval(interval: &Interval, at: i64) -> Option<(i64, i64)> {
-    match interval {
-        Interval::RollingInterval(rolling) => {
-            let span = span_seconds(&rolling.duration_unit, rolling.duration)?;
-            Some((at.checked_sub(span)?, at))
-        }
-        Interval::CalendarInterval(calendar) => {
-            let anchor = calendar.start_time.secs();
-            if at < anchor {
-                return None;
-            }
-            if calendar.duration_unit == DURATION_UNIT_MONTH {
-                return calendar_month_interval(anchor, calendar.duration, at);
-            }
-            let span = span_seconds(&calendar.duration_unit, calendar.duration)?;
-            let start = anchor.checked_add(at.checked_sub(anchor)? / span * span)?;
-            Some((start, start.checked_add(span)?))
-        }
-    }
-}
-
-/// The most corrections [`calendar_month_interval`] makes to its stride estimate.
-///
-/// The estimate is derived from the two instants' calendar year and month, so it can be off
-/// by one stride — the clamping of a day-of-month the target month does not have moves a
-/// tile boundary within its month — and one correction in either direction settles it. The
-/// bound is what keeps the search finite for any instant a `Timestamp` can carry.
-const MAX_STRIDE_CORRECTIONS: u32 = 4;
-
-/// The `duration`-month calendar tile containing `at`, stepped from `anchor` by the
-/// CALENDAR: a calendar interval is "aligned with the calendar"
-/// (`smithy_query(shape="CalendarInterval")`, member `Duration`), and calendar months are of
-/// different lengths, so a fixed span would drift a month boundary by days over a year.
-///
-/// The calendar arithmetic is `chrono`'s — `checked_add_months`, which clamps a
-/// day-of-month the target month does not have — so no month-length or leap-year table is
-/// re-derived here.
-fn calendar_month_interval(anchor: i64, duration: i32, at: i64) -> Option<(i64, i64)> {
-    let months_per_stride = u32::try_from(duration).ok().filter(|months| *months > 0)?;
-    let anchored = ::chrono::DateTime::from_timestamp(anchor, 0)?;
-    let requested = ::chrono::DateTime::from_timestamp(at, 0)?;
-
-    let months_between = (requested.year().checked_sub(anchored.year())?).checked_mul(12)?
-        + (i32::try_from(requested.month()).ok()? - i32::try_from(anchored.month()).ok()?);
-    let estimate = months_between / i32::try_from(months_per_stride).ok()?;
-    let mut strides = u32::try_from(estimate.max(0)).ok()?;
-
-    for _ in 0..MAX_STRIDE_CORRECTIONS {
-        let start = stepped_months(&anchored, strides, months_per_stride)?;
-        let end = stepped_months(&anchored, strides.checked_add(1)?, months_per_stride)?;
-        if start.timestamp() > at {
-            strides = strides.checked_sub(1)?;
-            continue;
-        }
-        if end.timestamp() <= at {
-            strides = strides.checked_add(1)?;
-            continue;
-        }
-        return Some((start.timestamp(), end.timestamp()));
-    }
-    None
-}
-
-/// `anchored` advanced by `strides` tiles of `months_per_stride` calendar months each.
-fn stepped_months(
-    anchored: &::chrono::DateTime<::chrono::Utc>,
-    strides: u32,
-    months_per_stride: u32,
-) -> Option<::chrono::DateTime<::chrono::Utc>> {
-    anchored.checked_add_months(::chrono::Months::new(strides.checked_mul(months_per_stride)?))
-}
-
-/// Whether anything in the interval starting at `interval_start` has been EVALUATED for
-/// `slo` as of the instant `at`.
-///
-/// The window a report covers is the part of the interval that both follows the SLO's
-/// creation and has already elapsed, so an EMPTY window means the SLO was measured over
-/// nothing: `INSUFFICIENT_DATA` "means that the specified start and end times were before
-/// the SLO was created, or that attainment data is missing"
-/// (`smithy_query(query="doc", shape="ServiceLevelObjectiveBudgetReport",
-/// member="BudgetStatus")`). An SLO monitors its entity only from the moment it is created,
-/// which is the same window rule this service's topology reads apply.
-///
-/// The three instants are ordered on the module's one instant key
-/// (`crate::state::instant_nanos`), the same key those reads apply, so a creation a fraction
-/// of a microsecond after the window ends leaves the window empty here exactly as it leaves
-/// the entity undiscovered there.
-fn evaluated(
-    interval_start: i64,
-    slo: &ServiceLevelObjective,
-    at: &::aws_smithy_types::DateTime,
-    now: &::aws_smithy_types::DateTime,
-) -> bool {
-    let interval_start = crate::state::instant_nanos(&::aws_smithy_types::DateTime::from_secs(
-        interval_start,
-    ));
-    let window_start = interval_start.max(crate::state::instant_nanos(&slo.created_time));
-    let window_end = crate::state::instant_nanos(at).min(crate::state::instant_nanos(now));
-    window_start < window_end
-}
-
-/// A real-valued budget of seconds as the whole seconds the modelled integer
-/// `TotalBudgetSeconds`/`BudgetSecondsRemaining` members count: the budget is a share of
-/// the interval and so is rarely a whole number of seconds (1% of 7 days is 6048 seconds,
-/// 0.1% of 12 hours is 43.2), and the nearest second is the closest the member can come to
-/// it.
-///
-/// Rounding rather than truncating also keeps the reported budget off the representation of
-/// the percentage it came from: an attainment goal is a decimal percentage, which binary
-/// floating point holds to within a tiny error either way, and truncation would turn that
-/// error into a whole second missing from an exact budget.
-fn whole_seconds(budget: f64) -> i32 {
-    budget.round().clamp(0.0, f64::from(i32::MAX)) as i32
-}
-
-/// The `BudgetStatus` a remaining error budget earns against the SLO's warning threshold.
-///
-/// `WarningThreshold` is "the percentage of remaining budget over total budget that you want
-/// to get warnings for" (`smithy_query(shape="Goal")`), so the comparison is on that
-/// percentage, and a budget with nothing left of it is the exhausted one `BREACHED` names. A
-/// ZERO total budget leaves no percentage to compare — an SLO whose attainment goal tolerates
-/// no unhealthy time at all — so it is `OK` exactly while nothing has been spent.
-fn budget_status_of(total: i32, remaining: i32, warning_threshold: Option<f64>) -> &'static str {
-    if remaining < 0 || (remaining == 0 && total > 0) {
-        return BUDGET_STATUS_BREACHED;
-    }
-    let remaining_percent = if total > 0 {
-        f64::from(remaining) / f64::from(total) * FULL_ATTAINMENT
-    } else {
-        FULL_ATTAINMENT
-    };
-    match warning_threshold {
-        Some(threshold) if remaining_percent < threshold => BUDGET_STATUS_WARNING,
-        _ => BUDGET_STATUS_OK,
-    }
-}
-
 /// The budget report of one stored SLO, as of the instant `at`, with `now` the instant the
 /// request is served at.
 ///
-/// The error budget of a PERIOD-BASED SLO is an amount of TIME, and follows from the stored
-/// goal alone: it is the share of the evaluation interval that the attainment goal leaves
-/// unattained — "an SLO with a threshold of 99.95% and a monthly interval translates to an
-/// error budget of 21.9 minutes of downtime in a 30-day month" (this operation's own doc).
-/// Nothing in the evaluated window has been observed in breach of the SLI threshold, since
-/// this emulator receives no telemetry and a period with no breaching data point is a good
-/// period, so every period of the window attained the goal and none of that budget has been
-/// spent.
-///
-/// The error budget of a REQUEST-BASED SLO is a number of REQUESTS — `TotalBudgetRequests`
-/// "displays the total number of failed requests that can be tolerated" and `Attainment` is
-/// "the number of successful requests divided by the number of total requests"
-/// (`smithy_query(query="doc", shape="ServiceLevelObjectiveBudgetReport",
-/// member="Attainment")`) — and a request exists only if one was made, where a period exists
-/// because time passed. No request has been observed, so there is no count to take a share
-/// of and no quotient to report: those members stay ABSENT and the status is the
-/// `INSUFFICIENT_DATA` the member's doc defines for missing attainment data, rather than a
-/// zero budget the SLO never set or an attainment nothing measured.
+/// The error budget itself is [`crate::state::budget_assessment`]'s — the one derivation of a
+/// stored objective's budget this crate owns, which the SLO auditor reads the same objective's
+/// budget status from — so this report states that assessment rather than reaching one of its
+/// own. A report asks about an INSTANT ("the date and time that you want the report to be
+/// for"), not a period, so it names no period start: its window reaches back to the start of
+/// the evaluation interval that instant falls in.
 fn budget_report(
     slo: &ServiceLevelObjective,
     at: &::aws_smithy_types::DateTime,
     now: &::aws_smithy_types::DateTime,
 ) -> ServiceLevelObjectiveBudgetReport {
-    // The goal with every member the model documents a default for filled in, through the
-    // same builder the create path stored the record with — so the interval, the attainment
-    // goal and the warning threshold this report is computed from are the ones the SLO is
-    // evaluated against.
-    let goal = crate::state::goal_with_defaults(Some(&slo.goal));
-    let interval = goal
-        .interval
-        .as_ref()
-        .and_then(|interval| evaluation_interval(interval, at.secs()));
-
-    // `TotalBudgetSeconds` and `BudgetSecondsRemaining` are "included only if the SLO is a
-    // period-based SLO", which is the SLO that carries the period-based indicator.
-    let total_budget_seconds = match (slo.sli.is_some(), interval, goal.attainment_goal) {
-        (true, Some((start, end)), Some(attainment_goal)) => {
-            let unattained = (1.0 - attainment_goal / FULL_ATTAINMENT).clamp(0.0, 1.0);
-            Some(whole_seconds((end - start) as f64 * unattained))
-        }
-        _ => None,
-    };
-    let evaluated_window = interval.is_some_and(|(start, _)| evaluated(start, slo, at, now));
-
-    let (budget_status, attainment, budget_seconds_remaining) = match total_budget_seconds {
-        // The whole budget remains, so this call site can only produce `OK` today: no part
-        // of a budget is spent while nothing is observed in breach. The comparison is
-        // [`budget_status_of`]'s all the same, so a spent budget would be classified by the
-        // member's own rule rather than by a second one written here.
-        Some(total) if evaluated_window => (
-            budget_status_of(total, total, goal.warning_threshold),
-            Some(FULL_ATTAINMENT),
-            Some(total),
-        ),
-        // Either the window was empty — the interval had not begun, or had not begun for
-        // this SLO — or the SLO's attainment is a quotient of request counts nothing has
-        // reported. The interval's own total budget is still a fact about the goal, so a
-        // period-based report keeps it; what nothing was measured for is left absent.
-        _ => (BUDGET_STATUS_INSUFFICIENT_DATA, None, None),
-    };
+    let assessment = crate::state::budget_assessment(slo, None, at, now);
 
     ServiceLevelObjectiveBudgetReport {
         arn: slo.arn.clone(),
         name: slo.name.clone(),
         evaluation_type: slo.evaluation_type.clone(),
-        budget_status: budget_status.to_string(),
-        attainment,
-        total_budget_seconds,
-        budget_seconds_remaining,
+        budget_status: assessment.budget_status.to_string(),
+        attainment: assessment.attainment,
+        total_budget_seconds: assessment.total_budget_seconds,
+        budget_seconds_remaining: assessment.budget_seconds_remaining,
         // The request counts of a request-based SLO, absent for the reason this function's
         // doc gives; a period-based SLO has no such member to report at all.
         total_budget_requests: None,
@@ -612,182 +363,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+// The unit tests of the budget rule — the `BudgetStatus` a remaining share earns and the
+// evaluation interval an instant falls in — live beside that rule, in `crate::state`.
 
-    /// 2020-01-01T00:00:00Z, the anchor most rows below tile from.
-    const JAN_01_2020: i64 = 1_577_836_800;
-    /// 2020-01-15T00:00:00Z, a mid-month anchor.
-    const JAN_15_2020: i64 = 1_579_046_400;
-    /// 2020-01-31T00:00:00Z, an anchor on a day February does not have.
-    const JAN_31_2020: i64 = 1_580_428_800;
-    /// 2020-02-01T00:00:00Z.
-    const FEB_01_2020: i64 = 1_580_515_200;
-    /// 2020-02-20T00:00:00Z.
-    const FEB_20_2020: i64 = 1_582_156_800;
-    /// 2020-02-29T00:00:00Z, the last day of a leap February.
-    const FEB_29_2020: i64 = 1_582_934_400;
-    /// 2020-03-01T00:00:00Z.
-    const MAR_01_2020: i64 = 1_583_020_800;
-    /// 2021-01-01T00:00:00Z.
-    const JAN_01_2021: i64 = 1_609_459_200;
-    /// 2021-02-15T00:00:00Z.
-    const FEB_15_2021: i64 = 1_613_347_200;
-    /// 2021-02-20T00:00:00Z.
-    const FEB_20_2021: i64 = 1_613_779_200;
-    /// 2021-03-15T00:00:00Z.
-    const MAR_15_2021: i64 = 1_615_766_400;
-    /// 2021-04-01T00:00:00Z.
-    const APR_01_2021: i64 = 1_617_235_200;
-    /// 2021-05-10T00:00:00Z.
-    const MAY_10_2021: i64 = 1_620_604_800;
-    /// 2021-05-11T00:00:00Z.
-    const MAY_11_2021: i64 = 1_620_691_200;
-    /// 2021-07-01T00:00:00Z.
-    const JUL_01_2021: i64 = 1_625_097_600;
-    /// 2030-01-01T00:00:00Z, an anchor after every instant asked about below.
-    const JAN_01_2030: i64 = 1_893_456_000;
 
-    fn rolling(duration_unit: &str, duration: i32) -> Interval {
-        Interval::RollingInterval(RollingInterval {
-            duration_unit: duration_unit.to_string(),
-            duration,
-        })
-    }
-
-    fn calendar(duration_unit: &str, duration: i32, start_time: i64) -> Interval {
-        Interval::CalendarInterval(CalendarInterval {
-            start_time: ::aws_smithy_types::DateTime::from_secs(start_time),
-            duration_unit: duration_unit.to_string(),
-            duration,
-        })
-    }
-
-    /// The `BudgetStatus` rule is the member's own — the remaining share of the budget
-    /// against the SLO's warning threshold — over EVERY share, including the spent budgets
-    /// no report of this emulator reaches while nothing is observed in breach.
-    #[test]
-    fn budget_status_follows_the_remaining_share() {
-        let cases = [
-            (3600, 3600, Some(50.0), BUDGET_STATUS_OK),
-            // Exactly AT the threshold is not below it.
-            (3600, 1800, Some(50.0), BUDGET_STATUS_OK),
-            (3600, 1799, Some(50.0), BUDGET_STATUS_WARNING),
-            (3600, 1, Some(50.0), BUDGET_STATUS_WARNING),
-            // A stricter threshold warns earlier, a laxer one later.
-            (3600, 3000, Some(90.0), BUDGET_STATUS_WARNING),
-            (3600, 360, Some(5.0), BUDGET_STATUS_OK),
-            // Nothing left of a budget that had something is the exhausted one.
-            (3600, 0, Some(50.0), BUDGET_STATUS_BREACHED),
-            (3600, -60, Some(50.0), BUDGET_STATUS_BREACHED),
-            // A goal that tolerates no unhealthy time has no share to compare, and is
-            // intact while nothing has been spent.
-            (0, 0, Some(50.0), BUDGET_STATUS_OK),
-            (0, -1, Some(50.0), BUDGET_STATUS_BREACHED),
-            // No threshold configured: nothing to be below.
-            (3600, 1, None, BUDGET_STATUS_OK),
-        ];
-        for (total, remaining, warning_threshold, expected) in cases {
-            let status = budget_status_of(total, remaining, warning_threshold);
-            assert_eq!(
-                status, expected,
-                "case {:?}: expected {expected}, got {status}",
-                (total, remaining, warning_threshold)
-            );
-        }
-    }
-
-    /// One row of the interval table: what it states, the interval, the instant asked
-    /// about, and the `(start, end)` the interval resolves to.
-    struct IntervalCase {
-        label: &'static str,
-        interval: Interval,
-        at: i64,
-        resolved: Option<(i64, i64)>,
-    }
-
-    /// The evaluation interval of an instant: the rolling span ending at it, or the calendar
-    /// tile containing it — months stepped by the calendar, so a tile is as long as the
-    /// months it covers.
-    #[test]
-    fn evaluation_interval_spans_rolling_windows_and_calendar_tiles() {
-        let cases = [
-            IntervalCase {
-                label: "a rolling week ends at the instant asked about",
-                interval: rolling("DAY", 7),
-                at: FEB_20_2020,
-                resolved: Some((FEB_20_2020 - 7 * 86_400, FEB_20_2020)),
-            },
-            IntervalCase {
-                label: "a rolling month is the 30-day month the doc measures a budget in",
-                interval: rolling("MONTH", 1),
-                at: FEB_20_2020,
-                resolved: Some((FEB_20_2020 - 30 * 86_400, FEB_20_2020)),
-            },
-            IntervalCase {
-                label: "a rolling span of minutes",
-                interval: rolling("MINUTE", 90),
-                at: FEB_20_2020,
-                resolved: Some((FEB_20_2020 - 5_400, FEB_20_2020)),
-            },
-            IntervalCase {
-                label: "a duration unit the service does not know spans nothing",
-                interval: rolling("WEEK", 1),
-                at: FEB_20_2020,
-                resolved: None,
-            },
-            IntervalCase {
-                label: "a monthly tile is the calendar month, 29 days in a leap February",
-                interval: calendar("MONTH", 1, JAN_01_2020),
-                at: FEB_20_2020,
-                resolved: Some((FEB_01_2020, MAR_01_2020)),
-            },
-            IntervalCase {
-                label: "a mid-month anchor tiles from its own day of the month",
-                interval: calendar("MONTH", 1, JAN_15_2020),
-                at: FEB_20_2021,
-                resolved: Some((FEB_15_2021, MAR_15_2021)),
-            },
-            IntervalCase {
-                label: "an anchor on the 31st ends on the last day the next month has",
-                interval: calendar("MONTH", 1, JAN_31_2020),
-                at: FEB_20_2020,
-                resolved: Some((JAN_31_2020, FEB_29_2020)),
-            },
-            IntervalCase {
-                label: "a three-month tile",
-                interval: calendar("MONTH", 3, JAN_01_2021),
-                at: MAY_10_2021,
-                resolved: Some((APR_01_2021, JUL_01_2021)),
-            },
-            IntervalCase {
-                label: "a daily tile, asked about at its own boundary",
-                interval: calendar("DAY", 1, JAN_01_2021),
-                at: MAY_10_2021,
-                resolved: Some((MAY_10_2021, MAY_11_2021)),
-            },
-            IntervalCase {
-                label: "the anchor instant itself falls in the first tile",
-                interval: calendar("MONTH", 1, JAN_01_2020),
-                at: JAN_01_2020,
-                resolved: Some((JAN_01_2020, FEB_01_2020)),
-            },
-            IntervalCase {
-                label: "an instant before the first tile falls in no interval",
-                interval: calendar("MONTH", 1, JAN_01_2030),
-                at: FEB_20_2020,
-                resolved: None,
-            },
-        ];
-
-        for case in &cases {
-            let resolved = evaluation_interval(&case.interval, case.at);
-            assert_eq!(
-                resolved, case.resolved,
-                "case {:?}: expected {:?}, got {resolved:?}",
-                case.label, case.resolved
-            );
-        }
-    }
-}

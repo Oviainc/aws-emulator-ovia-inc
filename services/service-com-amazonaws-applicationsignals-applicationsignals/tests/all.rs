@@ -19,6 +19,8 @@ mod audit_findings;
 mod batch_instrumentation_configuration_deletion;
 #[path = "all/budget_reports.rs"]
 mod budget_reports;
+#[path = "all/budget_status_agreement.rs"]
+mod budget_status_agreement;
 #[path = "all/change_event_attribution.rs"]
 mod change_event_attribution;
 #[path = "all/code_location_class_name.rs"]
