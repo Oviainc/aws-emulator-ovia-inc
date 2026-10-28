@@ -1079,11 +1079,11 @@ impl AccountSettingsRecord {
     }
 }
 
-/// The members ONE write to a stored policy replaces, as `UpdateAccessPolicy` and
-/// `UpdateSecurityPolicy` carry them.
+/// The members ONE write to a stored policy replaces, as `UpdateAccessPolicy`,
+/// `UpdateSecurityPolicy` and `UpdateLifecyclePolicy` carry them.
 ///
-/// Both operations model `description` and `policy` as OPTIONAL on a request whose
-/// `type`/`name` already identify the policy, and neither is documented as clearing the
+/// All three operations model `description` and `policy` as OPTIONAL on a request whose
+/// `type`/`name` already identify the policy, and none is documented as clearing the
 /// stored value, so a member the request did not name keeps what is stored — the same
 /// partial-write rule [`AccountSettingsRecord::apply`] follows. The other two members are
 /// server-derived: every write mints a fresh `policyVersion`
@@ -1103,7 +1103,8 @@ pub struct PolicyWrite {
 
 impl PolicyWrite {
     /// Apply this write to one stored policy's mutable members: the ONE place the merge
-    /// rule lives, so a data access policy and a security policy cannot drift apart.
+    /// rule lives, so a data access policy, a security policy and a lifecycle policy
+    /// cannot drift apart.
     fn apply(
         self,
         description: &mut Option<String>,
@@ -1793,6 +1794,16 @@ impl LifecyclePolicyRecord {
             created_date: Some(self.created_date),
             last_modified_date: Some(self.last_modified_date),
         }
+    }
+
+    /// Apply `write` to this record; see [`PolicyWrite`] for the rule it follows.
+    pub fn apply(&mut self, write: PolicyWrite) {
+        write.apply(
+            &mut self.description,
+            &mut self.policy,
+            &mut self.policy_version,
+            &mut self.last_modified_date,
+        );
     }
 }
 
