@@ -170,6 +170,11 @@ async fn caller_identity(
 }
 
 /// Create one IAM user and return its `UserId` and `Arn`.
+///
+/// The user is also given the grant its own nameless `iam:GetUser` below needs: IAM
+/// authorizes its own API, so a user holding no identity-based document is refused that
+/// read, and what this suite is about is WHICH user a presented key resolves to rather
+/// than what that user may do.
 async fn create_user(
     router: &MultiServiceRouter,
     case: &str,
@@ -189,6 +194,25 @@ async fn create_user(
     assert_eq!(
         status, 200,
         "case {case:?}: expected HTTP 200 from CreateUser, got {status} {body}"
+    );
+    let (status, put) = iam(
+        router,
+        AMBIENT_KEY,
+        "PutUserPolicy",
+        &[
+            ("UserName", user_name.to_string()),
+            ("PolicyName", "self-read".to_string()),
+            (
+                "PolicyDocument",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"iam:GetUser","Resource":"*"}]}"#
+                    .to_string(),
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from PutUserPolicy, got {status} {put}"
     );
     (member(case, &body, "UserId"), member(case, &body, "Arn"))
 }

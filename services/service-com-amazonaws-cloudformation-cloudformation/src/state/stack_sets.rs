@@ -40,7 +40,10 @@
 //! instances it deleted back OUT of the stack set when the DELETE operation it runs as
 //! concludes ([`StoredStackSet::settle`]) — by `UpdateStackSet` and `UpdateStackInstances`,
 //! which record the UPDATE operation their mutation runs as, and by `DetectStackSetDrift`,
-//! which records the operation a drift detection runs as and what that detection found. The
+//! which records the operation a drift detection runs as and what that detection found.
+//! `DeleteStackSet` is what retires a record: the stack set takes the DELETED status
+//! ([`status`]), which leaves its summary for `ListStackSets` to report and takes it out of
+//! everything that RESOLVES a stack set ([`StoredStackSet::is_addressed_by`]). The
 //! ONE way a record enters this
 //! store is
 //! [`crate::state::ComAmazonawsCloudformationCloudformationState::record_stack_set`], so
@@ -579,6 +582,15 @@ pub fn operation_in_progress_message(stack_set_arn: &str, operation_id: &str) ->
     format!("Another Operation on StackSet {stack_set_arn} is in progress: {operation_id}")
 }
 
+/// The `StackSetNotEmptyException` message CloudFormation answers a request that asks for a
+/// stack set that still carries stack instances to be deleted.
+///
+/// "Before you can delete a StackSet, all its member stack instances must be deleted", and
+/// the refusal is entirely FIXED text — the condition is about the stack set as a whole,
+/// which is why the modelled exception carries no member naming an instance — so nothing of
+/// the request or of any one run goes into it.
+pub const STACK_SET_NOT_EMPTY: &str = "StackSet is not empty";
+
 /// One resource of one stack instance, as the drift detection that covered it found it —
 /// every member `StackInstanceResourceDriftsSummary` reports.
 #[derive(Debug, Clone)]
@@ -762,8 +774,18 @@ impl StoredStackSet {
 
     /// Whether `name_or_id` addresses this stack set in `region`: `StackSetName` is "the
     /// name or unique ID of the StackSet", and nothing outside that Region is addressable.
+    ///
+    /// A stack set a deletion has already taken is addressed by NOTHING: its record stays in
+    /// the store so `ListStackSets` keeps reporting its summary under the DELETED status the
+    /// model declares for it — until a new stack set takes that name in that Region, which
+    /// [`crate::state::ComAmazonawsCloudformationCloudformationState::record_stack_set`]
+    /// replaces the retired record with — but the name and the id it was addressed by resolve
+    /// to no stack set any more: a read of it is "the specified StackSet doesn't exist", a
+    /// mutation of it likewise, its name is free for a new stack set, and a second deletion of
+    /// it has nothing left to delete.
     pub fn is_addressed_by(&self, region: &str, name_or_id: &str) -> bool {
-        self.region == region
+        self.status != status::DELETED
+            && self.region == region
             && (self.stack_set_name == name_or_id || self.stack_set_id == name_or_id)
     }
 

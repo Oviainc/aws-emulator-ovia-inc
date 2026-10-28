@@ -14,7 +14,8 @@
 //! subscriptions that say which Amazon Redshift events are published to an
 //! Amazon SNS topic, and the authentication profiles that hold, under a name a
 //! client names instead of repeating them, the connection settings it connects
-//! with. Every collection keeps
+//! with, and the resource policies attached to the resources whose ARNs a
+//! `PutResourcePolicy` named. Every collection keeps
 //! INSERTION ORDER, so the `Marker`
 //! cursor the paginated `Describe*` operations hand out is a stable, resumable
 //! offset into the same sequence a later page walks.
@@ -1977,6 +1978,139 @@ pub fn check_authentication_profile_content(
     Ok(())
 }
 
+/// How long one resource policy document may be, in characters, before a write
+/// refuses it as a document this service cannot hold.
+///
+/// The emulator's own bound on
+/// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::resource_policies`],
+/// not a claim about a published limit: the document is kept VERBATIM for as
+/// long as the policy is attached, so without a bound one request could size the
+/// store. Set at the size of the largest policy document AWS accepts anywhere
+/// (an IAM resource-based policy's 20 480 characters), so no document the real
+/// service would store is refused here.
+pub const MAX_RESOURCE_POLICY_LEN: usize = 20_480;
+
+/// How many resources this store holds a policy against before a write refuses
+/// to attach another.
+///
+/// The emulator's own bound on
+/// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::resource_policies`],
+/// with the same reasoning as [`NAMESPACE_REGISTRATION_QUOTA`] and the same
+/// value: a policy holder is identified by the ARN a request carries rather than
+/// by a record this store mints, so this bound is what stops the collection
+/// growing without end. It is set far above any workflow an emulator serves, and
+/// every entry it holds is released by `DeleteResourcePolicy`.
+pub const RESOURCE_POLICY_QUOTA: usize = NAMESPACE_REGISTRATION_QUOTA;
+
+/// What a write answers when the store already holds
+/// [`RESOURCE_POLICY_QUOTA`] policies and the request would attach one more.
+///
+/// It says that the limit is this emulator's, so a caller does not read the
+/// refusal as a defect in the document it sent.
+pub fn resource_policy_quota_message() -> String {
+    format!(
+        "Emulator limit, not a defect in this request: this emulator holds at most {RESOURCE_POLICY_QUOTA} resource policies; delete one before attaching another."
+    )
+}
+
+/// Why a policy document is not one this service can attach to a resource.
+///
+/// A resource policy is a JSON policy document (`smithy_query(query="doc",
+/// shape="ResourcePolicy", member="Policy")` — "The content of a resource
+/// policy"), so a write can check its SIZE and its FORM and nothing else: the
+/// document is reported back exactly as it arrived.
+pub fn check_resource_policy(policy: &str) -> Result<(), String> {
+    // The size is checked FIRST, so a request cannot make the service parse
+    // more than it would ever store.
+    let length = policy.chars().count();
+    if length > MAX_RESOURCE_POLICY_LEN {
+        return Err(format!(
+            "The resource policy is {length} characters long, which exceeds the maximum of {MAX_RESOURCE_POLICY_LEN} characters."
+        ));
+    }
+    match serde_json::from_str::<serde_json::Value>(policy) {
+        Ok(serde_json::Value::Object(_)) => Ok(()),
+        _ => Err(RESOURCE_POLICY_NOT_A_POLICY_DOCUMENT.to_string()),
+    }
+}
+
+/// Why a request carrying something that is not a JSON policy document is
+/// refused.
+pub const RESOURCE_POLICY_NOT_A_POLICY_DOCUMENT: &str =
+    "The resource policy must be a JSON policy document.";
+
+/// The services whose resources carry an Amazon Redshift resource policy: the
+/// provisioned control plane and Amazon Redshift Serverless, whose namespaces
+/// are the resources `PutResourcePolicy` / `GetResourcePolicy` /
+/// `DeleteResourcePolicy` attach a policy to, read and detach.
+pub const POLICY_RESOURCE_SERVICES: [&str; 2] = ["redshift", "redshift-serverless"];
+
+/// Why the ARN a resource-policy operation carries names no resource this
+/// operation works on.
+///
+/// One classification for the write, the read and the delete, so the three
+/// cannot disagree about which ARN names a policy holder.
+#[derive(Debug)]
+pub enum PolicyResourceRefusal {
+    /// The value is no ARN at all ([`is_arn`]), so it names no resource — the
+    /// modelled `ResourceNotFoundFault`.
+    NotAResource(String),
+    /// The ARN names a resource of another service, which carries no Amazon
+    /// Redshift resource policy — the modelled `UnsupportedOperationFault`,
+    /// declared by all three resource-policy operations.
+    UnsupportedResource(String),
+}
+
+/// Whether `resource_arn` names a resource an Amazon Redshift resource policy
+/// attaches to: an ARN ([`is_arn`]) of one of [`POLICY_RESOURCE_SERVICES`].
+///
+/// The ARN is the policy holder's whole identity here. A policy is attached to
+/// "the resources that a policy is attached to"
+/// (`smithy_query(query="shape", shape="ResourcePolicy")`) — a Redshift
+/// Serverless namespace among them, which this service's own store never holds —
+/// so the ARN is what a policy is keyed by, and nothing takes it apart beyond
+/// the service whose resource it names.
+pub fn check_policy_resource_arn(resource_arn: &str) -> Result<(), PolicyResourceRefusal> {
+    if !is_arn(resource_arn) {
+        return Err(PolicyResourceRefusal::NotAResource(
+            resource_not_found_message(resource_arn),
+        ));
+    }
+    let service = resource_arn.split(':').nth(2).unwrap_or_default();
+    if !POLICY_RESOURCE_SERVICES.contains(&service) {
+        return Err(PolicyResourceRefusal::UnsupportedResource(format!(
+            "{UNSUPPORTED_POLICY_RESOURCE} {resource_arn}"
+        )));
+    }
+    Ok(())
+}
+
+/// Why a request naming a resource of another service is refused.
+///
+/// Source for the sentence: `smithy_query(query="shape",
+/// shape="UnsupportedOperationFault")` — "The requested operation isn't
+/// supported" — followed by the ARN the request carried.
+pub const UNSUPPORTED_POLICY_RESOURCE: &str =
+    "The requested operation isn't supported for resource";
+
+/// What a resource-policy operation answers when the resource it names carries
+/// no resource policy: there is no document to report, to replace or to detach.
+///
+/// One sentence for the read and the delete, so a client sees one message for
+/// one condition, and it names nothing about the request: the condition is that
+/// the POLICY does not exist, not that the resource does not.
+pub const RESOURCE_POLICY_NOT_FOUND: &str = "The requested resource policy doesn’t exist.";
+
+/// Why a request naming a resource this account holds none of is refused, naming
+/// the ARN it carried.
+///
+/// The wording every operation of this service that resolves an ARN answers a
+/// value naming nothing with (see `create_tags.rs`, `delete_tags.rs`), so one
+/// condition reads the same whichever operation reports it.
+pub fn resource_not_found_message(resource_arn: &str) -> String {
+    format!("The resource could not be found: {resource_arn}")
+}
+
 /// How many entries one request's `SourceIds` list may carry.
 ///
 /// The emulator's own bound, and for the same reason as the collection quotas
@@ -3342,6 +3476,16 @@ pub struct ComAmazonawsRedshiftRedshiftserviceversion20121201State {
     /// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::event_subscriptions`],
     /// this collection needs no `Stored*` wrapper.
     pub authentication_profiles: Vec<AuthenticationProfile>,
+    /// The resource policy attached to each resource that carries one, keyed by
+    /// the ARN of the resource it is attached to.
+    ///
+    /// A resource carries at most ONE policy — `PutResourcePolicy` "updates the
+    /// resource policy for a specified resource", so a second write to the same
+    /// resource REPLACES the document it held rather than adding to it — and the
+    /// document is held VERBATIM, because what a read reports is "the content of
+    /// a resource policy": the characters the write sent, not a re-rendering of
+    /// the document they parse as.
+    pub resource_policies: BTreeMap<String, String>,
     /// Every partner integration, keyed by the (cluster, database, partner)
     /// triple it is an integration of, in the order the partners were added.
     pub partner_integrations: Vec<StoredPartnerIntegration>,
@@ -3405,6 +3549,7 @@ impl Default for ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             event_catalog: published_event_catalog(),
             events: Vec::new(),
             authentication_profiles: Vec::new(),
+            resource_policies: BTreeMap::new(),
             partner_integrations: Vec::new(),
             hsm_client_certificates: Vec::new(),
             integrations: Vec::new(),
@@ -4766,6 +4911,25 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
         }
         *stored = Some(tags);
         true
+    }
+
+    /// The policy document attached to the resource `resource_arn` names, or
+    /// `None` when that resource carries no resource policy.
+    pub fn resource_policy(&self, resource_arn: &str) -> Option<&str> {
+        self.resource_policies.get(resource_arn).map(String::as_str)
+    }
+
+    /// Attach `policy` to the resource `resource_arn` names, REPLACING whatever
+    /// document that resource held.
+    pub fn set_resource_policy(&mut self, resource_arn: &str, policy: String) {
+        self.resource_policies
+            .insert(resource_arn.to_string(), policy);
+    }
+
+    /// Detach the resource policy of the resource `resource_arn` names, and
+    /// report whether that resource carried one at all.
+    pub fn remove_resource_policy(&mut self, resource_arn: &str) -> bool {
+        self.resource_policies.remove(resource_arn).is_some()
     }
 
     /// Every taggable resource this store holds, in the order

@@ -2293,6 +2293,77 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
         self.default_version_document(&attached)
     }
 
+    /// The tags the IAM resource whose ARN is `arn` carries AT THIS INSTANT, or `None`
+    /// when `arn` names no resource this account holds.
+    ///
+    /// The distinction the `Option` draws is the one an authorization decision turns on:
+    /// a resource the account HOLDS has a tag set that is known in full, so a question
+    /// about one of its tags is answerable — including answering that it carries no value
+    /// for a key — while an ARN naming nothing this store holds leaves such a question
+    /// unanswerable rather than answered "untagged". An entity that holds no tags answers
+    /// with the EMPTY set, which is a known tag set and not an unknown one.
+    ///
+    /// Every resource type this store persists tags for is read here, found the way each
+    /// of them is already addressed: a user, group or role through
+    /// [`parse_entity_arn`] and a managed policy through
+    /// [`policy_by_arn`](Self::policy_by_arn), both of which answer only for a record
+    /// whose OWN ARN is the one asked for; the identity providers by the ARN their maps
+    /// are keyed on; the instance profiles and server certificates — keyed by name — by
+    /// the ARN each record carries. A group is held but carries no tags, because IAM's
+    /// tagging operations cover no group resource.
+    ///
+    /// A READ: it only consults the store.
+    pub fn resource_tags(&self, arn: &str) -> Option<&[Tag]> {
+        /// A resource whose tag set is known to be empty, which is what a record holding
+        /// no tags and an untaggable resource type both answer with.
+        const UNTAGGED: &[Tag] = &[];
+
+        if let Some(entity) = parse_entity_arn(arn) {
+            let key = name_key(&entity.name);
+            return match entity.kind {
+                EntityKind::User => self
+                    .users
+                    .get(&key)
+                    .filter(|user| user.arn == arn)
+                    .map(|user| held_tags(user.tags.as_ref())),
+                EntityKind::Role => self
+                    .roles
+                    .get(&key)
+                    .filter(|role| role.arn == arn)
+                    .map(|role| held_tags(role.tags.as_ref())),
+                EntityKind::Group => self
+                    .groups
+                    .get(&key)
+                    .filter(|group| group.arn == arn)
+                    .map(|_| UNTAGGED),
+            };
+        }
+        if let Some(policy) = self.policy_by_arn(arn) {
+            return Some(held_tags(policy.policy.tags.as_ref()));
+        }
+        if let Some(provider) = self.open_id_connect_providers.get(arn) {
+            return Some(held_tags(provider.tags.as_ref()));
+        }
+        if let Some(provider) = self.saml_providers.get(arn) {
+            return Some(held_tags(provider.tags.as_ref()));
+        }
+        if let Some(profile) = self
+            .instance_profiles
+            .values()
+            .find(|record| record.profile.arn == arn)
+        {
+            return Some(held_tags(profile.profile.tags.as_ref()));
+        }
+        if let Some(certificate) = self
+            .server_certificates
+            .values()
+            .find(|record| record.metadata.arn == arn)
+        {
+            return Some(held_tags(certificate.tags.as_ref()));
+        }
+        None
+    }
+
     /// The identity-based policies the IAM identity whose ARN is `arn` carries, each
     /// with WHERE it comes from, or `None` when `arn` names no identity the account
     /// holds.
@@ -4857,6 +4928,17 @@ pub fn reserved_tag_key<'a, I: IntoIterator<Item = &'a str>>(keys: I) -> Option<
             key.len() >= prefix.len() && key[..prefix.len()].eq_ignore_ascii_case(prefix)
         })
         .min()
+}
+
+/// The tags a record holds, as a slice: the stored list, or the EMPTY set for a record
+/// that holds no tags at all.
+///
+/// A tagged IAM record spells "no tags" as an absent list, because its modelled `Tags`
+/// member is optional and a reader "does not return tags" as an empty element
+/// (`User$Tags`); for a caller asking WHICH tags the record carries, both spellings are
+/// the same answer.
+fn held_tags(held: Option<&Vec<Tag>>) -> &[Tag] {
+    held.map_or(&[], ::std::vec::Vec::as_slice)
 }
 
 /// The tag set an entity holding `held` carries after a tag call supplying

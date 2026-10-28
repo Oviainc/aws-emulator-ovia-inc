@@ -224,10 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let not_found = || {
             CreateTagsErrorModeled::ResourceNotFoundFault(ResourceNotFoundFault {
-                message: Some(format!(
-                    "The resource could not be found: {}",
-                    input.resource_name
-                )),
+                message: Some(st::resource_not_found_message(&input.resource_name)),
             })
         };
 
