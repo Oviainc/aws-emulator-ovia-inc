@@ -640,6 +640,14 @@ pub const DESCRIBE_CONFORMANCE_PACK_STATUS_PAGE_SIZE: usize = 20;
 /// 0..20).
 pub const DESCRIBE_CONFORMANCE_PACKS_PAGE_SIZE: usize = 20;
 
+/// How many conformance pack summaries one `GetConformancePackComplianceSummary` page
+/// carries when the request does not ask for a page size — `Limit` defaults to 0, which
+/// is "unspecified" rather than "no results". 5 is the length maximum of the
+/// `ConformancePackComplianceSummaryList` one response carries (and of the
+/// `ConformancePackNames` one request may name), so it is the largest page the model lets
+/// one response carry whatever `Limit`'s own range (0..20) allows.
+pub const GET_CONFORMANCE_PACK_COMPLIANCE_SUMMARY_PAGE_SIZE: usize = 5;
+
 /// How Config words `NoSuchConformancePackException` ("You specified one or more
 /// conformance packs that do not exist") for the `missing` names of a request that
 /// named packs this account and Region does not hold.
@@ -2489,6 +2497,29 @@ impl DiscoveredResourceEntry {
             resource_id: Some(self.resource_id.clone()),
             resource_name: self.resource_name.clone(),
             resource_deletion_time: self.deleted_at.map(timestamp),
+        }
+    }
+
+    /// The modelled `AggregateResourceIdentifier`, read back out of state: the same
+    /// resource as [`Self::to_identifier`] names, plus the SOURCE this store's data
+    /// comes from.
+    ///
+    /// An aggregate read reports a resource as the account and Region it was recorded
+    /// in — "the resource type, ID, (if available) the custom resource name, the source
+    /// account, and source region" — and this store stands for ONE account in ONE
+    /// Region, so `source_account_id` and `source_region` are that account and that
+    /// Region rather than anything a caller sent.
+    pub fn to_aggregate_identifier(
+        &self,
+        account_id: &str,
+        region: &str,
+    ) -> AggregateResourceIdentifier {
+        AggregateResourceIdentifier {
+            source_account_id: account_id.to_string(),
+            source_region: region.to_string(),
+            resource_id: self.resource_id.clone(),
+            resource_type: self.resource_type.clone(),
+            resource_name: self.resource_name.clone(),
         }
     }
 

@@ -4,7 +4,8 @@
 //! resources of the types it records, writes a configuration item for each one into
 //! the inventory, and re-evaluates the Config rules whose scope covers them —
 //! recording the verdict each rule places a resource at, and reporting a verdict that
-//! CHANGED as a compliance change.
+//! CHANGED as a compliance change, and running the remediation a rule's own
+//! configuration standing-orders for a resource that change finds non-compliant.
 //!
 //! Neither half needs a call from the caller: a recorder that is recording keeps
 //! recording, and "when you create a rule, Config evaluates your resources against
@@ -27,7 +28,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 use super::{
-    compliance_change_detail, publish_service_event_via, service_state,
+    compliance_change_detail, publish_service_event_via, run_remediation_actions, service_state,
     ComAmazonawsConfigserviceStarlingdoveserviceState, DiscoveredResourceEntry,
     EvaluationResultEntry, COMPLIANCE_CHANGE_DETAIL_TYPE, COMPLIANCE_TYPE_COMPLIANT,
     COMPLIANCE_TYPE_NON_COMPLIANT, CONFIG_RULE_STATE_ACTIVE, EVALUATION_MODE_DETECTIVE, OWNER_AWS,
@@ -514,6 +515,12 @@ pub async fn run_due_recording_pass<Eng: Send + Sync + 'static>(
         store.evaluate_recorded_resources(now)
     };
 
+    // What the account has standing instructions to remediate: the resources a verdict
+    // just placed at NON_COMPLIANT under a rule whose remediation configuration is
+    // AUTOMATIC. The executions are recorded under the same guard that decided them,
+    // and the runs happen with the guard released, as a started execution's do.
+    let actions = state.lock().automatic_remediations(&changes, now);
+
     for change in changes {
         let detail = compliance_change_detail(
             &change.rule_name,
@@ -525,6 +532,8 @@ pub async fn run_due_recording_pass<Eng: Send + Sync + 'static>(
         );
         publish_service_event_via(callback, region, COMPLIANCE_CHANGE_DETAIL_TYPE, &detail).await;
     }
+
+    run_remediation_actions(callback, engine, region, &actions).await;
 }
 
 /// Start the in-process pump that runs the passes this store owes, after noting that
