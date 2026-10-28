@@ -38,10 +38,10 @@
 //! than anything recomputed from a request. Its instances and the operations performed on it
 //! are written by `CreateStackInstances`, by `DeleteStackInstances` — which takes the
 //! instances it deleted back OUT of the stack set when the DELETE operation it runs as
-//! concludes ([`StoredStackSet::settle`]) — and by `DetectStackSetDrift`, which records the
-//! operation a drift detection runs as and what that detection found; the remaining writer
-//! (`UpdateStackSet`) is still a scaffold answering 501, with
-//! its own stub issue. The ONE way a record enters this
+//! concludes ([`StoredStackSet::settle`]) — by `UpdateStackSet` and `UpdateStackInstances`,
+//! which record the UPDATE operation their mutation runs as, and by `DetectStackSetDrift`,
+//! which records the operation a drift detection runs as and what that detection found. The
+//! ONE way a record enters this
 //! store is
 //! [`crate::state::ComAmazonawsCloudformationCloudformationState::record_stack_set`], so
 //! those writers — and the suites that cover the reads over records no wire call can create
@@ -279,23 +279,48 @@ pub fn preferences_view(
     }
 }
 
-/// The target accounts a stack-set deployment request names, by the member that names them.
+/// The refusal for a request that names BOTH targeting modes.
+///
+/// The RULE comes from the model — "You can specify Accounts or DeploymentTargets, but not
+/// both" — and this is the sentence the service answers with, entirely fixed text with
+/// nothing taken from the request, since the request's own shape is what is wrong.
+pub const BOTH_TARGETING_MODES: &str = "Cannot specify both Accounts and DeploymentTargets";
+
+/// The refusal for a request that names NEITHER targeting mode.
+///
+/// The RULE, likewise from the model: "You must specify at least one value for either
+/// Accounts or DeploymentTargets."
+pub const NO_TARGETING_MODE: &str =
+    "You must specify at least one value for either Accounts or DeploymentTargets";
+
+/// How a stack-set deployment request names its TARGETS: the two mutually exclusive
+/// targeting members, read once for every operation that takes them.
+#[derive(Debug, Clone, Default)]
+pub struct RequestedTargets {
+    /// The accounts the request names — through `Accounts`, or through
+    /// `DeploymentTargets.Accounts`.
+    pub accounts: Vec<String>,
+    /// `DeploymentTargets$OrganizationalUnitIds`: "the organization root ID or
+    /// organizational unit (OU) IDs where you want to perform stack operations".
+    pub organizational_unit_ids: Vec<String>,
+}
+
+/// The targeting members a stack-set deployment request names, held to the rules that are
+/// about the REQUEST alone — the ones that are decided before any stack set is resolved.
 ///
 /// "[Self-managed permissions] The account IDs of one or more Amazon Web Services accounts"
 /// / "[Service-managed permissions] The Organizations accounts": "You can specify Accounts
 /// or DeploymentTargets, but not both", and "you must specify at least one value for
 /// either". The ONE reading of those two members, so every operation that targets accounts
-/// and Regions reads a request the same way.
-pub fn target_accounts(
+/// and Regions reads a request the same way; what the targeting means for one stack set is
+/// [`RequestedTargets::accounts_in`].
+pub fn requested_targets(
     accounts: Option<&[String]>,
     deployment_targets: Option<&crate::ops::types::DeploymentTargets>,
-) -> Result<Vec<String>, String> {
+) -> Result<RequestedTargets, String> {
     let named: Vec<String> = accounts.unwrap_or_default().to_vec();
-    let targeted: Vec<String> = deployment_targets
-        .map(|targets| targets.accounts.clone().unwrap_or_default())
-        .unwrap_or_default();
     if !named.is_empty() && deployment_targets.is_some() {
-        return Err("You cannot specify both Accounts and DeploymentTargets".to_string());
+        return Err(BOTH_TARGETING_MODES.to_string());
     }
     // "The location of the accounts" an `AccountsUrl` names is an Amazon S3 object, which
     // would have to be fetched over the network — this emulator makes no outbound
@@ -308,14 +333,232 @@ pub fn target_accounts(
                 .to_string(),
         );
     }
-    let selected = if named.is_empty() { targeted } else { named };
-    if selected.is_empty() {
-        return Err(
-            "You must specify at least one value for either Accounts or DeploymentTargets"
-                .to_string(),
-        );
+    let targeted = |select: fn(&crate::ops::types::DeploymentTargets) -> Option<&Vec<String>>| {
+        deployment_targets
+            .and_then(select)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let requested = RequestedTargets {
+        accounts: distinct(if named.is_empty() {
+            targeted(|targets| targets.accounts.as_ref())
+        } else {
+            named
+        }),
+        organizational_unit_ids: distinct(targeted(|targets| {
+            targets.organizational_unit_ids.as_ref()
+        })),
+    };
+    if requested.accounts.is_empty() && requested.organizational_unit_ids.is_empty() {
+        return Err(NO_TARGETING_MODE.to_string());
     }
-    Ok(selected)
+    Ok(requested)
+}
+
+/// Why the targeting a request named is not one the stack set it names can be deployed to.
+///
+/// The two cases are answered on DIFFERENT channels: a targeting the real service refuses
+/// too is a bad request, while one the real service SERVES and this emulator holds no state
+/// to carry out is not the caller's mistake, so it is answered as work nobody has written
+/// rather than by telling a well-formed request that it is malformed.
+#[derive(Debug, Clone)]
+pub enum TargetingRefusal {
+    /// A targeting the real service refuses too, in its own words.
+    Invalid(String),
+    /// A targeting the real service serves and this emulator holds no state to resolve.
+    Unsupported,
+}
+
+impl TargetingRefusal {
+    /// This refusal on the error channel `operation` answers with.
+    pub fn refuse<E>(self, operation: &str) -> crate::scaffolded::Scaffolded<E> {
+        match self {
+            Self::Invalid(message) => crate::scaffolded::Scaffolded::validation_error(message),
+            Self::Unsupported => crate::scaffolded::Scaffolded::not_implemented(operation),
+        }
+    }
+}
+
+impl RequestedTargets {
+    /// The accounts a deployment of `stack_set` really targets, or why this targeting is
+    /// not one that stack set can be deployed to.
+    ///
+    /// `OrganizationalUnitIds` selects targets by ORGANIZATION, which only a stack set
+    /// whose permission model is service-managed has — "[Service-managed permissions] The
+    /// Organizations accounts in which to create stack instances" — so a request naming OUs
+    /// against a stack set of any other permission model is refused for that reason, naming
+    /// the model the stack set carries, rather than read as naming no targeting mode at all.
+    pub fn accounts_in(
+        &self,
+        stack_set: &StoredStackSet,
+    ) -> Result<Vec<String>, TargetingRefusal> {
+        if !self.organizational_unit_ids.is_empty() {
+            if stack_set.permission_model != permission_model::SERVICE_MANAGED {
+                return Err(TargetingRefusal::Invalid(format!(
+                    "StackSets with {} permission model can only have accounts as target",
+                    stack_set.permission_model
+                )));
+            }
+            // A service-managed stack set's OU targeting selects the accounts the
+            // organization holds under those OUs — "CloudFormation will perform operations on
+            // accounts within these OUs and their child OUs" — and `AccountFilterType` is how
+            // any `Accounts` the request names ALSO refines that set. The real service serves
+            // this; this emulator holds no organization membership to expand an OU into
+            // accounts, so the call is answered as work nobody has written rather than
+            // silently over whichever accounts the request happened to list, or as a request
+            // that named no targeting mode — it named one.
+            return Err(TargetingRefusal::Unsupported);
+        }
+        if self.accounts.is_empty() {
+            return Err(TargetingRefusal::Invalid(NO_TARGETING_MODE.to_string()));
+        }
+        Ok(self.accounts.clone())
+    }
+}
+
+/// The first entry of `regions` that is not an Amazon Web Services Region, if any.
+///
+/// A stack instance is "a stack in a specific account and Region", so a Region a deployment
+/// targets has to be a Region that exists: one that does not could never carry a stack, and
+/// the whole request is refused rather than half of it carried out. The catalog is
+/// `emulator_telemetry::policy::KNOWN_REGIONS` ("every AWS region the wire may carry"), the
+/// one list of Region codes this emulator holds; the model's own `Region`
+/// `@pattern("^[a-zA-Z0-9-]{1,128}$")` admits any such label, so the boundary cannot decide
+/// this and the handler is what does.
+pub fn unknown_target_region(regions: &[String]) -> Option<&str> {
+    // The catalog is kept SORTED for exactly this lookup, so an entry costs a binary search
+    // rather than a scan of the whole list.
+    regions.iter().map(String::as_str).find(|region| {
+        ::emulator_telemetry::policy::KNOWN_REGIONS
+            .binary_search(region)
+            .is_err()
+    })
+}
+
+/// The refusal naming a Region AWS does not have, worded once for every operation that
+/// takes a `RegionList`.
+pub fn region_does_not_exist(region: &str) -> String {
+    format!("Region {region} is not a supported Amazon Web Services Region")
+}
+
+/// `base` with `overrides` applied by parameter key: an overridden parameter takes the
+/// override's value, one the overrides do not name keeps the base's, and an override of a
+/// key the base does not carry is kept too.
+///
+/// What a stack instance's own stack is parameterised with: "any overridden parameter values
+/// will be applied to all stack instances in the specified accounts and Regions", over the
+/// StackSet's own `Parameters`. The base's order is kept, so two reads of one instance
+/// cannot disagree about it.
+///
+/// Linear in the two counts: the overrides are indexed by key in ONE pass and the base is
+/// walked once, so the two caller-controlled counts cannot multiply — the same bound
+/// [`crate::state::parameters_in_force`] holds itself to. Both counts are refused past
+/// [`MAX_SUPPLIED_PARAMETERS`] before they reach here.
+pub fn parameters_with_overrides(
+    base: &[StoredParameter],
+    overrides: &[StoredParameter],
+) -> Vec<StoredParameter> {
+    let mut by_key: ::std::collections::BTreeMap<&str, &StoredParameter> = overrides
+        .iter()
+        .map(|parameter| (parameter.key.as_str(), parameter))
+        .collect();
+    let mut merged: Vec<StoredParameter> = base
+        .iter()
+        .map(|parameter| match by_key.remove(parameter.key.as_str()) {
+            // Whether the parameter is MASKED is a property of the template that declares
+            // it, not of the value an override carries, so the base's flag is kept.
+            Some(overridden) => StoredParameter {
+                key: parameter.key.clone(),
+                value: overridden.value.clone(),
+                no_echo: parameter.no_echo,
+            },
+            None => parameter.clone(),
+        })
+        .collect();
+    // An override naming a parameter the base states no value for is kept rather than
+    // dropped: whether the template declares it is what `parameters_in_force` resolves.
+    merged.extend(by_key.into_values().cloned());
+    merged
+}
+
+/// The most `Parameters` / `ParameterOverrides` entries one request may supply.
+///
+/// A parameter a request supplies is a parameter of the template it is resolved against, and
+/// "the maximum number of parameters that you can declare in a template" is the documented
+/// CloudFormation quota ([`crate::state::template::MAX_PARAMETERS_PER_TEMPLATE`]): a request
+/// naming more than that names parameters no template could declare. Every operation that
+/// takes such a list is held to it BEFORE the store is read, so no caller-sized parameter
+/// list drives work under the store lock.
+pub const MAX_SUPPLIED_PARAMETERS: usize = crate::state::template::MAX_PARAMETERS_PER_TEMPLATE;
+
+/// `Err(message)` when `supplied` carries more parameters than a template can declare.
+///
+/// The ONE reading of that bound, so every operation taking a caller's parameter list
+/// refuses an over-long one identically, naming the member that carried it. Worded as
+/// [`crate::state::template::quota_violation`] words the same documented quota — the count,
+/// the maximum — without its `Template format error:` prefix, which belongs to a refusal of
+/// a template BODY rather than of a request's own list.
+pub fn refuse_oversized_parameters(
+    member: &str,
+    supplied: Option<&[crate::ops::types::Parameter]>,
+) -> Result<(), String> {
+    let count = supplied.unwrap_or_default().len();
+    if count > MAX_SUPPLIED_PARAMETERS {
+        return Err(format!(
+            "{member} count {count} is greater than max allowed {MAX_SUPPLIED_PARAMETERS}"
+        ));
+    }
+    Ok(())
+}
+
+/// The message CloudFormation answers when the `OperationId` a request named already names
+/// an operation of that stack set: "The specified operation ID already exists."
+///
+/// One builder for the five mutations that take the token, so the wording cannot drift.
+pub fn operation_id_already_exists(operation_id: &str) -> String {
+    format!("Operation id {operation_id} already exists")
+}
+
+/// The message for a stack set that declares no template, so there is nothing for an
+/// instance of it to deploy: "The specified operation isn't valid."
+pub fn stack_set_has_no_template(stack_set_name: &str) -> String {
+    format!("StackSet {stack_set_name} has no template to deploy")
+}
+
+/// `values` with repeats removed and first-seen order kept.
+///
+/// A repeated account or Region names the SAME target — an account and Region pair carries at
+/// most one instance of a stack set — so what a request selects is the product of the
+/// DISTINCT values it names, which is also what bounds the work that selection drives.
+pub fn distinct(values: Vec<String>) -> Vec<String> {
+    let mut seen: ::std::collections::HashSet<String> = ::std::collections::HashSet::new();
+    values
+        .into_iter()
+        .filter(|value| seen.insert(value.clone()))
+        .collect()
+}
+
+/// `Err(message)` when `accounts` accounts and `regions` Regions select more account and
+/// Region pairs than one stack set can hold instances for.
+///
+/// The ONE reading of that bound. Every operation that selects instances is held to it
+/// BEFORE the store is read, over the distinct values the request names, and again once the
+/// stack set has resolved what those targets really select — so neither an expanded target
+/// set nor a repeated value can drive unbounded work under the store lock.
+pub fn refuse_oversized_selection(accounts: usize, regions: usize) -> Result<(), String> {
+    if accounts.saturating_mul(regions) > MAX_INSTANCES_PER_STACK_SET {
+        return Err(selection_wider_than_a_stack_set());
+    }
+    Ok(())
+}
+
+/// The message for a selection naming more account and Region pairs than one stack set can
+/// hold instances for — the ceiling the store bounds a stack set's instances at.
+pub fn selection_wider_than_a_stack_set() -> String {
+    format!(
+        "Accounts and Regions select more than the {MAX_INSTANCES_PER_STACK_SET} stack \
+         instances a StackSet can hold"
+    )
 }
 
 /// The `OperationInProgressException` message CloudFormation answers a request that asks a

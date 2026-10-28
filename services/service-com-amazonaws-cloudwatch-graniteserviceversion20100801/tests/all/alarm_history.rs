@@ -560,7 +560,10 @@ async fn bad_requests_carry_the_modelled_status_and_code() {
             "a HistoryItemType the enum does not declare",
             json!({"HistoryItemType": "Nonsense"}),
             400,
-            "ValidationException",
+            // A value outside a modelled enumerated type carries this service's own
+            // validation code, whichever operation and member it arrived on
+            // (`crate::metric_stream_scope`).
+            "ValidationError",
         ),
     ] {
         let (actual_status, body) = call(&router, "DescribeAlarmHistory", &request).await;

@@ -613,8 +613,9 @@ async fn a_boundary_constraint_is_stated_as_the_parameter_fault_the_operation_mo
             ),
         },
         RefusalRow {
-            // A SCALAR outside its enum is not one of the classes this service restates, so
-            // it keeps the framework's refusal — code and clause both.
+            // A SCALAR outside its enum keeps the framework's own CLAUSE — the value and the
+            // member path it arrived on — under this service's validation code, the one every
+            // validation refusal it makes carries (`crate::metric_stream_scope`).
             case: "a scalar member outside its enum",
             operation: "GetMetricData",
             request: json!({
@@ -630,7 +631,7 @@ async fn a_boundary_constraint_is_stated_as_the_parameter_fault_the_operation_mo
                 "EndTime": at + 60.0,
                 "ScanBy": "ValueDescending",
             }),
-            code: "ValidationException",
+            code: "ValidationError",
             message: MessageCheck::Names(vec![FRAMEWORK_ENVELOPE, "'scanBy'"]),
         },
     ];
