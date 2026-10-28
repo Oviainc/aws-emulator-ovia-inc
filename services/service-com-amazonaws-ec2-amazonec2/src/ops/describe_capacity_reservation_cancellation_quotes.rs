@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeCapacityReservationCancellationQuotes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeCapacityReservationCancellationQuotes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the stored Capacity Reservation cancellation quotes the request
+//! selects — by `CapacityReservationCancellationQuoteIds`, by filter, or every one of them —
+//! in `CapacityReservationCancellationQuoteId` order, paged with the token this service mints.
+//! A pure report: each quote's `QuoteState` is derived from the instants it carries
+//! ([`crate::state::CapacityReservationCancellationQuoteRecord::quote_state_at`]), so nothing
+//! is written for a read.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeCapacityReservationCancellationQuotes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -80,6 +79,14 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::borrow::Cow;
+use std::collections::BTreeSet;
+
+use crate::state::{
+    CompiledFilter, MAX_FILTERS, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES, MAX_FILTER_VALUE_BYTES,
+    MAX_PAGE_SIZE, MAX_RESOURCE_IDS, MatchBudget, TAG_FILTER_PREFIX,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -147,18 +154,277 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeCapacityReservationCancellationQuotes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeCapacityReservationCancellationQuotesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state;
+
+        // `ctx` carries request metadata only; this operation reads none of it. A quote is
+        // held per account under the id this service minted it with, so the Region a request
+        // was signed for does not narrow the quotes the store holds. The store is reached
+        // through the engine held on `self`.
+        let _ = ctx;
+
+        // Matching cost is filters x values x value length x stored quotes, and the model
+        // bounds none of them (`FilterList` and `Filter$Values` carry no `@length`), so every
+        // request-controlled factor is capped HERE, before any work proportional to it is done
+        // and before the store is locked — the same ceilings every other describe of this
+        // crate enforces, from `crate::state`.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > MAX_FILTERS {
+            return Err(state::invalid_parameter_value(format!(
+                "The request carries {} filters, above the maximum of {MAX_FILTERS}",
+                filters.len()
+            )));
+        }
+        // A filter name this operation does not answer is refused whether or not any quote
+        // would have matched it, so an unsupported filter can never read as "no results".
+        let mut compiled: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !is_documented_filter(name) {
+                return Err(state::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values: &[String] = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(state::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so a value's size is bounded
+            // here too.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(state::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            compiled.push(CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        // "The IDs of the cancellation quotes to describe" is caller-sized as well, and every
+        // entry is resolved against the store, so it is capped the way every other EC2
+        // operation of this crate caps a resource-id list.
+        let requested: &[String] = input
+            .capacity_reservation_cancellation_quote_ids
+            .as_deref()
+            .unwrap_or_default();
+        if requested.len() > MAX_RESOURCE_IDS {
+            return Err(state::invalid_parameter_value(format!(
+                "CapacityReservationCancellationQuoteIds carries {} ids, above the maximum \
+                 of {MAX_RESOURCE_IDS}",
+                requested.len()
+            )));
+        }
+
+        // "The token to use to retrieve the next page of results" (`NextToken`) — a token this
+        // service did not mint is refused rather than read as an id, and it is refused before
+        // the store is read, so whether a bogus token is caught never depends on what the
+        // store holds.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                state::decode_page_token(token)
+                    .ok_or_else(|| state::invalid_pagination_token_for(token))?,
+            ),
+        };
+
+        // DryRun sits AFTER every parameter has been validated: "If you have the required
+        // permissions, the error response is DryRunOperation" (`DryRun`), so a request that
+        // would have been refused is refused with that reason instead. Every caller of this
+        // emulator is permitted, so a dry run reports that outcome and reads nothing.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // ONE reading of the wall clock, so every quote on the page reports its state as of
+        // the same instant.
+        let now = ::std::time::SystemTime::now();
+        let service_state = state::require_service_state(&*self.engine)?;
+        let store = service_state.lock();
+
+        // "The IDs of the cancellation quotes to describe": an id the account holds no quote
+        // for is an error, not an absent row — a value outside the id form this service issues
+        // refused as malformed before any lookup, the way every other id of this service is
+        // ordered. A set, so narrowing below costs one lookup per quote rather than a scan of
+        // the asked-for list.
+        for quote_id in requested {
+            if !state::capacity_reservation_cancellation_quote_id_is_well_formed(quote_id) {
+                return Err(
+                    state::invalid_capacity_reservation_cancellation_quote_id_malformed(quote_id),
+                );
+            }
+            if !store
+                .capacity_reservation_cancellation_quotes
+                .contains_key(quote_id)
+            {
+                return Err(
+                    state::invalid_capacity_reservation_cancellation_quote_id_not_found(quote_id),
+                );
+            }
+        }
+        let wanted: BTreeSet<&str> = requested.iter().map(String::as_str).collect();
+
+        // Every quote unless the request narrows it: the ids named, and then every filter must
+        // hold ("If you specify multiple filters, the filters are joined with an AND" —
+        // `Filter`). Each quote is taken as of `now`, so a filter on `quote-state` compares
+        // against the state the clock has reached rather than the word the generate stored.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeCapacityReservationCancellationQuotes"))
+        // Every comparison is charged to ONE budget, so the product of stored quotes, filters,
+        // values and value length is bounded however the caller combines them — which is also
+        // what bounds how long this holds the store's lock.
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<CapacityReservationCancellationQuote> = Vec::new();
+        for (quote_id, record) in &store.capacity_reservation_cancellation_quotes {
+            if budget.exhausted() {
+                break;
+            }
+            if !wanted.is_empty() && !wanted.contains(quote_id.as_str()) {
+                continue;
+            }
+            let quote = record.view_at(now);
+            if state::matches_every_filter(&compiled, &mut budget, &|name| {
+                filter_values(&quote, name)
+            }) {
+                selected.push(quote);
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report as a
+        // result: the request asked for more filtering than one call will do, and is told so
+        // rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow them or page with MaxResults"
+            )));
+        }
+
+        // Page in `CapacityReservationCancellationQuoteId` order, which the cursor below names
+        // a position in. The store is an ordered map keyed by that id, so its iteration order
+        // already satisfies this sort; doing it here establishes the invariant the cursor
+        // depends on at the point of use.
+        selected.sort_by(|left, right| {
+            left.capacity_reservation_cancellation_quote_id
+                .cmp(&right.capacity_reservation_cancellation_quote_id)
+        });
+
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected.partition_point(|quote| {
+                quote
+                    .capacity_reservation_cancellation_quote_id
+                    .as_deref()
+                    .unwrap_or_default()
+                    < cursor
+            }),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // `MaxResults` carries the modelled `range 1..1000`
+        // (`smithy_query(query="shape",shape="DescribeCapacityReservationCancellationQuotesRequestMaxResults")`),
+        // so the boundary validator has already refused anything outside it, and a request
+        // that names no page size gets the largest page this service serves — the `NextToken`
+        // path then behaves the same whether or not a page size was asked for.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+
+        // "This value is null when there are no more results to return" (`NextToken`): a token
+        // only when a quote follows this page.
+        let next_token = page
+            .get(limit)
+            .and_then(|quote| quote.capacity_reservation_cancellation_quote_id.as_deref())
+            .map(state::encode_page_token);
+
+        Ok(DescribeCapacityReservationCancellationQuotesOutput {
+            capacity_reservation_cancellation_quotes: Some(
+                page.iter().take(limit).cloned().collect(),
+            ),
+            next_token,
+        })
+    }
+}
+
+/// The filter names this operation answers.
+///
+/// `DescribeCapacityReservationCancellationQuotesRequest$Filters` publishes no catalog at all
+/// — "One or more filters. Filter names and values are case-sensitive"
+/// (`smithy_query(query="doc",shape="DescribeCapacityReservationCancellationQuotesRequest",member="Filters")`)
+/// — so the names are EC2's own convention for a resource that publishes none: each scalar
+/// member of the described shape (`CapacityReservationCancellationQuote`) under its
+/// kebab-cased name, plus the [`TAG_FILTER_PREFIX`] and [`TAG_KEY_FILTER`] pair every EC2
+/// describe of a taggable resource answers. The two structural members
+/// (`CurrentConfiguration`, `CancellationTerms`) are not scalars and name no filter of their
+/// own. Every entry must be answered by [`filter_values`].
+const CAPACITY_RESERVATION_CANCELLATION_QUOTE_FILTERS: [&str; 5] = [
+    "capacity-reservation-cancellation-quote-id",
+    "capacity-reservation-id",
+    "create-time",
+    "expiration-time",
+    "quote-state",
+];
+
+/// The tag filter whose values are the KEYS a quote carries, rather than one key's value.
+const TAG_KEY_FILTER: &str = "tag-key";
+
+/// Is `name` a filter this operation answers? "Filter names are case-sensitive"
+/// (`Filter$Name`), so the comparison is exact — and a `tag:` prefix with no key names no tag,
+/// so it is as undocumented as any other misspelling.
+fn is_documented_filter(name: &str) -> bool {
+    name.strip_prefix(TAG_FILTER_PREFIX)
+        .is_some_and(|key| !key.is_empty())
+        || name == TAG_KEY_FILTER
+        || CAPACITY_RESERVATION_CANCELLATION_QUOTE_FILTERS.contains(&name)
+}
+
+/// The values the EC2 filter `name` compares against this cancellation quote.
+///
+/// A filter naming an attribute this quote does not carry compares against NO values, so it
+/// selects nothing — the answer for `tag:Owner` on an untagged quote. `name` is a name
+/// [`is_documented_filter`] accepted.
+fn filter_values<'a>(
+    quote: &'a CapacityReservationCancellationQuote,
+    name: &str,
+) -> Vec<Cow<'a, str>> {
+    if let Some(key) = name.strip_prefix(TAG_FILTER_PREFIX) {
+        return quote
+            .tags
+            .iter()
+            .flatten()
+            .filter(|tag| tag.key.as_deref() == Some(key))
+            .filter_map(|tag| tag.value.as_deref().map(Cow::Borrowed))
+            .collect();
+    }
+
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        "capacity-reservation-cancellation-quote-id" => {
+            text(quote.capacity_reservation_cancellation_quote_id.as_deref())
+        }
+        "capacity-reservation-id" => text(quote.capacity_reservation_id.as_deref()),
+        "create-time" => crate::state::timestamp_filter_values(quote.create_time),
+        "expiration-time" => crate::state::timestamp_filter_values(quote.expiration_time),
+        "quote-state" => text(quote.quote_state.as_deref()),
+        TAG_KEY_FILTER => quote
+            .tags
+            .iter()
+            .flatten()
+            .filter_map(|tag| tag.key.as_deref().map(Cow::Borrowed))
+            .collect(),
+        // Unreachable: `is_documented_filter` has already refused every other name. An
+        // undefined name compares against nothing, so it could never widen a result even if
+        // that check were bypassed.
+        _ => Vec::new(),
     }
 }

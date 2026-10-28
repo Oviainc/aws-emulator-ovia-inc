@@ -253,6 +253,11 @@ mod capacity_manager;
 mod capacity_manager_attributes;
 #[path = "all/capacity_reservation_billing_requests.rs"]
 mod capacity_reservation_billing_requests;
+// What `CreateCapacityReservationCancellationQuote` quotes for cancelling a future-dated
+// Capacity Reservation inside its commitment, and what
+// `DescribeCapacityReservationCancellationQuotes` reports back out of that store.
+#[path = "all/capacity_reservation_cancellation_quotes.rs"]
+mod capacity_reservation_cancellation_quotes;
 #[path = "all/capacity_reservation_fleets.rs"]
 mod capacity_reservation_fleets;
 #[path = "all/carrier_gateways.rs"]

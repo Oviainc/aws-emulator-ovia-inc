@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCapacityReservationCancellationQuote
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCapacityReservationCancellationQuote`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: generates a cancellation quote for a future-dated Capacity Reservation whose
+//! commitment is still in force, and stores it — the quote's id, the configuration of the
+//! reservation as of this instant, the cancellation terms that follow from its commitment,
+//! and the 24 hours the quote stays valid for. Idempotent on `ClientToken`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCapacityReservationCancellationQuote::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +140,258 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCapacityReservationCancellationQuote` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCapacityReservationCancellationQuoteErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state;
+
+        // "The tags to apply to the cancellation quote" (`TagSpecifications`) — the quote is
+        // the only resource this call creates, so a specification naming any other resource
+        // type is refused rather than accepted and discarded. The tag payload's own bounds
+        // are applied by the one shared reader every create holds its tags to.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_CAPACITY_RESERVATION_CANCELLATION_QUOTE,
+            Self::NAME,
+        )?;
+
+        // The token map keeps the token for the process's lifetime, so its length is bounded
+        // the way every other create of this crate bounds its own.
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > state::MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "clientToken accepts at most {} characters",
+                state::MAX_CLIENT_TOKEN_CHARS
+            )));
+        }
+
+        let region = state::request_region(ctx.parts());
+        // ONE reading of the wall clock for this call: the state the reservation is judged in,
+        // the terms the quote carries and the instant it was generated are all the same
+        // instant.
+        let now = ::std::time::SystemTime::now();
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // Every move the clock already owed — a future-dated reservation's `assessing` ->
+        // `scheduled` among them — is materialised before anything is read, so this call
+        // decides against the state a caller would have been shown anyway.
+        store.materialize_due_transitions();
+
+        // Idempotency: "Unique, case-sensitive identifier that you provide to ensure the
+        // idempotency of the request" (`ClientToken`) — one token names the ONE quote it
+        // generated, so a replay reports that quote and generates nothing more. A repeat that
+        // carries the same token but asks for something ELSE is not a replay: what the first
+        // request stored is compared against this one — the reservation it quoted and the tags
+        // that went on the quote — and a difference is answered with
+        // `IdempotentParameterMismatch`. A token whose quote the store no longer holds is a
+        // MISS, not a mismatch: there is nothing left to answer with, so the request is served
+        // as a fresh generate. The token is read under the Region the create was signed for,
+        // which is the scope an idempotency key has.
+        let replayed = input
+            .client_token
+            .as_deref()
+            .and_then(|token| {
+                store
+                    .capacity_reservation_cancellation_quote_client_tokens
+                    .get(&(region.clone(), token.to_string()))
+                    .cloned()
+            })
+            .filter(|first_id| {
+                store
+                    .capacity_reservation_cancellation_quotes
+                    .contains_key(first_id)
+            });
+        if let Some(first_id) = replayed {
+            let identical = store
+                .capacity_reservation_cancellation_quotes
+                .get(&first_id)
+                .is_some_and(|record| {
+                    record.view.capacity_reservation_id.as_deref()
+                        == Some(input.capacity_reservation_id.as_str())
+                        && state::same_tags(record.view.tags.as_deref().unwrap_or_default(), &tags)
+                });
+            if !identical {
+                // EC2's own wording for the code, from the one place this crate words it.
+                return Err(state::idempotent_parameter_mismatch());
+            }
+            // A replay writes nothing, so DryRun is the only thing left that can change the
+            // answer.
+            if input.dry_run == Some(true) {
+                return Err(Scaffolded::dry_run_operation());
+            }
+            return quote_response(&store, &first_id, now);
+        }
+
+        // "The ID of the Capacity Reservation" — an id the account holds no reservation for in
+        // the Region the request was signed for is an error, not a quote of nothing. Resolved
+        // Region-first, so a reservation of another Region is reported not found rather than
+        // quoted across Regions, and then read for the terms below.
+        let zones = state::availability_zones_in_region(&region);
+        state::require_capacity_reservation_in_region(
+            &store,
+            &zones,
+            &input.capacity_reservation_id,
+        )?;
+        let reservation =
+            state::require_known_capacity_reservation(&store, &input.capacity_reservation_id)?;
+        let reservation_id = input.capacity_reservation_id.clone();
+        let reservation_state = reservation.state_at(now).to_string();
+
+        // "Generates a cancellation quote for a future-dated Capacity Reservation that is
+        // within its commitment duration" (`CreateCapacityReservationCancellationQuote`): a
+        // commitment is what a FUTURE-DATED reservation makes
+        // (`CapacityReservation$CommitmentInfo`), and it is a reservation cancellable only
+        // "during the commitment duration" that "requires a cancellation quote"
+        // (`CancelCapacityReservation`). A reservation that committed to nothing is cancelled
+        // with no charge to quote, so there is no quote to generate for it.
+        let Some(commitment) = reservation.view.commitment_info.clone() else {
+            return Err(state::incorrect_state(format!(
+                "The Capacity Reservation '{reservation_id}' is in state \
+                 '{reservation_state}' with no commitment duration, so cancelling it needs \
+                 no cancellation quote"
+            )));
+        };
+        // The end of the commitment is the end of the window a quote can be generated in, and
+        // of the charge below: past it "the commitment duration has elapsed" and the
+        // reservation is cancelled with no charge (`CancelCapacityReservation`).
+        let Some(commitment_end_date) = commitment
+            .commitment_end_date
+            .and_then(|end_date| ::std::time::SystemTime::try_from(end_date).ok())
+        else {
+            return Err(Scaffolded::internal_error(format!(
+                "the commitment of the Capacity Reservation '{reservation_id}' carries no \
+                 readable end date to quote against"
+            )));
+        };
+        let Ok(remaining) = commitment_end_date.duration_since(now) else {
+            return Err(state::incorrect_state(format!(
+                "The commitment duration of the Capacity Reservation '{reservation_id}' \
+                 elapsed at {}, so cancelling it needs no cancellation quote",
+                state::iso8601_utc(commitment_end_date)
+            )));
+        };
+
+        // What the quote quotes, read out of the reservation rather than from the request.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCapacityReservationCancellationQuote"))
+        // "The current configuration of the Capacity Reservation" is its capacity and the
+        // state it is in as of this instant; the terms are what cancelling it during the
+        // commitment costs: the one charge type the model carries
+        // (`ApplyCancellationCharges`), the state the reservation moves to when those charges
+        // are applied — "The Capacity Reservation transitions to `cancelling` while charges
+        // are applied" (`CancelCapacityReservation`) — the capacity that stays under
+        // commitment, the hours the charge runs for and the instant it stops, which is the end
+        // of the commitment the cancellation winds down.
+        let current_configuration = CapacityReservationConfiguration {
+            instance_count: reservation.view.total_instance_count,
+            reservation_state: Some(reservation_state),
+        };
+        let cancellation_terms = vec![CancellationTerms {
+            cancellation_type: Some(
+                state::APPLY_CANCELLATION_CHARGES_COMMITMENT_WIND_DOWN.to_string(),
+            ),
+            reservation_state: Some(state::CAPACITY_RESERVATION_STATE_CANCELLING.to_string()),
+            committed_instance_count: commitment.committed_instance_count,
+            // The charge runs for what is left of the commitment, counted in the whole hours
+            // the member is published in and rounded UP, so a part hour of commitment is still
+            // a charged hour. The span is bounded by the commitment's own range, so the
+            // conversion cannot lose anything in practice; a value the member could not hold
+            // is clamped to what it can rather than wrapping.
+            charge_commitment_duration_hours: Some(
+                i64::try_from(remaining.as_secs().div_ceil(SECONDS_PER_HOUR)).unwrap_or(i64::MAX),
+            ),
+            charge_end_date: commitment.commitment_end_date,
+        }];
+
+        // A count ceiling first, then the byte budget: a record count on its own admits
+        // gigabytes, because each record holds strings the caller chose the length of.
+        if !store.has_capacity_reservation_cancellation_quote_capacity(1) {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "This emulator holds {} Capacity Reservation cancellation quotes, which is \
+                 as many as it stores",
+                state::MAX_STORED_CAPACITY_RESERVATION_CANCELLATION_QUOTES
+            )));
+        }
+        let payload_bytes = state::tag_list_bytes(&tags)
+            .saturating_add(input.client_token.as_deref().map_or(0, str::len));
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(Scaffolded::tag_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied \
+                 data, so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // DryRun sits AFTER every parameter has been validated and the reservation resolved,
+        // and BEFORE the first write: "Checks whether you have the required permissions for
+        // the action, without actually making the request" (`DryRun`), so a request that would
+        // have been refused is refused with that reason instead, and one that would have
+        // succeeded leaves the store untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        let Some(quote_id) = store.insert_capacity_reservation_cancellation_quote(
+            state::CapacityReservationCancellationQuoteSpec {
+                capacity_reservation_id: reservation_id,
+                created_at: now,
+                current_configuration,
+                cancellation_terms,
+                tags,
+            },
+        ) else {
+            // The store refused the write at one of its own ceilings: a quota, not something
+            // the request got wrong, and nothing has been written.
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "This emulator holds {} Capacity Reservation cancellation quotes and {} \
+                 bytes of caller-supplied data, which is as much as it stores",
+                state::MAX_STORED_CAPACITY_RESERVATION_CANCELLATION_QUOTES,
+                state::MAX_STORED_BYTES,
+            )));
+        };
+        // The token's own bytes, which the insert does not know about: charged here so no path
+        // can store them uncharged.
+        store.add_stored_bytes(input.client_token.as_deref().map_or(0, str::len));
+        if let Some(token) = input.client_token.clone() {
+            store
+                .capacity_reservation_cancellation_quote_client_tokens
+                .insert((region, token), quote_id.clone());
+        }
+
+        // The answer is read back OUT of the store, so this call and a later
+        // `DescribeCapacityReservationCancellationQuotes` cannot report one quote differently.
+        quote_response(&store, &quote_id, now)
     }
+}
+
+/// The seconds in one hour, the unit `CancellationTerms$ChargeCommitmentDurationHours` is
+/// published in ("The number of hours for which cancellation charges will apply").
+const SECONDS_PER_HOUR: u64 = 60 * 60;
+
+/// The stored quote `quote_id` names, as this operation answers it at `now`.
+///
+/// Read out of the store rather than built from the request, so a replay of an idempotent
+/// request and the call that generated the quote answer the same thing, and both report the
+/// state the clock has actually reached.
+fn quote_response(
+    store: &crate::state::ComAmazonawsEc2Amazonec2State,
+    quote_id: &str,
+    now: ::std::time::SystemTime,
+) -> Result<
+    CreateCapacityReservationCancellationQuoteOutput,
+    CreateCapacityReservationCancellationQuoteError,
+> {
+    let quote = store
+        .capacity_reservation_cancellation_quotes
+        .get(quote_id)
+        .map(|record| record.view_at(now))
+        .ok_or_else(|| {
+            crate::scaffolded::Scaffolded::internal_error(format!(
+                "the cancellation quote '{quote_id}' could not be read back to report it"
+            ))
+        })?;
+    Ok(CreateCapacityReservationCancellationQuoteOutput {
+        capacity_reservation_cancellation_quote: Some(quote),
+    })
 }

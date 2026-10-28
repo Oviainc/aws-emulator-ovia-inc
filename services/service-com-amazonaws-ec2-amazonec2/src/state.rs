@@ -1172,6 +1172,31 @@
 //! assessment has fallen due as `scheduled`, and one whose `StartDate` has arrived as
 //! `active`, the way it reports one whose `EndDate` has passed as `expired`.
 //!
+//! ## Capacity Reservation cancellation quotes
+//!
+//! [`ComAmazonawsEc2Amazonec2State::capacity_reservation_cancellation_quotes`] holds the
+//! quotes `CreateCapacityReservationCancellationQuote` generated, as
+//! [`CapacityReservationCancellationQuoteRecord`]s: the modelled
+//! [`CapacityReservationCancellationQuote`] the create and
+//! `DescribeCapacityReservationCancellationQuotes` both answer with, plus the move the clock
+//! owes it, keyed by `CapacityReservationCancellationQuoteId` in a [`BTreeMap`] — the order
+//! the describe reports and pages over.
+//! [`ComAmazonawsEc2Amazonec2State::insert_capacity_reservation_cancellation_quote`] is the
+//! one place a record is built, so the id, the creation instant and the instant the quote
+//! stops being usable are decided once however many writers there are.
+//!
+//! A quote is a DOCUMENT rather than a resource that tracks its reservation: its
+//! `CurrentConfiguration` and `CancellationTerms` are the terms as of the instant it was
+//! generated, which is what makes them quotable, and nothing a later call does to the
+//! reservation rewrites them. Only its `QuoteState` moves, and both moves are the clock's:
+//! it is generated `pending` and the clock owes it `active` one [`TRANSITION_DELAY`] later
+//! ([`ClockTransition`]), after which it is `expired` from the instant it stops being valid
+//! — "Cancellation quotes are valid for 24 hours"
+//! (`CreateCapacityReservationCancellationQuote`), carried on the record as its
+//! `ExpirationTime`. Neither is stored as a word a reader has to write:
+//! [`CapacityReservationCancellationQuoteRecord::quote_state_at`] derives both from those
+//! instants, the way [`CapacityReservationRecord::state_at`] derives a reservation's expiry.
+//!
 //! ## Capacity Reservation Fleets
 //!
 //! [`ComAmazonawsEc2Amazonec2State::capacity_reservation_fleets`] holds the account's
@@ -1447,6 +1472,7 @@ use crate::ops::types::{
     Byoasn, ByoipCidr, ConnectionNotification,
     DhcpConfiguration, DhcpOptions,
     CapacityBlock, CapacityReservation, CapacityReservationBillingRequest,
+    CapacityReservationCancellationQuote, CapacityReservationConfiguration, CancellationTerms,
     CapacityReservationCommitmentInfo, CapacityReservationInfo, CustomerGateway, ExportTask,
     FpgaImage,
     FpgaImageState, ImageUsageReport,
@@ -3226,6 +3252,25 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// create's own token map above, an idempotency key belonging to one Region.
     pub capacity_reservation_move_client_tokens:
         HashMap<(String, String), CapacityReservationInstanceMove>,
+    /// Every Capacity Reservation cancellation quote the account has generated, by
+    /// `CapacityReservationCancellationQuoteId`, as
+    /// [`CapacityReservationCancellationQuoteRecord`]s — see the "Capacity Reservation
+    /// cancellation quotes" section below. Ordered by id, the stable order
+    /// `DescribeCapacityReservationCancellationQuotes` reports and pages over.
+    ///
+    /// Starts EMPTY: an account holds no quote until
+    /// `CreateCapacityReservationCancellationQuote` generates one.
+    pub capacity_reservation_cancellation_quotes:
+        BTreeMap<String, CapacityReservationCancellationQuoteRecord>,
+    /// A `CreateCapacityReservationCancellationQuote` `ClientToken` and the
+    /// `CapacityReservationCancellationQuoteId` it generated, keyed by the Region the create
+    /// was signed for and that token, so a repeat of the same request answers with that quote
+    /// instead of generating a second one: "Unique, case-sensitive identifier that you provide
+    /// to ensure the idempotency of the request"
+    /// (`CreateCapacityReservationCancellationQuoteRequest$ClientToken`). Region-scoped like
+    /// the reservation create's own token map above, an idempotency key belonging to one
+    /// Region.
+    pub capacity_reservation_cancellation_quote_client_tokens: HashMap<(String, String), String>,
     /// What each instance's application health status is derived from, by `InstanceId` —
     /// see [`InstanceApplicationStatusRecord`] and the module docs. An instance with no
     /// entry has had no application status check reported for it, which is exactly the
@@ -3983,6 +4028,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             interruptible_allocation_client_tokens: HashMap::new(),
             capacity_reservation_client_tokens: HashMap::new(),
             capacity_reservation_move_client_tokens: HashMap::new(),
+            capacity_reservation_cancellation_quotes: BTreeMap::new(),
+            capacity_reservation_cancellation_quote_client_tokens: HashMap::new(),
             application_status: BTreeMap::new(),
             instance_status_reports: BTreeMap::new(),
             application_status_checks: BTreeMap::new(),
@@ -8423,6 +8470,7 @@ impl ComAmazonawsEc2Amazonec2State {
             resource_id,
             addresses,
             capacity_reservation_fleets => view,
+            capacity_reservation_cancellation_quotes => view,
             capacity_reservations => view,
             carrier_gateways,
             client_vpn_endpoints,
@@ -21183,6 +21231,13 @@ pub const CAPACITY_RESERVATION_STATE_EXPIRED: &str = "expired";
 /// ([`CapacityReservationRecord::state_at`]).
 pub const CAPACITY_RESERVATION_STATE_PAYMENT_PENDING: &str = "payment-pending";
 
+/// "`cancelling`" (`CapacityReservationState`), the state a reservation moves to while the
+/// charges of a cancellation during its commitment duration are applied: "The Capacity
+/// Reservation transitions to `cancelling` while charges are applied"
+/// (`CancelCapacityReservation`), which is the state a cancellation quote's terms say the
+/// reservation will transition to.
+pub const CAPACITY_RESERVATION_STATE_CANCELLING: &str = "cancelling";
+
 /// "Valid range: 1 - 1000" (`CreateCapacityReservationRequest$InstanceCount`). The model
 /// puts no `@range` on the member, so this is the only place the published one is kept.
 pub const CAPACITY_RESERVATION_INSTANCE_COUNT_RANGE: ::std::ops::RangeInclusive<i32> = 1..=1000;
@@ -21755,6 +21810,332 @@ pub fn require_known_capacity_reservation<'store, E>(
         .capacity_reservations
         .get(capacity_reservation_id)
         .ok_or_else(|| invalid_capacity_reservation_id_not_found(capacity_reservation_id))
+}
+
+// =============================================================================
+// Capacity Reservation cancellation quotes
+// =============================================================================
+//
+// See the module docs for why a quote is stored as the modelled shape plus the one move the
+// clock owes it. The words below are members of the model's own enums and the id form this
+// service issues, named here so the create and the describe cannot spell one value two
+// ways.
+
+/// The id prefix a Capacity Reservation cancellation quote's id carries, in the
+/// `<prefix>-<hex>` form every EC2 resource id takes (see
+/// [`ComAmazonawsEc2Amazonec2State::next_id`]).
+///
+/// The model publishes no pattern for `CapacityReservationCancellationQuoteId`
+/// (`smithy_query(query="shape",shape="CapacityReservationCancellationQuoteId")`), so the
+/// prefix is this service's own for the resource kind, kept here as the one place it is
+/// spelled.
+pub const CAPACITY_RESERVATION_CANCELLATION_QUOTE_ID_PREFIX: &str = "crcq";
+
+/// The `ResourceType` a cancellation quote tag specification may name: the
+/// `capacity-reservation-cancellation-quote` member of the modelled `ResourceType` enum
+/// (`smithy_query(query="shape",shape="ResourceType")`), which is the resource
+/// `CreateCapacityReservationCancellationQuote`'s "tags to apply to the cancellation quote"
+/// go on.
+pub const RESOURCE_TYPE_CAPACITY_RESERVATION_CANCELLATION_QUOTE: &str =
+    "capacity-reservation-cancellation-quote";
+
+/// The state a quote is generated in: the `pending` member of the modelled
+/// `CapacityReservationCancellationQuoteState` enum
+/// (`smithy_query(query="shape",shape="CapacityReservationCancellationQuoteState")`), the one
+/// word that enum carries for a quote that has been asked for and is not usable yet.
+pub const CAPACITY_RESERVATION_CANCELLATION_QUOTE_STATE_PENDING: &str = "pending";
+
+/// That enum's `active` member — the state a quote has to be in to be used: "The cancellation
+/// quote must be in an active state" (`CancelCapacityReservationRequest$QuoteId`).
+pub const CAPACITY_RESERVATION_CANCELLATION_QUOTE_STATE_ACTIVE: &str = "active";
+
+/// That enum's `expired` member, where a quote sits once the wall clock has passed the
+/// `ExpirationTime` it was generated with
+/// ([`CapacityReservationCancellationQuoteRecord::quote_state_at`]).
+pub const CAPACITY_RESERVATION_CANCELLATION_QUOTE_STATE_EXPIRED: &str = "expired";
+
+/// How long a generated quote stays usable: "Cancellation quotes are valid for 24 hours"
+/// (`CreateCapacityReservationCancellationQuote`), which is [`ONE_DAY`].
+pub const CAPACITY_RESERVATION_CANCELLATION_QUOTE_VALIDITY: Duration = ONE_DAY;
+
+/// The cancellation charge a quote quotes for: the only member of the modelled
+/// `ApplyCancellationCharges` enum
+/// (`smithy_query(query="shape",shape="ApplyCancellationCharges")`), which is also the value
+/// `CancelCapacityReservation` takes a quote with — "pass the quote ID with
+/// ApplyCancellationCharges set to commitment-wind-down".
+pub const APPLY_CANCELLATION_CHARGES_COMMITMENT_WIND_DOWN: &str = "commitment-wind-down";
+
+/// How many cancellation quotes this emulator stores before a writer must refuse.
+///
+/// CHOSEN, like [`MAX_STORED_CAPACITY_RESERVATIONS`] and for the same reason: nothing in this
+/// emulator reclaims a stored quote, so the store needs a ceiling that is not the process's
+/// memory. A count ceiling is no bound on the caller-chosen bytes each record holds, so those
+/// are charged against [`MAX_STORED_BYTES`] too
+/// ([`capacity_reservation_cancellation_quote_payload_bytes`]).
+pub const MAX_STORED_CAPACITY_RESERVATION_CANCELLATION_QUOTES: usize = 4096;
+
+/// The caller-chosen bytes one stored quote holds: its tags. Everything else on the record —
+/// the ids, the instants, the counts, the state words — is derived by this module or bounded
+/// by the id form, so it is fixed-size.
+///
+/// The ONE definition of that charge, the way [`capacity_reservation_payload_bytes`] is for
+/// its own store:
+/// [`ComAmazonawsEc2Amazonec2State::insert_capacity_reservation_cancellation_quote`] charges
+/// exactly it, and a removal path must give back the same number.
+pub fn capacity_reservation_cancellation_quote_payload_bytes(
+    quote: &CapacityReservationCancellationQuote,
+) -> usize {
+    tag_list_bytes(quote.tags.as_deref().unwrap_or_default())
+}
+
+/// What the clock owes one stored cancellation quote next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapacityReservationCancellationQuoteMove {
+    /// `pending` -> `active`: the quote is generated and usable.
+    Active,
+}
+
+/// The move the clock owes one cancellation quote: a [`ClockTransition`] to the next
+/// [`CapacityReservationCancellationQuoteMove`].
+pub type CapacityReservationCancellationQuoteTransition =
+    ClockTransition<CapacityReservationCancellationQuoteMove>;
+
+/// One stored Capacity Reservation cancellation quote: the modelled
+/// [`CapacityReservationCancellationQuote`] every operation that reports one answers with,
+/// plus the move the clock owes it.
+///
+/// The view is the modelled shape itself rather than a parallel record, so every member a
+/// writer sets round-trips through a reader without a field-by-field copy that can silently
+/// drop one — the same arrangement [`CapacityReservationRecord`] uses.
+#[derive(Debug, Clone)]
+pub struct CapacityReservationCancellationQuoteRecord {
+    /// The quote as the model shapes it.
+    pub view: CapacityReservationCancellationQuote,
+    /// The move the clock owes this quote, while one is owed.
+    pub pending: Option<CapacityReservationCancellationQuoteTransition>,
+}
+
+impl CapacityReservationCancellationQuoteRecord {
+    /// The quote's `CapacityReservationCancellationQuoteState` as it was last WRITTEN.
+    ///
+    /// [`Self::quote_state_at`] is what a reader reports: both of a quote's moves are facts
+    /// of where the clock stands rather than something a writer stored.
+    pub fn quote_state(&self) -> &str {
+        self.view.quote_state.as_deref().unwrap_or_default()
+    }
+
+    /// The quote's state at `now`.
+    ///
+    /// Two facts of the clock are derived here rather than stored, so a read reports what was
+    /// already due without writing anything:
+    ///
+    /// * The end of the wait for the quote to be generated: it is answered `pending` and the
+    ///   move to `active` fell due at the wall-clock instant its
+    ///   [`CapacityReservationCancellationQuoteTransition`] names ([`ClockTransition::at`]),
+    ///   whether or not anybody called again.
+    /// * The end of its validity: "Cancellation quotes are valid for 24 hours"
+    ///   (`CreateCapacityReservationCancellationQuote`), so a quote is `expired` from the
+    ///   `ExpirationTime` it carries on — which outranks the move above, a quote never
+    ///   becoming usable after it has stopped being valid.
+    pub fn quote_state_at(&self, now: SystemTime) -> &str {
+        let now_key = date_time_key(system_time_to_date_time(now));
+        if self
+            .view
+            .expiration_time
+            .map(date_time_key)
+            .is_some_and(|expires| now_key >= expires)
+        {
+            return CAPACITY_RESERVATION_CANCELLATION_QUOTE_STATE_EXPIRED;
+        }
+        let stored = self.quote_state();
+        let generated = stored == CAPACITY_RESERVATION_CANCELLATION_QUOTE_STATE_PENDING
+            && self.pending.as_ref().is_some_and(|pending| {
+                matches!(
+                    pending.to,
+                    CapacityReservationCancellationQuoteMove::Active
+                ) && now >= pending.at
+            });
+        if generated {
+            return CAPACITY_RESERVATION_CANCELLATION_QUOTE_STATE_ACTIVE;
+        }
+        stored
+    }
+
+    /// This quote as of `now`: the stored view with the state the clock has reached. A read
+    /// observes the generation and the expiry the clock already owed without writing anything.
+    pub fn view_at(&self, now: SystemTime) -> CapacityReservationCancellationQuote {
+        let mut view = self.view.clone();
+        view.quote_state = Some(self.quote_state_at(now).to_string());
+        view
+    }
+}
+
+/// What one stored cancellation quote is created with, for
+/// [`ComAmazonawsEc2Amazonec2State::insert_capacity_reservation_cancellation_quote`].
+///
+/// The instant is a [`SystemTime`] because the writer computes it from the clock it already
+/// holds; the store converts it once. Everything the service itself owns — the id, the instant
+/// the quote stops being valid and the state it is generated in — is derived by the insert
+/// rather than named here.
+#[derive(Debug, Clone)]
+pub struct CapacityReservationCancellationQuoteSpec {
+    /// "The ID of the Capacity Reservation associated with the cancellation quote"
+    /// (`CapacityReservationCancellationQuote$CapacityReservationId`).
+    pub capacity_reservation_id: String,
+    /// When the quote was generated, which is what its validity is measured from.
+    pub created_at: SystemTime,
+    /// "The current configuration of the Capacity Reservation" as of that instant.
+    pub current_configuration: CapacityReservationConfiguration,
+    /// "The cancellation terms associated with the quote, including the fee type and charge
+    /// details" (`$CancellationTerms`).
+    pub cancellation_terms: Vec<CancellationTerms>,
+    /// "The tags assigned to the cancellation quote" (`$Tags`).
+    pub tags: Vec<Tag>,
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another `count` cancellation quotes fit inside the store's ceiling
+    /// ([`MAX_STORED_CAPACITY_RESERVATION_CANCELLATION_QUOTES`]).
+    ///
+    /// A writer must ask this BEFORE inserting and refuse when it answers `false`, the way
+    /// [`Self::has_capacity_reservation_capacity`] gates its own store.
+    pub fn has_capacity_reservation_cancellation_quote_capacity(&self, count: usize) -> bool {
+        self.capacity_reservation_cancellation_quotes
+            .len()
+            .saturating_add(count)
+            <= MAX_STORED_CAPACITY_RESERVATION_CANCELLATION_QUOTES
+    }
+
+    /// Store one cancellation quote and answer the `CapacityReservationCancellationQuoteId` it
+    /// was given, or `None` when the store's own ceilings refuse it.
+    ///
+    /// The one place a quote enters this store, so every writer of one — and every reader that
+    /// reports what this wrote — agrees on the id form, the stored shape and which members a
+    /// quote carries. BOTH ceilings are asked HERE, before the first write and before an id is
+    /// minted — the record count
+    /// ([`MAX_STORED_CAPACITY_RESERVATION_CANCELLATION_QUOTES`]) and the caller-chosen bytes
+    /// ([`MAX_STORED_BYTES`]) — exactly as [`Self::insert_capacity_reservation`] asks its own:
+    /// nothing here reclaims a stored quote, so an unbounded write path would grow this
+    /// process without limit. A caller must map `None` onto the quota error its operation
+    /// answers. The bytes the record retains are charged here, and the clock-owed move is
+    /// recorded rather than slept for.
+    pub fn insert_capacity_reservation_cancellation_quote(
+        &mut self,
+        spec: CapacityReservationCancellationQuoteSpec,
+    ) -> Option<String> {
+        // The charge of the record this spec becomes, computed from the spec so it can be
+        // asked BEFORE anything is written or an id is minted. It is exactly what
+        // [`capacity_reservation_cancellation_quote_payload_bytes`] counts on the stored view
+        // below, which is the ONE definition of this store's charge.
+        let charge = tag_list_bytes(&spec.tags);
+        if !self.has_capacity_reservation_cancellation_quote_capacity(1)
+            || self.would_exceed_stored_bytes(charge)
+        {
+            return None;
+        }
+        let quote_id = self.next_id(CAPACITY_RESERVATION_CANCELLATION_QUOTE_ID_PREFIX);
+        let view = CapacityReservationCancellationQuote {
+            capacity_reservation_cancellation_quote_id: Some(quote_id.clone()),
+            capacity_reservation_id: Some(spec.capacity_reservation_id),
+            // "The date and time at which the cancellation quote was created" ($CreateTime).
+            create_time: Some(system_time_to_date_time(spec.created_at)),
+            // "The date and time at which the cancellation quote expires" ($ExpirationTime),
+            // which is its documented validity after that instant. Checked arithmetic: the
+            // span is this module's own constant, so it cannot overflow in practice, and an
+            // instant the clock type could not hold is reported as no expiry at all rather
+            // than panicked on.
+            expiration_time: spec
+                .created_at
+                .checked_add(CAPACITY_RESERVATION_CANCELLATION_QUOTE_VALIDITY)
+                .map(system_time_to_date_time),
+            // Generated `pending`, with `active` owed one TRANSITION_DELAY later.
+            quote_state: Some(
+                CAPACITY_RESERVATION_CANCELLATION_QUOTE_STATE_PENDING.to_string(),
+            ),
+            current_configuration: Some(spec.current_configuration),
+            cancellation_terms: Some(spec.cancellation_terms),
+            tags: Some(spec.tags),
+        };
+        self.add_stored_bytes(capacity_reservation_cancellation_quote_payload_bytes(&view));
+        self.capacity_reservation_cancellation_quotes.insert(
+            quote_id.clone(),
+            CapacityReservationCancellationQuoteRecord {
+                view,
+                pending: Some(CapacityReservationCancellationQuoteTransition::starting_now(
+                    CapacityReservationCancellationQuoteMove::Active,
+                )),
+            },
+        );
+        Some(quote_id)
+    }
+}
+
+/// The code this service answers for a cancellation quote id the account holds no quote for,
+/// in the `Invalid<Resource>Id.NotFound` family every other id of this service is refused
+/// with ([`INVALID_CAPACITY_RESERVATION_ID_NOT_FOUND`]).
+pub const INVALID_CAPACITY_RESERVATION_CANCELLATION_QUOTE_ID_NOT_FOUND: &str =
+    "InvalidCapacityReservationCancellationQuoteId.NotFound";
+
+/// The code for a value that is not a cancellation quote id at all, so there is nothing to
+/// look it up as, in the `Invalid<Resource>Id.Malformed` family this service refuses an
+/// unissuable id of any other kind with
+/// ([`INVALID_CAPACITY_RESERVATION_ID_MALFORMED`]).
+pub const INVALID_CAPACITY_RESERVATION_CANCELLATION_QUOTE_ID_MALFORMED: &str =
+    "InvalidCapacityReservationCancellationQuoteId.Malformed";
+
+/// Whether `id` is a well-formed cancellation quote id — one this service could have ISSUED.
+///
+/// The model publishes no pattern for `CapacityReservationCancellationQuoteId`, so the form is
+/// the one this service issues: the LONG resource-id reading
+/// ([`issued_long_id_is_well_formed`]) under this resource's own
+/// [`CAPACITY_RESERVATION_CANCELLATION_QUOTE_ID_PREFIX`], which is what
+/// [`ComAmazonawsEc2Amazonec2State::next_id`] mints — the same reading a Capacity Reservation
+/// id gets ([`capacity_reservation_id_is_well_formed`]), so a caller can tell a typo from a
+/// quote its account does not hold.
+pub fn capacity_reservation_cancellation_quote_id_is_well_formed(id: &str) -> bool {
+    issued_long_id_is_well_formed(CAPACITY_RESERVATION_CANCELLATION_QUOTE_ID_PREFIX, id)
+}
+
+/// Refuse a value that is not a cancellation quote id at all: HTTP 400
+/// [`INVALID_CAPACITY_RESERVATION_CANCELLATION_QUOTE_ID_MALFORMED`], worded the way this
+/// service words a malformed id and built from the value the request sent.
+pub fn invalid_capacity_reservation_cancellation_quote_id_malformed<E>(
+    quote_id: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_CAPACITY_RESERVATION_CANCELLATION_QUOTE_ID_MALFORMED,
+        400,
+        format!("Capacity Reservation cancellation quote ID '{quote_id}' is malformed"),
+    )
+}
+
+/// Refuse a well-formed cancellation quote id this store holds no quote under: HTTP 400
+/// [`INVALID_CAPACITY_RESERVATION_CANCELLATION_QUOTE_ID_NOT_FOUND`]. A value OUTSIDE the id
+/// form is answered [`invalid_capacity_reservation_cancellation_quote_id_malformed`] instead,
+/// before any lookup.
+pub fn invalid_capacity_reservation_cancellation_quote_id_not_found<E>(
+    quote_id: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_CAPACITY_RESERVATION_CANCELLATION_QUOTE_ID_NOT_FOUND,
+        400,
+        format!(
+            "The capacity-reservation-cancellation-quote ID '{quote_id}' does not exist"
+        ),
+    )
+}
+
+/// A timestamp attribute as an EC2 filter value compares against it: the wire rendering of
+/// the instant, which is what a caller was shown. A member that is not set carries no value
+/// for the filter to match, like any other absent attribute.
+///
+/// The timestamp companion of [`boolean_filter_values`] and [`integer_filter_values`], beside
+/// them so every describe renders one the same way.
+pub fn timestamp_filter_values(at: Option<::aws_smithy_types::DateTime>) -> Vec<Cow<'static, str>> {
+    at.and_then(|at| at.fmt(::aws_smithy_types::date_time::Format::DateTime).ok())
+        .map(Cow::Owned)
+        .into_iter()
+        .collect()
 }
 
 /// One move of capacity between two Capacity Reservations, as
