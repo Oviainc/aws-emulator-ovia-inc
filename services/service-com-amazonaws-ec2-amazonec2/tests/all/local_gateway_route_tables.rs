@@ -148,6 +148,9 @@ fn seed(engine: &engine::InMemoryEngine) -> Vec<String> {
                     outpost_arn: outpost_arn(row.outpost),
                     region: REGION.to_string(),
                     state: row.state.to_string(),
+                    // Seeded in the state the row names, so the clock owes these tables
+                    // nothing.
+                    becomes: None,
                     mode: row.mode.to_string(),
                     tags: row.tags,
                 })
@@ -350,6 +353,7 @@ async fn every_stored_route_table_is_reported_and_a_later_write_is_visible() {
             outpost_arn: outpost_arn("op-00000000000000009"),
             region: REGION.to_string(),
             state: "available".to_string(),
+            becomes: None,
             mode: "coip".to_string(),
             tags: vec![tag("Name", "late")],
         })

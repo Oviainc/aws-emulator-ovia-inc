@@ -111,6 +111,15 @@
 //! resolved — which answers [`INVALID_LOCAL_GATEWAY_ROUTE_TABLE_ID_NOT_FOUND`] for every
 //! well-formed id while the route table store is empty.
 //!
+//! [`ComAmazonawsEc2Amazonec2State::local_gateways`] holds the local gateways themselves,
+//! keyed by `LocalGatewayId`, as the modelled shape. It starts EMPTY for the reason the two
+//! stores above it do — a local gateway is part of an Outpost rack, which no EC2 call
+//! creates — so [`require_known_local_gateway`], the one way that id is resolved, answers
+//! [`INVALID_LOCAL_GATEWAY_ID_NOT_FOUND`] for every well-formed id until
+//! [`ComAmazonawsEc2Amazonec2State::insert_local_gateway`] has stored one. A route table is
+//! created ON a gateway, so `CreateLocalGatewayRouteTable` reads the Outpost the table
+//! belongs to off that stored gateway rather than from the request.
+//!
 //! ## A security group's rules are objects of their own
 //!
 //! A security group's rules have two shapes in the EC2 API: the aggregated
@@ -2748,6 +2757,18 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// stored.
     pub local_gateway_virtual_interface_groups:
         BTreeMap<String, crate::ops::types::LocalGatewayVirtualInterfaceGroup>,
+    /// Every local gateway the account holds, by `LocalGatewayId`, as the modelled
+    /// [`crate::ops::types::LocalGateway`] shape itself — so a member a writer sets
+    /// round-trips through a report of the gateways without a field-by-field copy that can
+    /// silently drop one. Ordered by id, the stable order such a report pages over.
+    ///
+    /// Starts EMPTY, for the reason the stores above it do: a local gateway is part of an
+    /// Outpost rack, which no EC2 call creates, so an account without an Outpost holds none
+    /// — which is why every well-formed `LocalGatewayId` is answered
+    /// [`invalid_local_gateway_id_not_found`] until one has been stored.
+    /// [`Self::insert_local_gateway`] is the one way a gateway is stored, and
+    /// [`require_known_local_gateway`] the one way an id is resolved against this map.
+    pub local_gateways: BTreeMap<String, crate::ops::types::LocalGateway>,
     /// Every Client VPN endpoint the account holds, by `ClientVpnEndpointId`, as the
     /// modelled [`crate::ops::types::ClientVpnEndpoint`] shape itself — so a member a writer
     /// sets round-trips through `DescribeClientVpnEndpoints` without a field-by-field copy
@@ -3962,6 +3983,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             // A local gateway route table lives on an Outpost, which no EC2 call creates.
             local_gateway_route_tables: BTreeMap::new(),
             local_gateway_virtual_interface_groups: BTreeMap::new(),
+            // A local gateway is part of an Outpost rack, which no EC2 call creates.
+            local_gateways: BTreeMap::new(),
             // A fresh account has created no Client VPN endpoint, so it holds none and no
             // target network is associated with one either.
             client_vpn_endpoints: BTreeMap::new(),
@@ -7117,8 +7140,19 @@ impl ComAmazonawsEc2Amazonec2State {
         // A route `CreateLocalGatewayRoute` answered as `pending` is carrying traffic once
         // its due instant has passed, whether or not anybody called — the same contract as
         // the `pending` VPC above. A route is reached only through the table it is in, so
-        // the moves are applied table by table.
+        // the moves are applied table by table, and the TABLE's own move —
+        // `CreateLocalGatewayRouteTable` answers a new table `pending`, which the clock owes
+        // `available` — falls due on the same clock.
         for table in self.local_gateway_route_tables.values_mut() {
+            let due = table
+                .pending
+                .as_ref()
+                .and_then(|pending| pending.due_by(now))
+                .map(str::to_string);
+            if let Some(state) = due {
+                table.view.state = Some(state);
+                table.pending = None;
+            }
             for record in table.routes.values_mut() {
                 let due = record
                     .pending
@@ -11479,6 +11513,170 @@ impl ComAmazonawsEc2Amazonec2State {
 }
 
 // =============================================================================
+// Local gateways
+// =============================================================================
+
+/// The id prefix EC2 mints a local gateway with: `lgw-`, as the AWS Outposts and EC2
+/// documentation's own ids read (for example `lgw-09b493aa7cEXAMPLE`) and as the id the
+/// recorded wire corpus behind this surface sends (`lgw-` plus 17 hexadecimal digits,
+/// answered with the gateway's `.NotFound`). The model puts no pattern on `LocalGatewayId`,
+/// so the prefix is the one thing that says which resource an id names.
+pub const LOCAL_GATEWAY_ID_PREFIX: &str = "lgw";
+
+/// The `ResourceType` enum member a local gateway is tagged and named under:
+/// `local-gateway` (`smithy_query(query="shape",shape="ResourceType")`). The resource's one
+/// spelling, so the refusals that name it cannot drift from it.
+pub const RESOURCE_TYPE_LOCAL_GATEWAY: &str = "local-gateway";
+
+/// How many local gateways this emulator stores before a write must refuse.
+///
+/// CHOSEN, like [`MAX_LOCAL_GATEWAY_ROUTE_TABLES`] and for the same reason: nothing in this
+/// emulator reclaims a stored gateway, so the store needs a ceiling that is not the
+/// process's memory.
+pub const MAX_LOCAL_GATEWAYS: usize = 4096;
+
+/// `InvalidLocalGatewayID.Malformed` (HTTP 400): the request named something that is not a
+/// local gateway id at all, so there is nothing to look up — the `Invalid<Kind>.Malformed`
+/// code EC2 answers before it looks an id up, as
+/// [`INVALID_LOCAL_GATEWAY_ROUTE_TABLE_ID_MALFORMED`] is for a route table ON a gateway.
+pub const INVALID_LOCAL_GATEWAY_ID_MALFORMED: &str = "InvalidLocalGatewayID.Malformed";
+
+/// `InvalidLocalGatewayID.NotFound` (HTTP 400): the request named a well-formed local
+/// gateway id this account holds no gateway for. The code AWS answers, as the recorded wire
+/// corpus behind `issues/…-ec2-local-gateway-route-table-and-coip-pool.md` shows.
+pub const INVALID_LOCAL_GATEWAY_ID_NOT_FOUND: &str = "InvalidLocalGatewayID.NotFound";
+
+/// Whether `id` is a well-formed local gateway id — one EC2 could have issued.
+///
+/// `<prefix>-<8 or 17 lowercase hex digits>`, read by the one generic id reader
+/// ([`prefixed_id_is_well_formed`]) under this resource's own prefix
+/// ([`LOCAL_GATEWAY_ID_PREFIX`], whose doc carries the evidence for it). A route table's own
+/// id (`lgw-rtb-…`) therefore reads as malformed here rather than as a gateway id, its
+/// suffix not being hexadecimal.
+pub fn local_gateway_id_is_well_formed(id: &str) -> bool {
+    prefixed_id_is_well_formed(LOCAL_GATEWAY_ID_PREFIX, id)
+}
+
+/// Refuse something that is not a local gateway id at all: HTTP 400
+/// [`INVALID_LOCAL_GATEWAY_ID_MALFORMED`], worded the way AWS words a malformed id of this
+/// resource and built from the request's own value.
+pub fn invalid_local_gateway_id_malformed<E>(id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_LOCAL_GATEWAY_ID_MALFORMED,
+        400,
+        format!("The {RESOURCE_TYPE_LOCAL_GATEWAY} ID '{id}' is malformed"),
+    )
+}
+
+/// Refuse a well-formed local gateway id this account holds no gateway for: HTTP 400
+/// [`INVALID_LOCAL_GATEWAY_ID_NOT_FOUND`], worded the way AWS words it for this family
+/// ("The LocalGateway ID '…' does not exist", the sentence
+/// [`invalid_local_gateway_route_table_id_not_found`] carries for the route table on it).
+pub fn invalid_local_gateway_id_not_found<E>(id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_LOCAL_GATEWAY_ID_NOT_FOUND,
+        400,
+        format!("The LocalGateway ID '{id}' does not exist"),
+    )
+}
+
+/// Refuse something that is not a local gateway id at all, for a handler that has to read
+/// the request's own FORM before it resolves anything — the contract
+/// [`require_well_formed_local_gateway_route_table_id`] writes out for the route table id.
+pub fn require_well_formed_local_gateway_id<E>(id: &str) -> Result<(), Scaffolded<E>> {
+    if !local_gateway_id_is_well_formed(id) {
+        return Err(invalid_local_gateway_id_malformed(id));
+    }
+    Ok(())
+}
+
+/// Refuse a `LocalGatewayId` this service cannot resolve: a malformed one before an unknown
+/// one, the order [`require_well_formed_id`] documents.
+///
+/// The ONE place a local gateway id is resolved, so every operation that takes one refuses
+/// the same id the same way; the contract [`require_known_local_gateway_route_table`] writes
+/// out for the route tables on a gateway.
+pub fn require_known_local_gateway<E>(
+    store: &ComAmazonawsEc2Amazonec2State,
+    id: &str,
+) -> Result<(), Scaffolded<E>> {
+    require_well_formed_local_gateway_id(id)?;
+    if !store.local_gateways.contains_key(id) {
+        return Err(invalid_local_gateway_id_not_found(id));
+    }
+    Ok(())
+}
+
+/// What one local gateway is written with: the Outpost it is part of, the state it is in,
+/// and its tags.
+///
+/// Every member the service itself owns — the gateway id and the owning account — is derived
+/// by [`ComAmazonawsEc2Amazonec2State::insert_local_gateway`] rather than taken from the
+/// caller, so two writers cannot report one gateway differently.
+#[derive(Debug, Clone)]
+pub struct LocalGatewaySpec {
+    /// "The Amazon Resource Name (ARN) of the Outpost" (`LocalGateway$OutpostArn`) the
+    /// gateway belongs to, which the route tables on it report as their own.
+    pub outpost_arn: String,
+    /// "The state of the local gateway" (`LocalGateway$State`), which the model leaves an
+    /// unconstrained string.
+    pub state: String,
+    /// "The tags assigned to the local gateway" (`LocalGateway$Tags`).
+    pub tags: Vec<Tag>,
+}
+
+/// The caller-chosen bytes one stored local gateway holds: its tags, the Outpost ARN it
+/// names and the state a writer pinned on it. Everything else on the record — the gateway
+/// id and the owning account — is derived by this module, so it is fixed-size.
+///
+/// The ONE definition of that charge, the way [`local_gateway_route_table_payload_bytes`] is
+/// for the route tables on a gateway.
+pub fn local_gateway_payload_bytes(spec: &LocalGatewaySpec) -> usize {
+    tag_list_bytes(&spec.tags)
+        .saturating_add(spec.outpost_arn.len())
+        .saturating_add(spec.state.len())
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another local gateway fits inside the store's ceiling
+    /// ([`MAX_LOCAL_GATEWAYS`]).
+    pub fn has_local_gateway_capacity(&self) -> bool {
+        self.local_gateways.len() < MAX_LOCAL_GATEWAYS
+    }
+
+    /// Store one local gateway and answer the id it was given — or `None` when the store
+    /// cannot take it.
+    ///
+    /// Both of the store's bounds are enforced HERE, before an id is minted or a byte
+    /// charged: the count ceiling ([`Self::has_local_gateway_capacity`]) and the byte budget
+    /// ([`Self::would_exceed_stored_bytes`] over [`local_gateway_payload_bytes`]) — the same
+    /// contract as [`Self::insert_local_gateway_route_table`]. A caller that gets `None` must
+    /// refuse the request rather than report a gateway it did not store.
+    ///
+    /// No EC2 operation creates a local gateway (one is part of an Outpost rack), so this is
+    /// the seam an account's gateways are placed through rather than dead code: it is what
+    /// gives [`require_known_local_gateway`] something to resolve.
+    pub fn insert_local_gateway(&mut self, spec: LocalGatewaySpec) -> Option<String> {
+        let payload_bytes = local_gateway_payload_bytes(&spec);
+        if !self.has_local_gateway_capacity() || self.would_exceed_stored_bytes(payload_bytes) {
+            return None;
+        }
+        let local_gateway_id = self.next_id(LOCAL_GATEWAY_ID_PREFIX);
+        let gateway = crate::ops::types::LocalGateway {
+            local_gateway_id: Some(local_gateway_id.clone()),
+            outpost_arn: Some(spec.outpost_arn),
+            owner_id: Some(::engine::emulator_account_id().to_string()),
+            state: Some(spec.state),
+            tags: Some(spec.tags),
+        };
+        self.add_stored_bytes(payload_bytes);
+        self.local_gateways
+            .insert(local_gateway_id.clone(), gateway);
+        Some(local_gateway_id)
+    }
+}
+
+// =============================================================================
 // Local gateway route tables and the routes in them
 // =============================================================================
 
@@ -11519,6 +11717,24 @@ pub const MAX_LOCAL_GATEWAY_ROUTE_TABLES: usize = 4096;
 /// request carries, so this is a ceiling of this emulator's own rather than that quota.
 pub const MAX_LOCAL_GATEWAY_ROUTES_PER_TABLE: usize = 1000;
 
+/// A local gateway route table being created, which is what a create answers with until its
+/// clock-owed move falls due: `pending`, the state the account's own tables are reported in
+/// while they are being set up (`LocalGatewayRouteTable$State` is an unconstrained string
+/// carrying the lifecycle `pending`, `available`, `deleting`, `deleted`).
+pub const LOCAL_GATEWAY_ROUTE_TABLE_STATE_PENDING: &str = "pending";
+
+/// A local gateway route table that is in service: the state the clock owes a `pending`
+/// table one [`TRANSITION_DELAY`] after the call that created it.
+pub const LOCAL_GATEWAY_ROUTE_TABLE_STATE_AVAILABLE: &str = "available";
+
+/// The mode of a local gateway route table that routes straight into the VPCs associated
+/// with it: the `LocalGatewayRouteTableMode` enum's `direct-vpc-routing` member
+/// (`smithy_query(query="shape",shape="LocalGatewayRouteTableMode")`, whose only other
+/// member is `coip`), and the mode a create that names none writes — `coip` is the mode of a
+/// table that routes through a customer-owned address pool, which is something a caller asks
+/// for rather than something a create can assume.
+pub const LOCAL_GATEWAY_ROUTE_TABLE_MODE_DIRECT_VPC_ROUTING: &str = "direct-vpc-routing";
+
 /// A route "pending" insertion into the local gateway route table: the
 /// `LocalGatewayRouteState` enum's `pending` member.
 pub const LOCAL_GATEWAY_ROUTE_STATE_PENDING: &str = "pending";
@@ -11553,6 +11769,27 @@ pub const LOCAL_GATEWAY_ROUTE_TYPE_PROPAGATED: &str = "propagated";
 /// `issues/…-ec2-deletelocalgatewayroute-stub.md` shows.
 pub const INVALID_LOCAL_GATEWAY_ROUTE_TABLE_ID_MALFORMED: &str =
     "InvalidLocalGatewayRouteTableID.Malformed";
+
+/// The code EC2 answers when a request would take the account past the local gateway route
+/// tables it may hold, in the `<Resource>LimitExceeded` family this service's other quotas
+/// are refused with ([`LOCAL_GATEWAY_ROUTE_TABLE_VPC_ASSOCIATION_LIMIT_EXCEEDED`]).
+pub const LOCAL_GATEWAY_ROUTE_TABLE_LIMIT_EXCEEDED: &str = "LocalGatewayRouteTableLimitExceeded";
+
+/// Refuse a route table create this store cannot take: HTTP 400
+/// [`LOCAL_GATEWAY_ROUTE_TABLE_LIMIT_EXCEEDED`], naming the two bounds this emulator holds a
+/// table against ([`MAX_LOCAL_GATEWAY_ROUTE_TABLES`] and [`MAX_STORED_BYTES`]) the way the
+/// association stores name theirs.
+pub fn local_gateway_route_table_limit_exceeded<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        LOCAL_GATEWAY_ROUTE_TABLE_LIMIT_EXCEEDED,
+        400,
+        format!(
+            "This emulator stores at most {MAX_LOCAL_GATEWAY_ROUTE_TABLES} local gateway route \
+             tables and at most {MAX_STORED_BYTES} bytes of caller-supplied data, and this \
+             request would take it past one of the two"
+        ),
+    )
+}
 
 /// `InvalidLocalGatewayRouteTableID.NotFound` (HTTP 400): the request named a well-formed
 /// local gateway route table id this account holds no route table for. The code AWS
@@ -11805,6 +12042,11 @@ pub struct LocalGatewayRouteTableRecord {
     /// ([`LocalGatewayRouteDestination::key`]). Ordered by destination, the stable order a
     /// search of the routes reports and pages over.
     pub routes: BTreeMap<String, LocalGatewayRouteRecord>,
+    /// The move a table still [`LOCAL_GATEWAY_ROUTE_TABLE_STATE_PENDING`] owes; `None` for
+    /// one in a state the clock owes nothing on. Beside the modelled shape because
+    /// `LocalGatewayRouteTable` carries no member for when its next state falls due — the
+    /// arrangement [`LocalGatewayRouteRecord::pending`] has for a route in the table.
+    pub pending: Option<PendingStateMove>,
 }
 
 /// One stored local gateway route: the modelled shape every reader of it reports, plus the
@@ -11846,6 +12088,11 @@ pub struct LocalGatewayRouteTableSpec {
     /// "The state of the local gateway route table" (`LocalGatewayRouteTable$State`),
     /// which the model leaves an unconstrained string.
     pub state: String,
+    /// The state the clock owes this table, [`TRANSITION_DELAY`] from the write; `None` for
+    /// one written in a state nothing is owed on — the contract
+    /// [`LocalGatewayRouteTableVpcAssociationSpec::becomes`] writes out for the associations
+    /// made in it.
+    pub becomes: Option<String>,
     /// "The tags assigned to the local gateway route table".
     pub tags: Vec<Tag>,
 }
@@ -12072,6 +12319,10 @@ impl ComAmazonawsEc2Amazonec2State {
             LocalGatewayRouteTableRecord {
                 view,
                 routes: BTreeMap::new(),
+                // RECORDED, never slept for: [`Self::materialize_due_transitions`] applies
+                // it once [`TRANSITION_DELAY`] has passed, so a caller asking straight after
+                // the write still sees the state the table was created in.
+                pending: spec.becomes.map(PendingStateMove::starting_now),
             },
         );
         Some(route_table_id)

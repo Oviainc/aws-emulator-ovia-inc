@@ -211,6 +211,7 @@ fn emulator() -> (MultiServiceRouter, std::sync::Arc<engine::InMemoryEngine>, Fi
                     region: REGION.to_string(),
                     mode: mode.to_string(),
                     state: "available".to_string(),
+                    becomes: None,
                     tags: Vec::new(),
                 })
                 .unwrap_or_else(|| panic!("case {mode:?}: the store must take the route table"))

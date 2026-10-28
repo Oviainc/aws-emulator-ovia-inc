@@ -846,3 +846,13 @@ mod ipam_byoasn_deprovisioning;
 // move the clock owes it are both visible through it.
 #[path = "all/transit_gateway_vpc_attachments.rs"]
 mod transit_gateway_vpc_attachments;
+// Appended at the END of this file, for the reason the header gives. What
+// `CreateLocalGatewayRouteTable` mints and persists for the local gateway it names, the move
+// the clock then owes the new table, and what it refuses.
+#[path = "all/create_local_gateway_route_table.rs"]
+mod create_local_gateway_route_table;
+// Appended at the END of this file, for the reason the header gives. What `GetCoipPoolUsage`
+// reports out of the addresses allocated from one customer-owned address pool, and how the
+// documented filters and the page size narrow it.
+#[path = "all/get_coip_pool_usage.rs"]
+mod get_coip_pool_usage;

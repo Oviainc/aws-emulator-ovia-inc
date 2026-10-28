@@ -164,6 +164,8 @@ fn seed_route_table(engine: &engine::InMemoryEngine, row: &RouteTableRow) -> Str
             region: row.region.to_string(),
             mode: row.mode.to_string(),
             state: row.state.to_string(),
+            // Seeded in the state the row names, so the clock owes this table nothing.
+            becomes: None,
             tags: Vec::new(),
         })
         .unwrap_or_else(|| panic!("case {case:?}: the store must take the seeded route table"))

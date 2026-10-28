@@ -247,6 +247,7 @@ fn seed(engine: &engine::InMemoryEngine) -> Seeded {
                 ),
                 region: REGION.to_string(),
                 state: ROUTE_TABLE_STATE.to_string(),
+                becomes: None,
                 mode: mode.to_string(),
                 tags: Vec::new(),
             })

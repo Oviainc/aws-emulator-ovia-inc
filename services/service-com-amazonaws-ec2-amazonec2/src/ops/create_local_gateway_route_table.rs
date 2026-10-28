@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLocalGatewayRouteTable
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLocalGatewayRouteTable`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: writes one route table into [`crate::state`] for the local gateway the
+//! request names, and answers that table as the store now holds it — in the non-terminal
+//! `pending` state the clock owes `available`. The Outpost the table belongs to and the
+//! owning account are facts of the GATEWAY and of the service, so they are read off the
+//! stored gateway rather than taken from the request. This is the ONLY file to touch for
+//! this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLocalGatewayRouteTable::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The refusals, in the order the service answers them: a request that carries no local
+//! gateway id is `MissingParameter`, something that is not a `LocalGatewayId` at all is
+//! `InvalidLocalGatewayID.Malformed`, a `TagSpecifications` entry naming another resource
+//! type is `InvalidParameterValue` — all of that being the request's own FORM, read before
+//! anything is resolved; a `DryRun` request a caller holds the permissions for is then
+//! `DryRunOperation` and writes nothing; and a well-formed local gateway id this account
+//! holds no gateway for is `InvalidLocalGatewayID.NotFound`, since there is nothing to
+//! create a route table on.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +144,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLocalGatewayRouteTable` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLocalGatewayRouteTableErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLocalGatewayRouteTable"))
+        use crate::state;
+
+        // The Region of the request's SigV4 credential scope: a local gateway route table is
+        // a Region's resource, and its own ARN names that Region
+        // (`LocalGatewayRouteTable$LocalGatewayRouteTableArn`). Everything else the table
+        // reports comes from the request or from the stored gateway it is created on.
+        let region = state::request_region(ctx.parts());
+
+        // The request's own FORM first, before anything is resolved. "The ID of the local
+        // gateway" is `@required` but modelled `clientOptional`, so a request that left it
+        // out reaches this handler as an empty string rather than being refused by the
+        // boundary validator: a parameter the request did not carry is EC2's
+        // `MissingParameter`.
+        let local_gateway_id = input.local_gateway_id.as_str();
+        if local_gateway_id.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter localGatewayId",
+            ));
+        }
+        // Something that is not a `LocalGatewayId` at all is refused through the crate's one
+        // form check for that id — the same one the resolver below makes before it looks the
+        // id up — so this operation's earlier reading of the FORM cannot drift from the
+        // resolver's.
+        state::require_well_formed_local_gateway_id(local_gateway_id)?;
+
+        // "The tags assigned to the local gateway route table" (`TagSpecifications`),
+        // refusing a specification that names any resource type but the one this action
+        // creates. The shared helper also bounds the tag count, each key and value, a key
+        // given twice and the reserved `aws:` prefix.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_LOCAL_GATEWAY_ROUTE_TABLE,
+            Self::NAME,
+        )?;
+
+        // "Checks whether you have the required permissions for the action, WITHOUT ACTUALLY
+        // MAKING THE REQUEST, and provides an error response. If you have the required
+        // permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`DryRun`): the flag asks about PERMISSION, not about the
+        // gateway the request names, so it is answered once the request's own form has been
+        // read and BEFORE the gateway is resolved — the order the sibling creates of this
+        // surface answer a dry run in. Every caller of this emulator is permitted, and
+        // nothing is written on this path.
+        if input.dry_run == Some(true) {
+            return Err(state::dry_run_operation());
+        }
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // A move the clock already owes a record of this store fell due whether or not
+        // anybody called, so those moves are applied before this write reads it.
+        store.materialize_due_transitions();
+
+        // "Creates a local gateway route table" FOR the gateway `LocalGatewayId` names: the
+        // table hangs off that gateway, so an id this account holds no local gateway for
+        // leaves nothing to create it on. The crate's one resolver for this id refuses a
+        // malformed one before an unknown one; an account without an Outpost holds no local
+        // gateway at all, so `.NotFound` is the answer every well-formed id gets until one
+        // has been stored.
+        state::require_known_local_gateway(&store, local_gateway_id)?;
+        // "The Amazon Resource Name (ARN) of the Outpost" is a fact of the GATEWAY
+        // (`LocalGateway$OutpostArn`), so the table reports the Outpost its gateway is part
+        // of, read off the stored record rather than taken from the request. The store's own
+        // insert always sets it, so a gateway missing it is a broken invariant rather than
+        // something to report as an empty member.
+        let Some(outpost_arn) = store
+            .local_gateways
+            .get(local_gateway_id)
+            .and_then(|gateway| gateway.outpost_arn.clone())
+        else {
+            return Err(state::internal_error(format!(
+                "the local gateway '{local_gateway_id}' carries no Outpost ARN"
+            )));
+        };
+
+        // "The mode of the local gateway route table" (`Mode`), one of the model's own
+        // `LocalGatewayRouteTableMode` catalog — the boundary validator has already refused
+        // every spelling that is not a member of it. A request that names no mode gets
+        // `direct-vpc-routing`: `coip` is the mode of a table that routes through a
+        // customer-owned address pool, which is something a caller asks for rather than
+        // something a create can assume.
+        let mode = input
+            .mode
+            .clone()
+            .unwrap_or_else(|| state::LOCAL_GATEWAY_ROUTE_TABLE_MODE_DIRECT_VPC_ROUTING.to_string());
+
+        // The record itself: the table id, its ARN and the owning account come from the
+        // store, never from the request. A new table starts in the TRANSIENT `pending` state
+        // with the clock owing it `available` one TRANSITION_DELAY later, so a caller
+        // describing the tables straight after this call still sees `pending`.
+        let Some(route_table_id) =
+            store.insert_local_gateway_route_table(state::LocalGatewayRouteTableSpec {
+                local_gateway_id: local_gateway_id.to_string(),
+                outpost_arn,
+                region,
+                mode,
+                state: state::LOCAL_GATEWAY_ROUTE_TABLE_STATE_PENDING.to_string(),
+                becomes: Some(state::LOCAL_GATEWAY_ROUTE_TABLE_STATE_AVAILABLE.to_string()),
+                tags,
+            })
+        else {
+            return Err(state::local_gateway_route_table_limit_exceeded());
+        };
+
+        // "Information about the local gateway route table"
+        // (`CreateLocalGatewayRouteTableResult$LocalGatewayRouteTable`): the table as it was
+        // STORED, so this operation and `DescribeLocalGatewayRouteTables` cannot report one
+        // table differently.
+        let Some(route_table) = store
+            .local_gateway_route_tables
+            .get(&route_table_id)
+            .map(|record| record.view.clone())
+        else {
+            return Err(state::internal_error(format!(
+                "the local gateway route table '{route_table_id}' could not be read back"
+            )));
+        };
+        Ok(CreateLocalGatewayRouteTableOutput {
+            local_gateway_route_table: Some(route_table),
+        })
     }
 }

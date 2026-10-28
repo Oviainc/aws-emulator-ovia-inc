@@ -164,6 +164,7 @@ fn emulator_with_routes() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>, S
                     region: REGION.to_string(),
                     mode: mode.to_string(),
                     state: "available".to_string(),
+                    becomes: None,
                     tags: Vec::new(),
                 })
                 .unwrap_or_else(|| panic!("case {mode:?}: the store must take the route table")),

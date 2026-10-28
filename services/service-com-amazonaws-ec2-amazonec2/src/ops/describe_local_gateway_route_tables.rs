@@ -5,8 +5,10 @@
 //! Reports the account's local gateway route tables out of [`crate::state`]: the whole store
 //! by default ("By default, all local gateway route tables are described"), or the subset
 //! the request's `LocalGatewayRouteTableIds` and `Filters` select, one `MaxResults`-sized
-//! page at a time. A reporting operation — it writes nothing at all, a stored route table
-//! carrying no clock-owed transition.
+//! page at a time. A reporting operation — it writes nothing beyond materialising the
+//! clock-owed move a table `CreateLocalGatewayRouteTable` answered `pending` is due
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::materialize_due_transitions`]), which had
+//! already fallen due whether or not anybody asked.
 //!
 //! ## Shape of an operation
 //!
@@ -265,7 +267,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .clamp(MIN_MAX_RESULTS, DEFAULT_MAX_RESULTS),
         };
 
-        let store = state.lock();
+        let mut store = state.lock();
+
+        // Every clock-owed move that has come due, applied before the store is read: a route
+        // table `CreateLocalGatewayRouteTable` answered `pending` owes `available` at its due
+        // instant whether or not anybody asks, so materialising it changes nothing a later
+        // caller would otherwise have seen.
+        store.materialize_due_transitions();
 
         // "The IDs of the local gateway route tables" (`...Request$LocalGatewayRouteTableIds`):
         // an id that names no route table of the account is an error, not an absent row — the
