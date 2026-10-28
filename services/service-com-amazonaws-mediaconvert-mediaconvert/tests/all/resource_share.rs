@@ -463,11 +463,14 @@ async fn the_attempt_that_completes_is_the_most_recent_one() {
     );
 }
 
-/// A `JobId` that resolves to no stored job is the modelled `NotFoundException`, worded
-/// the way this service words a lookup that resolves nothing — naming the request member.
+/// A `JobId` that CARRIES CHARACTERS but resolves to no stored job is the modelled
+/// `NotFoundException`, worded the way this service words a lookup that resolves nothing —
+/// naming the request member. (A `JobId` carrying no characters resolves nothing because it
+/// names nothing at all, which is the bad request `tests/all/blank_resource_name.rs` pins.)
 ///
 /// The table spans the class: an id nothing holds, the ARN of such an id, the ARN of
-/// another resource type, and an empty id.
+/// another resource type, and a stored id padded with whitespace — the reference is not
+/// normalised, so the padded spelling of a stored id names no job either.
 #[tokio::test]
 async fn sharing_a_job_that_is_not_stored_is_the_modelled_not_found() {
     let emulator = emulator_with_share_span(HELD_IN_INITIATED);
@@ -482,7 +485,10 @@ async fn sharing_a_job_that_is_not_stored_is_the_modelled_not_found() {
             by_arn("1700000000000-abcdef"),
         ),
         ("the ARN of another resource type", arn("queues/Default")),
-        ("an empty id", String::new()),
+        (
+            "a stored id padded with whitespace",
+            format!("  {stored}  "),
+        ),
     ] {
         let reply = create_resource_share(&emulator, &reference, "case-404").await;
         assert_eq!(

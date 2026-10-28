@@ -4,8 +4,11 @@
 //! Implemented: admits each event of the batch against the clock-relative ingestion
 //! window, appends only the admitted ones to the named stream in the shared store,
 //! stamping each with an ingestion time, reports the refused ones in
-//! `rejectedLogEventsInfo`, and mints the stream's next sequence token. This is the ONLY
-//! file to touch for this operation.
+//! `rejectedLogEventsInfo`, and mints the stream's next sequence token. Every event it
+//! stores also publishes the CloudWatch metric data the log group's metric filters extract
+//! from it ([`crate::state::metric_filters`]) and the metrics an Embedded Metric Format
+//! message declares ([`crate::state::emf`]). This is the ONLY file to touch for this
+//! operation.
 //!
 //! THE INGESTION WINDOW is per event, not per batch: an event more than
 //! [`MAX_EVENT_FUTURE_MS`] in the future, older than [`MAX_EVENT_AGE_MS`], or preceding
@@ -344,6 +347,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .log_groups
             .get(&input.log_group_name)
             .is_some_and(|group| store.emf_extraction_enabled_for(group));
+        // The log group's METRIC FILTERS are read — and their patterns parsed — here for the
+        // same reason: the filters this batch is extracted through are the ones the group was
+        // configured with when it arrived, and the parse belongs outside the per-event loop.
+        let metric_filters = store
+            .log_groups
+            .get(&input.log_group_name)
+            .map(crate::state::metric_filters::CompiledFilters::of)
+            .unwrap_or_default();
 
         // The documented batch constraints, which bound what one request may store:
         // "The maximum batch size is 1,048,576 bytes. This size is calculated as the sum
@@ -505,6 +516,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .saturating_sub(discarded_bytes)
             .max(0);
 
+        // The metric store is written with no log-store guard held, so the two services'
+        // stores are never locked at once.
+        drop(store);
         // An accepted event whose message is an Embedded Metric Format document publishes
         // the metrics that document declares — "EMF metric creation is enabled for all log
         // groups" unless an account-level metric extraction policy selects this group — so
@@ -512,23 +526,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // with each event's own timestamp. A policy that suppresses this group publishes
         // none of them and counts the skipped documents instead, so a client can see that
         // extraction was disabled rather than broken.
-        let extracted: Vec<crate::state::emf::ExtractedDatapoint> = stored_messages
-            .iter()
-            .flat_map(|(timestamp, message)| {
-                if extract_emf_metrics {
-                    crate::state::emf::extracted_datapoints(message, *timestamp)
-                } else {
-                    crate::state::emf::suppressed_datapoints(
-                        message,
-                        *timestamp,
-                        &input.log_group_name,
-                    )
-                }
-            })
-            .collect();
-        // The metric store is written with no log-store guard held, so the two services'
-        // stores are never locked at once.
-        drop(store);
+        //
+        // A stored event also publishes the metric data the log group's METRIC FILTERS
+        // extract from it: a filter whose pattern matches the event publishes its
+        // transformation's value, under the dimensions that event resolves, and a filter that
+        // does not match publishes its default value where it declares one. This is a rule
+        // the log group is configured with rather than a property of the message, so it is
+        // independent of the Embedded Metric Format path — one event can feed both, and the
+        // per-event ceiling bounds what the two publish BETWEEN them.
+        let mut extracted: Vec<crate::state::emf::ExtractedDatapoint> =
+            Vec::with_capacity(stored_messages.len());
+        for (timestamp, message) in &stored_messages {
+            let declared = if extract_emf_metrics {
+                crate::state::emf::extracted_datapoints(message, *timestamp)
+            } else {
+                crate::state::emf::suppressed_datapoints(message, *timestamp, &input.log_group_name)
+            };
+            let remaining = crate::state::emf::MAX_DATAPOINTS_PER_EVENT
+                .saturating_sub(declared.len());
+            extracted.extend(declared);
+            extracted.extend(metric_filters.datapoints(message, *timestamp, remaining));
+        }
         crate::state::emf::publish(&*self.engine, &extracted);
 
         Ok(PutLogEventsOutput {

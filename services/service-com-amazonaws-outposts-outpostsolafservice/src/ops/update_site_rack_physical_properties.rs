@@ -8,6 +8,13 @@
 //! value it had. The answer is the site as it now stands, so it is exactly what `GetSite`
 //! and `ListSites` report afterwards.
 //!
+//! The change waits for an order in progress at the site, which this operation's
+//! contract states (see the modelled sentence below): while an order placed at the site
+//! is still outstanding the request is refused `ConflictException` (409) naming that
+//! order, and nothing is written. What holds the change up is read through
+//! [`crate::state::ComAmazonawsOutpostsOutpostsolafserviceState::site_order_hold`], the
+//! same place `UpdateSiteAddress` reads it, so the two cannot disagree about it.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -227,6 +234,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .to_string();
 
         let mut store = state.lock();
+        // Whether an order is still in progress depends on the status it holds NOW,
+        // and an order moves on the clock, so the transition that was already due at
+        // this instant is materialised before the statuses are read.
+        store.settle_orders();
+        // An identifier that names no site is answered before anything about that
+        // site's orders is read.
+        if store.site(&region, &site_id).is_none() {
+            return Err(not_found().into());
+        }
+        // What holds this change up, read before the mutable borrow below: an order
+        // placed at the site that is still in progress. Nothing is written in that
+        // case — the stored rack properties are left exactly as they were.
+        if let Some(hold) = store.site_order_hold(&region, &site_id) {
+            let (resource_type, resource_id) = match hold.resource {
+                Some((resource_type, resource_id)) => {
+                    (Some(resource_type.to_string()), Some(resource_id))
+                }
+                None => (None, None),
+            };
+            return Err(UpdateSiteRackPhysicalPropertiesErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(crate::state::site_rack_properties_order_conflict(
+                        &site_id,
+                        &hold.order,
+                    )),
+                    resource_id,
+                    resource_type,
+                },
+            )
+            .into());
+        }
         let record = store.site_mut(&region, &site_id).ok_or_else(not_found)?;
         // A site created without rack properties at all gains the structure as soon
         // as this call sets its first property, so a property set only here is

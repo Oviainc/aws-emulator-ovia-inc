@@ -40,6 +40,10 @@ emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
+# The CloudWatch metric store an ingested log event publishes into, so a test can read
+# back the datapoints this service's metric filters extracted. Already a dependency of
+# `src/`; an integration test reaches it only through this list.
+service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
 
 [lints]
 workspace = true

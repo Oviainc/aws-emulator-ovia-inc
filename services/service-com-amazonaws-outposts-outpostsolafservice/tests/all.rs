@@ -111,6 +111,8 @@ mod site_and_outpost_lifecycle;
 mod site_and_outpost_projection;
 #[path = "all/site_delete_refusal.rs"]
 mod site_delete_refusal;
+#[path = "all/site_rack_properties_order_hold.rs"]
+mod site_rack_properties_order_hold;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/supported_instance_types.rs"]
