@@ -303,12 +303,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Tags supplied at open time go into the one authoritative tag store, so
         // `ListTagsForResource` and `DescribeTunnel` report exactly what was set here.
-        if let Some(tags) = input.tags.as_ref() {
-            let stored = store.tags.entry(tunnel_arn.clone()).or_default();
-            for tag in tags {
-                stored.insert(tag.key.clone(), tag.value.clone());
-            }
-        }
+        // The "did this change the set" answer is of no use on this path: the record
+        // below is new and already carries `last_updated_at: now`, so there is no
+        // earlier stamp for these tags to update.
+        store.put_tags(&tunnel_arn, input.tags.as_deref().unwrap_or(&[]));
         // The record is a resource of the Region whose endpoint opened it, so it
         // is stored under that Region and is reachable through no other.
         store.insert_tunnel(&region, tunnel);

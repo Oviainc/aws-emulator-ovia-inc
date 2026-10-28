@@ -1,23 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPolicyGenerations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPolicyGenerations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! The one thing it DOES assert is its refusal: a `principalArn` outside the model's
-//! `@pattern`, or a `maxResults` below the model's `@range` minimum, is answered with this
-//! service's MODELLED `ValidationException` (400) — `message` plus the `@required`
-//! `reason` and a `fieldList` naming the member — because the framework's pre-handler
-//! refusal is worded as a bare code and message and cannot carry a modelled member. A
-//! well-formed request keeps the 501: nothing in this service records a policy generation
-//! yet, so there is no state to list.
+//! Lists the policy generations `StartPolicyGeneration` recorded, projected from those
+//! job records at one instant — optionally narrowed to one `principalArn` — and paged
+//! over the stored order of their `jobId`s.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPolicyGenerations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Its refusal is modelled too: a `principalArn` outside the model's `@pattern`, or a
+//! `maxResults` below the model's `@range` minimum, is answered with this service's
+//! MODELLED `ValidationException` (400) — `message` plus the `@required` `reason` and a
+//! `fieldList` naming the member — because the framework's pre-handler refusal is worded
+//! as a bare code and message and cannot carry a modelled member.
 //!
 //! ## Shape of an operation
 //!
@@ -260,9 +253,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (ctx, &self.engine);
+        let _ = ctx;
 
         // The modelled constraints this operation owns (see `ConstrainedInput`): a value
         // outside one is refused with the MODELLED `ValidationException`, which carries
@@ -282,11 +273,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The listing itself is NOT implemented: no operation in this service records a
-        // policy generation yet (`StartPolicyGeneration` is still scaffolded), so there is
-        // no state to project and an empty page would assert something this emulator does
-        // not know. A well-formed request therefore keeps the scaffold's 501 — "nobody has
-        // written this yet" — while a malformed one gets the modelled 400 above.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPolicyGenerations"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListPolicyGenerationsErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+        })?;
+        let state = state.lock();
+
+        // One instant for the whole page, so every job on it is projected as of the same
+        // clock reading rather than a slightly different one each.
+        let now = ::std::time::SystemTime::now();
+        // "Lists all of the policy generations requested in the last seven days", and
+        // "use this with ListGeneratedPolicies to filter the results to only include
+        // results for a specific principal": the window and the principal are what select
+        // the jobs, and the stored `jobId` order is what pages them.
+        let matching: Vec<(String, PolicyGeneration)> = state
+            .policy_generations
+            .iter()
+            .filter(|(_, job)| job.is_within_retention(now))
+            .filter(|(_, job)| {
+                input
+                    .principal_arn
+                    .as_deref()
+                    .is_none_or(|principal_arn| job.principal_arn == principal_arn)
+            })
+            .map(|(job_id, job)| (job_id.clone(), job.summary_at(now)))
+            .collect();
+
+        let page = crate::state::page(matching, input.max_results, input.next_token.as_deref())
+            .map_err(|error| {
+                ListPolicyGenerationsErrorModeled::ValidationException(
+                    crate::state::page_validation_exception(&error),
+                )
+            })?;
+
+        Ok(ListPolicyGenerationsOutput {
+            policy_generations: page.items,
+            next_token: page.next_token,
+        })
     }
 }
