@@ -997,7 +997,7 @@ fn page(
     let resume_at = match input.next_token.as_deref() {
         None | Some("") => 0,
         Some(token) => decode_token(input, token)
-            .ok_or_else(|| invalid(format!("nextToken {token} is not a valid token")))?,
+            .ok_or_else(|| invalid(crate::state::invalid_next_token_message()))?,
     };
     let total: usize = series.iter().map(|one| one.values.len()).sum();
 

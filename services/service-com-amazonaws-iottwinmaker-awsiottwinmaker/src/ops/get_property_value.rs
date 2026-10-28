@@ -699,7 +699,7 @@ fn latest_values_response(
         None | Some("") => None,
         Some(token) => Some(
             decode_value_token(input, token)
-                .ok_or_else(|| invalid(format!("nextToken {token} is not a valid token")))?,
+                .ok_or_else(|| invalid(crate::state::invalid_next_token_message()))?,
         ),
     };
     let mut remaining = selected.iter().skip_while(|property_name| {
@@ -993,7 +993,7 @@ fn table_response(
     let resume_at = match input.next_token.as_deref() {
         None | Some("") => 0,
         Some(token) => decode_row_token(input, token)
-            .ok_or_else(|| invalid(format!("nextToken {token} is not a valid token")))?,
+            .ok_or_else(|| invalid(crate::state::invalid_next_token_message()))?,
     };
     let total = rows.len();
     let page: Vec<::std::collections::HashMap<String, DataValue>> = rows

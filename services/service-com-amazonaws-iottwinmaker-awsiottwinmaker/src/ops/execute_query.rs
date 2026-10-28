@@ -251,9 +251,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let resume_at = match input.next_token.as_deref() {
             None | Some("") => 0,
             Some(token) => decode_next_token(token, &input.workspace_id, &input.query_statement)
-                .ok_or_else(|| {
-                    invalid(format!("nextToken {token} is not a valid token for this query"))
-                })?,
+                .ok_or_else(|| invalid(crate::state::invalid_next_token_message()))?,
         };
 
         // "The maximum number of results to return at one time. The default is 50" — the

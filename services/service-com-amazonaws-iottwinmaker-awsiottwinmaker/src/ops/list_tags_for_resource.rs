@@ -201,7 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None | Some("") => None,
             Some(token) => Some(
                 decode_next_token(token, resource_arn)
-                    .ok_or_else(|| invalid(format!("nextToken {token} is not a valid token")))?,
+                    .ok_or_else(|| invalid(crate::state::invalid_next_token_message()))?,
             ),
         };
 

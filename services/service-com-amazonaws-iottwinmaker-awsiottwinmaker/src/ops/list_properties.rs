@@ -237,13 +237,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is refused rather than silently resumed.
         let resume_at = match input.next_token.as_deref() {
             None | Some("") => None,
-            Some(token) => Some(decode_next_token(&input, token).ok_or_else(|| {
-                // The token itself is NOT echoed back: it is opaque to the
-                // caller and modelled up to 17880 characters, so the refusal
-                // names the member and what is wrong with it rather than
-                // copying an arbitrary request string into the response.
-                invalid("nextToken is not a token this listing minted".to_string())
-            })?),
+            Some(token) => Some(
+                decode_next_token(&input, token)
+                    .ok_or_else(|| invalid(crate::state::invalid_next_token_message()))?,
+            ),
         };
 
         // The page size served, under the rule every paginated operation of this

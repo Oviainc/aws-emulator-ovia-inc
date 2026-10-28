@@ -4266,6 +4266,19 @@ pub fn decode_page_token(envelope: &str, scope: &[&str], token: &str) -> Option<
     (!key.is_empty()).then(|| key.to_string())
 }
 
+/// The message for a `nextToken` [`decode_page_token`] does not recognise: the
+/// ONE refusal every paginated operation of this service reports for a token it
+/// did not mint, so the same failure reads the same way whichever page was
+/// asked for.
+///
+/// The token is NOT part of it. A `nextToken` is opaque to the caller and
+/// modelled up to 17880 characters of any bytes, so interpolating it would copy
+/// an arbitrary request string back into a response body; the refusal names the
+/// member and what is wrong with it instead.
+pub fn invalid_next_token_message() -> String {
+    "nextToken is not a token this listing minted".to_string()
+}
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.
