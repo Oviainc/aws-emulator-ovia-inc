@@ -1230,12 +1230,15 @@ impl BenefitApplication {
     }
 
     /// Whether this application carries at least one of `arns` in its associated
-    /// resources. An empty filter matches everything.
+    /// resources.
+    ///
+    /// `arns` are the entries a filter the caller SUPPLIED resolved to (see
+    /// [`supplied_filter`]), so an empty `arns` — a supplied filter naming no resource —
+    /// matches nothing. A filter the caller did not supply is `None` there and this is
+    /// never asked about it.
     pub fn matches_resource_arns(&self, arns: &[String]) -> bool {
-        arns.is_empty()
-            || arns
-                .iter()
-                .any(|wanted| self.associated_resources.contains(wanted))
+        arns.iter()
+            .any(|wanted| self.associated_resources.contains(wanted))
     }
 }
 
@@ -2751,6 +2754,39 @@ pub fn catalog_not_found_message(catalog: Option<&str>) -> String {
 /// A list member, omitted from the wire when nothing was ever stored for it.
 pub fn optional_list<T: Clone>(values: &[T]) -> Option<Vec<T>> {
     (!values.is_empty()).then(|| values.to_vec())
+}
+
+/// The entries a list filter the caller SUPPLIED resolves to through `resolve`, or
+/// `None` when the caller supplied no filter at all.
+///
+/// An absent or empty list selects everything (`None` here), which is what an omitted
+/// list filter means on the wire; a list the caller DID supply selects only the records
+/// matching one of its resolved entries, so entries that resolve to nothing — an
+/// identifier no record of this catalog carries, a member whose optional parts name no
+/// value this listing can compare — narrow the listing to nothing rather than widening
+/// it to everything.
+pub fn supplied_filter<T, R>(
+    wanted: Option<&Vec<T>>,
+    resolve: impl FnMut(&T) -> Option<R>,
+) -> Option<Vec<R>> {
+    wanted.and_then(|wanted| {
+        (!wanted.is_empty()).then(|| wanted.iter().filter_map(resolve).collect())
+    })
+}
+
+/// One filter from two wire members that name the same thing — a member and the
+/// `@deprecated` member it replaced: the union of the entries each supplied, and `None`
+/// only when the caller supplied neither, so a request that supplies either member is
+/// filtered by it.
+pub fn union_filters<R>(left: Option<Vec<R>>, right: Option<Vec<R>>) -> Option<Vec<R>> {
+    match (left, right) {
+        (None, None) => None,
+        (Some(entries), None) | (None, Some(entries)) => Some(entries),
+        (Some(mut left), Some(right)) => {
+            left.extend(right);
+            Some(left)
+        }
+    }
 }
 
 /// Whether `values` carries at least one entry of `filter`. An empty or absent filter

@@ -47,6 +47,8 @@ mod get_benefit;
 mod get_benefit_allocation;
 #[path = "all/idempotent_parameter_mismatch.rs"]
 mod idempotent_parameter_mismatch;
+#[path = "all/list_applications_filter_members.rs"]
+mod list_applications_filter_members;
 #[path = "all/member_refusal_one_construction.rs"]
 mod member_refusal_one_construction;
 #[path = "all/pagination_cursor_issuance.rs"]
