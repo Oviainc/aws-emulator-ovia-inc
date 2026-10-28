@@ -383,6 +383,128 @@ const VALIDATION_EXCEPTION_CODE: &str = "ValidationException";
 /// The HTTP status the model declares for it (`@httpError(400)`).
 const VALIDATION_EXCEPTION_STATUS: u16 = 400;
 
+/// What one document plane's store answered for one fetch: the three outcomes the serving
+/// walk below has an answer for.
+///
+/// The bytes are BORROWED from the store they were read out of, so an authorised fetch
+/// copies a document only when it is written to the response — and a `HEAD`, which carries
+/// no body, copies none.
+enum DocumentOutcome<'store> {
+    /// No receipt this store holds authorises the fetch.
+    Denied,
+    /// The fetch is authorised, and the plane publishes no such document.
+    Absent,
+    /// The fetch is authorised and the document resolved: these bytes, under this type.
+    Served {
+        bytes: &'store [u8],
+        content_type: &'store str,
+    },
+}
+
+/// One of this service's document planes, as the one serving walk needs it.
+///
+/// The walk ([`serve_document`]) is the SAME for both planes, so it is written once; a
+/// plane states only what is its own: which query parameter carries the receipt that
+/// authorises a fetch, which store question authorises and resolves it, how the plane
+/// words a store it cannot reach, and which fields its log line carries. The path parser
+/// stays with the plane that publishes those paths, because that is also what decides
+/// which requests this service claims ([`Service::can_handle`]).
+trait DocumentPlane {
+    /// What this plane's path parser read out of a request path: the document a fetch
+    /// named.
+    type Target;
+
+    /// The query-string parameter the receipt that authorises a fetch of this plane's
+    /// documents travels in.
+    fn token_param(&self) -> &'static str;
+
+    /// What this plane answers when the store it serves from cannot be reached.
+    fn store_unavailable_message(&self) -> &'static str;
+
+    /// Authorise the fetch and resolve the document it named, against the one store.
+    ///
+    /// One step, not two, because the authorisation rule and the lookup are the only
+    /// things that differ between the planes; the ORDER they answer in is the walk's and
+    /// is the same for both.
+    fn resolve<'store>(
+        &self,
+        store: &'store crate::state::ComAmazonawsArtifactArtifactState,
+        target: &Self::Target,
+        token: &str,
+    ) -> DocumentOutcome<'store>;
+
+    /// Record a fetch this plane refused as unauthorised, in the plane's own fields.
+    fn log_denied(&self, target: &Self::Target);
+
+    /// Record a fetch this plane served, in the plane's own fields.
+    fn log_served(&self, target: &Self::Target);
+}
+
+/// The ONE rule both document planes of this service serve a fetch under, so the two
+/// cannot drift apart: the method policy, the store, the receipt the query string carries,
+/// the order authorization and existence answer in, and the hand-off to
+/// [`document_response`] are all decided here, once, for whichever plane is serving.
+///
+/// `target` is what the plane's own path parser read out of the request path, and `None`
+/// for a path that plane publishes no document at — reported as absent, but only after the
+/// method it was asked with, because a method this plane does not serve is refused as the
+/// method it is whatever the path named.
+///
+/// A fetch is a pure READ: it answers the bytes the store holds and writes nothing, so
+/// following one URL twice answers the same document and changes nothing a later caller
+/// sees.
+///
+/// A document is READ, so `GET` carries it and `HEAD` reports its metadata without the
+/// bytes; anything else is refused as the method it is.
+///
+/// DELIBERATE ORDERING: authorization answers first, so a path naming a document this
+/// service does not hold is refused as unauthorised (403) rather than reported as absent —
+/// a document URL is handed to ONE caller, and a 404 here would let anyone probe which ids
+/// exist. Only a path the plane's rule authorises can be answered `404`, for an object that
+/// plane does not publish. A fetch carrying NO token carries no receipt, so the empty token
+/// is what the plane's rule is asked about.
+fn serve_document<Eng, Plane>(
+    engine: &Eng,
+    req: &RtRequest,
+    plane: &Plane,
+    target: Option<Plane::Target>,
+) -> RtResponse
+where
+    Eng: Send + Sync + 'static,
+    Plane: DocumentPlane,
+{
+    if !matches!(req.method(), "GET" | "HEAD") {
+        return method_not_allowed();
+    }
+    let Some(target) = target else {
+        return document_error(404, "NoSuchKey", DOCUMENT_NOT_FOUND_MESSAGE);
+    };
+    let Some(state) = crate::state::service_state(engine) else {
+        return document_error(
+            500,
+            "InternalServerException",
+            plane.store_unavailable_message(),
+        );
+    };
+    let (_, query) = split_uri(req.uri());
+    let store = state.lock();
+    let token = query_param(&query, plane.token_param()).unwrap_or_default();
+    match plane.resolve(&store, &target, &token) {
+        DocumentOutcome::Denied => {
+            plane.log_denied(&target);
+            document_error(403, "AccessDenied", crate::state::INVALID_TOKEN_MESSAGE)
+        }
+        DocumentOutcome::Absent => document_error(404, "NoSuchKey", DOCUMENT_NOT_FOUND_MESSAGE),
+        DocumentOutcome::Served {
+            bytes,
+            content_type,
+        } => {
+            plane.log_served(&target);
+            document_response(bytes, content_type, req.method() == "GET")
+        }
+    }
+}
+
 /// Serves a report or term document from the stored bytes [`crate::state`] holds.
 ///
 /// This is the data plane behind the URL `GetReport` and `GetTermForReport` announce. It
@@ -402,69 +524,13 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for Documents<Eng> {
         _ctx: &'r smithy_server_runtime::OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
-            // The same method policy the export plane answers under: a document is READ,
-            // so `GET` carries it and `HEAD` reports its metadata without the bytes;
-            // anything else is refused as the method it is.
-            if !matches!(req.method(), "GET" | "HEAD") {
-                return method_not_allowed();
-            }
-            let (path, query) = split_uri(req.uri());
-            let Some(wanted) = parse_document_path(&path) else {
-                return document_error(404, "NoSuchKey", DOCUMENT_NOT_FOUND_MESSAGE);
-            };
-            let Some(state) = crate::state::service_state(&*self.engine) else {
-                return document_error(
-                    500,
-                    "InternalServerException",
-                    "the artifact report catalog is unavailable",
-                );
-            };
-            let store = state.lock();
-            // A download is authorised by the SAME rule `GetReport` applies: one rule,
-            // one place. Where the report's acceptance type requires the explicit
-            // acceptance of its term, only a grant covering that term authorises the
-            // fetch — and a fetch carrying NO token carries no grant, so the empty token
-            // is what that rule is asked about.
-            //
-            // DELIBERATE ORDERING: authorization answers first, so a path naming a
-            // report this service does not hold is refused as unauthorised (403) rather
-            // than reported as absent — a document URL is handed to one caller, and a
-            // 404 here would let anyone probe which report ids exist. Only a path this
-            // rule authorises can be answered `404`, for the version or the object the
-            // report does not publish.
-            let token = query_param(&query, crate::state::TERM_TOKEN_PARAM).unwrap_or_default();
-            let authorised = store
-                .reports
-                .get(&wanted.report_id)
-                .is_some_and(|report| store.download_authorised(&token, report));
-            if !authorised {
-                ::tracing::info!(
-                    operation = "GetReportDocument",
-                    report_id = ?wanted.report_id,
-                    report_version = wanted.version,
-                    document_kind = ?wanted.kind,
-                    outcome = "denied",
-                    reason = "no term grant covers this report's term",
-                    "refused a document fetch"
-                );
-                return document_error(403, "AccessDenied", crate::state::INVALID_TOKEN_MESSAGE);
-            }
-            let held = store.document(&wanted.kind, &wanted.report_id, wanted.version);
-            let Some(document) = held.filter(|held| held.object == wanted.object) else {
-                return document_error(404, "NoSuchKey", DOCUMENT_NOT_FOUND_MESSAGE);
-            };
-            ::tracing::info!(
-                operation = "GetReportDocument",
-                report_id = ?wanted.report_id,
-                report_version = wanted.version,
-                document_kind = ?wanted.kind,
-                outcome = "served",
-                "served a document"
-            );
-            document_response(
-                &document.bytes,
-                document.content_type,
-                req.method() == "GET",
+            // Served by the one walk both document planes answer under, over the path
+            // this plane publishes its documents at.
+            serve_document(
+                &*self.engine,
+                req,
+                &ReportDocumentPlane,
+                parse_document_path(&split_uri(req.uri()).0),
             )
         })
     }
@@ -485,6 +551,79 @@ struct WantedDocument {
     report_id: String,
     version: i64,
     object: String,
+}
+
+/// The report/term plane of [`serve_document`]: what is this plane's own about serving a
+/// report or term document.
+///
+/// A download is authorised by the SAME rule `GetReport` applies, from the one place that
+/// rule lives (`crate::state::ComAmazonawsArtifactArtifactState::download_authorised`):
+/// where the report's acceptance type requires the explicit acceptance of its term, only a
+/// grant covering that term authorises the fetch. A path this rule authorises is then
+/// answered for the version and the object the report publishes, and no others.
+///
+/// Carries nothing: the document a fetch names travels as the walk's target, so one
+/// instance serves every caller.
+struct ReportDocumentPlane;
+
+impl DocumentPlane for ReportDocumentPlane {
+    type Target = WantedDocument;
+
+    fn token_param(&self) -> &'static str {
+        crate::state::TERM_TOKEN_PARAM
+    }
+
+    fn store_unavailable_message(&self) -> &'static str {
+        "the artifact report catalog is unavailable"
+    }
+
+    fn resolve<'store>(
+        &self,
+        store: &'store crate::state::ComAmazonawsArtifactArtifactState,
+        target: &WantedDocument,
+        token: &str,
+    ) -> DocumentOutcome<'store> {
+        let authorised = store
+            .reports
+            .get(&target.report_id)
+            .is_some_and(|report| store.download_authorised(token, report));
+        if !authorised {
+            return DocumentOutcome::Denied;
+        }
+        match store
+            .document(&target.kind, &target.report_id, target.version)
+            .filter(|held| held.object == target.object)
+        {
+            Some(document) => DocumentOutcome::Served {
+                bytes: &document.bytes,
+                content_type: document.content_type,
+            },
+            None => DocumentOutcome::Absent,
+        }
+    }
+
+    fn log_denied(&self, target: &WantedDocument) {
+        ::tracing::info!(
+            operation = "GetReportDocument",
+            report_id = ?target.report_id,
+            report_version = target.version,
+            document_kind = ?target.kind,
+            outcome = "denied",
+            reason = "no term grant covers this report's term",
+            "refused a document fetch"
+        );
+    }
+
+    fn log_served(&self, target: &WantedDocument) {
+        ::tracing::info!(
+            operation = "GetReportDocument",
+            report_id = ?target.report_id,
+            report_version = target.version,
+            document_kind = ?target.kind,
+            outcome = "served",
+            "served a document"
+        );
+    }
 }
 
 /// The document a data-plane path names, or `None` when the path is not one this service
@@ -916,7 +1055,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // construction — the path is not in the model — so this is where an export's
         // presigned URL is served. Anything else keeps the framework's default.
         let target = crate::state::parse_export_document_path(&split_uri(req.uri()).0)?;
-        Some(self.serve_export_document(req, &target))
+        Some(self.serve_export_document(req, target))
     }
 
     fn override_framework_error(
@@ -935,63 +1074,76 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
-    /// Serve one request to a published export-document URL.
-    ///
-    /// A download is a pure READ: it answers the bytes the export stored and writes
-    /// nothing, so following a presigned URL twice answers the same document and changes
-    /// nothing a later caller sees.
-    ///
-    /// The fetch is authorised by the token the announced URL carries, by the one rule
-    /// `crate::state` holds the export-download question in
-    /// ([`crate::state::ComAmazonawsArtifactArtifactState::export_download_authorised`]),
-    /// as a report download is authorised by its term grant's: the URL was handed to one
-    /// caller, and the token is what that caller holds. A fetch carrying NO token carries
-    /// no receipt, so the empty token is what that rule is asked about.
-    ///
-    /// DELIBERATE ORDERING, the same the report plane answers under: authorization first,
-    /// so a path naming an export this store does not hold — one it never minted, one it
-    /// has since released, or a path crossing one export's id with another inquiry's — is
-    /// refused as unauthorised (403) rather than reported as absent, because the ids the
-    /// path carries are minted from counters and a 404 here would let anyone enumerate
-    /// which exports exist. Only a path this rule authorises can be answered `404`, for an
-    /// object the export does not publish.
+    /// Serve one request to a published export-document URL, through the one walk both
+    /// document planes of this service answer under ([`serve_document`]).
     fn serve_export_document(
         &self,
         req: &RtRequest,
-        target: &crate::state::ExportDocumentTarget,
+        target: crate::state::ExportDocumentTarget,
     ) -> RtResponse {
-        if !matches!(req.method(), "GET" | "HEAD") {
-            return method_not_allowed();
+        serve_document(&*self.engine, req, &InquiryExportPlane, Some(target))
+    }
+}
+
+/// The inquiry-export plane of [`serve_document`]: what is this plane's own about serving
+/// an exported compliance-inquiry document.
+///
+/// The fetch is authorised by the token the announced URL carries, by the one place that
+/// question lives
+/// ([`crate::state::ComAmazonawsArtifactArtifactState::export_download_authorised`]), as a
+/// report download is authorised by its term grant: the URL was handed to one caller, and
+/// the token is what that caller holds. A path that rule authorises is then answered for
+/// the object the export publishes, and no other.
+///
+/// Carries nothing: the document a fetch names travels as the walk's target, so one
+/// instance serves every caller.
+struct InquiryExportPlane;
+
+impl DocumentPlane for InquiryExportPlane {
+    type Target = crate::state::ExportDocumentTarget;
+
+    fn token_param(&self) -> &'static str {
+        crate::state::INQUIRY_EXPORT_TOKEN_PARAM
+    }
+
+    fn store_unavailable_message(&self) -> &'static str {
+        "the artifact compliance inquiry store is unavailable"
+    }
+
+    fn resolve<'store>(
+        &self,
+        store: &'store crate::state::ComAmazonawsArtifactArtifactState,
+        target: &crate::state::ExportDocumentTarget,
+        token: &str,
+    ) -> DocumentOutcome<'store> {
+        if !store.export_download_authorised(token, target) {
+            return DocumentOutcome::Denied;
         }
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            return document_error(
-                500,
-                "InternalServerException",
-                "the artifact compliance inquiry store is unavailable",
-            );
-        };
-        let (_, query) = split_uri(req.uri());
-        let store = state.lock();
-        let token =
-            query_param(&query, crate::state::INQUIRY_EXPORT_TOKEN_PARAM).unwrap_or_default();
-        if !store.export_download_authorised(&token, target) {
-            ::tracing::info!(
-                operation = "GetComplianceInquiryExportDocument",
-                compliance_inquiry_id = ?target.inquiry_id,
-                export_id = ?target.export_id,
-                outcome = "denied",
-                reason = "no export token authorises this document",
-                "refused a document fetch"
-            );
-            return document_error(403, "AccessDenied", crate::state::INVALID_TOKEN_MESSAGE);
-        }
-        let found = store
+        match store
             .inquiry_exports
             .get(&target.export_id)
-            .filter(|_| target.object == crate::state::INQUIRY_EXPORT_OBJECT);
-        let Some(export) = found else {
-            return document_error(404, "NoSuchKey", DOCUMENT_NOT_FOUND_MESSAGE);
-        };
+            .filter(|_| target.object == crate::state::INQUIRY_EXPORT_OBJECT)
+        {
+            Some(export) => DocumentOutcome::Served {
+                bytes: &export.document,
+                content_type: crate::state::INQUIRY_EXPORT_CONTENT_TYPE,
+            },
+            None => DocumentOutcome::Absent,
+        }
+    }
+
+    fn log_denied(&self, target: &crate::state::ExportDocumentTarget) {
+        ::tracing::info!(
+            operation = "GetComplianceInquiryExportDocument",
+            compliance_inquiry_id = ?target.inquiry_id,
+            export_id = ?target.export_id,
+            outcome = "denied",
+            reason = "no export token authorises this document",
+            "refused a document fetch"
+        );
+    }
+
+    fn log_served(&self, target: &crate::state::ExportDocumentTarget) {
         ::tracing::info!(
             operation = "GetComplianceInquiryExportDocument",
             compliance_inquiry_id = ?target.inquiry_id,
@@ -999,14 +1151,6 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             outcome = "served",
             "served a document"
         );
-
-        // The same serving rule both document planes answer under: a `GET` carries the
-        // bytes and a `HEAD` reports the metadata without them.
-        document_response(
-            &export.document,
-            crate::state::INQUIRY_EXPORT_CONTENT_TYPE,
-            req.method() == "GET",
-        )
     }
 }
 
