@@ -49,8 +49,9 @@ use service_com_amazonaws_licensemanagerusersubscriptions_licensemanagerusersubs
 };
 
 use super::identity_provider_subscriptions::{
-    arn_prefix, as_str, call, encoded_label, harness, list_providers, provider_union, register,
-    send, start_subscription, Harness, Reply, ACCOUNT, PRODUCTS, REGION, SIGNING_NAME,
+    arn_prefix, as_str, call, create_network, encoded_label, harness, list_providers,
+    provider_union, register, send, start_subscription, Harness, Reply, ACCOUNT, ACCOUNT_VPC,
+    PRODUCTS, REGION, SIGNING_NAME,
 };
 
 /// The sentence `DisassociateUser` answers a request that addresses no association
@@ -1551,6 +1552,19 @@ async fn a_request_cannot_buy_unbounded_work_or_state() {
     let subnets = |count: usize| -> Vec<String> {
         (0..count).map(|i| format!("subnet-{i:08x}")).collect()
     };
+
+    // The bound under test is how many subnets one payload may NAME, not whether the
+    // account holds them, so every generated subnet is created in the account's own Amazon
+    // EC2 store first — in the VPC the harness built, the one this registration's settings
+    // already name. `AddSubnets` resolves each id it names against that store, so without
+    // this the accepted rows would be refused for a reason that is not the bound.
+    let generated = subnets(MAX_SUBNETS_PER_UPDATE + 1);
+    create_network(
+        &h.engine,
+        ACCOUNT_VPC,
+        &generated.iter().map(String::as_str).collect::<Vec<_>>(),
+        &[],
+    );
 
     // Each published bound, and one past it, on both lists.
     let rows: [(&str, Value, bool); 4] = [
