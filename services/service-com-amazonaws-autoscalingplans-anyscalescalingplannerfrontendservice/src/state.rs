@@ -570,14 +570,31 @@ fn escape_key_part(part: &str) -> String {
     escaped
 }
 
+/// The parts of an identity key that stands for a SET of values: ordered, and with
+/// repeated entries collapsed to one.
+///
+/// A set is the entries it holds, not how many times each is written, so neither the
+/// ORDER nor the MULTIPLICITY of the entries may reach the rendered key: a request that
+/// repeats an entry names the same set as one that states it once, and so has to render
+/// the same identity. The repeats are collapsed after the ordering, which is what puts
+/// equal entries next to each other.
+fn set_key_parts<Parts: IntoIterator<Item = String>>(parts: Parts) -> Vec<String> {
+    let mut parts: Vec<String> = parts.into_iter().collect();
+    parts.sort();
+    parts.dedup();
+    parts
+}
+
 /// The identity of an `ApplicationSource`, used to enforce "You can create one
 /// scaling plan per application source" (`ApplicationSource` member doc).
 ///
-/// A tag-filter source is identified by the SET of tags it names, so the filters and
-/// each filter's values are ordered before they are rendered — two spellings of one set
-/// are one source — and each of them is escaped, so a tag key or tag value that itself
-/// contains a separator stays distinguishable from the separator (`TagFilter$Key` and
-/// `TagValues`' member admit every character in `\u0020-\uD7FF…`, punctuation included).
+/// A tag-filter source is identified by the SET of tags it names — `TagFilters` is "A
+/// set of tags (up to 50)" and each filter's `Values` are the tag's values — so the
+/// filters and each filter's values reach the key through [`set_key_parts`]: two
+/// spellings of one set, differing in the order or in a repeated entry, are one source.
+/// Each part is escaped, so a tag key or tag value that itself contains a separator
+/// stays distinguishable from the separator (`TagFilter$Key` and `TagValues`' member
+/// admit every character in `\u0020-\uD7FF…`, punctuation included).
 ///
 /// `None` when the source names neither a stack nor a tag filter, so it identifies no
 /// application at all. A source that names BOTH is refused before this is reached —
@@ -592,23 +609,19 @@ pub fn application_source_key(source: &ApplicationSource) -> Option<String> {
     if filters.is_empty() {
         return None;
     }
-    let mut rendered: Vec<String> = filters
-        .iter()
-        .map(|filter| {
-            let key = escape_key_part(filter.key.as_deref().unwrap_or_default());
-            let mut values: Vec<String> = filter
+    let rendered = set_key_parts(filters.iter().map(|filter| {
+        let key = escape_key_part(filter.key.as_deref().unwrap_or_default());
+        let values = set_key_parts(
+            filter
                 .values
                 .as_deref()
                 .unwrap_or_default()
                 .iter()
                 .map(String::as_str)
-                .map(escape_key_part)
-                .collect();
-            values.sort();
-            format!("{key}={}", values.join(","))
-        })
-        .collect();
-    rendered.sort();
+                .map(escape_key_part),
+        );
+        format!("{key}={}", values.join(","))
+    }));
     Some(format!("tags:{}", rendered.join(";")))
 }
 
@@ -1023,9 +1036,11 @@ fn resource_identity(instruction: &ScalingInstruction) -> ResourceIdentity<'_> {
 /// A customized metric's parts are caller-supplied text under no modelled pattern at
 /// all (`MetricNamespace`, `MetricName`, `MetricDimensionName` and
 /// `MetricDimensionValue` are plain strings), so each is escaped on the way into the
-/// key and two different metrics cannot render one identity. The dimensions are a set,
-/// so they are ordered first; a predefined metric type is one part, and one the model
-/// constrains to its own value list.
+/// key and two different metrics cannot render one identity. The dimensions are the set
+/// of dimensions the metric was published with, so they reach the key through
+/// [`set_key_parts`]: a reordered or a repeated dimension is the same set, hence the
+/// same metric. A predefined metric type is one part, and one the model constrains to
+/// its own value list.
 pub fn target_metric_identity(configuration: &TargetTrackingConfiguration) -> Option<String> {
     if let Some(predefined) = &configuration.predefined_scaling_metric_specification {
         return Some(predefined.predefined_scaling_metric_type.clone());
@@ -1033,20 +1048,20 @@ pub fn target_metric_identity(configuration: &TargetTrackingConfiguration) -> Op
     let customized = configuration
         .customized_scaling_metric_specification
         .as_ref()?;
-    let mut dimensions: Vec<String> = customized
-        .dimensions
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .map(|dimension| {
-            format!(
-                "{}={}",
-                escape_key_part(&dimension.name),
-                escape_key_part(&dimension.value)
-            )
-        })
-        .collect();
-    dimensions.sort();
+    let dimensions = set_key_parts(
+        customized
+            .dimensions
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|dimension| {
+                format!(
+                    "{}={}",
+                    escape_key_part(&dimension.name),
+                    escape_key_part(&dimension.value)
+                )
+            }),
+    );
     Some(format!(
         "{}/{}/{}[{}]",
         escape_key_part(&customized.namespace),

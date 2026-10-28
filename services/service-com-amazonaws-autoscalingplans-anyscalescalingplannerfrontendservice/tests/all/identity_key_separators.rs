@@ -36,7 +36,10 @@ const OWNER: &str = "plan-a";
 const CHALLENGER: &str = "plan-b";
 
 /// The refusal wording of the one-plan-per-application-source rule.
-fn covered_message(covered_by: &str) -> String {
+///
+/// `pub(crate)` so a suite about another way of re-spelling one identity words this
+/// refusal the same way rather than keeping a second copy of it.
+pub(crate) fn covered_message(covered_by: &str) -> String {
     format!("The application source is already covered by the scaling plan '{covered_by}'")
 }
 
@@ -102,7 +105,7 @@ fn source_pairs() -> Vec<(String, Value, Value)> {
 }
 
 /// Create one plan over `source`, require HTTP 200, and settle it to `Active`.
-async fn create_active_plan(emulator: &Emulator, name: &str, source: &Value) {
+pub(crate) async fn create_active_plan(emulator: &Emulator, name: &str, source: &Value) {
     emulator
         .ok(
             "CreateScalingPlan",
@@ -117,7 +120,7 @@ async fn create_active_plan(emulator: &Emulator, name: &str, source: &Value) {
 }
 
 /// The one stored plan under `name`, as `DescribeScalingPlans` projects it.
-async fn describe_one(emulator: &Emulator, name: &str) -> Value {
+pub(crate) async fn describe_one(emulator: &Emulator, name: &str) -> Value {
     let described = emulator
         .ok(
             "DescribeScalingPlans",
@@ -128,7 +131,7 @@ async fn describe_one(emulator: &Emulator, name: &str) -> Value {
 }
 
 /// The names of the plans `DescribeScalingPlans` reports for one application source.
-async fn names_covering(emulator: &Emulator, source: &Value) -> Vec<String> {
+pub(crate) async fn names_covering(emulator: &Emulator, source: &Value) -> Vec<String> {
     let described = emulator
         .ok(
             "DescribeScalingPlans",
@@ -293,7 +296,7 @@ async fn one_source_spelled_two_ways_is_still_one_source() {
 /// The resource triple is drawn from the model's own value lists, as
 /// [`crate::scaling_plan_lifecycle::instruction`] draws it; only the configurations
 /// vary here.
-fn instruction_tracking(configurations: Vec<Value>) -> Value {
+pub(crate) fn instruction_tracking(configurations: Vec<Value>) -> Value {
     json!({
         "ServiceNamespace": "autoscaling",
         "ResourceId": "autoScalingGroup/my-asg",
@@ -309,7 +312,7 @@ fn instruction_tracking(configurations: Vec<Value>) -> Value {
 /// `Statistic` is a modelled `MetricStatistic` value
 /// (`smithy_query(query="shape",shape="MetricStatistic")`, mirrored as
 /// `METRIC_STATISTIC_VALUES`); `dimensions` is `(name, value)` pairs.
-fn customized_metric(
+pub(crate) fn customized_metric(
     namespace: &str,
     metric_name: &str,
     dimensions: &[(&str, &str)],
