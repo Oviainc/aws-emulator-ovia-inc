@@ -191,15 +191,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "a key:value pair": one value per key, so a tag whose key is already on the
-        // resource replaces that key's value rather than being added beside it. The
-        // merge is computed first and committed below.
-        let mut merged = tags.clone();
-        for tag in input.tags {
-            match merged.iter_mut().find(|stored| stored.key == tag.key) {
-                Some(stored) => stored.value = tag.value,
-                None => merged.push(tag),
-            }
-        }
+        // resource replaces that key's value rather than being added beside it — the
+        // same merge every writer of a tag set applies (see
+        // [`crate::state::merge_tags`]). The merge is computed first and committed
+        // below.
+        let merged = crate::state::merge_tags(tags, input.tags);
         if merged.len() > crate::state::MAX_TAGS_PER_RESOURCE {
             let count = merged.len();
             return Err(bad_request(&format!(

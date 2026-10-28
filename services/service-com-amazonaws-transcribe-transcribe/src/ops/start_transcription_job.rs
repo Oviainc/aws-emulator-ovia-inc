@@ -642,7 +642,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             completion_time: None,
             queued_until: lifecycle.queued_until,
             completion_due: lifecycle.completion_due,
-            tags: input.tags.unwrap_or_default(),
+            // One value per key, as every writer of a tag set stores it (see
+            // [`crate::state::created_tag_set`]).
+            tags: crate::state::created_tag_set(input.tags),
         };
 
         // The response is the record just stored, never the request echoed back.

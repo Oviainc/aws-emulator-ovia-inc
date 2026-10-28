@@ -109,6 +109,8 @@ mod service_claim;
 mod settings_co_requirements;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_key_uniqueness.rs"]
+mod tag_key_uniqueness;
 #[path = "all/tag_set_dispatch.rs"]
 mod tag_set_dispatch;
 #[path = "all/tagging_arn_qualifiers.rs"]

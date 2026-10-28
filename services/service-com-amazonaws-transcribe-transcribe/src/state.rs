@@ -26,7 +26,10 @@
 //! Several operations read each record, so
 //! the projections are single-homed here rather than copied into each handler; the
 //! three tagging operations reach every family's tag set through one lookup
-//! ([`ComAmazonawsTranscribeTranscribeState::tags_mut`]).
+//! ([`ComAmazonawsTranscribeTranscribeState::tags_mut`]), and every operation that
+//! WRITES one — `TagResource` and each create/start whose input carries `Tags` — writes
+//! it through one merge ([`merge_tags`]), so a key holds one value whichever path stored
+//! it.
 //!
 //! EVERY family is REGION-SCOPED ([`RegionalStore`]): Amazon Transcribe is a regional
 //! service, so a record belongs to the one Region whose endpoint created it and every
@@ -1375,6 +1378,42 @@ pub fn reserved_tag_key_refusal(tags: &[Tag]) -> Option<String> {
          try your request again.",
         key = key.key,
     ))
+}
+
+/// One write of `requested` onto the tag set `stored`, as the set the resource then
+/// holds.
+///
+/// A tag is "metadata, in the form of a key:value pair" (`Tag`'s own model doc) and a
+/// resource's tags are keyed by that key: a resource holds AT MOST ONE value for a key,
+/// so a write replaces the value of a key already on the resource rather than adding a
+/// second entry beside it, and a request that names one key more than once leaves the
+/// LAST value it gave for that key. Keys are compared exactly, because a tag key is
+/// case-sensitive: `Env` and `env` are two keys.
+///
+/// One helper for EVERY writer of a tag set — `TagResource` and each create/start whose
+/// input carries `Tags` — so no path can store a key twice and leave two readers of the
+/// record disagreeing about which of the two values is in force. What is already stored
+/// keeps its order and a key new to the resource is appended, so the set reads back in
+/// the order its keys were first written.
+pub fn merge_tags(stored: &[Tag], requested: impl IntoIterator<Item = Tag>) -> Vec<Tag> {
+    let mut merged = stored.to_vec();
+    for tag in requested {
+        match merged.iter_mut().find(|held| held.key == tag.key) {
+            Some(held) => held.value = tag.value,
+            None => merged.push(tag),
+        }
+    }
+    merged
+}
+
+/// The tag set a create or start stores for the record it establishes, from its
+/// request's optional `Tags`.
+///
+/// [`merge_tags`] onto a resource that holds no tag yet: a repeated key is collapsed to
+/// its last value, exactly as a later `TagResource` write of the same list would
+/// collapse it, and a request carrying no `Tags` at all establishes an empty set.
+pub fn created_tag_set(requested: Option<Vec<Tag>>) -> Vec<Tag> {
+    merge_tags(&[], requested.unwrap_or_default())
 }
 
 /// One resource family's store, Region by Region.

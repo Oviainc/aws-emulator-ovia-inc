@@ -283,7 +283,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // created, so both instants are the creation one until an update rewrites
             // the rules.
             last_update_time: now,
-            tags: input.tags.unwrap_or_default(),
+            // One value per key, as every writer of a tag set stores it (see
+            // [`crate::state::created_tag_set`]).
+            tags: crate::state::created_tag_set(input.tags),
         };
 
         // The response is the record just stored, never the request echoed back.
