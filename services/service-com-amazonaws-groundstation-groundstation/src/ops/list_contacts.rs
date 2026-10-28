@@ -153,6 +153,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         /// issued is not accepted here.
         const LISTING: &str = "contacts";
 
+        /// Where one answered contact sits in this listing's order, which is what its
+        /// page token names: the contacts the store holds first, by contact id, then the
+        /// windows an availability search computed, by start time. Only an offered window
+        /// carries no `contactId` (nothing has reserved it), so the record itself says
+        /// which part of the sequence it belongs to.
+        fn page_key(contact: &ContactData) -> crate::state::PageCursor {
+            match contact.contact_id.as_deref() {
+                Some(contact_id) => stored_key(contact_id),
+                None => window_key(contact.start_time),
+            }
+        }
+
+        /// Where the stored contact `contact_id` sits in that order.
+        fn stored_key(contact_id: &str) -> crate::state::PageCursor {
+            crate::state::PageCursor::new(vec![
+                crate::state::CursorField::Number(0),
+                crate::state::CursorField::text(contact_id),
+            ])
+        }
+
+        /// Where the offered window starting at `start_time` sits in that order.
+        fn window_key(start_time: Option<::aws_smithy_types::DateTime>) -> crate::state::PageCursor {
+            crate::state::PageCursor::new(vec![
+                crate::state::CursorField::Number(1),
+                crate::state::CursorField::optional_instant(start_time),
+            ])
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListContactsErrorModeled::DependencyException(DependencyException {
                 message: Some("this service's state store is unavailable".to_string()),
@@ -207,9 +235,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // An offset counts within the FILTERED sequence, so the filters are part of the
-        // scope its token is issued under: resuming with a different status list,
-        // window or filter is refused rather than landing at an offset into a different
+        // A page boundary counts within the FILTERED sequence, so the filters are part of
+        // the scope its token is issued under: resuming with a different status list,
+        // window or filter is refused rather than landing inside a different
         // sequence. The status list is sorted first, so naming the same statuses in
         // another order is the same scope.
         let mut statuses = input.status_list.clone();
@@ -227,22 +255,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ],
         );
 
-        let offset = match input.next_token.as_deref() {
-            None => 0,
-            Some(token) => crate::state::decode_page_token(&scope, token).ok_or_else(|| {
-                ListContactsErrorModeled::InvalidParameterException(InvalidParameterException {
-                    message: Some(
-                        "nextToken was not issued by a previous ListContacts call with these \
-                         filters"
-                            .to_string(),
-                    ),
-                    parameter_name: Some("nextToken".to_string()),
-                })
-            })?,
+        let after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_page_token(&scope, token).ok_or_else(
+                || {
+                    ListContactsErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(
+                                "nextToken was not issued by a previous ListContacts call with \
+                                 these filters"
+                                    .to_string(),
+                            ),
+                            parameter_name: Some("nextToken".to_string()),
+                        },
+                    )
+                },
+            )?),
         };
 
         let window_start = input.start_time.as_secs_f64();
         let window_end = input.end_time.as_secs_f64();
+
+        // How many records of the order this answer can still reach: the page the request
+        // asked for ([`crate::state::page_size`], itself bounded by the modelled maximum),
+        // and one more, which is what tells the answer that a `nextToken` is owed. Nothing
+        // further down the order is built, so the work one request costs is bounded by the
+        // page it asked for rather than by the span its window names.
+        let reachable = crate::state::page_size(input.max_results).saturating_add(1);
 
         let mut guard = state.lock();
         // Apply every status move the clock already owes a contact — the scheduler's
@@ -262,13 +301,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The contacts the store holds, ordered by contact id: a page boundary is only
         // stable over a stable order. The windows an availability search computes are
-        // appended after them, in start-time order, so the whole sequence a token offsets
-        // into is stable too.
+        // appended after them, in start-time order, so the whole sequence runs in one
+        // order a boundary can be named in (`page_key`).
+        //
+        // Only the stretch of that order this answer can still reach is MATERIALISED: the
+        // records ordered after the boundary the token carries, and one more than the page
+        // holds (`reachable`), which is all that is needed to tell that more remain. So
+        // what one request costs is bounded by the page it asked for, not by how much of
+        // the store or of the clock its filters span.
         let mut ids: Vec<&String> = guard.contacts.keys().collect();
         ids.sort();
         let mut items: Vec<ContactData> = ids
             .into_iter()
             .filter_map(|id| guard.contacts.get(id))
+            .filter(|contact| {
+                after
+                    .as_ref()
+                    .is_none_or(|after| stored_key(&contact.contact_id) > *after)
+            })
             .filter(|contact| input.status_list.contains(&contact.contact_status))
             // A contact is in the window when its own window overlaps it — the one
             // reading of "these two windows collide" this service has
@@ -330,6 +380,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ephemeris: None,
                 version: Some(contact.version()),
             })
+            .take(reachable)
             .collect();
 
         // `AVAILABLE` is not a status any contact in this store holds — it is a window the
@@ -364,10 +415,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.ground_station.as_deref(),
                 input.satellite_arn.as_deref(),
             ) {
-                // The sequence of windows a search resolves is the same for every page of
-                // it (`available_contact_windows` is bounded by constants, not by what the
-                // request asks for), so the offset a token carries addresses the same
-                // window on every call.
+                // The windows a search resolves are recomputed on every call, from the
+                // clock and from the contacts held now, so one of them can be gone by the
+                // next page — reserved (which is the discovery-then-reserve loop this
+                // exists to serve) or ended. The boundary a token carries is therefore the
+                // last window the page returned, not a count of the ones before it, and
+                // the next page is the windows ordered after it (`page_key`).
+                //
+                // What this search COSTS is bounded by CONSTANTS rather than by the span
+                // the request names: it reads at most
+                // `crate::state::MAX_POINTING_POINTS_READ` pointing points and answers at
+                // most `crate::state::MAX_OFFERED_WINDOWS` passes, whatever window it is
+                // asked about (`crate::state::pointing_passes`), and of those only the
+                // `reachable` stretch below becomes a record. So a window spanning
+                // centuries costs no more than one spanning a day.
                 let offered = guard.available_contact_windows(
                     satellite_arn,
                     ground_station,
@@ -390,7 +451,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let region = crate::state::request_region(ctx.parts());
                 let pre_pass = i64::from(profile.contact_pre_pass_duration_seconds.unwrap_or(0));
                 let post_pass = i64::from(profile.contact_post_pass_duration_seconds.unwrap_or(0));
-                for pass in offered {
+                // The same bound as the stored half, on the same order: only the windows
+                // ordered after the boundary become records, and no more of them than the
+                // page this answer can carry plus one.
+                let reaching = offered
+                    .into_iter()
+                    .filter(|pass| {
+                        after
+                            .as_ref()
+                            .is_none_or(|after| window_key(Some(pass.start_time)) > *after)
+                    })
+                    .take(reachable.saturating_sub(items.len()));
+                for pass in reaching {
                     items.push(ContactData {
                         contact_id: None,
                         mission_profile_arn: Some(profile.mission_profile_arn.clone()),
@@ -429,7 +501,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let (page, next_token) = crate::state::paginate(&scope, &items, input.max_results, offset);
+        let (page, next_token) = crate::state::paginate(
+            &scope,
+            &items,
+            input.max_results,
+            after.as_ref(),
+            page_key,
+        );
 
         Ok(ListContactsOutput {
             next_token,

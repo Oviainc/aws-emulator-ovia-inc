@@ -181,18 +181,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
-        let offset = match input.next_token.as_deref() {
-            None => 0,
-            Some(token) => crate::state::decode_page_token(LISTING, token).ok_or_else(|| {
-                ListSatellitesErrorModeled::InvalidParameterException(InvalidParameterException {
-                    message: Some(
-                        "nextToken was not issued by a previous ListSatellites call".to_string(),
-                    ),
-                    parameter_name: Some("nextToken".to_string()),
-                })
-            })?,
+        let after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_page_token(LISTING, token).ok_or_else(
+                || {
+                    ListSatellitesErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(
+                                "nextToken was not issued by a previous ListSatellites call"
+                                    .to_string(),
+                            ),
+                            parameter_name: Some("nextToken".to_string()),
+                        },
+                    )
+                },
+            )?),
         };
-        let (page, next_token) = crate::state::paginate(LISTING, &items, input.max_results, offset);
+        // The boundary a token carries is the record the page ended on, in the order above
+        // — the catalogue number, then the `satelliteId` beside it — so an on-boarding
+        // removed between two pages does not move the next page past a satellite the walk
+        // has not seen.
+        let (page, next_token) = crate::state::paginate(
+            LISTING,
+            &items,
+            input.max_results,
+            after.as_ref(),
+            |satellite| {
+                crate::state::PageCursor::new(vec![
+                    crate::state::CursorField::Number(i64::from(satellite.norad_satellite_id)),
+                    crate::state::CursorField::optional_text(satellite.satellite_id.as_deref()),
+                ])
+            },
+        );
 
         Ok(ListSatellitesOutput {
             next_token,

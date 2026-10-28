@@ -166,18 +166,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
-        let offset = match input.next_token.as_deref() {
-            None => 0,
-            Some(token) => crate::state::decode_page_token(LISTING, token).ok_or_else(|| {
-                ListConfigsErrorModeled::InvalidParameterException(InvalidParameterException {
-                    message: Some(
-                        "nextToken was not issued by a previous ListConfigs call".to_string(),
-                    ),
-                    parameter_name: Some("nextToken".to_string()),
-                })
-            })?,
+        let after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_page_token(LISTING, token).ok_or_else(
+                || {
+                    ListConfigsErrorModeled::InvalidParameterException(InvalidParameterException {
+                        message: Some(
+                            "nextToken was not issued by a previous ListConfigs call".to_string(),
+                        ),
+                        parameter_name: Some("nextToken".to_string()),
+                    })
+                },
+            )?),
         };
-        let (page, next_token) = crate::state::paginate(LISTING, &items, input.max_results, offset);
+        // The boundary a token carries is the config the page ended on, by the
+        // `(configType, configId)` pair the order is taken on, so a config deleted between
+        // two pages does not move the next page past one the walk has not seen.
+        let (page, next_token) = crate::state::paginate(
+            LISTING,
+            &items,
+            input.max_results,
+            after.as_ref(),
+            |config| {
+                crate::state::PageCursor::new(vec![
+                    crate::state::CursorField::optional_text(config.config_type.as_deref()),
+                    crate::state::CursorField::optional_text(config.config_id.as_deref()),
+                ])
+            },
+        );
 
         Ok(ListConfigsOutput {
             next_token,

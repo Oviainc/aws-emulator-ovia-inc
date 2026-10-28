@@ -169,26 +169,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // An offset counts within the FILTERED sequence, so the satellite filter is part
-        // of the scope its token is issued under: resuming with a different satellite (or
-        // with none) is refused rather than landing at an offset into a different
+        // A page boundary counts within the FILTERED sequence, so the satellite filter is
+        // part of the scope its token is issued under: resuming with a different satellite
+        // (or with none) is refused rather than landing inside a different
         // sequence, which would skip or repeat ground stations.
         let satellite_filter = input.satellite_id.clone().unwrap_or_default();
         let scope = crate::state::page_scope(LISTING, ::std::slice::from_ref(&satellite_filter));
-        let offset = match input.next_token.as_deref() {
-            None => 0,
-            Some(token) => crate::state::decode_page_token(&scope, token).ok_or_else(|| {
-                ListGroundStationsErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(
-                            "nextToken was not issued by a previous ListGroundStations call with \
-                             these filters"
-                                .to_string(),
-                        ),
-                        parameter_name: Some("nextToken".to_string()),
-                    },
-                )
-            })?,
+        let after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_page_token(&scope, token).ok_or_else(
+                || {
+                    ListGroundStationsErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(
+                                "nextToken was not issued by a previous ListGroundStations call \
+                                 with these filters"
+                                    .to_string(),
+                            ),
+                            parameter_name: Some("nextToken".to_string()),
+                        },
+                    )
+                },
+            )?),
         };
 
         // A ground station's Region is the Region the request addressed: these are the
@@ -229,7 +231,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
-        let (page, next_token) = crate::state::paginate(&scope, &items, input.max_results, offset);
+        // The boundary a token carries is the station the page ended on, by the name the
+        // order is taken on, so a station this account is no longer served by does not
+        // move the next page past one the walk has not seen.
+        let (page, next_token) = crate::state::paginate(
+            &scope,
+            &items,
+            input.max_results,
+            after.as_ref(),
+            |station| crate::state::PageCursor::optional_text(station.ground_station_id.as_deref()),
+        );
 
         Ok(ListGroundStationsOutput {
             next_token,

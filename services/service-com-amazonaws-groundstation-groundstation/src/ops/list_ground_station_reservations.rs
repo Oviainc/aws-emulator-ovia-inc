@@ -196,9 +196,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::validate_search_window(input.start_time, input.end_time)
             .map_err(ListGroundStationReservationsErrorModeled::InvalidParameterException)?;
 
-        // An offset counts within the FILTERED sequence, so the ground station, the window
-        // and the type filter are part of the scope its token is issued under: resuming
-        // with any of them changed is refused rather than landing at an offset into a
+        // A page boundary counts within the FILTERED sequence, so the ground station, the
+        // window and the type filter are part of the scope its token is issued under:
+        // resuming with any of them changed is refused rather than landing inside a
         // different sequence. The types are sorted first, so naming the same types in
         // another order is the same scope.
         let mut types: Vec<String> = input.reservation_types.clone().unwrap_or_default();
@@ -213,20 +213,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ],
         );
 
-        let offset = match input.next_token.as_deref() {
-            None => 0,
-            Some(token) => crate::state::decode_page_token(&scope, token).ok_or_else(|| {
-                ListGroundStationReservationsErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(
-                            "nextToken was not issued by a previous \
-                             ListGroundStationReservations call with these filters"
-                                .to_string(),
-                        ),
-                        parameter_name: Some("nextToken".to_string()),
-                    },
-                )
-            })?,
+        let after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_page_token(&scope, token).ok_or_else(
+                || {
+                    ListGroundStationReservationsErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(
+                                "nextToken was not issued by a previous \
+                                 ListGroundStationReservations call with these filters"
+                                    .to_string(),
+                            ),
+                            parameter_name: Some("nextToken".to_string()),
+                        },
+                    )
+                },
+            )?),
         };
 
         // A request that names no type filters on none: every reservation type is
@@ -318,7 +320,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .then_with(|| left_held_for.cmp(right_held_for))
         });
 
-        let (page, next_token) = crate::state::paginate(&scope, &items, input.max_results, offset);
+        // The boundary a token carries is the reservation the page ended on, by the same
+        // key the order is taken on, so a reservation released or flown out of the window
+        // between two pages does not move the next page past one the walk has not seen.
+        let (page, next_token) = crate::state::paginate(
+            &scope,
+            &items,
+            input.max_results,
+            after.as_ref(),
+            |reservation| {
+                let (_, _, antenna, reservation_type, held_for) = order_key(reservation);
+                crate::state::PageCursor::new(vec![
+                    crate::state::CursorField::instant(reservation.start_time),
+                    crate::state::CursorField::instant(reservation.end_time),
+                    crate::state::CursorField::text(antenna),
+                    crate::state::CursorField::text(reservation_type),
+                    crate::state::CursorField::text(held_for),
+                ])
+            },
+        );
 
         Ok(ListGroundStationReservationsOutput {
             reservation_list: page,

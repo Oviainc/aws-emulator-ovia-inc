@@ -83,6 +83,8 @@ mod mission_profile_deletion;
 mod not_found_messages;
 #[path = "all/owed_transition_spans.rs"]
 mod owed_transition_spans;
+#[path = "all/page_boundaries.rs"]
+mod page_boundaries;
 #[path = "all/program_track_reference_integrity.rs"]
 mod program_track_reference_integrity;
 #[path = "all/recording_bucket_refusal_message.rs"]

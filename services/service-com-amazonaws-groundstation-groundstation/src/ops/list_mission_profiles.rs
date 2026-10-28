@@ -163,21 +163,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
-        let offset = match input.next_token.as_deref() {
-            None => 0,
-            Some(token) => crate::state::decode_page_token(LISTING, token).ok_or_else(|| {
-                ListMissionProfilesErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(
-                            "nextToken was not issued by a previous ListMissionProfiles call"
-                                .to_string(),
-                        ),
-                        parameter_name: Some("nextToken".to_string()),
-                    },
-                )
-            })?,
+        let after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_page_token(LISTING, token).ok_or_else(
+                || {
+                    ListMissionProfilesErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(
+                                "nextToken was not issued by a previous ListMissionProfiles call"
+                                    .to_string(),
+                            ),
+                            parameter_name: Some("nextToken".to_string()),
+                        },
+                    )
+                },
+            )?),
         };
-        let (page, next_token) = crate::state::paginate(LISTING, &items, input.max_results, offset);
+        // The boundary a token carries is the profile the page ended on, by the id the
+        // order is taken on, so a profile deleted between two pages does not move the next
+        // page past one the walk has not seen.
+        let (page, next_token) = crate::state::paginate(
+            LISTING,
+            &items,
+            input.max_results,
+            after.as_ref(),
+            |profile| crate::state::PageCursor::optional_text(profile.mission_profile_id.as_deref()),
+        );
 
         Ok(ListMissionProfilesOutput {
             next_token,

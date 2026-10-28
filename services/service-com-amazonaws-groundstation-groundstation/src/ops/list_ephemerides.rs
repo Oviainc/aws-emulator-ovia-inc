@@ -170,9 +170,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::validate_search_window(input.start_time, input.end_time)
             .map_err(ListEphemeridesErrorModeled::InvalidParameterException)?;
 
-        // An offset counts within the FILTERED sequence, so the filters are part of the
-        // scope its token is issued under: resuming with a different window, satellite,
-        // type or status list is refused rather than landing at an offset into a
+        // A page boundary counts within the FILTERED sequence, so the filters are part of
+        // the scope its token is issued under: resuming with a different window, satellite,
+        // type or status list is refused rather than landing inside a
         // different sequence. The status list is sorted first, so naming the same
         // statuses in another order is the same scope.
         let mut statuses = input.status_list.clone().unwrap_or_default();
@@ -188,18 +188,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ],
         );
 
-        let offset = match input.next_token.as_deref() {
-            None => 0,
-            Some(token) => crate::state::decode_page_token(&scope, token).ok_or_else(|| {
-                ListEphemeridesErrorModeled::InvalidParameterException(InvalidParameterException {
-                    message: Some(
-                        "nextToken was not issued by a previous ListEphemerides call with these \
-                         filters"
-                            .to_string(),
-                    ),
-                    parameter_name: Some("nextToken".to_string()),
-                })
-            })?,
+        let after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_page_token(&scope, token).ok_or_else(
+                || {
+                    ListEphemeridesErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(
+                                "nextToken was not issued by a previous ListEphemerides call with \
+                                 these filters"
+                                    .to_string(),
+                            ),
+                            parameter_name: Some("nextToken".to_string()),
+                        },
+                    )
+                },
+            )?),
         };
 
         let window_start = input.start_time.as_secs_f64();
@@ -282,7 +286,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
-        let (page, next_token) = crate::state::paginate(&scope, &items, input.max_results, offset);
+        // The boundary a token carries is the ephemeris the page ended on, in the order
+        // above — creation time, then the id beside it — so one deleted or expired out of
+        // the filtered sequence between two pages does not move the next page past an
+        // ephemeris the walk has not seen.
+        let (page, next_token) = crate::state::paginate(
+            &scope,
+            &items,
+            input.max_results,
+            after.as_ref(),
+            |ephemeris| {
+                crate::state::PageCursor::new(vec![
+                    crate::state::CursorField::optional_instant(ephemeris.creation_time),
+                    crate::state::CursorField::optional_text(ephemeris.ephemeris_id.as_deref()),
+                ])
+            },
+        );
 
         Ok(ListEphemeridesOutput {
             next_token,

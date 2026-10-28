@@ -1018,16 +1018,16 @@ pub fn shift_seconds(timestamp: &DateTime, seconds: i64) -> DateTime {
 }
 
 /// The scope a listing's pagination tokens are issued under: the listing's own name,
-/// plus a fingerprint of the filters the offset counts WITHIN when it has any.
+/// plus a fingerprint of the filters the sequence it pages was cut by when it has any.
 ///
-/// An offset is only meaningful against the sequence it was taken from, so a token
+/// A page boundary is only meaningful against the sequence it was taken from, so a token
 /// carries its scope: a token from another listing, or from the same listing under
-/// different filters, is then refused rather than silently resuming at an offset into a
-/// different sequence (skipping or repeating records). The fingerprint is a
-/// non-cryptographic hash — it only has to change when the filters do.
+/// different filters, is then refused rather than silently resuming inside a different
+/// sequence (skipping or repeating records). The fingerprint is a non-cryptographic hash
+/// — it only has to change when the filters do.
 ///
 /// `DefaultHasher`'s output is NOT stable across process runs or std versions, which is
-/// fine and deliberate: a token only ever addresses an offset into this process's
+/// fine and deliberate: a token only ever addresses a boundary in this process's
 /// in-memory store, so it is not meant to survive a restart (after one there is no
 /// sequence left to resume), and a token from an earlier run is refused rather than
 /// resumed.
@@ -1043,20 +1043,140 @@ pub fn page_scope(listing: &str, filters: &[String]) -> String {
     format!("{listing}.{:016x}", ::std::hash::Hasher::finish(&hasher))
 }
 
-/// A pagination token for "resume `scope` at item `offset`".
+/// One field of a [`PageCursor`]: the value one of the members a listing is ORDERED by
+/// carries, held so that comparing two cursors field by field puts them in exactly the
+/// order the listing holds the items they were read from.
 ///
-/// Spelled `<scope>.<n>`: every character is inside the model's `PaginationToken`
-/// pattern (`^[A-Za-z0-9-/+_.=]+$`) and needs no escaping in the query string
-/// `ListMissionProfiles` binds its `nextToken` to, and the shortest form clears the
-/// shape's 3-character minimum.
-pub fn encode_page_token(scope: &str, offset: usize) -> String {
-    format!("{scope}.{offset}")
+/// The three forms are ordered as declared — an absent optional member before every
+/// present one, as `Option` orders `None` before `Some` — so a listing ordered on an
+/// optional member yields cursors ordered the same way. Within one listing a given
+/// position carries one form (plus [`CursorField::Absent`] where the member is optional),
+/// because it is read off the same member of every item.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CursorField {
+    /// An optional order member that carries nothing.
+    Absent,
+    /// A number, ordered as numbers are. An instant is one of these
+    /// ([`CursorField::instant`]).
+    Number(i64),
+    /// Text, ordered as `str` orders text — the order a `sort` of the same values gives.
+    Text(String),
 }
 
-/// The offset a token issued by [`encode_page_token`] for `scope` names, or `None` when
+impl CursorField {
+    /// The field for the text `value`.
+    pub fn text(value: &str) -> Self {
+        Self::Text(value.to_string())
+    }
+
+    /// The field for an optional text member: [`CursorField::Absent`] when it carries
+    /// nothing.
+    pub fn optional_text(value: Option<&str>) -> Self {
+        value.map_or(Self::Absent, Self::text)
+    }
+
+    /// The field for an optional number member: [`CursorField::Absent`] when it carries
+    /// nothing.
+    pub fn optional_number(value: Option<i32>) -> Self {
+        value.map_or(Self::Absent, |number| Self::Number(i64::from(number)))
+    }
+
+    /// The field for the instant `value`.
+    ///
+    /// Held as the integer that orders as `f64::total_cmp` orders the seconds the instant
+    /// carries — its bit pattern, with the sign folded in — so no rounding can put two
+    /// instants in an order the listing does not hold them in.
+    pub fn instant(value: DateTime) -> Self {
+        let bits = value.as_secs_f64().to_bits() as i64;
+        Self::Number(bits ^ (((bits >> 63) as u64) >> 1) as i64)
+    }
+
+    /// The field for an optional instant member: [`CursorField::Absent`] when it carries
+    /// nothing.
+    pub fn optional_instant(value: Option<DateTime>) -> Self {
+        value.map_or(Self::Absent, Self::instant)
+    }
+
+    /// This field inside a token: a one-letter tag naming the form, then the value in
+    /// characters the model's `PaginationToken` pattern admits (text is hex, which a
+    /// ground-station name's spaces and colons are not).
+    fn render(&self) -> String {
+        match self {
+            Self::Absent => "a".to_string(),
+            Self::Number(number) => format!("n{number}"),
+            Self::Text(text) => format!("t{}", hex::encode(text)),
+        }
+    }
+
+    /// The field [`CursorField::render`] wrote, or `None` when `part` is not one.
+    fn parse(part: &str) -> Option<Self> {
+        let mut characters = part.chars();
+        let tag = characters.next()?;
+        let value = characters.as_str();
+        match tag {
+            'a' if value.is_empty() => Some(Self::Absent),
+            'n' => value.parse().ok().map(Self::Number),
+            't' => hex::decode(value)
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .map(Self::Text),
+            _ => None,
+        }
+    }
+}
+
+/// Where a page of a listing ENDED: the ordering key of the last item it returned, which
+/// is what its `nextToken` carries so the next page resumes after that item.
+///
+/// A position in the sequence rather than a COUNT of items: every listing of this service
+/// recomputes its sequence from the live store on every call (and an availability search
+/// computes it from the clock too), so between two pages an item can leave the sequence —
+/// a contact reserved over an offered window, a config deleted, an ephemeris expired —
+/// and everything behind it then sits one place earlier. A count would address a
+/// different item after that and the items it passed over would be returned by no page of
+/// the walk; a key addresses the boundary itself, so the next page is the items ordered
+/// after it whatever has since left or joined.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PageCursor(Vec<CursorField>);
+
+impl PageCursor {
+    /// The cursor for an item a listing orders by `fields`, most significant first.
+    pub fn new(fields: Vec<CursorField>) -> Self {
+        Self(fields)
+    }
+
+    /// The cursor for an item a listing orders by one text member — an id, for most of
+    /// them.
+    pub fn text(value: &str) -> Self {
+        Self::new(vec![CursorField::text(value)])
+    }
+
+    /// The cursor for an item a listing orders by one optional text member.
+    pub fn optional_text(value: Option<&str>) -> Self {
+        Self::new(vec![CursorField::optional_text(value)])
+    }
+}
+
+/// A pagination token for "resume `scope` after the item `cursor` names".
+///
+/// Spelled `<scope>.<field>.<field>…`: every character is inside the model's
+/// `PaginationToken` pattern (`^[A-Za-z0-9-/+_.=]+$`) and needs no escaping in the query
+/// string `ListMissionProfiles` binds its `nextToken` to, and the shortest form clears
+/// the shape's 3-character minimum.
+pub fn encode_page_token(scope: &str, cursor: &PageCursor) -> String {
+    let fields: Vec<String> = cursor.0.iter().map(CursorField::render).collect();
+    format!("{scope}.{}", fields.join("."))
+}
+
+/// The cursor a token issued by [`encode_page_token`] for `scope` carries, or `None` when
 /// the token was not issued by this service for that scope.
-pub fn decode_page_token(scope: &str, token: &str) -> Option<usize> {
-    token.strip_prefix(scope)?.strip_prefix('.')?.parse().ok()
+pub fn decode_page_token(scope: &str, token: &str) -> Option<PageCursor> {
+    let fields = token.strip_prefix(scope)?.strip_prefix('.')?;
+    fields
+        .split('.')
+        .map(CursorField::parse)
+        .collect::<Option<Vec<CursorField>>>()
+        .map(PageCursor::new)
 }
 
 /// Largest page any listing returns, and the ceiling on a caller's `maxResults`: the
@@ -1075,7 +1195,14 @@ pub const MAX_PAGE_SIZE: usize = 100;
 /// past an account limit.
 pub const MAX_RECORDS_PER_STORE: usize = 1_000;
 
-/// One page of `items`, plus the token that resumes after it.
+/// One page of `items`, plus the token that resumes AFTER it.
+///
+/// `items` is the listing's whole sequence in its own order and `key_of` reads an item's
+/// place in that order ([`PageCursor`]), which the caller keeps ASCENDING and distinct
+/// over the sequence: the page is the first [`page_size`] items ordered after the cursor
+/// `after` carries, so an item that left the sequence since the previous page cannot hide
+/// the items behind it from the walk, and the token this hands back names the last item
+/// of the page rather than a count of the ones before it.
 ///
 /// The page is at most [`MAX_PAGE_SIZE`] items whatever the caller asked for, so no
 /// single request can draw the whole store out in one answer.
@@ -1083,13 +1210,20 @@ pub fn paginate<T: Clone>(
     scope: &str,
     items: &[T],
     max_results: Option<i32>,
-    offset: usize,
+    after: Option<&PageCursor>,
+    key_of: impl Fn(&T) -> PageCursor,
 ) -> (Vec<T>, Option<String>) {
-    let start = offset.min(items.len());
+    let start = match after {
+        None => 0,
+        // Everything up to and including the item the previous page ended on is behind the
+        // boundary; the sequence is ascending, so that prefix is found by bisection.
+        Some(after) => items.partition_point(|item| key_of(item) <= *after),
+    };
     let limit = page_size(max_results);
     let end = start.saturating_add(limit).min(items.len());
     let page = items[start..end].to_vec();
-    let next = (end < items.len()).then(|| encode_page_token(scope, end));
+    // `end` is past `start` whenever anything remains, so the page has a last item to name.
+    let next = (end < items.len()).then(|| encode_page_token(scope, &key_of(&items[end - 1])));
     (page, next)
 }
 
@@ -3381,10 +3515,10 @@ pub const MAX_POINTING_POINTS_READ: usize = 20_000;
 /// materialises no more than this. A caller that wants fewer says so with `maxResults`,
 /// which cuts the page further ([`page_size`]).
 ///
-/// It is a CONSTANT rather than something the request names, so every page of one search
-/// resolves the SAME sequence of windows and an offset into it means the same thing on
-/// every call. CHOSEN bound: [`MAX_PAGE_SIZE`] pages of it, so a caller can page through
-/// everything a search answers rather than being offered more than it can reach.
+/// It is a CONSTANT rather than something the request names, so what a search answers is
+/// not widened or narrowed by the page a caller asks for. CHOSEN bound:
+/// [`MAX_PAGE_SIZE`] pages of it, so a caller can page through everything a search
+/// answers rather than being offered more than it can reach.
 pub const MAX_OFFERED_WINDOWS: usize = 5 * MAX_PAGE_SIZE;
 
 /// One pass as the azimuth-elevation segments carry it, before it is placed against the
@@ -4916,9 +5050,10 @@ impl ComAmazonawsGroundstationGroundstationState {
     /// kept, at most [`MAX_OFFERED_WINDOWS`] of them, and at most
     /// [`MAX_POINTING_POINTS_READ`] points are read whatever is still unexamined. A search
     /// that reaches either bound answers with the passes it has. Both bounds are CONSTANTS,
-    /// so two reads of the same store resolve the same sequence of passes and a positional
-    /// offset into it addresses the same window on every call — which is what lets a caller
-    /// page through them.
+    /// so the page a caller asks for does not change which passes a read resolves. The
+    /// passes a LATER read resolves can differ all the same — `accept` is asked about the
+    /// clock and about the contacts held now — so a caller paging over them resumes at the
+    /// pass its last page ended on ([`PageCursor`]), never at a count of the ones before it.
     pub fn pointing_passes(
         &self,
         satellite_arn: &str,

@@ -162,21 +162,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
-        let offset = match input.next_token.as_deref() {
-            None => 0,
-            Some(token) => crate::state::decode_page_token(LISTING, token).ok_or_else(|| {
-                ListDataflowEndpointGroupsErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(
-                            "nextToken was not issued by a previous ListDataflowEndpointGroups call"
-                                .to_string(),
-                        ),
-                        parameter_name: Some("nextToken".to_string()),
-                    },
-                )
-            })?,
+        let after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_page_token(LISTING, token).ok_or_else(
+                || {
+                    ListDataflowEndpointGroupsErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(
+                                "nextToken was not issued by a previous ListDataflowEndpointGroups \
+                                 call"
+                                    .to_string(),
+                            ),
+                            parameter_name: Some("nextToken".to_string()),
+                        },
+                    )
+                },
+            )?),
         };
-        let (page, next_token) = crate::state::paginate(LISTING, &items, input.max_results, offset);
+        // The boundary a token carries is the group the page ended on, by the id the order
+        // is taken on, so a group deleted between two pages does not move the next page
+        // past one the walk has not seen.
+        let (page, next_token) = crate::state::paginate(
+            LISTING,
+            &items,
+            input.max_results,
+            after.as_ref(),
+            |group| {
+                crate::state::PageCursor::optional_text(
+                    group.dataflow_endpoint_group_id.as_deref(),
+                )
+            },
+        );
 
         Ok(ListDataflowEndpointGroupsOutput {
             next_token,

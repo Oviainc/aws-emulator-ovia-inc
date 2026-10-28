@@ -159,27 +159,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // An offset counts within ONE contact's version history, so the contact the
+        // A page boundary counts within ONE contact's version history, so the contact the
         // request addresses is part of the scope its token is issued under: a token from
         // another contact's listing, or from another listing of this service, is refused
-        // rather than resuming at an offset into a different sequence.
+        // rather than resuming inside a different sequence.
         let scope =
             crate::state::page_scope(LISTING, ::std::slice::from_ref(&input.contact_id));
 
-        let offset = match input.next_token.as_deref() {
-            None => 0,
-            Some(token) => crate::state::decode_page_token(&scope, token).ok_or_else(|| {
-                ListContactVersionsErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(
-                            "nextToken was not issued by a previous ListContactVersions call \
-                             for this contact"
-                                .to_string(),
-                        ),
-                        parameter_name: Some("nextToken".to_string()),
-                    },
-                )
-            })?,
+        let after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_page_token(&scope, token).ok_or_else(
+                || {
+                    ListContactVersionsErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(
+                                "nextToken was not issued by a previous ListContactVersions call \
+                                 for this contact"
+                                    .to_string(),
+                            ),
+                            parameter_name: Some("nextToken".to_string()),
+                        },
+                    )
+                },
+            )?),
         };
 
         let mut guard = state.lock();
@@ -203,7 +205,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // order.
         let versions = contact.version_history();
 
-        let (page, next_token) = crate::state::paginate(&scope, &versions, input.max_results, offset);
+        // The boundary a token carries is the version the page ended on, by the
+        // `versionId` the history is ordered on, so a page resumes after that version
+        // however many have been appended since.
+        let (page, next_token) = crate::state::paginate(
+            &scope,
+            &versions,
+            input.max_results,
+            after.as_ref(),
+            |version| {
+                crate::state::PageCursor::new(vec![crate::state::CursorField::optional_number(
+                    version.version_id,
+                )])
+            },
+        );
 
         Ok(ListContactVersionsOutput {
             next_token,

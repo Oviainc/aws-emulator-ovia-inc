@@ -172,24 +172,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // An offset counts within the antennas of ONE ground station, so the ground
+        // A page boundary counts within the antennas of ONE ground station, so the ground
         // station is part of the scope its token is issued under: a token issued for
-        // another station is refused rather than resumed at an offset into a different
+        // another station is refused rather than resumed inside a different
         // sequence (skipping or repeating antennas).
         let scope =
             crate::state::page_scope(LISTING, ::std::slice::from_ref(&input.ground_station_id));
-        let offset = match input.next_token.as_deref() {
-            None => 0,
-            Some(token) => crate::state::decode_page_token(&scope, token).ok_or_else(|| {
-                ListAntennasErrorModeled::InvalidParameterException(InvalidParameterException {
-                    message: Some(
-                        "nextToken was not issued by a previous ListAntennas call for this ground \
-                         station"
-                            .to_string(),
-                    ),
-                    parameter_name: Some("nextToken".to_string()),
-                })
-            })?,
+        let after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_page_token(&scope, token).ok_or_else(
+                || {
+                    ListAntennasErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(
+                                "nextToken was not issued by a previous ListAntennas call for this \
+                                 ground station"
+                                    .to_string(),
+                            ),
+                            parameter_name: Some("nextToken".to_string()),
+                        },
+                    )
+                },
+            )?),
         };
 
         // An antenna's Region is the Region the request addressed: these are the ground
@@ -223,7 +227,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
-        let (page, next_token) = crate::state::paginate(&scope, &items, input.max_results, offset);
+        // The boundary a token carries is the antenna the page ended on, by the name the
+        // inventory orders them on, so an antenna the inventory no longer holds does not
+        // move the next page past one the walk has not seen.
+        let (page, next_token) = crate::state::paginate(
+            &scope,
+            &items,
+            input.max_results,
+            after.as_ref(),
+            |antenna| crate::state::PageCursor::text(&antenna.antenna_name),
+        );
 
         Ok(ListAntennasOutput {
             // Present and empty when the ground station has no antenna recorded for it:
