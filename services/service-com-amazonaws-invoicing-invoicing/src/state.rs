@@ -633,6 +633,54 @@ impl StoredProcurementPortalPreference {
 /// explicit `UpdateProcurementPortalPreferenceStatus`) moves it.
 pub const STATUS_PENDING_VERIFICATION: &str = "PENDING_VERIFICATION";
 
+/// The verification state each plane of a procurement portal preference reports after a
+/// write of that preference's configuration, in ONE place.
+///
+/// A plane's status is "the current status of the e-invoice delivery preference" / of the
+/// purchase order retrieval preference, and its reason is "the reason for the current"
+/// status (`smithy_query(query="shape", shape="ProcurementPortalPreference")`), so the
+/// pair describes the portal connection an ENABLED plane has: a plane the configuration
+/// enables and nothing has verified yet reports [`STATUS_PENDING_VERIFICATION`], and a
+/// plane the configuration leaves DISABLED reports no status and no reason at all,
+/// because there is no connection for either to be about. A status an enabled plane
+/// already holds is left exactly as it is: the validation calls
+/// (`SendProcurementPortalValidation` / `VerifyProcurementPortalValidation`) and
+/// `UpdateProcurementPortalPreferenceStatus` are what move a status, and a configuration
+/// write is none of them.
+///
+/// It lives beside the preference registry, for the reason [`PORTAL_COUPA`] states rather
+/// than in one operation's module: it is one rule about the RESOURCE which every write of
+/// a preference's configuration — the create and the update — applies whole, so two
+/// preferences holding the same configuration cannot report different state because they
+/// reached it by different paths.
+pub fn apply_plane_verification_statuses(preference: &mut ProcurementPortalPreference) {
+    // Each plane as the triple the rule acts on: whether the configuration enables it,
+    // and the status and reason it reports. The fields are disjoint, so both planes are
+    // borrowed at once and the rule below is written once for the two of them.
+    let planes: [(bool, &mut Option<String>, &mut Option<String>); 2] = [
+        (
+            preference.einvoice_delivery_enabled,
+            &mut preference.einvoice_delivery_preference_status,
+            &mut preference.einvoice_delivery_preference_status_reason,
+        ),
+        (
+            preference.purchase_order_retrieval_enabled,
+            &mut preference.purchase_order_retrieval_preference_status,
+            &mut preference.purchase_order_retrieval_preference_status_reason,
+        ),
+    ];
+    for (enabled, status, reason) in planes {
+        if enabled {
+            if status.is_none() {
+                *status = Some(STATUS_PENDING_VERIFICATION.to_string());
+            }
+        } else {
+            *status = None;
+            *reason = None;
+        }
+    }
+}
+
 /// `ProcurementPortalName$COUPA` — the portal whose Marketplace PunchOut configuration
 /// the model documents as required (`MarketplacePunchOutPreference`: "Required for Coupa
 /// when MarketplacePunchOutEnabled is true"). One of the values the modelled enum admits

@@ -631,6 +631,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 subtitle_file_uris: None,
             }),
             transcript: None,
+            // A job that has not finished owes its output locations nothing, because it
+            // reports none yet (see `crate::state::due_output_objects`).
+            outputs_stored: false,
             failure_reason: None,
             failure_due,
             creation_time: now,

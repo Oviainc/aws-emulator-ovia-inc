@@ -335,7 +335,7 @@ async fn a_created_trail_reports_the_configuration_it_was_given() {
                 &trail[member], want,
                 "case {case}: GetTrail reports {member} = {} where CreateTrail \
                  reported {want}, got {trail:?}",
-                &trail[member]
+                trail[member]
             );
         }
         // Neither selector kind has been put on this trail.

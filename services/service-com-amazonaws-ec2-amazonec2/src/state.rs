@@ -1788,8 +1788,9 @@ pub const RESERVED_TAG_PREFIX: &str = "aws:";
 ///
 /// From the member's documentation: "You can specify tags for the following
 /// resources only: Instances Volumes Spot Instance requests Network interfaces".
-/// Only the `instance` entry has a resource this slice stores; the others are
-/// accepted and carry no instance tags.
+/// Only the `instance` entry has a resource this slice stores; a specification for
+/// one of the others is accepted — the launch is not refused for naming a type the
+/// operation documents — and its tags are carried by no resource here.
 pub const RUN_INSTANCES_TAGGABLE_RESOURCES: &[&str] = &[
     "instance",
     "volume",

@@ -32,7 +32,11 @@ use crate::control_catalog::{drain, Emulator};
 /// `ObjectiveArn` and `CommonControlArn` patterns, each
 /// `^arn:(aws(?:[-a-z]*)?):controlcatalog:::<kind>/[0-9a-z]+$`, whose partition
 /// alternative admits the whole `aws` family.
-const PARTITIONS: [&str; 5] = ["aws", "aws-cn", "aws-us-gov", "aws-iso-b", "aws-iso-f"];
+///
+/// `pub(crate)` so the sibling suites in this test target (see `tests/all.rs`) narrow by
+/// the same set of spellings rather than keeping a second copy of it.
+pub(crate) const PARTITIONS: [&str; 5] =
+    ["aws", "aws-cn", "aws-us-gov", "aws-iso-b", "aws-iso-f"];
 
 /// The opening of every stored catalog ARN: the `aws` partition, with neither a Region
 /// nor an account id.
@@ -44,7 +48,7 @@ const UNPUBLISHED_IDENTIFIER: &str = "zzzzzzzzzzzzzzzzzzzzzzzzz";
 
 /// Rewrite a stored catalog ARN into `partition`, leaving the kind and the identifier —
 /// the resource's identity — exactly as the catalog minted them.
-fn in_partition(arn: &str, partition: &str) -> String {
+pub(crate) fn in_partition(arn: &str, partition: &str) -> String {
     let rest = arn
         .strip_prefix(STORED_PREFIX)
         .unwrap_or_else(|| panic!("case {arn}: a stored catalog ARN opens {STORED_PREFIX}"));

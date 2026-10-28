@@ -569,12 +569,10 @@ impl ComAmazonawsSagemakertrainingsessionruntimeLegorouterserviceState {
                     .filter(|(_, session)| session.is_settled())
                     .min_by_key(|(key, session)| (session.created_at, (*key).clone()))
                     .map(|(key, _)| key.clone());
-                match releasable {
-                    Some(key) => self.sessions.remove(&key),
-                    // Every session still has an operation in flight; the submit is
-                    // refused rather than one of them being thrown away.
-                    None => return None,
-                };
+                // Every session still has an operation in flight; the submit is
+                // refused rather than one of them being thrown away.
+                let key = releasable?;
+                self.sessions.remove(&key);
             }
         }
         let session = self
