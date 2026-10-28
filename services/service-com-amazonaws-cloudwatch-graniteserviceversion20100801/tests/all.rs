@@ -135,3 +135,5 @@ mod state_roundtrip;
 mod statistic_name_refusals;
 #[path = "all/stop_metric_streams.rs"]
 mod stop_metric_streams;
+#[path = "all/unit_read_identity.rs"]
+mod unit_read_identity;

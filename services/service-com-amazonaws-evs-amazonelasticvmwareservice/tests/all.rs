@@ -86,6 +86,8 @@ mod list_while_initializing;
 mod public_vlan_netmask;
 #[path = "all/reserved_tag_keys.rs"]
 mod reserved_tag_keys;
+#[path = "all/route_server_peer_references.rs"]
+mod route_server_peer_references;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tag_resource_idempotent_stamp.rs"]
