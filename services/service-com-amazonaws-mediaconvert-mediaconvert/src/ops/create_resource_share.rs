@@ -152,12 +152,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // "Specify MediaConvert Job ID or ARN to share": a value carrying no characters is
+        // neither an id nor an ARN, so it names no job and resolves to nothing. That is the
+        // test every resource-naming member in this service takes
+        // (`crate::state::carries_no_characters`), so it is refused as a problem in the
+        // request naming the member it arrived in, never as a lookup of an id nothing could
+        // hold. Tested before the support case below, which is the order the model lists
+        // the two required members in.
+        if crate::state::carries_no_characters(&input.job_id) {
+            return Err(CreateResourceShareErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::blank_member_message("JobId")),
+                },
+            )
+            .into());
+        }
+
         // "AWS Support case identifier": an identifier of nothing but whitespace names no
         // support case, so there is no case to share the job's resources with. The member
         // targets a bare `__string` with no length constraint, so the boundary validator
         // lets it through and the refusal belongs here — a problem in the request, naming
         // the member it is in.
-        if input.support_case_id.trim().is_empty() {
+        if crate::state::carries_no_characters(&input.support_case_id) {
             return Err(CreateResourceShareErrorModeled::BadRequestException(
                 BadRequestException {
                     message: Some(
