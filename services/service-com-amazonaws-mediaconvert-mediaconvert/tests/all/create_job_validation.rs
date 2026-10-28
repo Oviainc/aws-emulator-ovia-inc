@@ -25,7 +25,9 @@
 
 use serde_json::{json, Value};
 
-use super::job_lifecycle::{arn, settings as job_settings, Emulator, Reply, ROLE};
+use super::job_lifecycle::{
+    arn, projected_hop_destinations, settings as job_settings, Emulator, Reply, ROLE,
+};
 use super::job_template_crud::settings as template_settings;
 
 /// A queue the fixtures create, so a hop destination can reference a real queue.
@@ -639,7 +641,8 @@ async fn a_hop_destination_queue_must_resolve_to_a_stored_queue() {
         let after_hops = after.at("/jobTemplate/hopDestinations");
         if status == 0 {
             assert_eq!(
-                after_hops, &hops,
+                after_hops,
+                &projected_hop_destinations(&hops),
                 "case {case:?}: an accepted UpdateJobTemplate must store the hop list it \
                  was given, got {}",
                 after.body

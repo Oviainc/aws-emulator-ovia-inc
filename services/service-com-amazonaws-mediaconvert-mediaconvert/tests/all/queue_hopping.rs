@@ -37,7 +37,9 @@ use service_com_amazonaws_mediaconvert_mediaconvert::state::{
 };
 use service_com_amazonaws_mediaconvert_mediaconvert::ComAmazonawsMediaconvertMediaconvertState;
 
-use super::job_lifecycle::{arn, settings as job_settings, Emulator, Reply, ROLE};
+use super::job_lifecycle::{
+    projected_hop_destinations, queue_arn, settings as job_settings, Emulator, Reply, ROLE,
+};
 use super::job_template_crud::settings as template_settings;
 
 /// Longer than any row advances the clock by, so no row's job leaves `SUBMITTED` while its
@@ -86,12 +88,6 @@ fn transitions(reply: &Reply) -> Vec<(String, String, i64)> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-/// The queue ARN of a queue name — the form `Job$Queue` and both `QueueTransition` members
-/// are projected in.
-fn queue_arn(name: &str) -> String {
-    arn(&format!("queues/{name}"))
 }
 
 /// Create the queues a case needs, each `(name, paused)`.
@@ -646,7 +642,7 @@ async fn a_hop_destinations_wait_is_held_to_the_published_range() {
         if *accepted {
             assert_eq!(
                 after_hops,
-                Some(hops.clone()),
+                Some(projected_hop_destinations(&hops)),
                 "case {case:?}: an accepted UpdateJobTemplate must store the hop list it was \
                  given, got {}",
                 after.body

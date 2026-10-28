@@ -949,6 +949,40 @@ pub fn queue_name_from_reference(reference: &str) -> &str {
     resource_name_from_reference(RESOURCE_TYPE_QUEUES, reference)
 }
 
+/// The queue reference a resource projection reports for a queue a caller referenced:
+/// the queue's ARN, built from the referenced queue's name and the region of the request
+/// doing the reading.
+///
+/// A request may name a queue either way ([`queue_name_from_reference`]), so the form a
+/// reference is READ BACK in cannot be the form it arrived in: the resource reports the
+/// queue it references, and the identifier of a queue "that is unique within all of AWS"
+/// is its ARN ([`queue_arn`]). Used wherever a projection reports a reference STORED as
+/// the caller wrote it; a reference already resolved to a queue name on the way in is
+/// projected with [`queue_arn`] directly.
+pub fn queue_reference_view(region: &str, reference: &str) -> String {
+    queue_arn(region, queue_name_from_reference(reference))
+}
+
+/// Every hop destination of a stored record, as a projection reports it.
+///
+/// A hop destination's `Queue` is a queue reference exactly as a job's or a template's is,
+/// so one that names a queue is reported as that queue's ARN
+/// ([`queue_reference_view`]) rather than in whichever form the request wrote it. A hop
+/// destination that names NO queue still names none: the member is "optional unless the
+/// job is submitted on the default queue", so nothing was referenced and nothing is
+/// reported. Every other member is the record's own.
+pub fn hop_destinations_view(region: &str, hops: &[HopDestination]) -> Vec<HopDestination> {
+    hops.iter()
+        .map(|hop| HopDestination {
+            queue: hop
+                .queue
+                .as_deref()
+                .map(|reference| queue_reference_view(region, reference)),
+            ..hop.clone()
+        })
+        .collect()
+}
+
 /// The job id a caller named, whether they gave the id or the job's ARN.
 ///
 /// `CreateResourceShare$JobId` is "Specify MediaConvert Job ID or ARN to share", so it
@@ -2680,11 +2714,18 @@ impl JobTemplateRecord {
             category: self.category.clone(),
             created_at: Some(epoch_seconds(self.created_at)),
             description: self.description.clone(),
-            hop_destinations: Some(self.hop_destinations.clone()),
+            hop_destinations: Some(hop_destinations_view(region, &self.hop_destinations)),
             last_updated: Some(epoch_seconds(self.last_updated)),
             name: self.name.clone(),
             priority: Some(self.priority),
-            queue: self.queue.clone(),
+            // The queue jobs from this template are assigned to is reported as that
+            // queue's ARN — the same projection a job's queue takes, so the two
+            // projections of one reference report it in one form whichever form the
+            // request that stored it named the queue in.
+            queue: self
+                .queue
+                .as_deref()
+                .map(|name| queue_arn(region, name)),
             settings: self.settings.clone(),
             status_update_interval: Some(self.status_update_interval.clone()),
             r#type: Some(self.template_type.clone()),
@@ -3224,7 +3265,7 @@ impl JobRecord {
             elemental_inference_configuration: None,
             error_code: self.error_code,
             error_message: self.error_message.clone(),
-            hop_destinations: Some(self.hop_destinations.clone()),
+            hop_destinations: Some(hop_destinations_view(region, &self.hop_destinations)),
             id: Some(self.id.clone()),
             job_engine_version_requested: self.job_engine_version_requested.clone(),
             // The Job engine version this job runs on, resolved against the account's

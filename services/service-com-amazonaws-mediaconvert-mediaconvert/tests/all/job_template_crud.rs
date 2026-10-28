@@ -20,7 +20,9 @@ use service_com_amazonaws_mediaconvert_mediaconvert::ComAmazonawsMediaconvertMed
 // The router, the SigV4 scope, the reply decoding, the ARN helper and the request helpers
 // are the crate's ONE test harness, exported by `job_lifecycle`: this suite drives the
 // same wire path through it rather than keeping a second copy of it.
-use super::job_lifecycle::{arn, arn_in, settings as job_settings, Emulator, ROLE};
+use super::job_lifecycle::{
+    arn, arn_in, queue_arn, settings as job_settings, Emulator, ROLE,
+};
 
 /// A queue the fixture creates, so a case can point a template at a real queue.
 const FIXTURE_QUEUE: &str = "templates-queue";
@@ -172,7 +174,7 @@ async fn a_created_job_template_reads_back_through_get() {
                 "queue": FIXTURE_QUEUE,
                 "settings": settings(1, 1),
             }),
-            expected: json!({ "name": "queued-by-name", "queue": FIXTURE_QUEUE }),
+            expected: json!({ "name": "queued-by-name", "queue": queue_arn(FIXTURE_QUEUE) }),
             inputs: 1,
             groups: 1,
         },
@@ -183,7 +185,7 @@ async fn a_created_job_template_reads_back_through_get() {
                 "queue": arn(&format!("queues/{FIXTURE_QUEUE}")),
                 "settings": settings(1, 1),
             }),
-            expected: json!({ "name": "queued-by-arn", "queue": FIXTURE_QUEUE }),
+            expected: json!({ "name": "queued-by-arn", "queue": queue_arn(FIXTURE_QUEUE) }),
             inputs: 1,
             groups: 1,
         },
@@ -206,7 +208,7 @@ async fn a_created_job_template_reads_back_through_get() {
             groups: 1,
         },
         Row {
-            case: "two hop destinations",
+            case: "two hop destinations, one naming its queue by ARN",
             request: json!({
                 "name": "hopping",
                 "hopDestinations": [
@@ -218,9 +220,24 @@ async fn a_created_job_template_reads_back_through_get() {
             expected: json!({
                 "name": "hopping",
                 "hopDestinations": [
-                    { "queue": arn(&format!("queues/{FIXTURE_QUEUE}")), "priority": 10, "waitMinutes": 15 },
+                    { "queue": queue_arn(FIXTURE_QUEUE), "priority": 10, "waitMinutes": 15 },
                     { "priority": -10, "waitMinutes": 4320 },
                 ],
+            }),
+            inputs: 1,
+            groups: 1,
+        },
+        Row {
+            case: "a hop destination naming its queue by name",
+            request: json!({
+                "name": "hopping-by-name",
+                "hopDestinations": [{ "queue": FIXTURE_QUEUE, "waitMinutes": 1 }],
+                "settings": settings(1, 1),
+            }),
+            // The same destination, named the other way, reads back in the same form.
+            expected: json!({
+                "name": "hopping-by-name",
+                "hopDestinations": [{ "queue": queue_arn(FIXTURE_QUEUE), "waitMinutes": 1 }],
             }),
             inputs: 1,
             groups: 1,
@@ -501,8 +518,8 @@ async fn a_template_naming_an_unknown_queue_is_not_found() {
         );
         assert_eq!(
             created.at("/jobTemplate/queue").as_str(),
-            Some("Default"),
-            "case {reference:?}: expected the resolved queue name, got {}",
+            Some(queue_arn("Default").as_str()),
+            "case {reference:?}: expected the ARN of the resolved queue, got {}",
             created.body
         );
     }
@@ -623,7 +640,14 @@ async fn an_update_replaces_only_the_members_it_names_and_reflects_in_get() {
         UpdateRow {
             case: "a new queue referenced by ARN",
             update: json!({ "queue": arn(&format!("queues/{FIXTURE_QUEUE}")) }),
-            changed: json!({ "queue": FIXTURE_QUEUE }),
+            changed: json!({ "queue": queue_arn(FIXTURE_QUEUE) }),
+            inputs: 1,
+            groups: 1,
+        },
+        UpdateRow {
+            case: "the same new queue referenced by name",
+            update: json!({ "queue": FIXTURE_QUEUE }),
+            changed: json!({ "queue": queue_arn(FIXTURE_QUEUE) }),
             inputs: 1,
             groups: 1,
         },
@@ -645,6 +669,15 @@ async fn an_update_replaces_only_the_members_it_names_and_reflects_in_get() {
             case: "new hop destinations",
             update: json!({ "hopDestinations": [{ "priority": -5, "waitMinutes": 2 }] }),
             changed: json!({ "hopDestinations": [{ "priority": -5, "waitMinutes": 2 }] }),
+            inputs: 1,
+            groups: 1,
+        },
+        UpdateRow {
+            case: "a new hop destination naming its queue by name",
+            update: json!({ "hopDestinations": [{ "queue": FIXTURE_QUEUE, "waitMinutes": 2 }] }),
+            changed: json!({
+                "hopDestinations": [{ "queue": queue_arn(FIXTURE_QUEUE), "waitMinutes": 2 }],
+            }),
             inputs: 1,
             groups: 1,
         },

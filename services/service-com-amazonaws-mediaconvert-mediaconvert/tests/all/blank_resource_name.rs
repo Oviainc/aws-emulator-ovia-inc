@@ -31,7 +31,9 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_mediaconvert_mediaconvert::state::not_found_message;
 
-use super::job_lifecycle::{settings as job_settings, Emulator, Reply, ROLE};
+use super::job_lifecycle::{
+    projected_hop_destinations, settings as job_settings, Emulator, Reply, ROLE,
+};
 use super::job_template_crud::settings as template_settings;
 use super::resource_tagging::encode_label;
 
@@ -719,7 +721,7 @@ async fn a_hop_destination_queue_carrying_no_characters_is_refused() {
                 }
                 assert_eq!(
                     job.at("/job/hopDestinations"),
-                    &hops,
+                    &projected_hop_destinations(&hops),
                     "case {case:?}: the created job must carry the hop list it was given, \
                      got body {}",
                     job.body
@@ -727,7 +729,7 @@ async fn a_hop_destination_queue_carrying_no_characters_is_refused() {
                 let after = emulator.get_job_template("hopping-template").await;
                 assert_eq!(
                     after.at("/jobTemplate/hopDestinations"),
-                    &hops,
+                    &projected_hop_destinations(&hops),
                     "case {case:?}: an accepted update must store the hop list it was given, \
                      got body {}",
                     after.body

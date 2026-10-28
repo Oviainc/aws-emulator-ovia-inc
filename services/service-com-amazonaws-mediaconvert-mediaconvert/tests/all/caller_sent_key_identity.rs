@@ -22,7 +22,7 @@
 
 use serde_json::json;
 
-use crate::job_lifecycle::{arn, settings, Emulator, ROLE};
+use crate::job_lifecycle::{queue_arn, settings, Emulator, ROLE};
 use crate::job_template_crud::settings as template_settings;
 
 /// One caller-sent key value: its label, and the bytes the request carries.
@@ -260,15 +260,15 @@ async fn a_job_template_queue_reference_resolves_the_name_exactly_as_sent() {
         );
         assert_eq!(
             created.string("/jobTemplate/queue"),
-            value,
-            "case {label:?}: expected the queue reference stored verbatim, got {}",
+            queue_arn(value),
+            "case {label:?}: expected the ARN of the queue the reference resolved, got {}",
             created.body
         );
         let fetched = emulator.get_job_template(&name).await;
         assert_eq!(
             fetched.string("/jobTemplate/queue"),
-            value,
-            "case {label:?}: expected the stored queue read back verbatim, got {}",
+            queue_arn(value),
+            "case {label:?}: expected the stored queue read back as its ARN, got {}",
             fetched.body
         );
 
@@ -287,7 +287,7 @@ async fn a_job_template_queue_reference_resolves_the_name_exactly_as_sent() {
         );
         assert_eq!(
             job.string("/job/queue"),
-            arn(&format!("queues/{value}")),
+            queue_arn(value),
             "case {label:?}: expected the job on the queue the template names, got {}",
             job.body
         );
@@ -329,7 +329,7 @@ async fn a_job_template_queue_reference_resolves_the_name_exactly_as_sent() {
         let unchanged = emulator.get_job_template(&name).await;
         assert_eq!(
             unchanged.string("/jobTemplate/queue"),
-            value,
+            queue_arn(value),
             "case {label:?}: a refused update must leave the stored queue alone, got {}",
             unchanged.body
         );
@@ -353,7 +353,7 @@ async fn a_job_template_queue_reference_resolves_the_name_exactly_as_sent() {
         );
         assert_eq!(
             updated.string("/jobTemplate/queue"),
-            neighbour,
+            queue_arn(neighbour),
             "case {label:?}: expected the update to store {neighbour:?}, got {}",
             updated.body
         );

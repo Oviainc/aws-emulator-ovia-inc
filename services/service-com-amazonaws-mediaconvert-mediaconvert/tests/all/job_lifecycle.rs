@@ -263,6 +263,43 @@ pub(crate) fn arn_in(region: &str, resource: &str) -> String {
     engine::emulator_arn("mediaconvert", region, resource)
 }
 
+/// The ARN of the queue `name`, in `region` — the form every queue reference a resource
+/// projection reports takes, whichever form the request that stored it was written in.
+pub(crate) fn queue_arn_in(region: &str, name: &str) -> String {
+    arn_in(region, &format!("queues/{name}"))
+}
+
+/// [`queue_arn_in`] for the suite's default region.
+pub(crate) fn queue_arn(name: &str) -> String {
+    queue_arn_in(REGION, name)
+}
+
+/// A `hopDestinations` list as a resource projection reports it: an entry that names a
+/// queue reports that queue's ARN, and an entry that names none reports no queue.
+///
+/// The expectation is built from the queue NAME the request's own reference carries, so a
+/// suite asserting it spells the projection out rather than borrowing the emulator's.
+pub(crate) fn projected_hop_destinations(requested: &Value) -> Value {
+    let Some(entries) = requested.as_array() else {
+        return requested.clone();
+    };
+    Value::Array(
+        entries
+            .iter()
+            .map(|entry| {
+                let mut entry = entry.clone();
+                if let Some(reference) = entry.pointer("/queue").and_then(Value::as_str) {
+                    // A reference is either a bare queue name or the whole queue ARN, so
+                    // the name is what is left once that exact prefix is taken off.
+                    let name = reference.strip_prefix(&queue_arn("")).unwrap_or(reference);
+                    entry["queue"] = json!(queue_arn(name));
+                }
+                entry
+            })
+            .collect(),
+    )
+}
+
 /// Caller-driven growth is bounded: the store accepts queues up to its capacity and
 /// then answers the modelled quota error instead of growing further. `CreateJob` guards
 /// its own capacity through the same path.
