@@ -1882,11 +1882,17 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 }
 
 /// `arn:aws:acm:<region>:<account>:certificate/<certificate_id>`.
+/// The ARN resource type every ACM certificate ARN carries
+/// (`arn:aws:acm:<region>:<account>:certificate/<id>`): the one spelling `CertificateArn`'s
+/// own `@pattern` admits, so it is both what this service MINTS and what it names the
+/// collection an operation that resolves no single certificate reaches.
+pub const CERTIFICATE_RESOURCE_TYPE: &str = "certificate";
+
 pub fn certificate_arn(region: &str, certificate_id: &str) -> String {
     ::engine::emulator_arn(
         SIGNING_NAME,
         region,
-        &format!("certificate/{certificate_id}"),
+        &format!("{CERTIFICATE_RESOURCE_TYPE}/{certificate_id}"),
     )
 }
 
@@ -2287,7 +2293,7 @@ pub fn acm_arn_resource_type(arn: &str) -> Option<&str> {
 /// The model's `@pattern` already refused anything that is not an `acm` ARN before a
 /// handler runs; what is left to check here is that the resource is a `certificate`.
 pub fn certificate_id_from_arn(arn: &str) -> Option<&str> {
-    acm_resource_id(arn, "certificate")
+    acm_resource_id(arn, CERTIFICATE_RESOURCE_TYPE)
 }
 
 /// The endpoint id in an ACME endpoint ARN, or `None` when `arn` names something that

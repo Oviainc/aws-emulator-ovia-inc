@@ -273,7 +273,9 @@ async fn credentials_of_a_binding_nothing_answers_to_are_not_found() {
     );
 
     // Each row is a well-formed `AcmeExternalAccountBindingArn` (its modelled `@pattern`
-    // is checked before the handler runs) that no stored record answers to.
+    // is checked before the handler runs) OF THIS ACCOUNT that no stored record answers
+    // to. An ARN of ANOTHER account is not a missing resource but a bad request, refused
+    // before the lookup — pinned by [`crate::acme_authorization`].
     let cases: Vec<(&str, String)> = vec![
         (
             "an id under an endpoint this account does hold",
@@ -290,11 +292,19 @@ async fn credentials_of_a_binding_nothing_answers_to_are_not_found() {
             ),
         ),
         (
-            "an endpoint of another account",
-            state::acme_external_account_binding_arn(
-                &format!("arn:aws:acm:{REGION}:210987654321:acme-endpoint/other-endpoint"),
-                "other-binding",
-            ),
+            "a single-character binding id under an endpoint this account holds",
+            state::acme_external_account_binding_arn(&endpoint_arn, "a"),
+        ),
+        (
+            "an id at AcmeExternalAccountBindingArn's maximum length (200)",
+            {
+                // `@length(max: 200)` on the member, so this row sits on that bound.
+                let framing = state::acme_external_account_binding_arn(&endpoint_arn, "");
+                state::acme_external_account_binding_arn(
+                    &endpoint_arn,
+                    &"a".repeat(200 - framing.len()),
+                )
+            },
         ),
         ("a binding whose endpoint was deleted", orphan),
     ];
