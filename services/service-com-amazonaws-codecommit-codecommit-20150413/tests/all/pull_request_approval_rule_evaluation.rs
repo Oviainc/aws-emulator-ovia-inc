@@ -10,8 +10,9 @@
 //! the pull request holds meet that rule's every statement — at least
 //! `NumberOfApprovalsNeeded` approvers, drawn from `ApprovalPoolMembers` where the
 //! statement names a pool — and under `approvalRulesNotSatisfied` otherwise;
-//! `approved` is true exactly when no rule is left unmet or the rules have been
-//! overridden, and `overridden` is the pull request's override state. The evaluation
+//! `approved` is true exactly when no rule is left unmet, and `overridden` is the
+//! pull request's override state, which is reported on its own member and leaves the
+//! rules it sets aside reported as the unmet rules they still are. The evaluation
 //! is a report, so asking for it leaves the pull request as the next caller found it.
 //!
 //! The table below spans what that rule generalises over: the number of rules applied
@@ -279,9 +280,11 @@ impl Fixture {
             .unwrap_or_else(|| panic!("no evaluation in {read}"))
     }
 
-    /// Set the stored pull request's approval rules aside, as an override would: no
-    /// implemented operation overrides them yet, and the override is one axis the
-    /// evaluation reports on.
+    /// Set the stored pull request's approval rules aside, as an override would:
+    /// the override is one axis the evaluation reports on, and seeding it here keeps
+    /// this suite's subject the evaluation rather than the operation that records it
+    /// (`OverridePullRequestApprovalRules`, driven over the wire by the sibling
+    /// `pull_request_approval_rule_override` suite).
     fn override_rules(&self) {
         let state = self.engine.state::<CodeCommitState>();
         let mut store = state.lock();
@@ -292,7 +295,7 @@ impl Fixture {
         store
             .pull_request_mut(id)
             .expect("the pull request opened above")
-            .approval_rules_overridden = true;
+            .approval_rules_overridden_by = Some(caller_arn("AKIDOVERRIDER"));
     }
 }
 
@@ -498,7 +501,7 @@ async fn the_evaluation_reports_each_rule_against_the_approvals_the_pull_request
 }
 
 #[tokio::test]
-async fn overridden_rules_leave_the_pull_request_approved_with_their_conditions_still_reported() {
+async fn overridden_rules_are_reported_as_overridden_with_their_conditions_still_unmet() {
     let fixture = fixture().await;
     fixture
         .create_rule("needs-two", &document(&[statement(2, &[])]))
@@ -522,8 +525,9 @@ async fn overridden_rules_leave_the_pull_request_approved_with_their_conditions_
         "an unmet rule after the override"
     );
     assert!(
-        flag(&after, "approved"),
-        "case {:?}: an override sets the conditions aside, so expected approved true, got {after}",
+        !flag(&after, "approved"),
+        "case {:?}: an override is reported on its own member and does not meet a rule's \
+         conditions, so expected approved false, got {after}",
         "an unmet rule after the override"
     );
     let not_satisfied = names(&after, "approvalRulesNotSatisfied");
