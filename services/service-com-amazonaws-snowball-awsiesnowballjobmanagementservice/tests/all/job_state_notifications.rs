@@ -544,16 +544,17 @@ async fn every_record_an_order_moves_is_published_on_its_own() {
     assert_published(case, &since(&engine, &mut seen), &topic, &expected);
 
     // A node added to the cluster later is one more job entering `New`, under the settings
-    // it inherits from the cluster.
+    // it inherits from the cluster: a node names its cluster and nothing of the order
+    // besides ("you only need to provide the clusterId value").
     let case = "a node job added to the cluster";
-    let added = create_job(
+    let created = ok(
         &router,
-        &address_id,
-        None,
-        &json!({ "ClusterId": cluster_id, "JobType": "LOCAL_USE", "SnowballType": "EDGE" }),
+        "CreateJob",
+        json!({ "ClusterId": cluster_id }),
         case,
     )
     .await;
+    let added = string(&created, "JobId", case);
     assert_published(
         case,
         &since(&engine, &mut seen),

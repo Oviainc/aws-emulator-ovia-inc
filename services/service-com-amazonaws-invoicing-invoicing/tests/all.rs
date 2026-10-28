@@ -21,6 +21,8 @@ mod invoice_profiles;
 mod invoice_summaries;
 #[path = "all/invoice_unit_lifecycle.rs"]
 mod invoice_unit_lifecycle;
+#[path = "all/modelled_refusal_on_every_implemented_operation.rs"]
+mod modelled_refusal_on_every_implemented_operation;
 #[path = "all/own_account_and_request_derived_refusals.rs"]
 mod own_account_and_request_derived_refusals;
 #[path = "all/portal_validation_code_issue.rs"]

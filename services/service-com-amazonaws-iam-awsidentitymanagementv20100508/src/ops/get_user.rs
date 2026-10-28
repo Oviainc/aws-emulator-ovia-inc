@@ -227,10 +227,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         match held {
             Some(user) => Ok(GetUserOutput { user: user.clone() }),
             None => Err(GetUserErrorModeled::NoSuchEntityException(NoSuchEntityException {
-                message: Some(format!(
-                    "The user with name {} cannot be found.",
-                    input.user_name.as_deref().unwrap_or(&key)
-                )),
+                message: Some(format!("The user with name {addressed} cannot be found.")),
             })
             .into()),
         }

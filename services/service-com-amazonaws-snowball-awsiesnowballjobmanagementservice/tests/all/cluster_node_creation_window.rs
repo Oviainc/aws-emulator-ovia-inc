@@ -86,7 +86,11 @@ async fn job_state(router: &MultiServiceRouter, job_id: &str, case: &str) -> Str
 }
 
 /// The job ids `ListClusterJobs` reports for `cluster_id`, in the order it reports them.
-async fn listed_node_ids(router: &MultiServiceRouter, cluster_id: &str, case: &str) -> Vec<String> {
+pub(crate) async fn listed_node_ids(
+    router: &MultiServiceRouter,
+    cluster_id: &str,
+    case: &str,
+) -> Vec<String> {
     let listed = ok(
         router,
         "ListClusterJobs",

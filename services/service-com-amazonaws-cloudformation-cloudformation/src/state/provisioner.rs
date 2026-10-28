@@ -296,6 +296,16 @@
 //!   CloudFormation's own — "Ref returns the configuration set name" — so the delete and
 //!   the drift read address the set by the resource's physical id.
 //!
+//! * `AWS::SES::ReceiptRuleSet`'s one property IS the name CloudFormation decides, since
+//!   `CreateReceiptRuleSet` takes nothing else ([`create_ses_receipt_rule_set`]), and
+//!   `AWS::SES::ReceiptRule`'s three ARE `CreateReceiptRule`'s own members, spelled
+//!   identically on both sides (`RuleSetName`, `After`, `Rule`), so the evaluated document
+//!   is the request with the one member CloudFormation decides set on the way out: a rule's
+//!   `Rule.Name` is REQUIRED by that call, so a declaration that states none has the
+//!   resource's own computed name pushed for it ([`create_ses_receipt_rule`]). That name is
+//!   what the rule's `Ref` returns, and it is nested inside a property rather than being a
+//!   name property of its own, so the arm answers it as the resource's physical id.
+//!
 //! * `AWS::CodeCommit::Repository`'s properties are `CreateRepository`'s own members with a
 //!   lower-case initial (`RepositoryDescription`, `KmsKeyId`), with the repository's name
 //!   the one CloudFormation decides and `Tags` sent as that create's tag MAP. `Triggers` is
@@ -405,7 +415,8 @@ use super::template::{
     ROUTE53RESOLVER_RULE_ASSOCIATION, ROUTE53_HOSTED_ZONE, ROUTE53_RECORD_SET,
     S3VECTORS_BUCKET_SEGMENT, S3VECTORS_INDEX,
     S3VECTORS_VECTOR_BUCKET, SAGEMAKER_MODEL_PACKAGE_GROUP, SCHEDULER_SCHEDULE,
-    SCHEDULER_SCHEDULE_GROUP, SES_CONFIGURATION_SET, SNS_SUBSCRIPTION,
+    SCHEDULER_SCHEDULE_GROUP, SES_CONFIGURATION_SET, SES_RECEIPT_RULE, SES_RECEIPT_RULE_SET,
+    SNS_SUBSCRIPTION,
     SNS_TOPIC, SQS_QUEUE, SQS_QUEUE_INLINE_POLICY, SQS_QUEUE_POLICY,
     SSM_PARAMETER, STEP_FUNCTIONS_ACTIVITY,
     TRANSFER_SERVER, WAFV2_IP_SET, WAFV2_REGEX_PATTERN_SET, WAFV2_RULE_GROUP, WAFV2_WEB_ACL,
@@ -569,6 +580,12 @@ pub(super) enum Provisioner {
     ApiGatewayV2Authorizer,
     CodeCommitRepository,
     SesConfigurationSet,
+    /// `AWS::SES::ReceiptRuleSet`: a receipt rule set of Amazon SES, which
+    /// `CreateReceiptRuleSet` creates empty and `DeleteReceiptRuleSet` deletes.
+    SesReceiptRuleSet,
+    /// `AWS::SES::ReceiptRule`: one rule OF such a set, which `CreateReceiptRule` adds to
+    /// the set its declaration names and `DeleteReceiptRule` removes from it.
+    SesReceiptRule,
     BackupVault,
     BackupPlan,
     BackupSelection,
@@ -656,6 +673,8 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         APIGATEWAYV2_AUTHORIZER => Some(Provisioner::ApiGatewayV2Authorizer),
         CODECOMMIT_REPOSITORY => Some(Provisioner::CodeCommitRepository),
         SES_CONFIGURATION_SET => Some(Provisioner::SesConfigurationSet),
+        SES_RECEIPT_RULE_SET => Some(Provisioner::SesReceiptRuleSet),
+        SES_RECEIPT_RULE => Some(Provisioner::SesReceiptRule),
         BACKUP_VAULT => Some(Provisioner::BackupVault),
         BACKUP_PLAN => Some(Provisioner::BackupPlan),
         BACKUP_SELECTION => Some(Provisioner::BackupSelection),
@@ -960,6 +979,14 @@ impl Provisioner {
             Self::SesConfigurationSet => {
                 create_ses_configuration_set(ctx, region, resource).await
             }
+            // `AWS::SES::ReceiptRuleSet` publishes `RuleSetName` alone and
+            // `AWS::SES::ReceiptRule` publishes `After`, `Rule` and `RuleSetName`: neither
+            // type publishes a `Tags` property — Amazon SES holds no tags on either — so no
+            // tags are propagated to one.
+            Self::SesReceiptRuleSet => {
+                create_ses_receipt_rule_set(ctx, region, resource).await
+            }
+            Self::SesReceiptRule => create_ses_receipt_rule(ctx, region, resource).await,
             Self::BackupVault => {
                 create_backup_vault(ctx, region, resource, propagated).await
             }
@@ -1533,6 +1560,12 @@ impl Provisioner {
             Self::SesConfigurationSet => {
                 delete_ses_configuration_set(ctx, region, physical_resource_id).await
             }
+            Self::SesReceiptRuleSet => {
+                delete_ses_receipt_rule_set(ctx, region, physical_resource_id).await
+            }
+            // A rule is addressed by its own name AND the set that holds it, and only the
+            // resource's own declaration carries that set.
+            Self::SesReceiptRule => delete_ses_receipt_rule(ctx, region, resource).await,
             Self::BackupVault => {
                 delete_backup_vault(ctx, region, physical_resource_id).await
             }
@@ -1791,6 +1824,11 @@ impl Provisioner {
             Self::SesConfigurationSet => {
                 describe_ses_configuration_set(ctx, region, physical_resource_id).await
             }
+            Self::SesReceiptRuleSet => {
+                describe_ses_receipt_rule_set(ctx, region, physical_resource_id).await
+            }
+            // Read back by the same set-and-rule pair the delete addresses the rule by.
+            Self::SesReceiptRule => describe_ses_receipt_rule(ctx, region, resource).await,
             Self::BackupVault => {
                 describe_backup_vault(ctx, region, physical_resource_id).await
             }
@@ -10399,7 +10437,9 @@ fn query_members(
             QueryMember::Scalar => {
                 parameters.push((member.to_string(), attribute_text(value)));
             }
-            QueryMember::List(element) => push_list(&mut parameters, member, element, value),
+            QueryMember::List(element) => {
+                push_list(&mut parameters, member, element, value, 0)?
+            }
             QueryMember::Structure => push_structure(&mut parameters, member, value, 0)?,
         }
     }
@@ -10411,33 +10451,33 @@ fn query_members(
 ///
 /// A value the template did not write as a list is the one-entry list of itself, so a
 /// single value a template spells without the sequence syntax is not dropped.
+///
+/// Each entry is written the way a structure member is ([`push_structure`]), so an entry
+/// carrying a nested structure or list of its own — a receipt rule's action, which is one
+/// structure per kind of action — is WALKED to its leaves rather than flattened into the
+/// text of its JSON, which no member of the called operation would take. The walk is
+/// bounded for the reason [`MAX_PROPERTY_NESTING`] records.
 fn push_list(
     parameters: &mut Vec<(String, String)>,
     member: &str,
     element: &str,
     declared: &Value,
-) {
+    depth: usize,
+) -> Result<(), Refusal> {
     let entries: Vec<&Value> = match declared {
         Value::Array(values) => values.iter().collect(),
         single => vec![single],
     };
     for (index, value) in entries.iter().enumerate() {
         let position = index + 1;
-        match value {
-            Value::Object(entry) => {
-                for (name, inner) in entry {
-                    parameters.push((
-                        format!("{member}.{element}.{position}.{name}"),
-                        attribute_text(inner),
-                    ));
-                }
-            }
-            scalar => parameters.push((
-                format!("{member}.{element}.{position}"),
-                attribute_text(scalar),
-            )),
-        }
+        push_structure(
+            parameters,
+            &format!("{member}.{element}.{position}"),
+            value,
+            depth + 1,
+        )?;
     }
+    Ok(())
 }
 
 /// Write one STRUCTURE member into an awsQuery form body: each of its declared members
@@ -10463,7 +10503,7 @@ fn push_structure(
                 push_structure(parameters, &format!("{prefix}.{name}"), value, depth + 1)?;
             }
         }
-        Value::Array(_) => push_list(parameters, prefix, "member", declared),
+        Value::Array(_) => push_list(parameters, prefix, "member", declared, depth)?,
         scalar => parameters.push((prefix.to_string(), attribute_text(scalar))),
     }
     Ok(())
@@ -17522,6 +17562,269 @@ async fn call_ses(
         parameters,
     )
     .await
+}
+
+// ---------------------------------------------------------------------------
+// Amazon SES: AWS::SES::ReceiptRuleSet and AWS::SES::ReceiptRule
+// ---------------------------------------------------------------------------
+
+/// The error code Amazon SES answers for a receipt rule SET it does not hold:
+/// `RuleSetDoesNotExistException`'s own `awsQueryError` code
+/// (`smithy_query(query="operation", operation="DescribeReceiptRuleSet")`), which is what an
+/// awsQuery client branches on.
+const RULE_SET_DOES_NOT_EXIST: &str = "RuleSetDoesNotExist";
+
+/// The error code it answers for a receipt RULE a set it does hold carries no entry for
+/// (`RuleDoesNotExistException`'s own code, on `DescribeReceiptRule`).
+const RULE_DOES_NOT_EXIST: &str = "RuleDoesNotExist";
+
+/// The `AWS::SES::ReceiptRuleSet` properties this arm maps onto a call of the owning
+/// service: NONE of them, because `CreateReceiptRuleSet` takes nothing but the set's
+/// `RuleSetName` — which CloudFormation decides, and which
+/// [`RECEIPT_RULE_SET_PROPERTIES_NOT_SENT`] therefore lifts out.
+///
+/// Source: that type's CloudFormation resource reference against
+/// `smithy_query(operation="CreateReceiptRuleSet")`. The type publishes that one property,
+/// so an unpublished one reaches [`query_members`] against this empty catalogue and is
+/// REFUSED rather than reported as a set created without it.
+const RECEIPT_RULE_SET_PROPERTIES: &[(&str, QueryMember)] = &[];
+
+/// The `AWS::SES::ReceiptRuleSet` property the arm pushes itself: the set's name, which is
+/// this resource's physical id ("Ref returns the rule set name").
+const RECEIPT_RULE_SET_PROPERTIES_NOT_SENT: &[&str] = &["RuleSetName"];
+
+/// The `AWS::SES::ReceiptRule` properties `CreateReceiptRule` takes under the SAME member
+/// name, each as the awsQuery member of that call.
+///
+/// Source: that type's CloudFormation resource reference against
+/// `smithy_query(operation="CreateReceiptRule")` — the set the rule belongs to, the rule
+/// the new one is placed after, and the rule itself, spelled identically on both sides.
+const RECEIPT_RULE_PROPERTIES: &[(&str, QueryMember)] = &[
+    ("After", QueryMember::Scalar),
+    ("RuleSetName", QueryMember::Scalar),
+];
+
+/// The `AWS::SES::ReceiptRule` property the arm pushes itself: the rule, whose `Name`
+/// member CloudFormation decides ([`create_ses_receipt_rule`]).
+const RECEIPT_RULE_PROPERTIES_NOT_SENT: &[&str] = &["Rule"];
+
+/// The member of a declared `Rule` that carries the rule's own name, which is this
+/// resource's physical id ("Ref returns the receipt rule name") and a REQUIRED member of
+/// `CreateReceiptRule`'s `Rule` (`smithy_query(query="shape", shape="ReceiptRule")`).
+const RECEIPT_RULE_NAME_MEMBER: &str = "Name";
+
+/// The property that carries the rule the arm sends, and the awsQuery prefix its members
+/// are written under.
+const RECEIPT_RULE_MEMBER: &str = "Rule";
+
+/// Create the receipt rule set an `AWS::SES::ReceiptRuleSet` declares, under the name
+/// CloudFormation decided for it — this resource's physical id, which is what `Ref` returns
+/// for the type.
+///
+/// "Creates an empty receipt rule set": the rules of such a set are the
+/// `AWS::SES::ReceiptRule` resources declared against it, each its own resource of its own
+/// type, so this call carries none.
+async fn create_ses_receipt_rule_set(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    query_members(
+        &resource.properties,
+        RECEIPT_RULE_SET_PROPERTIES,
+        &[],
+        RECEIPT_RULE_SET_PROPERTIES_NOT_SENT,
+        SES_RECEIPT_RULE_SET,
+    )?;
+    call_ses(
+        ctx,
+        region,
+        "CreateReceiptRuleSet",
+        &[(
+            "RuleSetName".to_string(),
+            resource.physical_resource_id.clone(),
+        )],
+    )
+    .await?;
+    // "Ref returns the rule set name", which is the physical id the set was created under,
+    // and the type publishes no `Fn::GetAtt` attribute.
+    Ok(Created::default())
+}
+
+/// Delete the receipt rule set a stack created, addressed by its NAME — this resource's
+/// physical id.
+///
+/// `DeleteReceiptRuleSet` models no does-not-exist error at all ("deletes the specified
+/// receipt rule set and all of the receipt rules it contains"), so a set the owning service
+/// no longer holds is already in the state this delete asks for and that service says so
+/// itself. The one refusal it does model — the set email receiving is served by cannot be
+/// deleted — is reported as the refusal it is.
+async fn delete_ses_receipt_rule_set(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let parameters = vec![("RuleSetName".to_string(), physical_resource_id.to_string())];
+    call_ses(ctx, region, "DeleteReceiptRuleSet", &parameters).await?;
+    Ok(())
+}
+
+/// The receipt rule set as Amazon SES reports it NOW, for drift detection, keyed by the one
+/// property the declaring type spells. One it no longer holds was deleted.
+///
+/// `DescribeReceiptRuleSet` reports the set's name under its `Metadata`, so the reported
+/// document carries that name under the property the declaration states it as. The set's
+/// rules are not part of it: each is an `AWS::SES::ReceiptRule` resource of its own, with
+/// its own declaration and its own drift read.
+async fn describe_ses_receipt_rule_set(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let parameters = vec![("RuleSetName".to_string(), physical_resource_id.to_string())];
+    let answered = match call_ses(ctx, region, "DescribeReceiptRuleSet", &parameters).await {
+        Ok(answered) => answered,
+        Err(refusal) if refusal.code == RULE_SET_DOES_NOT_EXIST => return Ok(None),
+        Err(refusal) => return Err(refusal),
+    };
+    let mut reported = Map::new();
+    if let Some(name) = xml_scalar_children(&answered, "Metadata").get("Name") {
+        reported.insert("RuleSetName".to_string(), name.clone());
+    }
+    Ok(Some(Value::Object(reported)))
+}
+
+/// Create the receipt rule an `AWS::SES::ReceiptRule` declares, in the rule set its own
+/// declaration names.
+///
+/// The type's properties ARE `CreateReceiptRule`'s own members, so the evaluated document is
+/// the request — with the one member CloudFormation decides set on the way out: the rule's
+/// `Name` is a REQUIRED member of that call, so a declaration stating none has this
+/// resource's own computed name pushed for it rather than reaching the owning service as a
+/// rule with no name. That name is what the type's `Ref` returns, so it is answered as the
+/// resource's physical id. A declaration carrying no `Rule` structure at all describes no
+/// rule and is refused rather than sent as a rule carrying only that name.
+async fn create_ses_receipt_rule(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    let mut parameters = query_members(
+        &resource.properties,
+        RECEIPT_RULE_PROPERTIES,
+        &[],
+        RECEIPT_RULE_PROPERTIES_NOT_SENT,
+        SES_RECEIPT_RULE,
+    )?;
+    let declared = resource
+        .properties
+        .get(RECEIPT_RULE_MEMBER)
+        .cloned()
+        .unwrap_or(Value::Null);
+    let name = declared
+        .get(RECEIPT_RULE_NAME_MEMBER)
+        .and_then(scalar_text)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| resource.physical_resource_id.clone());
+    // `Rule` is the STRUCTURE the create asks for, and the type requires it: a declaration
+    // carrying no such structure describes no rule, so it is REFUSED here rather than sent
+    // as a rule carrying nothing but the name CloudFormation decided — the same reason
+    // [`query_members`] refuses a property this emulator sends nowhere.
+    let Value::Object(mut rule) = declared else {
+        return Err(Refusal {
+            code: MISSING_PROPERTY_CODE.to_string(),
+            message: format!(
+                "{} declares no {RECEIPT_RULE_MEMBER}",
+                resource.resource_type
+            ),
+        });
+    };
+    rule.insert(
+        RECEIPT_RULE_NAME_MEMBER.to_string(),
+        Value::String(name.clone()),
+    );
+    push_structure(
+        &mut parameters,
+        RECEIPT_RULE_MEMBER,
+        &Value::Object(rule),
+        0,
+    )?;
+    call_ses(ctx, region, "CreateReceiptRule", &parameters).await?;
+    Ok(Created {
+        physical_resource_id: Some(name),
+        attributes: BTreeMap::new(),
+    })
+}
+
+/// Delete the receipt rule a stack created, addressed by the PAIR Amazon SES holds one
+/// under: its own name — this resource's physical id — and the set that carries it, which
+/// only the resource's own declaration names.
+///
+/// `DeleteReceiptRule` models one error, for the SET: a set the owning service no longer
+/// holds carries no rules either, so that refusal is a request asking for a state that
+/// service is already in. A rule the set itself no longer carries is already in that state
+/// too, which `DeleteReceiptRule` answers as the success it is.
+async fn delete_ses_receipt_rule(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<(), Refusal> {
+    let parameters = vec![
+        (
+            "RuleSetName".to_string(),
+            required_property(resource, "RuleSetName")?,
+        ),
+        (
+            "RuleName".to_string(),
+            resource.physical_resource_id.clone(),
+        ),
+    ];
+    match call_ses(ctx, region, "DeleteReceiptRule", &parameters).await {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == RULE_SET_DOES_NOT_EXIST => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The receipt rule as Amazon SES reports it NOW, for drift detection: the set it is held
+/// in, read back by the same pair the delete addresses it by. A rule — or a set — the owning
+/// service no longer holds was deleted.
+///
+/// What is reported is the rule's PLACE, not its configuration: `DescribeReceiptRule`
+/// answers the rule as the nested action structures and recipient list of its own shape,
+/// which the XML readers here carry no document for, and reporting only the members they do
+/// carry would read as a REMOVAL of every member left out (see [`super::drift`]). So the
+/// declared `Rule` is compared against nothing rather than against a document missing most
+/// of it, while the rule's existence and the set it belongs to are reported.
+async fn describe_ses_receipt_rule(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Option<Value>, Refusal> {
+    let rule_set_name = required_property(resource, "RuleSetName")?;
+    let parameters = vec![
+        ("RuleSetName".to_string(), rule_set_name.clone()),
+        (
+            "RuleName".to_string(),
+            resource.physical_resource_id.clone(),
+        ),
+    ];
+    match call_ses(ctx, region, "DescribeReceiptRule", &parameters).await {
+        Ok(_) => {
+            let mut reported = Map::new();
+            reported.insert(
+                "RuleSetName".to_string(),
+                Value::String(rule_set_name),
+            );
+            Ok(Some(Value::Object(reported)))
+        }
+        Err(refusal)
+            if refusal.code == RULE_DOES_NOT_EXIST || refusal.code == RULE_SET_DOES_NOT_EXIST =>
+        {
+            Ok(None)
+        }
+        Err(refusal) => Err(refusal),
+    }
 }
 
 // ---------------------------------------------------------------------------

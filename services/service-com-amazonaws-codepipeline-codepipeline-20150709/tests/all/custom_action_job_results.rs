@@ -151,8 +151,12 @@ fn worker_action(name: &str, run_order: i64, configuration: Value, namespace: Op
     action
 }
 
-/// Create a pipeline whose one stage runs `actions`, start it, and answer the execution's
-/// id.
+/// Create a pipeline whose one stage runs `actions`, and answer the id of the execution
+/// its creation started.
+///
+/// Creating a pipeline RUNS it once — `TriggerType` carries `CreatePipeline` for that
+/// run — so the pipeline's first execution is the one the create began, and that is the
+/// execution whose job the worker in each case below reports for.
 async fn start(emulator: &Emulator, name: &str, actions: Value) -> String {
     emulator
         .ok(
@@ -165,11 +169,16 @@ async fn start(emulator: &Emulator, name: &str, actions: Value) -> String {
             }}),
         )
         .await;
-    emulator
-        .ok("StartPipelineExecution", &json!({"name": name}))
-        .await["pipelineExecutionId"]
-        .as_str()
-        .expect("a started execution carries its id")
+    let listed = emulator
+        .ok("ListPipelineExecutions", &json!({"pipelineName": name}))
+        .await;
+    listed["pipelineExecutionSummaries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|summary| summary["trigger"]["triggerType"] == json!("CreatePipeline"))
+        .and_then(|summary| summary["pipelineExecutionId"].as_str())
+        .unwrap_or_else(|| panic!("creating {name} ran it once, got {listed}"))
         .to_string()
 }
 

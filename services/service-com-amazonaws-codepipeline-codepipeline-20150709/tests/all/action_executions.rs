@@ -4,11 +4,15 @@
 //! `POST /` with `X-Amz-Target: CodePipeline_20150709.ListActionExecutions`).
 //!
 //! The rule under test: an action execution exists exactly for an action a pipeline
-//! execution has STARTED, so starting an execution records one `InProgress` action
-//! execution per action the executed pipeline version begins with — the actions of its
-//! first stage at that stage's lowest `runOrder` — and the listing reports those from
-//! the store, most recently started first, paging over them with an opaque cursor.
-//! Nothing later `runOrder` or stage has started yet, so no record for one is reported.
+//! execution has STARTED, so a pipeline reports one `InProgress` action execution per
+//! action each of its executions begins with — the actions of its first stage at that
+//! stage's lowest `runOrder` — and the listing reports those from the store, newest
+//! execution first, paging over them with an opaque cursor. Nothing of a later
+//! `runOrder` or stage has started yet, so no record for one is reported.
+//!
+//! Creating a pipeline RUNS it once, so every pipeline here carries its creation run's
+//! records too; a case asserting about the execution it started names that execution
+//! through the filter (`only`).
 //!
 //! Every action here is a `Custom`-owned source action, because such an action's work is
 //! performed by a job worker that reports its outcome through the API rather than by the
@@ -22,7 +26,7 @@
 
 use serde_json::{json, Value};
 
-use crate::pipeline_lifecycle::{Emulator, ROLE_ARN};
+use crate::pipeline_lifecycle::{creation_run, Emulator, ROLE_ARN};
 use service_com_amazonaws_codepipeline_codepipeline_20150709::state::{
     encode_page_token, CURSOR_ACTION_EXECUTION, CURSOR_EXECUTION, CURSOR_PIPELINE,
 };
@@ -108,6 +112,15 @@ async fn start(emulator: &Emulator, name: &str) -> String {
         .as_str()
         .expect("a started execution carries its id")
         .to_string()
+}
+
+/// A listing request for the action executions of ONE execution of `name`.
+///
+/// A pipeline always carries its creation run's action executions beside the ones a
+/// case starts, so a case asserting about the execution it started names it through the
+/// filter the model declares for exactly that.
+fn only(name: &str, execution_id: &str) -> Value {
+    json!({"pipelineName": name, "filter": {"pipelineExecutionId": execution_id}})
 }
 
 /// The `actionExecutionDetails` of a listing response.
@@ -242,7 +255,7 @@ async fn an_execution_records_the_actions_it_starts() {
         let execution_id = start(&emulator, &name).await;
 
         let page = emulator
-            .ok("ListActionExecutions", &json!({"pipelineName": name}))
+            .ok("ListActionExecutions", &only(&name, &execution_id))
             .await;
         let expected: Vec<(String, String)> = expected
             .iter()
@@ -296,37 +309,54 @@ async fn an_execution_records_the_actions_it_starts() {
     }
 }
 
-/// An action execution exists only once an execution has started the action: a
-/// pipeline nothing has run has none, and a pipeline's records go with it when it is
-/// deleted, so a pipeline recreated under the same name starts from none.
+/// An action execution exists only for an action one of the pipeline's executions has
+/// started: a pipeline carries the records of its own creation run and of nothing else,
+/// and a pipeline's records go with it when it is deleted, so a pipeline recreated under
+/// the same name reports only its new creation run's.
 #[tokio::test]
-async fn a_pipeline_whose_actions_never_started_reports_none() {
+async fn a_pipeline_reports_the_records_of_its_own_executions_only() {
     let emulator = Emulator::new();
     let declaration = pipeline("demo", vec![stage("Source", vec![action("Src", None)])]);
     let name = create(&emulator, &declaration).await;
 
+    let created = creation_run(&emulator, &name).await;
     let page = emulator
         .ok("ListActionExecutions", &json!({"pipelineName": name}))
         .await;
     assert_eq!(
-        page["actionExecutionDetails"],
-        json!([]),
-        "a pipeline that has never run has started no action, got {page}"
+        reported_actions(&page),
+        vec![("Source".to_string(), "Src".to_string())],
+        "the run the creation started reached the action, got {page}"
+    );
+    assert!(
+        details(&page)
+            .iter()
+            .all(|detail| detail["pipelineExecutionId"] == json!(created)),
+        "only the creation run has started an action, got {page}"
     );
     assert!(
         page["nextToken"].is_null(),
-        "an untruncated empty page issues no cursor, got {page}"
+        "a page that was not truncated issues no cursor, got {page}"
     );
 
-    start(&emulator, &name).await;
+    let started = start(&emulator, &name).await;
     emulator.ok("DeletePipeline", &json!({"name": name})).await;
     create(&emulator, &declaration).await;
     let page = emulator
         .ok("ListActionExecutions", &json!({"pipelineName": name}))
         .await;
-    assert_eq!(
-        page["actionExecutionDetails"],
-        json!([]),
+    let surviving: Vec<&str> = details(&page)
+        .iter()
+        .filter_map(|detail| {
+            detail["pipelineExecutionId"]
+                .as_str()
+                .filter(|id| *id == created.as_str() || *id == started.as_str())
+                .map(str::to_string)
+        })
+        .map(|_| "survivor")
+        .collect();
+    assert!(
+        surviving.is_empty(),
         "a deleted pipeline's action executions must not survive it, got {page}"
     );
 }
@@ -351,6 +381,7 @@ async fn the_listing_pages_newest_first_over_every_record() {
         ),
     )
     .await;
+    let created = creation_run(&emulator, &name).await;
     let older = start(&emulator, &name).await;
     let newer = start(&emulator, &name).await;
 
@@ -368,17 +399,20 @@ async fn the_listing_pages_newest_first_over_every_record() {
             newer.as_str(),
             older.as_str(),
             older.as_str(),
-            older.as_str()
+            older.as_str(),
+            created.as_str(),
+            created.as_str(),
+            created.as_str()
         ],
         "the most recently started execution's actions come first, got {whole:?}"
     );
 
-    // (case, page size, pages the walk must take for the six records held)
+    // (case, page size, pages the walk must take for the nine records held)
     let cases: [(&str, i64, usize); 5] = [
-        ("MaxResults' published minimum", 1, 6),
-        ("two per page", 2, 3),
-        ("a size that does not divide the total", 4, 2),
-        ("exactly the total", 6, 1),
+        ("MaxResults' published minimum", 1, 9),
+        ("three per page", 3, 3),
+        ("a size that does not divide the total", 4, 3),
+        ("exactly the total", 9, 1),
         ("MaxResults' published maximum", 100, 1),
     ];
     for (case, max_results, expected_pages) in cases {
@@ -410,10 +444,11 @@ async fn max_results_is_accepted_inside_its_modelled_range_and_refused_outside()
     start(&emulator, &name).await;
 
     // (case, maxResults, expected status, expected awsJson error code — "" for success,
-    //  records on the page)
+    //  records on the page). The pipeline holds four records: the two actions its
+    //  creation run started, and the two the start below did.
     let cases: [(&str, i64, u16, &str, usize); 4] = [
         ("the minimum MaxResults allows", 1, 200, "", 1),
-        ("the maximum MaxResults allows", 100, 200, "", 2),
+        ("the maximum MaxResults allows", 100, 200, "", 4),
         ("one below the minimum", 0, 400, "ValidationException", 0),
         ("one above the maximum", 101, 400, "ValidationException", 0),
     ];

@@ -51,7 +51,7 @@ pub struct Address {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.snowball#JobResource")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct JobResource {
     pub s3_resources: Option<Vec<S3Resource>>,
     pub lambda_resources: Option<Vec<LambdaResource>>,
@@ -59,7 +59,7 @@ pub struct JobResource {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.snowball#S3Resource")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct S3Resource {
     pub bucket_arn: Option<String>,
     pub key_range: Option<KeyRange>,
@@ -67,41 +67,41 @@ pub struct S3Resource {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.snowball#KeyRange")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct KeyRange {
     pub begin_marker: Option<String>,
     pub end_marker: Option<String>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.snowball#TargetOnDeviceService")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TargetOnDeviceService {
     pub service_name: Option<String>,
     pub transfer_option: Option<String>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.snowball#LambdaResource")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct LambdaResource {
     pub lambda_arn: Option<String>,
     pub event_triggers: Option<Vec<EventTriggerDefinition>>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.snowball#EventTriggerDefinition")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct EventTriggerDefinition {
     pub event_resource_arn: Option<String>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.snowball#Ec2AmiResource")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Ec2AmiResource {
     pub ami_id: String,
     pub snowball_ami_id: Option<String>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.snowball#OnDeviceServiceConfiguration")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct OnDeviceServiceConfiguration {
     pub nfs_on_device_service: Option<NFSOnDeviceServiceConfiguration>,
     pub tgw_on_device_service: Option<TGWOnDeviceServiceConfiguration>,
@@ -110,28 +110,28 @@ pub struct OnDeviceServiceConfiguration {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.snowball#NFSOnDeviceServiceConfiguration")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct NFSOnDeviceServiceConfiguration {
     pub storage_limit: i32,
     pub storage_unit: Option<String>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.snowball#TGWOnDeviceServiceConfiguration")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TGWOnDeviceServiceConfiguration {
     pub storage_limit: i32,
     pub storage_unit: Option<String>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.snowball#EKSOnDeviceServiceConfiguration")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct EKSOnDeviceServiceConfiguration {
     pub kubernetes_version: Option<String>,
     pub eks_anywhere_version: Option<String>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.snowball#S3OnDeviceServiceConfiguration")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct S3OnDeviceServiceConfiguration {
     pub storage_limit: Option<f64>,
     pub storage_unit: Option<String>,
@@ -140,7 +140,7 @@ pub struct S3OnDeviceServiceConfiguration {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.snowball#Notification")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Notification {
     pub sns_topic_arn: Option<String>,
     pub job_states_to_notify: Option<Vec<String>>,
@@ -149,13 +149,13 @@ pub struct Notification {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.snowball#TaxDocuments")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TaxDocuments {
     pub ind: Option<INDTaxDocuments>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.snowball#INDTaxDocuments")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct INDTaxDocuments {
     pub gstin: Option<String>,
 }

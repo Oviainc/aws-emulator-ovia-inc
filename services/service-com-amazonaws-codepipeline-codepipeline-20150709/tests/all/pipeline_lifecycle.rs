@@ -144,6 +144,28 @@ pub(crate) fn declaration(name: &str) -> Value {
     })
 }
 
+/// The id of the execution a pipeline's own CREATION started.
+///
+/// Creating a pipeline RUNS it once — `TriggerType` carries `CreatePipeline` for
+/// exactly that run — so every pipeline these suites create carries one execution
+/// before anything starts another, and this is how a case names it.
+///
+/// `pub(crate)` with the harness: the suites built on this `Emulator` name that run
+/// through this one lookup rather than growing a copy each.
+pub(crate) async fn creation_run(emulator: &Emulator, pipeline: &str) -> String {
+    let listed = emulator
+        .ok("ListPipelineExecutions", &json!({"pipelineName": pipeline}))
+        .await;
+    listed["pipelineExecutionSummaries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|summary| summary["trigger"]["triggerType"] == json!("CreatePipeline"))
+        .and_then(|summary| summary["pipelineExecutionId"].as_str())
+        .unwrap_or_else(|| panic!("creating {pipeline} ran it once, got {listed}"))
+        .to_string()
+}
+
 /// A source stage whose action is `Custom`-owned.
 ///
 /// The owner matters to every suite that STARTS an execution of these fixtures: a
@@ -1161,7 +1183,9 @@ async fn list_pipeline_executions_reports_newest_first_and_pages() {
         emulator
             .ok("CreatePipeline", &json!({"pipeline": declaration("demo")}))
             .await;
-        let mut started: Vec<String> = Vec::new();
+        // Creating the pipeline RAN it once, so the oldest execution of the five this
+        // listing pages over is that run (`TriggerType` carries `CreatePipeline`).
+        let mut started: Vec<String> = vec![creation_run(&emulator, "demo").await];
         for index in 0..4 {
             let response = emulator
                 .ok(
@@ -1268,6 +1292,19 @@ async fn delete_pipeline_removes_only_that_pipeline_and_its_executions() {
         .as_str()
         .expect("an id")
         .to_string();
+    // Every execution the pipeline about to be deleted holds — the run its creation
+    // started and the one the start above began — so what must not survive it is named
+    // rather than assumed.
+    let dropped = emulator
+        .ok("ListPipelineExecutions", &json!({"pipelineName": "drop"}))
+        .await;
+    let dropped_ids: Vec<Value> = dropped["pipelineExecutionSummaries"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .map(|summary| summary["pipelineExecutionId"].clone())
+        .collect();
 
     emulator.ok("DeletePipeline", &json!({"name": "drop"})).await;
 
@@ -1314,10 +1351,25 @@ async fn delete_pipeline_removes_only_that_pipeline_and_its_executions() {
     let executions = emulator
         .ok("ListPipelineExecutions", &json!({"pipelineName": "drop"}))
         .await;
-    assert_eq!(
-        executions["pipelineExecutionSummaries"],
-        json!([]),
+    let surviving: Vec<&Value> = executions["pipelineExecutionSummaries"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter(|summary| dropped_ids.contains(&summary["pipelineExecutionId"]))
+        .collect();
+    assert!(
+        surviving.is_empty(),
         "the deleted pipeline's executions did not survive, got {executions}"
+    );
+    // What the re-created pipeline does hold is the run its own creation started,
+    // which is a history of its own rather than the deleted pipeline's.
+    assert_eq!(
+        executions["pipelineExecutionSummaries"]
+            .as_array()
+            .map(Vec::len),
+        Some(1),
+        "the re-created pipeline holds its own creation run alone, got {executions}"
     );
 }
 
@@ -1529,7 +1581,9 @@ async fn reads_do_not_change_state() {
         executions["pipelineExecutionSummaries"]
             .as_array()
             .map(Vec::len),
-        Some(1),
+        // The two the calls above began: the run the pipeline's creation started and
+        // the one the start did. A read adds none.
+        Some(2),
         "reading must not start an execution, got {executions}"
     );
 }

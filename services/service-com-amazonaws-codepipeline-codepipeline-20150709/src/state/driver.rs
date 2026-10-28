@@ -4,9 +4,10 @@
 //! work that materialising it performs.
 //!
 //! [`advance`] is the one entry point. It alternates between the store (under the
-//! lock, planning the next due step) and the emulator's own S3 service (without the
-//! lock, performing an action's artifact I/O over the framework's in-process
-//! callback), so no step is ever reported as done without the bytes having moved.
+//! lock, planning the next due step) and the emulated services an action's work runs
+//! through (without the lock: S3 for artifact I/O, CodeCommit for a source revision,
+//! Lambda for an invoke action — each over the framework's in-process callback), so no
+//! step is ever reported as done without the work having been performed.
 //!
 //! See [`super::execution`] for the data model and for why a reporting operation is
 //! allowed to run this at all (every step carries the instant the CLOCK made it due).
@@ -19,6 +20,7 @@ use super::execution::{
     is_terminal_status, transition_held, ArtifactRef, Job, JobOutcome,
     ACTION_STEP, CLAIM_TIMEOUT, FAILURE_CONFIGURATION_ERROR, FAILURE_JOB_FAILED,
     MAX_ADVANCE_STEPS, MAX_ARCHIVE_ENTRIES, MAX_EXTRACTED_BYTES, MAX_EXTRACTED_ENTRY_BYTES,
+    MAX_SOURCE_BYTES, MAX_SOURCE_FILES,
     STATUS_FAILED, STATUS_STOPPED, STATUS_STOPPING, STATUS_SUCCEEDED, TRANSITION_INBOUND,
     TRANSITION_OUTBOUND,
 };
@@ -39,8 +41,27 @@ const CATEGORY_SOURCE: &str = "Source";
 /// See [`CATEGORY_SOURCE`].
 const CATEGORY_DEPLOY: &str = "Deploy";
 
-/// The `provider` of the action types this engine can actually run.
+/// The `provider` of the action types this engine performs through S3.
 const PROVIDER_S3: &str = "S3";
+
+/// The `provider` of a source action whose revisions live in a CodeCommit repository.
+const PROVIDER_CODE_COMMIT: &str = "CodeCommit";
+
+/// The `provider` of an action whose work is an invocation of a Lambda function.
+const PROVIDER_LAMBDA: &str = "Lambda";
+
+/// The configuration key naming the repository a CodeCommit source action reads
+/// (CodePipeline's action-structure reference for the CodeCommit source action).
+const CONFIG_REPOSITORY_NAME: &str = "RepositoryName";
+
+/// The configuration key naming the branch a CodeCommit source action reads.
+const CONFIG_BRANCH_NAME: &str = "BranchName";
+
+/// The configuration key naming the function a Lambda action invokes.
+const CONFIG_FUNCTION_NAME: &str = "FunctionName";
+
+/// The configuration key carrying the text a Lambda action's event passes through.
+const CONFIG_USER_PARAMETERS: &str = "UserParameters";
 
 /// `ActionExecutionStatus` values.
 const ACTION_IN_PROGRESS: &str = "InProgress";
@@ -534,6 +555,9 @@ fn start_action(
     let action = &mut record.stages[stage].actions[index];
     action.status = Some(ACTION_IN_PROGRESS.to_string());
     action.last_status_change = now;
+    // The instant the execution REACHED this action, which is what the action
+    // execution's `startTime` reports however long its work then takes.
+    action.start_time = Some(now);
     let Some(declared) = declared else {
         fail_action(
             action,
@@ -624,6 +648,128 @@ fn start_action(
         };
         super::enqueue_job_into(context.jobs, &declared.action_type_id, job);
         return None;
+    }
+
+    if category == CATEGORY_SOURCE && provider == PROVIDER_CODE_COMMIT {
+        // A CodeCommit source action's revision is a commit of the repository its
+        // configuration names, on the branch it names: the work is reading that
+        // branch's tip and producing the files at it as the output artifact. Both
+        // keys are what CodePipeline's CodeCommit source action declares, so a
+        // declaration missing either cannot name a revision at all.
+        if let Some(key) = &artifact_encryption_key {
+            let detail = format!(
+                "the pipeline's artifact store declares the customer managed key {key}, \
+                 and this emulator cannot encrypt an artifact object with KMS, so the \
+                 artifact cannot be produced as declared"
+            );
+            fail_action(action, FAILURE_CONFIGURATION_ERROR, &detail, now);
+            return None;
+        }
+        let (Some(repository), Some(branch)) = (
+            config.get(CONFIG_REPOSITORY_NAME),
+            config.get(CONFIG_BRANCH_NAME),
+        ) else {
+            fail_action(
+                action,
+                FAILURE_CONFIGURATION_ERROR,
+                &format!(
+                    "a CodeCommit source action must declare the configuration keys \
+                     {CONFIG_REPOSITORY_NAME} and {CONFIG_BRANCH_NAME}"
+                ),
+                now,
+            );
+            return None;
+        };
+        if output_artifacts.is_empty() {
+            fail_action(
+                action,
+                FAILURE_CONFIGURATION_ERROR,
+                "a CodeCommit source action must declare an output artifact to produce",
+                now,
+            );
+            return None;
+        }
+        let outputs = output_artifacts
+            .iter()
+            .map(|name| ArtifactRef {
+                bucket: artifact_bucket.clone(),
+                key: artifact_key(&pipeline_name, name),
+                revision: None,
+            })
+            .collect();
+        action.claimed = Some(now);
+        return Some(Job::CodeCommitSource {
+            execution_id,
+            stage,
+            action: index,
+            repository: repository.clone(),
+            branch: branch.clone(),
+            outputs,
+        });
+    }
+
+    if provider == PROVIDER_LAMBDA {
+        // A Lambda action's work IS the invocation of the function its configuration
+        // names ("the function to invoke" is the action's `FunctionName`), with
+        // `UserParameters` passed through to it, so the action is performed by calling
+        // that function and its outcome is what the invocation answered.
+        let Some(function_name) = config.get(CONFIG_FUNCTION_NAME) else {
+            fail_action(
+                action,
+                FAILURE_CONFIGURATION_ERROR,
+                &format!(
+                    "a {provider} {category} action must declare the configuration key \
+                     {CONFIG_FUNCTION_NAME}"
+                ),
+                now,
+            );
+            return None;
+        };
+        // The artifacts the function is handed are the ones the earlier actions
+        // produced, at the locations they produced them at; a declared input nothing
+        // produced means the action cannot run as declared.
+        let mut inputs = Vec::with_capacity(input_artifacts.len());
+        for name in &input_artifacts {
+            let Some(location) = produced.get(name).cloned() else {
+                fail_action(
+                    action,
+                    FAILURE_CONFIGURATION_ERROR,
+                    &format!("the input artifact {name} was not produced by an earlier action"),
+                    now,
+                );
+                return None;
+            };
+            inputs.push((name.clone(), location));
+        }
+        let outputs = output_artifacts
+            .iter()
+            .map(|name| {
+                (
+                    name.clone(),
+                    ArtifactRef {
+                        bucket: artifact_bucket.clone(),
+                        key: artifact_key(&pipeline_name, name),
+                        revision: None,
+                    },
+                )
+            })
+            .collect();
+        action.claimed = Some(now);
+        return Some(Job::LambdaInvoke {
+            execution_id,
+            stage,
+            action: index,
+            function_name: function_name.clone(),
+            user_parameters: config.get(CONFIG_USER_PARAMETERS).cloned(),
+            // The id the event publishes for this run. CodePipeline does not queue a
+            // pollable job for an action it owns ("PollForJobs is valid only for action
+            // types with Custom in the owner field"), so the handle the event carries is
+            // the action execution's own id, which is how every reporting operation of
+            // this service addresses this run.
+            job_id: action.action_execution_id.clone(),
+            inputs,
+            outputs,
+        });
     }
 
     if category == CATEGORY_SOURCE && provider == PROVIDER_S3 {
@@ -845,17 +991,23 @@ fn record_outcome(
             summary,
             revision,
             variables,
+            external_id,
         } => {
             action.status = Some(ACTION_SUCCEEDED.to_string());
             action.claimed = None;
             action.summary = Some(summary);
             action.last_status_change = now;
-            if let Job::S3Source { outputs, .. } = job {
-                for (name, location) in output_names.iter().zip(outputs.iter()) {
-                    let mut location = location.clone();
-                    location.revision = revision.clone();
-                    record.artifacts.insert(name.clone(), location);
+            action.external_execution_id = external_id;
+            let produced = match job {
+                Job::S3Source { outputs, .. } | Job::CodeCommitSource { outputs, .. } => {
+                    outputs.as_slice()
                 }
+                _ => &[],
+            };
+            for (name, location) in output_names.iter().zip(produced.iter()) {
+                let mut location = location.clone();
+                location.revision = revision.clone();
+                record.artifacts.insert(name.clone(), location);
             }
             if let Some(namespace) = namespace {
                 for (key, value) in &variables {
@@ -864,7 +1016,15 @@ fn record_outcome(
                         .insert(format!("{namespace}.{key}"), value.clone());
                 }
             }
-            if let Some(revision) = revision {
+            // `SourceRevision` is what a SOURCE action resolved — `sourceRevisions` is
+            // "the source revisions for a pipeline execution" — so only a source
+            // action's revision is recorded there; an action that merely consumed an
+            // artifact produced from a revision did not resolve one.
+            let sourced = matches!(
+                job,
+                Job::S3Source { .. } | Job::CodeCommitSource { .. }
+            );
+            if let (true, Some(revision)) = (sourced, revision) {
                 let existing = record
                     .source_revisions
                     .iter_mut()
@@ -880,8 +1040,13 @@ fn record_outcome(
                 }
             }
         }
-        JobOutcome::Failed { code, message } => {
+        JobOutcome::Failed {
+            code,
+            message,
+            external_id,
+        } => {
             fail_action(action, &code, &message, now);
+            action.external_execution_id = external_id;
         }
     }
     record.last_update_time = now;
@@ -920,13 +1085,60 @@ fn s3_client(
     ::aws_sdk_s3::Client::from_conf(config)
 }
 
+/// A CodeCommit client over the in-process callback into this same emulator.
+///
+/// Built exactly like [`s3_client`], for the same reasons: a fixed endpoint literal, the
+/// emulator's own credentials, and no retry, timeout or stalled-stream machinery, because
+/// the transport is in process.
+fn code_commit_client(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> ::aws_sdk_codecommit::Client {
+    let config = ::aws_sdk_codecommit::Config::builder()
+        .behavior_version(::aws_sdk_codecommit::config::BehaviorVersion::latest())
+        .region(::aws_sdk_codecommit::config::Region::new(region.to_string()))
+        .endpoint_url(super::in_process_endpoint("codecommit"))
+        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .http_client(ctx.callback().http_client())
+        .retry_config(::aws_sdk_codecommit::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_codecommit::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_codecommit::config::IdentityCache::no_cache())
+        .stalled_stream_protection(
+            ::aws_sdk_codecommit::config::StalledStreamProtectionConfig::disabled(),
+        )
+        .build();
+    ::aws_sdk_codecommit::Client::from_conf(config)
+}
+
+/// A Lambda client over the in-process callback into this same emulator.
+///
+/// Built exactly like [`s3_client`], for the same reasons.
+fn lambda_client(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> ::aws_sdk_lambda::Client {
+    let config = ::aws_sdk_lambda::Config::builder()
+        .behavior_version(::aws_sdk_lambda::config::BehaviorVersion::latest())
+        .region(::aws_sdk_lambda::config::Region::new(region.to_string()))
+        .endpoint_url(super::in_process_endpoint("lambda"))
+        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .http_client(ctx.callback().http_client())
+        .retry_config(::aws_sdk_lambda::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_lambda::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_lambda::config::IdentityCache::no_cache())
+        .stalled_stream_protection(
+            ::aws_sdk_lambda::config::StalledStreamProtectionConfig::disabled(),
+        )
+        .build();
+    ::aws_sdk_lambda::Client::from_conf(config)
+}
+
 /// Perform one claimed job's real work.
 async fn run_job(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     job: &Job,
 ) -> JobOutcome {
-    let client = s3_client(ctx, region);
     match job {
         Job::S3Source {
             bucket,
@@ -934,15 +1146,404 @@ async fn run_job(
             version_id,
             outputs,
             ..
-        } => run_source(&client, bucket, key, version_id.as_deref(), outputs).await,
+        } => {
+            run_source(
+                &s3_client(ctx, region),
+                bucket,
+                key,
+                version_id.as_deref(),
+                outputs,
+            )
+            .await
+        }
+        Job::CodeCommitSource {
+            repository,
+            branch,
+            outputs,
+            ..
+        } => {
+            run_code_commit_source(
+                &code_commit_client(ctx, region),
+                &s3_client(ctx, region),
+                repository,
+                branch,
+                outputs,
+            )
+            .await
+        }
+        Job::LambdaInvoke {
+            function_name,
+            user_parameters,
+            job_id,
+            inputs,
+            outputs,
+            ..
+        } => {
+            run_lambda_invoke(
+                &lambda_client(ctx, region),
+                function_name,
+                user_parameters.as_deref(),
+                job_id,
+                inputs,
+                outputs,
+            )
+            .await
+        }
         Job::S3Deploy {
             input,
             bucket,
             key,
             extract,
             ..
-        } => run_deploy(&client, input, bucket, key.as_deref(), *extract).await,
+        } => {
+            run_deploy(
+                &s3_client(ctx, region),
+                input,
+                bucket,
+                key.as_deref(),
+                *extract,
+            )
+            .await
+        }
     }
+}
+
+/// Resolve the branch's tip commit and write the repository's files at it into the
+/// artifact store.
+///
+/// The revision a CodeCommit source action ran is that commit: it is the artifact's
+/// revision, the output variable the later actions resolve, and the external execution
+/// the action reports. A repository or a branch the declaration names and the service
+/// does not hold is a declaration this pipeline cannot source from at all, which is what
+/// the `ConfigurationError` failure type reports; anything that goes wrong while the
+/// bytes are being moved is the run's own failure (`JobFailed`).
+async fn run_code_commit_source(
+    code_commit: &::aws_sdk_codecommit::Client,
+    s3: &::aws_sdk_s3::Client,
+    repository: &str,
+    branch: &str,
+    outputs: &[ArtifactRef],
+) -> JobOutcome {
+    let tip = code_commit
+        .get_branch()
+        .repository_name(repository)
+        .branch_name(branch)
+        .send()
+        .await;
+    let commit_id = match tip {
+        Ok(answer) => answer
+            .branch
+            .and_then(|info| info.commit_id)
+            .unwrap_or_default(),
+        Err(err) => {
+            let service = err.as_service_error();
+            let unreachable = service.is_some_and(|err| {
+                err.is_repository_does_not_exist_exception()
+                    || err.is_branch_does_not_exist_exception()
+            });
+            let code = if unreachable {
+                FAILURE_CONFIGURATION_ERROR
+            } else {
+                FAILURE_JOB_FAILED
+            };
+            return JobOutcome::Failed {
+                code: code.to_string(),
+                message: format!(
+                    "the branch {branch} of the repository {repository} could not be \
+                     resolved: {}",
+                    ::aws_smithy_types::error::display::DisplayErrorContext(&err)
+                ),
+                external_id: None,
+            };
+        }
+    };
+    if commit_id.is_empty() {
+        return JobOutcome::Failed {
+            code: FAILURE_CONFIGURATION_ERROR.to_string(),
+            message: format!(
+                "the branch {branch} of the repository {repository} reports no commit, so \
+                 there is no revision to source"
+            ),
+            external_id: None,
+        };
+    }
+
+    // Every file the commit holds, as the comparison against the empty tree reports it:
+    // with no `beforeCommitSpecifier` "all changes before the afterCommitSpecifier value
+    // are shown", so each of the commit's files is an addition. The comparison is PAGED,
+    // so the pages are followed to the end — a revision packed from the first page alone
+    // would be a short artifact reported as the whole commit — and the file count is
+    // checked as the pages accumulate, so the walk is bounded by [`MAX_SOURCE_FILES`]
+    // however many pages the answer has.
+    let mut files: Vec<(String, String)> = Vec::new();
+    let mut page_token: Option<String> = None;
+    loop {
+        let compared = code_commit
+            .get_differences()
+            .repository_name(repository)
+            .after_commit_specifier(&commit_id)
+            .set_next_token(page_token.clone())
+            .send()
+            .await;
+        let answer = match compared {
+            Ok(answer) => answer,
+            Err(err) => {
+                return JobOutcome::Failed {
+                    code: FAILURE_JOB_FAILED.to_string(),
+                    message: format!(
+                        "the files of the commit {commit_id} could not be read: {}",
+                        ::aws_smithy_types::error::display::DisplayErrorContext(&err)
+                    ),
+                    external_id: Some(commit_id),
+                }
+            }
+        };
+        files.extend(
+            answer
+                .differences
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|difference| {
+                    let blob = difference.after_blob?;
+                    Some((blob.path?, blob.blob_id?))
+                }),
+        );
+        if files.len() > MAX_SOURCE_FILES {
+            return JobOutcome::Failed {
+                code: FAILURE_JOB_FAILED.to_string(),
+                message: format!(
+                    "the commit {commit_id} carries more than the {MAX_SOURCE_FILES} files \
+                     this emulator packs into a source artifact"
+                ),
+                external_id: Some(commit_id),
+            };
+        }
+        page_token = answer.next_token;
+        if page_token.is_none() {
+            break;
+        }
+    }
+
+    // The bytes of each file, read one blob at a time and accounted against the budget
+    // as they arrive, so no commit can drive an allocation past the stated figure.
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::with_capacity(files.len());
+    let mut packed = 0usize;
+    for (path, blob_id) in files {
+        let blob = code_commit
+            .get_blob()
+            .repository_name(repository)
+            .blob_id(&blob_id)
+            .send()
+            .await;
+        let content = match blob {
+            Ok(answer) => answer.content.into_inner(),
+            Err(err) => {
+                return JobOutcome::Failed {
+                    code: FAILURE_JOB_FAILED.to_string(),
+                    message: format!(
+                        "the file {path} of the commit {commit_id} could not be read: {}",
+                        ::aws_smithy_types::error::display::DisplayErrorContext(&err)
+                    ),
+                    external_id: Some(commit_id),
+                }
+            }
+        };
+        packed = packed.saturating_add(content.len());
+        if packed > MAX_SOURCE_BYTES {
+            return JobOutcome::Failed {
+                code: FAILURE_JOB_FAILED.to_string(),
+                message: format!(
+                    "the commit {commit_id} carries more than the {MAX_SOURCE_BYTES} bytes \
+                     this emulator packs into a source artifact"
+                ),
+                external_id: Some(commit_id),
+            };
+        }
+        entries.push((path, content));
+    }
+
+    // The artifact a source action produces is the archive of the revision's files,
+    // which is what a later deploy action extracts. Building it is synchronous CPU work,
+    // so it runs on the blocking pool rather than on the worker serving this request.
+    let count = entries.len();
+    let archive = match ::tokio::task::spawn_blocking(move || zip_of(&entries)).await {
+        Ok(Ok(archive)) => archive,
+        Ok(Err(detail)) => {
+            return JobOutcome::Failed {
+                code: FAILURE_JOB_FAILED.to_string(),
+                message: format!("the source artifact could not be packed: {detail}"),
+                external_id: Some(commit_id),
+            }
+        }
+        Err(err) => {
+            return JobOutcome::Failed {
+                code: FAILURE_JOB_FAILED.to_string(),
+                message: format!("the source artifact was not packed: {err}"),
+                external_id: Some(commit_id),
+            }
+        }
+    };
+    for output in outputs {
+        if let Err(err) = s3
+            .put_object()
+            .bucket(&output.bucket)
+            .key(&output.key)
+            .body(::aws_sdk_s3::primitives::ByteStream::from(archive.clone()))
+            .send()
+            .await
+        {
+            return JobOutcome::Failed {
+                code: FAILURE_JOB_FAILED.to_string(),
+                message: format!(
+                    "the artifact could not be written to s3://{}/{}: {}",
+                    output.bucket,
+                    output.key,
+                    ::aws_smithy_types::error::display::DisplayErrorContext(&err)
+                ),
+                external_id: Some(commit_id),
+            };
+        }
+    }
+
+    // The output variables a CodeCommit source action publishes for the later actions of
+    // its execution, under the namespace the action declares.
+    let mut variables = BTreeMap::new();
+    variables.insert("CommitId".to_string(), commit_id.clone());
+    variables.insert("RepositoryName".to_string(), repository.to_string());
+    variables.insert("BranchName".to_string(), branch.to_string());
+    JobOutcome::Done {
+        summary: format!(
+            "Packed {count} file(s) of the commit {commit_id} on {branch} of {repository} as \
+             the output artifact"
+        ),
+        revision: Some(commit_id.clone()),
+        variables,
+        external_id: Some(commit_id),
+    }
+}
+
+/// Invoke the function a Lambda action names, and report what the invocation answered.
+///
+/// The event is the one CodePipeline publishes for such an action: the job's id, the
+/// action's `UserParameters` and the artifacts the function is handed and is to write.
+/// A function the service does not hold cannot be invoked as the declaration states it
+/// (`ConfigurationError`); a function it holds but whose invocation did not run is the
+/// run's own failure (`JobFailed`), and NOTHING is reported as having run in that case.
+async fn run_lambda_invoke(
+    lambda: &::aws_sdk_lambda::Client,
+    function_name: &str,
+    user_parameters: Option<&str>,
+    job_id: &str,
+    inputs: &[(String, ArtifactRef)],
+    outputs: &[(String, ArtifactRef)],
+) -> JobOutcome {
+    let artifact_list = |artifacts: &[(String, ArtifactRef)]| {
+        artifacts
+            .iter()
+            .map(|(name, location)| {
+                ::serde_json::json!({
+                    "name": name,
+                    "location": {
+                        "type": "S3",
+                        "s3Location": {
+                            "bucketName": location.bucket,
+                            "objectKey": location.key,
+                        },
+                    },
+                })
+            })
+            .collect::<Vec<::serde_json::Value>>()
+    };
+    let mut action_configuration = ::serde_json::Map::new();
+    action_configuration.insert(
+        CONFIG_FUNCTION_NAME.to_string(),
+        ::serde_json::Value::String(function_name.to_string()),
+    );
+    if let Some(parameters) = user_parameters {
+        action_configuration.insert(
+            CONFIG_USER_PARAMETERS.to_string(),
+            ::serde_json::Value::String(parameters.to_string()),
+        );
+    }
+    let event = ::serde_json::json!({
+        "CodePipeline.job": {
+            "id": job_id,
+            "accountId": ::engine::emulator_account_id(),
+            "data": {
+                "actionConfiguration": {"configuration": action_configuration},
+                "inputArtifacts": artifact_list(inputs),
+                "outputArtifacts": artifact_list(outputs),
+            },
+        }
+    });
+    let invoked = lambda
+        .invoke()
+        .function_name(function_name)
+        .payload(::aws_smithy_types::Blob::new(event.to_string().into_bytes()))
+        .send()
+        .await;
+    match invoked {
+        Ok(answer) => {
+            // A function that ran and reported a handler error did not do the action's
+            // work, so the action failed with what the function reported.
+            if let Some(error) = answer.function_error {
+                return JobOutcome::Failed {
+                    code: FAILURE_JOB_FAILED.to_string(),
+                    message: format!(
+                        "the function {function_name} reported {error} for the action's \
+                         invocation"
+                    ),
+                    external_id: Some(function_name.to_string()),
+                };
+            }
+            JobOutcome::Done {
+                summary: format!("Invoked the function {function_name}"),
+                // The invocation is not a revision of anything: a Lambda action
+                // produces no source revision.
+                revision: None,
+                variables: BTreeMap::new(),
+                external_id: Some(function_name.to_string()),
+            }
+        }
+        Err(err) => {
+            let absent = err
+                .as_service_error()
+                .is_some_and(::aws_sdk_lambda::operation::invoke::InvokeError::is_resource_not_found_exception);
+            let code = if absent {
+                FAILURE_CONFIGURATION_ERROR
+            } else {
+                FAILURE_JOB_FAILED
+            };
+            JobOutcome::Failed {
+                code: code.to_string(),
+                message: format!(
+                    "the function {function_name} could not be invoked for this action: {}",
+                    ::aws_smithy_types::error::display::DisplayErrorContext(&err)
+                ),
+                external_id: Some(function_name.to_string()),
+            }
+        }
+    }
+}
+
+/// The archive of `entries`, as a source action packs a revision's files.
+///
+/// Writing the archive format is the `zip` crate's job, not this emulator's; the entry
+/// count and the total size are bounded by the caller before anything is read
+/// ([`MAX_SOURCE_FILES`], [`MAX_SOURCE_BYTES`]).
+fn zip_of(entries: &[(String, Vec<u8>)]) -> Result<Vec<u8>, String> {
+    let mut cursor = ::std::io::Cursor::new(Vec::new());
+    {
+        let mut writer = ::zip::ZipWriter::new(&mut cursor);
+        for (path, body) in entries {
+            writer
+                .start_file(path.as_str(), ::zip::write::SimpleFileOptions::default())
+                .map_err(|err| err.to_string())?;
+            ::std::io::Write::write_all(&mut writer, body).map_err(|err| err.to_string())?;
+        }
+        writer.finish().map_err(|err| err.to_string())?;
+    }
+    Ok(cursor.into_inner())
 }
 
 /// Read the source object and write it into the artifact store.
@@ -969,6 +1570,7 @@ async fn run_source(
                     "the source object s3://{bucket}/{key} could not be read: {}",
                     ::aws_smithy_types::error::display::DisplayErrorContext(&err)
                 ),
+                external_id: None,
             }
         }
     };
@@ -980,6 +1582,7 @@ async fn run_source(
             return JobOutcome::Failed {
                 code: FAILURE_JOB_FAILED.to_string(),
                 message: format!("the source object s3://{bucket}/{key} could not be read: {err}"),
+                external_id: None,
             }
         }
     };
@@ -1000,6 +1603,7 @@ async fn run_source(
                     output.key,
                     ::aws_smithy_types::error::display::DisplayErrorContext(&err)
                 ),
+                external_id: None,
             };
         }
     }
@@ -1016,6 +1620,9 @@ async fn run_source(
         summary: format!("Source object s3://{bucket}/{key} delivered as the output artifact"),
         revision: version.or(etag),
         variables,
+        // The object's own version is the revision, not an external run: no system
+        // outside this emulator performed the action's work.
+        external_id: None,
     }
 }
 
@@ -1044,6 +1651,7 @@ async fn run_deploy(
                     input.key,
                     ::aws_smithy_types::error::display::DisplayErrorContext(&err)
                 ),
+                external_id: None,
             }
         }
     };
@@ -1053,6 +1661,7 @@ async fn run_deploy(
             return JobOutcome::Failed {
                 code: FAILURE_JOB_FAILED.to_string(),
                 message: format!("the input artifact could not be read: {err}"),
+                external_id: None,
             }
         }
     };
@@ -1079,6 +1688,7 @@ async fn run_deploy(
                     message: format!(
                         "the artifact could not be extracted before deploy: {detail}"
                     ),
+                    external_id: None,
                 }
             }
         }
@@ -1092,6 +1702,7 @@ async fn run_deploy(
                 message: "an S3 deploy action that does not extract the artifact must \
                           declare the configuration key ObjectKey"
                     .to_string(),
+                external_id: None,
             };
         };
         vec![(key.to_string(), bytes.to_vec())]
@@ -1113,6 +1724,7 @@ async fn run_deploy(
                     "the artifact could not be deployed to s3://{bucket}/{object_key}: {}",
                     ::aws_smithy_types::error::display::DisplayErrorContext(&err)
                 ),
+                external_id: None,
             };
         }
     }
@@ -1120,6 +1732,8 @@ async fn run_deploy(
         summary: format!("Deployed {count} object(s) to s3://{bucket}/{prefix}"),
         revision: input.revision.clone(),
         variables: BTreeMap::new(),
+        // The delivery ran here, not in a system outside this emulator.
+        external_id: None,
     }
 }
 

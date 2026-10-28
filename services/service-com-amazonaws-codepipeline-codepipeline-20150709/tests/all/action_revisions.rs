@@ -106,8 +106,14 @@ fn source_action(name: &str, key: &str) -> Value {
     })
 }
 
-/// The executions a pipeline has, newest first, as `ListPipelineExecutions` reports
-/// them.
+/// The executions a REPORTED REVISION started, newest first, as
+/// `ListPipelineExecutions` reports them.
+///
+/// Creating a pipeline runs it once — `TriggerType` carries `CreatePipeline` for
+/// exactly that run — so every pipeline here already carries one execution before a
+/// revision is reported for it. What this suite is about is the executions a revision
+/// report starts, so that run is left out of these counts; the slots it occupies are
+/// what the concurrency rows below account for.
 async fn executions(emulator: &Emulator, pipeline: &str) -> Vec<Value> {
     let listed = emulator
         .ok("ListPipelineExecutions", &json!({"pipelineName": pipeline}))
@@ -116,6 +122,9 @@ async fn executions(emulator: &Emulator, pipeline: &str) -> Vec<Value> {
         .as_array()
         .cloned()
         .unwrap_or_default()
+        .into_iter()
+        .filter(|summary| summary["trigger"]["triggerType"] != json!("CreatePipeline"))
+        .collect()
 }
 
 /// A revision no action carries yet is new, is recorded, and starts exactly one
@@ -585,7 +594,10 @@ async fn a_new_revision_past_the_concurrency_bound_is_refused() {
             )
             .await;
 
-        for index in 0..limit {
+        // One of the pipeline's slots is already taken by the run its creation started,
+        // so the reports that fit inside the bound are one fewer than the bound.
+        let reports_inside_the_bound = limit - 1;
+        for index in 0..reports_inside_the_bound {
             let put = emulator
                 .ok(
                     "PutActionRevision",
@@ -645,7 +657,7 @@ async fn a_new_revision_past_the_concurrency_bound_is_refused() {
         let summaries = executions(&emulator, "demo").await;
         assert_eq!(
             summaries.len(),
-            limit,
+            reports_inside_the_bound,
             "case {case:?}: a refused revision starts no execution, got {} summaries",
             summaries.len()
         );
@@ -656,7 +668,10 @@ async fn a_new_revision_past_the_concurrency_bound_is_refused() {
                     "pipelineName": "demo",
                     "stageName": "Source",
                     "actionName": "SrcA",
-                    "actionRevision": revision(&format!("rev-{}", limit - 1), "change"),
+                    "actionRevision": revision(
+                        &format!("rev-{}", reports_inside_the_bound - 1),
+                        "change",
+                    ),
                 }),
             )
             .await;
@@ -733,7 +748,9 @@ async fn an_execution_started_by_another_call_occupies_the_bound() {
             &json!({"pipeline": two_source_actions("parallel", Some("PARALLEL"))}),
         )
         .await;
-    for index in 0..limit {
+    // One slot is already taken by the run the pipeline's creation started, so the
+    // starts that fit inside the bound are one fewer than the bound.
+    for index in 0..limit - 1 {
         let started = emulator
             .call("StartPipelineExecution", &json!({"name": "parallel"}))
             .await;

@@ -60,6 +60,23 @@ fn declaration_with(name: &str, site: &str, value: Value) -> Value {
     })
 }
 
+/// A two-stage declaration whose SECOND stage carries `site` set to `value`.
+///
+/// The conditions sit on a stage no execution has reached: the first stage's action is
+/// `Custom`-owned, so the run the pipeline's creation started waits there for its job
+/// worker and the stage after it is never entered. That is what makes "declared but
+/// never evaluated" observable.
+fn unreached_conditions(name: &str, site: &str, value: Value) -> Value {
+    let mut stage = build_stage("Gate", 1);
+    stage[site] = value;
+    json!({
+        "name": name,
+        "roleArn": ROLE_ARN,
+        "artifactStore": {"type": "S3", "location": "my-bucket"},
+        "stages": [source_stage("Source"), stage],
+    })
+}
+
 /// Create `pipeline`, start `executions` executions of it, and return the pipeline's
 /// name with the ids those starts minted.
 async fn seed(emulator: &Emulator, pipeline: Value, executions: usize) -> (String, Vec<String>) {
@@ -400,8 +417,8 @@ async fn a_filter_execution_id_must_name_an_execution_of_that_pipeline() {
 }
 
 /// A pipeline that DOES configure condition rules reports no rule execution until one
-/// has been evaluated: declaring a rule is not running it, so a pipeline nothing has
-/// started yet answers the same empty page — and the call is answered rather than
+/// has been evaluated: declaring a rule is not running it, so rules on a stage no
+/// execution has reached report nothing — and the call is answered rather than
 /// refused, whichever site declares the rules and however many it declares.
 ///
 /// The rows span every site a stage can carry conditions at, and both ends of
@@ -452,7 +469,8 @@ async fn a_pipeline_that_declares_condition_rules_has_none_until_one_is_evaluate
 
     for (case, site, value) in cases {
         let emulator = Emulator::new();
-        let (name, _) = seed(&emulator, declaration_with("ruled", site, value), 0).await;
+        let (name, _) =
+            seed(&emulator, unreached_conditions("ruled", site, value), 0).await;
         let page = emulator
             .ok("ListRuleExecutions", &json!({"pipelineName": name}))
             .await;

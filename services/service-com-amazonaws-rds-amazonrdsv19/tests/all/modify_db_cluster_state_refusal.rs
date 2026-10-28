@@ -1,0 +1,437 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! End-to-end tests for how `ModifyDBCluster` WORDS the modelled state fault it refuses
+//! with when the cluster it names is not in a state the modification can be performed in —
+//! the refusal two overlapping modifications of one cluster make the loser see.
+//!
+//! The rule under test: `ModifyDBCluster` refuses a cluster that is not in a state the
+//! operation can be performed in with `InvalidDBClusterStateFault` (HTTP 400, the
+//! `awsQueryError` code `InvalidDBClusterStateFault` —
+//! `smithy_query(query="operation", operation="ModifyDBCluster")`) carrying ONE fixed
+//! sentence, into which nothing from the request or from the store is interpolated: not the
+//! `DBClusterIdentifier` the request carried and not the status the cluster is in. So a
+//! caller matching on the text to tell a concurrency collision from another refusal of the
+//! same fault sees the same string every time, including the retry hint that says the call
+//! can be made again.
+//!
+//! The table spans what the rule generalises over: WHICH status blocks the modification
+//! (one still coming up, one applying another modification, one whose stop is running, one
+//! whose stop has finished, one in a failover and one on its way out), both cluster TYPES
+//! `CreateDBCluster` documents across four of the engines `Engine` publishes, the spelling
+//! and length of the identifier the request carries (mixed case, and the published
+//! 1-to-63/1-to-52-character bound of each cluster type), and which settings the refused
+//! modification names (a number, a boolean, a window, a log-export list).
+//!
+//! Every call goes over the wire through the harness in `db_instances.rs`, so the
+//! assertions read the XML the emulator itself answered with.
+
+use service_com_amazonaws_rds_amazonrdsv19::state::{
+    db_cluster_identifier_max_len, DB_CLUSTER_STATUS_AVAILABLE, DB_CLUSTER_STATUS_CREATING,
+    DB_CLUSTER_STATUS_DELETING, DB_CLUSTER_STATUS_FAILING_OVER, DB_CLUSTER_STATUS_MODIFYING,
+    DB_CLUSTER_STATUS_STOPPED, DB_CLUSTER_STATUS_STOPPING,
+    MODIFY_DB_CLUSTER_INVALID_STATE_MESSAGE,
+};
+use smithy_server_runtime::MultiServiceRouter;
+
+use crate::db_instances::{
+    call, emulator, expect_error, expect_ok, subtrees, text, wait_for_settle, REGION,
+};
+
+/// The settings a Multi-AZ DB cluster requires, as `CreateDBCluster` documents them for
+/// that cluster type ("This setting is required to create a Multi-AZ DB cluster").
+const MULTI_AZ_SETTINGS: &[(&str, &str)] = &[
+    ("AllocatedStorage", "100"),
+    ("DBClusterInstanceClass", "db.m6gd.xlarge"),
+    ("StorageType", "io1"),
+    ("Iops", "1000"),
+];
+
+/// The `BackupRetentionPeriod` the WINNING modification of the overlapping pair names, and
+/// the one the loser names: the two differ, so the row can check the refused call changed
+/// nothing.
+const WINNING_RETENTION: &str = "3";
+const LOSING_RETENTION: &str = "9";
+
+/// How the test puts a cluster into a status the modification cannot be performed in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Blocked {
+    /// Straight after `CreateDBCluster`, inside the span the create owes.
+    StillCreating,
+    /// Another `ModifyDBCluster` is still applying — the overlapping pair.
+    ApplyingAModification,
+    /// `StopDBCluster` has been accepted and its span has not elapsed.
+    Stopping,
+    /// The stop has finished and the cluster sits in its settled status.
+    Stopped,
+    /// `FailoverDBCluster` has been accepted and its span has not elapsed.
+    FailingOver,
+    /// `DeleteDBCluster` has been accepted and the record is inside the span it owes.
+    BeingDeleted,
+}
+
+impl Blocked {
+    /// The `Status` the cluster reports when the refused modification arrives.
+    fn status(self) -> &'static str {
+        match self {
+            Blocked::StillCreating => DB_CLUSTER_STATUS_CREATING,
+            Blocked::ApplyingAModification => DB_CLUSTER_STATUS_MODIFYING,
+            Blocked::Stopping => DB_CLUSTER_STATUS_STOPPING,
+            Blocked::Stopped => DB_CLUSTER_STATUS_STOPPED,
+            Blocked::FailingOver => DB_CLUSTER_STATUS_FAILING_OVER,
+            Blocked::BeingDeleted => DB_CLUSTER_STATUS_DELETING,
+        }
+    }
+}
+
+/// One row: a cluster, the status it is in when the modification arrives, and the
+/// modification that is refused.
+struct RefusalCase {
+    case: &'static str,
+    /// The `DBClusterIdentifier` the create names; stored folded to lower case.
+    identifier: String,
+    engine: &'static str,
+    /// The parameters the create carries beyond `DBClusterIdentifier` and `Engine`.
+    create_extra: Vec<(&'static str, String)>,
+    blocked: Blocked,
+    /// The settings the REFUSED modification names.
+    modification: Vec<(&'static str, String)>,
+}
+
+impl RefusalCase {
+    /// The member DB instance a failover needs to have something to promote.
+    fn member_identifier(&self) -> String {
+        format!("{}-m", self.identifier)
+    }
+}
+
+/// `(name, value)` pairs owned so a row can hold them.
+fn owned(pairs: &[(&'static str, &str)]) -> Vec<(&'static str, String)> {
+    pairs
+        .iter()
+        .map(|(name, value)| (*name, (*value).to_string()))
+        .collect()
+}
+
+/// A `DBClusterIdentifier` of exactly the length its member admits for `engine`'s cluster
+/// type ("Must contain from 1 to 63 (for Aurora DB clusters) or 1 to 52 (for Multi-AZ DB
+/// clusters) letters, numbers, or hyphens"), so the published bound is one of the rows.
+fn identifier_at_the_published_bound(engine: &str, prefix: &str) -> String {
+    let max = db_cluster_identifier_max_len(engine);
+    let mut identifier = prefix.to_string();
+    identifier.extend(std::iter::repeat_n('a', max - prefix.len()));
+    assert_eq!(
+        identifier.len(),
+        max,
+        "the row at the published bound must be {max} characters, got {}",
+        identifier.len()
+    );
+    identifier
+}
+
+/// The table: one row per status that blocks a modification, across both cluster types.
+fn refusal_cases() -> Vec<RefusalCase> {
+    vec![
+        RefusalCase {
+            case: "an Aurora Serverless v2 cluster already applying another modification",
+            identifier: "emu-modstate-serverless".to_string(),
+            engine: "aurora-postgresql",
+            create_extra: owned(&[
+                ("ServerlessV2ScalingConfiguration.MinCapacity", "0.5"),
+                ("ServerlessV2ScalingConfiguration.MaxCapacity", "1.0"),
+            ]),
+            blocked: Blocked::ApplyingAModification,
+            modification: owned(&[("BackupRetentionPeriod", LOSING_RETENTION)]),
+        },
+        RefusalCase {
+            case: "a cluster still coming up, named in mixed case",
+            identifier: "EMU-ModState-Creating".to_string(),
+            engine: "aurora-mysql",
+            create_extra: Vec::new(),
+            blocked: Blocked::StillCreating,
+            modification: owned(&[("Port", "3307")]),
+        },
+        RefusalCase {
+            case: "a Multi-AZ DB cluster still coming up, at its 52-character bound",
+            identifier: identifier_at_the_published_bound("mysql", "emu-modstate-multiaz-"),
+            engine: "mysql",
+            create_extra: owned(MULTI_AZ_SETTINGS),
+            blocked: Blocked::StillCreating,
+            modification: owned(&[("BackupRetentionPeriod", "35")]),
+        },
+        RefusalCase {
+            case: "a cluster whose stop is still running",
+            identifier: "emu-modstate-stopping".to_string(),
+            engine: "aurora-mysql",
+            create_extra: Vec::new(),
+            blocked: Blocked::Stopping,
+            modification: owned(&[("DeletionProtection", "true")]),
+        },
+        RefusalCase {
+            case: "a DocumentDB cluster whose stop has finished",
+            identifier: "emu-modstate-stopped".to_string(),
+            engine: "docdb",
+            create_extra: owned(&[
+                ("MasterUsername", "emuadmin"),
+                ("MasterUserPassword", "pw1-Secret"),
+            ]),
+            blocked: Blocked::Stopped,
+            modification: owned(&[("PreferredBackupWindow", "04:00-04:30")]),
+        },
+        RefusalCase {
+            case: "a cluster in a failover",
+            identifier: "emu-modstate-failover".to_string(),
+            engine: "aurora-postgresql",
+            create_extra: Vec::new(),
+            blocked: Blocked::FailingOver,
+            modification: owned(&[(
+                "CloudwatchLogsExportConfiguration.EnableLogTypes.member.1",
+                "audit",
+            )]),
+        },
+        RefusalCase {
+            case: "a cluster on its way out, at its 63-character bound",
+            identifier: identifier_at_the_published_bound("aurora-mysql", "emu-modstate-deleting-"),
+            engine: "aurora-mysql",
+            create_extra: Vec::new(),
+            blocked: Blocked::BeingDeleted,
+            modification: owned(&[("BackupRetentionPeriod", WINNING_RETENTION)]),
+        },
+    ]
+}
+
+/// `CreateDBCluster` for one row.
+async fn create_cluster(router: &MultiServiceRouter, row: &RefusalCase) -> (u16, String) {
+    let mut request: Vec<(&str, String)> = vec![
+        ("DBClusterIdentifier", row.identifier.clone()),
+        ("Engine", row.engine.to_string()),
+    ];
+    request.extend(row.create_extra.iter().cloned());
+    call(router, "CreateDBCluster", &request).await
+}
+
+/// `ModifyDBCluster` naming `identifier` and carrying `settings`.
+async fn modify_cluster(
+    router: &MultiServiceRouter,
+    identifier: &str,
+    settings: &[(&'static str, String)],
+) -> (u16, String) {
+    let mut request: Vec<(&str, String)> =
+        vec![("DBClusterIdentifier", identifier.to_string())];
+    request.extend(settings.iter().cloned());
+    call(router, "ModifyDBCluster", &request).await
+}
+
+/// The one `DBCluster` subtree `DescribeDBClusters` reports for `identifier`.
+async fn describe_cluster(router: &MultiServiceRouter, case: &str, identifier: &str) -> String {
+    let body = expect_ok(
+        case,
+        call(
+            router,
+            "DescribeDBClusters",
+            &[("DBClusterIdentifier", identifier)],
+        )
+        .await,
+    );
+    let found = subtrees(&body, "DBCluster");
+    assert_eq!(
+        found.len(),
+        1,
+        "case {case:?}: expected exactly one DBCluster, got {} in {body}",
+        found.len()
+    );
+    found.into_iter().next().expect("checked just above")
+}
+
+#[tokio::test]
+async fn a_modification_of_a_cluster_in_a_blocking_state_is_refused_with_one_fixed_sentence() {
+    let router = emulator();
+    let cases = refusal_cases();
+
+    // Every cluster whose blocking call needs it `available` first, plus the member
+    // instance a failover has to have something to promote. One wait settles them all.
+    for row in &cases {
+        if row.blocked == Blocked::StillCreating {
+            continue;
+        }
+        expect_ok(row.case, create_cluster(&router, row).await);
+        if row.blocked == Blocked::FailingOver {
+            expect_ok(
+                row.case,
+                call(
+                    &router,
+                    "CreateDBInstance",
+                    &[
+                        ("DBInstanceIdentifier", row.member_identifier().as_str()),
+                        ("Engine", row.engine),
+                        ("DBInstanceClass", "db.serverless"),
+                        ("DBClusterIdentifier", row.identifier.as_str()),
+                        ("AvailabilityZone", format!("{REGION}a").as_str()),
+                    ],
+                )
+                .await,
+            );
+        }
+    }
+    wait_for_settle();
+
+    // The stops that must have FINISHED when the modification arrives, settled together.
+    let mut stopped_any = false;
+    for row in &cases {
+        if row.blocked == Blocked::Stopped {
+            expect_ok(
+                row.case,
+                call(
+                    &router,
+                    "StopDBCluster",
+                    &[("DBClusterIdentifier", row.identifier.as_str())],
+                )
+                .await,
+            );
+            stopped_any = true;
+        }
+    }
+    if stopped_any {
+        wait_for_settle();
+    }
+
+    // One row at a time, with no wait inside the loop, so the transient status each
+    // blocking call leaves is still the one the refused modification meets.
+    for row in &cases {
+        let case = row.case;
+        match row.blocked {
+            Blocked::StillCreating => {
+                expect_ok(case, create_cluster(&router, row).await);
+            }
+            Blocked::ApplyingAModification => {
+                expect_ok(
+                    case,
+                    modify_cluster(
+                        &router,
+                        &row.identifier,
+                        &owned(&[("BackupRetentionPeriod", WINNING_RETENTION)]),
+                    )
+                    .await,
+                );
+            }
+            Blocked::Stopping => {
+                expect_ok(
+                    case,
+                    call(
+                        &router,
+                        "StopDBCluster",
+                        &[("DBClusterIdentifier", row.identifier.as_str())],
+                    )
+                    .await,
+                );
+            }
+            Blocked::Stopped => {}
+            Blocked::FailingOver => {
+                expect_ok(
+                    case,
+                    call(
+                        &router,
+                        "FailoverDBCluster",
+                        &[("DBClusterIdentifier", row.identifier.as_str())],
+                    )
+                    .await,
+                );
+            }
+            Blocked::BeingDeleted => {
+                expect_ok(
+                    case,
+                    call(
+                        &router,
+                        "DeleteDBCluster",
+                        &[
+                            ("DBClusterIdentifier", row.identifier.as_str()),
+                            ("SkipFinalSnapshot", "true"),
+                        ],
+                    )
+                    .await,
+                );
+            }
+        }
+
+        // The cluster really is in the status this row is about: the refusal below is the
+        // state precondition answering, not some other check.
+        let reported = describe_cluster(&router, case, &row.identifier).await;
+        let status = text(&reported, "Status");
+        assert_eq!(
+            status,
+            row.blocked.status(),
+            "case {case:?}: expected the cluster to be {:?} when the modification arrives, \
+             got {status:?}",
+            row.blocked.status()
+        );
+
+        let refused = expect_error(
+            case,
+            modify_cluster(&router, &row.identifier, &row.modification).await,
+            400,
+            "InvalidDBClusterStateFault",
+        );
+        let message = text(&refused, "Message");
+        assert_eq!(
+            message, MODIFY_DB_CLUSTER_INVALID_STATE_MESSAGE,
+            "case {case:?}: expected the one fixed wording \
+             {MODIFY_DB_CLUSTER_INVALID_STATE_MESSAGE:?}, got {message:?}"
+        );
+        let folded = row.identifier.to_ascii_lowercase();
+        assert!(
+            !message.to_ascii_lowercase().contains(&folded),
+            "case {case:?}: the refusal must not interpolate the cluster identifier, got \
+             {message:?}"
+        );
+        assert!(
+            !message.contains(row.blocked.status()),
+            "case {case:?}: the refusal must not interpolate the cluster status {:?}, got \
+             {message:?}",
+            row.blocked.status()
+        );
+
+        // Nothing the refused modification named reached the store: it is refused on the
+        // cluster's STATE, and a refusal changes nothing a later caller sees.
+        let after = describe_cluster(&router, case, &row.identifier).await;
+        let status_after = text(&after, "Status");
+        assert_eq!(
+            status_after,
+            row.blocked.status(),
+            "case {case:?}: expected the refused modification to leave the status alone, \
+             got {status_after:?}"
+        );
+    }
+
+    // The refusal was about the STATE: once the clock has settled the overlapping pair's
+    // cluster, the winner's value is the one it kept and a further modification is taken.
+    wait_for_settle();
+    let overlapping = cases
+        .iter()
+        .find(|row| row.blocked == Blocked::ApplyingAModification)
+        .expect("the table carries an overlapping-modification row");
+    let settled = describe_cluster(&router, overlapping.case, &overlapping.identifier).await;
+    let status = text(&settled, "Status");
+    assert_eq!(
+        status, DB_CLUSTER_STATUS_AVAILABLE,
+        "case {:?}: expected the cluster to settle back to {DB_CLUSTER_STATUS_AVAILABLE}, \
+         got {status:?}",
+        overlapping.case
+    );
+    let retention = text(&settled, "BackupRetentionPeriod");
+    assert_eq!(
+        retention, WINNING_RETENTION,
+        "case {:?}: expected the accepted modification's value {WINNING_RETENTION:?} and \
+         not the refused one's {LOSING_RETENTION:?}, got {retention:?}",
+        overlapping.case
+    );
+    let accepted = expect_ok(
+        overlapping.case,
+        modify_cluster(&router, &overlapping.identifier, &overlapping.modification).await,
+    );
+    let status = text(&accepted, "Status");
+    assert_eq!(
+        status, DB_CLUSTER_STATUS_MODIFYING,
+        "case {:?}: expected the same modification to be taken once the cluster is \
+         available, got {status:?}",
+        overlapping.case
+    );
+}

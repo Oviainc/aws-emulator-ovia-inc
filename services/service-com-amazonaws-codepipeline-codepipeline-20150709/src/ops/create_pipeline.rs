@@ -6,6 +6,12 @@
 //! pipeline's ARN and its created/updated instants, and answers with the stored
 //! declaration — so a later `GetPipeline` reports the same stages and actions.
 //!
+//! Creating a pipeline also RUNS it once: the create starts one execution of the stored
+//! declaration, whose `trigger.triggerType` is `CreatePipeline`, and drives the
+//! execution plane (`crate::state::execution`) from there, so the pipeline has an
+//! execution history — and whatever its source action resolves, or cannot resolve — from
+//! the moment it exists.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -207,11 +213,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let arn = ::engine::emulator_arn(
-            crate::state::ARN_SERVICE,
-            &crate::state::request_region(&ctx.parts().headers),
-            &name,
-        );
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let arn = ::engine::emulator_arn(crate::state::ARN_SERVICE, &region, &name);
         // Tags created with the pipeline are judged by the same rule every operation
         // that sets tags on a resource of this service applies
         // (`state::validate_tags`), each defect reported as the error shape the model
@@ -272,8 +275,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-            state.pipelines.insert(name, pipeline);
+            state.pipelines.insert(name.clone(), pipeline);
+            // Creating a pipeline RUNS it once: the `TriggerType` enum carries
+            // `CreatePipeline` for exactly that run, so the pipeline has an execution
+            // history from the moment it exists, and whatever its source action
+            // resolves (or cannot resolve) is reported against that execution rather
+            // than leaving the pipeline looking as though nothing ever triggered it.
+            // The run carries no caller input, so it is started through the one path
+            // such a start takes (`state::start_execution`).
+            crate::state::start_execution(
+                &mut state,
+                &name,
+                crate::state::TRIGGER_TYPE_CREATE_PIPELINE,
+                &region,
+                ::std::time::SystemTime::now(),
+            );
         }
+
+        // The run's first step is not due yet (it becomes due a span from now), so this
+        // only publishes the start; the steps the clock makes due are materialised by
+        // whichever call comes after each one.
+        crate::state::advance(&*self.engine, ctx, &name).await;
 
         Ok(CreatePipelineOutput {
             pipeline: Some(stored),
