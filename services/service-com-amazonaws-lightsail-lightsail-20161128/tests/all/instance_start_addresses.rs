@@ -262,7 +262,9 @@ pub(crate) fn attach_static_ip(
 /// allocated to the account.
 ///
 /// Only the attachment is released: what `DetachStaticIp` then does to the
-/// instance's own address is that operation's business, and it is still a stub.
+/// instance's own address is that operation's business, pinned where that
+/// operation is tested (`static_ip_detach.rs`), so this case makes the release
+/// alone and asserts only what the next START draws.
 fn detach_static_ip(emulator: &Emulator, static_ip_name: &str, instance_name: &str) {
     lightsail_state::with_state(emulator.engine(), |store| {
         store

@@ -2,7 +2,9 @@
 
 //! @op DeleteExperimentDefinition
 //! IMPLEMENTED: archives the stored experiment definition, or removes it outright,
-//! according to the `DeleteType` the request asks for.
+//! according to the `DeleteType` the request asks for — unless an experiment of that
+//! definition is still running, which refuses the call and leaves the definition and its
+//! runs exactly as they were.
 //!
 //! `DeleteType` is optional and the model documents no default for it, so which deletion
 //! a request that names none asks for is read off the operation itself: it is documented
@@ -247,6 +249,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // A definition whose experiment is still running is not deleted at all: while any
+        // run of it is RUNNING — the state the definition itself reports as `ACTIVE` — the
+        // call is refused as a bad request and writes nothing, so the live experiment and
+        // the run history it has produced survive a delete aimed at them and the caller is
+        // told to stop the run first. The guard is the running experiment, not the kind of
+        // deletion asked for, so it holds for every `DeleteType` the operation offers:
+        // neither removing the record nor hiding it from the active list is a thing to do
+        // to an experiment that is still delivering treatments. A definition with no run in
+        // flight — the one reporting `IDLE`, or already archived — is deleted exactly as
+        // before.
+        let Some(definition) = application.experiment_definitions.get(&definition_id) else {
+            return Err(DeleteExperimentDefinitionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The experiment definition could not be read after it was resolved"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        if definition.active_run().is_some() {
+            // An attribution record for the refusal: which records were addressed and what
+            // this call answered, so a destructive call that changed nothing leaves a trace
+            // beside the ones that did. The ids this call resolved and nothing the caller
+            // sent.
+            tracing::debug!(
+                operation = "DeleteExperimentDefinition",
+                outcome = "BadRequestException",
+                application_id = application_id.as_str(),
+                experiment_definition_id = definition_id.as_str(),
+                "refused an experiment definition delete while an experiment is running"
+            );
+            return Err(DeleteExperimentDefinitionErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::experiment_definition_not_deletable(
+                        &input.experiment_definition_identifier,
+                    )),
+                    reason: None,
+                    details: None,
+                },
+            )
+            .into());
+        }
 
         if delete_type == crate::state::DELETE_TYPE_ARCHIVE {
             // An archiving delete PRESERVES the record and takes it out of the active set,

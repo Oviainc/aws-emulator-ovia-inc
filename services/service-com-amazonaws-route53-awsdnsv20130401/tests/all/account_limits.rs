@@ -39,10 +39,14 @@ async fn get_account_limit(router: &MultiServiceRouter, limit_type: &str) -> Rep
 }
 
 /// `(Limit/Type, Limit/Value, Count)` as a successful reply reports them.
-fn reported(reply: &Reply, case: &str) -> (String, String, String) {
+///
+/// `pub(crate)` so the sibling suite over the PER-ZONE limits reads a limit
+/// reply the same way — both operations answer the same `(Limit, Count)` pair —
+/// rather than growing a second copy of this.
+pub(crate) fn reported(reply: &Reply, case: &str) -> (String, String, String) {
     assert_eq!(
         reply.status, 200,
-        "case {case:?}: expected 200 from GetAccountLimit, got {} with body {}",
+        "case {case:?}: expected 200 from the limit read, got {} with body {}",
         reply.status, reply.body
     );
     let pick = |path: &str| {

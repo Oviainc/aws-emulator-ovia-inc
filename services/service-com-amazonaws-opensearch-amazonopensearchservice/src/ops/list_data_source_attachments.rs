@@ -157,8 +157,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = service_state(&*self.engine).ok_or_else(state_unavailable)?;
+
+        // IAM decides whether the caller may do this BEFORE the application or its
+        // attachments are looked up, so a caller no identity-based policy permits is
+        // told it is not authorized rather than told anything about the resources the
+        // request names.
+        crate::state::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::authorization::data_source_attachment_resource(ctx),
+        )
+        .map_err(ListDataSourceAttachmentsErrorModeled::AccessDeniedException)?;
 
         // `maxResults` publishes no range at all, so the only value that is not a page
         // size is a negative one, and that is refused rather than reinterpreted. The

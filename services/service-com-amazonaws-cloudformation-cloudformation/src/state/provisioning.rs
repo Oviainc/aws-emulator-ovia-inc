@@ -188,7 +188,7 @@ use std::time::SystemTime;
 
 use serde_json::Value;
 
-use super::provisioner::provisioner_for;
+use super::provisioner::{provisioner_for, Provisioner};
 use super::StoredResource;
 
 /// The awsJson media types the services this module calls speak, named once here because
@@ -574,7 +574,10 @@ pub async fn advance_stabilisations(
                             stack.fail_stabilisation(
                                 now,
                                 &barrier.logical_id,
-                                &handler_failure_reason(&refusal),
+                                &handler_failure_reason(
+                                    provisioner_for(&barrier.resource_type),
+                                    &refusal,
+                                ),
                             )
                         } else {
                             None
@@ -780,7 +783,10 @@ pub async fn reconcile(
                         outcome.transitions.push(ResourceTransition::finished(
                             &resource,
                             super::resource_status::UPDATE_FAILED,
-                            Some(handler_failure_reason(&refusal)),
+                            Some(handler_failure_reason(
+                                provisioner_for(&resource.resource_type),
+                                &refusal,
+                            )),
                         ));
                         outcome.resources.push(resource);
                         break;
@@ -833,7 +839,10 @@ pub async fn reconcile(
                     outcome.transitions.push(ResourceTransition::finished(
                         &resource,
                         super::resource_status::UPDATE_FAILED,
-                        Some(handler_failure_reason(&refusal)),
+                        Some(handler_failure_reason(
+                            provisioner_for(&resource.resource_type),
+                            &refusal,
+                        )),
                     ));
                     outcome.resources.push(resource);
                     break;
@@ -1006,7 +1015,7 @@ pub async fn reconcile(
                         outcome.transitions.push(ResourceTransition::finished(
                             &resource,
                             super::resource_status::CREATE_FAILED,
-                            Some(handler_failure_reason(&refusal)),
+                            Some(handler_failure_reason(owner, &refusal)),
                         ));
                         outcome.resources.push(resource);
                         break;
@@ -1021,7 +1030,7 @@ pub async fn reconcile(
                 outcome.transitions.push(ResourceTransition::failed(
                     &resource,
                     super::resource_status::CREATE_FAILED,
-                    handler_failure_reason(&refusal),
+                    handler_failure_reason(owner, &refusal),
                 ));
                 outcome.resources.push(resource);
                 break;
@@ -1358,7 +1367,10 @@ async fn delete_pass(
                     super::failed_action::DELETE,
                     [outcome.resources[index].logical_id.as_str()],
                 ));
-                let reason = handler_failure_reason(&refusal);
+                let reason = handler_failure_reason(
+                    provisioner_for(&outcome.resources[index].resource_type),
+                    &refusal,
+                );
                 let resource = &outcome.resources[index];
                 outcome.transitions.push(ResourceTransition::finished(
                     resource,
@@ -1457,6 +1469,50 @@ impl ::std::fmt::Display for Refusal {
 /// a failed create — the status it came back with is what the stack's reason reports.
 const UNNAMED_CODE_PREFIX: &str = "HTTP ";
 
+/// The SDK service NAME the diagnostic below names a called service by, per SIGNING name.
+///
+/// A resource provider calls the service that owns the type through an AWS SDK, and what it
+/// reports when that call is refused is the SDK's exception message: the service's own
+/// message followed by the SDK's own diagnostic of the call ([`sdk_diagnostic`]). The
+/// service in that diagnostic is the SDK's name for it, which is NOT the signing name the
+/// request was signed with — Amazon OpenSearch Service signs `es` and its SDK names it
+/// `OpenSearch`, that model's own `sdkId`.
+///
+/// One entry per service whose reported wording this emulator pins; a service with no entry
+/// has its message reported exactly as it worded it, with no diagnostic invented for it.
+const SDK_SERVICE_NAMES: &[(&str, &str)] = &[("es", "OpenSearch")];
+
+/// The diagnostic an AWS SDK appends to the message of the exception it raises for a refused
+/// call: which service refused it, the HTTP status it answered with and the id of the call.
+///
+/// `None` for a service [`SDK_SERVICE_NAMES`] does not name, which leaves the message as
+/// that service worded it.
+///
+/// The request id is this call's own, minted per call as every identifier this service hands
+/// out is: the in-process answer carries none of its own, and the id identifies the CALL
+/// rather than anything about the resource.
+fn sdk_diagnostic(signing_name: &str, status: u16) -> Option<String> {
+    let service = SDK_SERVICE_NAMES
+        .iter()
+        .find(|(name, _)| *name == signing_name)
+        .map(|(_, service)| *service)?;
+    Some(format!(
+        "(Service: {service}, Status Code: {status}, Request ID: {})",
+        super::new_request_id()
+    ))
+}
+
+/// One refused answer's message as the SDK of the called service raises it: the message that
+/// service worded, then that SDK's diagnostic of the call where this crate words one
+/// ([`sdk_diagnostic`]).
+fn sdk_message(signing_name: &str, status: u16, message: &str) -> String {
+    match sdk_diagnostic(signing_name, status) {
+        Some(diagnostic) if message.is_empty() => diagnostic,
+        Some(diagnostic) => format!("{message} {diagnostic}"),
+        None => message.to_string(),
+    }
+}
+
 /// Each `HandlerErrorCode` a provider's refusal is reported under, with the fragments an
 /// owning service's own error CODE carries when the refusal falls in that class.
 ///
@@ -1505,7 +1561,10 @@ const HANDLER_ERROR_CLASSES: &[(&str, &[&str])] = &[
 
 /// The class a refusal falls in when nothing above matches: the owning service refused the
 /// request the declaration asked for, which is what every validation refusal is.
-const HANDLER_ERROR_DEFAULT: &str = "InvalidRequest";
+///
+/// Read by [`super::provisioner::Provisioner::handler_message`] too: it is the class whose
+/// own wording some providers carry inside the message.
+pub(super) const HANDLER_ERROR_INVALID_REQUEST: &str = "InvalidRequest";
 
 /// The lowest HTTP status that is the owning SERVICE failing rather than the request being
 /// wrong, for an answer that carried no error code at all ([`UNNAMED_CODE_PREFIX`]).
@@ -1523,13 +1582,13 @@ fn handler_error_code(code: &str) -> &'static str {
         // whether the service failed or the request was refused.
         return match status.parse::<u16>() {
             Ok(status) if status >= SERVER_ERROR_STATUS => HANDLER_ERROR_SERVICE_FAILED,
-            _ => HANDLER_ERROR_DEFAULT,
+            _ => HANDLER_ERROR_INVALID_REQUEST,
         };
     }
     HANDLER_ERROR_CLASSES
         .iter()
         .find(|(_, fragments)| fragments.iter().any(|fragment| code.contains(fragment)))
-        .map_or(HANDLER_ERROR_DEFAULT, |(class, _)| *class)
+        .map_or(HANDLER_ERROR_INVALID_REQUEST, |(class, _)| *class)
 }
 
 /// The `ResourceStatusReason` the event for a resource its provider refused to act on
@@ -1542,7 +1601,13 @@ fn handler_error_code(code: &str) -> &'static str {
 ///
 /// The token is this resource request's own, minted per request as every identifier this
 /// service hands out is.
-fn handler_failure_reason(refusal: &Refusal) -> String {
+///
+/// `owner` is the provisioner of the type whose resource failed, because the message inside
+/// the quotes is the type's HANDLER's
+/// ([`super::provisioner::Provisioner::handler_message`]): for a type whose provider words a
+/// refusal through the class it put it in, that wording is part of what CloudFormation
+/// quotes. A type this emulator has no provisioner for reports the refusal as it came.
+fn handler_failure_reason(owner: Option<Provisioner>, refusal: &Refusal) -> String {
     // A service that worded no message at all still named the error, and the code is then
     // all there is to report.
     let message = if refusal.message.is_empty() {
@@ -1550,11 +1615,15 @@ fn handler_failure_reason(refusal: &Refusal) -> String {
     } else {
         refusal.message.as_str()
     };
+    let class = handler_error_code(&refusal.code);
+    let message = match owner {
+        Some(provisioner) => provisioner.handler_message(class, message),
+        None => message.to_string(),
+    };
     format!(
         "Resource handler returned message: \"{message}\" (RequestToken: {}, \
-         HandlerErrorCode: {})",
+         HandlerErrorCode: {class})",
         super::new_request_id(),
-        handler_error_code(&refusal.code)
     )
 }
 
@@ -1597,7 +1666,7 @@ pub(super) async fn call_json_rpc(
     if (200..300).contains(&status) {
         return Ok(document);
     }
-    Err(refusal_of(status, &document))
+    Err(refusal_of(signing_name, status, &document))
 }
 
 /// The media type an awsQuery request carries: its parameters are a form body, not a
@@ -1650,7 +1719,11 @@ pub(super) async fn call_query(
     Err(Refusal {
         code: xml_element(&document, "Code")
             .unwrap_or_else(|| format!("{UNNAMED_CODE_PREFIX}{status}")),
-        message: xml_element(&document, "Message").unwrap_or_default(),
+        message: sdk_message(
+            signing_name,
+            status,
+            &xml_element(&document, "Message").unwrap_or_default(),
+        ),
     })
 }
 
@@ -1705,7 +1778,7 @@ pub(super) async fn call_rest_json(
     if (200..300).contains(&status) {
         return Ok(document);
     }
-    Err(refusal_of(status, &document))
+    Err(refusal_of(signing_name, status, &document))
 }
 
 /// Call one REST-XML operation of another emulated service in-process and read the XML
@@ -1746,7 +1819,11 @@ pub(super) async fn call_rest_xml(
     Err(Refusal {
         code: xml_element(&document, "Code")
             .unwrap_or_else(|| format!("{UNNAMED_CODE_PREFIX}{status}")),
-        message: xml_element(&document, "Message").unwrap_or_default(),
+        message: sdk_message(
+            signing_name,
+            status,
+            &xml_element(&document, "Message").unwrap_or_default(),
+        ),
     })
 }
 
@@ -1997,7 +2074,10 @@ pub(super) fn xml_scalar_children(
 /// the last segment of the awsJson `__type`
 /// (`com.amazonaws.firehose#ResourceInUseException` -> `ResourceInUseException`), which is
 /// what a client branches on.
-fn refusal_of(status: u16, document: &Value) -> Refusal {
+///
+/// The message is the one an SDK of that service would raise ([`sdk_message`]), because what
+/// a resource provider reports is what its own SDK call raised.
+fn refusal_of(signing_name: &str, status: u16, document: &Value) -> Refusal {
     let code = document
         .get("__type")
         .or_else(|| document.get("code"))
@@ -2009,9 +2089,11 @@ fn refusal_of(status: u16, document: &Value) -> Refusal {
         .get("message")
         .or_else(|| document.get("Message"))
         .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    Refusal { code, message }
+        .unwrap_or_default();
+    Refusal {
+        code,
+        message: sdk_message(signing_name, status, message),
+    }
 }
 
 /// Sign a request with the emulator's own credentials and dispatch it in-process to the
@@ -2161,7 +2243,7 @@ async fn callback_credentials(
 #[cfg(test)]
 mod handler_error_class_tests {
     use super::{
-        handler_error_code, HANDLER_ERROR_CLASSES, HANDLER_ERROR_DEFAULT,
+        handler_error_code, HANDLER_ERROR_CLASSES, HANDLER_ERROR_INVALID_REQUEST,
         HANDLER_ERROR_SERVICE_FAILED,
     };
     use crate::ops::types::HANDLER_ERROR_CODE_VALUES;
@@ -2174,7 +2256,7 @@ mod handler_error_class_tests {
         for class in HANDLER_ERROR_CLASSES
             .iter()
             .map(|(class, _)| *class)
-            .chain([HANDLER_ERROR_DEFAULT, HANDLER_ERROR_SERVICE_FAILED])
+            .chain([HANDLER_ERROR_INVALID_REQUEST, HANDLER_ERROR_SERVICE_FAILED])
         {
             assert!(
                 HANDLER_ERROR_CODE_VALUES.contains(&class),

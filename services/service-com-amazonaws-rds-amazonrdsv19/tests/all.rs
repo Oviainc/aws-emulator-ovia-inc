@@ -123,6 +123,8 @@ mod query_catalog_reads;
 mod query_error_envelope;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/sibling_control_plane_clusters.rs"]
+mod sibling_control_plane_clusters;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/valid_db_instance_modifications.rs"]

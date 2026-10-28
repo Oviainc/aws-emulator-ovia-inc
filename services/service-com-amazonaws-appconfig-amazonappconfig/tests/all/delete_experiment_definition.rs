@@ -14,6 +14,12 @@
 //! the writer and a second removing delete all miss on it, and the name it held is free
 //! for a new definition again.
 //!
+//! And one deletion is not performed at all: while an experiment of the definition is
+//! still running — the state the definition reports as `ACTIVE` — the call is refused
+//! HTTP 400 `BadRequestException` and writes nothing, whichever `DeleteType` it asked
+//! for, so the live experiment and its run history survive it; once no run of the
+//! definition is running the identical delete succeeds and takes the run history with it.
+//!
 //! Every case drives real HTTP requests through the router the emulator's front door
 //! uses, and every delete is read back through `GetExperimentDefinition`, so what is
 //! asserted is what an AppConfig client sees on the wire rather than what one handler
@@ -41,6 +47,8 @@ use crate::appconfig_workflow::{
 use crate::experiment_definitions::{create_definition, flag, get_definition, scope, treatment, Scope};
 use crate::resource_deletes::{assert_deleted, assert_not_found};
 use crate::resource_tags::pct;
+use crate::start_experiment_run::{assert_refused, get_run, start_run};
+use crate::stop_experiment_run::stop_run;
 use crate::update_experiment_definition::instant;
 
 /// The weights each row's treatments carry, so a row can take the first `n` of them and
@@ -139,10 +147,8 @@ async fn create(
         .unwrap_or_else(|| panic!("case {case:?}: CreateExperimentDefinition answered no Id"))
 }
 
-/// Move a stored definition's status, for the rows that need a definition the wire cannot
-/// put in that status yet: the operation that starts an experiment run is still a scaffold
-/// stub, so no request makes a definition `ACTIVE`. Everything else in this suite goes
-/// over the wire.
+/// Move a stored definition's status, so a row can start from a status directly rather
+/// than through the call that writes it. Everything else in this suite goes over the wire.
 fn set_status(
     engine: &Arc<engine::InMemoryEngine>,
     case: &str,
@@ -161,6 +167,33 @@ fn set_status(
         .get_mut(definition_id)
         .unwrap_or_else(|| panic!("case {case:?}: the definition under test must be stored"));
     definition.status = status.to_string();
+}
+
+/// Start an experiment run of a definition and stop it again, over the wire, so a row can
+/// drive a definition that HAS run an experiment and is no longer running one. The run it
+/// leaves behind is the definition's run history, which a permanent delete takes with it.
+async fn run_and_finish(
+    router: &MultiServiceRouter,
+    case: &str,
+    application: &str,
+    definition: &str,
+) {
+    let started = start_run(router, application, definition, &json!({})).await;
+    assert_eq!(
+        started.status,
+        201,
+        "case {case:?}: the run the row needs must start, got {} / {}",
+        started.status,
+        String::from_utf8_lossy(&started.body)
+    );
+    let stopped = stop_run(router, application, definition, 1, &json!({})).await;
+    assert_eq!(
+        stopped.status,
+        200,
+        "case {case:?}: the run the row needs must stop, got {} / {}",
+        stopped.status,
+        String::from_utf8_lossy(&stopped.body)
+    );
 }
 
 /// The definition `GetExperimentDefinition` reports, as a 200 body.
@@ -221,15 +254,19 @@ async fn an_archiving_delete_preserves_the_definition_and_reports_it_archived() 
 
     // Rows differ along the shape of the definition being archived (treatment count across
     // the modelled 1..5, descriptions present or absent), the status the record holds when
-    // the delete arrives (every `ExperimentDefinitionStatus`, including one already
-    // archived, which is what makes the call idempotent), and whether the request addresses
-    // the application and the definition by id or by name.
-    for (index, (case, treatments, descriptions, status_before, by_name)) in [
+    // the delete arrives (the statuses a delete is accepted in: idle, and one already
+    // archived, which is what makes the call idempotent — a definition whose experiment is
+    // still running is refused instead, which
+    // `a_delete_while_an_experiment_is_running_is_refused_and_writes_nothing` covers),
+    // whether the definition has an experiment behind it already, and whether the request
+    // addresses the application and the definition by id or by name.
+    for (index, (case, treatments, descriptions, status_before, finished_run, by_name)) in [
         (
             "one treatment, no descriptions, idle, addressed by id",
             1,
             false,
             state::EXPERIMENT_DEFINITION_IDLE,
+            false,
             false,
         ),
         (
@@ -237,6 +274,7 @@ async fn an_archiving_delete_preserves_the_definition_and_reports_it_archived() 
             3,
             true,
             state::EXPERIMENT_DEFINITION_IDLE,
+            false,
             true,
         ),
         (
@@ -245,12 +283,14 @@ async fn an_archiving_delete_preserves_the_definition_and_reports_it_archived() 
             false,
             state::EXPERIMENT_DEFINITION_IDLE,
             false,
+            false,
         ),
         (
-            "a definition with an experiment run in flight, addressed by id",
+            "a definition whose experiment has already finished, addressed by id",
             2,
             true,
-            state::EXPERIMENT_DEFINITION_ACTIVE,
+            state::EXPERIMENT_DEFINITION_IDLE,
+            true,
             false,
         ),
         (
@@ -258,6 +298,7 @@ async fn an_archiving_delete_preserves_the_definition_and_reports_it_archived() 
             1,
             false,
             state::EXPERIMENT_DEFINITION_ARCHIVED,
+            false,
             true,
         ),
     ]
@@ -266,6 +307,9 @@ async fn an_archiving_delete_preserves_the_definition_and_reports_it_archived() 
     {
         let name = format!("archived-{index}");
         let id = create(&router, case, &scope, &name, treatments, descriptions).await;
+        if finished_run {
+            run_and_finish(&router, case, &scope.application, &id).await;
+        }
         if status_before != state::EXPERIMENT_DEFINITION_IDLE {
             set_status(&engine, case, &scope.application, &id, status_before);
         }
@@ -344,15 +388,22 @@ async fn a_permanent_delete_removes_the_definition() {
 
     // Rows differ along whether the request names the destroying `DeleteType` or names
     // none at all (the member is optional and carries no modelled default), the status the
-    // record holds when the delete arrives, the shape of the definition, and whether the
-    // request addresses the resources by id or by name.
-    for (index, (case, delete_type, treatments, descriptions, status_before, by_name)) in [
+    // record holds when the delete arrives (the statuses a delete is accepted in: a
+    // definition whose experiment is still running is refused instead), whether the
+    // definition has an experiment behind it already — the run history the removal takes
+    // with it — the shape of the definition, and whether the request addresses the
+    // resources by id or by name.
+    for (
+        index,
+        (case, delete_type, treatments, descriptions, status_before, finished_run, by_name),
+    ) in [
         (
             "the destroying DeleteType, idle, addressed by id",
             Some(state::DELETE_TYPE_DESTROY),
             1,
             false,
             state::EXPERIMENT_DEFINITION_IDLE,
+            false,
             false,
         ),
         (
@@ -362,13 +413,16 @@ async fn a_permanent_delete_removes_the_definition() {
             true,
             state::EXPERIMENT_DEFINITION_IDLE,
             false,
+            false,
         ),
         (
-            "the destroying DeleteType while a run is in flight, addressed by name",
+            "the destroying DeleteType on a definition whose experiment has finished, \
+             addressed by name",
             Some(state::DELETE_TYPE_DESTROY),
             3,
             true,
-            state::EXPERIMENT_DEFINITION_ACTIVE,
+            state::EXPERIMENT_DEFINITION_IDLE,
+            true,
             true,
         ),
         (
@@ -377,6 +431,7 @@ async fn a_permanent_delete_removes_the_definition() {
             1,
             false,
             state::EXPERIMENT_DEFINITION_ARCHIVED,
+            false,
             true,
         ),
         (
@@ -385,6 +440,7 @@ async fn a_permanent_delete_removes_the_definition() {
             5,
             false,
             state::EXPERIMENT_DEFINITION_IDLE,
+            false,
             false,
         ),
     ]
@@ -396,6 +452,9 @@ async fn a_permanent_delete_removes_the_definition() {
         // A sibling under the same application: a delete reaches ONE record.
         let sibling_name = format!("sibling-{index}");
         let sibling = create(&router, case, &scope, &sibling_name, 1, false).await;
+        if finished_run {
+            run_and_finish(&router, case, &scope.application, &id).await;
+        }
         if status_before != state::EXPERIMENT_DEFINITION_IDLE {
             set_status(&engine, case, &scope.application, &id, status_before);
         }
@@ -435,6 +494,15 @@ async fn a_permanent_delete_removes_the_definition() {
                 case,
                 "a second DeleteExperimentDefinition",
                 &delete_definition(&router, &scope.application, &addressed, delete_type).await,
+            );
+        }
+        // The definition owned its run history, which lives nowhere else, so a removal
+        // cascades: the run it had is readable nowhere either.
+        if finished_run {
+            assert_not_found(
+                case,
+                "GetExperimentRun",
+                &get_run(&router, &scope.application, &id, 1).await,
             );
         }
 
@@ -633,5 +701,185 @@ async fn a_delete_type_outside_the_modelled_enum_is_refused_and_changes_nothing(
             after, before,
             "case {case:?}: a refused delete must write nothing, expected {before}, got {after}"
         );
+    }
+}
+
+/// While an experiment of the definition is running, the delete is refused HTTP 400
+/// `BadRequestException` naming the definition as the REQUEST addressed it, and writes
+/// nothing: the definition still reads back member for member, still in the status it
+/// reports while an experiment is live, and so does the run. Once no run of the definition
+/// is running, the identical delete is accepted.
+#[tokio::test]
+async fn a_delete_while_an_experiment_is_running_is_refused_and_writes_nothing() {
+    const LABEL: &str = "running";
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let router = router_on(&engine);
+    let scope = scope(&router, LABEL).await;
+    let application_name = application_name(LABEL);
+
+    // Rows differ along WHICH deletion the refused request asks for (each `DeleteType` the
+    // model's enum declares and the request that names none), whether the application and
+    // the definition are addressed by minted id or by name, the shape of the definition
+    // (treatment count across the modelled `TreatmentInputList` bounds 1..5, descriptions
+    // present or absent), and what the start that made the experiment live carried
+    // (`Description` len 0..1024 and `NullablePercentage` range 0..100, at both bounds).
+    for (index, (case, delete_type, by_name, treatments, descriptions, start_body)) in [
+        (
+            "the destroying DeleteType, addressed by id, a bare start",
+            Some(state::DELETE_TYPE_DESTROY),
+            false,
+            1,
+            false,
+            json!({}),
+        ),
+        (
+            "the archiving DeleteType, addressed by id, the whole audience exposed",
+            Some(state::DELETE_TYPE_ARCHIVE),
+            false,
+            3,
+            true,
+            json!({ "ExposurePercentage": 100.0 }),
+        ),
+        (
+            "no DeleteType at all, addressed by name, a described start",
+            None,
+            true,
+            5,
+            false,
+            json!({ "Description": "the live experiment", "ExposurePercentage": 12.5 }),
+        ),
+        (
+            "the destroying DeleteType, addressed by name, exposing none of the audience",
+            Some(state::DELETE_TYPE_DESTROY),
+            true,
+            2,
+            true,
+            json!({ "ExposurePercentage": 0.0 }),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = format!("live-{index}");
+        let id = create(&router, case, &scope, &name, treatments, descriptions).await;
+        // The experiment is made live over the wire, so the state that refuses the delete
+        // is the state a client put the definition in.
+        let started = start_run(&router, &scope.application, &id, &start_body).await;
+        assert_eq!(
+            started.status,
+            201,
+            "case {case:?}: the run that makes the experiment live must start, got {} / {}",
+            started.status,
+            String::from_utf8_lossy(&started.body)
+        );
+        let run = started.json();
+
+        let before = read_definition(&router, case, &scope.application, &id).await;
+        assert_eq!(
+            before.get("Status").and_then(Value::as_str),
+            Some(state::EXPERIMENT_DEFINITION_ACTIVE),
+            "case {case:?}: a definition with a run in flight must report the active status, \
+             got {:?}",
+            before.get("Status")
+        );
+
+        let (application, definition) = if by_name {
+            (application_name.clone(), name.clone())
+        } else {
+            (scope.application.clone(), id.clone())
+        };
+
+        let refused = delete_definition(&router, &application, &definition, delete_type).await;
+        assert_refused(case, &refused, 400, "BadRequestException");
+        let expected = format!(
+            "Experiment definition {definition} cannot be deleted while an experiment is \
+             running."
+        );
+        assert_eq!(
+            refused.string("Message").as_deref(),
+            Some(expected.as_str()),
+            "case {case:?}: expected the message {expected:?}, got {:?}",
+            refused.string("Message")
+        );
+        // The run that is in the way is not disclosed: neither the status it holds nor the
+        // status the definition holds is part of the refusal.
+        for withheld in [
+            state::EXPERIMENT_RUN_RUNNING,
+            state::EXPERIMENT_DEFINITION_ACTIVE,
+        ] {
+            assert!(
+                !expected.contains(withheld),
+                "case {case:?}: the template withholds {withheld:?}, got {expected:?}"
+            );
+        }
+
+        // The refusal wrote nothing: the definition reads back exactly as it did, and so
+        // does the run the start created.
+        let after = read_definition(&router, case, &scope.application, &id).await;
+        assert_eq!(
+            after, before,
+            "case {case:?}: a refused delete must write nothing, expected {before}, got {after}"
+        );
+        let read_run = get_run(&router, &scope.application, &id, 1).await;
+        assert_eq!(
+            read_run.status,
+            200,
+            "case {case:?}: the run must survive the refused delete, got {} / {}",
+            read_run.status,
+            String::from_utf8_lossy(&read_run.body)
+        );
+        assert_eq!(
+            read_run.json(),
+            run,
+            "case {case:?}: expected the run to be untouched as {run}, got {}",
+            read_run.json()
+        );
+
+        // The positive control: with no run of the definition running any more, the
+        // identical delete is accepted and performs the deletion it was asked for.
+        let stopped = stop_run(&router, &scope.application, &id, 1, &json!({})).await;
+        assert_eq!(
+            stopped.status,
+            200,
+            "case {case:?}: the run must stop so the delete can be accepted, got {} / {}",
+            stopped.status,
+            String::from_utf8_lossy(&stopped.body)
+        );
+        let idle = read_definition(&router, case, &scope.application, &id).await;
+        assert_eq!(
+            idle.get("Status").and_then(Value::as_str),
+            Some(state::EXPERIMENT_DEFINITION_IDLE),
+            "case {case:?}: a definition with no run in flight must report the idle status, \
+             got {:?}",
+            idle.get("Status")
+        );
+        let accepted = delete_definition(&router, &application, &definition, delete_type).await;
+        assert_deleted(
+            case,
+            "DeleteExperimentDefinition once no experiment is running",
+            &accepted,
+        );
+        if delete_type == Some(state::DELETE_TYPE_ARCHIVE) {
+            let archived = read_definition(&router, case, &scope.application, &id).await;
+            assert_eq!(
+                archived.get("Status").and_then(Value::as_str),
+                Some(state::EXPERIMENT_DEFINITION_ARCHIVED),
+                "case {case:?}: expected the archived status, got {:?}",
+                archived.get("Status")
+            );
+        } else {
+            // A permanent delete cascades: the definition owns its run history, so both
+            // the definition and its run are gone.
+            assert_not_found(
+                case,
+                "GetExperimentDefinition",
+                &get_definition(&router, &scope.application, &id).await,
+            );
+            assert_not_found(
+                case,
+                "GetExperimentRun",
+                &get_run(&router, &scope.application, &id, 1).await,
+            );
+        }
     }
 }

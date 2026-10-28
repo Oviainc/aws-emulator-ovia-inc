@@ -1,26 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Whether IAM lets a request to this service perform the action it asks for — the
-//! authorization step an index operation runs BEFORE it reads or writes the index the
+//! authorization step an operation runs BEFORE it reads or writes the resource the
 //! request names.
 //!
 //! AWS evaluates authorization at the IAM layer, before the service looks at the
 //! resource, so a caller whose identity policies do not grant the action is told it is
 //! not authorized rather than told anything about the resource, and the call performs
-//! nothing. Each of this service's index operations models `AccessDeniedException`
+//! nothing. Each operation that takes this decision models `AccessDeniedException`
 //! (HTTP 403), which is the refusal that decision is returned as.
 //!
 //! Three pieces, each held in exactly one place:
 //!
 //! 1. **who** — the principal the request's access key id speaks for, read from the SAME
-//!    place `sts:GetCallerIdentity` answers from (`sts_store::resolve_caller`), so the
-//!    principal a refusal blames is the one the caller reads back from STS for the
-//!    credentials it signed with;
+//!    place `sts:GetCallerIdentity` answers from (`sts_store::resolve_request_caller` over
+//!    `sts_store::long_term_identity`), so the principal a refusal blames is the one the
+//!    caller reads back from STS for the credentials it signed with: the session a
+//!    temporary credential was minted for, or the IAM user that holds a long-term key;
 //! 2. **what it may do** — the identity-based policy documents the IAM store holds for
-//!    that principal: the role's inline policies and the default version of each managed
-//!    policy attached to it, read out of the IAM service's OWN store, so a policy written
-//!    by `iam:PutRolePolicy` takes effect on the next request and deleting it lifts it
-//!    again;
+//!    that principal: the identity's inline policies and the default version of each
+//!    managed policy attached to it (and, for a user, the ones its groups carry), read out
+//!    of the IAM service's OWN store, so a policy written by `iam:PutRolePolicy` or
+//!    `iam:PutUserPolicy` takes effect on the next request and deleting it lifts it again;
 //! 3. **the decision** — [`::service_common::iam_authorization`], the ONE shared
 //!    evaluation of those documents against `(action, resource)`, so this service and
 //!    every other one handed the same documents answer alike: an explicit `Deny` wins,
@@ -35,25 +36,27 @@
 //!
 //! ## Which callers this bounds
 //!
-//! A request is evaluated when its credentials name an assumed-role session, because the
-//! role is the principal whose identity policies this emulator can read. These are served
-//! rather than evaluated, since no identity policy here bounds them:
+//! A request is evaluated when its credentials name a principal whose identity policies
+//! this emulator can read: an assumed-role session, whose ROLE carries them, or a
+//! long-term access key an IAM user of this account holds, where the USER carries them.
+//! These are served rather than evaluated, since no identity policy here bounds them:
 //!
-//! * a request whose access key id names no session — the long-term key this emulator
-//!   publishes at start, which is the account's own administrator
-//!   (`sts_store::ambient_identity`), the position AWS account root credentials are in;
-//! * a session that is not an assumed role (an `sts:GetSessionToken` or
-//!   `sts:GetFederationToken` session): what bounds such a caller is the IAM user's own
-//!   identity policies or the session policy its mint supplied, and this gate reads
-//!   neither;
-//! * an engine that carries no STS or IAM store, where no session and no role can exist;
+//! * a request whose access key id no IAM user of this account holds and no session was
+//!   minted for — the long-term key this emulator publishes at start, which is the
+//!   account's own administrator (`sts_store::ambient_identity`), the position AWS
+//!   account root credentials are in;
+//! * a credential that speaks for neither a role nor a user of this account (an
+//!   `sts:GetFederationToken` session, whose federated principal carries no identity
+//!   policy of its own);
+//! * an engine that carries no STS or IAM store, where no session and no user can exist;
 //! * an expired session, which the layer that authenticates a request refuses, not this
 //!   one;
-//! * a role carrying a managed policy no document can be read for — an AWS-managed ARN
-//!   outside the catalog the IAM emulator publishes — whose grant is evidence this
+//! * a principal carrying a managed policy no document can be read for — an AWS-managed
+//!   ARN outside the catalog the IAM emulator publishes — whose grant is evidence this
 //!   emulator does not have: refusing on it would deny access AWS permits. An explicit
 //!   `Deny` in a document that CAN be read still refuses.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
 use ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam_store;
@@ -68,6 +71,35 @@ use crate::ops::types::AccessDeniedException;
 /// [`super::ARN_NAMESPACE`] spells into every ARN it builds.
 pub const ACTION_PREFIX: &str = super::ARN_NAMESPACE;
 
+/// The IAM store this gate reads the identity policies out of.
+type IamState =
+    ::service_com_amazonaws_iam_awsidentitymanagementv20100508::ComAmazonawsIamAwsidentitymanagementv20100508State;
+
+/// The IAM store's map of one kind of entity's INLINE policies:
+/// `<entity key> -> <policy name> -> the policy`.
+type InlinePolicies = BTreeMap<String, BTreeMap<String, iam_store::InlinePolicy>>;
+
+/// The IAM store's map of one kind of entity's managed-policy ATTACHMENTS:
+/// `<entity key> -> the ARNs attached to it`.
+type Attachments = BTreeMap<String, BTreeSet<String>>;
+
+/// The resource-name wildcard that stands for every domain of an account and Region in a
+/// `Resource` element — IAM's own "any run of characters" pattern.
+const EVERY_DOMAIN: &str = "*";
+
+/// The `Resource` an operation on an application's data source attachments is decided
+/// against: every domain of the account and Region the request was signed for.
+///
+/// This service's IAM actions take a DOMAIN resource — an attachment links an application
+/// to the data a domain serves — so an operation addressed by application id is decided
+/// against the domain resource PATTERN rather than against one named domain. Built from
+/// the request, so the decision does not depend on which domains the account holds.
+pub fn data_source_attachment_resource(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+) -> String {
+    super::domain_arn(EVERY_DOMAIN, &super::request_region(ctx.parts()))
+}
+
 /// Authorize this request, as [`ACTION_PREFIX`] and `operation` name the action and
 /// `resource` names the ARN the request addresses.
 ///
@@ -77,10 +109,10 @@ pub const ACTION_PREFIX: &str = super::ARN_NAMESPACE;
 /// so the decision does not depend on whether that resource exists — which is also what
 /// keeps a refused call from telling an unauthorized caller whether it does.
 ///
-/// The caller is resolved through STS's own `resolve_caller`, which first materialises the
-/// session expiries the clock has already made due; that write is owed at the same instant
-/// whether or not anybody called, which is why a REPORTING operation of this service may
-/// take this decision too.
+/// The caller is resolved through STS's own `resolve_request_caller` over
+/// `long_term_identity`, which first materialises the session expiries the clock has
+/// already made due; that write is owed at the same instant whether or not anybody
+/// called, which is why a REPORTING operation of this service may take this decision too.
 pub fn authorize<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
@@ -152,56 +184,142 @@ fn caller<Eng: Send + Sync + 'static>(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
 ) -> Option<Caller> {
     let sts = sts_store::service_state(engine)?;
+    let iam = iam_store::service_state(engine)?;
     let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
-    let identity = sts_store::resolve_caller(
+    // A long-term access key speaks for the IAM user that HOLDS it — the identity STS
+    // itself reports for that key — and for the account's own published credential when
+    // no user of this account holds it.
+    let long_term = sts_store::long_term_identity(Some(&iam.lock()), &access_key_id);
+    let identity = sts_store::resolve_request_caller(
         &mut sts.lock(),
         &access_key_id,
         SystemTime::now(),
         ctx.credential_store(),
+        long_term,
     )
-    .ok()?;
-    let role_name = assumed_role_name(&identity.arn)?.to_string();
-    let iam = iam_store::service_state(engine)?;
-    let mut caller = role_identity_policies(&iam.lock(), &role_name);
+    .ok()?
+    .identity;
+    // The account's own published credential carries no identity-based policy at all, so
+    // nothing here bounds it.
+    if identity.arn == sts_store::ambient_identity().arn {
+        return None;
+    }
+    let mut caller = identity_policies(&iam.lock(), named_identity(&identity.arn)?);
     caller.arn = identity.arn;
     Some(caller)
 }
+
+/// The IAM identity whose identity-based policies are in force on a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NamedIdentity<'a> {
+    /// A role — the principal an assumed-role session speaks for.
+    Role(&'a str),
+    /// An IAM user — the principal its own long-term access key speaks for.
+    User(&'a str),
+}
+
+/// Which identity the principal ARN `identity_arn` names, or `None` for a principal form
+/// this gate does not bound (see the module docs).
+fn named_identity(identity_arn: &str) -> Option<NamedIdentity<'_>> {
+    if let Some(role_name) = assumed_role_name(identity_arn) {
+        return Some(NamedIdentity::Role(role_name));
+    }
+    iam_user_name(identity_arn).map(NamedIdentity::User)
+}
+
+/// AWS STS's `arnNamespace`, which the ARN of a session principal carries.
+const STS_ARN_NAMESPACE: &str = "sts";
+
+/// AWS IAM's `arnNamespace`, which the ARN of an IAM entity carries.
+const IAM_ARN_NAMESPACE: &str = "iam";
 
 /// The role name an assumed-role session's ARN names
 /// (`arn:<partition>:sts::<account>:assumed-role/<RoleName>/<SessionName>`), or `None` for
 /// every other principal form.
 fn assumed_role_name(identity_arn: &str) -> Option<&str> {
-    let resource = identity_arn.splitn(6, ':').nth(5)?;
-    let role_name = resource.strip_prefix("assumed-role/")?.split('/').next()?;
-    (!role_name.is_empty()).then_some(role_name)
+    let parsed = ::service_common::arn::parse(identity_arn)?;
+    let role_name = parsed
+        .resource
+        .strip_prefix("assumed-role/")?
+        .split('/')
+        .next()?;
+    (parsed.vendor == STS_ARN_NAMESPACE && !role_name.is_empty()).then_some(role_name)
 }
 
-/// The identity policies in force on one role: its inline policies and the document of
-/// each managed policy attached to it — the two kinds of identity policy IAM evaluates
-/// for a role. A role the IAM store does not hold carries none, which IAM's default deny
-/// refuses.
-fn role_identity_policies(
-    iam: &::service_com_amazonaws_iam_awsidentitymanagementv20100508::ComAmazonawsIamAwsidentitymanagementv20100508State,
-    role_name: &str,
-) -> Caller {
-    let role_key = iam_store::name_key(role_name);
-    let mut caller = Caller {
-        arn: String::new(),
-        documents: iam
-            .role_inline_policies
-            .get(&role_key)
+/// The user name an IAM user's ARN names
+/// (`arn:<partition>:iam::<account>:user/<path…>/<UserName>`): the LAST segment of the
+/// resource, since the path is optional and only the last segment is the name. `None` for
+/// every other principal form.
+fn iam_user_name(identity_arn: &str) -> Option<&str> {
+    let parsed = ::service_common::arn::parse(identity_arn)?;
+    let user_name = parsed
+        .resource
+        .strip_prefix("user/")?
+        .split('/')
+        .next_back()?;
+    (parsed.vendor == IAM_ARN_NAMESPACE && !user_name.is_empty()).then_some(user_name)
+}
+
+/// The identity policies in force on one identity: for a ROLE its inline policies and the
+/// document of each managed policy attached to it, and for a USER those plus the ones in
+/// force on every group it belongs to, because a user also holds the permissions of its
+/// groups. An identity the IAM store holds nothing for carries none, which IAM's default
+/// deny refuses.
+fn identity_policies(iam: &IamState, named: NamedIdentity<'_>) -> Caller {
+    let mut caller = Caller::default();
+    match named {
+        NamedIdentity::Role(role_name) => {
+            let role_key = iam_store::name_key(role_name);
+            collect_entity_policies(
+                iam,
+                &iam.role_inline_policies,
+                &iam.role_attached_policies,
+                &role_key,
+                &mut caller,
+            );
+        }
+        NamedIdentity::User(user_name) => {
+            let user_key = iam_store::name_key(user_name);
+            collect_entity_policies(
+                iam,
+                &iam.user_inline_policies,
+                &iam.user_attached_policies,
+                &user_key,
+                &mut caller,
+            );
+            for group_key in iam.group_keys_held_by(&user_key) {
+                collect_entity_policies(
+                    iam,
+                    &iam.group_inline_policies,
+                    &iam.group_attached_policies,
+                    group_key,
+                    &mut caller,
+                );
+            }
+        }
+    }
+    caller
+}
+
+/// Add the documents one entity carries to `caller`: the inline policies embedded in it,
+/// plus the default version of each managed policy attached to it — the two kinds of
+/// identity policy IAM evaluates, read the same way whichever kind of entity carries
+/// them.
+fn collect_entity_policies(
+    iam: &IamState,
+    inline: &InlinePolicies,
+    attached: &Attachments,
+    entity_key: &str,
+    caller: &mut Caller,
+) {
+    caller.documents.extend(
+        inline
+            .get(entity_key)
             .into_iter()
             .flat_map(|held| held.values())
-            .map(|policy| policy.policy_document.clone())
-            .collect(),
-        unreadable_attachment: false,
-    };
-    for arn in iam
-        .role_attached_policies
-        .get(&role_key)
-        .into_iter()
-        .flatten()
-    {
+            .map(|policy| policy.policy_document.clone()),
+    );
+    for arn in attached.get(entity_key).into_iter().flatten() {
         // A managed policy is either the ACCOUNT's, whose versions the store holds, or
         // one of AWS's own, whose document the IAM emulator publishes as a catalog entry.
         let document = iam
@@ -222,7 +340,6 @@ fn role_identity_policies(
             None => {}
         }
     }
-    caller
 }
 
 /// The document of an account-managed policy's DEFAULT version — the one in force on
@@ -276,40 +393,77 @@ mod tests {
         );
     }
 
-    /// RULE: a session ARN names the role whose policies are read; every other principal
-    /// form names none, so its request is not evaluated here.
+    /// RULE: a principal ARN names the identity whose policies are read — a session ARN
+    /// the role it is a session of, a user ARN the user itself — and every other form
+    /// names none, so its request is not evaluated here.
     #[test]
-    fn a_session_arn_names_the_role_its_policies_are_read_from() {
-        // (case, the ARN, the role it names)
-        let rows: &[(&str, &str, Option<&str>)] = &[
+    fn a_principal_arn_names_the_identity_its_policies_are_read_from() {
+        // (case, the ARN, the role it names, the user it names)
+        let rows: &[(&str, &str, Option<&str>, Option<&str>)] = &[
             (
                 "an assumed-role session",
                 "arn:aws:sts::000000000000:assumed-role/search-reader/session-1",
                 Some("search-reader"),
+                None,
             ),
             (
                 "a session name carrying a slash",
                 "arn:aws:sts::000000000000:assumed-role/search-reader/one/two",
                 Some("search-reader"),
+                None,
             ),
             (
                 "an IAM user",
                 "arn:aws:iam::000000000000:user/search-user",
                 None,
+                Some("search-user"),
+            ),
+            (
+                "an IAM user under a path",
+                "arn:aws:iam::000000000000:user/team/search-user",
+                None,
+                Some("search-user"),
             ),
             (
                 "the account's own identity",
                 "arn:aws:iam::000000000000:root",
                 None,
+                None,
             ),
-            ("a value that is no ARN", "AKIDTESTONLY", None),
+            (
+                "a federated user, whose own policies IAM does not hold",
+                "arn:aws:sts::000000000000:federated-user/search-federated",
+                None,
+                None,
+            ),
+            (
+                "a user spelling under another vendor",
+                "arn:aws:es:us-east-1:000000000000:user/search-user",
+                None,
+                None,
+            ),
+            ("a value that is no ARN", "AKIDTESTONLY", None, None),
         ];
-        for (case, arn, role) in rows {
+        for (case, arn, role, user) in rows {
             assert_eq!(
                 assumed_role_name(arn),
                 *role,
                 "case {case:?}: expected the role {role:?}, got {:?}",
                 assumed_role_name(arn)
+            );
+            assert_eq!(
+                iam_user_name(arn),
+                *user,
+                "case {case:?}: expected the user {user:?}, got {:?}",
+                iam_user_name(arn)
+            );
+            let named = named_identity(arn);
+            let expected = role
+                .map(NamedIdentity::Role)
+                .or_else(|| user.map(NamedIdentity::User));
+            assert_eq!(
+                named, expected,
+                "case {case:?}: expected the identity {expected:?}, got {named:?}"
             );
         }
     }

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetHostedZoneLimit
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetHostedZoneLimit`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetHostedZoneLimit::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -152,20 +143,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetHostedZoneLimit` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetHostedZoneLimitErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetHostedZoneLimit"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable under the router, which always mounts this service on
+            // the shared `InMemoryEngine`.
+            GetHostedZoneLimitErrorModeled::InvalidInput(InvalidInput {
+                message: Some("the Route 53 emulator's state store is unavailable".to_string()),
+            })
+        })?;
+
+        // The caller may pass the bare id or the `/hostedzone/`-prefixed `Id` a
+        // HostedZone handed it back; both name the same zone.
+        let id = crate::state::normalize_zone_id(&input.hosted_zone_id);
+        // Reporting only: the value reported is the per-zone maximum in force
+        // for the requested entity kind and the count is counted off the zone,
+        // so reading a limit never changes what a later caller sees.
+        let store = state.lock();
+        let zone = store.zones.get(id).ok_or_else(|| {
+            GetHostedZoneLimitErrorModeled::NoSuchHostedZone(crate::state::no_such_hosted_zone(
+                &input.hosted_zone_id,
+            ))
+        })?;
+
+        // A VPC association belongs to a PRIVATE hosted zone only, so a public
+        // zone has no VPC quota to report — which is what
+        // `HostedZoneNotPrivate` states ("The specified hosted zone is a public
+        // hosted zone, not a private hosted zone"). The record-set quota
+        // applies to every zone, so it is reported for public and private zones
+        // alike.
+        if input.r#type == crate::state::HOSTED_ZONE_LIMIT_MAX_VPCS_ASSOCIATED && !zone.private_zone
+        {
+            return Err(GetHostedZoneLimitErrorModeled::HostedZoneNotPrivate(
+                HostedZoneNotPrivate {
+                    // The shape's own sentence, kept as the model words it, with
+                    // the zone that was asked about named after it in its bare
+                    // form — request-derived, so a caller that asked about
+                    // several zones can tell which one each refusal is about.
+                    message: Some(format!(
+                        "The specified hosted zone is a public hosted zone, not a private \
+                         hosted zone: {id}"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let (value, count) = zone.limit_usage(&input.r#type).ok_or_else(|| {
+            // Unreachable: `Type` is a modelled enum, so a value outside
+            // `HostedZoneLimitType` is refused before this handler runs.
+            GetHostedZoneLimitErrorModeled::InvalidInput(InvalidInput {
+                message: Some(format!("{} is not a valid HostedZoneLimitType", input.r#type)),
+            })
+        })?;
+
+        Ok(GetHostedZoneLimitOutput {
+            // `HostedZoneLimit$Type` names the limit that was requested, beside
+            // the value currently in force for it.
+            limit: HostedZoneLimit {
+                r#type: input.r#type,
+                value,
+            },
+            count,
+        })
     }
 }
+

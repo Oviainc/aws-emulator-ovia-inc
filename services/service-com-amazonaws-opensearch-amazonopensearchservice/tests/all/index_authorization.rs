@@ -236,14 +236,14 @@ fn allow(actions: Value, resources: Value) -> Value {
 /// Which of IAM's two refusals a row expects: the default deny of a request no statement
 /// allows, or the explicit deny of one a `Deny` statement covers.
 #[derive(Debug, Clone, Copy)]
-enum Refusal {
+pub(crate) enum Refusal {
     DefaultDeny,
     ExplicitDeny,
 }
 
 impl Refusal {
     /// The reason clause IAM closes the refusal with.
-    fn reason(self, action: &str) -> String {
+    pub(crate) fn reason(self, action: &str) -> String {
         match self {
             Self::DefaultDeny => {
                 format!("because no identity-based policy allows the {action} action")
@@ -255,12 +255,12 @@ impl Refusal {
 
 /// The refusal an unauthorized call must carry, in IAM's own wording: who was refused,
 /// which action, on which resource, and which rule refused it.
-fn not_authorized(principal: &str, action: &str, resource: &str, reason: &str) -> String {
+pub(crate) fn not_authorized(principal: &str, action: &str, resource: &str, reason: &str) -> String {
     format!("User: {principal} is not authorized to perform: {action} on resource: {resource} {reason}")
 }
 
 /// Assert `answer` is the modelled authorization refusal naming `action` on `resource`.
-fn assert_refused(
+pub(crate) fn assert_refused(
     answer: &Answer,
     case: &str,
     principal: &str,

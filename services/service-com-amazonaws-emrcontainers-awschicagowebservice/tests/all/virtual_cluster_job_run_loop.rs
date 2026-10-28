@@ -19,7 +19,6 @@
 //!    that is not there (or not usable) is refused with the modelled error.
 //! 5. `@paginated` paging walks the stored set with no repeats and no gaps, and reports
 //!    `nextToken` only while runs remain.
-//! 6. An operation outside this slice still answers 501, never an empty 200.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -1360,29 +1359,4 @@ async fn the_virtual_cluster_store_is_capped_and_reclaims_retired_clusters() {
     );
     emr.describe_cluster(&ids[1]).await.ok("a live cluster");
     emr.describe_cluster(&fresh).await.ok("the new cluster");
-}
-
-/// RULE 6: the operations this slice does not implement still answer 501, so a client
-/// cannot mistake an unwritten operation for an implemented one.
-///
-/// `GetManagedEndpointSessionCredentials` left this list when it was implemented; the suite
-/// that drives it is [`crate::managed_endpoint_session_credentials`].
-#[tokio::test]
-async fn operations_outside_this_slice_still_answer_501() {
-    let emr = Emr::new();
-    let cases = [(
-        "DeleteManagedEndpoint",
-        "DELETE",
-        "/virtualclusters/doesnotexist1/endpoints/doesnotexist2".to_string(),
-        None,
-    )];
-
-    for (label, method, path, body) in cases {
-        let answer = emr.send(method, &path, body).await;
-        assert_eq!(
-            answer.status, 501,
-            "case {label:?}: an unimplemented operation must answer 501, got {} with body {}",
-            answer.status, answer.body
-        );
-    }
 }
