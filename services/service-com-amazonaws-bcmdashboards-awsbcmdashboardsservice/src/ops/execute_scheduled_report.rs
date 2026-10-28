@@ -39,7 +39,16 @@
 //! * A `clientToken` makes the call idempotent for
 //!   `crate::state::EXECUTION_IDEMPOTENCY_WINDOW` (the minute the model documents): a
 //!   retry presenting the same token for the same report answers the first call's
-//!   outcome and triggers nothing. The token is scoped to the request it was presented
+//!   outcome and triggers nothing. The token is RESERVED under the same guard that reads
+//!   it (`crate::state::ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState::reserve_execution_token`),
+//!   before the delivery below, so a duplicate still IN FLIGHT triggers no second
+//!   execution either: several calls presenting one token for one report produce exactly
+//!   one execution and one notification however they overlap. A duplicate that arrives
+//!   while the execution is still reaching the bus is answered the outcome that execution
+//!   was already committed to when it reserved the token, which is all that is known of
+//!   it at that instant; the record is then settled with the health the delivery
+//!   established, so every later retry replays the outcome the execution ended with.
+//!   The token is scoped to the request it was presented
 //!   with — the model's only documented effect is that "requests with the same client
 //!   token will not trigger a new execution within the same minute" — so the same token
 //!   presented for a DIFFERENT report is a different request: it triggers that report's
@@ -229,7 +238,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Everything this request can decide from the store alone is decided here, under
         // one guard that is DROPPED before the delivery below: the delivery is an await,
         // and a lock is not held across one.
-        let (record, configured_health) = {
+        let (record, configured_health, execution_triggered) = {
             let mut store = state.lock();
 
             // The report the ARN is the key of. Cloned so the health below can read the
@@ -288,31 +297,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // any of them can be read as a retry.
             store.expire_execution_tokens(now);
 
-            if let Some(prior) = idempotency_key
-                .as_ref()
-                .and_then(|key| store.scheduled_report_executions.get(key))
-            {
-                // A retry inside the documented window: the first call's outcome, and no
-                // second execution — so no second notification either. It triggers
-                // nothing and changes nothing a later caller sees, so — like the dry run
-                // — it emits no audit record; the execution it replays already emitted
-                // one.
-                return Ok(ExecuteScheduledReportOutput {
-                    health_status: Some(prior.health_status.clone()),
-                    execution_triggered: Some(prior.execution_triggered),
-                });
-            }
-
             // The health the stored configuration establishes for this report right now,
             // and with it whether the execution could be triggered at all: a report whose
             // dashboard or widgets no longer resolve has nothing to render, so nothing is
             // triggered and nothing is delivered.
             let configured_health = store.scheduled_report_health(&record, now);
-            (record, configured_health)
-        };
+            let execution_triggered =
+                configured_health.status_code == crate::state::HEALTH_STATUS_HEALTHY;
 
-        let execution_triggered =
-            configured_health.status_code == crate::state::HEALTH_STATUS_HEALTHY;
+            // The token is looked up and, when it is free, RESERVED here — one operation
+            // under this one guard, and not two straddling the delivery below. The guard
+            // is dropped across that delivery, so a token recorded only once the bus had
+            // answered would leave a window in which a duplicate presenting it finds
+            // nothing recorded, triggers its own execution and publishes its own
+            // notification: one token, two executions. Reserving it here is how
+            // `CreateScheduledReport` resolves its own racing duplicates, and it makes
+            // several calls presenting one token for one report produce exactly one
+            // execution and one notification however they overlap.
+            //
+            // What is reserved is the outcome this call is already committed to: whether
+            // it triggers an execution, and the health its stored configuration
+            // establishes — all the delivery can still do is refine that health, which it
+            // does once it is known (`settle_execution_token` below).
+            if let Some(reserved) = idempotency_key.clone().and_then(|key| {
+                store.reserve_execution_token(
+                    key,
+                    crate::state::ScheduledReportExecution {
+                        executed_at: now,
+                        execution_triggered,
+                        health_status: configured_health.clone(),
+                    },
+                )
+            }) {
+                // A duplicate inside the documented window: the outcome of the call that
+                // holds the token, and no second execution — so no second notification
+                // either. It triggers nothing and changes nothing a later caller sees, so
+                // — like the dry run — it emits no audit record; the execution it replays
+                // already emitted one.
+                return Ok(ExecuteScheduledReportOutput {
+                    health_status: Some(reserved.health_status),
+                    execution_triggered: Some(reserved.execution_triggered),
+                });
+            }
+
+            (record, configured_health, execution_triggered)
+        };
 
         // The execution itself: the notification the model defines a scheduled report by,
         // handed to the account's default EventBridge event bus. The health this request
@@ -344,14 +373,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         if let Some(key) = idempotency_key {
-            store.scheduled_report_executions.insert(
-                key,
-                crate::state::ScheduledReportExecution {
-                    executed_at: now,
-                    execution_triggered,
-                    health_status: health_status.clone(),
-                },
-            );
+            // The reservation this call took before the delivery, settled with the health
+            // that delivery established: a retry presenting the token from here on
+            // replays the outcome this call ended with rather than the one it was
+            // committed to beforehand.
+            store.settle_execution_token(&key, now, &health_status);
         }
 
         // The record this call changed state, for the audit stream.

@@ -21,6 +21,7 @@
 //! service reaches another: over the in-process callback, so nothing is dialled and this
 //! crate names no other service crate.
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
 use std::time::{Duration, SystemTime};
@@ -797,6 +798,16 @@ pub fn scheduled_report_creation_fingerprint(
 /// repeat of the request that carried it, and the request names the report, so the same
 /// token presented for another report is a different request and is decided on its own
 /// merits.
+///
+/// It is written BEFORE the execution's delivery is attempted
+/// ([`ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState::reserve_execution_token`]),
+/// holding the outcome the call is already committed to at that point — whether it
+/// triggers an execution, and the health its stored configuration establishes — and the
+/// health is then settled with what the delivery established
+/// ([`ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState::settle_execution_token`]).
+/// `executed_at` is the instant of the call that reserved it, which is both what the
+/// expiry measures the idempotency window from and what identifies the reservation to
+/// settle.
 #[derive(Debug, Clone)]
 pub struct ScheduledReportExecution {
     pub executed_at: SystemTime,
@@ -837,8 +848,12 @@ pub struct ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState {
     /// an execution under a `clientToken`, keyed by the pair (the executed report's ARN,
     /// that token) and mapped to that call's outcome — the scope an idempotency token
     /// has, which is the request it was presented with, not every request sharing its
-    /// value. An entry lives for [`EXECUTION_IDEMPOTENCY_WINDOW`] from the call that
-    /// wrote it and is dropped once the clock has closed its window
+    /// value. An entry is RESERVED by the call that executes, under the same guard that
+    /// read it ([`Self::reserve_execution_token`]), and settled with the health its
+    /// delivery established ([`Self::settle_execution_token`]), so a duplicate still in
+    /// flight is suppressed exactly as one arriving afterwards is. An entry lives for
+    /// [`EXECUTION_IDEMPOTENCY_WINDOW`] from the call that wrote it and is dropped once
+    /// the clock has closed its window
     /// ([`Self::expire_execution_tokens`]), so the map a caller can grow stays bounded by
     /// the calls of one minute.
     pub scheduled_report_executions: BTreeMap<(String, String), ScheduledReportExecution>,
@@ -1175,6 +1190,52 @@ impl ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState {
                 .unwrap_or_default()
                 < EXECUTION_IDEMPOTENCY_WINDOW
         });
+    }
+
+    /// The outcome already recorded under `key`, or — when nothing is recorded under it —
+    /// `None`, with `reservation` recorded under it as this call's outcome.
+    ///
+    /// The lookup and the write are ONE operation under the caller's single guard, which
+    /// is what makes an idempotency token suppress a duplicate that is IN FLIGHT and not
+    /// only one that arrives afterwards: an execution reaches the event bus with the store
+    /// UNLOCKED (a lock is not held across an await), so a token recorded only once that
+    /// delivery has answered leaves a window in which a duplicate finds nothing recorded,
+    /// triggers its own execution and delivers its own notification. Of several calls
+    /// presenting one token for one report exactly one is therefore answered `None` and
+    /// goes on to execute; every other is answered the outcome that call reserved.
+    pub fn reserve_execution_token(
+        &mut self,
+        key: (String, String),
+        reservation: ScheduledReportExecution,
+    ) -> Option<ScheduledReportExecution> {
+        match self.scheduled_report_executions.entry(key) {
+            Entry::Occupied(recorded) => Some(recorded.get().clone()),
+            Entry::Vacant(free) => {
+                free.insert(reservation);
+                None
+            }
+        }
+    }
+
+    /// Settle the reservation `key` holds for the call that took it at `executed_at` with
+    /// `health_status` — the health that call's delivery established — so a later retry
+    /// replays the outcome the call ended with rather than the one it was committed to
+    /// before the delivery.
+    ///
+    /// Only that call's own reservation is settled: a record another call wrote under the
+    /// same key once this one's window had closed is left as that call recorded it, and a
+    /// reservation the expiry has already dropped is not written back.
+    pub fn settle_execution_token(
+        &mut self,
+        key: &(String, String),
+        executed_at: SystemTime,
+        health_status: &HealthStatus,
+    ) {
+        if let Some(reserved) = self.scheduled_report_executions.get_mut(key) {
+            if reserved.executed_at == executed_at {
+                reserved.health_status = health_status.clone();
+            }
+        }
     }
 }
 

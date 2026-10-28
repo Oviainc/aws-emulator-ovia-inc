@@ -15,6 +15,8 @@
 mod arn_minting;
 #[path = "all/audit_records.rs"]
 mod audit_records;
+#[path = "all/concurrent_execution_idempotency.rs"]
+mod concurrent_execution_idempotency;
 #[path = "all/create_report_client_token.rs"]
 mod create_report_client_token;
 #[path = "all/create_report_conflict_message.rs"]
