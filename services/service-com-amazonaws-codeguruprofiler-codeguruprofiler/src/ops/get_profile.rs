@@ -5,9 +5,9 @@
 //! maximum time range the operation's doc allows — in the
 //! representation the request accepts and bounded to the call-stack depth it asks for:
 //! the bytes exactly as `PostAgentProfile` uploaded them when the caller accepts the
-//! representation they were posted under and asks for no depth bound, and otherwise the
-//! same document re-encoded in an accepted representation, carrying no frame nested
-//! deeper than `maxDepth`. A profile the group has received but that the service has not
+//! representation their bytes are a document in and asks for no depth bound, and
+//! otherwise the same document re-encoded in an accepted representation, carrying no
+//! frame nested deeper than `maxDepth`. A profile the group has received but that the service has not
 //! yet collected into an aggregated profile is not servable, so a window covered by no
 //! aggregated profile is the operation's 404. Reporting only: it writes nothing.
 //!
@@ -181,15 +181,54 @@ fn requested_window(
     Ok((window.start, window.end))
 }
 
+/// The stored profile `profile` read as a document, together with the representation its
+/// bytes are a document IN — or `None` when they are a document in neither representation
+/// this service reads (so they hold no frames it can see).
+///
+/// Which representation a stored profile is read in is decided by READING its bytes, not
+/// by the media type they were announced under: a `Content-Type` says how to read bytes,
+/// it cannot make bytes that carry no document into one, and it cannot stop bytes that do
+/// carry one from being read as the document they are. That is exactly how a SUBMITTED
+/// profile is judged ([`submitted_document`]), so a document this service accepts is a
+/// document it can also serve, and the frames of a stored profile are the ones its bytes
+/// hold however it was announced. The announced media type decides only which
+/// representation is tried FIRST, so bytes that are a document in both are read in the
+/// one they were announced in.
+fn stored_document(profile: &crate::state::AgentProfile) -> Option<(Representation, Element)> {
+    read_document(&profile.bytes, Representation::of(&profile.content_type))
+}
+
+/// `bytes` read as a document in whichever representation they are one in, with that
+/// representation, or `None` when they are one in neither.
+///
+/// `first` is the representation to try before any other — the one the bytes were
+/// announced under, where that is known — so bytes that are a document in BOTH are read
+/// in it, and one request has one answer.
+fn read_document(
+    bytes: &[u8],
+    first: Option<Representation>,
+) -> Option<(Representation, Element)> {
+    first
+        .into_iter()
+        .chain(
+            Representation::ALL
+                .into_iter()
+                .filter(|representation| Some(*representation) != first),
+        )
+        .find_map(|representation| {
+            decoded(bytes, representation).map(|document| (representation, document))
+        })
+}
+
 /// The stored profile `profile` read as a document, or `None` when its bytes are not one
-/// in the representation it was posted under (so it holds no frames this service can
+/// in either representation this service reads (so it holds no frames this service can
 /// see).
 ///
 /// `pub(crate)` because reading a stored profile as a document is not only this
 /// operation's business: `BatchGetFrameMetricData` derives a frame metric from the same
-/// documents, and both must read a profile the same way.
+/// documents, and both must read a profile the same way — through [`stored_document`].
 pub(crate) fn profile_document(profile: &crate::state::AgentProfile) -> Option<Element> {
-    decoded(&profile.bytes, Representation::of(&profile.content_type)?)
+    stored_document(profile).map(|(_, document)| document)
 }
 
 /// `bytes` read as a document in WHICHEVER representation they are one in, or `None` when
@@ -201,9 +240,7 @@ pub(crate) fn profile_document(profile: &crate::state::AgentProfile) -> Option<E
 /// exactly the ones read here — so a document this service accepts is a document it can
 /// also serve.
 pub(crate) fn submitted_document(bytes: &[u8]) -> Option<Element> {
-    Representation::ALL
-        .into_iter()
-        .find_map(|representation| decoded(bytes, representation))
+    read_document(bytes, None).map(|(_, document)| document)
 }
 
 /// The representations this service serves an aggregated profile in, as the model's
@@ -330,44 +367,53 @@ const DOCUMENT_NESTING_LIMIT: u32 = 128;
 /// serve it in a representation the caller understands (`accept`), and leave out the
 /// frames below a depth (`maxDepth`, whose doc: "if the maxDepth is set to 2, then the
 /// aggregated profile contains representations of methods A and B"). Neither is a
-/// constraint on the request, so neither can refuse one: a profile the caller accepts as
-/// it is stored and asks for no depth bound on is served byte for byte, and anything else
-/// is the stored document re-encoded. A profile this service cannot read as a document in
-/// the representation it was posted under holds no frames it can see — there is nothing
-/// in it to re-encode or to bound — so it is served as stored, under the media type it
-/// really has, which is what the response's `contentType` then reports.
+/// constraint on the request, so neither can refuse one: a profile the caller accepts in
+/// the representation its bytes already are a document in and asks for no depth bound on
+/// is served byte for byte, and anything else is the stored document re-encoded. The
+/// representation a stored profile is read in is the one its bytes are a document in
+/// ([`stored_document`]), never the one they were announced under, so both members are
+/// honoured for every stored profile this service can read at all; `contentType` reports
+/// the representation the served bytes are in. Bytes that are a document in NEITHER
+/// representation hold no frames this service can see — there is nothing in them to
+/// re-encode or to bound — so they are served as stored, under the media type they were
+/// announced with, which is what `contentType` then reports.
 fn served_profile(
     profile: &crate::state::AgentProfile,
     accept: Option<&str>,
     max_depth: Option<i32>,
 ) -> (Vec<u8>, String) {
-    let as_stored = || (profile.bytes.clone(), profile.content_type.clone());
-    let stored = Representation::of(&profile.content_type);
-    let wanted = accept
-        .and_then(|accept| negotiated(accept, stored))
-        .or(stored);
     // The modelled range is 1..10000, so the boundary validator has already refused
     // anything else; a value outside it bounds nothing rather than panicking here.
     let keep = max_depth.and_then(|depth| u32::try_from(depth).ok());
 
+    let Some((stored, document)) = stored_document(profile) else {
+        // Bytes that are a document in neither representation: served as stored, under
+        // the media type they were announced with.
+        return (profile.bytes.clone(), profile.content_type.clone());
+    };
+    // The stored bytes, announced under the representation they ARE a document in: the
+    // answer whenever the document itself is not to be changed, and the one left when a
+    // document that was read cannot be written back out.
+    let as_read = || (profile.bytes.clone(), stored.media_type().to_string());
+    let wanted = accept
+        .and_then(|accept| negotiated(accept, Some(stored)))
+        .unwrap_or(stored);
+
+    // The caller accepts the representation the profile already is a document in and asks
+    // for no depth bound: nothing is to be done to the document, so the stored bytes
+    // themselves are the answer.
     if keep.is_none() && wanted == stored {
-        return as_stored();
+        return as_read();
     }
-    let (Some(stored), Some(wanted)) = (stored, wanted) else {
-        return as_stored();
-    };
-    let Some(document) = decoded(&profile.bytes, stored) else {
-        return as_stored();
-    };
     // No `maxDepth` bounds no depth, so the whole document is kept — up to the nesting
     // this operation reads at all.
     let Some(document) = bounded(&document, keep.unwrap_or(u32::MAX), DOCUMENT_NESTING_LIMIT)
     else {
-        return as_stored();
+        return as_read();
     };
     match encoded(&document, wanted) {
         Some(bytes) => (bytes, wanted.media_type().to_string()),
-        None => as_stored(),
+        None => as_read(),
     }
 }
 

@@ -437,7 +437,7 @@ fn frame_metric_data(
     let documents: Vec<(usize, Element)> = profiles
         .iter()
         .filter_map(|(step, profile)| {
-            // Bytes that are no document in the representation they were posted under
+            // Bytes that are a document in neither representation this service reads
             // hold no frames this service can see, so they record no counts — the same
             // answer `GetProfile` gives such a profile when it is asked to re-read it.
             crate::ops::get_profile::profile_document(profile).map(|document| (*step, document))

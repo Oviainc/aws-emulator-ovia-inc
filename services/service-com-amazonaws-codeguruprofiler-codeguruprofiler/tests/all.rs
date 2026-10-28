@@ -71,6 +71,8 @@ mod resource_policy;
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/stored_profile_representation.rs"]
+mod stored_profile_representation;
 #[path = "all/tag_resource.rs"]
 mod tag_resource;
 #[path = "all/untag_resource.rs"]

@@ -169,7 +169,9 @@ fn unprocessed_end_times(answer: &Answer) -> BTreeMap<String, Vec<i64>> {
 }
 
 /// The `values` of the datum at `index`, and the `frameMetric` it is reported for.
-fn datum(answer: &Answer, index: usize) -> (serde_json::Value, Vec<f64>) {
+/// `pub(crate)` so a sibling suite asserting what this operation reports for one stored
+/// profile reads a datum through this one reducer rather than forking it.
+pub(crate) fn datum(answer: &Answer, index: usize) -> (serde_json::Value, Vec<f64>) {
     let json = answer.json();
     let data = json
         .get("frameMetricData")
