@@ -261,6 +261,19 @@ impl Enrollment {
             .is_some_and(|written| now - written.as_secs_f64() >= ANALYSIS_DELAY.as_secs_f64())
     }
 
+    /// Whether the analysis this enrollment started can be reported yet: the account is
+    /// opted in AND that analysis is due.
+    ///
+    /// The two halves are ONE rule — Compute Optimizer reports recommendations for an
+    /// ENROLLED account only, and only once the analysis that enrollment starts has been
+    /// produced ([`ANALYSIS_DELAY`]) — so it is stated here once rather than conjoined again
+    /// at each surface that serves the analysis. Every such surface asks this, so a reader, a
+    /// summary and an export of one analysis cannot apply different halves of the rule and
+    /// disagree about whether that analysis exists yet.
+    pub fn analysis_visible(&self) -> bool {
+        self.is_opted_in() && self.analysis_due()
+    }
+
     /// When the analysis this enrollment started was generated: one analysis span
     /// ([`ANALYSIS_DELAY`]) after the enrollment record was written, and `None` for an account
     /// that never enrolled, which has no analysis to report a refresh for.
@@ -6916,7 +6929,7 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     ///
     /// [`visible_auto_scaling_group_analyses`]: Self::visible_auto_scaling_group_analyses
     pub fn visible_volumes(&self) -> impl Iterator<Item = &ObservedVolume> {
-        let visible = self.enrollment.is_opted_in() && self.enrollment.analysis_due();
+        let visible = self.enrollment.analysis_visible();
         self.volumes.values().filter(move |_| visible)
     }
 
@@ -6930,7 +6943,7 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     ///
     /// [`visible_volumes`]: Self::visible_volumes
     pub fn visible_functions(&self) -> impl Iterator<Item = &ObservedFunction> {
-        let visible = self.enrollment.is_opted_in() && self.enrollment.analysis_due();
+        let visible = self.enrollment.analysis_visible();
         self.functions.values().filter(move |_| visible)
     }
 
@@ -6945,7 +6958,7 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     ///
     /// [`visible_volumes`]: Self::visible_volumes
     pub fn visible_licenses(&self) -> impl Iterator<Item = &ObservedLicensedInstance> {
-        let visible = self.enrollment.is_opted_in() && self.enrollment.analysis_due();
+        let visible = self.enrollment.analysis_visible();
         self.licenses.values().filter(move |_| visible)
     }
 
@@ -6959,7 +6972,7 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     ///
     /// [`visible_volumes`]: Self::visible_volumes
     pub fn visible_instances(&self) -> impl Iterator<Item = &ObservedInstance> {
-        let visible = self.enrollment.is_opted_in() && self.enrollment.analysis_due();
+        let visible = self.enrollment.analysis_visible();
         self.instances.values().filter(move |_| visible)
     }
 
@@ -6973,7 +6986,7 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     ///
     /// [`visible_volumes`]: Self::visible_volumes
     pub fn visible_idle_recommendations(&self) -> impl Iterator<Item = &IdleResourceAnalysis> {
-        let visible = self.enrollment.is_opted_in() && self.enrollment.analysis_due();
+        let visible = self.enrollment.analysis_visible();
         self.idle_recommendations
             .iter_in_order()
             .filter(move |_| visible)
@@ -6994,7 +7007,7 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     /// [`visible_volumes`]: Self::visible_volumes
     /// [`analysed_resources_by_type`]: Self::analysed_resources_by_type
     pub fn visible_analysed_resources(&self) -> impl Iterator<Item = &AnalysedResource> {
-        let visible = self.enrollment.is_opted_in() && self.enrollment.analysis_due();
+        let visible = self.enrollment.analysis_visible();
         self.analysed_resources.iter().filter(move |_| visible)
     }
 }
@@ -7302,9 +7315,11 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     /// Compute Optimizer reports recommendations for an ENROLLED account only, and only
     /// once the analysis that enrollment starts is due ([`ANALYSIS_DELAY`]), so an
     /// account that never opted in, one that opted out, and one that has just opted in
-    /// all read the empty set rather than an analysis nothing has produced yet.
+    /// all read the empty set rather than an analysis nothing has produced yet. The rule
+    /// itself is [`Enrollment::analysis_visible`], which every surface that serves this
+    /// service's analysis asks.
     pub fn visible_auto_scaling_group_analyses(&self) -> &[AnalyzedAutoScalingGroup] {
-        if !self.enrollment.is_opted_in() || !self.enrollment.analysis_due() {
+        if !self.enrollment.analysis_visible() {
             return &[];
         }
         &self.auto_scaling_group_analyses

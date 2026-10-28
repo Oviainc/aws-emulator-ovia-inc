@@ -887,7 +887,7 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     /// the analysis its enrollment starts is due, so an export created before then holds the
     /// header row alone — exactly what the recommendation readers report at that moment.
     fn export_rows(&self, plan: &ExportPlan) -> Vec<ExportRow> {
-        if !self.enrollment.is_opted_in() || !self.enrollment.analysis_due() {
+        if !self.enrollment.analysis_visible() {
             return Vec::new();
         }
         // When the analysis these rows are of was generated: the instant every reader of this
