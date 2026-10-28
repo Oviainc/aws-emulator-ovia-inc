@@ -546,6 +546,19 @@ fn refusal_for(violation: &Violation) -> Option<Refused> {
             "InvalidApprovalStateException",
             crate::state::INVALID_APPROVAL_STATE_MESSAGE,
         ),
+        // `overrideStatus` is a modelled enum too, so a value outside it is refused
+        // at the boundary rather than by the handler that sets the rules aside; the
+        // code and sentence are the ones `OverridePullRequestApprovalRules` models
+        // for that member, which requires it, so one that was not provided at all is
+        // reported as missing rather than as invalid.
+        ("overrideStatus", _) if missing => (
+            "OverrideStatusRequiredException",
+            crate::state::OVERRIDE_STATUS_REQUIRED_MESSAGE,
+        ),
+        ("overrideStatus", _) => (
+            "InvalidOverrideStatusException",
+            crate::state::INVALID_OVERRIDE_STATUS_MESSAGE,
+        ),
         ("tags", _) if missing => (
             "TagsMapRequiredException",
             "A map of tags is required.",
