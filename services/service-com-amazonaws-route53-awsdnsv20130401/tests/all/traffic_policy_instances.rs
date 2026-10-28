@@ -69,7 +69,10 @@ const SETTLE_MARGIN: Duration = Duration::from_millis(250);
 // ---------------------------------------------------------------------------
 
 /// Create a traffic policy instance.
-async fn create_instance(
+///
+/// `pub(crate)` so the suite asserting the account's instance COUNT builds its
+/// population through the SAME create this one does.
+pub(crate) async fn create_instance(
     router: &MultiServiceRouter,
     hosted_zone_id: &str,
     name: &str,
@@ -94,7 +97,10 @@ async fn create_instance(
 }
 
 /// Read one traffic policy instance back.
-async fn get_instance(router: &MultiServiceRouter, id: &str) -> Reply {
+///
+/// `pub(crate)` so the count suite confirms through the SAME read that the
+/// instances it counted are the ones the account holds.
+pub(crate) async fn get_instance(router: &MultiServiceRouter, id: &str) -> Reply {
     call(
         router,
         "GET",
@@ -117,7 +123,10 @@ async fn list_records(router: &MultiServiceRouter, zone_id: &str) -> Reply {
 
 /// How many traffic policy instances the account holds, as `GetAccountLimit`
 /// reports it — the count that has to agree with the instances in the store.
-async fn instance_count(router: &MultiServiceRouter) -> String {
+///
+/// `pub(crate)` so the count suite asserts `GetTrafficPolicyInstanceCount`
+/// against the SAME population this operation reports.
+pub(crate) async fn instance_count(router: &MultiServiceRouter) -> String {
     let reply = call(
         router,
         "GET",

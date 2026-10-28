@@ -1986,6 +1986,24 @@ impl ComAmazonawsRoute53Awsdnsv20130401State {
         count_as_i64(self.zones.len())
     }
 
+    /// How many traffic policy instances the account holds right now, as the
+    /// `integer` the `TrafficPolicyInstanceCount` shape carries — every
+    /// instance of every policy and every hosted zone, whatever `State` each
+    /// one is reported in.
+    ///
+    /// COUNTED off the store on every call rather than tracked beside it, for
+    /// the same reason [`Self::account_limit_usage`] counts: creating or
+    /// deleting an instance moves the number by itself, so no reporting
+    /// operation has to be told about it and none can disagree with the
+    /// instances a read or a listing reports. A borrow, not a mutation —
+    /// reporting the count leaves the store exactly as it was. Saturating
+    /// rather than wrapping on a population no store this size can reach; the
+    /// create path refuses past [`MAX_TRAFFIC_POLICY_INSTANCES`], far below
+    /// that.
+    pub fn traffic_policy_instance_count(&self) -> i32 {
+        i32::try_from(self.traffic_policy_instances.len()).unwrap_or(i32::MAX)
+    }
+
     /// The zone OTHER than `excluding_zone_id` that carries the same DNS name
     /// as `zone_name` and is already associated with `vpc_id`, if there is one.
     ///
