@@ -156,6 +156,15 @@
 //!   on it (a subnet is created in it straight away), exactly as the DB instance an
 //!   `AWS::RDS::DBInstance` creates is reported created while Amazon RDS still has it
 //!   `creating`.
+//! * `AWS::EC2::SecurityGroup`'s are `CreateSecurityGroup`'s own members
+//!   ([`EC2_SECURITY_GROUP_CREATE_MEMBERS`]) beside the NAME CloudFormation decides, which
+//!   that call requires and the type leaves optional, and the two INLINE RULE lists, which
+//!   are not members of the create at all: a group is created with no inbound rule and each
+//!   declared rule is one permission of the authorize call for its direction
+//!   ([`security_group_rule_parameters`]). Its identity is Amazon EC2's own as well — the
+//!   create takes no id and answers the `sg-…` one it assigned, which is what "Ref returns
+//!   the ID of the security group" names — and its tag set reaches EC2 through the same
+//!   `CreateTags` a VPC's does.
 //! * `AWS::RDS::DBInstance`'s and `AWS::RDS::DBSubnetGroup`'s are the members
 //!   `CreateDBInstance` / `CreateDBSubnetGroup` take, named identically on both sides
 //!   except the two Amazon RDS spells differently (`VPCSecurityGroups` is
@@ -426,7 +435,7 @@ use super::template::{
     BATCH_JOB_QUEUE, BATCH_SERVICE_ENVIRONMENT, CLOUDWATCH_DASHBOARD,
     CLOUDWATCH_METRIC_STREAM, CODECOMMIT_REPOSITORY, CODEDEPLOY_APPLICATION,
     CODEDEPLOY_DEPLOYMENT_CONFIG, CODEDEPLOY_DEPLOYMENT_GROUP,
-    COGNITO_USER_POOL_GROUP, DEFAULT_SCHEDULE_GROUP, EC2_SUBNET, EC2_VPC,
+    COGNITO_USER_POOL_GROUP, DEFAULT_SCHEDULE_GROUP, EC2_SECURITY_GROUP, EC2_SUBNET, EC2_VPC,
     ECR_PUBLIC_REPOSITORY, ECS_CLUSTER,
     EMR_CLUSTER, EVENTS_RULE, FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE,
     ELASTIC_BEANSTALK_APPLICATION, ELASTIC_BEANSTALK_APPLICATION_VERSION,
@@ -525,6 +534,10 @@ pub(super) enum Provisioner {
     /// `AWS::EC2::Subnet`: a subnet of one of those VPCs, whose `subnet-…` identifier is
     /// EC2's to assign the same way.
     Ec2Subnet,
+    /// `AWS::EC2::SecurityGroup`: a security group of one of those VPCs, whose `sg-…`
+    /// identifier is EC2's to assign the same way, with the inline rules its declaration
+    /// asks for authorized on it.
+    Ec2SecurityGroup,
     OpenSearchServerlessCollection,
     OpenSearchServerlessSecurityPolicy,
     /// `AWS::OpenSearchService::Domain`: a domain of Amazon OpenSearch Service, which is a
@@ -630,6 +643,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         ECR_PUBLIC_REPOSITORY => Some(Provisioner::EcrPublicRepository),
         EC2_VPC => Some(Provisioner::Ec2Vpc),
         EC2_SUBNET => Some(Provisioner::Ec2Subnet),
+        EC2_SECURITY_GROUP => Some(Provisioner::Ec2SecurityGroup),
         AOSS_COLLECTION => Some(Provisioner::OpenSearchServerlessCollection),
         AOSS_SECURITY_POLICY => Some(Provisioner::OpenSearchServerlessSecurityPolicy),
         OPENSEARCH_DOMAIN => Some(Provisioner::OpenSearchServiceDomain),
@@ -759,6 +773,9 @@ impl Provisioner {
             }
             Self::Ec2Vpc => create_ec2_vpc(ctx, region, resource, propagated).await,
             Self::Ec2Subnet => create_ec2_subnet(ctx, region, resource, propagated).await,
+            Self::Ec2SecurityGroup => {
+                create_ec2_security_group(ctx, region, resource, propagated).await
+            }
             Self::S3Bucket => create_bucket(ctx, region, resource, propagated).await,
             Self::S3VectorsVectorBucket => {
                 create_vector_bucket(ctx, region, resource, propagated).await
@@ -1406,6 +1423,9 @@ impl Provisioner {
             }
             Self::Ec2Vpc => delete_ec2_vpc(ctx, region, physical_resource_id).await,
             Self::Ec2Subnet => delete_ec2_subnet(ctx, region, physical_resource_id).await,
+            Self::Ec2SecurityGroup => {
+                delete_ec2_security_group(ctx, region, physical_resource_id).await
+            }
             Self::OpenSearchServerlessSecurityPolicy => {
                 delete_security_policy(ctx, region, resource).await
             }
@@ -1679,6 +1699,9 @@ impl Provisioner {
             }
             Self::Ec2Vpc => describe_ec2_vpc(ctx, region, physical_resource_id).await,
             Self::Ec2Subnet => describe_ec2_subnet(ctx, region, physical_resource_id).await,
+            Self::Ec2SecurityGroup => {
+                describe_ec2_security_group(ctx, region, physical_resource_id).await
+            }
             Self::S3Bucket => describe_bucket(ctx, region, physical_resource_id).await,
             Self::S3VectorsVectorBucket => {
                 describe_vector_bucket(ctx, region, physical_resource_id).await
@@ -10507,13 +10530,7 @@ fn query_members(
             .find(|(declared, _)| *declared == property.as_str())
             .map_or(property.as_str(), |(_, member)| *member);
         let Some((_, shape)) = members.iter().find(|(name, _)| *name == member) else {
-            return Err(Refusal {
-                code: NOT_IMPLEMENTED.to_string(),
-                message: format!(
-                    "this emulator does not send {resource_type}'s {property} property to \
-                     the service that owns the type, so the resource was not created"
-                ),
-            });
+            return Err(property_not_sent(resource_type, property));
         };
         match shape {
             QueryMember::Scalar => {
@@ -10526,6 +10543,24 @@ fn query_members(
         }
     }
     Ok(parameters)
+}
+
+/// The refusal a declaration carrying a property no arm maps onto the owning service's
+/// request answers with: a resource created without a property its declaration asked for is
+/// configured differently from what the template declared, and the stack would have reported
+/// it as created.
+///
+/// The one wording for it, shared by [`query_members`] and by the per-member walk of a
+/// structure an arm maps itself ([`security_group_rule_parameters`]), so a property left out
+/// of one catalogue is refused in the same words as one left out of the other.
+fn property_not_sent(resource_type: &str, property: &str) -> Refusal {
+    Refusal {
+        code: NOT_IMPLEMENTED.to_string(),
+        message: format!(
+            "this emulator does not send {resource_type}'s {property} property to the \
+             service that owns the type, so the resource was not created"
+        ),
+    }
 }
 
 /// Write one LIST member into an awsQuery form body: each entry indexed from 1 under
@@ -10610,7 +10645,7 @@ fn push_tag_list(
 }
 
 // ---------------------------------------------------------------------------
-// Amazon EC2: AWS::EC2::VPC and AWS::EC2::Subnet
+// Amazon EC2: AWS::EC2::VPC, AWS::EC2::Subnet and AWS::EC2::SecurityGroup
 // ---------------------------------------------------------------------------
 
 /// Amazon EC2's signing name and the API version a request names beside the action, from
@@ -10625,11 +10660,12 @@ fn push_tag_list(
 const EC2_SIGNING_NAME: &str = "ec2";
 const EC2_API_VERSION: &str = "2016-11-15";
 
-/// The error codes Amazon EC2 answers for a VPC and a subnet it does not hold
-/// (`InvalidVpcID.NotFound` / `InvalidSubnetID.NotFound`, EC2 API error codes), which is a
-/// delete asking for a state that service is already in.
+/// The error codes Amazon EC2 answers for a VPC, a subnet and a security group it does not
+/// hold (`InvalidVpcID.NotFound` / `InvalidSubnetID.NotFound` / `InvalidGroup.NotFound`, EC2
+/// API error codes), which is a delete asking for a state that service is already in.
 const INVALID_VPC_ID_NOT_FOUND: &str = "InvalidVpcID.NotFound";
 const INVALID_SUBNET_ID_NOT_FOUND: &str = "InvalidSubnetID.NotFound";
+const INVALID_GROUP_NOT_FOUND: &str = "InvalidGroup.NotFound";
 
 /// The `AWS::EC2::VPC` properties `CreateVpc` takes under the SAME member name.
 ///
@@ -11136,6 +11172,337 @@ async fn describe_ec2_subnet(
     {
         Ok(answered) => Ok(Some(Value::Object(ec2_reported_entry(&answered, "subnetSet")))),
         Err(refusal) if refusal.code == INVALID_SUBNET_ID_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The `AWS::EC2::SecurityGroup` properties `CreateSecurityGroup` takes, each a scalar for
+/// the reason [`EC2_VPC_CREATE_MEMBERS`] records.
+///
+/// Source: AWS's CloudFormation resource reference for the type against
+/// `smithy_query(query="operation",operation="CreateSecurityGroup")`. The description is
+/// `GroupDescription` on both sides — that is the `@xmlName` of the create's `Description`
+/// member, which is the parameter name an ec2Query request carries it under — and `VpcId` is
+/// the VPC the group is created in, a `Ref` to the VPC of the same template resolving to the
+/// id EC2 assigned it ([`super::provisioning::reconcile`]). The group's own `sg-…` id is
+/// EC2's to assign, exactly as a VPC's is.
+const EC2_SECURITY_GROUP_CREATE_MEMBERS: &[(&str, QueryMember)] = &[
+    ("GroupDescription", QueryMember::Scalar),
+    ("VpcId", QueryMember::Scalar),
+];
+
+/// The `AWS::EC2::SecurityGroup` properties another parameter or another call carries: the
+/// NAME, which `CreateSecurityGroup` requires and the type leaves optional, so the arm
+/// pushes the name CloudFormation decided ([`declared_name`]); the two inline rule lists,
+/// which are not members of the create at all and are each one authorize call per rule; and
+/// the tags, which reach EC2 through [`tag_ec2_resource`].
+const EC2_SECURITY_GROUP_PROPERTIES_NOT_SENT: &[&str] = &[
+    "GroupName",
+    "SecurityGroupEgress",
+    "SecurityGroupIngress",
+    "Tags",
+];
+
+/// Where one member of an inline security group rule goes inside the `IpPermission` the
+/// authorize call for its direction takes.
+#[derive(Debug, Clone, Copy)]
+enum RuleMember {
+    /// A member of the permission itself (`IpProtocol`, `FromPort`, `ToPort`).
+    Permission(&'static str),
+    /// A member of the SOURCE the rule grants to: the permission's list that carries that
+    /// kind of source, and the member of its one entry the value is (`IpRanges` `CidrIp`,
+    /// `Groups` `GroupId`).
+    Source(&'static str, &'static str),
+}
+
+/// The `Description` member an inline rule may carry, which is a member of the SOURCE the
+/// rule references rather than of the permission ([`security_group_rule_parameters`]).
+const RULE_DESCRIPTION: &str = "Description";
+
+/// The published members of an `AWS::EC2::SecurityGroup` `Ingress` entry, each against the
+/// `IpPermission` member `AuthorizeSecurityGroupIngress` takes it as.
+///
+/// Source: the type's `Ingress` property type in AWS's resource and property type reference
+/// against `smithy_query(query="shape",shape="IpPermission,IpRange,Ipv6Range,PrefixListId,
+/// UserIdGroupPair")`. One inline rule is ONE permission, and the source it names decides
+/// which of the permission's four source lists carries it — "you must specify exactly one of
+/// the following sources" — so the three members that name a source group are all members of
+/// the `Groups` entry.
+const EC2_SECURITY_GROUP_INGRESS_MEMBERS: &[(&str, RuleMember)] = &[
+    ("IpProtocol", RuleMember::Permission("IpProtocol")),
+    ("FromPort", RuleMember::Permission("FromPort")),
+    ("ToPort", RuleMember::Permission("ToPort")),
+    ("CidrIp", RuleMember::Source("IpRanges", "CidrIp")),
+    ("CidrIpv6", RuleMember::Source("Ipv6Ranges", "CidrIpv6")),
+    (
+        "SourcePrefixListId",
+        RuleMember::Source("PrefixListIds", "PrefixListId"),
+    ),
+    (
+        "SourceSecurityGroupId",
+        RuleMember::Source("Groups", "GroupId"),
+    ),
+    (
+        "SourceSecurityGroupName",
+        RuleMember::Source("Groups", "GroupName"),
+    ),
+    (
+        "SourceSecurityGroupOwnerId",
+        RuleMember::Source("Groups", "UserId"),
+    ),
+];
+
+/// The published members of an `AWS::EC2::SecurityGroup` `Egress` entry, read the same way
+/// against `AuthorizeSecurityGroupEgress`: an outbound rule names a DESTINATION, which is
+/// the same permission structure under that type's own property names.
+const EC2_SECURITY_GROUP_EGRESS_MEMBERS: &[(&str, RuleMember)] = &[
+    ("IpProtocol", RuleMember::Permission("IpProtocol")),
+    ("FromPort", RuleMember::Permission("FromPort")),
+    ("ToPort", RuleMember::Permission("ToPort")),
+    ("CidrIp", RuleMember::Source("IpRanges", "CidrIp")),
+    ("CidrIpv6", RuleMember::Source("Ipv6Ranges", "CidrIpv6")),
+    (
+        "DestinationPrefixListId",
+        RuleMember::Source("PrefixListIds", "PrefixListId"),
+    ),
+    (
+        "DestinationSecurityGroupId",
+        RuleMember::Source("Groups", "GroupId"),
+    ),
+];
+
+/// The inline rules one of a security group's two rule properties declares, as the entries
+/// each authorize call takes one of.
+///
+/// A declaration that writes a single rule without the sequence syntax is the one-entry list
+/// of itself, exactly as [`push_list`] reads one, so such a rule is not dropped.
+fn declared_security_group_rules<'declaration>(
+    properties: &'declaration Value,
+    property: &str,
+) -> Vec<&'declaration Value> {
+    match properties.get(property) {
+        Some(Value::Array(rules)) => rules.iter().collect(),
+        Some(Value::Null) | None => Vec::new(),
+        Some(single) => vec![single],
+    }
+}
+
+/// ONE inline rule of a security group as the `IpPermissions.1.…` parameters the authorize
+/// call for its direction takes, walked against that rule type's published members.
+///
+/// A member the catalogue does not carry is REFUSED, for the reason [`property_not_sent`]
+/// records: a group authorized without a rule its declaration asked for is not the group the
+/// template declared. The rule's `Description` is a member of the source it references
+/// (`IpRange$Description`, `UserIdGroupPair$Description`, `PrefixListId$Description`), so it
+/// is written onto the list that source is in — and a rule naming no source at all carries it
+/// nowhere, which leaves Amazon EC2's own refusal of a rule that names none ("you must
+/// specify exactly one of the following sources") as the answer.
+fn security_group_rule_parameters(
+    rule: &Value,
+    members: &[(&str, RuleMember)],
+) -> Result<Vec<(String, String)>, Refusal> {
+    /// The index of the one permission each of these calls carries: a rule is one
+    /// permission, and an ec2Query list is indexed from 1.
+    const PERMISSION: &str = "IpPermissions.1";
+
+    let mut parameters: Vec<(String, String)> = Vec::new();
+    let Some(declared) = rule.as_object() else {
+        return Err(Refusal {
+            code: NOT_IMPLEMENTED.to_string(),
+            message: format!(
+                "a rule of {EC2_SECURITY_GROUP} is a structure of the members its rule \
+                 property type publishes, so {rule} is not one this emulator can authorize"
+            ),
+        });
+    };
+    let mut source: Option<&str> = None;
+    for (member, value) in declared {
+        if member == RULE_DESCRIPTION {
+            continue;
+        }
+        let Some((_, placed)) = members.iter().find(|(name, _)| *name == member.as_str()) else {
+            return Err(property_not_sent(EC2_SECURITY_GROUP, member));
+        };
+        match placed {
+            RuleMember::Permission(name) => {
+                parameters.push((format!("{PERMISSION}.{name}"), attribute_text(value)));
+            }
+            RuleMember::Source(list, name) => {
+                source = Some(list);
+                parameters.push((
+                    format!("{PERMISSION}.{list}.1.{name}"),
+                    attribute_text(value),
+                ));
+            }
+        }
+    }
+    if let (Some(description), Some(list)) = (declared.get(RULE_DESCRIPTION), source) {
+        parameters.push((
+            format!("{PERMISSION}.{list}.1.{RULE_DESCRIPTION}"),
+            attribute_text(description),
+        ));
+    }
+    Ok(parameters)
+}
+
+/// Create the security group an `AWS::EC2::SecurityGroup` declares, in Amazon EC2, and
+/// authorize the inline rules its declaration asks for.
+///
+/// "Ref returns the ID of the security group" — an id EC2 ASSIGNS (`sg-` and 17 hexadecimal
+/// characters), which is what this answers as the resource's physical id, so the stack's
+/// `Ref`, its outputs and its per-resource reads report an id EC2 really holds a group for
+/// and every service that takes a security group id accepts it.
+///
+/// The rules are not members of the create: "when you create a security group, it has no
+/// inbound rules", and each entry of either rule property is one permission of
+/// `AuthorizeSecurityGroupIngress` / `AuthorizeSecurityGroupEgress`. An outbound rule is
+/// authorized BESIDE the all-traffic rule EC2 gives a new group, since the call that would
+/// remove that rule is one this emulator does not serve yet — so a declaration's own
+/// outbound rules are added rather than left unasked for.
+async fn create_ec2_security_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let mut parameters = query_members(
+        &resource.properties,
+        EC2_SECURITY_GROUP_CREATE_MEMBERS,
+        &[],
+        EC2_SECURITY_GROUP_PROPERTIES_NOT_SENT,
+        EC2_SECURITY_GROUP,
+    )?;
+    // "The name of the security group" (`CreateSecurityGroupRequest$GroupName`) is required
+    // by that call while the type's own `GroupName` is optional — "if you don't specify a
+    // group name, CloudFormation generates a unique physical ID and uses that ID for the
+    // group name" — so the group is created under the name the stack gave the resource.
+    parameters.push(("GroupName".to_string(), declared_name(resource)));
+    let answered = call_query(
+        ctx,
+        EC2_SIGNING_NAME,
+        region,
+        EC2_API_VERSION,
+        "CreateSecurityGroup",
+        &parameters,
+    )
+    .await?;
+    let group_id = xml_element(&answered, "groupId")
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| Refusal {
+            code: UNIDENTIFIED_FAILURE.to_string(),
+            message: "CreateSecurityGroup answered no groupId".to_string(),
+        })?;
+    for (property, members, action) in [
+        (
+            "SecurityGroupIngress",
+            EC2_SECURITY_GROUP_INGRESS_MEMBERS,
+            "AuthorizeSecurityGroupIngress",
+        ),
+        (
+            "SecurityGroupEgress",
+            EC2_SECURITY_GROUP_EGRESS_MEMBERS,
+            "AuthorizeSecurityGroupEgress",
+        ),
+    ] {
+        for rule in declared_security_group_rules(&resource.properties, property) {
+            let mut parameters = vec![("GroupId".to_string(), group_id.clone())];
+            parameters.extend(security_group_rule_parameters(rule, members)?);
+            call_query(
+                ctx,
+                EC2_SIGNING_NAME,
+                region,
+                EC2_API_VERSION,
+                action,
+                &parameters,
+            )
+            .await?;
+        }
+    }
+    tag_ec2_resource(
+        ctx,
+        region,
+        &group_id,
+        &tags_of(&resource.properties, propagated),
+    )
+    .await?;
+    // The attributes the type publishes: the id EC2 assigned (which this type's `GroupId`
+    // return value is) and the VPC the group was created in, which is the one the
+    // declaration named — re-pointed at the id EC2 minted for it before this create was
+    // made, so the attribute carries a VPC id EC2 knows. A declaration naming none leaves
+    // the group in the Region's default VPC, whose id only EC2 holds, so none is reported
+    // rather than invented. The ARN is the one EC2 built for the group, under both names the
+    // uniform convention reads a resource's ARN off.
+    let mut attributes = BTreeMap::new();
+    attributes.insert("GroupId".to_string(), group_id.clone());
+    if let Some(vpc_id) = resource
+        .properties
+        .get("VpcId")
+        .and_then(Value::as_str)
+        .filter(|vpc_id| !vpc_id.is_empty())
+    {
+        attributes.insert("VpcId".to_string(), vpc_id.to_string());
+    }
+    if let Some(arn) = xml_element(&answered, "securityGroupArn").filter(|arn| !arn.is_empty()) {
+        attributes.extend(super::template::arn_attributes(
+            &resource.resource_type,
+            &arn,
+        ));
+    }
+    Ok(Created {
+        physical_resource_id: Some(group_id),
+        attributes,
+    })
+}
+
+/// Delete the security group a stack created, addressed by the id EC2 assigned it. A group
+/// EC2 no longer holds (`InvalidGroup.NotFound`) is already in the state the delete asks
+/// for; one another resource still references is that service's own `DependencyViolation`,
+/// which the stack reports as the failure it is.
+async fn delete_ec2_security_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    group_id: &str,
+) -> Result<(), Refusal> {
+    let parameters = vec![("GroupId".to_string(), group_id.to_string())];
+    match call_query(
+        ctx,
+        EC2_SIGNING_NAME,
+        region,
+        EC2_API_VERSION,
+        "DeleteSecurityGroup",
+        &parameters,
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == INVALID_GROUP_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The security group's configuration as Amazon EC2 reports it, for drift detection. A group
+/// it no longer holds (`InvalidGroup.NotFound`) was deleted.
+async fn describe_ec2_security_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    group_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let parameters = vec![("GroupId.1".to_string(), group_id.to_string())];
+    match call_query(
+        ctx,
+        EC2_SIGNING_NAME,
+        region,
+        EC2_API_VERSION,
+        "DescribeSecurityGroups",
+        &parameters,
+    )
+    .await
+    {
+        Ok(answered) => Ok(Some(Value::Object(ec2_reported_entry(
+            &answered,
+            "securityGroupInfo",
+        )))),
+        Err(refusal) if refusal.code == INVALID_GROUP_NOT_FOUND => Ok(None),
         Err(refusal) => Err(refusal),
     }
 }

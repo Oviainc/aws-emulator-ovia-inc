@@ -58,7 +58,7 @@ const OWN_NETWORK: &str = concat!(
     "  DbSecurityGroup:\n",
     "    Type: AWS::EC2::SecurityGroup\n",
     "    Properties:\n",
-    "      GroupDescription: the database's own security group\n",
+    "      GroupDescription: the database security group\n",
     "      VpcId: !Ref Vpc\n",
     "  DbSubnetGroup:\n",
     "    Type: AWS::RDS::DBSubnetGroup\n",

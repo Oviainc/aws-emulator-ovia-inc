@@ -224,7 +224,7 @@ const IDENTITY_ROWS: &[IdentityRow] = &[
         resource_type: "AWS::EC2::SecurityGroup",
         prefix: "sg",
         identifier_attribute: "GroupId",
-        properties: |_| json!({ "GroupDescription": "the identifier table's group" }),
+        properties: |_| json!({ "GroupDescription": "the identifier table group" }),
         supporting: nothing_else,
     },
     IdentityRow {
