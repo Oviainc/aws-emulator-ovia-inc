@@ -153,10 +153,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     /// Report the satellite `{satelliteId}` addresses.
     ///
-    /// `@readonly`: the answer is computed from the stored onboarding and nothing is
-    /// written, so reading a satellite changes nothing a later caller sees. Nothing in
-    /// this API onboards a satellite — AWS does that outside it — so an id this account
-    /// holds no onboarding for names no satellite and is refused with
+    /// `@readonly`: the answer is computed from the stored onboarding and the ephemerides
+    /// this account holds for it, so reading a satellite changes nothing a later caller
+    /// sees — the ephemeris it reports as `currentEphemeris` is derived from that store
+    /// and from the clock, both of which stood as they are whether or not anybody called.
+    /// Nothing in this API onboards a satellite — AWS does that outside it — so an id this
+    /// account holds no onboarding for names no satellite and is refused with
     /// [`SATELLITE_NOT_FOUND`].
     async fn handle(
         &self,
@@ -170,7 +172,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        let guard = state.lock();
+        let mut guard = state.lock();
+        // An ephemeris leaves `VALIDATING` at an instant its create recorded and becomes
+        // `EXPIRED` once its expiration passes, and which ephemeris a satellite's
+        // trajectory is computed from follows from those statuses: both moves were owed at
+        // this instant whether or not anybody called, so materialising them and the
+        // reference they imply before reading changes nothing a later caller could
+        // otherwise have seen.
+        guard.settle_due_ephemerides();
+        guard.refresh_current_ephemerides();
+
         let stored = guard.satellites.get(&input.satellite_id).ok_or_else(|| {
             GetSatelliteErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                 message: Some(SATELLITE_NOT_FOUND.to_string()),

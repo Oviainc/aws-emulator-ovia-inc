@@ -210,8 +210,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The link is optional, and the modelled pattern admits the empty string, which
-        // names no link and is held as none.
-        let link_id = input.link_id.clone().filter(|link| !link.is_empty());
+        // names no link and is held as none ([`crate::state::optional_reference`]).
+        let link_id = crate::state::optional_reference(input.link_id.clone());
         if let Some(link) = link_id.as_deref() {
             if store
                 .links

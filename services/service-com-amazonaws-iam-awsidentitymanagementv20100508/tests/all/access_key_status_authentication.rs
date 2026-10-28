@@ -27,6 +27,7 @@
 use service_com_amazonaws_iam_awsidentitymanagementv20100508::ops::types::STATUS_TYPE_VALUES;
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::identity_policy_enforcement::grant_get_user;
 use crate::user_lifecycle::{call, call_signed_by, element, elements, error_code, router};
 
 /// The status a key carries from the moment it is minted: `CreateAccessKey` documents
@@ -86,6 +87,11 @@ async fn user_with_two_keys(router: &MultiServiceRouter, case: &str, user: &str)
         "case {case:?}: the fixture CreateUser must succeed, got {status}: {body}"
     );
     let mut ids = Vec::new();
+    // The nameless `GetUser` below is a signed read IAM authorizes against the caller's
+    // own identity-based policies, so the user is given the grant AWS requires for it:
+    // what the rows are about is the KEY's status, which a caller without that grant
+    // would never get far enough to show.
+    grant_get_user(router, case, user).await;
     for index in 0..2 {
         let (status, created) = call(router, "CreateAccessKey", &[("UserName", user)]).await;
         assert_eq!(

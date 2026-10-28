@@ -333,22 +333,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `AgreementStatus` documents the status the agreement a replacement
         // acts upon carries from then on: "REPLACED – The agreement was replaced
         // using an agreement replacement offer." What an AMEND leaves its source
-        // in is not documented, so the emulator does not move it.
+        // in is not documented, so the emulator does not move it. The move goes
+        // through the guarded writer every status transition of this service
+        // goes through (`Agreement::replace`), so a source that has already
+        // reached a terminal status keeps it and only the transition this call
+        // actually made is audited.
         if request.intent == crate::state::INTENT_REPLACE {
             if let Some(source) = request
                 .source_agreement_identifier
                 .as_deref()
                 .and_then(|source| store.agreements.get_mut(source))
             {
-                source.status = crate::state::STATUS_REPLACED.to_string();
-                source.updated_at = now;
-                let replaced = source.id.clone();
-                crate::state::audit(
-                    "AcceptAgreementRequest",
-                    "replaced",
-                    &replaced,
-                    ctx.parts(),
-                );
+                if source.replace(now) {
+                    let replaced = source.id.clone();
+                    crate::state::audit(
+                        "AcceptAgreementRequest",
+                        "replaced",
+                        &replaced,
+                        ctx.parts(),
+                    );
+                }
             }
         }
 

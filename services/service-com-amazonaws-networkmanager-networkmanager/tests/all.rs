@@ -89,6 +89,8 @@ mod device_lifecycle;
 mod direct_connect_gateway_attachment_lifecycle;
 #[path = "all/disassociate_connect_peer.rs"]
 mod disassociate_connect_peer;
+#[path = "all/empty_optional_reference.rs"]
+mod empty_optional_reference;
 #[path = "all/filter_id_list_maximum.rs"]
 mod filter_id_list_maximum;
 #[path = "all/filter_maximum_table.rs"]

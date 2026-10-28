@@ -193,6 +193,34 @@ async fn create_user(
     (member(case, &body, "UserId"), member(case, &body, "Arn"))
 }
 
+/// Give `user_name` the grant AWS requires for the nameless `GetUser` read below.
+///
+/// IAM authorizes its own API against the calling user's identity-based policies, so a
+/// user holding none could never reach that handler whatever the access-key binding
+/// says. The grant is the fixture; what the rows are about is still WHICH user the
+/// presented key resolves to.
+async fn grant_reading_itself(router: &MultiServiceRouter, case: &str, user_name: &str) {
+    let (status, body) = iam(
+        router,
+        AMBIENT_KEY,
+        "PutUserPolicy",
+        &[
+            ("UserName", user_name.to_string()),
+            ("PolicyName", "allow-getuser".to_string()),
+            (
+                "PolicyDocument",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"iam:GetUser","Resource":"*"}]}"#
+                    .to_string(),
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from the fixture PutUserPolicy, got {status} {body}"
+    );
+}
+
 /// Mint one access key for `user_name` and return its `AccessKeyId` with the
 /// `SecretAccessKey` the call handed back.
 async fn create_access_key(
@@ -246,6 +274,7 @@ async fn an_access_key_minted_for_a_user_resolves_to_that_user() {
     let mut seen_arns: Vec<String> = Vec::new();
     for (case, user_name, path, key_count) in rows {
         let (user_id, user_arn) = create_user(&router, case, user_name, path).await;
+        grant_reading_itself(&router, case, user_name).await;
         assert_eq!(
             user_arn,
             format!("arn:aws:iam::{account}:user{path}{user_name}"),

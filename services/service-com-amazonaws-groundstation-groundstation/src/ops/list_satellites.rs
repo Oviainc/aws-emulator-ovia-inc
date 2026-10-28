@@ -132,9 +132,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// Report the satellites this account is on-boarded to, a page at a time.
     ///
     /// `@readonly`: the answer is computed from [`crate::state::ComAmazonawsGroundstationGroundstationState::satellites`]
-    /// and nothing is written, so a listing changes nothing a later caller sees. A
-    /// satellite is not created through this API — AWS onboards one to the account
-    /// outside it — so the store holds exactly the onboardings
+    /// and the ephemerides this account holds for them, so a listing changes nothing a
+    /// later caller sees — the ephemeris each item reports as `currentEphemeris` is
+    /// derived from that store and from the clock, both of which stood as they are
+    /// whether or not anybody called. A satellite is not created through this API — AWS
+    /// onboards one to the account outside it — so the store holds exactly the onboardings
     /// [`crate::state::SATELLITES_ENV`] describes, and an account with none lists none.
     async fn handle(
         &self,
@@ -156,7 +158,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // by the NORAD catalogue number that identifies the spacecraft (and by
         // `satelliteId` beside it, so the order is total whatever the store holds) rather
         // than by the map's own iteration order.
-        let guard = state.lock();
+        let mut guard = state.lock();
+        // The same two clock-owed moves `GetSatellite` materialises before reading: this
+        // listing and that reader report ONE record, so they read the ephemeris in force
+        // for a satellite from the same store at the same instant.
+        guard.settle_due_ephemerides();
+        guard.refresh_current_ephemerides();
+
         let mut onboarded: Vec<&crate::state::Satellite> = guard.satellites.values().collect();
         onboarded.sort_by(|left, right| {
             (left.norad_satellite_id, &left.satellite_id)

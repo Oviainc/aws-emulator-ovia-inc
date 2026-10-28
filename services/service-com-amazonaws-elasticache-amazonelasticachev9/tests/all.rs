@@ -188,3 +188,7 @@ mod serverless_cache_modify;
 // and the refusal templates).
 #[path = "all/read_validate_fidelity.rs"]
 mod read_validate_fidelity;
+
+// Appended for the same reason: the `StartMigration` suite.
+#[path = "all/start_migration.rs"]
+mod start_migration;

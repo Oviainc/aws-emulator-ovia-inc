@@ -15,6 +15,7 @@
 //! and which credentials the request is presented as signed by. The awsQuery
 //! harness (router, call, element) is the one `tests/all/user_lifecycle.rs` owns.
 
+use crate::identity_policy_enforcement::{grant_get_user, GET_USER_GRANT_NAME};
 use crate::user_lifecycle::{call, call_signed_by, element, elements, error_code, router};
 
 /// One deletion: the user the account holds, and the case the request spells that
@@ -87,6 +88,11 @@ async fn user_with_keys(
         "case {case:?}: CreateUser must succeed, got {status}: {body}"
     );
     let mut ids = Vec::new();
+    // `GetUser` signed by the user's own key is the read this suite follows the binding
+    // through, and IAM authorizes it against the caller's own identity-based policies —
+    // so the user is given the grant AWS requires for that read. The grant is the
+    // fixture: what each row is about is whether the key still resolves to its user.
+    grant_get_user(router, case, user).await;
     for index in 0..count {
         let (status, created) = call(router, "CreateAccessKey", &[("UserName", user)]).await;
         assert_eq!(
@@ -241,6 +247,19 @@ async fn a_deleted_key_frees_the_quota_and_the_user() {
                 "case {case:?}: expected remaining key {index} to delete, got {status}: {body}"
             );
         }
+        // An inline policy is a dependent of its user too, so the fixture grant comes
+        // off before the delete under test: what this row is about is the last ACCESS
+        // KEY no longer holding the user back.
+        let (status, removed) = call(
+            &router,
+            "DeleteUserPolicy",
+            &[("UserName", requested_name), ("PolicyName", GET_USER_GRANT_NAME)],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the fixture DeleteUserPolicy must succeed, got {status}: {removed}"
+        );
         let (status, body) = call(&router, "DeleteUser", &[("UserName", requested_name)]).await;
         assert_eq!(
             status, 200,

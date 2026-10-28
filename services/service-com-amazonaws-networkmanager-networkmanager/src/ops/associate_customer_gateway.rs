@@ -206,7 +206,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        if let Some(link_id) = input.link_id.as_deref() {
+        // The link is OPTIONAL, and the empty string names no link ([`crate::state::
+        // optional_reference`], as the other two associates read that member), so it
+        // resolves nothing and is held as none rather than being answered as a link that
+        // cannot be found.
+        let link_id = crate::state::optional_reference(input.link_id);
+        if let Some(link_id) = link_id.as_deref() {
             let link_resolves = store
                 .links
                 .get(link_id)
@@ -253,7 +258,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.customer_gateway_arn,
         );
         if let Some(existing) = store.customer_gateway_associations.get(&key) {
-            if existing.device_id == input.device_id && existing.link_id == input.link_id {
+            if existing.device_id == input.device_id && existing.link_id == link_id {
                 return Ok(AssociateCustomerGatewayOutput {
                     customer_gateway_association: Some(existing.to_shape(now)),
                 });
@@ -311,7 +316,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             global_network_id: input.global_network_id,
             customer_gateway_arn: input.customer_gateway_arn,
             device_id: input.device_id,
-            link_id: input.link_id,
+            link_id,
             available_at: now + crate::state::SETTLE_DELAY,
         };
         let association = record.to_shape(now);

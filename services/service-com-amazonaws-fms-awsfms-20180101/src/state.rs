@@ -2969,11 +2969,15 @@ pub fn decode_uri_page_token(token: &str) -> Option<String> {
 /// [`encode_page_token`]. `None` when the token was not produced by this
 /// service.
 ///
+/// The token-to-key step is [`decode_key_token`]'s, like every other
+/// specialised decoder here, so this module expresses that rule once; this one
+/// adds only its own shape check.
+///
 /// The decoded value must still be an `AWSAccountId` ([`is_account_id`]), so a
 /// token minted for a policy page — or any foreign token that happens to be
 /// valid hex — is refused rather than resumed from as an arbitrary key.
 pub fn decode_account_page_token(token: &str) -> Option<String> {
-    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    let decoded = decode_key_token(token)?;
     is_account_id(&decoded).then_some(decoded)
 }
 

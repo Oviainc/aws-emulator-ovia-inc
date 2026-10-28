@@ -16,7 +16,11 @@
 //! that whole sequence — judge the ARN as an input, take the store, materialise
 //! the due expiry, then resolve the record or answer the service's not-found
 //! failure — is this module's [`with_tagged_parameter`], so the rule is stated
-//! and applied in one place rather than re-derived per handler.
+//! and applied in one place rather than re-derived per handler; the operations
+//! whose success WRITES the record it resolves take [`write_tagged_parameter`],
+//! which is that same sequence plus the one thing a write owes the record it
+//! changed: the instant it was written
+//! ([`DeploymentParameterRecord::mark_written`]).
 //!
 //! The AGREEMENTS a deployment parameter is written against are held here too
 //! ([`ProvisionedAgreement`]). This API models no operation that creates a
@@ -426,6 +430,21 @@ impl DeploymentParameterRecord {
             self.agreement_id.clone(),
             self.name.clone(),
         )
+    }
+
+    /// Stamp `now` as the instant this record's stored content was last written.
+    ///
+    /// [`Self::updated_at`] is the record's "last written" instant, so EVERY
+    /// operation that writes the stored record refreshes it from the clock sample
+    /// its own call was served at — the content a write leaves and the instant the
+    /// record reports for it are one write, so no stored record can report a
+    /// "last written" instant older than its own content. Only a call that wrote
+    /// does: a reporting operation, and a write the service refused, leave the
+    /// field where the last write left it. Stated here once so the write paths
+    /// cannot come to disagree, and applied for the tagging writes by
+    /// [`write_tagged_parameter`].
+    pub fn mark_written(&mut self, now: SystemTime) {
+        self.updated_at = now;
     }
 
     /// The tag map as the modelled `TagsMap` / `Tags` wire shape.
@@ -1061,16 +1080,84 @@ pub fn store_unavailable() -> InternalServerException {
 ///    ([`parameter_not_found`]).
 ///
 /// `resolved` therefore sees a record that EXISTS, still inside the store lock, and
-/// may read it or write it; what it answers is what the operation answers. Generic
-/// over the operation's modelled error enum and over what the operation reports, so
-/// one implementation of the sequence serves a reporting operation and a mutating
-/// one alike — and a change to any step is a change to all of them.
+/// what it answers is what the operation answers. Generic over the operation's
+/// modelled error enum and over what the operation reports, so one implementation of
+/// the sequence serves a reporting operation and a mutating one alike — and a change
+/// to any step is a change to all of them.
+///
+/// This is the REPORTING entry point: it leaves the record's "last written" instant
+/// alone, because reporting a record is not writing it. An operation whose success
+/// writes the record takes [`write_tagged_parameter`], which runs this same sequence
+/// and stamps that instant.
 pub fn with_tagged_parameter<Eng, E, T>(
     engine: &Eng,
     resource_arn: &str,
     store_unavailable_as: impl FnOnce(InternalServerException) -> E,
     judge_request: impl FnOnce() -> Result<(), E>,
     resolved: impl FnOnce(&mut DeploymentParameterRecord) -> Result<T, E>,
+) -> Result<T, crate::scaffolded::Scaffolded<E>>
+where
+    Eng: Send + Sync + 'static,
+{
+    resolve_tagged_parameter(
+        engine,
+        resource_arn,
+        store_unavailable_as,
+        judge_request,
+        |record, _now| resolved(record),
+    )
+}
+
+/// [`with_tagged_parameter`] for an operation whose success WRITES the record it
+/// resolved: `write` sees the resolved record and, when it answers success, the
+/// record's "last written" instant is refreshed from the sequence's own clock
+/// sample ([`DeploymentParameterRecord::mark_written`]).
+///
+/// The stamp is applied HERE rather than in each handler so the two tagging writes
+/// cannot drift from one another or from the write `PutDeploymentParameter`
+/// performs: a mutating operation that goes through this sequence refreshes the
+/// field by going through it. It is applied only on SUCCESS and only from this
+/// entry point, so a refused write leaves the record exactly as it found it and a
+/// reporting operation (which takes [`with_tagged_parameter`]) never moves the
+/// field at all.
+///
+/// The instant is the sample the sequence already took under the lock for the
+/// expiry it materialises, so the whole call — the deletion the clock made due and
+/// the write this record records — is served at ONE instant.
+pub fn write_tagged_parameter<Eng, E, T>(
+    engine: &Eng,
+    resource_arn: &str,
+    store_unavailable_as: impl FnOnce(InternalServerException) -> E,
+    judge_request: impl FnOnce() -> Result<(), E>,
+    write: impl FnOnce(&mut DeploymentParameterRecord) -> Result<T, E>,
+) -> Result<T, crate::scaffolded::Scaffolded<E>>
+where
+    Eng: Send + Sync + 'static,
+{
+    resolve_tagged_parameter(
+        engine,
+        resource_arn,
+        store_unavailable_as,
+        judge_request,
+        |record, now| {
+            let answered = write(record)?;
+            record.mark_written(now);
+            Ok(answered)
+        },
+    )
+}
+
+/// The resolution sequence itself, which [`with_tagged_parameter`] and
+/// [`write_tagged_parameter`] are the reporting and the writing view of: `resolved`
+/// additionally sees the instant the sequence sampled under the lock, which is what
+/// lets a write stamp the record it changed with the instant its own call was
+/// served at.
+fn resolve_tagged_parameter<Eng, E, T>(
+    engine: &Eng,
+    resource_arn: &str,
+    store_unavailable_as: impl FnOnce(InternalServerException) -> E,
+    judge_request: impl FnOnce() -> Result<(), E>,
+    resolved: impl FnOnce(&mut DeploymentParameterRecord, SystemTime) -> Result<T, E>,
 ) -> Result<T, crate::scaffolded::Scaffolded<E>>
 where
     Eng: Send + Sync + 'static,
@@ -1088,7 +1175,7 @@ where
     let Some(record) = store.parameters.get_mut(resource_arn) else {
         return Err(parameter_not_found());
     };
-    resolved(record).map_err(crate::scaffolded::Scaffolded::Modeled)
+    resolved(record, now).map_err(crate::scaffolded::Scaffolded::Modeled)
 }
 
 /// Record the agreements this account holds ahead of any request.

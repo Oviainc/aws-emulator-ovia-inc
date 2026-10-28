@@ -9,8 +9,12 @@
 //!
 //! Resolving the label is the sequence every operation that addresses a deployment
 //! parameter by a caller-supplied `resourceArn` runs, written once as
-//! `crate::state::with_tagged_parameter`; what follows is what that sequence decides,
-//! and this handler adds only the removal from the resolved record.
+//! `crate::state::write_tagged_parameter` (the writing view of that sequence); what
+//! follows is what the sequence decides, and this handler adds only the removal from
+//! the resolved record. Because the removal IS a write to the stored record, the
+//! sequence refreshes the instant the record reports as last written
+//! (`crate::state::DeploymentParameterRecord::mark_written`) once it succeeds, and
+//! leaves it untouched when the request is refused.
 //!
 //! The label is judged as an INPUT first (`crate::state::validate_resource_arn`): a
 //! value that is not a resource ARN of this service's vendor names nothing this API
@@ -163,8 +167,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ONE sequence, stated once in `crate::state`: judge the `resourceArn` as an
         // input, judge the rest of the request on its own content, take the store,
         // materialise the expiry the clock has already made due, then resolve the
-        // record or answer the service's not-found failure. The removal below is
-        // everything this operation adds to it.
+        // record or answer the service's not-found failure — and, because this
+        // operation's success WRITES the record, stamp the instant it was written.
+        // The removal below is everything this operation adds to it.
         //
         // The ARN check comes first: a value that is not a resource ARN this API
         // addresses is a bad request, not a missing resource. A tag key in the
@@ -174,7 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and the request removes nothing. A record whose `expirationDate` has passed
         // is scheduled for deletion, so a tag removal against it is a write to a
         // resource that no longer exists.
-        crate::state::with_tagged_parameter(
+        crate::state::write_tagged_parameter(
             &*self.engine,
             &input.resource_arn,
             UntagResourceErrorModeled::InternalServerException,
