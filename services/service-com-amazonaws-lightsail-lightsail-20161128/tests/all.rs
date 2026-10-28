@@ -169,6 +169,8 @@ mod instance_error_envelope;
 mod instance_https_setup;
 #[path = "all/instance_lifecycle.rs"]
 mod instance_lifecycle;
+#[path = "all/instance_metadata_ipv6_region.rs"]
+mod instance_metadata_ipv6_region;
 #[path = "all/instance_metadata_options.rs"]
 mod instance_metadata_options;
 #[path = "all/instance_metric_data.rs"]

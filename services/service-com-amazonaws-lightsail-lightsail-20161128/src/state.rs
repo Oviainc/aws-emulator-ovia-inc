@@ -4898,6 +4898,38 @@ pub const HTTP_PROTOCOL_IPV6_ENABLED: &str = "enabled";
 /// See [`HTTP_PROTOCOL_IPV6_ENABLED`].
 pub const HTTP_PROTOCOL_IPV6_DISABLED: &str = "disabled";
 
+/// The one Region whose instances have an IPv6 endpoint on their metadata
+/// service at all, from that setting's own documented availability note
+/// (`smithy_query(query="doc",shape="UpdateInstanceMetadataOptionsRequest",member="httpProtocolIpv6")`):
+/// "This parameter is available only for instances in the Europe (Stockholm)
+/// Amazon Web Services Region (eu-north-1)."
+pub const IPV6_METADATA_ENDPOINT_REGION_NAME: &str = "eu-north-1";
+
+/// The refusal a request that sets `httpProtocolIpv6` on an instance outside
+/// [`IPV6_METADATA_ENDPOINT_REGION_NAME`] is answered with, as that member's own
+/// documentation states the restriction.
+pub const IPV6_METADATA_ENDPOINT_REGION_ONLY_MESSAGE: &str =
+    "The httpProtocolIpv6 parameter is available only for instances in the Europe (Stockholm) \
+     Amazon Web Services Region (eu-north-1).";
+
+/// Whether an instance in `region_name` has the metadata service's IPv6 endpoint
+/// to enable or disable.
+///
+/// The crate's ONE owner of that setting's documented Region restriction, asked
+/// both by the operation that sets the member and by the projection that reports
+/// it, so the restriction is decided in a single place.
+pub fn region_has_ipv6_metadata_endpoint(region_name: &str) -> bool {
+    region_name == IPV6_METADATA_ENDPOINT_REGION_NAME
+}
+
+/// The refusal for a request that sets `httpProtocolIpv6` on an instance in
+/// `region_name`, and `None` when that Region's instances have the endpoint the
+/// member configures.
+pub fn ipv6_metadata_region_refusal(region_name: &str) -> Option<String> {
+    (!region_has_ipv6_metadata_endpoint(region_name))
+        .then(|| IPV6_METADATA_ENDPOINT_REGION_ONLY_MESSAGE.to_string())
+}
+
 /// The hop limit an instance's metadata service is created with: a metadata
 /// response reaches the instance itself and goes no further, which is the one
 /// hop a request from the instance needs.
@@ -4951,12 +4983,18 @@ impl Default for StoredMetadataOptions {
 
 impl StoredMetadataOptions {
     /// This configuration as the modelled `InstanceMetadataOptions`, for an
-    /// instance whose own addressing is `ip_address_type`.
+    /// instance whose own addressing is `ip_address_type` and which lives in
+    /// `region_name`.
     ///
     /// `state` is read from what is outstanding rather than stored twice: a
     /// selection the clock still owes the instance is `pending`, and one it has
     /// nothing left to do for is `applied`.
-    pub fn view(&self, ip_address_type: &str) -> InstanceMetadataOptions {
+    ///
+    /// `httpProtocolIpv6` is the metadata service's IPv6 endpoint, which only an
+    /// instance in [`IPV6_METADATA_ENDPOINT_REGION_NAME`] has at all, so an
+    /// instance anywhere else reports it disabled whatever its own addressing:
+    /// there is no such endpoint there to reach.
+    pub fn view(&self, ip_address_type: &str, region_name: &str) -> InstanceMetadataOptions {
         InstanceMetadataOptions {
             state: Some(
                 if self.applied_at_ms.is_some() {
@@ -4969,13 +5007,17 @@ impl StoredMetadataOptions {
             http_tokens: Some(self.http_tokens.clone()),
             http_endpoint: Some(self.http_endpoint.clone()),
             http_put_response_hop_limit: Some(self.http_put_response_hop_limit),
-            http_protocol_ipv6: Some(self.http_protocol_ipv6.clone().unwrap_or_else(|| {
-                if ip_address_type_has_ipv6(ip_address_type) {
-                    HTTP_PROTOCOL_IPV6_ENABLED.to_string()
-                } else {
-                    HTTP_PROTOCOL_IPV6_DISABLED.to_string()
-                }
-            })),
+            http_protocol_ipv6: Some(if !region_has_ipv6_metadata_endpoint(region_name) {
+                HTTP_PROTOCOL_IPV6_DISABLED.to_string()
+            } else {
+                self.http_protocol_ipv6.clone().unwrap_or_else(|| {
+                    if ip_address_type_has_ipv6(ip_address_type) {
+                        HTTP_PROTOCOL_IPV6_ENABLED.to_string()
+                    } else {
+                        HTTP_PROTOCOL_IPV6_DISABLED.to_string()
+                    }
+                })
+            }),
         }
     }
 }
@@ -5039,7 +5081,10 @@ impl StoredInstance {
             }),
             username: blueprint_username(&self.blueprint_id).map(str::to_string),
             ssh_key_name: Some(self.ssh_key_name.clone()),
-            metadata_options: Some(self.metadata_options.view(&self.ip_address_type)),
+            metadata_options: Some(
+                self.metadata_options
+                    .view(&self.ip_address_type, &self.location.region_name),
+            ),
         }
     }
 

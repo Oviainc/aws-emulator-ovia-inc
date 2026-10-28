@@ -691,8 +691,16 @@ async fn an_instance_reads_back_as_it_was_created() {
         }
         assert_eq!(
             instance["metadataOptions"]["httpProtocolIpv6"].as_str(),
-            Some(if wants_ipv6 { "enabled" } else { "disabled" }),
-            "case {case}: expected the metadata IPv6 endpoint to follow the address type, got {:?}",
+            Some(
+                if wants_ipv6 && row.region == crate::instance_metadata_ipv6_region::IPV6_METADATA_REGION
+                {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            ),
+            "case {case}: expected the metadata IPv6 endpoint to follow the address type where \
+             an instance has that endpoint at all, got {:?}",
             instance["metadataOptions"]
         );
 

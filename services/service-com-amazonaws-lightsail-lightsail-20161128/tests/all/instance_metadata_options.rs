@@ -4,6 +4,11 @@
 //! of one Lightsail instance, driven over the wire through the same front door a
 //! client uses.
 //!
+//! Every instance here lives in the one Region whose instances have an IPv6
+//! endpoint on their metadata service, so a row may name `httpProtocolIpv6`
+//! alongside the other three settings; that member's own Region restriction is
+//! the table in `instance_metadata_ipv6_region.rs`.
+//!
 //! The rule under test: the call records the metadata settings the request NAMES
 //! on the ONE stored instance its `instanceName` addresses — a setting the
 //! request names no value for keeps the value the instance already had, except
@@ -29,6 +34,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::instance_lifecycle::{error_code, is_uuid_shaped, wait_for_state, Emulator};
+use crate::instance_metadata_ipv6_region::IPV6_METADATA_REGION;
 
 /// The `operationType` the log entry of this call carries, the modelled
 /// `OperationType` enum's own `UpdateInstanceMetadataOptions` member.
@@ -185,13 +191,16 @@ fn update_body(
 
 /// Create the dual-stack instance `name` and wait until it is running — the
 /// state the documented `pending` → `applied` span belongs to.
+///
+/// In the Region whose instances have the metadata service's IPv6 endpoint, so
+/// every one of the four settings is one this instance has.
 async fn running_instance(emulator: &Emulator, name: &str) {
     emulator
         .ok(
             "CreateInstances",
             json!({
                 "instanceNames": [name],
-                "availabilityZone": "us-east-1a",
+                "availabilityZone": format!("{IPV6_METADATA_REGION}a"),
                 "blueprintId": "amazon_linux_2023",
                 "bundleId": "micro_3_0",
                 "ipAddressType": "dualstack",

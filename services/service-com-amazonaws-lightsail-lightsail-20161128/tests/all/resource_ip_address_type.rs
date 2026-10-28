@@ -35,6 +35,7 @@ use serde_json::{json, Value};
 use crate::instance_lifecycle::{
     error_code, is_modelled_ipv4, is_modelled_ipv6, is_uuid_shaped, wait_for_state, Emulator,
 };
+use crate::instance_metadata_ipv6_region::IPV6_METADATA_REGION;
 // The store-side static IP attachment `instance_start_addresses.rs` already
 // publishes: `AttachStaticIp` is still a 501 stub, so the attachment the refusal
 // below is about cannot be made through the API yet.
@@ -69,6 +70,13 @@ fn has_ipv4(ip_address_type: &str) -> bool {
 /// [`has_ipv4`].
 fn has_ipv6(ip_address_type: &str) -> bool {
     matches!(ip_address_type, "ipv6" | "dualstack")
+}
+
+/// The Region an availability zone belongs to: the zone name without its trailing
+/// zone letter, the form `AvailabilityZone$zoneName` documents ("The format is
+/// `us-east-2a` (case-sensitive)").
+fn region_of(availability_zone: &str) -> &str {
+    &availability_zone[..availability_zone.len() - 1]
 }
 
 /// The `SetIpAddressType` body for `resource_type`/`resource_name`, accepting the
@@ -169,6 +177,14 @@ const INSTANCE_ROWS: &[InstanceRow] = &[
         availability_zone: "ap-northeast-1c",
         blueprint_id: "wordpress",
         bundle_id: "nano_3_0",
+    },
+    // The one Region whose instances have an IPv6 endpoint on their metadata
+    // service, so the setting that follows the address type is observable on
+    // both sides of the change (`instance_metadata_ipv6_region.rs`).
+    InstanceRow {
+        availability_zone: "eu-north-1a",
+        blueprint_id: "ubuntu_22_04",
+        bundle_id: "small_3_0",
     },
 ];
 
@@ -384,12 +400,21 @@ async fn setting_an_instances_ip_address_type_reprovisions_its_addresses() {
                 assert_everything_else_unchanged(&case, &before, &after);
                 // "`httpProtocolIpv6` […] enables or disables the IPv6 endpoint
                 // for the instance metadata service": an instance without an
-                // IPv6 address has no IPv6 metadata endpoint to reach.
+                // IPv6 address has no IPv6 metadata endpoint to reach — and
+                // neither has an instance outside the one Region that endpoint
+                // is available in.
+                let endpoint_available =
+                    region_of(row.availability_zone) == IPV6_METADATA_REGION;
                 assert_eq!(
                     after["metadataOptions"]["httpProtocolIpv6"].as_str(),
-                    Some(if has_ipv6(to) { "enabled" } else { "disabled" }),
+                    Some(if has_ipv6(to) && endpoint_available {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }),
                     "case {case}: the metadata service's IPv6 endpoint follows the \
-                     instance's own address type, got {after:?}"
+                     instance's own address type where it has that endpoint at all, got \
+                     {after:?}"
                 );
 
                 // The entry is in the log the operation reads answer from, too.

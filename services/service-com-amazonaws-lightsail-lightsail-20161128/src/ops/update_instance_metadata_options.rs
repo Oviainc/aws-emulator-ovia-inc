@@ -2,8 +2,9 @@
 
 //! @op UpdateInstanceMetadataOptions
 //! Puts the metadata-service settings the request names on the ONE stored
-//! instance it addresses — leaving a setting it names no value for where it is —
-//! and answers the operation-log entry the change appended.
+//! instance it addresses — leaving a setting it names no value for where it is,
+//! and refusing a setting that is available only to the instances of another
+//! Region — and answers the operation-log entry the change appended.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -185,10 +186,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `httpTokens`, `httpEndpoint` and `httpProtocolIpv6` each target a
         // modelled enum and `instanceName` carries the modelled `ResourceName`
         // pattern, so the centralized walk refused anything outside them before
-        // this body ran. What is left is the one rule the model cannot express:
-        // `httpPutResponseHopLimit` targets a plain integer, and the metadata
-        // service takes a hop limit within the published range. It is checked
-        // BEFORE the first write, so a refused request changes nothing.
+        // this body ran. What is left are the two rules the model cannot
+        // express: `httpPutResponseHopLimit` targets a plain integer, and the
+        // metadata service takes a hop limit within the published range; and
+        // `httpProtocolIpv6` configures an endpoint only the instances of one
+        // Region have, so it is served only for an instance there. Both are
+        // checked BEFORE the first write, so a refused request changes nothing.
         let instance_name = input.instance_name;
         if let Some(hop_limit) = input.http_put_response_hop_limit {
             if !(crate::state::MIN_HTTP_PUT_RESPONSE_HOP_LIMIT
@@ -215,6 +218,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let instance = store
                 .instance_mut(&instance_name)
                 .ok_or_else(|| not_found(&instance_name))?;
+            // The IPv6 endpoint of the metadata service belongs to the
+            // instances of ONE Region, so what decides is where the addressed
+            // instance lives — asked of the crate's one owner of that
+            // restriction, before anything is written. A request that names no
+            // value for the member asks nothing of that endpoint and is served
+            // wherever the instance is.
+            if selection.http_protocol_ipv6.is_some() {
+                if let Some(message) =
+                    crate::state::ipv6_metadata_region_refusal(&instance.location.region_name)
+                {
+                    return Err(invalid(message));
+                }
+            }
             // The record carries the new selection from here on; the instant the
             // clock owes the instance the applied options is what leaves the
             // options — and the log entry for them — non-terminal until then.
