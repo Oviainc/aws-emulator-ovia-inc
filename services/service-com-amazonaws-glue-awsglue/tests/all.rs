@@ -173,6 +173,8 @@ mod registries;
 mod resource_policies;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
+#[path = "all/resource_untagging.rs"]
+mod resource_untagging;
 #[path = "all/schema_registry.rs"]
 mod schema_registry;
 #[path = "all/search_tables.rs"]

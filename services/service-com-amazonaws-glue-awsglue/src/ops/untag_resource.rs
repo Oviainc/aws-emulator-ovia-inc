@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! "Removes tags from a resource": every key `TagsToRemove` names is DROPPED from the tag
+//! set of the resource `ResourceArn` names, held on THAT resource's own record in
+//! [`crate::state::ComAmazonawsGlueAwsglueState`]. A key the resource holds goes together
+//! with its value; a key it does not hold leaves the set as it was, because a removal
+//! states which keys must be gone afterwards and that one already is; and every key the
+//! request does not name keeps the value it had. What is left is what every later read
+//! reports (`GetTags`), so this write and that read address one record.
+//!
+//! The ARN is resolved through [`crate::state::parse_tagged_resource`] plus
+//! [`crate::state::ComAmazonawsGlueAwsglueState::resource_tags_mut`], the mutable half of
+//! the one resolution every tag read in this emulator goes through, exactly as the tag
+//! write beside it does, so a write, a removal and a read of one ARN reach the same tag
+//! set. An ARN that names no taggable Glue resource at all earns the modelled client-input
+//! refusal, as does one naming another Region than the endpoint serving the request; one
+//! of a known kind this store holds no resource for earns the modelled
+//! `EntityNotFoundException`, as does one naming another account's estate. A refused
+//! removal changes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +151,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagResourceErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue Data Catalog store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // A `ResourceArn` this service tags NO resource of is a bad parameter, not a
+        // miss: the modelled constraint admits any Glue ARN, so the resource type it
+        // carries is what is checked here.
+        let Some(resource) = crate::state::parse_tagged_resource(&input.resource_arn) else {
+            return Err(UntagResourceErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::invalid_resource_arn_message(
+                        &input.resource_arn,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        // A Glue resource belongs to the Region its ARN names, and this endpoint serves
+        // exactly one, so an ARN of another Region is a bad parameter rather than a
+        // reference to the same-named local resource: refused before the store is
+        // consulted at all, exactly as the tag write beside this one refuses it.
+        if resource.region != crate::state::request_region(ctx.parts()) {
+            return Err(UntagResourceErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::messages::ARN_WRONG_REGION.to_string()),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+
+        // The resolution is scoped to the ARN's ACCOUNT as well as its kind and name (a
+        // catalog resource is keyed by the account its catalog id names, and a crawler or
+        // job is held only for the account this emulator serves), so an ARN of another
+        // account's estate resolves to nothing here and earns the miss below.
+        let mut store = state.lock();
+        let Some(tags) = store.resource_tags_mut(&resource) else {
+            return Err(UntagResourceErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::tagged_resource_not_found_message(
+                        &resource,
+                        &input.resource_arn,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        // A removal names the keys that must be gone afterwards, so one the resource does
+        // not hold leaves the set as it was: the call is idempotent, and a key named twice
+        // in one request is removed once.
+        let mut removed = 0usize;
+        for key in &input.tags_to_remove {
+            if tags.remove(key).is_some() {
+                removed += 1;
+            }
+        }
+        ::tracing::info!(
+            operation = "UntagResource",
+            resource_arn = %input.resource_arn,
+            requested = input.tags_to_remove.len(),
+            removed,
+            "removed tags from a Glue resource"
+        );
+
+        // The response models no member: what is left of the tag set is what `GetTags`
+        // reports.
+        Ok(UntagResourceOutput {})
     }
 }

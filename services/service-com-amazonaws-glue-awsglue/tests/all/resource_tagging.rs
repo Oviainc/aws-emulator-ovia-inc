@@ -22,6 +22,11 @@
 //! published bounds of `TagKey` (len 1..128) and of `TagValue` (len 0..256) — how full the
 //! resource's tag set already is, and which part of the ARN does not address a resource
 //! this endpoint serves.
+//!
+//! The fixtures a tagging suite needs - the create of each taggable kind, the tag-set
+//! helpers and the read that reports one - are `pub` here and shared with the removal suite
+//! beside this one ([`crate::resource_untagging`]), so a tag write and a tag removal are
+//! driven through one harness.
 
 use std::collections::BTreeMap;
 
@@ -39,20 +44,20 @@ const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/sim2real-glue-role";
 
 /// The Regions, other than the harness's own, these tests address an endpoint in. They
 /// span three partitions' worth of prefixes, so nothing here depends on one Region name.
-const OTHER_REGIONS: [&str; 3] = ["us-west-2", "eu-west-1", "ap-southeast-1"];
+pub const OTHER_REGIONS: [&str; 3] = ["us-west-2", "eu-west-1", "ap-southeast-1"];
 
 /// The sentence the service answers for a `ResourceArn` that belongs to another Region.
 /// Recorded wording: it names neither the ARN nor either Region.
-const ARN_WRONG_REGION: &str = "Arn passed doesn't belong to this region.";
+pub const ARN_WRONG_REGION: &str = "Arn passed doesn't belong to this region.";
 
 /// An ARN of a Glue resource, as the modelled `GlueResourceArn` pattern spells one
 /// (`^arn:aws(-(cn|us-gov|iso(-[bef])?))?:glue:`).
-fn glue_arn(region: &str, account: &str, resource: &str) -> String {
+pub fn glue_arn(region: &str, account: &str, resource: &str) -> String {
     format!("arn:aws:glue:{region}:{account}:{resource}")
 }
 
 /// The ARN of `name` of the kind `segment`, as served in this harness's Region and account.
-fn resource_arn(segment: &str, name: &str) -> String {
+pub fn resource_arn(segment: &str, name: &str) -> String {
     glue_arn(REGION, ACCOUNT_ID, &format!("{segment}/{name}"))
 }
 
@@ -62,7 +67,7 @@ fn resource_arn(segment: &str, name: &str) -> String {
 /// `CreateConnection$Tags`, `CreateCrawler$Tags` and `CreateJob$Tags` (from
 /// `smithy_query operation=CreateDatabase,CreateConnection,CreateCrawler,CreateJob`) — so
 /// each of them has a tag set a tag write can land in.
-fn create_request(segment: &str, name: &str, tags: &Value) -> (&'static str, Value) {
+pub fn create_request(segment: &str, name: &str, tags: &Value) -> (&'static str, Value) {
     match segment {
         "database" => (
             "CreateDatabase",
@@ -105,7 +110,7 @@ fn create_request(segment: &str, name: &str, tags: &Value) -> (&'static str, Val
 }
 
 /// A `TagsMap` JSON object as a sorted map, so two tag sets compare by content.
-fn map_of(tags: &Value) -> BTreeMap<String, String> {
+pub fn map_of(tags: &Value) -> BTreeMap<String, String> {
     tags.as_object()
         .map(|members| {
             members
@@ -125,7 +130,7 @@ fn map_of(tags: &Value) -> BTreeMap<String, String> {
 }
 
 /// A `TagsMap` of `count` distinct keys, each with its own value.
-fn tags_of(count: usize, prefix: &str) -> Value {
+pub fn tags_of(count: usize, prefix: &str) -> Value {
     let mut members = Map::new();
     for index in 0..count {
         members.insert(
@@ -137,7 +142,7 @@ fn tags_of(count: usize, prefix: &str) -> Value {
 }
 
 /// The tag set the service reports for `arn`.
-async fn read_tags(
+pub async fn read_tags(
     router: &MultiServiceRouter,
     case: &str,
     arn: &str,
