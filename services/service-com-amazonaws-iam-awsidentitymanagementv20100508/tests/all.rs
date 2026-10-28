@@ -37,6 +37,8 @@ mod aws_managed_policy_catalog;
 mod boundary_and_provider_writes;
 #[path = "all/custom_policy_context_keys.rs"]
 mod custom_policy_context_keys;
+#[path = "all/delegation_request_filing.rs"]
+mod delegation_request_filing;
 #[path = "all/delegation_request_listing.rs"]
 mod delegation_request_listing;
 #[path = "all/delegation_request_reads.rs"]

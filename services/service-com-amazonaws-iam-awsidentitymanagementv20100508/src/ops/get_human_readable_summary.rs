@@ -214,7 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ones this operation answers with on the wire; see this module's header.
         let Some(parsed) = crate::state::parse_delegation_request_arn(&input.entity_arn) else {
             return Err(crate::scaffolded::Scaffolded::validation_error(
-                "Invalid resource type in ARN",
+                crate::state::ARN_WRONG_RESOURCE_TYPE,
             ));
         };
 
