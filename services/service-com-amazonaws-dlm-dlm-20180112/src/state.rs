@@ -179,7 +179,13 @@ pub const RETAIN_INTERVAL_MAX_DAYS: i32 = 14;
 /// member="Interval")`), with `CreateRule$IntervalUnit` offering `HOURS` alone.
 ///
 /// The member targets `Interval`, which is `@range(min: 1)` — every positive
-/// integer — so the SET is enforced here.
+/// integer — so the SET is enforced here. The member hands its boundary
+/// validation over entirely (the `skip_validation` note on
+/// [`CreateRule`](crate::ops::types::CreateRule)), because the service
+/// materializes [`UNSET_RULE_INTERVAL`] for a rule that stated no interval and
+/// reports it on a read: that value has to reach the handler to be read as the
+/// filler it is, and this set, being narrower than the modelled bound, is what
+/// decides every value a request does state.
 pub const SUPPORTED_CREATE_RULE_INTERVALS: [i32; 8] = [1, 2, 3, 4, 6, 8, 12, 24];
 
 /// The least standard-tier retention a schedule may keep when it also carries a
@@ -1458,9 +1464,32 @@ impl Cadence {
     }
 }
 
+/// The creation interval a `CreateRule` STATED, or `None` when it states none.
+///
+/// [`UNSET_RULE_INTERVAL`] is the value this service itself materializes for a
+/// rule that stated no interval — a cron-driven creation rule
+/// ([`materialized_policy_details`]) — and every read of such a policy reports
+/// it, so it is a value this API's own responses carry rather than one a request
+/// asked for. Every check that judges what a request asked for reads the
+/// interval through here, so the configuration a read REPORTS is one the create
+/// and the update accept back unchanged.
+///
+/// It is also why the member hands its boundary validation to these checks (the
+/// `skip_validation` note on [`CreateRule`]): the value the service reports must
+/// reach the handler to be read as the filler it is.
+fn stated_create_interval(rule: &CreateRule) -> Option<i32> {
+    rule.interval.filter(|value| *value != UNSET_RULE_INTERVAL)
+}
+
 /// The first schedule in `details` whose `CreateRule` states a creation interval
 /// outside [`SUPPORTED_CREATE_RULE_INTERVALS`], as (how the schedule is named,
 /// the interval it stated), or `None` when every schedule states a supported one.
+///
+/// Only an interval the request STATED is judged ([`stated_create_interval`]):
+/// the materialized filler is not a value the caller chose. The supported set is
+/// what `CreateRule$Interval`'s documentation offers a caller, and it is narrower
+/// than the member's modelled bound, so this is the whole domain of the member —
+/// every other value is refused here, whichever side of the set it falls.
 ///
 /// EVERY element of `Schedules` is examined (`@length(min: 1, max: 4)`), not just
 /// the first: a policy is refused for the interval of whichever schedule carries
@@ -1474,7 +1503,7 @@ pub fn schedule_with_unsupported_create_interval(
         .iter()
         .enumerate()
         .find_map(|(position, schedule)| {
-            let interval = schedule.create_rule.as_ref()?.interval?;
+            let interval = stated_create_interval(schedule.create_rule.as_ref()?)?;
             (!SUPPORTED_CREATE_RULE_INTERVALS.contains(&interval))
                 .then(|| (schedule_label(position, schedule), interval))
         })
@@ -1638,13 +1667,20 @@ pub fn schedule_rule_violation(details: Option<&PolicyDetails>) -> Option<Invali
 /// it: its own documentation gives it a default ("If you do not specify a time,
 /// Amazon Data Lifecycle Manager selects a time within the next 24 hours"), so a
 /// rule that omits it still says when to create.
+///
+/// A creation interval of [`UNSET_RULE_INTERVAL`] is the value this service
+/// itself materializes for a rule that stated none, so it is not an interval the
+/// request asked for ([`stated_create_interval`]): a unit, a time, or any other
+/// interval is what states the interval form. That is what makes the cron form
+/// a read reports — which carries the materialized interval beside the
+/// expression — one this check still sees as the cron form alone.
 fn create_rule_violation(
     label: &str,
     path: &str,
     rule: Option<&CreateRule>,
 ) -> Option<InvalidRequestException> {
     let cron_based = rule.is_some_and(|rule| rule.cron_expression.is_some());
-    let interval = rule.and_then(|rule| rule.interval);
+    let interval = rule.and_then(stated_create_interval);
     let interval_unit = rule.and_then(|rule| rule.interval_unit.as_deref());
     // Any one of the interval form's three members states the schedule as an
     // interval, whether or not the other two are there.
