@@ -431,9 +431,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.expression_attribute_values.as_ref(),
         )
         .check_all_referenced(&[
-            input.key_condition_expression.as_deref(),
-            input.filter_expression.as_deref(),
-            input.projection_expression.as_deref(),
+            (
+                "KeyConditionExpression",
+                input.key_condition_expression.as_deref(),
+            ),
+            ("FilterExpression", input.filter_expression.as_deref()),
+            ("ProjectionExpression", input.projection_expression.as_deref()),
         ])
         .map_err(lift)?;
 
@@ -1266,7 +1269,9 @@ impl Parser<'_> {
         }
     }
 
-    /// A `:placeholder` token, resolved through `ExpressionAttributeValues`.
+    /// A `:placeholder` token, resolved through `ExpressionAttributeValues`. A
+    /// placeholder the request never defined is the one undefined-token refusal every
+    /// expression member of this service states (`crate::state::undefined_value`).
     fn value(&mut self) -> Result<AttributeValue, crate::state::RequestError> {
         match self.take()? {
             Token::Value(placeholder) => self
@@ -1274,16 +1279,16 @@ impl Parser<'_> {
                 .and_then(|values| values.get(&placeholder))
                 .cloned()
                 .ok_or_else(|| {
-                    crate::state::RequestError::Validation(format!(
-                        "ExpressionAttributeValues contains no value for {placeholder}"
-                    ))
+                    crate::state::undefined_value(KEY_CONDITION_MEMBER, &placeholder)
                 }),
             _ => Err(invalid_expression(self)),
         }
     }
 
     /// `#alias` resolves through `ExpressionAttributeNames`; any other name is the
-    /// attribute name itself.
+    /// attribute name itself. An alias the request never defined is the one
+    /// undefined-token refusal every expression member of this service states
+    /// (`crate::state::undefined_name`).
     fn resolve_name(&self, token: &str) -> Result<String, crate::state::RequestError> {
         match token.strip_prefix('#') {
             None => Ok(token.to_string()),
@@ -1291,11 +1296,7 @@ impl Parser<'_> {
                 .names
                 .and_then(|names| names.get(token))
                 .cloned()
-                .ok_or_else(|| {
-                    crate::state::RequestError::Validation(format!(
-                        "ExpressionAttributeNames contains no name for {token}"
-                    ))
-                }),
+                .ok_or_else(|| crate::state::undefined_name(KEY_CONDITION_MEMBER, token)),
         }
     }
 }

@@ -18,8 +18,10 @@
 //! Two questions are asked here, and nothing is cached for either: a resource created a
 //! moment ago resolves at once, and one that has been deleted stops resolving at once.
 //!
-//! * the INSTANCE a user association acts on ([`authorizes_instance`]). The fleet this
-//!   service holds of its own
+//! * the INSTANCE a user association acts on ([`authorizes_instance`]), which every caller
+//!   reaches through the one gate the refusal is also written in ([`instance_refusal`], and
+//!   [`authorize_instance`] for a handler's error channel). The fleet this service holds of
+//!   its own
 //!   ([`crate::state::ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState::account_instances`])
 //!   is consulted FIRST: it costs no hop, and it is what answers in a process that mounts
 //!   this service with no EC2 beside it. Neither source is authoritative over the other —
@@ -109,9 +111,10 @@ async fn ec2_holds_instance(
 /// when the account has it, in either of the two places an instance of this account can be
 /// reported from — this service's own fleet seam, or EC2 itself.
 ///
-/// The gate every operation that acts on a caller-named instance runs BEFORE it looks
-/// anything else up, so a refusal discloses nothing about this service's own resources.
-/// Asked in one place, so no two operations can resolve the same instance differently.
+/// The resolution behind the gate below ([`instance_refusal`]), which every operation that
+/// acts on a caller-named instance runs BEFORE it looks anything else up, so a refusal
+/// discloses nothing about this service's own resources. Asked in one place, so no two
+/// operations can resolve the same instance differently.
 pub async fn authorizes_instance<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &smithy_server_runtime::OperationContext<'_>,
@@ -126,6 +129,49 @@ pub async fn authorizes_instance<Eng: Send + Sync + 'static>(
     }
     let region = crate::state::request_region(&ctx.parts().headers);
     ec2_holds_instance(ctx, &region, instance_id).await
+}
+
+/// THE GATE, as the refusal a caller that names an instance of `instance_id` gets: `None`
+/// when the request goes on — either because it names no instance to authorize, or because
+/// the account has the one it names — and the fail-closed refusal otherwise.
+///
+/// One function, so the decision AND what a refused request is answered with are written
+/// once for every caller: the pre-validation gate in [`crate::service`] renders this refusal
+/// through the service's protocol envelope, and a handler returns it on its own error
+/// channel ([`authorize_instance`]). Neither spells the code or the sentence itself, so the
+/// two layers cannot answer one refusal two ways.
+///
+/// `None` for `instance_id` is a request that NAMES no instance — the member is optional on
+/// `DisassociateUser`, which can address an association by its ARN alone — and so has
+/// nothing to authorize; the rest of the request's own rules then decide it.
+pub async fn instance_refusal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    instance_id: Option<&str>,
+) -> Option<crate::scaffolded::ServiceRefusal> {
+    let instance_id = instance_id?;
+    if authorizes_instance(engine, ctx, instance_id).await {
+        return None;
+    }
+    Some(crate::scaffolded::ServiceRefusal::unauthorized())
+}
+
+/// [`instance_refusal`] on a handler's error channel: `Ok(())` when the request goes on,
+/// `Err` carrying the fail-closed refusal when the account cannot be shown to have the
+/// instance the request names.
+///
+/// What every operation that acts on a caller-named instance opens with, whatever its own
+/// error enum: the gate is one `?` rather than a restatement per handler of what a failed
+/// gate answers.
+pub async fn authorize_instance<Eng: Send + Sync + 'static, E>(
+    engine: &Eng,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    instance_id: Option<&str>,
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    match instance_refusal(engine, ctx, instance_id).await {
+        None => Ok(()),
+        Some(refusal) => Err(crate::scaffolded::Scaffolded::ServiceRefusal(refusal)),
+    }
 }
 
 /// The `DescribeSubnets` filter that selects subnets BY ID, and the `DescribeSecurityGroups`

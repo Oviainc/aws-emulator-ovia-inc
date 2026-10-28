@@ -323,6 +323,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // moves neither stamp.
             environment.note_child_change(modified_at_ms);
             state.note_transition_due(due_at);
+            // The environment's health checks read what each of its connectors has
+            // decided about its own connectivity, and a connector that is reconnecting
+            // has decided nothing, so they are recomputed from the state the update
+            // leaves behind. An update that changed nothing changed no check input
+            // either, so it recomputes nothing.
+            state.recompute_environment_checks();
         }
 
         Ok(UpdateEnvironmentConnectorOutput {

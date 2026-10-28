@@ -220,6 +220,7 @@ fn stored(row: &Row, base: SystemTime) -> InsightRecord {
         // none of its detail fields; the detailed view has its own suite
         // ([`super::insight_details`]).
         details: Vec::new(),
+        feedback: None,
     }
 }
 
@@ -635,6 +636,7 @@ async fn a_token_that_names_no_insight_of_the_listing_is_refused() {
         updated_at: base,
         is_experimental: false,
         details: Vec::new(),
+        feedback: None,
     };
     {
         let store = emulator.store();
@@ -777,6 +779,7 @@ async fn an_account_listing_reports_the_insights_of_the_account_and_of_its_domai
         updated_at: shifted(base, 7_200),
         is_experimental: false,
         details: Vec::new(),
+        feedback: None,
     };
     let account_wide = InsightRecord {
         insight_id: "9bb2ce4d-3f60-4e7b-8c8d-200000000001".to_string(),
@@ -788,6 +791,7 @@ async fn an_account_listing_reports_the_insights_of_the_account_and_of_its_domai
         updated_at: shifted(base, 10_800),
         is_experimental: false,
         details: Vec::new(),
+        feedback: None,
     };
     {
         let store = emulator.store();

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteVpcEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteVpcEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteVpcEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: accepts the deletion of the stored endpoint the request's `id` names —
+//! reporting it in the non-terminal `DELETING` status it stays readable in until the clock
+//! makes its purge due — and refuses an id that names no endpoint and an endpoint that is
+//! not in a status it may be deleted from.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +145,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteVpcEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteVpcEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteVpcEndpoint"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteVpcEndpointErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(crate::state::STORE_UNREACHABLE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        store.settle_due_transitions();
+
+        // A `clientToken` on a delete is not a replay index: the endpoint this request
+        // addresses is named by `id`, and the second delete of an endpoint already gone is
+        // the 404 below whatever token it carries.
+        let Some(record) = store.vpc_endpoints.get(&input.id) else {
+            return Err(DeleteVpcEndpointErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::ERROR_MESSAGE_VPC_ENDPOINT_NOT_FOUND.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // From `ConflictException`'s own documentation: "When deleting a resource, thrown
+        // when the resource is not in the ACTIVE, FAILED, or UPDATE_FAILED state" — so an
+        // endpoint still being brought up, or already being deleted, cannot be deleted yet.
+        if !crate::state::VPC_ENDPOINT_DELETABLE_STATUSES.contains(&record.status.as_str()) {
+            return Err(DeleteVpcEndpointErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "VPC endpoint cannot be deleted because it is not in {} status.",
+                        crate::state::statuses_phrase(
+                            &crate::state::VPC_ENDPOINT_DELETABLE_STATUSES
+                        )
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The delete is ACCEPTED here, not completed: the endpoint is reported in
+        // `DELETING` — "the current status of the endpoint deletion process", as
+        // `DeleteVpcEndpointDetail$status` documents it — and stays readable in that status
+        // until the clock makes its purge due, so a caller polling the deletion observes
+        // the state it goes through instead of the resource vanishing in one step.
+        let Some(record) = store.vpc_endpoints.get_mut(&input.id) else {
+            return Err(DeleteVpcEndpointErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::ERROR_MESSAGE_VPC_ENDPOINT_NOT_FOUND.to_string()),
+                },
+            )
+            .into());
+        };
+        record.begin_deletion();
+
+        // Answered from the STORED record, so the delete cannot report anything a read
+        // straight after it would not.
+        Ok(DeleteVpcEndpointOutput {
+            delete_vpc_endpoint_detail: Some(record.delete_detail()),
+        })
     }
 }

@@ -855,6 +855,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for due_at in host_transitions_due {
             state.note_transition_due(due_at);
         }
+        // A license key this environment carries is a key the environments that already
+        // carry it now share, which is a check input of THEIRS, so the checks are
+        // recomputed from the store this create leaves behind. The new environment is
+        // still `CREATING`, so no check of it has run and it reports none.
+        state.recompute_environment_checks();
         Ok(CreateEnvironmentOutput {
             environment: Some(created),
         })

@@ -3,24 +3,26 @@
 //! `DeleteStack` on a stack whose exported output value another live stack still imports,
 //! end to end over the awsQuery wire.
 //!
-//! RULE under test: **a `DeleteStack` the service accepts (200) always concludes in a
-//! TERMINAL stack status a waiter can stop on — so a deletion that cannot be carried out
-//! because the stack publishes an exported output value another live stack still imports
-//! reports `DELETE_IN_PROGRESS` ("User Initiated") and then `DELETE_FAILED`, carrying
-//! `Export <export> cannot be deleted as it is in use by <importing stack>` as its
-//! `StackStatusReason`, with nothing of the stack disposed of; once no live stack imports
-//! it the identical call deletes the stack and reaches `DELETE_COMPLETE`.**
+//! RULE under test: **an exported output value another live stack still imports is PINNED,
+//! so a `DeleteStack` the service accepts (200) for the stack that publishes it reports
+//! `DELETE_IN_PROGRESS` ("User Initiated") and is then CANCELLED: the stack goes back to
+//! the healthy status it held, carrying
+//! `Delete canceled. Cannot delete export <export> as it is in use by <importing stack>`
+//! as its `StackStatusReason`, with nothing of the stack disposed of; once no live stack
+//! imports it the identical call deletes the stack and reaches `DELETE_COMPLETE`.**
 //!
-//! Why it matters: a client that was told a deletion started polls for a terminal status.
-//! A deletion put back to the status the stack already held publishes no outcome at all, so
-//! `aws cloudformation wait stack-delete-complete` and every SDK waiter poll forever, and an
-//! orchestration that escalates on the failed delete status never fires.
+//! Why it matters: a terminal `DELETE_FAILED` conventionally means the stack's resources are
+//! stranded and the delete should be retried — with `RetainResources`, or forced — so
+//! automation that follows that convention would drive the delete through and destroy a
+//! resource another live stack still imports. A cancelled delete says the opposite: the
+//! stack is healthy and the dependency, not the stack, is what has to change.
 //!
 //! The rows differ along what the rule generalises over: WHICH of several exports of the
 //! stack is the imported one (the first, the last), where the importing stack resolved it
 //! (an output value, a resource property), how MANY live stacks import it, and the status
-//! the exporting stack held when the call arrived (created, updated). A stack nothing
-//! imports is the control row: its deletion is not blocked and completes.
+//! the exporting stack held when the call arrived (created, updated) — which is the status
+//! it is restored to. A stack nothing imports is the control row: its deletion is not
+//! blocked and completes.
 
 use std::time::Instant;
 
@@ -30,11 +32,14 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::harness::{call, member, router, wait_for_the_transition, xml_text, xml_texts};
 use crate::stack_lifecycle::{deploy, describe_stack, expected_status};
 
-/// The reason a deletion blocked by an export in use fails with, as AWS words it: the fixed
-/// text around the export and the stack that still imports it. Written out here rather than
-/// read off the emulator's own formatter, so the assertion pins the wording.
+/// The reason a cancelled deletion carries, as AWS words it: the fixed text around the
+/// export and the stack that still imports it. Written out here rather than read off the
+/// emulator's own formatter, so the assertion pins the wording.
 fn in_use_reason(export_name: &str, importing_stack_name: &str) -> String {
-    format!("Export {export_name} cannot be deleted as it is in use by {importing_stack_name}")
+    format!(
+        "Delete canceled. Cannot delete export {export_name} as it is in use by \
+         {importing_stack_name}"
+    )
 }
 
 /// A stack template publishing one export per entry of `exports`, over a resource no
@@ -86,8 +91,9 @@ struct Row {
     held: &'static str,
     /// The importing stacks, each with where its template resolved the import.
     importers: Vec<(&'static str, ImportedIn)>,
-    /// Whether the exporting stack is UPDATED before the delete: the deletion fails the same
-    /// way whichever operation left the stack where it was.
+    /// Whether the exporting stack is UPDATED before the delete: the deletion is cancelled
+    /// the same way whichever operation left the stack where it was, and the status it is
+    /// restored to is that operation's.
     update_first: bool,
 }
 
@@ -126,7 +132,7 @@ fn rows() -> Vec<Row> {
             update_first: false,
         },
         Row {
-            case: "the exporting stack was last UPDATED, and the delete fails the same way",
+            case: "the exporting stack was last UPDATED, and the delete is cancelled alike",
             exports: vec![("updated-export", "updated-value")],
             held: "updated-export",
             importers: vec![("updated-held-importer", ImportedIn::AnOutput)],
@@ -175,7 +181,7 @@ async fn exported_names(router: &MultiServiceRouter, case: &str) -> Vec<String> 
 }
 
 #[tokio::test]
-async fn a_delete_blocked_by_a_live_importer_ends_in_delete_failed() {
+async fn a_delete_blocked_by_a_live_importer_is_canceled_and_the_stack_stays_healthy() {
     for row in rows() {
         let router = router();
         let exporter = "held-exporter";
@@ -190,8 +196,8 @@ async fn a_delete_blocked_by_a_live_importer_ends_in_delete_failed() {
             .await;
         }
 
-        // Whatever status the stack holds when the call arrives, the blocked deletion ends
-        // in the same terminal one.
+        // Whatever healthy status the stack holds when the call arrives, the cancelled
+        // deletion puts it back into that one.
         let held_status = if row.update_first {
             // The same export NAMES, carrying changed values: the update is a real change,
             // and the reference the importing stack holds is still held.
@@ -246,10 +252,9 @@ async fn a_delete_blocked_by_a_live_importer_ends_in_delete_failed() {
         );
 
         // The deletion was STARTED: a caller reading straight after the call sees the
-        // attempt (or, having lost the race to the clock, the status it failed with).
+        // attempt (or, having lost the race to the clock, the status it was restored to).
         let (reading, _) = stack_status(&router, row.case, exporter).await;
-        let expected_now =
-            expected_status(started, status::DELETE_IN_PROGRESS, status::DELETE_FAILED);
+        let expected_now = expected_status(started, status::DELETE_IN_PROGRESS, held_status);
         assert_eq!(
             reading, expected_now,
             "case {:?}: expected {expected_now} right after the accepted delete, got \
@@ -259,15 +264,14 @@ async fn a_delete_blocked_by_a_live_importer_ends_in_delete_failed() {
 
         wait_for_the_transition().await;
 
-        // TERMINAL: the deletion failed, saying which export and which importer stood in
-        // the way — the answer a waiter stops on.
+        // CANCELLED: the stack is back in the healthy status it held, saying which export
+        // and which importer stood in the way.
         let (settled, reason) = stack_status(&router, row.case, exporter).await;
         assert_eq!(
-            settled,
-            status::DELETE_FAILED,
-            "case {:?}: expected the blocked delete to end in {}, got {settled:?}",
-            row.case,
-            status::DELETE_FAILED
+            settled, held_status,
+            "case {:?}: expected the cancelled delete to restore {held_status}, got \
+             {settled:?}",
+            row.case
         );
         let accepted: Vec<String> = row
             .importers
@@ -281,7 +285,7 @@ async fn a_delete_blocked_by_a_live_importer_ends_in_delete_failed() {
         );
 
         // The attempt is on the event stream, with the reason CloudFormation opens a stack
-        // operation with, and the failure is recorded after it.
+        // operation with, and the cancellation is recorded after it.
         let stream = events(&router, row.case, exporter).await;
         assert!(
             stream.contains(status::DELETE_IN_PROGRESS),
@@ -295,9 +299,9 @@ async fn a_delete_blocked_by_a_live_importer_ends_in_delete_failed() {
             row.case
         );
         assert!(
-            stream.contains(status::DELETE_FAILED) && stream.contains("cannot be deleted as it"),
-            "case {:?}: expected the failed deletion and its reason on the event stream, got \
-             {stream}",
+            stream.contains("Delete canceled") && stream.contains("as it is in use by"),
+            "case {:?}: expected the cancelled deletion and its reason on the event stream, \
+             got {stream}",
             row.case
         );
 
@@ -307,7 +311,8 @@ async fn a_delete_blocked_by_a_live_importer_ends_in_delete_failed() {
         for (name, _) in &row.exports {
             assert!(
                 published.contains(&name.to_string()),
-                "case {:?}: expected {name:?} to survive the failed delete, got {published:?}",
+                "case {:?}: expected {name:?} to survive the cancelled delete, got \
+                 {published:?}",
                 row.case
             );
         }
@@ -327,7 +332,6 @@ async fn a_delete_blocked_by_a_live_importer_ends_in_delete_failed() {
             "case {:?}: expected the exporter's resource to be intact, got {resources}",
             row.case
         );
-
         // Once the last importer is gone the identical call deletes the stack.
         for (importer, _) in &row.importers {
             let (code, body) = call(
@@ -388,11 +392,11 @@ async fn a_delete_blocked_by_a_live_importer_ends_in_delete_failed() {
     }
 }
 
-/// A stack a blocked deletion left behind is never LEFT in an `*_IN_PROGRESS` status, even
-/// when the call arrived while another operation of the stack was still in flight: the
-/// deletion the service took concludes in its own terminal status.
+/// A stack a cancelled deletion left behind is never LEFT in an `*_IN_PROGRESS` status,
+/// even when the call arrived while another operation of the stack was still in flight: the
+/// cancellation restores the healthy status that operation was going to reach.
 #[tokio::test]
-async fn a_blocked_delete_never_leaves_an_in_progress_status() {
+async fn a_canceled_delete_never_leaves_an_in_progress_status() {
     let case = "the delete arrives while an update of the exporter is still in flight";
     let router = router();
     let exports = [("in-flight-export", "in-flight-value")];
@@ -405,7 +409,7 @@ async fn a_blocked_delete_never_leaves_an_in_progress_status() {
     .await;
 
     // No wait between the two calls: the update is still in flight when the delete arrives
-    // (and if it loses the race to the clock, the delete fails the same way).
+    // (and if it loses the race to the clock, the delete is cancelled the same way).
     let revalued = [("in-flight-export", "in-flight-value-updated")];
     let (code, body) = call(
         &router,
@@ -440,8 +444,9 @@ async fn a_blocked_delete_never_leaves_an_in_progress_status() {
     );
     assert_eq!(
         settled,
-        status::DELETE_FAILED,
-        "case {case:?}: expected the blocked delete's terminal status, got {settled:?}"
+        status::UPDATE_COMPLETE,
+        "case {case:?}: expected the status the in-flight update was going to reach, got \
+         {settled:?}"
     );
     assert_eq!(
         reason,
@@ -494,8 +499,8 @@ async fn a_delete_nothing_imports_from_completes() {
         "case {case:?}: expected an unblocked delete to complete, got {settled:?}"
     );
     assert!(
-        !reason.contains("cannot be deleted as it"),
-        "case {case:?}: expected no in-use reason, got {reason:?}"
+        !reason.contains("Delete canceled"),
+        "case {case:?}: expected no cancellation reason, got {reason:?}"
     );
     let published = exported_names(&router, case).await;
     assert!(

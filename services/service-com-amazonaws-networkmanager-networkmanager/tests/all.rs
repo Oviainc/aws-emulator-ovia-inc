@@ -39,6 +39,8 @@ mod connect_peer_delete;
 mod connect_peer_delete_cascade;
 #[path = "all/connect_peer_lifecycle.rs"]
 mod connect_peer_lifecycle;
+#[path = "all/connect_peer_tie_removal_refusals.rs"]
+mod connect_peer_tie_removal_refusals;
 #[path = "all/connection_lifecycle.rs"]
 mod connection_lifecycle;
 #[path = "all/core_network_change_events.rs"]

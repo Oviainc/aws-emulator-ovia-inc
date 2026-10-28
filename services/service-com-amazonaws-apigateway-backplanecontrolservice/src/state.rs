@@ -364,47 +364,79 @@ impl RestApiEntry {
         self.referencing_method(|method| method.authorizer_id.as_deref() == Some(authorizer_id))
     }
 
-    /// The method of this API that names `model_name` in its `requestModels`, or `None`
-    /// when none does.
+    /// The place in this API that still names `model_name` as a data schema, or `None`
+    /// when nothing does.
     ///
-    /// `Method$requestModels` is "a key-value map specifying data schemas ... the value is
-    /// a `Model` name", so a method carrying that name is a reference to the model, the
-    /// same kind of reference [`Self::method_referencing_authorizer`] finds.
-    pub fn method_referencing_model(&self, model_name: &str) -> Option<MethodReference> {
-        self.referencing_method(|method| {
-            method
+    /// `Method$requestModels` ("a key-value map specifying data schemas ... the value is a
+    /// `Model` name") and `MethodResponse$responseModels` ("specifies the `Model`
+    /// resources used for the response's content type") are the two maps that name a
+    /// model, so a method request or a method response carrying that name is a reference
+    /// to the model — the same kind of reference [`Self::method_referencing_authorizer`]
+    /// finds. Both sites are walked in one pass, in the order
+    /// [`Self::methods_in_path_order`] fixes and then by the response's status code, so a
+    /// refusal NAMES the same reference on every call for one set of records.
+    pub fn reference_to_model(&self, model_name: &str) -> Option<ModelReference> {
+        let mut referencing: Vec<ModelReference> = Vec::new();
+        for (at, method) in self.methods_in_path_order() {
+            if method
                 .request_models
                 .values()
                 .any(|named| named == model_name)
-        })
+            {
+                referencing.push(ModelReference::MethodRequest(at.clone()));
+            }
+            for (status_code, response) in &method.method_responses {
+                if response
+                    .response_models
+                    .iter()
+                    .flatten()
+                    .any(|(_, named)| named == model_name)
+                {
+                    referencing
+                        .push(ModelReference::MethodResponse(at.clone(), status_code.clone()));
+                }
+            }
+        }
+        referencing.sort_by(|left, right| left.order_key().cmp(&right.order_key()));
+        referencing.into_iter().next()
     }
 
     /// The first method of this API, in resource-path then verb order, that `names`
-    /// something — the one walk both reference lookups above share.
-    ///
-    /// The order is the stored one (`resources` is keyed by id, so the paths are sorted
-    /// here), which is what makes the method a refusal NAMES the same one on every call
-    /// for one set of records rather than whichever the map yielded first.
+    /// something — the one lookup the single-valued references above share.
     fn referencing_method(
         &self,
         mut names: impl FnMut(&MethodEntry) -> bool,
     ) -> Option<MethodReference> {
-        let mut referencing: Vec<MethodReference> = Vec::new();
+        self.methods_in_path_order()
+            .into_iter()
+            .find(|(_, method)| names(method))
+            .map(|(at, _)| at)
+    }
+
+    /// Every method of this API paired with the reference that names it, in resource-path
+    /// then verb order — the one walk every reference lookup here shares.
+    ///
+    /// The order is not the stored one (`resources` is keyed by id, so the paths are
+    /// sorted here), which is what makes the method a refusal NAMES the same one on every
+    /// call for one set of records rather than whichever the map yielded first.
+    fn methods_in_path_order(&self) -> Vec<(MethodReference, &MethodEntry)> {
+        let mut methods: Vec<(MethodReference, &MethodEntry)> = Vec::new();
         for resource in self.resources.values() {
             for (verb, method) in &resource.methods {
-                if names(method) {
-                    referencing.push(MethodReference {
+                methods.push((
+                    MethodReference {
                         http_method: verb.clone(),
                         resource_path: resource.path.clone(),
-                    });
-                }
+                    },
+                    method,
+                ));
             }
         }
-        referencing.sort_by(|left, right| {
+        methods.sort_by(|(left, _), (right, _)| {
             (&left.resource_path, &left.http_method)
                 .cmp(&(&right.resource_path, &right.http_method))
         });
-        referencing.into_iter().next()
+        methods
     }
 }
 
@@ -434,6 +466,42 @@ impl MethodReference {
     /// for its own refusal, which is why this is not the `Display` one.
     pub fn in_method_request(&self) -> String {
         format!("{}/{}", self.resource_path, self.http_method)
+    }
+
+    /// `<resource-path>/<HTTP-METHOD>/<statusCode>`, the spelling a refusal naming the
+    /// method RESPONSE that references a blocked model carries: a method response is keyed
+    /// by its `statusCode` under the method, so identifying the reference site takes that
+    /// status code on top of the method's own [`Self::in_method_request`] spelling.
+    pub fn in_method_response(&self, status_code: &str) -> String {
+        format!("{}/{status_code}", self.in_method_request())
+    }
+}
+
+/// Where a `Model` of an API is still referenced from — the site a refusal blocked by that
+/// reference names.
+///
+/// A model is named as a data schema in two places, and they are DIFFERENT sites: the
+/// method request's `requestModels` and one method response's `responseModels`, the latter
+/// keyed by the response's status code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelReference {
+    /// A method whose `requestModels` names the model.
+    MethodRequest(MethodReference),
+    /// A method response, under the status code it is keyed by, whose `responseModels`
+    /// names the model.
+    MethodResponse(MethodReference, String),
+}
+
+impl ModelReference {
+    /// The order two references of one API are compared in: the method first, then the
+    /// status code, so the request site of a method precedes its response sites.
+    fn order_key(&self) -> (&str, &str, &str) {
+        match self {
+            Self::MethodRequest(at) => (&at.resource_path, &at.http_method, ""),
+            Self::MethodResponse(at, status_code) => {
+                (&at.resource_path, &at.http_method, status_code)
+            }
+        }
     }
 }
 
@@ -3602,18 +3670,24 @@ pub fn no_such_model(model_name: &str) -> String {
 pub const MODEL_NAME_ALREADY_EXISTS: &str = "Model name already exists for this REST API";
 
 /// The `ConflictException` message for a model a `Method` of the same API still names in
-/// its `requestModels`, which is what `DeleteModel` refuses while the reference stands
-/// (see [`RestApiEntry::method_referencing_model`]).
+/// its `requestModels`, or one of that method's responses in its `responseModels`, which
+/// is what `DeleteModel` refuses while the reference stands (see
+/// [`RestApiEntry::reference_to_model`]).
 ///
-/// BUILT FROM STATE: the fixed text names the condition and the variable parts are the
-/// model's own name and the referencing METHOD REQUEST, which API Gateway identifies by
-/// its resource path and verb ([`MethodReference::in_method_request`]) — so a client is
-/// told which method request still has to be updated.
-pub fn model_in_use(model_name: &str, referencing: &MethodReference) -> String {
-    format!(
-        "Cannot delete model '{model_name}', is referenced in method request: {}",
-        referencing.in_method_request()
-    )
+/// BUILT FROM STATE: the fixed text names the condition and which SITE still holds the
+/// reference — the method request or the method response — and the variable parts are the
+/// model's own name and that site, which API Gateway identifies by the referencing
+/// method's resource path and verb ([`MethodReference::in_method_request`]) plus, for a
+/// response, the status code it is keyed by ([`MethodReference::in_method_response`]) — so
+/// a client is told which record still has to be updated.
+pub fn model_in_use(model_name: &str, referencing: &ModelReference) -> String {
+    let (site, at) = match referencing {
+        ModelReference::MethodRequest(method) => ("request", method.in_method_request()),
+        ModelReference::MethodResponse(method, status_code) => {
+            ("response", method.in_method_response(status_code))
+        }
+    };
+    format!("Cannot delete model '{model_name}', is referenced in method {site}: {at}")
 }
 
 /// The `BadRequestException` message for a `name` that is not a model name: "The name of

@@ -211,25 +211,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(refusal) = guard.opt_in_required() {
             return Err(ListAutomationRulesErrorModeled::OptInRequiredException(refusal).into());
         }
-        let matching: Vec<AutomationRule> = guard
-            .rules
-            .iter_in_order()
-            .filter(|rule| crate::state::rule_matches_filters(rule, &filters))
-            .skip(offset)
-            .take(page_size.saturating_add(1))
-            .map(crate::state::StoredRule::to_automation_rule)
-            .collect();
-
-        // One extra rule was taken: its presence is what says another page
-        // exists, and the token resumes exactly where this page stopped.
-        let has_more = matching.len() > page_size;
-        let page: Vec<AutomationRule> = matching.into_iter().take(page_size).collect();
-        let next_token = has_more.then(|| {
-            crate::state::encode_page_token(&crate::state::PageCursor {
-                offset: offset + page.len(),
-                filter_fingerprint,
-            })
-        });
+        // The matching rules are what gets paged, and the page walk is the one
+        // every paginated listing of this service performs:
+        // `crate::state::serve_page`.
+        let (page, next_token): (Vec<AutomationRule>, Option<String>) = crate::state::serve_page(
+            guard
+                .rules
+                .iter_in_order()
+                .filter(|rule| crate::state::rule_matches_filters(rule, &filters))
+                .map(crate::state::StoredRule::to_automation_rule),
+            offset,
+            page_size,
+            filter_fingerprint,
+        );
 
         Ok(ListAutomationRulesOutput {
             automation_rules: Some(page),

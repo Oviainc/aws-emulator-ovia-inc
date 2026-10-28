@@ -1076,6 +1076,17 @@ pub fn merge_tags(tags: &[Tag], incoming: &[Tag]) -> Vec<Tag> {
     merged
 }
 
+/// The tag set a request's `tags` list assigns, as the resource holds it: the
+/// list is collapsed through [`merge_tags`], so a key the SAME list carries
+/// twice is held once with the last value that list gave it (the model puts no
+/// `@uniqueItems` on `TagList`, so a request may legitimately repeat a key).
+///
+/// Every path that takes a tag list off the wire goes through this, so one tag
+/// list always yields one stored tag set whichever operation received it.
+pub fn tag_set(tags: Option<&[Tag]>) -> Vec<Tag> {
+    merge_tags(&[], tags.unwrap_or_default())
+}
+
 /// The store key of the ingestion `identifier` names inside `bundle`, by ARN or
 /// bare UUID — the same two forms [`ComAmazonawsAppfabricFabricfrontendserviceState::bundle_key`] accepts.
 pub fn ingestion_key(bundle: &AppBundleRecord, identifier: &str) -> Option<String> {

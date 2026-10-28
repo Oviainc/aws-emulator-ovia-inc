@@ -17,6 +17,10 @@
 //! judged only AFTER the `clientToken` replay: a retry whose ingestion already
 //! exists replays it, whatever the authorization has become since.
 //!
+//! The `tags` the request carries are stored as the MAP they are (see
+//! [`crate::state::tag_set`]), so a key the list repeats is held once with the
+//! last value the list gave it — exactly what `TagResource` would have stored.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -241,6 +245,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The PARENT is one of this request's parameters, so it belongs in the
         // fingerprint: the same token under a different bundle is a different
         // request, not a retry of this one.
+        //
+        // A tag list is a map of key-value pairs, so the list this request
+        // carried is collapsed onto one entry per key BEFORE it is stored or
+        // fingerprinted (see [`crate::state::tag_set`]).
+        let tags = crate::state::tag_set(input.tags.as_deref());
         let fingerprint = crate::state::request_fingerprint(
             &[
                 ("appBundleArn", app_bundle_arn.as_str()),
@@ -248,7 +257,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ("tenantId", input.tenant_id.as_str()),
                 ("ingestionType", input.ingestion_type.as_str()),
             ],
-            input.tags.as_deref(),
+            Some(&tags),
         );
 
         // @idempotencyToken: the same token replays the ingestion the first call
@@ -367,7 +376,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state: crate::state::INGESTION_STATE_DISABLED.to_string(),
             created_at,
             updated_at: created_at,
-            tags: input.tags.unwrap_or_default(),
+            tags,
             sequence,
             destinations: ::std::collections::HashMap::new(),
             // A new ingestion is disabled and has lost no destination, so the

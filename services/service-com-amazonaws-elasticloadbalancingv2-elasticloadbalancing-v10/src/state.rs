@@ -3005,26 +3005,37 @@ pub fn taggable_resource(arn: &str) -> Option<TaggableResource> {
 /// The message a tag operation answers the `NotFound` of `kind` with when the ARN list it
 /// was given names a resource this store does not hold.
 ///
-/// A tag operation selects the resources it acts on through a LIST
-/// (`AddTags`/`RemoveTags`/`DescribeTags` all take `ResourceArns`), so its refusal is
-/// about the request's whole selection rather than one resource the call addresses, and
-/// Elastic Load Balancing names no value in it: the collection-level wording of the
-/// kind, which is fixed text — the same wording its list READS answer
-/// ([`load_balancer_selection_not_found_message`],
-/// [`target_group_selection_not_found_message`],
-/// [`listener_selection_not_found_message`], [`rule_selection_not_found_message`]).
-/// Quoting one ARN back would tell a caller that named several which one failed, which
-/// this API deliberately does not report.
+/// Elastic Load Balancing words this refusal by the KIND of the ARN it could not resolve,
+/// not by the operation that carried it, so each kind keeps its own template and the three
+/// tag operations (`AddTags`/`RemoveTags`/`DescribeTags`, which all take `ResourceArns`)
+/// answer the same words for the same kind. Two of the templates are pinned by what the
+/// service answers:
+///
+/// * the load balancer kind names NO value — the collection-level wording
+///   ([`load_balancer_selection_not_found_message`]), which is the recorded answer to a tag
+///   write naming a load balancer that was deleted;
+/// * the target group kind QUOTES the identifier that did not resolve, under its plural
+///   noun ([`target_groups_not_found_message`]) — the recorded answer to a tag removal
+///   naming a target group ARN with nothing behind it, and the same template every
+///   operation addressing one target group through its own `TargetGroupArn` answers with.
+///
+/// The listener, rule and trust store kinds keep the collection-level wording their own
+/// list reads answer ([`listener_selection_not_found_message`],
+/// [`rule_selection_not_found_message`], [`trust_store_selection_not_found_message`]).
+///
+/// `arn` is the entry of `ResourceArns` that did not resolve — the same entry that picks
+/// which `NotFound` the call is refused with — so a kind whose template carries an
+/// identifier carries the caller's own value, taken from the request verbatim.
 ///
 /// One function for every tag operation, so a read and a write of the tags of one absent
 /// resource cannot be refused in different words. The operations that address exactly ONE
-/// resource through their own required identifier keep naming it
+/// resource through their own required identifier name it the same way
 /// ([`load_balancer_not_found_message`], [`listener_not_found_message`],
 /// [`rule_not_found_message`], [`target_groups_not_found_message`]).
-pub fn taggable_not_found_message(kind: TaggableResource) -> String {
+pub fn taggable_not_found_message(kind: TaggableResource, arn: &str) -> String {
     match kind {
         TaggableResource::LoadBalancer => load_balancer_selection_not_found_message(),
-        TaggableResource::TargetGroup => target_group_selection_not_found_message(),
+        TaggableResource::TargetGroup => target_groups_not_found_message([arn]),
         TaggableResource::Listener => listener_selection_not_found_message(),
         TaggableResource::Rule => rule_selection_not_found_message(),
         TaggableResource::TrustStore => trust_store_selection_not_found_message(),
