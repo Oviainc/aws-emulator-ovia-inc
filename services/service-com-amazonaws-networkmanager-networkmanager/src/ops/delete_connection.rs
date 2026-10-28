@@ -186,8 +186,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Nothing hangs off a connection: the two devices and the optional links it names
         // are its REFERENCES, which outlive it, so no dependency refusal applies here and
-        // the record goes away on its own. Removing it is what makes those devices, and
-        // the global network above them, deletable in turn.
+        // the record goes away on its own. Removing it is what makes those devices, those
+        // links, and the global network above them, deletable in turn.
         let removed = store
             .connections
             .remove(&input.connection_id)

@@ -3979,6 +3979,152 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
             .count()
     }
 
+    /// Every stored record of `global_network_id` that still NAMES the link `link_id`,
+    /// paired with its kind in the order a refusal should list them — what
+    /// [`dependents_block_delete`] turns into the dependency `ValidationException` of
+    /// `DeleteLink`.
+    ///
+    /// A delete may not leave a stored record pointing at a resource no read can resolve
+    /// any more, so what blocks it is EVERY reference to the link this store holds, whether
+    /// the referring record requires one ([`LinkAssociationRecord`]) or only carries the
+    /// link the request supplied ([`CustomerGatewayAssociationRecord`],
+    /// [`ConnectionRecord`], [`TransitGatewayConnectPeerAssociationRecord`],
+    /// [`ConnectPeerAssociationRecord`]) — a connection holds two such members, either of
+    /// which names a link of the same global network. The two kinds the operation's own
+    /// documentation names ("You must first disassociate the link from any devices and
+    /// customer gateways", `smithy_query query="doc" shape="DeleteLink"`) come first.
+    pub fn link_dependents(
+        &self,
+        global_network_id: &str,
+        link_id: &str,
+    ) -> Vec<(&'static str, usize)> {
+        let names_link = |candidate: &Option<String>| candidate.as_deref() == Some(link_id);
+        vec![
+            (
+                LINK_ASSOCIATION_KIND,
+                self.link_associations
+                    .values()
+                    .filter(|association| {
+                        association.global_network_id == global_network_id
+                            && association.link_id == link_id
+                    })
+                    .count(),
+            ),
+            (
+                CUSTOMER_GATEWAY_ASSOCIATION_KIND,
+                self.customer_gateway_associations
+                    .values()
+                    .filter(|association| {
+                        association.global_network_id == global_network_id
+                            && names_link(&association.link_id)
+                    })
+                    .count(),
+            ),
+            (
+                CONNECTION_KIND,
+                self.connections
+                    .values()
+                    .filter(|connection| {
+                        connection.global_network_id == global_network_id
+                            && (names_link(&connection.link_id)
+                                || names_link(&connection.connected_link_id))
+                    })
+                    .count(),
+            ),
+            (
+                TRANSIT_GATEWAY_CONNECT_PEER_ASSOCIATION_KIND,
+                self.transit_gateway_connect_peer_associations
+                    .values()
+                    .filter(|association| {
+                        association.global_network_id == global_network_id
+                            && names_link(&association.link_id)
+                    })
+                    .count(),
+            ),
+            (
+                CONNECT_PEER_ASSOCIATION_KIND,
+                self.connect_peer_associations
+                    .values()
+                    .filter(|association| {
+                        association.global_network_id == global_network_id
+                            && names_link(&association.link_id)
+                    })
+                    .count(),
+            ),
+        ]
+    }
+
+    /// Every stored record of `global_network_id` that still NAMES the device `device_id`,
+    /// paired with its kind in the order a refusal should list them — the
+    /// [`link_dependents`](Self::link_dependents) of a device, for `DeleteDevice`.
+    ///
+    /// The same rule holds here: the four ties that each run over one device of the global
+    /// network, and the connections whose two device members name it — "Creates a
+    /// connection between two devices" (`smithy_query query="doc"
+    /// shape="CreateConnection"`), which is a reference needing no association at all. The
+    /// kinds the operation's own documentation names ("You must first disassociate the
+    /// device from any links and customer gateways", `smithy_query query="doc"
+    /// shape="DeleteDevice"`) come first.
+    pub fn device_dependents(
+        &self,
+        global_network_id: &str,
+        device_id: &str,
+    ) -> Vec<(&'static str, usize)> {
+        vec![
+            (
+                LINK_ASSOCIATION_KIND,
+                self.link_associations
+                    .values()
+                    .filter(|association| {
+                        association.global_network_id == global_network_id
+                            && association.device_id == device_id
+                    })
+                    .count(),
+            ),
+            (
+                CUSTOMER_GATEWAY_ASSOCIATION_KIND,
+                self.customer_gateway_associations
+                    .values()
+                    .filter(|association| {
+                        association.global_network_id == global_network_id
+                            && association.device_id == device_id
+                    })
+                    .count(),
+            ),
+            (
+                CONNECTION_KIND,
+                self.connections
+                    .values()
+                    .filter(|connection| {
+                        connection.global_network_id == global_network_id
+                            && (connection.device_id == device_id
+                                || connection.connected_device_id == device_id)
+                    })
+                    .count(),
+            ),
+            (
+                TRANSIT_GATEWAY_CONNECT_PEER_ASSOCIATION_KIND,
+                self.transit_gateway_connect_peer_associations
+                    .values()
+                    .filter(|association| {
+                        association.global_network_id == global_network_id
+                            && association.device_id == device_id
+                    })
+                    .count(),
+            ),
+            (
+                CONNECT_PEER_ASSOCIATION_KIND,
+                self.connect_peer_associations
+                    .values()
+                    .filter(|association| {
+                        association.global_network_id == global_network_id
+                            && association.device_id == device_id
+                    })
+                    .count(),
+            ),
+        ]
+    }
+
     /// The ids of the devices assigned to `site_id`, in `DeviceId` order.
     pub fn device_ids_of_site(&self, site_id: &str) -> Vec<String> {
         self.devices

@@ -3,10 +3,10 @@
 //! @op DeleteLink
 //! Deletes an existing link of a global network and reports the removed record as
 //! `DELETING`; an unknown global network or link, or a link that belongs to a different
-//! global network, is a 404, and a link a stored tie still stands on — a device, a customer
-//! gateway association or a Connect peer association of either kind — is
-//! refused with the dependency `ValidationException` (400). This is the ONLY file to touch
-//! for this operation.
+//! global network, is a 404, and a link any stored record of that global network still
+//! names — a device, a customer gateway association, a Connect peer association of either
+//! kind, or a connection — is refused with the dependency `ValidationException` (400).
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Reaching this service's state
 //!
@@ -169,69 +169,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ValidationException (400) every delete of this service raises through
         // `crate::state::dependents_block_delete`.
         //
-        // Neither association is a resource with an id of its own, so what still ties one
-        // to this link is a count of the stored records naming it — the same shape of
-        // filter `GetLinkAssociations` / `GetCustomerGatewayAssociations` read them
-        // through.
-        let link_associations = store
-            .link_associations
-            .values()
-            .filter(|association| {
-                association.global_network_id == input.global_network_id
-                    && association.link_id == input.link_id
-            })
-            .count();
-        let gateway_associations = store
-            .customer_gateway_associations
-            .values()
-            .filter(|association| {
-                association.global_network_id == input.global_network_id
-                    && association.link_id.as_deref() == Some(input.link_id.as_str())
-            })
-            .count();
-        // The same holds for the two Connect peer association kinds this service stores:
-        // each optionally names the LINK the peering is carried over, and the associate that
-        // made it required that link to be one of this global network's, associated with the
+        // What is left pointing at the link decides it, not what kind of record does the
+        // pointing: an association carries no id of its own, a connection does, and either
+        // way the delete may not leave a stored record naming a link no read resolves. The
+        // two Connect peer association kinds make the same point from the other side — each
+        // optionally names the LINK its peering is carried over, and the associate that made
+        // it required that link to be one of this global network's, associated with the
         // device it names (`AssociateTransitGatewayConnectPeer`, `AssociateConnectPeer`), so
         // deleting the link would leave the tie standing on a precondition it no longer
-        // satisfies — the same refusal, reached the same way.
-        let transit_gateway_connect_peer_associations = store
-            .transit_gateway_connect_peer_associations
-            .values()
-            .filter(|association| {
-                association.global_network_id == input.global_network_id
-                    && association.link_id.as_deref() == Some(input.link_id.as_str())
-            })
-            .count();
-        let connect_peer_associations = store
-            .connect_peer_associations
-            .values()
-            .filter(|association| {
-                association.global_network_id == input.global_network_id
-                    && association.link_id.as_deref() == Some(input.link_id.as_str())
-            })
-            .count();
-        // The two kinds the documentation names first, in its order, then the two Connect
-        // peer association kinds, which it does not name and which block for the reason
-        // above.
-        if let Some(refusal) = crate::state::dependents_block_delete(
-            crate::state::LINK_KIND,
-            &[
-                (crate::state::LINK_ASSOCIATION_KIND, link_associations),
-                (
-                    crate::state::CUSTOMER_GATEWAY_ASSOCIATION_KIND,
-                    gateway_associations,
-                ),
-                (
-                    crate::state::TRANSIT_GATEWAY_CONNECT_PEER_ASSOCIATION_KIND,
-                    transit_gateway_connect_peer_associations,
-                ),
-                (
-                    crate::state::CONNECT_PEER_ASSOCIATION_KIND,
-                    connect_peer_associations,
-                ),
-            ],
-        ) {
+        // satisfies. So the refusal counts EVERY stored reference to this link of this
+        // global network —
+        // `crate::state::ComAmazonawsNetworkmanagerNetworkmanagerState::link_dependents`,
+        // which filters the same way the reader of each of those records does and lists the
+        // kinds the documentation names first, in its order.
+        let dependents = store.link_dependents(&input.global_network_id, &input.link_id);
+        if let Some(refusal) =
+            crate::state::dependents_block_delete(crate::state::LINK_KIND, &dependents)
+        {
             return Err(DeleteLinkErrorModeled::ValidationException(refusal).into());
         }
 

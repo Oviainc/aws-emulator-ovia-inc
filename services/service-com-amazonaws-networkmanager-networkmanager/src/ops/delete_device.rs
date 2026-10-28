@@ -3,9 +3,10 @@
 //! @op DeleteDevice
 //! Deletes an existing device of a global network and reports the removed record as
 //! `DELETING`; an unknown global network or device, or a device that belongs to a
-//! different global network, is a 404, and a device a stored tie still stands on — a link
-//! association, a customer gateway association or a Connect peer association of either
-//! kind — is refused with the dependency `ValidationException` (400). This
+//! different global network, is a 404, and a device any stored record of that global
+//! network still names — a link association, a customer gateway association, a Connect
+//! peer association of either kind, or a connection — is refused with the dependency
+//! `ValidationException` (400). This
 //! is the ONLY file to touch for this operation.
 //!
 //! ## Reaching this service's state
@@ -169,69 +170,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ValidationException (400) every delete of this service raises through
         // `crate::state::dependents_block_delete`.
         //
-        // Neither association is a resource with an id of its own, so what still ties one
-        // to this device is a count of the stored records naming it — the same shape of
-        // filter `GetLinkAssociations` / `GetCustomerGatewayAssociations` read them
-        // through.
-        let link_associations = store
-            .link_associations
-            .values()
-            .filter(|association| {
-                association.global_network_id == input.global_network_id
-                    && association.device_id == input.device_id
-            })
-            .count();
-        let gateway_associations = store
-            .customer_gateway_associations
-            .values()
-            .filter(|association| {
-                association.global_network_id == input.global_network_id
-                    && association.device_id == input.device_id
-            })
-            .count();
-        // The same holds for the two Connect peer association kinds this service stores:
-        // each names the DEVICE the peering is reached over, and the associate that made it
+        // What is left pointing at the device decides it, not what kind of record does the
+        // pointing: an association carries no id of its own, a connection does, and either
+        // way the delete may not leave a stored record naming a device no read resolves.
+        // The two Connect peer association kinds make the same point from the other side —
+        // each names the DEVICE its peering is reached over, and the associate that made it
         // required that device to be one of this global network's
         // (`AssociateTransitGatewayConnectPeer`, `AssociateConnectPeer`), so deleting the
-        // device would leave the tie standing on a precondition it no longer satisfies —
-        // the same refusal, reached the same way.
-        let transit_gateway_connect_peer_associations = store
-            .transit_gateway_connect_peer_associations
-            .values()
-            .filter(|association| {
-                association.global_network_id == input.global_network_id
-                    && association.device_id == input.device_id
-            })
-            .count();
-        let connect_peer_associations = store
-            .connect_peer_associations
-            .values()
-            .filter(|association| {
-                association.global_network_id == input.global_network_id
-                    && association.device_id == input.device_id
-            })
-            .count();
-        // The two kinds the documentation names first, in its order, then the two Connect
-        // peer association kinds, which it does not name and which block for the reason
-        // above.
-        if let Some(refusal) = crate::state::dependents_block_delete(
-            crate::state::DEVICE_KIND,
-            &[
-                (crate::state::LINK_ASSOCIATION_KIND, link_associations),
-                (
-                    crate::state::CUSTOMER_GATEWAY_ASSOCIATION_KIND,
-                    gateway_associations,
-                ),
-                (
-                    crate::state::TRANSIT_GATEWAY_CONNECT_PEER_ASSOCIATION_KIND,
-                    transit_gateway_connect_peer_associations,
-                ),
-                (
-                    crate::state::CONNECT_PEER_ASSOCIATION_KIND,
-                    connect_peer_associations,
-                ),
-            ],
-        ) {
+        // device would leave the tie standing on a precondition it no longer satisfies. So
+        // the refusal counts EVERY stored reference to this device of this global network —
+        // `crate::state::ComAmazonawsNetworkmanagerNetworkmanagerState::device_dependents`,
+        // which filters the same way the reader of each of those records does and lists the
+        // kinds the documentation names first, in its order.
+        let dependents = store.device_dependents(&input.global_network_id, &input.device_id);
+        if let Some(refusal) =
+            crate::state::dependents_block_delete(crate::state::DEVICE_KIND, &dependents)
+        {
             return Err(DeleteDeviceErrorModeled::ValidationException(refusal).into());
         }
 

@@ -53,7 +53,15 @@ pub(crate) async fn associate_ok(
 }
 
 /// `DisassociateLink` for the `device`/`link` pair of `network`.
-async fn disassociate(emulator: &Emulator, network: &str, device: &str, link: &str) -> (u16, Value) {
+///
+/// Shared with the suite that unties a pair to reach the state behind it
+/// (`crate::delete_live_reference_refusal`), so the request is built in exactly one place.
+pub(crate) async fn disassociate(
+    emulator: &Emulator,
+    network: &str,
+    device: &str,
+    link: &str,
+) -> (u16, Value) {
     emulator
         .delete(&format!(
             "/global-networks/{network}/link-associations?deviceId={device}&linkId={link}"
