@@ -7,6 +7,10 @@
 //! operation is `@idempotent`: a key the resource does not carry leaves the set alone,
 //! so repeating the call answers the same success.
 //!
+//! A resource whose teardown has already started accepts no change, so a workflow in
+//! `DELETING` ([`crate::state::Workflow::is_deleting`]) cannot have a tag removed: the
+//! call is refused with the modelled `ValidationException` and writes nothing.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -200,6 +204,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                 ))
             })?;
+
+        // A workflow whose teardown has started is on its way out and accepts no
+        // change, so the tag set of one is not writable either: the record, with the
+        // tag set it carries, goes when the removal the clock owes falls due. The
+        // sibling writers refuse it with the modelled `ConflictException`; this
+        // operation models none, so the refusal is the error it does model for a
+        // request inconsistent with the service's requirements
+        // (`crate::state::tearing_down_resource`). Checked BEFORE any write, so a
+        // refused call leaves the tag set exactly as it was.
+        if workflow.is_deleting() {
+            return Err(UntagResourceErrorModeled::ValidationException(
+                crate::state::tearing_down_resource(&workflow.arn, "cannot be untagged"),
+            )
+            .into());
+        }
 
         // "Only the keys are required; the values are ignored": each requested key is
         // dropped from the tag set the resource carries, and a key it does not carry

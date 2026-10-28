@@ -8,6 +8,10 @@
 //! value it had — so the tag set a later `ListTagsForResource` reports is the union of
 //! what was there and what was sent.
 //!
+//! A resource whose teardown has already started accepts no change, so a workflow in
+//! `DELETING` ([`crate::state::Workflow::is_deleting`]) cannot be tagged: the call is
+//! refused with the modelled `ValidationException` and writes nothing.
+//!
 //! A resource carries at most [`crate::state::MAX_TAGS_PER_RESOURCE`] tags (the entry
 //! count the modelled `Tags` map declares), counted over that union, so a key the
 //! request re-states does not grow the set; a call that would carry the resource past
@@ -208,6 +212,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                 ))
             })?;
+
+        // A workflow whose teardown has started is on its way out and accepts no
+        // change, so the tag set of one is not writable either: the record, with the
+        // tag set it carries, goes when the removal the clock owes falls due. The
+        // sibling writers refuse it with the modelled `ConflictException`; this
+        // operation models none, so the refusal is the error it does model for a
+        // request inconsistent with the service's requirements
+        // (`crate::state::tearing_down_resource`). Checked BEFORE any write, so a
+        // refused call leaves the tag set exactly as it was.
+        if workflow.is_deleting() {
+            return Err(TagResourceErrorModeled::ValidationException(
+                crate::state::tearing_down_resource(&workflow.arn, "cannot be tagged"),
+            )
+            .into());
+        }
 
         // The set the resource will carry is the UNION of what it holds and what the
         // request names, so a key the request re-states takes a new value without

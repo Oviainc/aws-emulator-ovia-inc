@@ -1897,6 +1897,16 @@ pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
 /// that failed the constraint declared for its member is the third.
 pub const REASON_FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
 
+/// The `ValidationExceptionReason` a request carries when every member value it
+/// holds is within its declared constraint and the request is still refused
+/// because it is "inconsistent with … service requirements"
+/// (`smithy_query(query="shape", shape="ValidationException")`).
+///
+/// `smithy_query(query="shape", shape="ValidationExceptionReason")` lists
+/// `unknownOperation | cannotParse | fieldValidationFailed | other`; a refusal
+/// that no member of the request is at fault for is the fourth.
+pub const REASON_OTHER: &str = "other";
+
 /// This service's Smithy namespace, for the shadow schemas below.
 const NAMESPACE: &str = "com.amazonaws.mwaaserverless";
 
@@ -2765,6 +2775,27 @@ pub fn too_many_tags(member: &str, resource_arn: &str, resulting: usize) -> Vali
             name: member.to_string(),
             message,
         }]),
+    }
+}
+
+/// The modelled `ValidationException` for a change asked of a workflow whose
+/// teardown has already started, where `action` completes the clause (`cannot be
+/// tagged`).
+///
+/// A workflow in [`WORKFLOW_STATUS_DELETING`] is on its way out and accepts no
+/// change ([`Workflow::is_deleting`]), so every operation that would write to it
+/// refuses the request and writes nothing. An operation that models
+/// `ConflictException` refuses such a write with it; one that does not —
+/// `TagResource` and `UntagResource` model no conflict
+/// (`smithy_query(query="operation", operation="TagResource,UntagResource")`) —
+/// refuses it with the error it does model for a request inconsistent with the
+/// service's requirements. The resource's state is not a constraint on any member
+/// the request carried, so no field is named and the reason is [`REASON_OTHER`].
+pub fn tearing_down_resource(resource_arn: &str, action: &str) -> ValidationException {
+    ValidationException {
+        message: format!("Workflow {resource_arn} is {WORKFLOW_STATUS_DELETING} and {action}"),
+        reason: REASON_OTHER.to_string(),
+        field_list: None,
     }
 }
 

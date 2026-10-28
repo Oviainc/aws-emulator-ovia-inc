@@ -51,6 +51,8 @@ mod run_task_instances;
 mod scheduled_workflow_runs;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_writes_while_deleting.rs"]
+mod tag_writes_while_deleting;
 #[path = "all/task_instance_listing.rs"]
 mod task_instance_listing;
 #[path = "all/task_instance_reads.rs"]
