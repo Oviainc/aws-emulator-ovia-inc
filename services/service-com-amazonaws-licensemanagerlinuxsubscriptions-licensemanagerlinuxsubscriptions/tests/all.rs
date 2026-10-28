@@ -23,6 +23,8 @@ mod provider_credential_validation;
 mod provider_status_transition;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/service_settings_status.rs"]
+mod service_settings_status;
 #[path = "all/shared_harness.rs"]
 mod shared_harness;
 #[path = "all/shared_tag_merge.rs"]

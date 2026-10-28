@@ -66,7 +66,8 @@ pub const DISCOVERY_DISABLED: &str = "Disabled";
 /// `LinuxSubscriptionsDiscovery` has been applied, and it is the value every client's
 /// onboarding poll waits for. The settings singleton is written before the call that
 /// changed it returns, so the change is already applied — the status is terminal on the
-/// first read and no later transition is owed on it.
+/// first read and no later transition is owed on it. It follows that an account carrying
+/// no settings singleton reports NO status: there is no change for one to report on.
 pub const SETTINGS_STATUS_COMPLETED: &str = "Completed";
 
 /// The fixed text a refusal naming no registered subscription provider carries.
@@ -639,7 +640,8 @@ pub struct ReportedServiceSettings {
     pub linux_subscriptions_discovery: Option<String>,
     /// `LinuxSubscriptionsDiscoverySettings`, absent until an update persisted one.
     pub discovery_settings: Option<LinuxSubscriptionsDiscoverySettings>,
-    /// `Status`.
+    /// `Status`, absent until a settings change was applied: the member reports the
+    /// status OF that change, so an account that never requested one has no status.
     pub status: Option<String>,
     /// `StatusMessage`, absent while the service has nothing to report.
     pub status_message: Option<HashMap<String, String>>,
@@ -649,7 +651,12 @@ pub struct ReportedServiceSettings {
 
 /// The settings to report for this account: the persisted singleton, or the default an
 /// account that never called `UpdateServiceSettings` has — discovery `Disabled`, with no
-/// discovery settings and no home Region, since nothing has been configured.
+/// discovery settings, no status and no home Region, since nothing has been configured.
+///
+/// `LinuxSubscriptionsDiscovery` is the one member the default branch fills, because
+/// discovery being off is the state of an account that never enabled it. `Status` reports
+/// on a settings change having been applied, and no change has been requested on such an
+/// account, so it is absent like the other members nothing was stored for.
 pub fn reported_service_settings(
     settings: Option<&ServiceSettingsRecord>,
 ) -> ReportedServiceSettings {
@@ -657,7 +664,7 @@ pub fn reported_service_settings(
         return ReportedServiceSettings {
             linux_subscriptions_discovery: Some(DISCOVERY_DISABLED.to_string()),
             discovery_settings: None,
-            status: Some(SETTINGS_STATUS_COMPLETED.to_string()),
+            status: None,
             status_message: None,
             home_regions: None,
         };
