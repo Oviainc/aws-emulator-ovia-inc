@@ -17,6 +17,11 @@
 //! one delta per block — nothing here splits it into fabricated increments, and
 //! nothing is echoed back from the request.
 //!
+//! The supplied `inferenceConfig` bounds that text exactly as it bounds
+//! `Converse`'s: it is composed to fit `maxTokens` and it halts where the first
+//! configured `stopSequences` entry completes, so no delta carries text past a
+//! configured stop sequence.
+//!
 //! A turn a mandatory `toolConfig.toolChoice` obliged to request a tool carries
 //! no text: its block opens with a `contentBlockStart` naming the minted
 //! `toolUseId` and the tool, its input arrives in that block's
@@ -192,10 +197,7 @@ impl<Eng: Send + Sync + 'static> ConverseStream<Eng> {
             input.system.as_ref(),
             input.messages.as_ref(),
             input.tool_config.as_ref(),
-            input
-                .inference_config
-                .as_ref()
-                .and_then(|config| config.max_tokens),
+            crate::state::TurnInference::of(input.inference_config.as_ref()),
             tool_use,
             cache,
         );

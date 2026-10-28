@@ -635,26 +635,35 @@ async fn a_principal_without_the_grant_is_refused_and_named() {
             // Every variable part of the relayed sentence comes from the request and
             // the state: who asked, what for, on which key, and which document has to
             // change — the key policy delegates, so what the principal is missing is
-            // its own identity-based permission. The request id the metadata block
-            // ends with is minted per call, so the block is checked for its fixed
-            // parts.
+            // its own identity-based permission. The id of the refused inner call and
+            // the attempts it took are minted per call, so the metadata that follows
+            // the sentence is checked for its fixed text with those two read out of it.
             let message = answer.get("message").and_then(Value::as_str).unwrap_or("");
             let sentence = format!(
                 "User: {reader_arn} is not authorized to perform: kms:Decrypt on resource: \
                  {key} because no identity-based policy allows the kms:Decrypt action"
             );
+            let trailer = message.strip_prefix(&sentence).unwrap_or_else(|| {
+                panic!("case {case:?}: expected the refusal to state {sentence:?}, got {answer:?}")
+            });
+            let (request_id, attempts) = trailer
+                .strip_prefix(" (Service: Kms, Status Code: 400, Request ID: ")
+                .and_then(|rest| rest.split_once(") (SDK Attempt Count: "))
+                .and_then(|(id, rest)| rest.strip_suffix(')').map(|count| (id, count)))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "case {case:?}: expected the relayed metadata \" (Service: Kms, Status \
+                         Code: 400, Request ID: <id>) (SDK Attempt Count: <n>)\", got \
+                         {trailer:?}"
+                    )
+                });
             assert!(
-                message.starts_with(&sentence),
-                "case {case:?}: expected the refusal to state {sentence:?}, got {answer:?}"
+                !request_id.is_empty() && !request_id.contains(' '),
+                "case {case:?}: expected the id of the refused call, got {request_id:?}"
             );
             assert!(
-                message.ends_with("; Proxy: null)")
-                    && message.contains(
-                        "(Service: AWSKMS; Status Code: 400; Error Code: AccessDeniedException; \
-                         Request ID: "
-                    ),
-                "case {case:?}: expected the AWS metadata block to close the message, got \
-                 {answer:?}"
+                attempts.parse::<u32>().is_ok_and(|made| made >= 1),
+                "case {case:?}: expected how many attempts were made, got {attempts:?}"
             );
         } else {
             assert_eq!(

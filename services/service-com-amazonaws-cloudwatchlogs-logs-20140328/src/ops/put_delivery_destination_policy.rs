@@ -158,8 +158,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // Assigning a policy names the destination it is assigned to and the policy to
-        // assign; nothing else on the request takes part.
-        let _ = ctx;
+        // assign; the destination is a regional resource, so it is the one the Region this
+        // request was signed for holds under that name.
+        let region = crate::state::request_region(ctx.parts());
 
         // "Creates and assigns an IAM policy": an IAM policy is a JSON document, so a
         // `deliveryDestinationPolicy` that is not a JSON object is not one. Its statements
@@ -194,10 +195,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // The policy is assigned TO a delivery destination, so there is nothing to assign it
-        // to until that destination exists — `PutDeliveryDestination` creates one.
-        let Some(destination) = store
-            .delivery_destinations
-            .get_mut(&input.delivery_destination_name)
+        // to until that destination exists in this Region — `PutDeliveryDestination` creates
+        // one there.
+        let Some(destination) =
+            store.delivery_destination_mut(&region, &input.delivery_destination_name)
         else {
             return Err(
                 PutDeliveryDestinationPolicyErrorModeled::ResourceNotFoundException(

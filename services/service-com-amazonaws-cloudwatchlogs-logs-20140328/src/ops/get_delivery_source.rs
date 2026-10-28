@@ -2,9 +2,11 @@
 
 //! @op GetDeliverySource
 //!
-//! Reports the one delivery source the account holds under the requested name — "Retrieves
-//! complete information about one delivery source" — and refuses a name it holds none under.
-//! Reporting is a read: nothing in the store changes.
+//! Reports the one delivery source the request's Region holds under the requested name —
+//! "Retrieves complete information about one delivery source" — and refuses a name it holds
+//! none under. A delivery source is a regional resource, so a name only another Region holds
+//! one under is a name this endpoint holds none under. Reporting is a read: nothing in the
+//! store changes.
 //!
 //! ## Shape of an operation
 //!
@@ -139,9 +141,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Reporting one delivery source reads the account's store; nothing on the request but
-        // the name it asks for takes part, and nothing is written.
-        let _ = ctx;
+        // Reporting one delivery source reads the delivery sources of the Region the request
+        // was signed for — a delivery source is a regional resource, so this endpoint serves
+        // only the ones created through it — and nothing is written.
+        let region = crate::state::request_region(ctx.parts());
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetDeliverySourceError::from(
@@ -154,13 +157,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let store = state.lock();
 
-        let source = store.delivery_sources.get(&input.name).ok_or_else(|| {
+        let source = store.delivery_source(&region, &input.name).ok_or_else(|| {
             GetDeliverySourceError::from(
                 GetDeliverySourceErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         // The sentence every delivery-source operation refuses an unknown
                         // name with: the service states that the requested delivery source is
-                        // not in this account, the way it does for a delivery destination.
+                        // not in this account, the way it does for a delivery destination. A
+                        // name only ANOTHER Region holds a source under is such a name here.
                         message: Some(
                             crate::state::DELIVERY_SOURCE_NOT_FOUND_MESSAGE.to_string(),
                         ),

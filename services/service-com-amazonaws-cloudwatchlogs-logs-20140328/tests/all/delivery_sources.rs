@@ -212,10 +212,16 @@ fn reported(operation: &str, body: &Value, response: &Value) -> Value {
     })
 }
 
-/// The source the service reports under `name`.
+/// The source the service reports under `name`, read through [`REGION`]'s endpoint.
 async fn get(logs: &Logs, name: &str) -> Value {
+    get_in_region(logs, REGION, name).await
+}
+
+/// The source `region`'s endpoint reports under `name` — a delivery source is a regional
+/// resource, so the Region a read is addressed to is part of naming one.
+async fn get_in_region(logs: &Logs, region: &str, name: &str) -> Value {
     let body = json!({"name": name});
-    let response = logs.ok(GET, &body).await;
+    let response = logs.ok_in_region(region, GET, &body).await;
     reported(GET, &body, &response)
 }
 
@@ -315,7 +321,7 @@ async fn a_put_delivery_source_is_reported_and_read_back() {
             case.label
         );
 
-        let read = get(&logs, &case.name).await;
+        let read = get_in_region(&logs, case.region, &case.name).await;
         assert_eq!(
             read, expected,
             "case {:?}: expected the read-back to report {expected}, got {read}",
@@ -323,7 +329,7 @@ async fn a_put_delivery_source_is_reported_and_read_back() {
         );
 
         // Reporting is a READ: asking twice reports the same record.
-        let again = get(&logs, &case.name).await;
+        let again = get_in_region(&logs, case.region, &case.name).await;
         assert_eq!(
             again, read,
             "case {:?}: a second read must report the same record, got {again} then {read}",
@@ -334,7 +340,7 @@ async fn a_put_delivery_source_is_reported_and_read_back() {
     // Every source put above is still reported as it was put: one put does not disturb
     // another name's record.
     for case in &cases {
-        let read = get(&logs, &case.name).await;
+        let read = get_in_region(&logs, case.region, &case.name).await;
         let expected = case.expected();
         assert_eq!(
             read, expected,
@@ -443,7 +449,11 @@ async fn a_put_under_a_held_name_overwrites_the_source_parameters() {
     let state = logs
         .engine()
         .state::<ComAmazonawsCloudwatchlogsLogs20140328State>();
-    let stored: Vec<String> = state.lock().delivery_sources.keys().cloned().collect();
+    let stored: Vec<String> = state
+        .lock()
+        .delivery_sources_in(REGION)
+        .map(|source| source.name.clone())
+        .collect();
     assert_eq!(
         stored,
         vec![name.to_string()],
@@ -539,7 +549,11 @@ async fn concurrent_puts_of_one_pairing_all_succeed_and_leave_one_source() {
     let state = logs
         .engine()
         .state::<ComAmazonawsCloudwatchlogsLogs20140328State>();
-    let stored: Vec<String> = state.lock().delivery_sources.keys().cloned().collect();
+    let stored: Vec<String> = state
+        .lock()
+        .delivery_sources_in(REGION)
+        .map(|source| source.name.clone())
+        .collect();
     assert_eq!(
         stored,
         vec![name.to_string()],
@@ -683,8 +697,9 @@ async fn a_global_resource_source_lives_only_in_its_partitions_global_region() {
                 "case {case:?} put in {region}: expected {expected:?}, got {message:?}"
             );
 
-            // A refused put stores nothing.
-            let code = logs.err(GET, &json!({"name": name})).await;
+            // A refused put stores nothing — not in the Region it was refused in, and not
+            // anywhere else.
+            let code = logs.err_in_region(region, GET, &json!({"name": name})).await;
             assert_eq!(
                 code, NOT_FOUND,
                 "case {case:?} put in {region}: a refused put must store nothing, got {code}"
@@ -697,7 +712,7 @@ async fn a_global_resource_source_lives_only_in_its_partitions_global_region() {
         let body = json!({"name": name, "resourceArn": resource_arn, "logType": log_type});
         let response = logs.ok_in_region(home_region, PUT, &body).await;
         let put_reported = reported(PUT, &body, &response);
-        let read = get(&logs, &name).await;
+        let read = get_in_region(&logs, home_region, &name).await;
         assert_eq!(
             read, put_reported,
             "case {case:?}: expected the read-back to report {put_reported}, got {read}"
@@ -773,7 +788,7 @@ async fn a_resource_that_pins_no_region_is_accepted_from_every_region() {
                 Some(expected_arn.as_str()),
                 "case {case:?} put in {region}: expected {expected_arn}, got {put_reported}"
             );
-            let read = get(&logs, &name).await;
+            let read = get_in_region(&logs, region, &name).await;
             assert_eq!(
                 read, put_reported,
                 "case {case:?} put in {region}: expected the read-back to report \
@@ -868,10 +883,14 @@ async fn reading_a_source_the_account_does_not_hold_is_refused() {
     );
 }
 
-/// The whole account's sources, as `DescribeDeliverySources` reports them: one page per call,
-/// in the order the store enumerates them (by source name).
-async fn describe(logs: &Logs, body: &Value) -> (Vec<Value>, Option<String>) {
-    let response = logs.ok(DESCRIBE, body).await;
+/// The sources one Region's endpoint reports, as `DescribeDeliverySources` reports them: one
+/// page per call, in the order the store enumerates that Region's sources (by source name).
+async fn describe_in_region(
+    logs: &Logs,
+    region: &str,
+    body: &Value,
+) -> (Vec<Value>, Option<String>) {
+    let response = logs.ok_in_region(region, DESCRIBE, body).await;
     let page = response
         .get("deliverySources")
         .and_then(Value::as_array)
@@ -884,8 +903,17 @@ async fn describe(logs: &Logs, body: &Value) -> (Vec<Value>, Option<String>) {
     (page, token)
 }
 
-/// Every source the account holds is reported as it was put, in source-name order, and
-/// `resourceArns` "filters the results to delivery sources associated with ANY specified ARN".
+/// The same, read through [`REGION`]'s endpoint.
+async fn describe(logs: &Logs, body: &Value) -> (Vec<Value>, Option<String>) {
+    describe_in_region(logs, REGION, body).await
+}
+
+/// Every source a Region holds is reported through THAT Region's endpoint as it was put, in
+/// source-name order, and `resourceArns` "filters the results to delivery sources associated
+/// with ANY specified ARN". A delivery source is a regional resource, so each endpoint reports
+/// its own Region's sources: the corpus below is put across two Regions and each is described
+/// through the Region it was put in (region scoping itself is the subject of
+/// `tests/all/delivery_region_isolation.rs`).
 #[tokio::test]
 async fn describe_reports_every_stored_source_and_filters_by_resource_arn() {
     let logs = Logs::new();
@@ -894,23 +922,10 @@ async fn describe_reports_every_stored_source_and_filters_by_resource_arn() {
         logs.ok_in_region(case.region, PUT, &case.body()).await;
     }
 
-    // No filter: every source, in name order.
-    let mut expected: Vec<(String, Value)> = cases
-        .iter()
-        .map(|case| (case.name.clone(), case.expected()))
-        .collect();
-    expected.sort_by(|left, right| left.0.cmp(&right.0));
-    let expected_all: Vec<Value> = expected.iter().map(|(_, value)| value.clone()).collect();
-
-    let (page, token) = describe(&logs, &json!({"limit": 50})).await;
-    assert_eq!(
-        page, expected_all,
-        "case no filter: expected {expected_all:?}, got {page:?}"
-    );
-    assert_eq!(
-        token, None,
-        "case no filter: one page holding every source carries no nextToken, got {token:?}"
-    );
+    // Every Region the corpus was put across, each described through its own endpoint.
+    let mut regions: Vec<&str> = cases.iter().map(|case| case.region).collect();
+    regions.sort_unstable();
+    regions.dedup();
 
     // (case, the resourceArns the request filters by)
     let filters: [(&str, Vec<&str>); 5] = [
@@ -932,29 +947,58 @@ async fn describe_reports_every_stored_source_and_filters_by_resource_arn() {
         ),
     ];
 
-    for (case, arns) in filters {
-        let selected: Vec<Value> = cases
+    for region in regions {
+        // No filter: every source of this Region, in name order.
+        let mut expected: Vec<(String, Value)> = cases
             .iter()
-            .filter(|candidate| arns.contains(&candidate.resource_arn))
-            .map(|candidate| (candidate.name.clone(), candidate.expected()))
-            .collect::<std::collections::BTreeMap<String, Value>>()
-            .into_values()
+            .filter(|case| case.region == region)
+            .map(|case| (case.name.clone(), case.expected()))
             .collect();
-        let (page, token) = describe(&logs, &json!({"resourceArns": arns, "limit": 50})).await;
+        expected.sort_by(|left, right| left.0.cmp(&right.0));
+        let expected_all: Vec<Value> = expected.iter().map(|(_, value)| value.clone()).collect();
+
+        let (page, token) = describe_in_region(&logs, region, &json!({"limit": 50})).await;
         assert_eq!(
-            page, selected,
-            "case {case:?}: expected {selected:?}, got {page:?}"
+            page, expected_all,
+            "case no filter in {region}: expected {expected_all:?}, got {page:?}"
         );
         assert_eq!(
             token, None,
-            "case {case:?}: one page holding every selected source carries no nextToken, got {token:?}"
+            "case no filter in {region}: one page holding every source carries no nextToken, \
+             got {token:?}"
         );
+
+        for (case, arns) in &filters {
+            let selected: Vec<Value> = cases
+                .iter()
+                .filter(|candidate| {
+                    candidate.region == region && arns.contains(&candidate.resource_arn)
+                })
+                .map(|candidate| (candidate.name.clone(), candidate.expected()))
+                .collect::<std::collections::BTreeMap<String, Value>>()
+                .into_values()
+                .collect();
+            let (page, token) =
+                describe_in_region(&logs, region, &json!({"resourceArns": arns, "limit": 50}))
+                    .await;
+            assert_eq!(
+                page, selected,
+                "case {case:?} in {region}: expected {selected:?}, got {page:?}"
+            );
+            assert_eq!(
+                token, None,
+                "case {case:?} in {region}: one page holding every selected source carries no \
+                 nextToken, got {token:?}"
+            );
+        }
     }
 }
 
 /// `DescribeDeliverySources` pages the enumeration: each page holds at most `limit` sources,
 /// a `nextToken` is handed back exactly while sources remain, and the pages concatenated are
 /// the whole enumeration whatever the page size. A token issued for another filter is refused.
+/// The enumeration one endpoint pages is its own Region's sources, so each Region the corpus
+/// was put across is paged through its own endpoint.
 #[tokio::test]
 async fn describe_pages_the_enumeration_whatever_the_page_size() {
     let logs = Logs::new();
@@ -962,47 +1006,60 @@ async fn describe_pages_the_enumeration_whatever_the_page_size() {
     for case in &cases {
         logs.ok_in_region(case.region, PUT, &case.body()).await;
     }
-    let mut names: Vec<String> = cases.iter().map(|case| case.name.clone()).collect();
-    names.sort();
 
-    // Every page size from one source to more than the account holds, plus the default.
-    for limit in [None, Some(1), Some(2), Some(3), Some(names.len()), Some(50)] {
-        let mut seen: Vec<String> = Vec::new();
-        let mut token: Option<String> = None;
-        loop {
-            let mut body = json!({});
-            if let Some(limit) = limit {
-                body["limit"] = json!(limit);
+    let mut regions: Vec<&str> = cases.iter().map(|case| case.region).collect();
+    regions.sort_unstable();
+    regions.dedup();
+
+    for region in regions {
+        let mut names: Vec<String> = cases
+            .iter()
+            .filter(|case| case.region == region)
+            .map(|case| case.name.clone())
+            .collect();
+        names.sort();
+
+        // Every page size from one source to more than the Region holds, plus the default.
+        for limit in [None, Some(1), Some(2), Some(3), Some(names.len()), Some(50)] {
+            let mut seen: Vec<String> = Vec::new();
+            let mut token: Option<String> = None;
+            loop {
+                let mut body = json!({});
+                if let Some(limit) = limit {
+                    body["limit"] = json!(limit);
+                }
+                if let Some(token) = &token {
+                    body["nextToken"] = json!(token);
+                }
+                let (page, next) = describe_in_region(&logs, region, &body).await;
+                if let Some(limit) = limit {
+                    assert!(
+                        page.len() <= limit,
+                        "case limit {limit} in {region}: a page holds at most {limit} sources, \
+                         got {}",
+                        page.len()
+                    );
+                }
+                for source in &page {
+                    seen.push(
+                        source
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_else(|| panic!("case limit {limit:?} in {region}: a reported source carries a name, got {source}"))
+                            .to_string(),
+                    );
+                }
+                match next {
+                    Some(next) => token = Some(next),
+                    None => break,
+                }
             }
-            if let Some(token) = &token {
-                body["nextToken"] = json!(token);
-            }
-            let (page, next) = describe(&logs, &body).await;
-            if let Some(limit) = limit {
-                assert!(
-                    page.len() <= limit,
-                    "case limit {limit}: a page holds at most {limit} sources, got {}",
-                    page.len()
-                );
-            }
-            for source in &page {
-                seen.push(
-                    source
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or_else(|| panic!("case limit {limit:?}: a reported source carries a name, got {source}"))
-                        .to_string(),
-                );
-            }
-            match next {
-                Some(next) => token = Some(next),
-                None => break,
-            }
+            assert_eq!(
+                seen, names,
+                "case limit {limit:?} in {region}: expected the pages to enumerate {names:?}, \
+                 got {seen:?}"
+            );
         }
-        assert_eq!(
-            seen, names,
-            "case limit {limit:?}: expected the pages to enumerate {names:?}, got {seen:?}"
-        );
     }
 
     // A token is a position within ONE filtered enumeration, so continuing it under another

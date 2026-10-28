@@ -440,14 +440,16 @@ async fn a_reserved_term_read_out_of_scope_is_refused_per_field() {
 }
 
 /// The diagnostic states the FIELD the expression read: the term is not bound in that
-/// scope, so there is no such field to read, and the message names the term and
-/// nothing of the state or the member that carried it.
+/// scope, so there is no such field to read, and the message names the field expression
+/// that was written — the term with the member accessors after it — and nothing of the
+/// state or the member that carried it.
 #[tokio::test]
 async fn the_diagnostic_states_the_field_the_expression_read() {
     let emulator = Emulator::new();
 
-    // Rows differ along WHICH term is out of scope and which member of which state
-    // type reads it.
+    // Rows differ along WHICH term is out of scope, which member of which state type
+    // reads it, and whether the written field expression is the bare term or the term
+    // followed by the member the expression actually wanted.
     let rows: Vec<(&str, String, &str)> = vec![
         (
             "the result of a state that produces none",
@@ -479,7 +481,16 @@ async fn the_diagnostic_states_the_field_the_expression_read() {
                 "Output": { "why": "{% $states.errorOutput.Cause %}" },
                 "Next": "Done"
             })),
-            "$states.errorOutput",
+            "$states.errorOutput.Cause",
+        ),
+        (
+            "a member of the result of a state that produces none",
+            jsonata_machine(json!({
+                "Type": "Pass",
+                "Output": { "x": "{% $states.result.count %}" },
+                "Next": "Done"
+            })),
+            "$states.result.count",
         ),
     ];
 

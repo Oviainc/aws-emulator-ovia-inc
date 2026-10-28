@@ -193,9 +193,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries only request metadata; this operation reports on stored
-        // deliveries and needs none of it.
-        let _ = ctx;
+        // A delivery is a regional resource, so what this reports is the deliveries of the
+        // Region the request was signed for; nothing else on the request takes part.
+        let region = crate::state::request_region(ctx.parts());
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DescribeDeliveriesError::from(
@@ -231,14 +231,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
-        // One enumeration, in the order the store holds it (by delivery id), of the
-        // deliveries the request's filter selects: `deliverySourceNames` is "An array of
-        // delivery source names that filters the results to deliveries associated with ANY
-        // specified delivery source", so a delivery is selected when its source is one of
-        // them, and every delivery is selected when the request names no source at all.
+        // One enumeration, in the order the store holds it (by delivery id) of the Region's
+        // own deliveries, of the ones the request's filter selects: `deliverySourceNames` is
+        // "An array of delivery source names that filters the results to deliveries associated
+        // with ANY specified delivery source", so a delivery is selected when its source is one
+        // of them, and every delivery is selected when the request names no source at all.
         let matching: Vec<&crate::state::DeliveryRecord> = store
-            .deliveries
-            .values()
+            .deliveries_in(&region)
             .filter(|delivery| {
                 input
                     .delivery_source_names
