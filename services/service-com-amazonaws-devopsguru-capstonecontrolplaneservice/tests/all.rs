@@ -49,6 +49,8 @@ mod insight_search;
 mod monitored_resources;
 #[path = "all/mutation_idempotency_and_tenancy.rs"]
 mod mutation_idempotency_and_tenancy;
+#[path = "all/not_found_message.rs"]
+mod not_found_message;
 #[path = "all/notification_channel_conflict.rs"]
 mod notification_channel_conflict;
 #[path = "all/notification_channel_removal.rs"]

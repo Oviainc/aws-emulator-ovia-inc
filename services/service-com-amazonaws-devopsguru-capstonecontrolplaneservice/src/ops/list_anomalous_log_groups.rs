@@ -190,12 +190,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // gives for that id, rather than an empty page that would claim the insight
         // exists and simply has no anomalous logs.
         if !store.insights.contains_key(&input.insight_id) {
+            // The account this emulator serves: `ListAnomalousLogGroups` models no
+            // `AccountId`, so the read is scoped to the caller's own account.
+            let account_id = crate::state::requested_account_id(None);
             return Err(ListAnomalousLogGroupsErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("no insight with id {} exists", input.insight_id),
-                    resource_id: input.insight_id.clone(),
-                    resource_type: crate::state::INSIGHT_RESOURCE_TYPE.to_string(),
-                },
+                crate::state::insight_not_found(Self::NAME, &account_id, &input.insight_id),
             )
             .into());
         }

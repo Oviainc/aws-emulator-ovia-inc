@@ -223,11 +223,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // exists and simply has nothing recommended for it.
         if !store.insights.contains_key(&input.insight_id) {
             return Err(ListRecommendationsErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("no insight with id {} exists", input.insight_id),
-                    resource_id: input.insight_id.clone(),
-                    resource_type: crate::state::INSIGHT_RESOURCE_TYPE.to_string(),
-                },
+                crate::state::insight_not_found(Self::NAME, &account_id, &input.insight_id),
             )
             .into());
         }

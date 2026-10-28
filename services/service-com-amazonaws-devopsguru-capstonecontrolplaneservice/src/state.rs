@@ -53,9 +53,9 @@ use crate::ops::types::{
     ProactiveOrganizationInsightSummary, ReactiveAnomaly, ReactiveAnomalySummary, ReactiveInsight,
     ReactiveInsightSummary,
     ReactiveOrganizationInsightSummary, Recommendation, RecommendationRelatedAnomaly,
-    RecommendationRelatedEvent, ResourceCollection, ServiceCollection, ServiceHealth,
-    ServiceInsightHealth, StartTimeRange, TagCollection, TagHealth, ValidationException,
-    ValidationExceptionField, EVENT_CLASS_VALUES, EVENT_DATA_SOURCE_VALUES,
+    RecommendationRelatedEvent, ResourceCollection, ResourceNotFoundException, ServiceCollection,
+    ServiceHealth, ServiceInsightHealth, StartTimeRange, TagCollection, TagHealth,
+    ValidationException, ValidationExceptionField, EVENT_CLASS_VALUES, EVENT_DATA_SOURCE_VALUES,
     INSIGHT_SEVERITY_VALUES, INSIGHT_STATUS_VALUES, INSIGHT_TYPE_VALUES, SERVICE_NAME_VALUES,
 };
 
@@ -2742,6 +2742,78 @@ pub const ANOMALY_RESOURCE_TYPE: &str = "ANOMALY";
 /// today: `RemoveNotificationChannel` is a terminal, idempotent deletion, so an id
 /// naming no stored channel is a no-op success rather than a refusal.
 pub const NOTIFICATION_CHANNEL_RESOURCE_TYPE: &str = "NOTIFICATION_CHANNEL";
+
+/// The identifier KIND a not-found refusal names inside its message when the id it
+/// could not resolve is an `InsightId`.
+///
+/// DevOps Guru resolves an insight by the identifier its analysis findings carry, so
+/// the token the message reports for an insight id is that identifier's name rather
+/// than [`INSIGHT_RESOURCE_TYPE`], which is what the error's own `ResourceType`
+/// member reports.
+pub const FINDING_ID_LOOKUP_TYPE: &str = "findingId";
+
+/// The identifier kind a not-found refusal names when the id it could not resolve is
+/// an `AnomalyId` — the lower-camel name of the `AnomalyId` shape `DescribeAnomaly`'s
+/// `Id` member targets, for the reason [`FINDING_ID_LOOKUP_TYPE`] gives.
+pub const ANOMALY_ID_LOOKUP_TYPE: &str = "anomalyId";
+
+/// The message every DevOps Guru not-found refusal carries: the refusing operation's
+/// own name in brackets, then a fixed sentence whose variable parts are the account
+/// the request resolved to, the kind of identifier the lookup was resolving, and the
+/// id the request asked for.
+///
+/// One renderer so each refusal reports the same sentence, with the same account id
+/// and the same bracketing, whichever operation failed to resolve the id.
+pub fn resource_not_found_message(
+    operation: &str,
+    account_id: &str,
+    lookup_type: &str,
+    id: &str,
+) -> String {
+    format!(
+        "[{operation}] failed - Resource Not found for awsAccountId [{account_id}] \
+         for type [{lookup_type}] with id [{id}]"
+    )
+}
+
+/// The refusal an operation gives when `insight_id` names no insight the account
+/// holds: the shared message, plus the modelled `ResourceId`/`ResourceType` members
+/// naming the id asked for and the kind of resource it would have named.
+pub fn insight_not_found(
+    operation: &str,
+    account_id: &str,
+    insight_id: &str,
+) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: resource_not_found_message(
+            operation,
+            account_id,
+            FINDING_ID_LOOKUP_TYPE,
+            insight_id,
+        ),
+        resource_id: insight_id.to_string(),
+        resource_type: INSIGHT_RESOURCE_TYPE.to_string(),
+    }
+}
+
+/// The refusal an operation gives when `anomaly_id` names no anomaly the account
+/// holds, under the same rule as [`insight_not_found`].
+pub fn anomaly_not_found(
+    operation: &str,
+    account_id: &str,
+    anomaly_id: &str,
+) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: resource_not_found_message(
+            operation,
+            account_id,
+            ANOMALY_ID_LOOKUP_TYPE,
+            anomaly_id,
+        ),
+        resource_id: anomaly_id.to_string(),
+        resource_type: ANOMALY_RESOURCE_TYPE.to_string(),
+    }
+}
 
 /// Before any `UpdateServiceIntegration`, every integration is opted out: a
 /// client that never enabled OpsCenter, log anomaly detection or customer-managed

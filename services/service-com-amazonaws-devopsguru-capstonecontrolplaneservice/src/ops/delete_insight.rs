@@ -187,12 +187,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // anomalies associated with it — or it named none, which is a not-found refusal
         // that changed nothing.
         if guard.remove_insight(&input.id).is_none() {
+            // The account this emulator serves: `DeleteInsight` models no `AccountId`,
+            // so the deletion is scoped to the caller's own account.
+            let account_id = crate::state::requested_account_id(None);
             return Err(DeleteInsightErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("no insight with id {} exists", input.id),
-                    resource_id: input.id.clone(),
-                    resource_type: crate::state::INSIGHT_RESOURCE_TYPE.to_string(),
-                },
+                crate::state::insight_not_found(Self::NAME, &account_id, &input.id),
             )
             .into());
         }

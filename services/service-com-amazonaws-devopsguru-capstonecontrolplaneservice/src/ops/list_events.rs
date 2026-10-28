@@ -220,11 +220,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(insight_id) = selector.insight_id() {
             if !store.insights.contains_key(insight_id) {
                 return Err(ListEventsErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: format!("no insight with id {insight_id} exists"),
-                        resource_id: insight_id.to_string(),
-                        resource_type: crate::state::INSIGHT_RESOURCE_TYPE.to_string(),
-                    },
+                    crate::state::insight_not_found(Self::NAME, &account_id, insight_id),
                 )
                 .into());
             }

@@ -185,11 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let Some(record) = store.insights.get(&input.id) else {
             return Err(DescribeInsightErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("no insight with id {} exists", input.id),
-                    resource_id: input.id.clone(),
-                    resource_type: crate::state::INSIGHT_RESOURCE_TYPE.to_string(),
-                },
+                crate::state::insight_not_found(Self::NAME, &account_id, &input.id),
             )
             .into());
         };
