@@ -157,9 +157,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; this configuration is account-level,
-        // so nothing here reads the request's Region.
-        let _ = ctx;
+        // `ctx` carries the credential the request presented, which is who the
+        // authorization gate judges; this configuration is account-level, so nothing
+        // here reads the request's Region.
+        //
+        // Authorization comes FIRST: AWS decides it at the IAM layer, ahead of the
+        // service acting, so a caller whose identity-based policies do not allow the
+        // action is refused and nothing is written. The configuration names no resource,
+        // so it is judged against the resource IAM writes for such a request
+        // ([`crate::service::authorization::ANY_RESOURCE`]).
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            crate::service::authorization::ANY_RESOURCE,
+        )
+        .map_err(PutAccountConfigurationErrorModeled::AccessDeniedException)?;
 
         // Unreachable in the assembled emulator (the engine is the shared store).
         let Some(state) = crate::state::service_state(&*self.engine) else {

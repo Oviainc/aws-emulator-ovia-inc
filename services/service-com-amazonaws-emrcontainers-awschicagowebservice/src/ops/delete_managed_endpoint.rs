@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteManagedEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteManagedEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteManagedEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Tears down the stored managed endpoint of this (virtual cluster, id) pair: it moves to
+//! TERMINATING, and the clock owes it TERMINATED ([`crate::state::TRANSITION_SPAN`]) — the
+//! same two steps the teardown of the cluster it gateways into writes for it. A following
+//! `DescribeManagedEndpoint` observes both.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +139,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteManagedEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteManagedEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteManagedEndpointError::Modeled(
+                DeleteManagedEndpointErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the managed endpoint store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let region = crate::state::request_region(ctx);
+        let mut state = store.lock();
+        state.settle();
+
+        // The endpoint is resolved by the PAIR (virtual cluster, id) in the region this
+        // request is signed for, the way every other read of a managed endpoint resolves
+        // one. This operation models no not-found error, so a pair the store does not hold
+        // is refused as an invalid request rather than answered with a silent success.
+        let Some(record) = state.managed_endpoint(&region, &input.virtual_cluster_id, &input.id)
+        else {
+            return Err(DeleteManagedEndpointErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "Endpoint {} was not found in virtual cluster {}",
+                        input.id, input.virtual_cluster_id
+                    )),
+                },
+            )
+            .into());
+        };
+        let current_state = record.state.clone();
+
+        // A teardown is a transition only a resource that has not ended has left to take:
+        // an endpoint already in a terminal state cannot be deleted, and one whose teardown
+        // is already in flight is left exactly as it is, so a retried delete neither
+        // restarts the step nor pushes its due instant out.
+        if crate::state::endpoint_state_is_terminal(&current_state) {
+            return Err(DeleteManagedEndpointErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "Endpoint {} is in state {current_state} and cannot be deleted",
+                        input.id
+                    )),
+                },
+            )
+            .into());
+        }
+        // An endpoint is de-provisioned, so it is accepted TERMINATING and reaches
+        // TERMINATED on the clock: a caller that reads straight back observes the transient
+        // state, as it would against AWS.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteManagedEndpoint"))
+        // A teardown ALREADY in flight is answered rather than refused the way
+        // `DeleteVirtualCluster` refuses a cluster that is not RUNNING: an endpoint is torn
+        // down both by this call and by its cluster's teardown, so a delete that arrives
+        // while it is TERMINATING is asking for the end the endpoint is already reaching,
+        // exactly as a repeated `CancelJobRun` is. The cluster has no such second path,
+        // which is why the two differ.
+        if current_state != crate::state::ENDPOINT_TERMINATING {
+            state.move_managed_endpoint(
+                &region,
+                &input.virtual_cluster_id,
+                &input.id,
+                crate::state::ENDPOINT_TERMINATING,
+                crate::state::ENDPOINT_TERMINATED,
+            );
+        }
+
+        Ok(DeleteManagedEndpointOutput {
+            id: Some(input.id),
+            virtual_cluster_id: Some(input.virtual_cluster_id),
+        })
     }
 }

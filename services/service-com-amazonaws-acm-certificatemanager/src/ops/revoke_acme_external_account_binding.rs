@@ -167,11 +167,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // No request metadata is needed: the `AcmeExternalAccountBindingArn` the request
+        // Authorization comes FIRST: AWS decides it at the IAM layer, ahead of the
+        // service looking at the resource, so a caller whose identity-based policies do
+        // not allow the action is refused without being told anything about the resource,
+        // and nothing is revoked. `ctx` carries the credential the request presented,
+        // which is who is judged ([`crate::service::authorization`]).
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.acme_external_account_binding_arn,
+        )
+        .map_err(RevokeAcmeExternalAccountBindingErrorModeled::AccessDeniedException)?;
+
+        // The account segment of the ARN is INPUT this operation validates: a caller
+        // addresses only their own account's resources, so an ARN carrying another
+        // account's id names nothing they could revoke — a fact about the REQUEST, decided
+        // before the store is consulted at all. Reported in the one sentence this service
+        // words that verdict with, as every sibling ACME operation reports it.
+        if !crate::state::arn_is_in_caller_account(&input.acme_external_account_binding_arn) {
+            return Err(
+                RevokeAcmeExternalAccountBindingErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::service::cross_account_arn_refusal()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Nothing else about the request is needed: the `AcmeExternalAccountBindingArn` it
         // names carries the Region, the account and the endpoint the binding was created
         // under, so the record is found by ARN alone — as in
         // `DescribeAcmeExternalAccountBinding`.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Unreachable in the assembled emulator (the engine IS the shared store);
             // this operation models a server fault, so that is the honest answer.

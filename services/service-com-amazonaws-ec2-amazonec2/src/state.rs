@@ -1326,6 +1326,14 @@
 //! of progress an active task reports is derived per read, being a fact of elapsed time
 //! that no store could hold.
 //!
+//! `CancelImportTask` cancels a task of EITHER import kind, so the state it reads and the
+//! state it moves are reached through
+//! [`ComAmazonawsEc2Amazonec2State::import_task_state`] and
+//! [`ComAmazonawsEc2Amazonec2State::start_import_task_cancellation`], and the instant the
+//! clock owes a cancelled task its `deleting` -> `deleted` move sits in the one map
+//! [`ComAmazonawsEc2Amazonec2State::import_task_deleted_at`] — neither modelled task shape
+//! carrying a member for it.
+//!
 //! ## Root volume replacement tasks
 //!
 //! [`ComAmazonawsEc2Amazonec2State::replace_root_volume_tasks`] holds the root volume
@@ -3526,6 +3534,19 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// same request answers with that task instead of starting a second import: "The token
     /// to enable idempotency for VM import requests" (`ImportImageRequest$ClientToken`).
     pub import_image_task_client_tokens: HashMap<String, String>,
+    /// When a cancelled import task's `deleting` -> `deleted` move falls due, by
+    /// `ImportTaskId` — the import-task counterpart of [`Self::vpc_available_at`].
+    ///
+    /// ONE map for both kinds of import task, because one operation cancels either and an
+    /// id names at most one of them: a task of [`Self::import_image_tasks`] and one of
+    /// [`Self::import_snapshot_tasks`] are stored as the modelled shapes their describes
+    /// report, and neither shape carries a member for that instant. Monotonic
+    /// ([`Instant`]), because it is only ever compared against the clock and never
+    /// reported, so a wall-clock adjustment cannot move a task back to `deleting`. An entry
+    /// is dropped as soon as the move has been applied
+    /// ([`Self::delete_due_cancelled_import_tasks`]), so this holds exactly the
+    /// cancellations still owed.
+    pub import_task_deleted_at: BTreeMap<String, Instant>,
     /// Every NAT gateway the account holds, by `NatGatewayId`, as the modelled
     /// [`NatGateway`] shape itself — so a member a writer sets round-trips through
     /// `DescribeNatGateways` without a field-by-field copy that can silently drop one. The
@@ -3903,6 +3924,9 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             vpc_block_public_access_exclusions: BTreeMap::new(),
             import_image_tasks: BTreeMap::new(),
             import_image_task_client_tokens: HashMap::new(),
+            // A fresh account has cancelled no import task, so the clock owes none of them
+            // its `deleted` state.
+            import_task_deleted_at: BTreeMap::new(),
             nat_gateways: BTreeMap::new(),
             nat_gateway_address_transitions: BTreeMap::new(),
             capacity_reservation_fleets: BTreeMap::new(),
@@ -6537,7 +6561,10 @@ impl ComAmazonawsEc2Amazonec2State {
     ///
     /// An `active` import image task becoming `completed` with the AMI it created is one of
     /// them too; it is documented on [`Self::complete_due_import_image_tasks`], which this
-    /// calls. So is a NAT gateway address an association left `associating` reaching
+    /// calls. So is the end of an import task cancellation — a `deleting` task of either
+    /// import kind reaching `deleted`
+    /// ([`Self::delete_due_cancelled_import_tasks`]). So is a NAT gateway address an
+    /// association left `associating` reaching
     /// `succeeded` ([`NatGatewayAddressTransition`]), and a `running` Network Access Scope
     /// analysis reaching its terminal `AnalysisStatus`. So is an `associating` local gateway
     /// route table / VPC association reaching `associated`, an `associating` local gateway
@@ -7515,6 +7542,10 @@ impl ComAmazonawsEc2Amazonec2State {
         // moves above.
         self.apply_due_ptr_record_updates(now);
         self.complete_due_import_image_tasks(now);
+        // AFTER the completions: a cancel takes a task out of `active`, so the two can
+        // never be owed on one task at once, and applying the completions first means a
+        // cancelled task's `deleted` is written over nothing.
+        self.delete_due_cancelled_import_tasks(now);
         self.materialize_due_capacity_reservation_fleet_moves(now);
         self.materialize_due_spot_instance_requests(now);
         // AFTER the Spot Instance requests a Spot Fleet placed: the capacity a fleet reports
@@ -18785,6 +18816,155 @@ impl ComAmazonawsEc2Amazonec2State {
         self.import_snapshot_tasks
             .insert(import_task_id.clone(), task);
         Some(import_task_id)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cancelling an import task, whichever resource it imports
+// ---------------------------------------------------------------------------
+//
+// "Cancels an in-process import virtual machine or import snapshot task"
+// (`CancelImportTask`): ONE operation acts on a task of either kind, so the state it reads
+// and the state it moves live here once rather than once per store. An import image task
+// keeps its state on `ImportImageTask$Status` and an import snapshot task on its
+// `SnapshotTaskDetail$Status` — the only places either describe reads it from — and both
+// move `active` -> `deleting` when a cancel is admitted, then `deleting` -> `deleted` when
+// the clock has given that move its span ([`TRANSITION_DELAY`]), so a caller reading
+// straight after the cancel still sees the task working through it.
+
+/// How long a cancel reason this store keeps on a task may be.
+///
+/// CHOSEN, like [`MAX_ECHOED_PAGE_TOKEN_CHARS`]: `CancelImportTaskRequest$CancelReason`
+/// publishes no `@length`, and the text is retained on the stored task for the process's
+/// lifetime, so a reason past the width EC2 gives its other free-text members is refused
+/// rather than stored.
+pub const MAX_IMPORT_TASK_CANCEL_REASON_CHARS: usize = 255;
+
+/// Refuse a request naming an import task id EC2 could have issued that this account holds
+/// no import task for: HTTP 400 [`INVALID_CONVERSION_TASK_ID`], EC2's code for a conversion
+/// (import) task id it cannot resolve.
+///
+/// The counterpart of [`require_well_formed_import_task_id`], which answers the same code
+/// for an id that is not an import task id at all: an operation acting on ONE named task
+/// cannot act on a task that is not there, where an import-task describe reports "a list of
+/// zero or more" tasks and so answers such an id with no row instead of an error.
+pub fn invalid_conversion_task_id_not_found<E>(import_task_id: &str) -> Scaffolded<E> {
+    id_not_found(
+        INVALID_CONVERSION_TASK_ID,
+        "conversion task",
+        import_task_id,
+    )
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// The state the import task `import_task_id` reports, or `None` when this account
+    /// holds no import task under that id — of either kind, because one operation cancels
+    /// either.
+    ///
+    /// An image task's state is its own `ImportImageTask$Status`; a snapshot task's is its
+    /// `SnapshotTaskDetail$Status`. A stored task carrying no status at all reports none
+    /// (the empty string), which is no state of [`IMPORT_TASK_STATES`] and so admits no
+    /// cancel — every writer of a task sets one.
+    pub fn import_task_state(&self, import_task_id: &str) -> Option<String> {
+        if let Some(record) = self.import_image_tasks.get(import_task_id) {
+            return Some(record.view.status.clone().unwrap_or_default());
+        }
+        let task = self.import_snapshot_tasks.get(import_task_id)?;
+        Some(
+            task.snapshot_task_detail
+                .as_ref()
+                .and_then(|detail| detail.status.clone())
+                .unwrap_or_default(),
+        )
+    }
+
+    /// Start the cancellation of the import task `import_task_id`, which does nothing at
+    /// all when this account holds no task under that id.
+    ///
+    /// The task moves to [`IMPORT_TASK_STATE_DELETING`] now and the clock owes it
+    /// [`IMPORT_TASK_STATE_DELETED`] one [`TRANSITION_DELAY`] later
+    /// ([`Self::delete_due_cancelled_import_tasks`]). A task that is not converting any
+    /// more has no percentage left to make, so no progress is reported for it, and `reason`
+    /// — "the reason for canceling the task" (`CancelImportTaskRequest$CancelReason`) — is
+    /// written onto the task's status message, the one member either shape carries for a
+    /// descriptive status (`ImportImageTask$StatusMessage`,
+    /// `SnapshotTaskDetail$StatusMessage`), so the describes report why the task ended
+    /// instead of dropping it. Its bytes are caller-chosen text on a stored record, so they
+    /// are charged against the store's byte budget the way a tag write is; the message it
+    /// replaces is given no refund, because neither writer of a task charges one — an
+    /// import image task's is a constant of this module and
+    /// [`import_snapshot_task_payload_bytes`] counts the detail's text but not its status
+    /// message.
+    pub fn start_import_task_cancellation(
+        &mut self,
+        import_task_id: &str,
+        now: Instant,
+        reason: Option<&str>,
+    ) -> bool {
+        let deleting = IMPORT_TASK_STATE_DELETING.to_string();
+        let message = reason.map(str::to_string);
+        let held = if let Some(record) = self.import_image_tasks.get_mut(import_task_id) {
+            record.view.status = Some(deleting.clone());
+            record.view.status_message = message.clone();
+            record.view.progress = None;
+            // Each disk of the import stops where the task did: its own status is the
+            // task's ("a brief status for the import image task"), and it has no progress
+            // left either.
+            for detail in record.view.snapshot_details.iter_mut().flatten() {
+                detail.status = Some(deleting.clone());
+                detail.progress = None;
+            }
+            true
+        } else if let Some(detail) = self
+            .import_snapshot_tasks
+            .get_mut(import_task_id)
+            .and_then(|task| task.snapshot_task_detail.as_mut())
+        {
+            detail.status = Some(deleting);
+            detail.status_message = message.clone();
+            detail.progress = None;
+            true
+        } else {
+            false
+        };
+        if !held {
+            return false;
+        }
+        self.add_stored_bytes(message.map_or(0, |text| text.len()));
+        self.import_task_deleted_at
+            .insert(import_task_id.to_string(), now + TRANSITION_DELAY);
+        true
+    }
+
+    /// Finish every import task cancellation the clock owed by `now`: a task a cancel left
+    /// [`IMPORT_TASK_STATE_DELETING`] is [`IMPORT_TASK_STATE_DELETED`] once its instant has
+    /// passed.
+    ///
+    /// Reached only through [`Self::materialize_due_transitions`], so a reporting operation
+    /// observes the move without having caused it: it was owed at this instant whether or
+    /// not anybody called. The record itself stays in the store — a state is only
+    /// reportable while the task it belongs to is there.
+    pub fn delete_due_cancelled_import_tasks(&mut self, now: Instant) {
+        let image_tasks = &mut self.import_image_tasks;
+        let snapshot_tasks = &mut self.import_snapshot_tasks;
+        self.import_task_deleted_at.retain(|import_task_id, due_at| {
+            if now < *due_at {
+                return true;
+            }
+            if let Some(record) = image_tasks.get_mut(import_task_id) {
+                record.view.status = Some(IMPORT_TASK_STATE_DELETED.to_string());
+                for detail in record.view.snapshot_details.iter_mut().flatten() {
+                    detail.status = Some(IMPORT_TASK_STATE_DELETED.to_string());
+                }
+            } else if let Some(detail) = snapshot_tasks
+                .get_mut(import_task_id)
+                .and_then(|task| task.snapshot_task_detail.as_mut())
+            {
+                detail.status = Some(IMPORT_TASK_STATE_DELETED.to_string());
+            }
+            // The move is applied once; nothing is owed on this task any more.
+            false
+        });
     }
 }
 
