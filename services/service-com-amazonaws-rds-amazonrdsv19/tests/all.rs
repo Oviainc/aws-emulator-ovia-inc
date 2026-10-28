@@ -101,6 +101,8 @@ mod lifecycle_poll_loops;
 mod management_event_recording;
 #[path = "all/modify_custom_db_engine_version.rs"]
 mod modify_custom_db_engine_version;
+#[path = "all/modify_db_cluster_state_refusal.rs"]
+mod modify_db_cluster_state_refusal;
 #[path = "all/modify_db_shard_group.rs"]
 mod modify_db_shard_group;
 #[path = "all/modify_event_subscription.rs"]
