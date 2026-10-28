@@ -25,6 +25,13 @@
 //! supplies only the VALUE of its type's external-id property is still
 //! selected.
 //!
+//! Both component filters ask about the components an entity HOLDS, and a
+//! composite component is one of them — it instantiates a component type and
+//! carries properties of its own, and every reader of the entity reports it as
+//! a component — so `componentTypeId` and `externalId` are alike answered over
+//! an entity's top-level components AND the composite components inside them
+//! ([`crate::state::Entity::components_at_every_path`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -283,10 +290,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// Whether `entity` is in the list the single accepted filter selects. With no
 /// filter every entity of the workspace is.
 ///
+/// Both component filters — `componentTypeId` ("the ID of the component type in
+/// the entities in the list") and `externalId` ("the external-Id property of a
+/// component") — are answered over every component the entity HOLDS
+/// ([`crate::state::Entity::components_at_every_path`]): a composite component
+/// is a component of the entity too, instantiating a component type and
+/// carrying properties of its own, and `GetEntity` and `ListComponents` both
+/// report it as one, so a filter that skipped it would contradict every reader
+/// of the same entity.
+///
 /// `workspace` is the entity's own workspace, which the `externalId` filter
 /// needs: which property of a component is its external id is declared on a
 /// component TYPE, so the filter is answered against the workspace's component
-/// types rather than off the entity alone.
+/// types rather than off the entity alone
+/// ([`crate::state::Workspace::component_external_ids`], which reads
+/// `isExternalId` off the EFFECTIVE definition of each property rather than off
+/// an entity-local one).
 fn matches_filter(
     workspace: &crate::state::Workspace,
     entity: &crate::state::Entity,
@@ -297,43 +316,17 @@ fn matches_filter(
         Some(ListEntitiesFilter::parentEntityId(parent_entity_id)) => {
             entity.parent_entity_id == *parent_entity_id
         }
-        Some(ListEntitiesFilter::componentTypeId(component_type_id)) => {
-            entity.components.values().any(|component| {
-                component.component_type_id.as_deref() == Some(component_type_id.as_str())
+        Some(ListEntitiesFilter::componentTypeId(component_type_id)) => entity
+            .components_at_every_path()
+            .any(|component| component.component_type_id() == Some(component_type_id.as_str())),
+        Some(ListEntitiesFilter::externalId(external_id)) => {
+            entity.components_at_every_path().any(|component| {
+                workspace
+                    .component_external_ids(component.component_type_id(), component.properties())
+                    .contains(external_id)
             })
         }
-        Some(ListEntitiesFilter::externalId(external_id)) => entity
-            .components
-            .values()
-            .any(|component| carries_external_id(workspace, component, external_id)),
     }
-}
-
-/// Whether `component`, or any composite component inside it, carries
-/// `external_id` as the value of its external-id property.
-///
-/// A composite component is a component of the entity too — `GetEntity` reports
-/// it as one — and it carries a `componentTypeId` and properties of its own, so
-/// the external id it names is resolved the same way the holding component's
-/// is: through [`crate::state::Workspace::component_external_ids`], which reads
-/// `isExternalId` off the EFFECTIVE definition of each property rather than off
-/// an entity-local one.
-fn carries_external_id(
-    workspace: &crate::state::Workspace,
-    component: &crate::state::ComponentRecord,
-    external_id: &str,
-) -> bool {
-    workspace
-        .component_external_ids(component.component_type_id.as_deref(), &component.properties)
-        .contains(external_id)
-        || component.composite_components.values().any(|composite| {
-            workspace
-                .component_external_ids(
-                    Some(composite.component_type_id.as_str()),
-                    &composite.properties,
-                )
-                .contains(external_id)
-        })
 }
 
 /// The envelope a `nextToken` of this service carries, so a token minted

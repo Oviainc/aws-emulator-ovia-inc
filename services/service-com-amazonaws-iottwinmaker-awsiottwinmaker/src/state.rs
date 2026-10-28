@@ -2131,6 +2131,34 @@ impl Entity {
         self.state = STATE_UPDATING.to_string();
         self.settles_at = now + ENTITY_SETTLE_SPAN;
     }
+
+    /// Every component the entity holds: each top-level component, and every
+    /// composite component stored inside one of them, at whatever depth.
+    ///
+    /// A composite component is a component of the entity too — it instantiates
+    /// a component type of its own and carries properties of its own, and
+    /// `GetEntity` and `ListComponents` both report it as a component — so any
+    /// reader asking "which components does this entity hold" walks all of them
+    /// through here rather than stopping at
+    /// [`components`](Self::components). Each is handed back as the
+    /// [`ComponentAtPath`] a `componentPath` would have resolved to, so the two
+    /// kinds answer the same questions ([`ComponentAtPath::component_type_id`],
+    /// [`ComponentAtPath::properties`]) while staying distinguishable by a
+    /// caller that reports them differently.
+    pub fn components_at_every_path(&self) -> impl Iterator<Item = ComponentAtPath<'_>> {
+        self.components.values().flat_map(|component| {
+            ::std::iter::once(ComponentAtPath::TopLevel(component)).chain(
+                component
+                    .composite_components
+                    .iter()
+                    .map(move |(composite_path, composite)| ComponentAtPath::Composite {
+                        component,
+                        composite_path,
+                        composite,
+                    }),
+            )
+        })
+    }
 }
 
 /// One stored component type.
