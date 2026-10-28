@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateStackSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateStackSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateStackSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: records the configuration the StackSet is updated to — its template,
+//! parameters, capabilities, tags, roles, permission model and deployment settings — and
+//! rolls that revision out over the stack instances the request selects as ONE `UPDATE`
+//! StackSet operation, whose `OperationId` it answers and which
+//! `DescribeStackSetOperation` monitors.
 //!
 //! ## Shape of an operation
 //!
@@ -198,6 +194,27 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::stack_sets::{
+    distinct, instance_status, operation_action, operation_id_already_exists,
+    parameters_with_overrides, refuse_oversized_parameters, refuse_oversized_selection,
+    region_does_not_exist, requested_targets, stack_set_has_no_template, unknown_target_region,
+    StoredAutoDeployment, StoredStackSetOperation,
+};
+use crate::state::StoredParameter;
+
+/// One stack instance this update rolls out over, as the read block hands it to the
+/// parameter resolution and then to the write that redeploys its stack.
+struct Selected {
+    /// The target account the instance belongs to.
+    account: String,
+    /// The target Region the instance's stack lives in.
+    region: String,
+    /// `ParameterOverrides`: "a list of parameters from the StackSet template whose values
+    /// have been overridden in this stack instance" — "during StackSet updates, any
+    /// parameters overridden for a stack instance aren't updated, but retain their
+    /// overridden value", so the revision is parameterised with them.
+    overrides: Vec<StoredParameter>,
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -272,18 +289,511 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateStackSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateStackSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateStackSet"))
+        // "Conditional: You must specify only one of the following parameters: TemplateBody
+        // or TemplateURL—or set UsePreviousTemplate to true." The RULE is the model's; no
+        // recording of this suite carries AWS's own sentence for the none/both cases, so the
+        // refusal states the condition the model documents, worded as `UpdateStack` words the
+        // same condition in this crate.
+        let template_sources = [
+            input.template_body.is_some(),
+            input.template_url.is_some(),
+            input.use_previous_template == Some(true),
+        ]
+        .into_iter()
+        .filter(|specified| *specified)
+        .count();
+        if template_sources != 1 {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::ONE_TEMPLATE_SOURCE,
+            ));
+        }
+        // A `TemplateURL` says WHERE the revised template is, not what it means: the object
+        // it addresses is read from this emulator's own Amazon S3 and becomes the body the
+        // StackSet carries, so a template submitted by reference and the same one submitted
+        // inline update the StackSet alike (`crate::state::template_url`).
+        let submitted_body = match (&input.template_body, &input.template_url) {
+            (Some(body), _) => Some(body.clone()),
+            (None, Some(url)) => Some(
+                crate::state::template_url::fetch(
+                    ctx,
+                    &crate::state::request_region(ctx.parts()),
+                    url,
+                )
+                .await
+                .map_err(crate::scaffolded::Scaffolded::validation_error)?,
+            ),
+            // "Use the existing template that's associated with the StackSet that you're
+            // updating": the revision's template is then the one the StackSet already holds.
+            (None, None) => None,
+        };
+        // "A list of input parameters for the StackSet template": a parameter the request
+        // supplies is a parameter of the template it is resolved against, so a list longer
+        // than a template can declare is refused HERE, before the store is read — the
+        // resolution below runs once per instance this update rolls out over, so the
+        // parameter count is a factor of its work.
+        refuse_oversized_parameters("Parameters", input.parameters.as_deref())
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        // A submitted body is held to the same rules every operation that takes one holds it
+        // to: the documented maximum, the acknowledgement a template declaring a macro or an
+        // IAM resource needs, the documented per-template quotas and the recognised resource
+        // types. Done BEFORE the store is read, so a template real AWS refuses outright
+        // never reaches a write.
+        if let Some(body) = &submitted_body {
+            crate::state::validate_template_body(body)
+                .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+            // "In some cases, you must explicitly acknowledge that your stack template
+            // contains certain capabilities in order for CloudFormation to update the
+            // StackSet and its associated stack instances."
+            let missing = crate::state::missing_auto_expand_capability(
+                body,
+                input.capabilities.as_deref().unwrap_or_default(),
+            );
+            if !missing.is_empty() {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::template::insufficient_capabilities_message(&missing),
+                ));
+            }
+            if let Some(message) = crate::state::insufficient_capabilities(
+                body,
+                input.capabilities.as_deref().unwrap_or_default(),
+            ) {
+                return Err(crate::scaffolded::Scaffolded::validation_error(message));
+            }
+            crate::state::validate_template_quotas(body)
+                .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+            crate::state::validate_resource_types(body)
+                .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        }
+
+        // "To update all the stack instances associated with this StackSet, don't specify
+        // the Accounts or Regions properties", and "if you specify accounts, you must also
+        // specify the Amazon Web Services Regions in which to update StackSet instances":
+        // the two go together, so a request naming one without the other selects nothing
+        // coherent and is refused. "You can specify Accounts or DeploymentTargets, but not
+        // both" is judged here too, before any stack set is resolved.
+        let regions = distinct(input.regions.clone().unwrap_or_default());
+        let names_targets = input.accounts.as_deref().is_some_and(|accounts| !accounts.is_empty())
+            || input.deployment_targets.is_some();
+        let targets = if names_targets {
+            Some(
+                requested_targets(input.accounts.as_deref(), input.deployment_targets.as_ref())
+                    .map_err(crate::scaffolded::Scaffolded::validation_error)?,
+            )
+        } else {
+            None
+        };
+        if targets.is_some() && regions.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "You must specify Regions when you specify Accounts or DeploymentTargets",
+            ));
+        }
+        if targets.is_none() && !regions.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "You must specify Accounts or DeploymentTargets when you specify Regions",
+            ));
+        }
+        // Every Region named has to be a Region that exists: an update targeting one that
+        // does not could never reach a stack, so the whole request is refused and no
+        // instance in the Regions beside it is updated either.
+        if let Some(unknown) = unknown_target_region(&regions) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                region_does_not_exist(unknown),
+            ));
+        }
+        // "If you specify accounts, you must also specify the Amazon Web Services Regions in
+        // which to update StackSet instances": the selection is the PRODUCT of the two
+        // caller-chosen lists, taken over their DISTINCT values, so a product past the
+        // ceiling one StackSet's instances are bounded by names more pairs than that StackSet
+        // can hold an instance for. Refused HERE, before the store is read at all, and
+        // re-asserted under the lock once the stack set has resolved what the targeting
+        // really selects — so neither an expanded target set nor a repeated value drives work
+        // under the store lock. The model declares no `LimitExceededException` for this
+        // operation, so the refusal is a bad request rather than a modelled quota failure.
+        refuse_oversized_selection(
+            targets
+                .as_ref()
+                .map(|targets| targets.accounts.len())
+                .unwrap_or_default(),
+            regions.len(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no StackSet store to update, so
+            // nothing was written and 501 is the only honest answer.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateStackSet",
+            ));
+        };
+        // "The Amazon Resource Name (ARN) of the IAM role to use to update this StackSet" —
+        // a role whose trust policy does not let CloudFormation assume it is one no StackSet
+        // operation could ever run under, so the request is refused before anything is
+        // written, exactly as `CreateStackSet` refuses one.
+        crate::state::refuse_unassumable_role(
+            &*self.engine,
+            input.administration_role_arn.as_deref(),
+        )?;
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        // "The operation ID also functions as an idempotency token": the caller's when it
+        // named one, otherwise the one CloudFormation assigns the operation.
+        let operation_id = input
+            .operation_id
+            .clone()
+            .unwrap_or_else(crate::state::new_operation_id);
+
+        // What the StackSet is now, read under a short lock so the caller-sized template is
+        // processed below it rather than while every other CloudFormation request waits.
+        let (
+            stack_set_id,
+            selected,
+            template_body,
+            previous_template,
+            previous_parameters,
+            parameters,
+        ) = {
+            let mut store = state.lock();
+            store.settle(now);
+            let stack_set = store
+                .resolve_stack_set(&region, &input.stack_set_name)
+                .ok_or_else(|| {
+                    UpdateStackSetErrorModeled::StackSetNotFoundException(
+                        StackSetNotFoundException {
+                            message: Some(crate::state::stack_set_does_not_exist(
+                                &input.stack_set_name,
+                            )),
+                        },
+                    )
+                })?;
+            // Which accounts this targeting really selects for THIS stack set: the
+            // permission model the stack set carries is what says whether organizational
+            // units are targets of it at all.
+            let accounts = targets
+                .as_ref()
+                .map(|targets| targets.accounts_in(stack_set))
+                .transpose()
+                .map_err(|refusal| refusal.refuse("UpdateStackSet"))?;
+            // Re-asserted over what the targeting REALLY selects for this stack set: the
+            // product the loop below walks is this one, not the request's literal list.
+            refuse_oversized_selection(
+                accounts.as_ref().map(Vec::len).unwrap_or_default(),
+                regions.len(),
+            )
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+            // "Only one operation can be performed for a stack set at a given time": the
+            // refusal names the StackSet it is about and the operation that still holds it. A
+            // mutation arriving while a prior operation runs is REFUSED, never queued.
+            if let Some(in_flight) = stack_set.operation_in_flight() {
+                return Err(
+                    UpdateStackSetErrorModeled::OperationInProgressException(
+                        OperationInProgressException {
+                            message: Some(
+                                crate::state::stack_sets::operation_in_progress_message(
+                                    &stack_set.stack_set_arn,
+                                    &in_flight.operation_id,
+                                ),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // "The specified operation ID already exists": the same id names the operation
+            // that already ran, so this request is not performed a second time.
+            if stack_set.operation(&operation_id).is_some() {
+                return Err(
+                    UpdateStackSetErrorModeled::OperationIdAlreadyExistsException(
+                        OperationIdAlreadyExistsException {
+                            message: Some(operation_id_already_exists(&operation_id)),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // "You cannot modify PermissionModel if there are stack instances associated
+            // with your stack set": the instances were deployed through the roles that model
+            // provides, so the modelled `InvalidOperationException` rather than a StackSet
+            // whose instances no model accounts for.
+            if input
+                .permission_model
+                .as_ref()
+                .is_some_and(|model| *model != stack_set.permission_model)
+                && !stack_set.instances.is_empty()
+            {
+                return Err(UpdateStackSetErrorModeled::InvalidOperationException(
+                    InvalidOperationException {
+                        message: Some(format!(
+                            "StackSet {} has stack instances associated with it, so its \
+                             PermissionModel cannot be modified",
+                            stack_set.stack_set_name
+                        )),
+                    },
+                )
+                .into());
+            }
+            // The template this update puts in force: the submitted body, or the one the
+            // StackSet already holds. "The specified operation isn't valid": a StackSet with
+            // no template at all declares nothing for an instance to deploy.
+            let template_body = match (&submitted_body, &stack_set.template_body) {
+                (Some(body), _) => body.clone(),
+                (None, Some(held)) => held.clone(),
+                (None, None) => {
+                    return Err(UpdateStackSetErrorModeled::InvalidOperationException(
+                        InvalidOperationException {
+                            message: Some(stack_set_has_no_template(&stack_set.stack_set_name)),
+                        },
+                    )
+                    .into())
+                }
+            };
+            // "A list of input parameters for the StackSet template": each entry carries a
+            // new value or asks (`UsePreviousValue`) for the one the StackSet is already
+            // using, exactly as a stack's update resolves them.
+            let parameters =
+                crate::state::merged_parameters(&stack_set.parameters, input.parameters.as_deref())
+                    .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+            // The instances this update rolls out over: the pairs the request selects, or —
+            // for a request that selects none — every instance the StackSet holds. A
+            // selected pair the StackSet holds no instance for is the modelled
+            // `StackInstanceNotFoundException`.
+            let mut selected: Vec<Selected> = Vec::new();
+            match &accounts {
+                Some(accounts) => {
+                    for account in accounts {
+                        for target_region in &regions {
+                            let instance =
+                                stack_set.instance(account, target_region).ok_or_else(|| {
+                                    UpdateStackSetErrorModeled::StackInstanceNotFoundException(
+                                        StackInstanceNotFoundException {
+                                            message: Some(
+                                                crate::state::stack_instance_does_not_exist(
+                                                    account,
+                                                    target_region,
+                                                ),
+                                            ),
+                                        },
+                                    )
+                                })?;
+                            selected.push(Selected {
+                                account: account.clone(),
+                                region: target_region.clone(),
+                                overrides: instance.parameter_overrides.clone(),
+                            });
+                        }
+                    }
+                }
+                None => {
+                    selected.extend(stack_set.instances.iter().map(|instance| Selected {
+                        account: instance.account.clone(),
+                        region: instance.region.clone(),
+                        overrides: instance.parameter_overrides.clone(),
+                    }));
+                }
+            }
+            (
+                stack_set.stack_set_id.clone(),
+                selected,
+                template_body,
+                stack_set.template_body.clone(),
+                stack_set.parameters.clone(),
+                parameters,
+            )
+        };
+
+        // Applying the template's transforms is caller-sized work, so it happens HERE,
+        // between the locks, and once for every instance this update redeploys.
+        let processed_template = crate::state::template::process(&template_body);
+        // What the StackSet reports as `Parameters` once this update is in force: the values
+        // the request resolved, plus the template's own `Default` for a declared parameter
+        // it passed none for — the same resolution a stack's parameters go through.
+        let set_parameters = crate::state::parameters_in_force(&template_body, parameters);
+        // "If the StackSet update includes changes to the template [...] or the Parameters
+        // property, CloudFormation marks all stack instances with a status of OUTDATED prior
+        // to updating the stack instances in the specified accounts and Regions."
+        let revision_changed = previous_template.as_deref() != Some(template_body.as_str())
+            || previous_parameters != set_parameters;
+        // Each selected instance's own parameters: the StackSet's, with the overrides that
+        // instance carries applied, resolved against the template now in force.
+        let rollout: Vec<(Selected, Vec<StoredParameter>)> = selected
+            .into_iter()
+            .map(|instance| {
+                let in_force = crate::state::parameters_in_force(
+                    &template_body,
+                    parameters_with_overrides(&set_parameters, &instance.overrides),
+                );
+                (instance, in_force)
+            })
+            .collect();
+
+        // The StackSet's new configuration, the instances' redeployments and the operation
+        // this call started: one write block, re-asserting under the WRITING lock what the
+        // read block decided, since the guard above ran in a different critical section.
+        let mut rollouts: Vec<crate::state::stack_set_rollout::Rollout> = Vec::new();
+        {
+            let mut store = state.lock();
+            // Re-asserted under the WRITING lock rather than trusted from the read above:
+            // between the two another request may have taken the stack set away, or started
+            // an operation of its own on it — and only one operation may be in flight.
+            let Some(stack_set) = store.resolve_stack_set_mut(&region, &stack_set_id) else {
+                return Err(UpdateStackSetErrorModeled::StackSetNotFoundException(
+                    StackSetNotFoundException {
+                        message: Some(crate::state::stack_set_does_not_exist(
+                            &input.stack_set_name,
+                        )),
+                    },
+                )
+                .into());
+            };
+            if let Some(in_flight) = stack_set.operation_in_flight() {
+                return Err(
+                    UpdateStackSetErrorModeled::OperationInProgressException(
+                        OperationInProgressException {
+                            message: Some(
+                                crate::state::stack_sets::operation_in_progress_message(
+                                    &stack_set.stack_set_arn,
+                                    &in_flight.operation_id,
+                                ),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // "Even if the StackSet operation created by updating the StackSet fails [...]
+            // the StackSet is updated with your changes. Subsequent CreateStackInstances
+            // calls on the specified StackSet use the updated StackSet." A member the
+            // request restates replaces what the StackSet held; one it does not state leaves
+            // that configuration alone.
+            stack_set.template_body = Some(template_body.clone());
+            stack_set.parameters = set_parameters.clone();
+            if let Some(description) = &input.description {
+                stack_set.description = Some(description.clone());
+            }
+            if let Some(capabilities) = &input.capabilities {
+                stack_set.capabilities = capabilities.clone();
+            }
+            // "If you specify tags for this parameter, those tags replace any list of tags
+            // that are currently associated with this StackSet [...] If you don't specify
+            // this parameter, CloudFormation doesn't modify the stack's tags."
+            if let Some(tags) = &input.tags {
+                stack_set.tags = crate::state::stored_tags(tags);
+            }
+            if let Some(administration_role_arn) = &input.administration_role_arn {
+                stack_set.administration_role_arn = Some(administration_role_arn.clone());
+            }
+            if let Some(execution_role_name) = &input.execution_role_name {
+                stack_set.execution_role_name = Some(execution_role_name.clone());
+            }
+            if let Some(permission_model) = &input.permission_model {
+                stack_set.permission_model = permission_model.clone();
+            }
+            if let Some(auto_deployment) = &input.auto_deployment {
+                stack_set.auto_deployment = Some(StoredAutoDeployment {
+                    enabled: auto_deployment.enabled,
+                    retain_stacks_on_account_removal: auto_deployment
+                        .retain_stacks_on_account_removal,
+                    depends_on: auto_deployment.depends_on.clone().unwrap_or_default(),
+                });
+            }
+            if let Some(active) = input
+                .managed_execution
+                .as_ref()
+                .and_then(|managed_execution| managed_execution.active)
+            {
+                stack_set.managed_execution_active = active;
+            }
+            // An instance this update does NOT roll out over is no longer up to date with
+            // the StackSet once its revision changed: "OUTDATED: The stack isn't currently
+            // up to date with the StackSet."
+            if revision_changed {
+                for instance in &mut stack_set.instances {
+                    if rollout
+                        .iter()
+                        .any(|(held, _)| held.account == instance.account
+                            && held.region == instance.region)
+                    {
+                        continue;
+                    }
+                    instance.status = instance_status::OUTDATED.to_string();
+                }
+            }
+            let capabilities = stack_set.capabilities.clone();
+            let tags = stack_set.tags.clone();
+            let administration_role_arn = stack_set.administration_role_arn.clone();
+            let execution_role_name = stack_set.execution_role_name.clone();
+            // What a `Fn::ImportValue` in the template resolves against, per TARGET Region:
+            // an instance's template resolves its imports against the Region the instance is
+            // deployed IN, the way any other stack of that Region does.
+            let exports_by_region: ::std::collections::BTreeMap<
+                String,
+                ::std::collections::BTreeMap<String, String>,
+            > = rollout
+                .iter()
+                .map(|(instance, _)| {
+                    (
+                        instance.region.clone(),
+                        store.exported_values(&instance.region),
+                    )
+                })
+                .collect();
+            let no_exports = ::std::collections::BTreeMap::new();
+            for (instance, in_force) in &rollout {
+                let revision = crate::state::stack_set_rollout::Revision {
+                    template_body: &template_body,
+                    processed_template: &processed_template,
+                    parameters: in_force,
+                    capabilities: &capabilities,
+                    tags: &tags,
+                    exports: exports_by_region
+                        .get(&instance.region)
+                        .unwrap_or(&no_exports),
+                };
+                rollouts.extend(crate::state::stack_set_rollout::redeploy(
+                    &mut store,
+                    &crate::state::stack_set_rollout::Redeploying {
+                        stack_set_region: &region,
+                        stack_set_id: &stack_set_id,
+                        operation_id: &operation_id,
+                        account: &instance.account,
+                        region: &instance.region,
+                        now,
+                        revision,
+                    },
+                ));
+            }
+            // The operation this call started, which `DescribeStackSetOperation` monitors:
+            // RUNNING now, SUCCEEDED once the clock makes its conclusion due — and that
+            // conclusion is what leaves the updated instances up to date with the StackSet.
+            if let Some(stack_set) = store.resolve_stack_set_mut(&region, &stack_set_id) {
+                let mut operation = StoredStackSetOperation::running(
+                    operation_id.clone(),
+                    operation_action::UPDATE,
+                    now,
+                );
+                operation.preferences = input
+                    .operation_preferences
+                    .as_ref()
+                    .map(crate::state::stack_sets::stored_preferences);
+                operation.administration_role_arn = administration_role_arn;
+                operation.execution_role_name = execution_role_name;
+                stack_set.record_operation(operation);
+            }
+        }
+
+        // Each instance's resources are brought into step in the services that own them, in
+        // the instance's own Region, with the store unlocked — every one of those calls
+        // reaches another service's handler, which takes that service's lock.
+        let failed = crate::state::stack_set_rollout::apply(ctx, &state, rollouts).await;
+        crate::state::stack_set_rollout::record_failures(
+            &mut state.lock(),
+            &region,
+            &stack_set_id,
+            &operation_id,
+            &failed,
+        );
+
+        Ok(UpdateStackSetOutput {
+            operation_id: Some(operation_id),
+        })
     }
 }
