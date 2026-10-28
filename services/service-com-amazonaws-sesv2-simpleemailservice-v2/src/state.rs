@@ -2905,6 +2905,35 @@ pub const MANAGED_WARMUP_PERCENTAGE: i32 = -1;
 /// fully warmed up and ready for use."
 pub const WARMUP_COMPLETE_PERCENTAGE: i32 = 100;
 
+/// The `WarmupPercentage` of a dedicated IP whose warm-up has not got anywhere.
+///
+/// The low end of the `0-100` range `DedicatedIp$WarmupPercentage` documents for a
+/// standard dedicated IP, where the member "shows the warm-up completion percentage".
+pub const WARMUP_START_PERCENTAGE: i32 = 0;
+
+/// Whether `percentage` is a warm-up percentage a request may associate with a
+/// dedicated IP address.
+///
+/// `Percentage100Wrapper` is a plain integer in the model, so the bound is the one
+/// `DedicatedIp$WarmupPercentage` documents for a standard dedicated IP:
+/// [`WARMUP_START_PERCENTAGE`]..=[`WARMUP_COMPLETE_PERCENTAGE`]. The one value outside
+/// it the member documents, [`MANAGED_WARMUP_PERCENTAGE`], is what SES reports for an
+/// address whose warm-up it handles itself, never a progress a caller sets.
+pub fn warmup_percentage_can_be_set(percentage: i32) -> bool {
+    (WARMUP_START_PERCENTAGE..=WARMUP_COMPLETE_PERCENTAGE).contains(&percentage)
+}
+
+/// How this service words `BadRequestException` for a `WarmupPercentage` outside the
+/// range [`warmup_percentage_can_be_set`] accepts.
+///
+/// The sentence names the bounds themselves rather than the number the request carried,
+/// so it reads the same for every value it refuses.
+pub fn invalid_warmup_percentage() -> String {
+    format!(
+        "Warmup Percentage must be between {WARMUP_START_PERCENTAGE} and {WARMUP_COMPLETE_PERCENTAGE}."
+    )
+}
+
 /// One dedicated IP address the account holds: the pool it is in and how far its
 /// warm-up has got.
 ///
@@ -3833,6 +3862,9 @@ pub const TENANTS_PAGE_TOKEN_TAG: &str = "sesv2:tenants:";
 
 /// The tag `ListDedicatedIpPools`'s own tokens carry.
 pub const DEDICATED_IP_POOLS_PAGE_TOKEN_TAG: &str = "sesv2:dedicated-ip-pools:";
+
+/// The tag `GetDedicatedIps`'s own tokens carry.
+pub const DEDICATED_IPS_PAGE_TOKEN_TAG: &str = "sesv2:dedicated-ips:";
 
 /// The tag `ListExportJobs`'s own tokens carry.
 pub const EXPORT_JOBS_PAGE_TOKEN_TAG: &str = "sesv2:export-jobs:";
