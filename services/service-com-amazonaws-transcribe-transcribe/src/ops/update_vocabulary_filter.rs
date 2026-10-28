@@ -196,18 +196,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let region = crate::state::request_region(ctx.parts());
+
         // Same pair of alternatives as the create, and the same handling: "You can use
-        // Words or VocabularyFilterFileUri, but you can't use both." Either source is
-        // recorded; only the refusals for naming neither or both remain.
+        // Words or VocabularyFilterFileUri, but you can't use both." Either source
+        // gives the words the rebuild holds; only the refusals for naming neither or
+        // both remain.
         let (words, file_uri) = match crate::state::content_source(
             input.words.as_deref(),
             input.vocabulary_filter_file_uri.as_deref(),
         ) {
             crate::state::ContentSource::Inline(words) => (words.to_vec(), None),
-            // Recorded, not read, exactly as on the create: this emulator reads no
-            // object store and makes no outbound request, so no words are loaded and
-            // the rebuilt filter reports no file of its own to download.
-            crate::state::ContentSource::File(uri) => (Vec::new(), Some(uri.to_string())),
+            // READ before anything is written, exactly as on the create: the file is an
+            // object of this emulator's own Amazon S3
+            // (`crate::state::resolve_vocabulary_file`).
+            crate::state::ContentSource::File(uri) => {
+                let verdict = crate::state::resolve_vocabulary_file(
+                    ctx,
+                    &region,
+                    crate::state::VOCABULARY_FILTER_FILE_MEMBER,
+                    uri,
+                )
+                .await;
+                match verdict.into_build() {
+                    Ok((words, _)) => (words, Some(uri.to_string())),
+                    Err(bytes) => {
+                        return Err(UpdateVocabularyFilterErrorModeled::LimitExceededException(
+                            LimitExceededException {
+                                message: Some(crate::state::vocabulary_file_too_large_message(
+                                    crate::state::VOCABULARY_FILTER_FILE_MEMBER,
+                                    uri,
+                                    bytes,
+                                    crate::state::KIND_VOCABULARY_FILTER,
+                                )),
+                            },
+                        )
+                        .into())
+                    }
+                }
+            }
             crate::state::ContentSource::Neither => {
                 return Err(bad_request(
                     "Your request must include either Words or VocabularyFilterFileUri. Add \
@@ -235,7 +262,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
-        let region = crate::state::request_region(ctx.parts());
         // The guard is SCOPED: the store lock is released before this handler awaits
         // the write of the file the filter's `DownloadUri` names, which is a call out to
         // another emulated service and reaches none of this state.
@@ -285,9 +311,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The new list you provide overwrites all previous entries": the file this
         // filter's `DownloadUri` names is rewritten from the words just recorded, so
-        // that location serves the filter's CURRENT words. A rebuild whose words were
-        // to be read from a caller-named file has none, which withdraws the file the
-        // previous build left (`crate::state::store_vocabulary_content`).
+        // that location serves the filter's CURRENT words. A rebuild whose file the
+        // object store did not serve has none, which withdraws the file the previous
+        // build left (`crate::state::store_vocabulary_content`).
         crate::state::store_vocabulary_content(
             ctx,
             &region,

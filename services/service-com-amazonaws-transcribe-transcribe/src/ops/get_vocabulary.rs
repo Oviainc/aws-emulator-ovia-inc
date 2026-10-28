@@ -210,9 +210,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             failure_reason: record.failure_reason.clone(),
             // Where the BUILT vocabulary lives, so only one whose build has FINISHED
             // carries it: the member is absent while the service is still processing
-            // the terms and absent after a build that failed, which is every
-            // vocabulary whose terms would have had to be read from a file nothing
-            // read (`crate::state::VocabularyRecord::download_uri`). A reported
+            // the terms and absent after a build that failed, which is a vocabulary
+            // whose file the object store did not serve
+            // (`crate::state::VocabularyRecord::download_uri`). A reported
             // location IS served: the create or update that supplied the terms wrote
             // them as the text file there (`crate::state::store_vocabulary_content`),
             // so a client reads the terms back by fetching it. This answer itself

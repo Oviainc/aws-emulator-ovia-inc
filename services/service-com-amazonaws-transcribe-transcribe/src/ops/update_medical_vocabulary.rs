@@ -178,9 +178,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ///
     /// As on the create, the terms themselves can only come from the file at
     /// `VocabularyFileUri`, which this operation models `@required` with no inline
-    /// alternative; reading it is work this emulator cannot perform, so the rebuild
-    /// ends in the service's own modelled `FAILED` state with a `FailureReason` (see
-    /// [`crate::state::MedicalVocabularyRecord`]).
+    /// alternative: the rebuild READS that file from this emulator's own Amazon S3
+    /// ([`crate::state::resolve_vocabulary_file`]), so it settles `READY` for a file
+    /// the object store serves and `FAILED` with a grounded `FailureReason` only for
+    /// one it does not (see [`crate::state::MedicalVocabularyRecord`]).
     async fn handle(
         &self,
         input: Self::Input,
@@ -212,68 +213,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
-        let mut store = state.lock();
-        let Some(existing) = store.medical_vocabulary_mut(&region, &input.vocabulary_name, now)
-        else {
-            // A medical vocabulary this Region does not hold is this service's
-            // `BadRequestException`, as it is for `GetMedicalVocabulary` and
-            // `UpdateVocabulary`: the shape whose own documentation covers an entity
-            // that "doesn't exist", and the one this service's recorded not-found
-            // responses carry — not the modelled `NotFoundException`.
-            return Err(bad_request(&crate::state::not_found_message(
-                crate::state::KIND_MEDICAL_VOCABULARY,
-            )));
+        // The table file the rebuild is to read, read the same way the create reads it.
+        let verdict = crate::state::resolve_vocabulary_file(
+            ctx,
+            &region,
+            crate::state::VOCABULARY_FILE_MEMBER,
+            &input.vocabulary_file_uri,
+        )
+        .await;
+        let (terms, failure_due) = match verdict.into_build() {
+            Ok(build) => build,
+            Err(bytes) => {
+                return Err(UpdateMedicalVocabularyErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(crate::state::vocabulary_file_too_large_message(
+                            crate::state::VOCABULARY_FILE_MEMBER,
+                            &input.vocabulary_file_uri,
+                            bytes,
+                            crate::state::KIND_MEDICAL_VOCABULARY,
+                        )),
+                    },
+                )
+                .into())
+            }
         };
 
-        // A build the service is still running is not overwritten: the same rule, and
-        // the same records, as `DeleteMedicalVocabulary`'s own state refusal — "Your
-        // request didn't pass one or more validation tests. This can occur when the
-        // entity you're trying to delete doesn't exist or if it's in a non-terminal
-        // state" (`BadRequestException`'s own documentation). The lookup above
-        // materialised the transition the clock already owed the record, so only a
-        // build that is genuinely still running is refused.
-        if !crate::state::is_terminal_vocabulary_state(&existing.state) {
-            let refusal = crate::state::resource_not_updatable_message(
-                crate::state::KIND_MEDICAL_VOCABULARY,
-                &existing.name,
-                &existing.state,
+        let now = ::std::time::SystemTime::now();
+        // The guard is SCOPED: the store lock is released before this handler awaits
+        // the write of the file the vocabulary's `DownloadUri` names, which is a call
+        // out to another emulated service and reaches none of this state.
+        let (output, name, content) = {
+            let mut store = state.lock();
+            let Some(existing) = store.medical_vocabulary_mut(&region, &input.vocabulary_name, now)
+            else {
+                // A medical vocabulary this Region does not hold is this service's
+                // `BadRequestException`, as it is for `GetMedicalVocabulary` and
+                // `UpdateVocabulary`: the shape whose own documentation covers an entity
+                // that "doesn't exist", and the one this service's recorded not-found
+                // responses carry — not the modelled `NotFoundException`.
+                return Err(bad_request(&crate::state::not_found_message(
+                    crate::state::KIND_MEDICAL_VOCABULARY,
+                )));
+            };
+
+            // A build the service is still running is not overwritten: the same rule, and
+            // the same records, as `DeleteMedicalVocabulary`'s own state refusal — "Your
+            // request didn't pass one or more validation tests. This can occur when the
+            // entity you're trying to delete doesn't exist or if it's in a non-terminal
+            // state" (`BadRequestException`'s own documentation). The lookup above
+            // materialised the transition the clock already owed the record, so only a
+            // build that is genuinely still running is refused.
+            if !crate::state::is_terminal_vocabulary_state(&existing.state) {
+                let refusal = crate::state::resource_not_updatable_message(
+                    crate::state::KIND_MEDICAL_VOCABULARY,
+                    &existing.name,
+                    &existing.state,
+                );
+                return Err(bad_request(&refusal));
+            }
+
+            // The replacement record, built through the family's own `PENDING`
+            // constructor so the create and this update cannot disagree about the
+            // invariant that a `PENDING` record carries the instant its transition falls
+            // due. The Region a resource lives in is fixed when it is created — it is
+            // half of the record's key — so an update reaches only its own Region's
+            // resource and never migrates one.
+            let record = crate::state::MedicalVocabularyRecord::pending(
+                existing.name.clone(),
+                existing.sequence,
+                input.language_code,
+                input.vocabulary_file_uri,
+                terms,
+                failure_due,
+                existing.region.clone(),
+                existing.tags.clone(),
+                now,
             );
-            return Err(bad_request(&refusal));
-        }
 
-        // The replacement record, built through the family's own `PENDING`
-        // constructor so the create and this update cannot disagree about the
-        // invariant that a `PENDING` record carries the instant its transition falls
-        // due. The Region a resource lives in is fixed when it is created — it is
-        // half of the record's key — so an update reaches only its own Region's
-        // resource and never migrates one.
-        let record = crate::state::MedicalVocabularyRecord::pending(
-            existing.name.clone(),
-            existing.sequence,
-            input.language_code,
-            input.vocabulary_file_uri,
-            existing.region.clone(),
-            existing.tags.clone(),
-            now,
-        );
-
-        // The response is the record just stored, never the request echoed back.
-        let output = UpdateMedicalVocabularyOutput {
-            vocabulary_name: Some(record.name.clone()),
-            language_code: Some(record.language_code.clone()),
-            last_modified_time: Some(crate::state::to_date_time(record.last_modified_time)),
-            vocabulary_state: Some(record.state.clone()),
+            // The response is the record just stored, never the request echoed back.
+            let output = UpdateMedicalVocabularyOutput {
+                vocabulary_name: Some(record.name.clone()),
+                language_code: Some(record.language_code.clone()),
+                last_modified_time: Some(crate::state::to_date_time(record.last_modified_time)),
+                vocabulary_state: Some(record.state.clone()),
+            };
+            ::tracing::info!(
+                operation = "UpdateMedicalVocabulary",
+                vocabulary = %record.name,
+                state = %record.state,
+                terms = record.terms.len(),
+                "custom medical vocabulary overwritten"
+            );
+            let name = record.name.clone();
+            // The terms the rebuild has to store, taken from the record rather than from
+            // the file that was read: what is served is what was persisted.
+            let content = record.terms.clone();
+            store.medical_vocabularies.insert(&region, &name, record);
+            (output, name, content)
         };
-        ::tracing::info!(
-            operation = "UpdateMedicalVocabulary",
-            vocabulary = %record.name,
-            state = %record.state,
-            "custom medical vocabulary overwritten; its file is not read"
-        );
-        let name = record.name.clone();
-        store.medical_vocabularies.insert(&region, &name, record);
+
+        // "This operation overwrites all existing information with your new values":
+        // the file this vocabulary's `DownloadUri` names is rewritten from the terms
+        // just recorded, so that location serves the vocabulary's CURRENT terms. A
+        // rebuild whose file the object store did not serve has none, which withdraws
+        // the file the previous build left
+        // (`crate::state::store_vocabulary_content`).
+        crate::state::store_vocabulary_content(
+            ctx,
+            &region,
+            crate::state::RESOURCE_TYPE_MEDICAL_VOCABULARY,
+            &name,
+            &content,
+        )
+        .await;
 
         Ok(output)
     }

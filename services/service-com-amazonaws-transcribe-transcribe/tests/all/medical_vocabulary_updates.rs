@@ -18,9 +18,11 @@
 //!
 //! WHERE THE REBUILD LANDS: a medical vocabulary's terms can only come from the
 //! table file at `VocabularyFileUri`, which this operation models `@required` with no
-//! inline alternative, and this emulator reads no object store — so the rebuild ends
-//! in the service's own modelled `FAILED` state with a `FailureReason` naming the
-//! file the UPDATE gave, never the one it replaced.
+//! inline alternative, and no Amazon S3 is mounted beside the service in this suite,
+//! so no file any row names is served — the rebuild therefore ends in the service's
+//! own modelled `FAILED` state with a `FailureReason` naming the file the UPDATE gave,
+//! never the one it replaced. A rebuild from a file the object store DOES serve is
+//! `crate::vocabulary_file_objects`' subject.
 //!
 //! What this suite pins that `crate::medical_vocabularies` does not: the family's
 //! update path. The create's own form, the listing, the paging and the tagging
@@ -216,7 +218,8 @@ async fn an_update_overwrites_the_stored_medical_vocabulary() {
         }
 
         // The rebuild the update started settles the same way the create's did, on the
-        // file the UPDATE named: nothing read it, so there is still nothing to download.
+        // file the UPDATE named: no object store served it, so there is still nothing
+        // to download.
         std::thread::sleep(PAST_THE_TRANSITION);
         let settled = transcribe
             .call("GetMedicalVocabulary", json!({"VocabularyName": row.name}))
@@ -225,8 +228,8 @@ async fn an_update_overwrites_the_stored_medical_vocabulary() {
         assert_eq!(
             settled.member(case, "VocabularyState"),
             "FAILED",
-            "case {case:?}: a medical vocabulary whose file is never read must end \
-             FAILED, got {:?}",
+            "case {case:?}: a medical vocabulary whose file no object store served \
+             must end FAILED, got {:?}",
             settled.body
         );
         let reason = settled.member(case, "FailureReason");

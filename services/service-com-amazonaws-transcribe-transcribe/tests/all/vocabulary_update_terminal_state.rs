@@ -100,9 +100,9 @@ impl Source {
     }
 
     /// The terminal state a build from this source settles in: a vocabulary built from
-    /// the terms the request listed is `READY`, while one whose terms would have had to
-    /// be READ from a file ends `FAILED` — this emulator reads no object store, so
-    /// nothing built it.
+    /// the terms the request listed is `READY`, while one whose terms were to be READ
+    /// from a file ends `FAILED` — no Amazon S3 is mounted beside the service in this
+    /// suite, so nothing serves the file and nothing loaded its terms.
     fn settles(self) -> &'static str {
         match self {
             Source::Inline(_) => "READY",
