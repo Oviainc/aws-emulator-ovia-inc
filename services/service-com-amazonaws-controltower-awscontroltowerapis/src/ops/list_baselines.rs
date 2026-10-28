@@ -170,40 +170,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let catalog = crate::state::BASELINE_CATALOG;
 
-        // The token is the index of the first entry the previous page did not return,
-        // over the catalog's published order — the one order this operation lists in.
-        let start = match input.next_token.as_deref() {
-            None | Some("") => 0usize,
-            Some(token) => match token.parse::<usize>() {
-                Ok(index) if index <= catalog.len() => index,
-                _ => {
-                    return Err(ListBaselinesErrorModeled::ValidationException(
-                        ValidationException {
-                            message: format!(
-                                "nextToken {token} was not returned by a previous \
-                                 ListBaselines call"
-                            ),
-                        },
-                    )
-                    .into())
-                }
-            },
-        };
-
-        // `maxResults` is modelled `range 4..100`, so the front door has already refused
-        // anything outside it; absent, every remaining entry is returned. The floor of 1
-        // keeps a page from being empty-but-tokened should the model ever widen the range
-        // downwards.
-        let limit = input
-            .max_results
-            .map_or(catalog.len(), |max| max.max(1) as usize);
-        let end = start.saturating_add(limit).min(catalog.len());
+        // The page the call asks for, cut out by this crate's one pagination rule: the
+        // token is the index of the first entry the previous page did not return, over the
+        // catalog's published order — the one order this operation lists in, so the token
+        // means the same to every call. `maxResults` is modelled `range 4..100`, so the
+        // front door has already refused anything outside it.
+        let (page, next_token) = crate::state::page(
+            Self::NAME,
+            crate::state::TokenScope::WholeListing,
+            input.next_token.as_deref(),
+            input.max_results,
+            catalog,
+        )
+        .map_err(|message| {
+            ListBaselinesErrorModeled::ValidationException(ValidationException { message })
+        })?;
 
         // The region the entries' ARNs are served in is the request's, read once rather
         // than per entry.
         let region = crate::state::request_region(ctx.parts());
 
-        let baselines: Vec<BaselineSummary> = catalog[start..end]
+        let baselines: Vec<BaselineSummary> = page
             .iter()
             .map(|baseline| BaselineSummary {
                 arn: crate::state::baseline_arn(&region, baseline.id),
@@ -214,7 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(ListBaselinesOutput {
             baselines,
-            next_token: (end < catalog.len()).then(|| end.to_string()),
+            next_token,
         })
     }
 }

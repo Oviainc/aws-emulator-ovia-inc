@@ -221,40 +221,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .then_with(|| left.operation_identifier.cmp(&right.operation_identifier))
         });
 
-        // The token this operation hands out is the index of the next unreturned record,
-        // so it is only meaningful against a call carrying the same filter, which is what
-        // `nextToken` is documented to require.
-        let start = match input.next_token.as_deref() {
-            None | Some("") => 0usize,
-            Some(token) => match token.parse::<usize>() {
-                Ok(index) if index <= records.len() => index,
-                _ => {
-                    return Err(ListLandingZoneOperationsErrorModeled::ValidationException(
-                        ValidationException {
-                            message: format!(
-                                "nextToken {token} was not returned by a previous \
-                                 ListLandingZoneOperations call with these parameters"
-                            ),
-                        },
-                    )
-                    .into())
-                }
-            },
-        };
-
-        // `maxResults` is modelled `range 1..100`, so the front door has already refused
-        // anything outside it; absent, every remaining record is returned.
-        let limit = input
-            .max_results
-            .map_or(records.len(), |max| max.max(1) as usize);
-        let end = start.saturating_add(limit).min(records.len());
+        // The page the call asks for, cut out by this crate's one pagination rule: the
+        // token is the index of the next unreturned record, so it is only meaningful
+        // against a call carrying the same filter, which is what `nextToken` is documented
+        // to require. `maxResults` is modelled `range 1..100`, so the front door has
+        // already refused anything outside it.
+        let (page, next_token) = crate::state::page(
+            Self::NAME,
+            crate::state::TokenScope::SameParameters,
+            input.next_token.as_deref(),
+            input.max_results,
+            &records,
+        )
+        .map_err(|message| {
+            ListLandingZoneOperationsErrorModeled::ValidationException(ValidationException {
+                message,
+            })
+        })?;
 
         Ok(ListLandingZoneOperationsOutput {
-            landing_zone_operations: records[start..end]
-                .iter()
-                .map(|record| summary(record))
-                .collect(),
-            next_token: (end < records.len()).then(|| end.to_string()),
+            landing_zone_operations: page.iter().map(|record| summary(record)).collect(),
+            next_token,
         })
     }
 }
