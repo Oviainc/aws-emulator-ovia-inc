@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateExportJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateExportJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateExportJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates an export job for a data source and destination, and stores it: the job
+//! this mints is what every read of the account's export jobs reports
+//! ([`crate::state::ExportJobRecord`]), and the `JobId` it answers with is the only
+//! name the job has. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +146,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateExportJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateExportJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateExportJob"))
+        // An export job belongs to the account rather than to a Region-scoped
+        // resource, so no request metadata is needed — the same reading this
+        // service's other export-job operations take.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // No store at all, which is not a modelled SES state: answer the scaffold's
+            // 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateExportJob without the shared emulator state",
+            ));
+        };
+
+        // `ExportDataSource` "can only contain one of MetricsDataSource or
+        // MessageInsightsDataSource object", and which one it carries is what the
+        // job's `ExportSourceType` is. Both members are optional in the model, so a
+        // request naming neither — or both — reaches here and is refused: there is no
+        // one source for the export to draw on.
+        let Some(source_type) = crate::state::export_source_type(&input.export_data_source) else {
+            return Err(bad_request(crate::state::invalid_export_data_source()));
+        };
+
+        // `ExportDestination$S3Url`: "SES sets this value. It's returned only in the
+        // GetExportJob response... If you include this field in a CreateExportJob
+        // request, the request fails with a BadRequestException."
+        if input.export_destination.s3_url.is_some() {
+            return Err(bad_request(
+                crate::state::export_destination_s3_url_is_set_by_ses(),
+            ));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Whatever progress the stored runs had already made at `now` was due whether
+        // or not anybody called, so materialising it changes nothing a later caller
+        // would otherwise have seen.
+        store.settle(now);
+
+        // "There are too many instances of the specified resource type"
+        // (`LimitExceededException`): the store holds all the export jobs it may, so
+        // another create is refused rather than growing it without end.
+        if store.export_jobs.len() >= crate::state::MAX_EXPORT_JOBS {
+            return Err(CreateExportJobErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The account already holds the maximum of {} export jobs.",
+                        crate::state::MAX_EXPORT_JOBS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let job_id = store.next_export_job_id(now);
+        let mut record =
+            crate::state::ExportJobRecord::new(job_id.clone(), source_type, now);
+        // "Export jobs run asynchronously": the request's data source and data format
+        // are what the run draws on and writes, so they are stored with the job and
+        // read back from it rather than recomputed.
+        record.data_source = input.export_data_source;
+        record.data_format = input.export_destination.data_format;
+        store.export_jobs.insert(job_id.clone(), record);
+
+        Ok(CreateExportJobOutput {
+            // "This operation returns a JobId. Call GetExportJob with that ID": the id
+            // minted for the stored job, and the only name it has.
+            job_id: Some(job_id),
+        })
     }
+}
+
+/// Refuse the request with this operation's input error — "the input you provided is
+/// invalid".
+fn bad_request(message: impl Into<String>) -> CreateExportJobError {
+    CreateExportJobErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
 }

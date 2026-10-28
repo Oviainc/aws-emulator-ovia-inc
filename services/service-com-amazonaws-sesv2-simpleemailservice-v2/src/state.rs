@@ -159,6 +159,14 @@ pub const EXPORT_JOB_PROCESSING_SETTLE: Duration = Duration::from_secs(3);
 /// processing. The due instant is stored on the record; nothing ever sleeps for it.
 pub const EXPORT_JOB_COMPLETION_SETTLE: Duration = Duration::from_secs(3);
 
+/// Export jobs the account may hold.
+///
+/// A CHOSEN bound, not an AWS one: an export job is created by a request, so a
+/// long-lived emulator must not grow without limit while serving them. It is far
+/// above what a client exercising the export API needs, and `CreateExportJob` refuses
+/// past it with the `LimitExceededException` its model binds.
+pub const MAX_EXPORT_JOBS: usize = 1_000;
+
 /// The window the account's sending quota is measured over: SES states the quota
 /// as `Max24HourSend`, "the maximum number of emails you can send in a 24-hour
 /// period".
@@ -1079,6 +1087,9 @@ pub struct ComAmazonawsSesv2SimpleemailserviceV2State {
     /// Monotonic counter feeding [`Self::next_endpoint_id`], so two endpoints
     /// created in the same microsecond still get different ids.
     pub endpoint_sequence: u64,
+    /// Monotonic counter feeding [`Self::next_export_job_id`], so two export jobs
+    /// created in the same microsecond still get different ids.
+    pub export_job_sequence: u64,
 }
 
 impl ComAmazonawsSesv2SimpleemailserviceV2State {
@@ -1516,6 +1527,39 @@ impl ComAmazonawsSesv2SimpleemailserviceV2State {
             .as_millis();
         let sequence = self.tenant_sequence;
         format!("{millis:016x}{sequence:016x}")
+    }
+
+    /// Mint the `JobId` of a new export job.
+    ///
+    /// `JobId` is documented only as "a string that represents the export job ID" and
+    /// the model bounds it at one character or more, so the shape mirrors the dashed
+    /// 8-4-4-4-12 hex id SES hands back while the only guarantees this makes are the
+    /// ones a client depends on: the id is unique across export jobs and stable for as
+    /// long as the job holds it (it is minted once, at create, and read back from the
+    /// record afterwards). Uniqueness is structural — the monotonic sequence number is
+    /// hashed in — so two jobs created in the same instant still differ.
+    pub fn next_export_job_id(&mut self, now: SystemTime) -> String {
+        self.export_job_sequence += 1;
+        let nanos = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let mut hex = String::with_capacity(32);
+        for salt in [0_u64, u64::from_be_bytes(*b"ExportJb")] {
+            let mut hasher = DefaultHasher::new();
+            salt.hash(&mut hasher);
+            nanos.hash(&mut hasher);
+            self.export_job_sequence.hash(&mut hasher);
+            write!(hex, "{:016x}", hasher.finish()).expect("writing to a String cannot fail");
+        }
+        format!(
+            "{}-{}-{}-{}-{}",
+            &hex[..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..]
+        )
     }
 
     /// Remove the tenant `tenant_name` holds, with the state that belongs to the
@@ -3912,8 +3956,52 @@ impl ExportJobStatus {
     }
 }
 
-/// One export job: the kind of data the export draws on, how far its run has got,
-/// and when the job was created and completed.
+/// The `ExportSourceType` the data source `data_source` selects, or `None` when it
+/// selects neither or both.
+///
+/// `ExportDataSource` "can only contain one of `MetricsDataSource` or
+/// `MessageInsightsDataSource` object", and which one it carries is what the job's
+/// source type is: a request that names neither, or both, selects no source at all.
+pub fn export_source_type(
+    data_source: &crate::ops::types::ExportDataSource,
+) -> Option<&'static str> {
+    match (
+        data_source.metrics_data_source.as_ref(),
+        data_source.message_insights_data_source.as_ref(),
+    ) {
+        (Some(_), None) => Some("METRICS_DATA"),
+        (None, Some(_)) => Some("MESSAGE_INSIGHTS"),
+        _ => None,
+    }
+}
+
+/// How this service words `BadRequestException` for an `ExportDataSource` that
+/// selects no one data source.
+///
+/// The sentence states the modelled rule — the structure carries exactly one of the
+/// two — and carries no part of the request: what is wrong is which members are
+/// present, which the sentence already names.
+pub fn invalid_export_data_source() -> String {
+    "ExportDataSource must contain exactly one of MetricsDataSource or \
+     MessageInsightsDataSource."
+        .to_string()
+}
+
+/// How this service words `BadRequestException` for a create request that carries
+/// `ExportDestination$S3Url`.
+///
+/// "SES sets this value. It's returned only in the `GetExportJob` response... If you
+/// include this field in a `CreateExportJob` request, the request fails with a
+/// `BadRequestException`" — so the sentence names the member and says who sets it,
+/// and carries no part of the request.
+pub fn export_destination_s3_url_is_set_by_ses() -> String {
+    "ExportDestination.S3Url is set by SES and must not be included in a \
+     CreateExportJob request."
+        .to_string()
+}
+
+/// One export job: the data the export draws on, the format it is written in, how far
+/// its run has got, and when the job was created and completed.
 #[derive(Debug, Clone)]
 pub struct ExportJobRecord {
     /// The `JobId` this record is keyed by, minted when the job was created and
@@ -3922,6 +4010,15 @@ pub struct ExportJobRecord {
     /// The `ExportSourceType` the job's data source is of, which is the source type
     /// every read of the job reports (see `crate::ops::types::EXPORT_SOURCE_TYPE_VALUES`).
     pub source_type: String,
+    /// The `ExportDataSource` the job was created for, exactly as the create
+    /// supplied it — the dimensions, metrics, filters and date range the export
+    /// draws on, which `GetExportJob` reports back as "the data source of the export
+    /// job".
+    pub data_source: crate::ops::types::ExportDataSource,
+    /// `ExportDestination$DataFormat`: "the data format of the final export job
+    /// file", as the create supplied it. The destination's `S3Url` is not stored,
+    /// because SES sets that value rather than the caller.
+    pub data_format: String,
     /// How far the run has got.
     pub status: ExportJobStatus,
     /// When the job was created.
@@ -3937,11 +4034,17 @@ pub struct ExportJobRecord {
 impl ExportJobRecord {
     /// A job as a create stores it: just created, with both transitions of its run
     /// already due at known instants.
+    ///
+    /// The data source and the data format are the create's to fill in, the way an
+    /// endpoint's tags are: a reader of the job reports whatever the request that
+    /// created it supplied.
     pub fn new(job_id: String, source_type: &str, now: SystemTime) -> Self {
         let processing_due_at = now.checked_add(EXPORT_JOB_PROCESSING_SETTLE).unwrap_or(now);
         Self {
             job_id,
             source_type: source_type.to_string(),
+            data_source: crate::ops::types::ExportDataSource::default(),
+            data_format: String::new(),
             status: ExportJobStatus::Created,
             created_at: now,
             processing_due_at,

@@ -89,6 +89,8 @@ mod email_identity_verification_info;
 mod email_template_updates;
 #[path = "all/email_templates.rs"]
 mod email_templates;
+#[path = "all/export_job_creation.rs"]
+mod export_job_creation;
 #[path = "all/export_jobs.rs"]
 mod export_jobs;
 #[path = "all/list_tenants.rs"]
