@@ -332,6 +332,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             "updated an authorizer"
         );
         let stored = updated.to_wire();
+        // An authorizer is part of the configuration the api's routes are served under, so
+        // every stage of it that auto-deploys has the new configuration released to it.
+        api.redeploy_auto_deploying_stages(::std::time::SystemTime::now());
         Ok(UpdateAuthorizerOutput {
             authorizer_credentials_arn: stored.authorizer_credentials_arn,
             authorizer_id: stored.authorizer_id,

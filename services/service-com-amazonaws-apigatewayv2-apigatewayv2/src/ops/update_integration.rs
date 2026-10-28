@@ -513,6 +513,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&input.integration_id)
             .map(crate::state::Integration::to_wire)
             .expect("the integration just written is in the store");
+        // The api's integrations have changed, so every stage of it that auto-deploys has
+        // the new configuration released to it.
+        api.redeploy_auto_deploying_stages(::std::time::SystemTime::now());
         Ok(UpdateIntegrationOutput {
             api_gateway_managed: stored.api_gateway_managed,
             connection_id: stored.connection_id,

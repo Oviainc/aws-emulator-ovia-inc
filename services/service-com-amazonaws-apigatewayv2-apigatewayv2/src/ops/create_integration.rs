@@ -549,6 +549,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .entry(integration_id)
             .or_insert(record)
             .to_wire();
+        // The api's integrations have changed, so every stage of it that auto-deploys has
+        // the new configuration released to it.
+        api.redeploy_auto_deploying_stages(::std::time::SystemTime::now());
         Ok(CreateIntegrationOutput {
             api_gateway_managed: stored.api_gateway_managed,
             connection_id: stored.connection_id,

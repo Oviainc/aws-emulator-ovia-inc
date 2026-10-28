@@ -339,22 +339,27 @@ pub fn serve<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtRes
         );
         return forbidden();
     };
-    let released = stage
+    // What the stage serves is the configuration its deployment FROZE, so the connection
+    // request is answered by the `$connect` route of that deployment and not by the api's
+    // current routes.
+    let served = stage
         .deployment_id
         .as_deref()
-        .is_some_and(|deployment_id| resolved.api.deployments.contains_key(deployment_id));
-    if !released {
+        .and_then(|deployment_id| resolved.api.deployments.get(deployment_id));
+    let Some(deployment) = served else {
         tracing::debug!(
             api_id = %resolved.api.api_id,
             stage = %stage.stage_name,
             "the WebSocket handshake names a stage with no deployment released to it"
         );
         return forbidden();
-    }
+    };
     // A deployed stage: the handshake is authorized by the route that serves the
     // connection request, and only then met by the capability this emulator does not
     // have. See the module docs for why this is not a `101`.
-    if let Some(refusal) = connect_authorization_refusal(resolved.api, stage, req) {
+    if let Some(refusal) =
+        connect_authorization_refusal(resolved.api, stage, &deployment.configuration, req)
+    {
         return refusal;
     }
     tracing::info!(
@@ -394,18 +399,24 @@ pub fn serve<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtRes
 /// INVOKE to decide, which it cannot (see the module docs), so the handshake falls through
 /// to the transport refusal rather than being allowed or denied here.
 ///
-/// The records read are the api's current ones: a `Deployment` of this service carries no
-/// configuration snapshot of its own (it is an id, a status and a date — see
-/// [`crate::state::Deployment`]), so what a released stage serves is the api as it stands.
+/// The route read is the one the stage's DEPLOYMENT froze
+/// ([`crate::state::Deployment::configuration`]), so a stage pinned to an older deployment
+/// is authorized by the `$connect` route as it stood then; the authorizer that route names
+/// is the api's current record of it, which is where authorizer configuration lives.
 ///
 /// The work this adds per handshake is bounded, and so is the PRODUCT of its two factors:
-/// the route is found by one scan of `api.routes`, capped at
+/// the route is found by one scan of the deployed routes, capped at
 /// [`crate::state::MAX_ROUTES_PER_API`]; the request's query string is decoded ONCE into
 /// [`query_parameters`], never once per identity source; and the identity sources then
 /// looked up in it are capped at [`crate::state::MAX_IDENTITY_SOURCES_PER_AUTHORIZER`] by
 /// the create that stored them.
-fn connect_authorization_refusal(api: &Api, stage: &Stage, req: &RtRequest) -> Option<RtResponse> {
-    let route = api
+fn connect_authorization_refusal(
+    api: &Api,
+    stage: &Stage,
+    deployed: &crate::state::DeployedConfiguration,
+    req: &RtRequest,
+) -> Option<RtResponse> {
+    let route = deployed
         .routes
         .values()
         .find(|route| route.route_key == CONNECT_ROUTE_KEY)?;

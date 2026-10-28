@@ -527,8 +527,11 @@ async fn a_reimported_definition_replaces_the_api_and_changes_which_route_answer
             "case {case:?}: expected the new document's routes {expected:?}, got {stored:?}"
         );
 
-        // The stage the api was deployed to is still there, carrying the same deployment:
-        // it is what serves the new routes.
+        // The stage the api was deployed to is still there — and because it auto-deploys,
+        // the reimport released the api's NEW routes and integrations to it: "Specifies
+        // whether updates to an API automatically trigger a new deployment"
+        // (`Stage$AutoDeploy`), so its DeploymentId moved onto the deployment that froze
+        // the new configuration, which is what serves the new routes below.
         let (status, stage) = call(
             &emulator,
             "GET",
@@ -540,10 +543,29 @@ async fn a_reimported_definition_replaces_the_api_and_changes_which_route_answer
             status, 200,
             "case {case:?}: the stage must survive the reimport, got {status} {stage}"
         );
+        let redeployed = as_str(&stage, "deploymentId");
+        assert_ne!(
+            redeployed, deployment_id,
+            "case {case:?}: the auto-deploying stage must be released a new deployment of \
+             the reimported api, got {stage}"
+        );
+        let (status, deployment) = call(
+            &emulator,
+            "GET",
+            &format!("/v2/apis/{api_id}/deployments/{redeployed}"),
+            None,
+        )
+        .await;
         assert_eq!(
-            as_str(&stage, "deploymentId"),
-            deployment_id,
-            "case {case:?}: the stage must keep its released deployment, got {stage}"
+            status, 200,
+            "case {case:?}: the deployment the stage now serves must be readable, got \
+             {status} {deployment}"
+        );
+        assert_eq!(
+            deployment.get("autoDeployed").and_then(Value::as_bool),
+            Some(true),
+            "case {case:?}: a deployment the service released by itself is autoDeployed, \
+             got {deployment}"
         );
 
         // And the data plane answers what the NEW document declares: the route key only

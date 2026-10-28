@@ -244,6 +244,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // just minted, whatever was there before.
         api.models.insert(model_id.clone(), record);
         let stored = api.models[&model_id].to_wire();
+        // A model is part of the configuration the api's routes are served under (a route
+        // selects one through its `RequestModels`), so every stage of it that auto-deploys
+        // has the new configuration released to it.
+        api.redeploy_auto_deploying_stages(::std::time::SystemTime::now());
         Ok(CreateModelOutput {
             content_type: stored.content_type,
             description: stored.description,

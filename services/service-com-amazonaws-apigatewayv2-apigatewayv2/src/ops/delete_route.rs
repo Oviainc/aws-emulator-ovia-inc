@@ -184,6 +184,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // an integration through its `Target` and to an authorizer through its
         // `AuthorizerId` — so there is no dependent for this delete to refuse over.
         api.routes.remove(&input.route_id);
+        // The api's routes have changed, so every stage of it that auto-deploys has the
+        // new configuration released to it.
+        api.redeploy_auto_deploying_stages(::std::time::SystemTime::now());
 
         Ok(DeleteRouteOutput)
     }

@@ -1039,6 +1039,7 @@ impl Api {
                 )),
             );
         }
+        let configuration = self.deployable_configuration();
         let released = self.mint_deployment_id();
         self.deployments.insert(
             released.clone(),
@@ -1050,10 +1051,61 @@ impl Api {
                 deployment_status_message: None,
                 auto_deployed: true,
                 created_date: now,
+                configuration,
             },
         );
         let message = format!("Successfully deployed stage with deployment id '{released}'");
         (Some(released), Some(message))
+    }
+
+    /// The configuration a deployment of this api FREEZES: the routes and integrations it
+    /// holds right now, each with the responses that belong to it.
+    ///
+    /// A deployment is "an immutable representation of an API that can be called by users"
+    /// (the `Deployment` shape's own doc), so releasing one captures the api's routes and
+    /// integrations rather than referring to them: a later change to either leaves every
+    /// deployment already released exactly as it was, and a stage serving one of those
+    /// serves what it froze ([`Deployment::configuration`]).
+    ///
+    /// What one snapshot holds is bounded by the quotas the creates enforce
+    /// ([`MAX_ROUTES_PER_API`] routes and [`MAX_INTEGRATIONS_PER_API`] integrations), and
+    /// how many an api can hold by [`MAX_DEPLOYMENTS_PER_API`], so neither a loop of
+    /// configuration changes nor a loop of deployments grows this store without end.
+    pub fn deployable_configuration(&self) -> DeployedConfiguration {
+        DeployedConfiguration {
+            routes: self.routes.clone(),
+            integrations: self.integrations.clone(),
+        }
+    }
+
+    /// Release this api's configuration afresh to every stage of it that auto-deploys,
+    /// because that configuration has just changed.
+    ///
+    /// "Specifies whether updates to an API automatically trigger a new deployment"
+    /// (`Stage$AutoDeploy`): such a stage does not stay on the deployment it was last
+    /// released when the api's routes or integrations move under it — the service releases
+    /// the new configuration to it by itself, which is what [`Deployment::auto_deployed`]
+    /// marks. A stage whose `AutoDeploy` is off keeps the deployment it was pinned to,
+    /// because that deployment is the one its caller chose.
+    ///
+    /// ONE release serves every auto-deploying stage of the api, so one change mints one
+    /// deployment however many stages are on it, and an api with no auto-deploying stage
+    /// mints none at all. Every writer of this api's routes and integrations calls this
+    /// once it has written, so no two of them release differently.
+    pub fn redeploy_auto_deploying_stages(&mut self, now: SystemTime) {
+        if !self.stages.values().any(|stage| stage.auto_deploy) {
+            return;
+        }
+        let (released, status_message) = self.release_auto_deployment(now);
+        for stage in self.stages.values_mut().filter(|stage| stage.auto_deploy) {
+            // A release the deployment quota refused leaves the stage on the deployment it
+            // already serves, reporting why the last one did not happen.
+            if released.is_some() {
+                stage.deployment_id = released.clone();
+            }
+            stage.last_deployment_status_message = status_message.clone();
+            stage.last_updated_date = now;
+        }
     }
 }
 
@@ -2515,6 +2567,27 @@ pub struct Deployment {
     /// (`Deployment$AutoDeployed`). A deployment the caller asked for is not one.
     pub auto_deployed: bool,
     pub created_date: SystemTime,
+    /// The api configuration this deployment froze when it was released
+    /// ([`Api::deployable_configuration`]): the routes and integrations a stage serving
+    /// this deployment serves. Modelled on no member of the `Deployment` shape — a
+    /// deployment reports its id, status and date — so no reader projects it; it is what
+    /// makes the deployment "immutable" rather than a pointer at the api's current state.
+    pub configuration: DeployedConfiguration,
+}
+
+/// The api configuration one [`Deployment`] froze: the routes and integrations the api
+/// held when that deployment was released, each with the responses that belong to it.
+///
+/// Two stages of one api can therefore serve two different configurations of it — the one
+/// each one's own deployment froze — which is what pinning a stage to a deployment is for.
+#[derive(Debug, Clone, Default)]
+pub struct DeployedConfiguration {
+    /// The routes the deployment froze, keyed by `RouteId` exactly as [`Api::routes`] keys
+    /// them.
+    pub routes: BTreeMap<String, Route>,
+    /// The integrations the deployment froze, keyed by `IntegrationId` exactly as
+    /// [`Api::integrations`] keys them.
+    pub integrations: BTreeMap<String, Integration>,
 }
 
 impl Deployment {

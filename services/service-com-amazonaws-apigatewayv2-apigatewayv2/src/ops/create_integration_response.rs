@@ -313,6 +313,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .entry(integration_response_id)
             .or_insert(record)
             .to_wire();
+        // An integration response belongs to its integration, so the api's integrations
+        // have changed: every stage of it that auto-deploys has the new configuration
+        // released to it.
+        api.redeploy_auto_deploying_stages(::std::time::SystemTime::now());
         Ok(CreateIntegrationResponseOutput {
             content_handling_strategy: stored.content_handling_strategy,
             integration_response_id: stored.integration_response_id,

@@ -215,6 +215,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // later GetIntegration finds nothing, and a second DeleteIntegration of the
         // same id answers 404 rather than removing anything again.
         api.integrations.remove(&input.integration_id);
+        // The api's integrations have changed, so every stage of it that auto-deploys has
+        // the new configuration released to it.
+        api.redeploy_auto_deploying_stages(::std::time::SystemTime::now());
 
         Ok(DeleteIntegrationOutput)
     }

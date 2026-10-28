@@ -330,7 +330,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Persist, then read the response back out of the STORE, so what the caller gets
         // is what a later GetAuthorizer will report rather than an echo of the request.
         api.authorizers.insert(authorizer_id.clone(), record);
-        Ok(authorizer_output(&api.authorizers[&authorizer_id]))
+        // An authorizer is part of the configuration the api's routes are served under, so
+        // every stage of it that auto-deploys has the new configuration released to it.
+        let output = authorizer_output(&api.authorizers[&authorizer_id]);
+        api.redeploy_auto_deploying_stages(::std::time::SystemTime::now());
+        Ok(output)
     }
 }
 

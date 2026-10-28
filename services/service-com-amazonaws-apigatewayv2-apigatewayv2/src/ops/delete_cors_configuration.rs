@@ -180,6 +180,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // second call answers 204 exactly like the first. Nothing else on the record is
         // touched, so a later GetApi reports the same api minus its CORS configuration.
         record.cors_configuration = ::std::option::Option::None;
+        // The CORS configuration is part of what the api's stages serve, so every stage of
+        // it that auto-deploys has the new configuration released to it.
+        record.redeploy_auto_deploying_stages(::std::time::SystemTime::now());
 
         Ok(DeleteCorsConfigurationOutput)
     }

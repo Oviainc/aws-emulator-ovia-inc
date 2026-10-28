@@ -104,6 +104,7 @@
 //! decision is a function of the token and of the api's own `JWTConfiguration`, both of
 //! which are here, so it is computed in full ([`super::jwt`]).
 
+use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
@@ -118,7 +119,10 @@ use super::data_plane::{
     UNAUTHORIZED_STATUS, UNPLACEABLE_STATUS,
 };
 use super::jwt;
-use crate::state::{Api, ComAmazonawsApigatewayv2Apigatewayv2State, Integration, Route, Stage};
+use crate::state::{
+    Api, ComAmazonawsApigatewayv2Apigatewayv2State, DeployedConfiguration, Integration, Route,
+    Stage,
+};
 
 /// The `RouteKey` that catches what no other route matches. AWS documents `$default` as
 /// "the default route" of an HTTP api, the one reached when no route key matches the
@@ -446,19 +450,24 @@ pub fn serve<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtRes
         );
         return forbidden();
     };
-    let released = stage
+    // The deployment the stage serves: "A Deployment must be associated with a Stage for
+    // it to be callable over the internet" (the `Deployment` shape's own doc), and what it
+    // serves is the configuration that deployment FROZE — a stage pinned to an older
+    // deployment answers for the api as it stood then, not as it stands now.
+    let served = stage
         .deployment_id
         .as_deref()
-        .is_some_and(|deployment_id| api.deployments.contains_key(deployment_id));
-    if !released {
+        .and_then(|deployment_id| api.deployments.get(deployment_id));
+    let Some(deployment) = served else {
         tracing::debug!(
             api_id = %api.api_id,
             stage = %stage.stage_name,
             "the request names a stage with no deployment released to it"
         );
         return forbidden();
-    }
-    let Some(route) = matching_route(api, addressed.method, &route_path) else {
+    };
+    let Some(route) = matching_route(&deployment.configuration.routes, addressed.method, &route_path)
+    else {
         tracing::debug!(
             api_id = %api.api_id,
             stage = %stage.stage_name,
@@ -474,7 +483,7 @@ pub fn serve<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtRes
     if let Some(refusal) = authorization_refusal(api, stage, route, req) {
         return refusal;
     }
-    serve_integration(api, stage, route)
+    serve_integration(api, stage, &deployment.configuration, route)
 }
 
 /// The stage of `api` that `invoke_path` names, and the path WITHIN that stage.
@@ -511,7 +520,11 @@ fn normalised_path(path: &str) -> String {
     format!("/{}", segments.join("/"))
 }
 
-/// The route of `api` that serves `method path`, or `None` when none of its routes does.
+/// The route of `routes` that serves `method path`, or `None` when none of them does.
+///
+/// `routes` are the routes of the DEPLOYMENT the stage serves (frozen when it was
+/// released), not the api's current ones: that is what makes a stage pinned to an older
+/// deployment keep answering for the configuration it froze.
 ///
 /// The rule is API Gateway's own: a request is served by the MOST SPECIFIC matching route
 /// key, and `$default` catches what nothing else matches. Specificity is read off the key
@@ -521,20 +534,23 @@ fn normalised_path(path: &str) -> String {
 /// for the same request, and a key naming the request's verb beats the `ANY` catch-all for
 /// the same path.
 ///
-/// The work is bounded: one scan of `api.routes`, capped at
+/// The work is bounded: one scan of the deployed routes, capped at
 /// [`crate::state::MAX_ROUTES_PER_API`] by the create that stored them, and each key's
 /// segments are compared once against the request's.
-fn matching_route<'s>(api: &'s Api, method: &str, path: &str) -> Option<&'s Route> {
+fn matching_route<'s>(
+    routes: &'s BTreeMap<String, Route>,
+    method: &str,
+    path: &str,
+) -> Option<&'s Route> {
     let requested = path_segments(path);
-    let best = api
-        .routes
+    let best = routes
         .values()
         .filter(|route| route.route_key != DEFAULT_ROUTE_KEY)
         .filter_map(|route| specificity(&route.route_key, method, &requested).map(|rank| (rank, route)))
         .max_by(|(left, _), (right, _)| left.cmp(right))
         .map(|(_, route)| route);
     best.or_else(|| {
-        api.routes
+        routes
             .values()
             .find(|route| route.route_key == DEFAULT_ROUTE_KEY)
     })
@@ -788,15 +804,20 @@ fn authorization_refusal(
 ///   logged so a developer reading the emulator's output learns which backend was not
 ///   called. See the module docs for the whole mapping and for what the `503` class needs.
 ///
-/// A route that targets no integration, or one whose target names none this api holds, is
-/// the same `500` for a different reason: a route with nothing behind it cannot answer at
-/// all.
-fn serve_integration(api: &Api, stage: &Stage, route: &Route) -> RtResponse {
+/// A route that targets no integration, or one whose target names none the deployment
+/// froze, is the same `500` for a different reason: a route with nothing behind it cannot
+/// answer at all.
+fn serve_integration(
+    api: &Api,
+    stage: &Stage,
+    deployed: &DeployedConfiguration,
+    route: &Route,
+) -> RtResponse {
     let integration: Option<&Integration> = route
         .target
         .as_deref()
         .and_then(crate::state::target_integration_id)
-        .and_then(|integration_id| api.integrations.get(integration_id));
+        .and_then(|integration_id| deployed.integrations.get(integration_id));
     let Some(integration) = integration else {
         tracing::warn!(
             api_id = %api.api_id,

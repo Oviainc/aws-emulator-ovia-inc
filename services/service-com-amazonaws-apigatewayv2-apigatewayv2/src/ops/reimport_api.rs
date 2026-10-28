@@ -264,6 +264,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         existing.routes.clear();
         existing.integrations.clear();
         super::import_api::write_definition_routes(existing, definition.routes);
+        // The api's routes and integrations have changed, so every stage of it that
+        // auto-deploys has the new configuration released to it.
+        existing.redeploy_auto_deploying_stages(::std::time::SystemTime::now());
 
         let stored = existing.to_wire();
         Ok(ReimportApiOutput {

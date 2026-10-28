@@ -226,6 +226,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Deploying FREEZES the api's current routes and integrations into the deployment,
+        // read out before anything is minted: a stage released to it serves that
+        // configuration however the api changes afterwards.
+        let configuration = api.deployable_configuration();
         let deployment_id = api.mint_deployment_id();
         // ONE clock reading for this call: the deployment's creation instant is also the
         // instant a stage released to it was last changed, so the two cannot disagree.
@@ -245,6 +249,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // by itself for an auto-deploying stage.
             auto_deployed: false,
             created_date: now,
+            configuration,
         };
 
         // A stage serves ONE deployment, so deploying to it moves the stage onto this

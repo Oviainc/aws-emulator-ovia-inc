@@ -342,11 +342,11 @@ Outputs:
         protocol_type: Some("WEBSOCKET"),
         api_name_suffix: "socket",
         domain: true,
-        // A mapping names a STAGE of its api, and a WebSocket api holds none until a
-        // caller creates one: `AWS::ApiGatewayV2::Stage` is left declared-only by this
-        // emulator (its own open issue,
-        // `20261023T151412Z-apigatewayv2-cloudformation-stacks-containing-aws-apigatewayv2-stage-route`),
-        // so this row declares no mapping.
+        // A mapping names a STAGE of its api, and a WebSocket api holds none until
+        // something creates one — this row's template declares no
+        // `AWS::ApiGatewayV2::Stage` (the stages a template declares are provisioned, and
+        // `cloudformation_apigatewayv2_api_children` owns those), so it declares no
+        // mapping either.
         mappings: &[],
     },
 ];

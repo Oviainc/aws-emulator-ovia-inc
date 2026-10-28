@@ -431,6 +431,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // record rather than minting a second one, and its id, its creation instant, its
         // endpoint and its children are carried over by the clone.
         store.apis.insert(input.api_id.clone(), updated);
+        // The api's own configuration has changed, so every stage of it that auto-deploys
+        // has the new configuration released to it.
+        if let Some(record) = store.apis.get_mut(&input.api_id) {
+            record.redeploy_auto_deploying_stages(::std::time::SystemTime::now());
+        }
         let stored = store
             .apis
             .get(&input.api_id)

@@ -225,6 +225,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // later GetAuthorizer finds nothing, and a second DeleteAuthorizer of the same
         // id answers 404 rather than removing anything again.
         api.authorizers.remove(&input.authorizer_id);
+        // An authorizer is part of the configuration the api's routes are served under, so
+        // every stage of it that auto-deploys has the new configuration released to it.
+        api.redeploy_auto_deploying_stages(::std::time::SystemTime::now());
 
         Ok(DeleteAuthorizerOutput)
     }

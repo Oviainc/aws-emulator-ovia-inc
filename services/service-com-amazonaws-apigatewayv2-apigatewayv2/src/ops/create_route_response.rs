@@ -255,6 +255,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .entry(route_response_id)
             .or_insert(record)
             .to_wire();
+        // A route response belongs to its route, so the api's routes have changed: every
+        // stage of it that auto-deploys has the new configuration released to it.
+        api.redeploy_auto_deploying_stages(::std::time::SystemTime::now());
         Ok(CreateRouteResponseOutput {
             model_selection_expression: stored.model_selection_expression,
             response_models: stored.response_models,

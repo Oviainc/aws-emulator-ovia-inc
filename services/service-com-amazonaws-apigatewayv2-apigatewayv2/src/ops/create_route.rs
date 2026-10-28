@@ -354,6 +354,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // later GetRoute will report. `route_id` comes from this api's own id
         // bijection, so it names no existing route and this inserts.
         let stored = api.routes.entry(route_id).or_insert(record).to_wire();
+        // The api's routes have changed, so every stage of it that auto-deploys has the
+        // new configuration released to it.
+        api.redeploy_auto_deploying_stages(::std::time::SystemTime::now());
         Ok(CreateRouteOutput {
             api_gateway_managed: stored.api_gateway_managed,
             api_key_required: stored.api_key_required,
