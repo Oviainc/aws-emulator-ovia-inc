@@ -128,6 +128,27 @@ pub fn member_clause(path: &str, requirement: &str, subject_null: bool) -> Strin
     format!("{subject} at '{path}' failed to satisfy constraint: {requirement}")
 }
 
+/// The member path a refusal states, spelled the way the centralized walk spells one.
+///
+/// `member` is an input member as the WIRE spells it, optionally followed by the
+/// `.`-separated steps a handler addressed below it (a position inside a document, a list
+/// element). Only the leading INPUT MEMBER is re-cased, and through the framework's own
+/// `aws_smithy_schema_server::constraints::path::member` — the single spelling the walk
+/// reports — so one input member has ONE path however it was refused: by a modelled
+/// constraint the walk enforces or by a rule a handler enforces itself. The steps below it
+/// are keys the CALLER chose and are echoed exactly as sent, the way the walk echoes a map
+/// entry's key.
+///
+/// Idempotent on a path already spelled this way, so a handler may hand over either
+/// spelling and still name the member the walk names.
+pub fn walk_member_path(member: &str) -> String {
+    let spell = ::aws_smithy_schema_server::constraints::path::member;
+    match member.split_once('.') {
+        Some((head, below)) => format!("{}.{below}", spell(head)),
+        None => spell(member),
+    }
+}
+
 /// Render one constraint violation the way PartnerCentral states it: the member path
 /// and the constraint it failed, and NOTHING of the value that was rejected.
 ///

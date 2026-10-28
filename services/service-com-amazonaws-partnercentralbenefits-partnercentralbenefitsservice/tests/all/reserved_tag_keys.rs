@@ -156,9 +156,13 @@ fn seeded_map() -> BTreeMap<String, String> {
         .collect()
 }
 
-/// Require that `operation` refuses `body` as a reserved-key violation of `member`: HTTP
-/// 400, the modelled `ValidationException`, and a message that names the member the caller
-/// must fix and the requirement it failed.
+/// Require that `operation` refuses `body` as a reserved-key violation of the member named
+/// by `member`: HTTP 400, the modelled `ValidationException`, and a message that names the
+/// member path the caller must fix and the requirement it failed.
+///
+/// `member` is the path the refusal states — the input member in lowerCamel, the spelling
+/// the centralized walk reports for it — whatever case the wire member is spelled in
+/// (`Tags` on the create, `tags`/`tagKeys` on the tagging operations).
 async fn assert_reserved_refusal(
     harness: &Harness,
     case: &str,
@@ -446,7 +450,7 @@ async fn create_refuses_a_reserved_key_and_mints_nothing() {
         });
 
         if row.reserved {
-            assert_reserved_refusal(&harness, &case, "CreateBenefitApplication", "Tags", &body)
+            assert_reserved_refusal(&harness, &case, "CreateBenefitApplication", "tags", &body)
                 .await;
         } else {
             let created = ok(&harness, &case, "CreateBenefitApplication", &body).await;
@@ -494,7 +498,7 @@ async fn a_refused_create_leaves_its_client_token_unused() {
         "Tags": tag_payload(&[("aws:createdBy", "mine")]),
     });
 
-    assert_reserved_refusal(&harness, "token", "CreateBenefitApplication", "Tags", &body).await;
+    assert_reserved_refusal(&harness, "token", "CreateBenefitApplication", "tags", &body).await;
 
     body["Tags"] = tag_payload(&[("createdBy", "mine")]);
     let created = ok(&harness, "token", "CreateBenefitApplication", &body).await;

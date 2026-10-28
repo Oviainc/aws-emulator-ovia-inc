@@ -38,6 +38,11 @@ use crate::service_error_rules::{assert_validation_invariants, clause, message_o
 /// The input member every refusal below names, spelled as the wire spells it.
 const MEMBER: &str = "BenefitApplicationDetails";
 
+/// The PATH that member is named by in a refusal: the member in lowerCamel, the spelling
+/// the centralized walk reports for an input member, so a client reads a refusal this
+/// service's handlers state exactly as it reads one the walk produced.
+pub(crate) const MEMBER_PATH: &str = "benefitApplicationDetails";
+
 /// The requirement a document nested past the depth bound fails, written out here rather
 /// than read from the service's own helper so the wording itself is under test.
 fn depth_requirement() -> String {
@@ -249,8 +254,8 @@ fn accepted_rows() -> Vec<(&'static str, Value)> {
 
 /// Require that `operation` refused `body` as a document-guard violation: HTTP 400, the
 /// modelled `ValidationException`, and a `Message` that is the AWS envelope over the one
-/// clause naming [`MEMBER`] and `requirement` — with the same member and requirement on
-/// the `FieldList` beside it.
+/// clause naming [`MEMBER_PATH`] and `requirement` — with the same member path and
+/// requirement on the `FieldList` beside it.
 async fn assert_guard_refusal(
     harness: &Harness,
     case: &str,
@@ -274,8 +279,8 @@ async fn assert_guard_refusal(
     });
     assert_eq!(
         message,
-        one(&clause(MEMBER, requirement)),
-        "case {case:?}: expected the envelope over the clause for {MEMBER}, got {message:?}"
+        one(&clause(MEMBER_PATH, requirement)),
+        "case {case:?}: expected the envelope over the clause for {MEMBER_PATH}, got {message:?}"
     );
     assert_validation_invariants(case, &message);
     let field = out["FieldList"]
@@ -285,8 +290,8 @@ async fn assert_guard_refusal(
         .unwrap_or(Value::Null);
     assert_eq!(
         field["Name"],
-        json!(MEMBER),
-        "case {case:?}: the refusal's FieldList must name {MEMBER}, got {out:?}"
+        json!(MEMBER_PATH),
+        "case {case:?}: the refusal's FieldList must name {MEMBER_PATH}, got {out:?}"
     );
     assert_eq!(
         field["Message"],

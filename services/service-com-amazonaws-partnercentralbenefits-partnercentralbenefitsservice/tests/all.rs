@@ -61,6 +61,8 @@ mod pagination_lookahead_one_construction;
 mod persisted_string_bounds;
 #[path = "all/recall_benefit_application.rs"]
 mod recall_benefit_application;
+#[path = "all/refusal_member_path.rs"]
+mod refusal_member_path;
 #[path = "all/reserved_tag_keys.rs"]
 mod reserved_tag_keys;
 #[path = "all/resource_tagging.rs"]

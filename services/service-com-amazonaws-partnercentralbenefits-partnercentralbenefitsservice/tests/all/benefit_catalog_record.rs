@@ -35,12 +35,18 @@
 
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_partnercentralbenefits_partnercentralbenefitsservice::state::{
-    BENEFIT_IDENTIFIER_MEMBER, BENEFIT_RESOURCE, BENEFIT_STATUS_ACTIVE, DETAILS_MEMBER,
-    SEEDED_CATALOGS, VALIDATION_REASON_BUSINESS,
+    BENEFIT_RESOURCE, BENEFIT_STATUS_ACTIVE, DETAILS_MEMBER, SEEDED_CATALOGS,
+    VALIDATION_REASON_BUSINESS,
 };
 
 use crate::benefit_application_lifecycle::{error_code, text, Harness, CATALOG};
+use crate::details_document_guard::MEMBER_PATH as DETAILS_PATH;
 use crate::resource_tagging::expected_arn;
+
+/// The PATH a refusal names the benefit member by: the input member in lowerCamel, the
+/// spelling the centralized walk reports for an input member (pinned for this member's
+/// modelled `@pattern` in `tests/all/validation_error_body.rs`).
+const BENEFIT_IDENTIFIER_PATH: &str = "benefitIdentifier";
 
 /// A field name no seeded `BenefitRequestSchema` declares, so a document carrying it
 /// carries something the schema says nothing about.
@@ -253,7 +259,7 @@ async fn create_refuses_an_application_for_a_benefit_the_catalog_no_longer_offer
                 );
                 assert_eq!(
                     refused_field(&case, &out).0,
-                    BENEFIT_IDENTIFIER_MEMBER,
+                    BENEFIT_IDENTIFIER_PATH,
                     "case {case:?}: expected the refusal to name the benefit member, got {out:?}"
                 );
                 assert_eq!(
@@ -343,7 +349,7 @@ async fn create_judges_the_details_document_against_the_benefits_request_schema(
                     "BenefitIdentifier": benefit.id,
                     "BenefitApplicationDetails": Value::Object(wrong),
                 }),
-                &format!("{DETAILS_MEMBER}.{field}"),
+                &format!("{DETAILS_PATH}.{field}"),
                 &format!("Member must be of type {json_type}"),
             )
             .await;
@@ -377,7 +383,7 @@ async fn create_judges_the_details_document_against_the_benefits_request_schema(
                     "BenefitIdentifier": benefit.id,
                     "BenefitApplicationDetails": document,
                 }),
-                DETAILS_MEMBER,
+                DETAILS_PATH,
                 "Member must be of type object",
             )
             .await;
@@ -486,7 +492,7 @@ async fn update_and_amend_judge_the_document_they_would_store_by_the_same_schema
             "Revision": text("seed", &before, "Revision"),
             "BenefitApplicationDetails": Value::Object(wrong),
         }),
-        &format!("{DETAILS_MEMBER}.{number_field}"),
+        &format!("{DETAILS_PATH}.{number_field}"),
         "Member must be of type number",
     )
     .await;
@@ -565,7 +571,7 @@ async fn update_and_amend_judge_the_document_they_would_store_by_the_same_schema
                 "NewValue": "250",
             }],
         }),
-        &format!("{DETAILS_MEMBER}.{number_field}"),
+        &format!("{DETAILS_PATH}.{number_field}"),
         "Member must be of type number",
     )
     .await;

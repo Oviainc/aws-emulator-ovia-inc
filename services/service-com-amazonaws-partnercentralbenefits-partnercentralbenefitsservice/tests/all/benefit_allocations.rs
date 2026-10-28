@@ -780,8 +780,9 @@ async fn a_next_token_this_operation_did_not_issue_is_refused() {
             "case {case:?}: expected ValidationException, got {out:?}"
         );
         assert!(
-            error_message(&out).contains("NextToken"),
-            "case {case:?}: the refusal must name NextToken, got {out:?}"
+            error_message(&out).contains("nextToken"),
+            "case {case:?}: the refusal must name the cursor member the way the centralized \
+             walk spells it, got {out:?}"
         );
     }
 

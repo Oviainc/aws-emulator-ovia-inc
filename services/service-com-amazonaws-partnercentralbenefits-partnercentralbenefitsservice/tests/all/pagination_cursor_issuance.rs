@@ -13,8 +13,9 @@
 //! listing.** A list operation resumes at the record its OWN cursor names for the catalog
 //! and the record kind the request asks about; every other token — one a client built, one
 //! naming a record the collection does not hold, one of another record kind, or one issued
-//! for another catalog's listing — is `ValidationException` (400) naming `NextToken`,
-//! never a position in the collection.
+//! for another catalog's listing — is `ValidationException` (400) stating the AWS
+//! validation envelope over the clause for that member, never a position in the
+//! collection.
 //!
 //! The rows span what the rule generalises over: every list operation this service serves
 //! (`ListBenefits`, `ListBenefitApplications`, `ListBenefitAllocations`), every seeded
@@ -28,7 +29,7 @@ use service_com_amazonaws_partnercentralbenefits_partnercentralbenefitsservice::
 };
 
 use crate::benefit_application_lifecycle::{error_code, text, Harness};
-use crate::resource_tagging::error_message;
+use crate::service_error_rules::{assert_validation_invariants, clause, message_of, one};
 
 /// A catalog name the modelled `CatalogName` pattern `^[A-Za-z0-9_-]+$` admits and this
 /// service does not serve (see `SEEDED_CATALOGS`).
@@ -106,8 +107,20 @@ async fn page(
     (ids, token)
 }
 
+/// The member path a refusal of the cursor member states: the member in lowerCamel, the
+/// spelling the centralized walk reports for `NextToken` (pinned, for the member's modelled
+/// `@length`, in `tests/all/validation_error_body.rs`).
+pub(crate) const NEXT_TOKEN_PATH: &str = "nextToken";
+
+/// The requirement a token this service never issued fails, written out here rather than
+/// read from the service's own helper so the wording itself is under test.
+pub(crate) fn issued_requirement(operation: &str) -> String {
+    format!("Member must be a pagination token issued by {operation}")
+}
+
 /// Assert `operation` refuses `token` for `catalog` the way the rule says: 400
-/// `ValidationException` naming `NextToken` in both the message and the `FieldList`.
+/// `ValidationException` whose message is the AWS validation envelope over the clause for
+/// the cursor member, with the same member path in the `FieldList`.
 async fn assert_refused(harness: &Harness, case: &str, operation: &str, catalog: &str, token: &str) {
     let (status, out) = harness
         .call(
@@ -124,18 +137,24 @@ async fn assert_refused(harness: &Harness, case: &str, operation: &str, catalog:
         "ValidationException",
         "case {case:?}: expected ValidationException, got {out:?}"
     );
-    assert!(
-        error_message(&out).contains("NextToken"),
-        "case {case:?}: the refusal must name NextToken, got {out:?}"
+    let message = message_of(&out).unwrap_or_else(|| {
+        panic!("case {case:?}: the refusal carries no modelled Message member: {out:?}")
+    });
+    assert_eq!(
+        message,
+        one(&clause(NEXT_TOKEN_PATH, &issued_requirement(operation))),
+        "case {case:?}: expected the envelope over the clause for {NEXT_TOKEN_PATH}, \
+         got {message:?}"
     );
+    assert_validation_invariants(case, &message);
     let named = out["FieldList"]
         .as_array()
         .and_then(|fields| fields.first())
         .and_then(|field| field["Name"].as_str());
     assert_eq!(
         named,
-        Some("NextToken"),
-        "case {case:?}: the refusal's FieldList must name NextToken, got {out:?}"
+        Some(NEXT_TOKEN_PATH),
+        "case {case:?}: the refusal's FieldList must name {NEXT_TOKEN_PATH}, got {out:?}"
     );
 }
 

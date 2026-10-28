@@ -119,18 +119,18 @@ impl From<ListBenefitsErrorModeled> for ListBenefitsError {
     }
 }
 
-/// Why a `NextToken` that is not one this operation issued is refused.
-fn invalid_next_token() -> ListBenefitsError {
-    let message = "NextToken is not a pagination token issued by ListBenefits";
-    ListBenefitsErrorModeled::ValidationException(ValidationException {
-        message: message.to_string(),
-        reason: crate::state::VALIDATION_REASON_FIELD.to_string(),
-        field_list: Some(crate::state::validation_field(
-            "NextToken",
-            message,
-            crate::state::VALIDATION_CODE_INVALID_VALUE,
-        )),
-    })
+/// Why a `NextToken` that is not one this operation issued is refused: a refusal of the
+/// member that carried it, built by the one construction every in-handler member refusal
+/// of this crate goes through ([`crate::state::foreign_page_token_refusal`]), so it names
+/// the member path the centralized walk reports for the same member and states it under
+/// the AWS validation envelope.
+///
+/// `operation` is this operation's own name, which is the operation that issues the
+/// cursors this listing resumes at.
+fn invalid_next_token(operation: &str) -> ListBenefitsError {
+    ListBenefitsErrorModeled::ValidationException(crate::state::foreign_page_token_refusal(
+        operation,
+    ))
     .into()
 }
 
@@ -218,7 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.catalog,
             &catalog.benefits,
         )
-        .map_err(|_| invalid_next_token())?;
+        .map_err(|_| invalid_next_token(Self::NAME))?;
 
         // The benefits are keyed by id in a `BTreeMap`, so this walk is in one stable
         // order and the token is simply the id to resume at — the range starts directly

@@ -124,18 +124,18 @@ impl From<ListBenefitApplicationsErrorModeled> for ListBenefitApplicationsError 
     }
 }
 
-/// Why a `NextToken` that is not one this operation issued is refused.
-fn invalid_next_token() -> ListBenefitApplicationsError {
-    let message = "NextToken is not a pagination token issued by ListBenefitApplications";
-    ListBenefitApplicationsErrorModeled::ValidationException(ValidationException {
-        message: message.to_string(),
-        reason: crate::state::VALIDATION_REASON_FIELD.to_string(),
-        field_list: Some(crate::state::validation_field(
-            "NextToken",
-            message,
-            crate::state::VALIDATION_CODE_INVALID_VALUE,
-        )),
-    })
+/// Why a `NextToken` that is not one this operation issued is refused: a refusal of the
+/// member that carried it, built by the one construction every in-handler member refusal
+/// of this crate goes through ([`crate::state::foreign_page_token_refusal`]), so it names
+/// the member path the centralized walk reports for the same member and states it under
+/// the AWS validation envelope.
+///
+/// `operation` is this operation's own name, which is the operation that issues the
+/// cursors this listing resumes at.
+fn invalid_next_token(operation: &str) -> ListBenefitApplicationsError {
+    ListBenefitApplicationsErrorModeled::ValidationException(
+        crate::state::foreign_page_token_refusal(operation),
+    )
     .into()
 }
 
@@ -229,7 +229,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.catalog,
             &catalog.applications,
         )
-        .map_err(|_| invalid_next_token())?;
+        .map_err(|_| invalid_next_token(Self::NAME))?;
 
         // `BenefitIdentifiers` accepts either form the modelled `BenefitId` allows, so
         // each entry is resolved to the catalog's own benefit id before the comparison.

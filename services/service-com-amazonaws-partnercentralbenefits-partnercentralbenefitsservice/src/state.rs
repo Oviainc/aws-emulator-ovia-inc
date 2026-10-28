@@ -2924,18 +2924,25 @@ pub fn length_clause(value: &str, min: usize, max: usize) -> Option<String> {
 /// `ValidationExceptionReason` the refusal class carries: [`VALIDATION_REASON_FIELD`] for
 /// a member whose value this service does not accept, [`VALIDATION_REASON_BUSINESS`] for
 /// a well-formed request a rule of the service's own refuses.
+///
+/// `member` is the input member as the wire spells it, optionally followed by the steps a
+/// handler addressed below it; the PATH the clause and the `ValidationExceptionField$Name`
+/// state is spelled here by [`crate::service::walk_member_path`], so one input member is
+/// named one way whether it was refused by the centralized walk or by a handler's own
+/// rule.
 pub fn member_validation_exception(
     member: &str,
     requirement: &str,
     reason: &str,
 ) -> crate::ops::types::ValidationException {
-    let clause = crate::service::member_clause(member, requirement, false);
+    let path = crate::service::walk_member_path(member);
+    let clause = crate::service::member_clause(&path, requirement, false);
     crate::ops::types::ValidationException {
         message: crate::service::validation_envelope(std::slice::from_ref(&clause))
             .unwrap_or(clause),
         reason: reason.to_string(),
         field_list: Some(validation_field(
-            member,
+            &path,
             requirement,
             VALIDATION_CODE_INVALID_VALUE,
         )),
@@ -2995,9 +3002,36 @@ pub fn decode_page_token(token: &str, prefix: &str, catalog: &str) -> Option<Str
 
 /// Why a list operation refuses a `NextToken`: it is not a cursor this service issued for
 /// the collection being paged. Each list operation turns this into its OWN modelled
-/// `ValidationException` naming the member.
+/// `ValidationException` through [`foreign_page_token_refusal`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ForeignPageToken;
+
+/// The input member a refusal of a pagination cursor names, spelled as the wire spells it
+/// (`ListBenefitsInput$NextToken` and the same member on the other two listings).
+pub const NEXT_TOKEN_MEMBER: &str = "NextToken";
+
+/// The requirement a `NextToken` fails when it is not a cursor `operation` issued: a
+/// pagination token is a handle the service minted, so the requirement on the member is
+/// that it be one of `operation`'s own.
+pub fn issued_page_token_requirement(operation: &str) -> String {
+    format!("Member must be a pagination token issued by {operation}")
+}
+
+/// The refusal a listing answers a `NextToken` it never issued with ([`ForeignPageToken`]),
+/// for the operation that issues the cursors of that listing.
+///
+/// Built by the one construction every in-handler refusal of a member goes through
+/// ([`member_validation_exception`]), so it reads exactly like a refusal the centralized
+/// walk produced — the envelope over the clause, naming the same member path the walk
+/// reports for this member — and echoes NOTHING of the token the request carried. The one
+/// construction of this refusal, so the three listings cannot word it three ways.
+pub fn foreign_page_token_refusal(operation: &str) -> crate::ops::types::ValidationException {
+    member_validation_exception(
+        NEXT_TOKEN_MEMBER,
+        &issued_page_token_requirement(operation),
+        VALIDATION_REASON_FIELD,
+    )
+}
 
 /// The key a list operation resumes `records` at, given the `NextToken` the request
 /// carried — `None` when it carried none, so the page starts at the front.

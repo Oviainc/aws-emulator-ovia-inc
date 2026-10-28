@@ -127,7 +127,7 @@ async fn schema_field(harness: &Harness, catalog: &str) -> (String, String, Stri
 }
 
 /// A benefit the catalog no longer offers: `(its catalog, its id, its `BenefitStatus`)`.
-async fn withdrawn_benefit(harness: &Harness) -> (&'static str, String, String) {
+pub(crate) async fn withdrawn_benefit(harness: &Harness) -> (&'static str, String, String) {
     for catalog in SEEDED_CATALOGS {
         for summary in harness.benefits(catalog).await {
             let status = text(catalog, &summary, "Status");
@@ -379,29 +379,39 @@ async fn every_member_refusal_is_the_one_construction() {
 /// renders the member clause under the single-violation envelope, carries that reason, and
 /// names the member once in its `FieldList` under the invalid-value code.
 ///
+/// The member it NAMES is the path the centralized walk reports for that input member —
+/// the member in lowerCamel, the steps a handler addressed below it echoed as sent — so one
+/// member has one spelling whether a modelled constraint or a handler's own rule refused
+/// it. Each row therefore states the member as the WIRE spells it and the path the refusal
+/// must carry.
+///
 /// The rows differ along what the rule generalises over: the shape of the member path (a
-/// top-level member, a path into a document, an element path), the length and wording of
-/// the requirement, and each `ValidationExceptionReason` the service answers with.
+/// top-level member, a path into a document, an element path), the case the wire member is
+/// spelled in, the length and wording of the requirement, and each
+/// `ValidationExceptionReason` the service answers with.
 #[test]
 fn the_constructor_renders_the_clause_the_reason_and_the_field_list() {
     // A requirement far longer than any one clause of this service, so the rendering is
     // pinned on a long one too.
     let long_requirement = "requirement ".repeat(40);
-    let rows: Vec<(&str, &str, &str, &str)> = vec![
+    let rows: Vec<(&str, &str, &str, &str, &str)> = vec![
         (
-            "a top-level member",
+            "a top-level member the wire spells in PascalCase",
             BENEFIT_IDENTIFIER_MEMBER,
+            "benefitIdentifier",
             "Member must not be null",
             VALIDATION_REASON_FIELD,
         ),
         (
             "a path into the details document",
             "BenefitApplicationDetails.Campaign.Name",
+            "benefitApplicationDetails.Campaign.Name",
             "Member must be of type number",
             VALIDATION_REASON_FIELD,
         ),
         (
             "an element path of a list member",
+            "amendments.3.member.fieldPath",
             "amendments.3.member.fieldPath",
             UNAMENDABLE,
             VALIDATION_REASON_FIELD,
@@ -409,21 +419,23 @@ fn the_constructor_renders_the_clause_the_reason_and_the_field_list() {
         (
             "a business rule of the service's own",
             "tagKeys",
+            "tagKeys",
             "Member must have length less than or equal to 50",
             VALIDATION_REASON_BUSINESS,
         ),
         (
             "a one-character member and a long requirement",
+            "Q",
             "q",
             &long_requirement,
             VALIDATION_REASON_BUSINESS,
         ),
     ];
 
-    for (case, member, requirement, reason) in rows {
+    for (case, member, path, requirement, reason) in rows {
         let built = member_validation_exception(member, requirement, reason);
         let expected = format!(
-            "1 validation error detected: Value at '{member}' failed to satisfy constraint: \
+            "1 validation error detected: Value at '{path}' failed to satisfy constraint: \
              {requirement}"
         );
         assert_eq!(
@@ -442,7 +454,7 @@ fn the_constructor_renders_the_clause_the_reason_and_the_field_list() {
             .map(|field| (field.name, field.message, field.code))
             .collect();
         let want = vec![(
-            member.to_string(),
+            path.to_string(),
             requirement.to_string(),
             Some(VALIDATION_CODE_INVALID_VALUE.to_string()),
         )];
