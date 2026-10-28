@@ -148,54 +148,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The token is the experiment id the next page starts at, so anything that is
-        // not an id this service mints was never issued by this operation.
-        if let Some(token) = input.next_token.as_deref() {
-            if !crate::state::is_minted_id(token, crate::state::EXPERIMENT_ID_PREFIX) {
-                return Err(ListExperimentsErrorModeled::ValidationException(
-                    crate::state::invalid_next_token(),
-                )
-                .into());
-            }
-        }
+        // not an id this service mints was never issued by this operation. Decoding it is
+        // the shared rule; lifting its refusal into this operation's error enum is the only
+        // part of it that belongs to this operation.
+        let resume_at = crate::state::minted_id_page_resume_point(
+            input.next_token.as_deref(),
+            crate::state::EXPERIMENT_ID_PREFIX,
+        )
+        .map_err(ListExperimentsErrorModeled::ValidationException)?;
 
         let page_size = crate::state::page_size(input.max_results);
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         // The guard is taken, spent and RELEASED inside this block, so the records the
         // settle produced are written after it rather than while the store is locked.
-        let (experiments, next_token, deliveries) = {
+        let (page, deliveries) = {
             let mut store = state.lock();
             store.settle_experiments(now);
 
-            let mut experiments = Vec::with_capacity(page_size.min(store.experiments.len()));
-            let mut next_token = None;
-            for (id, record) in &store.experiments {
-                // Resume at the first id at or after the token.
-                if input
-                    .next_token
-                    .as_deref()
-                    .is_some_and(|token| id.as_str() < token)
-                {
-                    continue;
-                }
-                // The filter is applied BEFORE the page is cut, so a page holds
-                // `maxResults` matching experiments and the token only names one the
-                // filter admits.
-                if input
-                    .experiment_template_id
-                    .as_deref()
-                    .is_some_and(|wanted| record.experiment_template_id != wanted)
-                {
-                    continue;
-                }
-                if experiments.len() >= page_size {
-                    next_token = Some(id.clone());
-                    break;
-                }
-                experiments.push(record.to_summary());
-            }
+            // The page walk itself is the shared one over a collection keyed by minted
+            // ids, so this operation and `ListExperimentTemplates` cut their pages and
+            // mint their tokens by the same rule; what belongs to this operation is the
+            // collection it walks — filtered BEFORE the page is cut, so a page holds
+            // `maxResults` matching experiments and the token only names one the filter
+            // admits — the page size the caller sized and the summary shape it reports.
+            let page = crate::state::minted_id_page(
+                store.experiments.iter().filter(|(_, record)| {
+                    input
+                        .experiment_template_id
+                        .as_deref()
+                        .is_none_or(|wanted| record.experiment_template_id == wanted)
+                }),
+                resume_at,
+                page_size,
+                crate::state::ExperimentRecord::to_summary,
+            );
             let deliveries = store.take_pending_log_deliveries();
-            (experiments, next_token, deliveries)
+            (page, deliveries)
         };
 
         // The records the clock already owed, to the destination each experiment's template
@@ -203,8 +192,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::experiment_logs::deliver(ctx, &region, deliveries).await;
 
         Ok(ListExperimentsOutput {
-            experiments: Some(experiments),
-            next_token,
+            experiments: Some(page.entries),
+            next_token: page.next_token,
         })
     }
 }
