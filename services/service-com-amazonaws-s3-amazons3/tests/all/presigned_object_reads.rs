@@ -88,6 +88,16 @@ async fn send_unsigned(
     send_to_host(router, method, host, uri, false).await
 }
 
+/// Dispatch one request to `host` carrying this suite's `Authorization` header.
+///
+/// What the host-style rows below are about is the ADDRESS a request resolves, so they
+/// present a credential: a request carrying none speaks for nobody and is served only what
+/// the bucket grants to everyone, which is a different rule and is pinned by
+/// [`super::anonymous_object_reads`].
+async fn send_signed(router: &MultiServiceRouter, method: &str, host: &str, uri: &str) -> Answer {
+    send_to_host(router, method, host, uri, true).await
+}
+
 /// The `Authorization` header the suites in this crate sign with: a SigV4 scope naming `s3`,
 /// which is the routing signal a SIGNED request carries whatever its host is. Neither the
 /// key id nor the signature is a credential — this harness's router has request
@@ -282,7 +292,7 @@ async fn a_bucket_addressed_in_the_host_resolves_the_same_object_the_path_does()
             ("/deep/dir/nested.bin", &nested),
             ("/assembled.bin", &assembled),
         ] {
-            let fetched = send_unsigned(&router, "GET", host, key).await;
+            let fetched = send_signed(&router, "GET", host, key).await;
             assert_eq!(
                 fetched.status,
                 200,
@@ -301,7 +311,7 @@ async fn a_bucket_addressed_in_the_host_resolves_the_same_object_the_path_does()
 
         // A read of the object's METADATA, and a LISTING of the bucket the host names — the
         // same two addresses, resolving the operations their path-style forms resolve.
-        let head = send_unsigned(&router, "HEAD", host, "/written.bin").await;
+        let head = send_signed(&router, "HEAD", host, "/written.bin").await;
         assert_eq!(
             head.status,
             200,
@@ -314,7 +324,7 @@ async fn a_bucket_addressed_in_the_host_resolves_the_same_object_the_path_does()
             "case {host:?}: a host-style HEAD must report the object's size, got {:?}",
             head.header("content-length")
         );
-        let listed = send_unsigned(&router, "GET", host, "/?list-type=2").await;
+        let listed = send_signed(&router, "GET", host, "/?list-type=2").await;
         assert_eq!(
             listed.status,
             200,
@@ -329,7 +339,7 @@ async fn a_bucket_addressed_in_the_host_resolves_the_same_object_the_path_does()
         );
 
         // A key the bucket does not hold is absent, not unroutable.
-        let absent = send_unsigned(&router, "GET", host, "/absent.bin").await;
+        let absent = send_signed(&router, "GET", host, "/absent.bin").await;
         assert_eq!(
             absent.error_code(),
             "NoSuchKey",
@@ -344,7 +354,7 @@ async fn a_bucket_addressed_in_the_host_resolves_the_same_object_the_path_does()
     // leaves an endpoint whose own name nothing here knows resolving as it always did — and
     // what a host-style request for a bucket that does not exist is read as too (it resolves
     // from the bare path, so it answers about the address the path names).
-    let path_style = send_unsigned(
+    let path_style = send_signed(
         &router,
         "GET",
         "s3.us-east-1.amazonaws.com",

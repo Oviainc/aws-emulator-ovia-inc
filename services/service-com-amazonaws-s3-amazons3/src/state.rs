@@ -1600,6 +1600,25 @@ pub fn acl_grants_public_access(grants: &[AclGrant]) -> bool {
     grants.iter().any(acl_grant_is_public)
 }
 
+/// Whether `grants` gives `permission` to the caller that presents NO credential.
+///
+/// `AllUsers` is the predefined group that "includes anyone in the world" while
+/// `AuthenticatedUsers` "includes all AWS accounts" (Amazon S3 User Guide, *Access control
+/// list (ACL) overview*, Amazon S3 predefined groups), so a request speaking for nobody is
+/// reached by the first and NOT by the second. `FULL_CONTROL` "allows grantee the READ,
+/// WRITE, READ_ACP, and WRITE_ACP permissions" (same overview), so it answers for any one
+/// permission asked about.
+///
+/// The grants passed in are what an ACL READ reports ([`Bucket::object_acl_grants`]), which
+/// is where `IgnorePublicAcls` has already dropped every public grant S3 ignores: a grant
+/// S3 ignores gives nobody anything, so it cannot admit this caller either.
+pub fn acl_grants_to_all_users(grants: &[AclGrant], permission: &str) -> bool {
+    grants.iter().any(|grant| {
+        grant.grantee.uri.as_deref() == Some(ALL_USERS_GROUP_URI)
+            && (grant.permission == permission || grant.permission == PERMISSION_FULL_CONTROL)
+    })
+}
+
 /// The ARN of the S3 bucket `bucket`: `arn:aws:s3:::<bucket>`.
 ///
 /// An S3 bucket's ARN leaves the Region and the account-id fields EMPTY, "because a bucket
@@ -5270,6 +5289,60 @@ impl Bucket {
             _ => default_acl_grants(),
         };
         self.reported_acl_grants(stored)
+    }
+
+    /// Why S3 refuses a read of `key` — the bytes or the metadata of the version `object`
+    /// names, `None` for an address this bucket holds no object at — to a caller that
+    /// presents NO credential, or `None` when the public may read it.
+    ///
+    /// The ANONYMOUS caller is a principal the bucket has to grant access to explicitly,
+    /// so what it may read is what this bucket's own configuration gives to EVERYONE, and
+    /// everything else is refused ([`ACCESS_DENIED_MESSAGE`]) rather than served:
+    ///
+    /// * an ACL grant to `AllUsers` ([`acl_grants_to_all_users`]) carrying the `READ` the
+    ///   read needs, judged on the grants an ACL read reports — which is where
+    ///   `IgnorePublicAcls` has already dropped the public grants S3 ignores, so a grant
+    ///   that is ignored admits nobody;
+    /// * a bucket policy statement that allows [`GET_OBJECT_ACTION`] on this object to
+    ///   every principal ([`policy_decision_for_anonymous`]) — unless
+    ///   `RestrictPublicBuckets` is on, which "restricts access to … buckets with public
+    ///   policies to only AWS service principals and authorized users within the bucket
+    ///   owner's account" (`PublicAccessBlockConfiguration$RestrictPublicBuckets`), a set
+    ///   this caller is in neither of. An explicit `Deny` refuses the read whatever the
+    ///   ACL grants, the way IAM combines the two.
+    ///
+    /// A Requester Pays bucket refuses it ahead of all of that
+    /// ([`REQUESTER_PAYS_ANONYMOUS_MESSAGE`]): there is no account to charge.
+    pub fn anonymous_object_read_refusal(
+        &self,
+        bucket: &str,
+        key: &str,
+        object: Option<&Object>,
+    ) -> Option<&'static str> {
+        if self.payer() == PAYER_REQUESTER {
+            return Some(REQUESTER_PAYS_ANONYMOUS_MESSAGE);
+        }
+        let granted_by_acl = object.is_some_and(|object| {
+            acl_grants_to_all_users(&self.object_acl_grants(object), PERMISSION_READ)
+        });
+        let restricted = self
+            .public_access_block()
+            .is_some_and(|settings| settings.restrict_public_buckets);
+        let by_policy = self
+            .policy
+            .as_deref()
+            .map(|policy| {
+                policy_decision_for_anonymous(policy, GET_OBJECT_ACTION, &object_arn(bucket, key))
+            })
+            // A bucket carrying no policy has no policy to state anything, which is the
+            // decision a document that says nothing about the request reaches.
+            .unwrap_or_default();
+        let granted = match by_policy {
+            ::service_common::iam_authorization::Decision::Denied => false,
+            ::service_common::iam_authorization::Decision::Allowed => !restricted || granted_by_acl,
+            ::service_common::iam_authorization::Decision::NotStated => granted_by_acl,
+        };
+        (!granted).then_some(ACCESS_DENIED_MESSAGE)
     }
 
     /// The bucket's event notification configuration — empty when the bucket has no event
@@ -10952,6 +11025,95 @@ fn is_fixed_value(key: &str, value: &str) -> bool {
         return false;
     }
     key != SOURCE_IP_CONDITION_KEY || !WHOLE_INTERNET_CIDRS.contains(&value)
+}
+
+/// What a bucket policy says about `action` on `resource` for a caller that presents NO
+/// credential.
+///
+/// Decided by the tree's ONE evaluation of IAM policy documents
+/// (`service_common::iam_authorization`), which is the same rule every other emulated
+/// service that enforces a resource policy answers with — an explicit `Deny` about the
+/// request wins, otherwise an `Allow` about it grants, and a document that says nothing
+/// about it states nothing. The caller is passed with NO principal spellings at all, which
+/// is exactly what the anonymous caller is: only a statement whose principal element reaches
+/// EVERY principal is about its request, and one naming an account or a role is not.
+pub fn policy_decision_for_anonymous(
+    policy: &str,
+    action: &str,
+    resource: &str,
+) -> ::service_common::iam_authorization::Decision {
+    ::service_common::iam_authorization::resource_decision(
+        policy,
+        &::service_common::iam_authorization::Request::new(action, resource, &[]),
+    )
+}
+
+/// The IAM action an object READ is authorized under: "To use `GetObject`, you must have
+/// the `READ` access to the object (or version)" (`GetObject`'s own documentation), which
+/// is the same permission a read of that object's metadata needs — "A `HEAD` request has
+/// the same options as a `GET` operation on an object" (`HeadObject`'s own documentation).
+pub const GET_OBJECT_ACTION: &str = "s3:GetObject";
+
+/// The `Payer` value under which the REQUESTER, rather than the bucket owner, pays for a
+/// download — one of the two values `Payer` takes (`PAYER_VALUES`), the other being
+/// [`DEFAULT_PAYER`].
+pub const PAYER_REQUESTER: &str = "Requester";
+
+/// The code S3 answers a request its authorization refuses with, and the status and message
+/// that code carries (Amazon S3 "Error responses", list of error codes: "AccessDenied —
+/// Access Denied", HTTP 403).
+pub const ACCESS_DENIED_CODE: &str = "AccessDenied";
+/// See [`ACCESS_DENIED_CODE`].
+pub const ACCESS_DENIED_STATUS: u16 = 403;
+/// See [`ACCESS_DENIED_CODE`] — the text that same published list carries for it.
+pub const ACCESS_DENIED_MESSAGE: &str = "Access Denied";
+
+/// The message S3 refuses a request carrying no credential against a Requester Pays bucket
+/// with: "Anonymous users cannot invoke requests against Requester Pays buckets" — fixed
+/// text with no variable parts, because there is no principal to name.
+///
+/// A Requester Pays bucket charges the REQUESTER, and "requests to a Requester Pays bucket
+/// must be authenticated: you cannot make anonymous requests"
+/// (`PutBucketRequestPayment`'s own documentation of the feature), since an anonymous
+/// request names no account to charge. The acknowledgement header does not rescue it for
+/// the same reason.
+pub const REQUESTER_PAYS_ANONYMOUS_MESSAGE: &str =
+    "Anonymous users cannot invoke requests against Requester Pays buckets. Please \
+     authenticate.";
+
+/// The query parameters a request's CREDENTIAL can travel in when it carries no
+/// `Authorization` header: the SigV4 presigned fields ("`X-Amz-Credential`", "`X-Amz-
+/// Signature`") and the legacy presigned form's access key id (AWS General Reference,
+/// *Authenticating requests: using query parameters*).
+///
+/// `pub(crate)`: the refusal wording asks the same question of the request it is answering
+/// for ([`crate::service::sigv4`]), so both read one catalog.
+pub(crate) const CREDENTIAL_QUERY_PARAMETERS: [&str; 3] =
+    ["X-Amz-Credential", "X-Amz-Signature", "AWSAccessKeyId"];
+
+/// Whether `parts` presents NO credential at all — the ANONYMOUS caller, which is what
+/// decides whether an operation judges the request against what the bucket grants to
+/// everyone.
+///
+/// "If you grant READ access to the anonymous user, the `GetObject` operation returns the
+/// object without using an authorization header" (`GetObject`'s own documentation): a
+/// request carrying a credential speaks for the account that credential names, whatever the
+/// signature then verifies as, and one carrying none speaks for nobody. A credential travels
+/// in the `Authorization` header of a signed request or in the query string of a presigned
+/// one ([`CREDENTIAL_QUERY_PARAMETERS`]).
+pub fn request_is_anonymous(parts: &::http::request::Parts) -> bool {
+    let signed = parts
+        .headers
+        .get(::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| !value.trim().is_empty());
+    if signed {
+        return false;
+    }
+    let query = parts.uri.query().unwrap_or_default();
+    !CREDENTIAL_QUERY_PARAMETERS
+        .iter()
+        .any(|parameter| crate::service::query_carries(query, parameter))
 }
 
 /// The Region a `CreateBucket` request places its bucket in, from the

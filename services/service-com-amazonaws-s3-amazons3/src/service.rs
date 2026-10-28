@@ -503,7 +503,11 @@ const SELECT_SUBRESOURCE: &str = "select";
 /// Whether `query` — a request URI's query string — carries the parameter `name`, with or
 /// without a value. A subresource arrives as a bare flag (`?select`), so a reader that
 /// insisted on `=` would miss it.
-fn query_carries(query: &str, name: &str) -> bool {
+///
+/// `pub(crate)`: the store asks the same question of a request's query string when it reads
+/// whether the request presented a credential there
+/// ([`crate::state::request_is_anonymous`]), so both read a parameter list the one way.
+pub(crate) fn query_carries(query: &str, name: &str) -> bool {
     query
         .split('&')
         .any(|parameter| parameter.split('=').next().unwrap_or(parameter) == name)
@@ -738,7 +742,24 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             // credential travels is not part of addressing, so it is this service's request
             // and is claimed as one. Whether it then VERIFIES is the framework's own
             // judgement, exactly as for the SigV4 query form.
-            None => carries_legacy_presigned_credential(&parts.uri),
+            //
+            // An ANONYMOUS (unsigned) request names no service either: it carries no
+            // credential scope and no `X-Amz-Target`, and the endpoint host a client of this
+            // emulator addresses is a loopback name the framework reads no service label out
+            // of — so no routing key is resolved and no service would claim it, leaving the
+            // router to answer its "no such service" 404. S3 is nonetheless reached
+            // anonymously by design ("if you grant READ access to the anonymous user, the
+            // GetObject operation returns the object without using an authorization header",
+            // `GetObject`'s own documentation), and such a request is this service's when
+            // its PATH addresses a bucket this emulator holds — the path-style half of the
+            // host-addressed rule above, resolved against the same buckets. What the caller
+            // may then do is the operation's own authorization question, which a refusal
+            // answers with S3's own code rather than with a routing error.
+            None => {
+                carries_legacy_presigned_credential(&parts.uri)
+                    || first_path_segment(parts.uri.path())
+                        .is_some_and(|segment| self.holds_bucket(segment))
+            }
         };
         claimed
     }

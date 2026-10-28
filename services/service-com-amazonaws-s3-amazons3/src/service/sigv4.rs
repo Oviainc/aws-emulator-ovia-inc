@@ -33,6 +33,13 @@
 //!    request itself presented. They are the only way a caller (or a human debugging a
 //!    presigner) can tell WHICH canonical request the service signed from a wrong secret
 //!    key, so they are what makes a signing bug diagnosable at all.
+//! 4. The request presented NO credential at all — the ANONYMOUS caller, which is a caller
+//!    S3 serves ("if you grant READ access to the anonymous user, the `GetObject` operation
+//!    returns the object without using an authorization header", `GetObject`'s own
+//!    documentation) rather than one that failed to sign. Nothing was signed, so there is no
+//!    signature to diagnose and no credential to name: S3 answers the authorization refusal
+//!    it answers any caller a bucket grants nothing to, the `AccessDenied` of its published
+//!    error list with that list's own sentence.
 //!
 //! Every one of them is derived from the request as received. Nothing here reads a secret:
 //! the signing key is never named, the signature the service COMPUTED is never answered
@@ -209,6 +216,10 @@ pub(super) struct Presented {
     /// What the signature was computed over, when the request carried a SigV4 signature at
     /// all.
     signing: Option<Signing>,
+    /// Whether the request presented a credential AT ALL — in its `Authorization` header or
+    /// in the query string of a presigned URL. `false` is the ANONYMOUS caller, which is
+    /// refused for what the bucket grants rather than for anything about a signature.
+    carries_credential: bool,
 }
 
 impl Presented {
@@ -235,6 +246,10 @@ impl Presented {
         let signature = field("Signature").unwrap_or_default();
         let carries_signature =
             !scope.is_empty() && !signed_headers.is_empty() && !signature.is_empty();
+        let carries_credential = authorization.is_some()
+            || crate::state::CREDENTIAL_QUERY_PARAMETERS
+                .iter()
+                .any(|parameter| query_parameter(query, parameter).is_some());
         Self {
             access_key_id: bounded(
                 scope
@@ -256,6 +271,7 @@ impl Presented {
                 amz_date: bounded(amz_date),
                 signature: bounded(signature),
             }),
+            carries_credential,
         }
     }
 
@@ -546,8 +562,9 @@ fn amz_instant(stamp: &str) -> Option<SystemTime> {
 /// The order is AWS's: a query string the service cannot use is answered before anything
 /// about the caller, so a presigned URL whose window is outside the accepted range is
 /// refused for the URL whether or not its signature verifies; then the window that has
-/// passed, which refuses an intact signature; and last the signature itself, which is the
-/// only condition left once the credential has resolved.
+/// passed, which refuses an intact signature; then the request that presented no credential
+/// at all, which has neither; and last the signature itself, which is the only condition
+/// left once the credential has resolved.
 pub(super) fn refusal_for(
     presented: &Presented,
     issued: &dyn Fn(&str) -> bool,
@@ -569,6 +586,17 @@ pub(super) fn refusal_for(
             code: REQUEST_EXPIRED_CODE,
             status: UNAUTHENTICATED_STATUS,
             message: REQUEST_EXPIRED_MESSAGE,
+            diagnostics: None,
+        });
+    }
+    if !presented.carries_credential {
+        // Nothing was presented, so nothing about a signature or a credential can be said:
+        // the request speaks for the anonymous caller, and what refused it is that the
+        // bucket grants that caller nothing.
+        return Some(AuthRefusal {
+            code: crate::state::ACCESS_DENIED_CODE,
+            status: UNAUTHENTICATED_STATUS,
+            message: crate::state::ACCESS_DENIED_MESSAGE,
             diagnostics: None,
         });
     }

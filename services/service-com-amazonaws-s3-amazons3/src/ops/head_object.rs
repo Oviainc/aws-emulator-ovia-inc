@@ -342,8 +342,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A read needs nothing from the request beyond its deserialized input.
-        let _ = ctx;
+        // Beyond its deserialized input this read needs only WHO is asking, which decides
+        // whether the bucket's public grants are what admits it (below).
 
         // What this read cannot answer faithfully: `If-None-Match` and `If-Modified-Since`
         // are answered with HTTP 304 and no body when the condition fails, which an
@@ -426,6 +426,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
         let object = held.and_then(crate::state::StoredVersion::as_object);
+        // WHO is asking comes before anything this read reports. A request presenting no
+        // credential speaks for no principal, so it is served only what the bucket grants to
+        // everyone ([`crate::state::Bucket::anonymous_object_read_refusal`] carries that
+        // rule, over the `s3:GetObject` permission a HEAD of an object needs too) and is
+        // otherwise refused with S3's authorization status — ahead of the 404 below, so a
+        // refusal says nothing about whether the key is there. A HEAD carries no body, so
+        // the status is the whole answer.
+        if crate::state::request_is_anonymous(ctx.parts()) {
+            let refused = store.bucket(&input.bucket).and_then(|bucket| {
+                bucket.anonymous_object_read_refusal(&input.bucket, &input.key, object)
+            });
+            if let Some(message) = refused {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::ACCESS_DENIED_CODE,
+                    crate::state::ACCESS_DENIED_STATUS,
+                    message,
+                ));
+            }
+        }
         // A missing bucket and a missing key are both a 404 on a HEAD, which carries no
         // body to tell them apart by an error document. The modelled `NotFound` cannot
         // say it: the shape carries no `@httpError`, so the framework would render the

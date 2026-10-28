@@ -336,7 +336,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Nothing can be reported about an object the emulator cannot look up, and
             // `NoSuchKey` would be a false statement about it, so the scaffold's 501 says
@@ -383,6 +382,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(bucket) = store.bucket(&input.bucket) else {
             return Err(GetObjectErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
         };
+
+        // WHO is asking comes before anything this read reports. A request presenting no
+        // credential speaks for no principal, so it is served only what the bucket grants to
+        // everyone ([`crate::state::Bucket::anonymous_object_read_refusal`] carries that
+        // rule) and is otherwise refused with S3's authorization code — ahead of the key
+        // lookup, so a refusal says nothing about whether the key is there.
+        if crate::state::request_is_anonymous(ctx.parts()) {
+            let addressed = match input.version_id.as_deref() {
+                None => bucket.object(&input.key),
+                Some(version_id) => bucket
+                    .stored_version(&input.key, version_id)
+                    .and_then(crate::state::StoredVersion::as_object),
+            };
+            if let Some(message) =
+                bucket.anonymous_object_read_refusal(&input.bucket, &input.key, addressed)
+            {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::ACCESS_DENIED_CODE,
+                    crate::state::ACCESS_DENIED_STATUS,
+                    message,
+                ));
+            }
+        }
+
         // "To retrieve a specific version, you must be the bucket owner and you must use
         // the versionId subresource" (`GetObject`'s documentation): with one, the read is
         // of that stored version — current or not — and with none it is of the key's
