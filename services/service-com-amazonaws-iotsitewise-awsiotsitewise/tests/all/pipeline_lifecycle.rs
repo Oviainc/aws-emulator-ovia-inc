@@ -86,11 +86,17 @@ fn state(body: &Value) -> &str {
 }
 
 /// `CreatePipeline` with `body`.
+///
+/// A pipeline is created INSIDE a workspace, which the create resolves through the
+/// workspace registry, so this helper opens the workspace it is pointed at first.
+/// A suite that is about an unopened workspace addresses the route directly
+/// instead.
 pub(crate) async fn create(
     router: &MultiServiceRouter,
     workspace: &str,
     body: Value,
 ) -> (u16, Value) {
+    crate::support::ensure_workspace(router, workspace).await;
     call(router, "POST", &pipelines_uri(workspace), Some(body)).await
 }
 

@@ -639,13 +639,17 @@ pub fn deployment_targets<P: ConfigurationParameters + ?Sized>(
 /// deploy to ([`NO_DEPLOYMENT_TARGET_MESSAGE`]), a targeted account is named by its
 /// account id, and the number of account-and-Region deployments one definition fans out
 /// to is bounded by [`MAX_DEPLOYMENT_TARGETS`]. The one place the rule lives, so a
-/// create and an update refuse the same target sets — and, reading the same parameters
-/// [`deployment_targets`] deploys from, refuse exactly the sets that cannot be
-/// deployed. `member` labels the request member the parameters arrived on, so a refusal
-/// stating one of this service's own bounds names what the caller sent.
+/// create and an update refuse the same target sets — and, counting the deployments
+/// [`deployment_targets`] would build from the same parameters, with the same
+/// `local_account` and `local_region` defaults a definition naming no account or no
+/// Region is deployed in, refuse exactly the sets that cannot be deployed. `member`
+/// labels the request member the parameters arrived on, so a refusal stating one of
+/// this service's own bounds names what the caller sent.
 pub fn deployment_targets_rejection<P: ConfigurationParameters + ?Sized>(
     member: &str,
     parameters: &P,
+    local_account: &str,
+    local_region: &str,
 ) -> Option<String> {
     let target_parameters = deployment_target_parameters(parameters);
     let accounts = comma_separated(target_parameters.accounts);
@@ -666,7 +670,10 @@ pub fn deployment_targets_rejection<P: ConfigurationParameters + ?Sized>(
             echoed_value(malformed)
         ));
     }
-    let targets = comma_separated(target_parameters.regions).len().max(1) * accounts.len().max(1);
+    // The bound is read off the deployments themselves rather than off a formula over
+    // the parameter values, so what is counted here is exactly what the definition is
+    // deployed to: whatever a parameter set fans out to, it fans out to that here too.
+    let targets = deployment_targets(parameters, local_account, local_region).len();
     (targets > MAX_DEPLOYMENT_TARGETS).then(|| {
         format!(
             "{member} names {targets} account and Region deployments, more than the \

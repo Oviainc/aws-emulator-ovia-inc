@@ -204,25 +204,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // `MaxResults` is modelled `@range(min: 1, max: 100)` with `@default(20)`,
-        // so the boundary has applied the default. The range is CHECKED here
-        // rather than assumed: a page size outside it is refused with the
-        // modelled `ValidationException`, so no request can reach the paging
-        // arithmetic with a size the model does not allow.
-        if !(1..=crate::state::LIST_ASSESSMENTS_PAGE_LIMIT).contains(&input.max_results) {
-            return Err(ListAssessmentsErrorModeled::ValidationException(
-                crate::state::validation(
-                    "MaxResults",
-                    format!(
-                        "ListAssessments serves between 1 and {} assessments a page, not {}",
-                        crate::state::LIST_ASSESSMENTS_PAGE_LIMIT,
-                        input.max_results
-                    ),
-                ),
-            )
-            .into());
-        }
-        let page_size =
-            usize::try_from(input.max_results).expect("a page size in 1..=100 fits in usize");
+        // so the boundary has applied the default; the range itself is judged by
+        // the one page-size rule in `crate::state::page_size`, so no request can
+        // reach the paging arithmetic with a size the model does not allow.
+        let page_size = match crate::state::page_size(
+            "ListAssessments",
+            "assessments",
+            crate::state::LIST_ASSESSMENTS_PAGE_LIMIT,
+            Some(input.max_results),
+        ) {
+            Ok(page_size) => page_size,
+            Err(fault) => {
+                return Err(ListAssessmentsErrorModeled::ValidationException(fault).into())
+            }
+        };
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();

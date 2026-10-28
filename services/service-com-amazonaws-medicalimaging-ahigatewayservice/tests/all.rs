@@ -29,6 +29,8 @@ mod image_set_access_time;
 mod image_set_copy;
 #[path = "all/image_set_copy_subsets.rs"]
 mod image_set_copy_subsets;
+#[path = "all/image_set_copy_tombstones.rs"]
+mod image_set_copy_tombstones;
 #[path = "all/image_set_deletion.rs"]
 mod image_set_deletion;
 #[path = "all/image_set_metadata.rs"]

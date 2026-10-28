@@ -92,7 +92,12 @@
 //! What it serves is the document the export STORED
 //! (`crate::state::InquiryExport::document`), rendered from the inquiry when the export
 //! ran: a download is a pure read, and a URL whose export has since been released, or
-//! that names another inquiry or another object, is `404`.
+//! that names another inquiry or another object, serves no document. The fetch is
+//! authorised by the download token the announced URL carries
+//! (`crate::state::InquiryExport::download_token`), the ONE thing a caller that was handed
+//! the URL holds — the ids its path carries are minted from counters, so they authorise
+//! nobody — and a fetch presenting no such token is refused `403`, as the report plane
+//! below refuses a fetch carrying no term grant.
 //!
 //! The REPORT and TERM documents `GetReport` and `GetTermForReport` hand out are served
 //! the same way, by [`Documents`] under `crate::state::DOCUMENT_PATH_PREFIX`: their bytes
@@ -427,7 +432,7 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for Documents<Eng> {
             // 404 here would let anyone probe which report ids exist. Only a path this
             // rule authorises can be answered `404`, for the version or the object the
             // report does not publish.
-            let token = query_param(&query, "termToken").unwrap_or_default();
+            let token = query_param(&query, crate::state::TERM_TOKEN_PARAM).unwrap_or_default();
             let authorised = store
                 .reports
                 .get(&wanted.report_id)
@@ -934,9 +939,22 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     ///
     /// A download is a pure READ: it answers the bytes the export stored and writes
     /// nothing, so following a presigned URL twice answers the same document and changes
-    /// nothing a later caller sees. The export, the inquiry it was taken from and the
-    /// object name must all agree with the URL — an export this store no longer holds, or
-    /// a path that crosses one export's id with another inquiry's id, names no document.
+    /// nothing a later caller sees.
+    ///
+    /// The fetch is authorised by the token the announced URL carries, by the one rule
+    /// `crate::state` holds the export-download question in
+    /// ([`crate::state::ComAmazonawsArtifactArtifactState::export_download_authorised`]),
+    /// as a report download is authorised by its term grant's: the URL was handed to one
+    /// caller, and the token is what that caller holds. A fetch carrying NO token carries
+    /// no receipt, so the empty token is what that rule is asked about.
+    ///
+    /// DELIBERATE ORDERING, the same the report plane answers under: authorization first,
+    /// so a path naming an export this store does not hold — one it never minted, one it
+    /// has since released, or a path crossing one export's id with another inquiry's — is
+    /// refused as unauthorised (403) rather than reported as absent, because the ids the
+    /// path carries are minted from counters and a 404 here would let anyone enumerate
+    /// which exports exist. Only a path this rule authorises can be answered `404`, for an
+    /// object the export does not publish.
     fn serve_export_document(
         &self,
         req: &RtRequest,
@@ -952,14 +970,35 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
                 "the artifact compliance inquiry store is unavailable",
             );
         };
+        let (_, query) = split_uri(req.uri());
         let store = state.lock();
-        let found = store.inquiry_exports.get(&target.export_id).filter(|export| {
-            export.inquiry_id == target.inquiry_id
-                && target.object == crate::state::INQUIRY_EXPORT_OBJECT
-        });
+        let token =
+            query_param(&query, crate::state::INQUIRY_EXPORT_TOKEN_PARAM).unwrap_or_default();
+        if !store.export_download_authorised(&token, target) {
+            ::tracing::info!(
+                operation = "GetComplianceInquiryExportDocument",
+                compliance_inquiry_id = ?target.inquiry_id,
+                export_id = ?target.export_id,
+                outcome = "denied",
+                reason = "no export token authorises this document",
+                "refused a document fetch"
+            );
+            return document_error(403, "AccessDenied", crate::state::INVALID_TOKEN_MESSAGE);
+        }
+        let found = store
+            .inquiry_exports
+            .get(&target.export_id)
+            .filter(|_| target.object == crate::state::INQUIRY_EXPORT_OBJECT);
         let Some(export) = found else {
             return document_error(404, "NoSuchKey", DOCUMENT_NOT_FOUND_MESSAGE);
         };
+        ::tracing::info!(
+            operation = "GetComplianceInquiryExportDocument",
+            compliance_inquiry_id = ?target.inquiry_id,
+            export_id = ?target.export_id,
+            outcome = "served",
+            "served a document"
+        );
 
         // The same serving rule both document planes answer under: a `GET` carries the
         // bytes and a `HEAD` reports the metadata without them.

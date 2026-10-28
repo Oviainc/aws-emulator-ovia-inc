@@ -212,7 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resolved as a unit: a pool that is not stored holds no domain,
         // exactly as a stored pool holds none under a name it never took.
         let Some(pool) = guard.pool(&input.user_pool_id) else {
-            return Err(no_such_domain());
+            return Err(user_pool_domain_not_found());
         };
         let user_pool_tier = pool.user_pool_tier.clone();
 
@@ -223,7 +223,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resource of this pool's — whichever of its two domain slots it would
         // have lived in.
         let Some(stored) = pool.domain_named(&input.domain) else {
-            return Err(no_such_domain());
+            return Err(user_pool_domain_not_found());
         };
         let custom = stored.is_custom();
 
@@ -336,18 +336,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
+/// The one sentence this operation's `ResourceNotFoundException` carries.
+///
+/// Fixed text in full, with no variable part: the pair `UserPoolId` + `Domain`
+/// is resolved as a UNIT, so the refusal reports that the pair holds no domain
+/// and names neither half, whichever of the two the caller got wrong.
+const USER_POOL_DOMAIN_NOT_FOUND_MESSAGE: &str = "User pool domain was not found.";
+
 /// This operation's refusal of a request whose `UserPoolId` + `Domain` pair
 /// holds no stored domain — a pool that is not stored, or one that holds no
 /// domain of that name (including a name another pool holds).
 ///
-/// The pair names the domain to update, so failing to resolve it is a bad
-/// parameter rather than a resource this operation looked up by its own id:
-/// `InvalidParameterException` is "thrown when the Amazon Cognito service
-/// encounters an invalid parameter" (this service's model), and the one sentence
-/// it carries ([`crate::state::NO_SUCH_DOMAIN_MESSAGE`]) reports the pair
-/// without naming either half.
-fn no_such_domain() -> UpdateUserPoolDomainError {
-    invalid_parameter(crate::state::NO_SUCH_DOMAIN_MESSAGE.to_string())
+/// The pair names an EXISTING domain record for this operation to reconfigure
+/// ("This operation doesn't change the name of your user pool domain"), so a
+/// pair that resolves none names a resource that is gone, not a malformed
+/// parameter: `ResourceNotFoundException` is "thrown when the Amazon Cognito
+/// service can't find the requested resource" (this service's model) and the
+/// model gives it HTTP 404, which is the signal a client keys its "recreate the
+/// resource" path on. `DeleteUserPoolDomain` refuses the same unresolvable pair
+/// differently, so the two operations deliberately share no refusal helper.
+fn user_pool_domain_not_found() -> UpdateUserPoolDomainError {
+    UpdateUserPoolDomainErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(USER_POOL_DOMAIN_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
 }
 
 /// This operation's `InvalidParameterException`, which names the member the

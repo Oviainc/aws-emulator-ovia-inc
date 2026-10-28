@@ -47,12 +47,12 @@ use super::bucket_lifecycle::{create_bucket, router, send, Answer};
 const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 
 /// The whole `WebsiteConfiguration` document for the members `inner` spells.
-fn payload(inner: &str) -> String {
+pub(crate) fn payload(inner: &str) -> String {
     format!("<WebsiteConfiguration xmlns=\"{XMLNS}\">{inner}</WebsiteConfiguration>")
 }
 
 /// `PUT /<bucket>?website` — `PutBucketWebsite`.
-async fn put_website(router: &MultiServiceRouter, bucket: &str, inner: &str) -> Answer {
+pub(crate) async fn put_website(router: &MultiServiceRouter, bucket: &str, inner: &str) -> Answer {
     send(
         router,
         "PUT",
@@ -64,17 +64,17 @@ async fn put_website(router: &MultiServiceRouter, bucket: &str, inner: &str) -> 
 }
 
 /// `GET /<bucket>?website` — `GetBucketWebsite`.
-async fn get_website(router: &MultiServiceRouter, bucket: &str) -> Answer {
+pub(crate) async fn get_website(router: &MultiServiceRouter, bucket: &str) -> Answer {
     send(router, "GET", &format!("/{bucket}?website"), &[], "").await
 }
 
 /// An `IndexDocument` container naming `suffix`.
-fn index_document(suffix: &str) -> String {
+pub(crate) fn index_document(suffix: &str) -> String {
     format!("<IndexDocument><Suffix>{suffix}</Suffix></IndexDocument>")
 }
 
 /// An `ErrorDocument` container naming `key`.
-fn error_document(key: &str) -> String {
+pub(crate) fn error_document(key: &str) -> String {
     format!("<ErrorDocument><Key>{key}</Key></ErrorDocument>")
 }
 
@@ -187,7 +187,7 @@ const REDIRECT_EVERYTHING: &str =
 /// one value the issue's recorded call sent), how MANY routing rules it carries (none, one,
 /// several and the documented ceiling), the ORDER those rules arrive in, and the order the
 /// members themselves are spelled in.
-fn round_trip_rows() -> Vec<(String, String)> {
+pub(crate) fn round_trip_rows() -> Vec<(String, String)> {
     let index = index_document("index.html");
     let prefix_condition = "<Condition><KeyPrefixEquals>docs/</KeyPrefixEquals></Condition>";
     let error_condition =

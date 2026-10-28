@@ -171,19 +171,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The listing is scoped to ONE workspace, so a workspace this service holds no
         // record of is the modelled refusal rather than an empty page, which would
-        // report absence as success. "Holds" is decided by the STORE, and a job stored
-        // under a workspace is such a record: the create keys a job by
-        // `(workspaceName, jobId)` without consulting the workspace registry, so
-        // refusing on the registry alone would hide jobs this service really holds.
+        // report absence as success. The workspace registry is the one place that says
+        // which workspaces exist — the create resolves a job's workspace there too, so
+        // no job can be stored under a workspace the registry does not hold.
         // Resolved BEFORE the filter and the paging arguments are read, as every
         // handler in this crate resolves the resource its path names first, so a
         // request that is wrong in both ways reports the resource that is absent.
-        let holds_workspace = store.workspaces.contains_key(&input.workspace_name)
-            || store
-                .dataset_export_jobs
-                .keys()
-                .any(|(workspace, _)| *workspace == input.workspace_name);
-        if !holds_workspace {
+        if !store.workspaces.contains_key(&input.workspace_name) {
             return Err(not_found(crate::state::not_found_message(
                 crate::state::RESOURCE_WORKSPACE,
                 &input.workspace_name,

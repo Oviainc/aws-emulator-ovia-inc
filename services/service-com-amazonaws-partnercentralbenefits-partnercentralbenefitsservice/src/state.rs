@@ -2089,9 +2089,10 @@ pub fn details_requirement(details: Option<&Document>) -> Option<String> {
 /// guards is answered with, or `None` when the document can be stored.
 ///
 /// `member` is the input member the document arrived on, spelled as the wire spells it,
-/// so the clause names the member the caller must fix. The message goes through the same
-/// two helpers every other in-handler refusal of this service uses
-/// ([`crate::service::member_clause`] and [`crate::service::validation_envelope`]), so a
+/// so the clause names the member the caller must fix. The exception is built by the one
+/// construction every member refusal of this crate goes through
+/// ([`member_validation_exception`], which renders the message with
+/// [`crate::service::member_clause`] and [`crate::service::validation_envelope`]), so a
 /// client that parses a clause to learn which member and which requirement failed reads
 /// this refusal exactly as it reads one the centralized walk produced, and NOTHING of the
 /// rejected document is echoed.
@@ -2104,17 +2105,11 @@ pub fn details_refusal(
     details: Option<&Document>,
 ) -> Option<crate::ops::types::ValidationException> {
     let requirement = details_requirement(details)?;
-    let clause = crate::service::member_clause(member, &requirement, false);
-    Some(crate::ops::types::ValidationException {
-        message: crate::service::validation_envelope(std::slice::from_ref(&clause))
-            .unwrap_or_else(|| clause.clone()),
-        reason: VALIDATION_REASON_FIELD.to_string(),
-        field_list: Some(validation_field(
-            member,
-            &requirement,
-            VALIDATION_CODE_INVALID_VALUE,
-        )),
-    })
+    Some(member_validation_exception(
+        member,
+        &requirement,
+        VALIDATION_REASON_FIELD,
+    ))
 }
 
 /// How many members and how many bytes of text `value` holds, over the whole tree: the
@@ -2205,17 +2200,11 @@ pub fn benefit_schema_refusal(
     details: Option<&Document>,
 ) -> Option<crate::ops::types::ValidationException> {
     let violation = benefit_schema_violation(schema, details)?;
-    let clause = crate::service::member_clause(&violation.member, &violation.requirement, false);
-    Some(crate::ops::types::ValidationException {
-        message: crate::service::validation_envelope(std::slice::from_ref(&clause))
-            .unwrap_or_else(|| clause.clone()),
-        reason: VALIDATION_REASON_FIELD.to_string(),
-        field_list: Some(validation_field(
-            &violation.member,
-            &violation.requirement,
-            VALIDATION_CODE_INVALID_VALUE,
-        )),
-    })
+    Some(member_validation_exception(
+        &violation.member,
+        &violation.requirement,
+        VALIDATION_REASON_FIELD,
+    ))
 }
 
 /// Why `details` does not satisfy `schema`, or `None` when it does: the rule
@@ -2319,17 +2308,11 @@ pub fn benefit_not_offered_refusal(
         "Member must name a benefit the catalog offers, which a {} benefit is not",
         benefit.status
     );
-    let clause = crate::service::member_clause(member, &requirement, false);
-    Some(crate::ops::types::ValidationException {
-        message: crate::service::validation_envelope(std::slice::from_ref(&clause))
-            .unwrap_or_else(|| clause.clone()),
-        reason: VALIDATION_REASON_BUSINESS.to_string(),
-        field_list: Some(validation_field(
-            member,
-            &requirement,
-            VALIDATION_CODE_INVALID_VALUE,
-        )),
-    })
+    Some(member_validation_exception(
+        member,
+        &requirement,
+        VALIDATION_REASON_BUSINESS,
+    ))
 }
 
 /// The stored `FileDetail` for one supplied `FileInput`.
@@ -2712,8 +2695,9 @@ pub fn reserved_tag_key_requirement() -> String {
 ///
 /// `member` is the input member those keys came from, spelled as the wire spells it
 /// (`tags` / `tagKeys` on the tagging operations, `Tags` on a create), so the clause names
-/// the member the caller must fix. The message goes through the same two helpers every
-/// other in-handler refusal uses ([`crate::service::member_clause`] and
+/// the member the caller must fix. The exception is built by the one construction every
+/// member refusal of this crate goes through ([`member_validation_exception`], which
+/// renders the message with [`crate::service::member_clause`] and
 /// [`crate::service::validation_envelope`]) and echoes NOTHING of the rejected value; the
 /// element path collapses onto the collection member, the way the walk reports a violation
 /// on a collection's element.
@@ -2727,18 +2711,11 @@ pub fn reserved_tag_key_refusal<'a>(
     if !keys.into_iter().any(is_reserved_tag_key) {
         return None;
     }
-    let requirement = reserved_tag_key_requirement();
-    let clause = crate::service::member_clause(member, &requirement, false);
-    Some(crate::ops::types::ValidationException {
-        message: crate::service::validation_envelope(std::slice::from_ref(&clause))
-            .unwrap_or_else(|| clause.clone()),
-        reason: VALIDATION_REASON_FIELD.to_string(),
-        field_list: Some(validation_field(
-            member,
-            &requirement,
-            VALIDATION_CODE_INVALID_VALUE,
-        )),
-    })
+    Some(member_validation_exception(
+        member,
+        &reserved_tag_key_requirement(),
+        VALIDATION_REASON_FIELD,
+    ))
 }
 
 /// A stored tag set as the modelled `Tags` list, in tag-key order.
@@ -2814,6 +2791,37 @@ pub fn validation_field(
         message: message.to_string(),
         code: Some(code.to_string()),
     }]
+}
+
+/// This service's modelled `ValidationException` refusing ONE input member: the clause
+/// that names the member and the requirement it failed, under the AWS validation
+/// envelope, with the one-member `FieldList` that says which member a client must fix.
+///
+/// The single construction every in-handler refusal of a member goes through — the
+/// clause ([`crate::service::member_clause`]), the envelope
+/// ([`crate::service::validation_envelope`], whose one-clause form always renders, the
+/// bare clause standing in only for the case it declines) and the field list
+/// ([`validation_field`]) — so the message, the reason and the field list of a refusal
+/// cannot drift between the operations that answer one. `reason` is the
+/// `ValidationExceptionReason` the refusal class carries: [`VALIDATION_REASON_FIELD`] for
+/// a member whose value this service does not accept, [`VALIDATION_REASON_BUSINESS`] for
+/// a well-formed request a rule of the service's own refuses.
+pub fn member_validation_exception(
+    member: &str,
+    requirement: &str,
+    reason: &str,
+) -> crate::ops::types::ValidationException {
+    let clause = crate::service::member_clause(member, requirement, false);
+    crate::ops::types::ValidationException {
+        message: crate::service::validation_envelope(std::slice::from_ref(&clause))
+            .unwrap_or(clause),
+        reason: reason.to_string(),
+        field_list: Some(validation_field(
+            member,
+            requirement,
+            VALIDATION_CODE_INVALID_VALUE,
+        )),
+    }
 }
 
 /// The page size a list operation uses, from the `MaxResults` the request asked for.

@@ -2,11 +2,13 @@
 
 //! @op CancelQuery
 //! Cancels one query in flight on one graph: the request names the graph
-//! (`graphIdentifier`) and the query running on it (`queryId`), and a graph or a query
-//! this store does not hold is a 404 `ResourceNotFoundException`. The cancel is
-//! ACCEPTED here, not finished — the query reports `CANCELLING` until the clock makes
-//! its termination due ([`crate::state::CANCELLATION_SPAN`]), after which it has
-//! stopped and is no longer a query the service reports. The operation is
+//! (`graphIdentifier`) and the query running on it (`queryId`). A graph or a query
+//! this store does not hold is a 404 `ResourceNotFoundException`, and a graph that is
+//! not serving is a 400 `ValidationException`: this operation is reached through the
+//! graph's own data plane, which answers only while the graph is `AVAILABLE`. The
+//! cancel is ACCEPTED here, not finished — the query reports `CANCELLING` until the
+//! clock makes its termination due ([`crate::state::CANCELLATION_SPAN`]), after which
+//! it has stopped and is no longer a query the service reports. The operation is
 //! `@idempotent`, so cancelling a query already stopping is the same empty 200 and
 //! leaves the termination it is already owed where it is.
 //!
@@ -184,14 +186,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // exactly one Region, so one of another Region is not found here. The lookup
         // settles the transitions the clock has already made due, so a graph whose
         // provisioning has come due is a graph queries can be cancelled on.
-        if store
-            .settled_graph(&input.graph_identifier, &region, now)
-            .is_none()
-        {
+        let Some(graph) = store.settled_graph(&input.graph_identifier, &region, now) else {
             return Err(CancelQueryErrorModeled::ResourceNotFoundException(
                 crate::state::graph_not_found(&input.graph_identifier),
             )
             .into());
+        };
+
+        // A cancel is sent to the graph's OWN data endpoint — the operation is bound to
+        // the host prefix `{graphIdentifier}.`
+        // (`smithy_query(query="operation",operation="CancelQuery")` -> endpoint) — and
+        // that endpoint serves only while the graph is serving, so a graph that is not
+        // serving is running nothing this call could stop. That precondition and the
+        // refusal it is reported with are the ONE rule `crate::state` states for every
+        // operation on that endpoint, and it is settled before the query lookup: this
+        // request would otherwise write a cancellation through a plane that is not
+        // answering.
+        if !graph.status.is_serving() {
+            let refused = crate::state::graph_data_plane_unavailable(
+                &graph.id,
+                graph.status,
+                "cancel a query on",
+            );
+            return Err(CancelQueryErrorModeled::ValidationException(refused).into());
         }
 
         // Only a query still in flight on THAT graph can be cancelled: one that has

@@ -991,6 +991,9 @@ async fn ldaps_settings_report_exactly_what_the_store_holds() {
                     status: (*status).to_string(),
                     status_reason: Some(reason.clone()),
                     last_updated: updated,
+                    // A seeded status owes the clock nothing: each row pins what the
+                    // read reports for the status it holds, so nothing may move it.
+                    status_due_at: None,
                 },
             );
         });

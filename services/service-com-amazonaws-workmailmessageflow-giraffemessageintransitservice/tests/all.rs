@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/header_block_ceiling.rs"]
 mod header_block_ceiling;
+#[path = "all/header_block_walk.rs"]
+mod header_block_walk;
 #[path = "all/mime_header_criteria.rs"]
 mod mime_header_criteria;
 #[path = "all/mime_header_field_position.rs"]
