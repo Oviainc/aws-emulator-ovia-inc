@@ -41,21 +41,25 @@ use crate::rest_api_lifecycle::{create_api, create_resource, string_member, Gate
 const REGION: &str = "us-east-1";
 
 /// One answered invoke: the status line, the headers asserted on, and the body verbatim.
-struct Invoked {
-    status: u16,
+///
+/// `pub(crate)` with [`invoke`], so the sibling `test_invoke_method_data_plane_parity`
+/// suite compares a SIMULATED invocation against what this endpoint serves for the same
+/// records through this one reader rather than a second one of its own.
+pub(crate) struct Invoked {
+    pub(crate) status: u16,
     headers: std::collections::HashMap<String, String>,
-    body: String,
+    pub(crate) body: String,
 }
 
 impl Invoked {
     /// One response header, lowercased as HTTP names compare.
-    fn header(&self, name: &str) -> Option<&str> {
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
         self.headers.get(name).map(String::as_str)
     }
 
     /// The `message` member of a JSON body, which is what every API Gateway gateway
     /// response carries; `None` for a body that is not such an object.
-    fn message(&self) -> Option<String> {
+    pub(crate) fn message(&self) -> Option<String> {
         serde_json::from_str::<Value>(&self.body)
             .ok()?
             .get("message")?
@@ -74,7 +78,10 @@ fn invoke_host(api: &str) -> String {
 ///
 /// `host` is the api's own endpoint rather than the control plane's, which is the whole
 /// point: the data plane is reached by HOST.
-async fn invoke(
+///
+/// `pub(crate)` for the sibling `test_invoke_method_data_plane_parity` suite; see
+/// [`Invoked`].
+pub(crate) async fn invoke(
     gateway: &Gateway,
     api: &str,
     verb: &str,

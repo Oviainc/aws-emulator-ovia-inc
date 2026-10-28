@@ -323,11 +323,10 @@ async fn deleting_a_binding_of_another_account_is_refused_and_writes_nothing() {
             "case {case:?}: a cross-account refusal must withhold the submitted ARN, \
              got {refusal}"
         );
-        assert!(
-            message.contains(state::ACME_EXTERNAL_ACCOUNT_BINDING_SEGMENT)
-                && message.contains("cross-account"),
-            "case {case:?}: expected the cross-account verdict for the ARN's own resource \
-             type, got {refusal}"
+        assert_eq!(
+            message,
+            crate::acme_authorization::CROSS_ACCOUNT_ARN_MESSAGE,
+            "case {case:?}: expected the cross-account verdict's fixed sentence, got {refusal}"
         );
     }
 

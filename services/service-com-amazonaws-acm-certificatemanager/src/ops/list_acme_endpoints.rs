@@ -145,9 +145,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // No request metadata is needed: this operation lists the endpoints this
-        // account holds, and each record already carries the ARN it was minted with.
-        let _ = ctx;
+        // Authorization comes FIRST: AWS decides it at the IAM layer, ahead of the
+        // service looking at anything, so a caller whose identity-based policies do not
+        // allow the action is refused without being told what this account holds. The
+        // request names no resource of its own, so what IAM evaluates is the collection
+        // this list reaches — every ACME endpoint of this account in the Region the
+        // caller signed for ([`crate::service::authorization::collection_arn`]). Nothing
+        // else about the request is needed: each record already carries the ARN it was
+        // minted with.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::service::authorization::collection_arn(
+                ctx,
+                crate::state::ACME_ENDPOINT_RESOURCE_TYPE,
+            ),
+        )
+        .map_err(ListAcmeEndpointsErrorModeled::AccessDeniedException)?;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Unreachable in the assembled emulator (the engine IS the shared store);
             // this operation models a server fault, so that is the honest answer.

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteChannel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteChannel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteChannel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the channel `crate::state`'s `channels` store holds under the `ChannelARN` the
+//! request names, inside the region the request was signed for: "Deleting a channel stops
+//! delivery from the source stream to the destination", so the whole record goes and the
+//! channel is no resource of this account any more — a later `DescribeChannel` or
+//! `ListChannels` reports it gone and its name is free for another create. A channel still
+//! inside the transition its create or its last accepted change armed is refused with
+//! `ResourceInUseException`, and an ARN this account and region hold no channel under with
+//! `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -109,7 +109,16 @@ impl ::aws_smithy_schema::serde::SerializableStruct for DeleteChannelOutput {
 // here — hence the `DeleteChannelError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.kinesis#DeleteChannel")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.kinesis#DeleteChannel",
+    // Two shapes this SERVICE models that the operation shape does not list are widened in
+    // with `extra_errors`: `ResourceInUseException` ("The resource is not available for this
+    // operation. For successful operation, the resource must be in the ACTIVE state"), which
+    // is what a channel still inside a transition earns from every channel write, and
+    // `InternalFailureException`, the only honest answer for a service mounted on an engine
+    // that holds no state for it.
+    extra_errors = ["ResourceInUseException", "InternalFailureException"]
+)]
 #[derive(Debug)]
 pub enum DeleteChannelErrorModeled {
     AccessDeniedException(AccessDeniedException),
@@ -117,6 +126,8 @@ pub enum DeleteChannelErrorModeled {
     LimitExceededException(LimitExceededException),
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
+    ResourceInUseException(ResourceInUseException),
+    InternalFailureException(InternalFailureException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -142,6 +153,82 @@ impl From<DeleteChannelErrorModeled> for DeleteChannelError {
 /// concrete engine where it mounts the service, not here.
 pub struct DeleteChannel<Eng> {
     engine: ::std::sync::Arc<Eng>,
+}
+
+/// Record this state-changing call for attribution: the access key id the caller presented
+/// (a public identifier, never a secret), the region the channel was deleted in, and how the
+/// call ended. No channel name and no ARN: a log sink needs neither to attribute the change.
+fn audit(akid: &str, region: &str, outcome: &str) {
+    ::tracing::info!(
+        target: "emulator::audit",
+        operation = "DeleteChannel",
+        akid = %akid,
+        region = %region,
+        outcome = %outcome,
+        "state-changing operation"
+    );
+}
+
+/// Refuse the request because the `ChannelARN` it names is one this account and region do
+/// not hold, worded exactly as the reads word it: one rule, one phrasing, for every
+/// operation that addresses a channel.
+fn not_found(message: String) -> DeleteChannelError {
+    DeleteChannelErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Refuse the request because the channel it names is "not available for this operation": a
+/// channel whose create or whose accepted change is still due is one no further change may be
+/// applied to, since "For successful operation, the resource must be in the ACTIVE state"
+/// (`ResourceInUseException`).
+fn resource_in_use(message: String) -> DeleteChannelError {
+    DeleteChannelErrorModeled::ResourceInUseException(ResourceInUseException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Remove the channel the request names, or answer the modelled refusal that stands in the
+/// way.
+///
+/// The whole read-and-write lives here so the caller holds the store's lock for exactly this
+/// long — which is what makes two overlapping deletes of one channel settle: the one that
+/// takes the lock first removes the record, and the second finds no channel under the ARN and
+/// is told so, exactly as a delete of a channel nothing created is.
+fn delete_channel(
+    store: &mut crate::state::ComAmazonawsKinesisKinesis20131202State,
+    region: &str,
+    now: ::std::time::SystemTime,
+    input: &DeleteChannelInput,
+) -> Result<(), DeleteChannelError> {
+    // `ChannelARN` is the only identifier this operation takes (`@required`), and a channel
+    // "is unique within your Amazon Web Services account and Amazon Web Services Region", so
+    // the region the request was signed for is the one whose channels it addresses.
+    let identifier = input.channel_arn.as_str();
+    let channel = store
+        .channel_by_arn(region, identifier)
+        .ok_or_else(|| not_found(crate::state::channel_not_found_message(identifier)))?;
+
+    // A channel whose create or whose previous change is still due is in use by that
+    // transition, so the delete is refused and the record is left exactly as it was; the
+    // caller retries once the channel reports `ACTIVE`.
+    let status = channel.status(now);
+    if status != crate::state::CHANNEL_ACTIVE {
+        return Err(resource_in_use(crate::state::channel_not_active_message(
+            identifier, status,
+        )));
+    }
+
+    // "Deleting a channel stops delivery from the source stream to the destination"
+    // (`DeleteChannel`): the whole record goes, so nothing of it is read afterwards — the
+    // channel is no resource of this account any more, its tags included, and the name it
+    // held is free for another create. "Data already delivered to the destination is not
+    // deleted", and this emulator delivers nothing, so there is nothing else to drop.
+    let key = crate::state::RegionalName::new(region, &channel.name);
+    store.channels.remove(&key);
+    Ok(())
 }
 
 impl<Eng> DeleteChannel<Eng> {
@@ -170,18 +257,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteChannel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteChannelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteChannel"))
+        // The credential scope's access key id is read only to ATTRIBUTE the change
+        // ([`audit`]); the region it names is the region whose channels this request
+        // addresses, since a channel name "is unique within your Amazon Web Services account
+        // and Amazon Web Services Region".
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+        let region = crate::state::request_region(ctx);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            audit(&akid, &region, "unavailable");
+            DeleteChannelError::from(DeleteChannelErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the channel store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let deleted = {
+            let mut store = state.lock();
+            delete_channel(&mut store, &region, now, &input)
+        };
+        audit(
+            &akid,
+            &region,
+            if deleted.is_ok() { "deleted" } else { "refused" },
+        );
+        deleted?;
+
+        // `DeleteChannel` models no output members (its output shape is `Unit`): the channel
+        // it named is gone, which is the whole answer.
+        Ok(DeleteChannelOutput)
     }
 }

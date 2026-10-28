@@ -2634,11 +2634,24 @@ pub const CHANNEL_DESTINATION_REQUIRED_MESSAGE: &str =
     "You must specify either S3DestinationConfiguration or S3TablesDestinationConfiguration, \
      but not both.";
 
-/// How a read states that this account and region hold no channel under the ARN the request
-/// named. Built FROM the request, so the identifier at fault is what names it.
+/// The channel name an identifier carries: a `ChannelARN` ends in the resource
+/// `channel/<name>` (pattern `^arn:aws.*:kinesis:.*:\d{12}:channel/\S+$`) and a `ChannelName`
+/// carries no `/` (pattern `^[a-zA-Z0-9_.-]+$`), so the name is what follows the last one —
+/// and an identifier that carries none is already a bare name, answered as it arrived.
+pub fn channel_name_in(identifier: &str) -> &str {
+    identifier
+        .rsplit_once('/')
+        .map_or(identifier, |(_, name)| name)
+}
+
+/// How an operation states that this account holds no channel under the identifier the
+/// request named. Built FROM the request and the account serving it: the channel is named the
+/// way a client addresses it — by its NAME, which is what the `ChannelARN` carries as its
+/// resource ([`channel_name_in`]) — and never by anything else the store happens to hold.
 pub fn channel_not_found_message(identifier: &str) -> String {
     format!(
-        "channel {identifier} not found under account {}",
+        "Channel {} under account {} not found.",
+        channel_name_in(identifier),
         ::engine::emulator_account_id()
     )
 }

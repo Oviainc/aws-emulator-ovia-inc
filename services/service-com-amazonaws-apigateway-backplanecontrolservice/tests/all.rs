@@ -250,3 +250,5 @@ mod model_collection;
 mod delete_domain_name_access_association;
 #[path = "all/base_path_mapping_collection.rs"]
 mod base_path_mapping_collection;
+#[path = "all/test_invoke_method_data_plane_parity.rs"]
+mod test_invoke_method_data_plane_parity;
