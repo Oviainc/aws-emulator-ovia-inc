@@ -36,7 +36,7 @@ use crate::comment_lifecycle::OTHER_ACCESS_KEY_ID;
 use crate::compared_commit_comments::refused;
 use crate::pull_request_comments::{pull_request_on, PullRequest, AFTER_LINES, PATH};
 use crate::repository_lifecycle::{emulator_with_engine, is_uuid, ok, string_at};
-use crate::wire::{caller_arn, ok_as, DEFAULT_ACCESS_KEY_ID};
+use crate::wire::{caller_arn, emulator_with_callers, ok_as, DEFAULT_ACCESS_KEY_ID};
 
 /// A comment id of the form the service mints ids in that no comment was minted
 /// as: what a reply to a comment the service does not hold names.
@@ -240,7 +240,7 @@ async fn a_reply_is_stored_in_the_thread_of_the_comment_it_replies_to() {
 
     for (index, case) in cases().into_iter().enumerate() {
         let label = case.label;
-        let (router, engine) = emulator_with_engine();
+        let (router, engine) = emulator_with_callers(&[OTHER_ACCESS_KEY_ID]);
         let pr = pull_request_on(&router, &format!("comment-replies-{index}")).await;
         let thread = thread_to_reply_into(&router, &pr, case.parent).await;
 

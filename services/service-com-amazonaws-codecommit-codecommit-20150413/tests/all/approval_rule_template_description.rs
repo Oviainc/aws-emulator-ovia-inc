@@ -233,9 +233,9 @@ async fn an_updated_template_description_is_read_back_from_state() {
 
 #[tokio::test]
 async fn the_change_records_the_calling_identity_as_the_last_modifier() {
-    let router = emulator();
     let creator = "AKIDCREATOR";
     let updater = "AKIDUPDATER";
+    let (router, _engine) = crate::wire::emulator_with_callers(&[creator, updater]);
 
     crate::wire::ok_as(
         &router,

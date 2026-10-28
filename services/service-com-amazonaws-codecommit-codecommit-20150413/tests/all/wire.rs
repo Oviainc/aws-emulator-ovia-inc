@@ -11,22 +11,99 @@
 //! tested by calling as two different principals. That default harness builds its
 //! requests through [`call_as`] too, so there is exactly one request builder.
 
+use std::sync::Arc;
+
 use serde_json::Value;
 use smithy_server_runtime::MultiServiceRouter;
+
+use service_com_amazonaws_iam_awsidentitymanagementv20100508::ops::types::User;
+use service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam;
+use service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts;
 
 use crate::repository_lifecycle::REGION;
 
 /// The access key id a request is signed with unless a suite is checking that the
-/// service tells two callers apart.
+/// service tells two callers apart. The shared harness holds it for an IAM user of
+/// the account ([`hold_long_term_key`]), the position a long-term key is in on AWS.
 pub(crate) const DEFAULT_ACCESS_KEY_ID: &str = "AKIDTESTKEY";
 
 /// The ARN the service reports for a caller signing with `access_key_id` — what a
-/// comment's `authorArn` and a reaction's owner are read back as.
+/// comment's `authorArn` and a reaction's owner are read back as: the ARN of the IAM
+/// user the account holds that key for ([`hold_long_term_key`]).
 pub(crate) fn caller_arn(access_key_id: &str) -> String {
     format!(
         "arn:aws:iam::{}:user/{access_key_id}",
         engine::emulator_account_id()
     )
+}
+
+/// Make `access_key_id` a long-term access key the ACCOUNT HOLDS for an IAM user
+/// named after it — the way `iam:CreateUser` and `iam:CreateAccessKey` record one —
+/// and answer that user's ARN ([`caller_arn`]).
+///
+/// A long-term access key belongs to an IAM user, and the identity a request speaks
+/// for is the one that key resolves to, so a suite that calls as two principals gives
+/// each of them a key the account holds rather than expecting the service to invent an
+/// identity for a key no store names: a key nothing holds speaks for the account's own
+/// principal, which is what the credential this emulator publishes speaks for.
+///
+/// A suite whose principal has a NAME of its own — one not to be confused with the key
+/// id — names it through [`hold_long_term_key_for`] instead; this is that function with
+/// the key id as the name.
+pub(crate) fn hold_long_term_key(engine: &engine::InMemoryEngine, access_key_id: &str) -> String {
+    hold_long_term_key_for(engine, access_key_id, access_key_id)
+}
+
+/// The ONE place these suites record "the account holds `access_key_id` for the IAM user
+/// `user_name`": the user record `iam:CreateUser` writes and the access-key record
+/// `iam:CreateAccessKey` writes, in the one shared engine the resolution reads them from.
+/// Answers that user's ARN.
+pub(crate) fn hold_long_term_key_for(
+    engine: &engine::InMemoryEngine,
+    user_name: &str,
+    access_key_id: &str,
+) -> String {
+    let arn = format!(
+        "arn:aws:iam::{}:user/{user_name}",
+        engine::emulator_account_id()
+    );
+    let state = iam::service_state(engine).expect("the in-memory engine carries the IAM store");
+    let mut account = state.lock();
+    account.users.insert(
+        iam::name_key(user_name),
+        User {
+            path: "/".to_string(),
+            user_name: user_name.to_string(),
+            user_id: sts::unique_id("AIDA", &arn),
+            arn: arn.clone(),
+            create_date: ::aws_smithy_types::DateTime::from_secs(0),
+            password_last_used: None,
+            permissions_boundary: None,
+            tags: None,
+        },
+    );
+    account.access_keys.insert(
+        access_key_id.to_string(),
+        iam::AccessKeyRecord {
+            user_key: iam::name_key(user_name),
+            status: iam::ACCESS_KEY_ACTIVE_STATUS.to_string(),
+            create_date: ::aws_smithy_types::DateTime::from_secs(0),
+        },
+    );
+    arn
+}
+
+/// The shared harness's emulator, with a long-term key held for each caller in
+/// `access_key_ids` — so each of them is a principal of the account with an identity
+/// of its own, which is what a suite calling as more than one caller needs.
+pub(crate) fn emulator_with_callers(
+    access_key_ids: &[&str],
+) -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+    let (router, engine) = crate::repository_lifecycle::emulator_with_engine();
+    for access_key_id in access_key_ids {
+        hold_long_term_key(&engine, access_key_id);
+    }
+    (router, engine)
 }
 
 /// Send one awsJson1_1 request: `POST /` with `X-Amz-Target:

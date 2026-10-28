@@ -49,6 +49,8 @@ mod branch_listing;
 mod branch_listing_writes;
 #[path = "all/caller_credential_identity.rs"]
 mod caller_credential_identity;
+#[path = "all/caller_identity_agrees_with_sts.rs"]
+mod caller_identity_agrees_with_sts;
 #[path = "all/caller_identity_matches_sts.rs"]
 mod caller_identity_matches_sts;
 #[path = "all/client_error_messages.rs"]

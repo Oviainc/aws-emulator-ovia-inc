@@ -32,13 +32,11 @@ use std::time::{Duration, SystemTime};
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use service_com_amazonaws_iam_awsidentitymanagementv20100508::ops::types::User;
-use service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam;
 use service_com_amazonaws_sts_awssecuritytokenservicev20110615 as sts_service;
 use service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts;
 
 use crate::repository_lifecycle::{base64, string_at};
-use crate::wire::ok_as;
+use crate::wire::{hold_long_term_key_for, ok_as};
 
 /// The operations the caller's identity is read back through.
 const OVERRIDE_OPERATION: &str = "OverridePullRequestApprovalRules";
@@ -184,31 +182,10 @@ impl Credential {
         let (identity, kind, role, expires_at) = match self {
             Self::Published => return,
             Self::IamUserKey { user } => {
-                let state =
-                    iam::service_state(engine).expect("the in-memory engine carries the IAM store");
-                let mut store = state.lock();
-                let arn = user_arn(user);
-                store.users.insert(
-                    iam::name_key(user),
-                    User {
-                        path: "/".to_string(),
-                        user_name: user.to_string(),
-                        user_id: sts::unique_id("AIDA", &arn),
-                        arn,
-                        create_date: ::aws_smithy_types::DateTime::from_secs(0),
-                        password_last_used: None,
-                        permissions_boundary: None,
-                        tags: None,
-                    },
-                );
-                store.access_keys.insert(
-                    access_key_id.to_string(),
-                    iam::AccessKeyRecord {
-                        user_key: iam::name_key(user),
-                        status: iam::ACCESS_KEY_ACTIVE_STATUS.to_string(),
-                        create_date: ::aws_smithy_types::DateTime::from_secs(0),
-                    },
-                );
+                // A long-term key names no session: the account's record of WHO holds
+                // the key is IAM's, written here through the harness's one writer of
+                // those records.
+                hold_long_term_key_for(engine, user, access_key_id);
                 return;
             }
             Self::AssumedRole { role, session } => (

@@ -9,8 +9,10 @@
 //! the session that access key id names — for the temporary credentials of an assumed
 //! role, that session's `assumed-role` ARN, which is the spelling an approval rule's
 //! `ApprovalPoolMembers` entry names. An access key id no live session is held for is a
-//! long-term key, and this emulator's account need hold no user for it, so such a
-//! request keeps the stand-in identity derived from the key id.
+//! long-term key, and such a request speaks for the IAM user the account holds that key
+//! for; a key no store holds at all speaks for the account's own principal, the identity
+//! this emulator's published credential resolves to — never an identity derived from the
+//! key id's text, which no caller could correlate with the one it reads for itself.
 //!
 //! The consequence the table drives end to end: an approval given by a session inside a
 //! rule's pool MEETS that rule, so the identical merge that was refused before the
@@ -38,12 +40,10 @@ use std::time::{Duration, SystemTime};
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use service_com_amazonaws_iam_awsidentitymanagementv20100508::ops::types::User;
-use service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam;
 use service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts;
 
-use crate::repository_lifecycle::{base64, emulator_with_engine, ok, string_at};
-use crate::wire::{caller_arn, ok_as, refusal_as};
+use crate::repository_lifecycle::{base64, ok, string_at};
+use crate::wire::{emulator_with_callers, hold_long_term_key_for, ok_as, refusal_as};
 
 /// The operations driven here: the approval, the merge the approval gates, and the
 /// readers the recorded identity and the merge's effect are read back through.
@@ -144,13 +144,13 @@ enum Credential {
 
 impl Credential {
     /// The identity this service must attribute a request signed with this credential
-    /// to: the session's identity where a live session names one, and otherwise the
-    /// stand-in derived from the access key id.
-    fn identity_arn(self, access_key_id: &str) -> String {
+    /// to: the session's identity where a live session names one, the IAM user the
+    /// account holds the key for, and otherwise the account's own principal.
+    fn identity_arn(self) -> String {
         match self {
             Self::AssumedRole { role, session } => assumed_role_arn(role, session),
             Self::SessionToken { user } | Self::IamUserKey { user } => user_arn(user),
-            Self::ExpiredAssumedRole { .. } | Self::LongTerm => caller_arn(access_key_id),
+            Self::ExpiredAssumedRole { .. } | Self::LongTerm => sts::ambient_identity().arn,
         }
     }
 
@@ -162,33 +162,10 @@ impl Credential {
         let (identity, kind, role, expires_at) = match self {
             Self::LongTerm => return,
             // A long-term key names no session: the account's record of WHO holds the
-            // key is IAM's, so that is the store this row seeds.
+            // key is IAM's, so that is the store this row seeds — through the harness's
+            // one writer of those records.
             Self::IamUserKey { user } => {
-                let state = iam::service_state(engine)
-                    .expect("the in-memory engine carries the IAM store");
-                let mut store = state.lock();
-                let arn = user_arn(user);
-                store.users.insert(
-                    iam::name_key(user),
-                    User {
-                        path: "/".to_string(),
-                        user_name: user.to_string(),
-                        user_id: sts::unique_id("AIDA", &arn),
-                        arn,
-                        create_date: ::aws_smithy_types::DateTime::from_secs(0),
-                        password_last_used: None,
-                        permissions_boundary: None,
-                        tags: None,
-                    },
-                );
-                store.access_keys.insert(
-                    access_key_id.to_string(),
-                    iam::AccessKeyRecord {
-                        user_key: iam::name_key(user),
-                        status: iam::ACCESS_KEY_ACTIVE_STATUS.to_string(),
-                        create_date: ::aws_smithy_types::DateTime::from_secs(0),
-                    },
-                );
+                hold_long_term_key_for(engine, user, access_key_id);
                 return;
             }
             Self::AssumedRole { role, session } => (
@@ -295,7 +272,7 @@ struct Fixture {
 }
 
 async fn fixture(rule: &str) -> Fixture {
-    let (router, engine) = emulator_with_engine();
+    let (router, engine) = emulator_with_callers(&[AUTHOR]);
     ok(
         &router,
         "CreateRepository",
@@ -456,7 +433,7 @@ async fn an_approval_is_recorded_for_the_principal_its_credential_was_minted_for
     )];
     let one_user = vec![user_arn(REVIEW_USER)];
     let key_holding_user = vec![user_arn(KEY_HOLDING_USER)];
-    let one_long_term_caller = vec![caller_arn("AKIDLONGTERMREVIEWER")];
+    let one_long_term_caller = vec![sts::ambient_identity().arn];
     let no_pool: Vec<String> = Vec::new();
 
     let rows = vec![
@@ -645,7 +622,7 @@ async fn an_approval_is_recorded_for_the_principal_its_credential_was_minted_for
             merged: false,
         },
         Row {
-            case: "a long-term key the pool names by its stand-in identity",
+            case: "a key no store holds, the pool naming the account's own principal",
             needed: 1,
             pool: one_long_term_caller,
             approvers: vec![Approver {
@@ -694,7 +671,7 @@ async fn an_approval_is_recorded_for_the_principal_its_credential_was_minted_for
         // The approvals, each signed with its approver's own credential.
         let mut logged: Vec<(String, &str)> = Vec::new();
         for approver in &row.approvers {
-            let recorded = approver.credential.identity_arn(approver.access_key_id);
+            let recorded = approver.credential.identity_arn();
             for state in approver.states {
                 ok_as(
                     &fixture.router,

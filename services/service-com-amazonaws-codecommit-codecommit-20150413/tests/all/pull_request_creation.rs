@@ -31,9 +31,16 @@ use service_com_amazonaws_codecommit_codecommit_20150413::state::{
 use service_com_amazonaws_codecommit_codecommit_20150413::ComAmazonawsCodecommitCodecommit20150413State as CodeCommitState;
 
 use crate::repository_lifecycle::{
-    base64, emulator, emulator_with_engine, error, ok, string_at, REGION,
+    base64, emulator_with_engine, error, ok, string_at, REGION,
 };
-use crate::wire::{caller_arn, error_as, ok_as, DEFAULT_ACCESS_KEY_ID};
+use crate::wire::{caller_arn, emulator_with_callers, error_as, ok_as, DEFAULT_ACCESS_KEY_ID};
+
+/// The principals the author rows below call as, and a principal that only reads:
+/// each one is a user of the account holding its own long-term access key, so the
+/// identity a request speaks for is that user.
+const AUTHOR_ONE: &str = "AKIDAUTHORONE";
+const AUTHOR_TWO: &str = "AKIDAUTHORTWO";
+const READER: &str = "AKIDREADER";
 
 /// `PullRequestStatusEnum`'s values
 /// (`smithy_query(query="shape",shape="PullRequestStatusEnum")`).
@@ -61,7 +68,7 @@ struct Diverged {
 /// then move each side as many commits as asked. A side moved zero commits keeps the
 /// base commit as its tip.
 async fn diverged(repository: &str, main_commits: usize, feature_commits: usize) -> Diverged {
-    let router = emulator();
+    let (router, _engine) = emulator_with_callers(&[AUTHOR_ONE, AUTHOR_TWO, READER]);
     ok(
         &router,
         "CreateRepository",
@@ -849,7 +856,7 @@ async fn the_author_is_the_calling_principal_and_two_callers_are_told_apart() {
     let router = &built.router;
 
     // Rows differ along the principal that signs the call.
-    for access_key_id in ["AKIDAUTHORONE", "AKIDAUTHORTWO"] {
+    for access_key_id in [AUTHOR_ONE, AUTHOR_TWO] {
         let created = ok_as(
             router,
             access_key_id,
@@ -874,14 +881,14 @@ async fn the_author_is_the_calling_principal_and_two_callers_are_told_apart() {
     // caller.
     let read = ok_as(
         router,
-        "AKIDREADER",
+        READER,
         "GetPullRequest",
         &json!({ "pullRequestId": "1" }),
     )
     .await;
     assert_eq!(
         read.pointer("/pullRequest/authorArn").and_then(Value::as_str),
-        Some(caller_arn("AKIDAUTHORONE").as_str()),
+        Some(caller_arn(AUTHOR_ONE).as_str()),
         "a reader must not be reported as the author, got {read}"
     );
 }

@@ -19,8 +19,10 @@
 
 use serde_json::{json, Value};
 
-use crate::repository_lifecycle::{base64, emulator, error, is_uuid, ok, string_at};
-use crate::wire::{caller_arn, error_as, ok_as, DEFAULT_ACCESS_KEY_ID};
+use crate::repository_lifecycle::{base64, error, is_uuid, ok, string_at};
+use crate::wire::{
+    caller_arn, emulator_with_callers, error_as, hold_long_term_key, ok_as, DEFAULT_ACCESS_KEY_ID,
+};
 
 /// The file every fixture repository holds, and the two versions of it the two
 /// commits carry. The line counts (2 and 3) are what a comment's `filePosition`
@@ -45,6 +47,9 @@ pub(crate) const MAX_COMMENT_CHARACTERS: usize = 10_240;
 /// comparison needs.
 pub(crate) struct Fixture {
     pub(crate) router: smithy_server_runtime::MultiServiceRouter,
+    /// The shared engine, so a suite needing MORE principals than this fixture
+    /// names can give one a long-term access key of its own.
+    pub(crate) engine: std::sync::Arc<engine::InMemoryEngine>,
     pub(crate) repository: String,
     pub(crate) before_commit: String,
     pub(crate) after_commit: String,
@@ -52,8 +57,16 @@ pub(crate) struct Fixture {
     pub(crate) after_blob: String,
 }
 
+impl Fixture {
+    /// Make `access_key_id` a long-term key the account holds for a user of its own,
+    /// and answer that user's ARN: the principal a call signed with it speaks for.
+    pub(crate) fn hold(&self, access_key_id: &str) -> String {
+        hold_long_term_key(&self.engine, access_key_id)
+    }
+}
+
 pub(crate) async fn fixture(repository: &str) -> Fixture {
-    let router = emulator();
+    let (router, engine) = emulator_with_callers(&[OTHER_ACCESS_KEY_ID]);
     ok(
         &router,
         "CreateRepository",
@@ -88,6 +101,7 @@ pub(crate) async fn fixture(repository: &str) -> Fixture {
     .await;
     Fixture {
         router,
+        engine,
         repository: repository.to_string(),
         before_blob: string_at(&first, "/blobId"),
         after_blob: string_at(&second, "/blobId"),
@@ -918,9 +932,11 @@ async fn a_comment_holds_a_bounded_number_of_principals_reactions() {
 
     // One reaction per principal, up to the bound, each accepted.
     for index in 0..MAX_REACTIONS_PER_COMMENT {
+        let reactor = format!("AKIDREACTOR{index}");
+        fixture.hold(&reactor);
         ok_as(
             &fixture.router,
-            &format!("AKIDREACTOR{index}"),
+            &reactor,
             "PutCommentReaction",
             &json!({ "commentId": comment_id, "reactionValue": ":eyes:" }),
         )
@@ -928,9 +944,11 @@ async fn a_comment_holds_a_bounded_number_of_principals_reactions() {
     }
 
     // A principal the comment does not hold yet is refused past the bound …
+    let one_too_many = "AKIDONETOOMANY";
+    fixture.hold(one_too_many);
     let code = error_as(
         &fixture.router,
-        "AKIDONETOOMANY",
+        one_too_many,
         "PutCommentReaction",
         &json!({ "commentId": comment_id, "reactionValue": ":eyes:" }),
         400,

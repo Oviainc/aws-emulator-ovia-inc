@@ -32,8 +32,8 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_codecommit_codecommit_20150413::state::ComAmazonawsCodecommitCodecommit20150413State as CodeCommitState;
 
 use crate::harness::error_with_message;
-use crate::repository_lifecycle::{base64, emulator_with_engine, ok, string_at};
-use crate::wire::{caller_arn, ok_as};
+use crate::repository_lifecycle::{base64, ok, string_at};
+use crate::wire::{caller_arn, emulator_with_callers, ok_as};
 
 /// The operation under test.
 const OPERATION: &str = "EvaluatePullRequestApprovalRules";
@@ -145,7 +145,7 @@ struct Fixture {
 }
 
 async fn fixture() -> Fixture {
-    let (router, engine) = emulator_with_engine();
+    let (router, engine) = emulator_with_callers(&[AUTHOR, ONE, TWO, THREE]);
     ok(
         &router,
         "CreateRepository",

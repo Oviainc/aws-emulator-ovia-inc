@@ -27,8 +27,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_codecommit_codecommit_20150413::state::MAX_APPROVALS_PER_PULL_REQUEST;
 
-use crate::repository_lifecycle::{base64, emulator, ok, string_at};
-use crate::wire::{caller_arn, ok_as, refusal_as};
+use crate::repository_lifecycle::{base64, ok, string_at};
+use crate::wire::{caller_arn, emulator_with_callers, hold_long_term_key, ok_as, refusal_as};
 
 /// The operation under test, and the readers a recorded approval is read back
 /// through.
@@ -136,11 +136,14 @@ fn document(approvals: u32, pool: &[String]) -> String {
 /// case asked for.
 struct Fixture {
     router: MultiServiceRouter,
+    /// The shared engine, so a case needing MORE principals than the fixture names
+    /// can give one its own long-term access key.
+    engine: std::sync::Arc<engine::InMemoryEngine>,
     pull_request_id: String,
 }
 
 async fn fixture(rule: Option<&str>) -> Fixture {
-    let router = emulator();
+    let (router, engine) = emulator_with_callers(&[AUTHOR, REVIEWER, OTHER_REVIEWER]);
     ok(
         &router,
         "CreateRepository",
@@ -216,11 +219,17 @@ async fn fixture(rule: Option<&str>) -> Fixture {
     }
     Fixture {
         router,
+        engine,
         pull_request_id,
     }
 }
 
 impl Fixture {
+    /// Give `access_key_id` a long-term key of its own, so a call signed with it
+    /// speaks for a principal of its own.
+    fn hold(&self, access_key_id: &str) -> String {
+        hold_long_term_key(&self.engine, access_key_id)
+    }
     /// The pull request `GetPullRequest` reports.
     async fn stored(&self) -> Value {
         let read = ok(
@@ -842,9 +851,11 @@ async fn a_pull_request_holds_no_more_approvals_than_the_published_maximum() {
     // Fill the pull request to exactly the bound it enforces, read from the service
     // rather than written out here, each state recorded by a distinct identity.
     for index in 0..MAX_APPROVALS_PER_PULL_REQUEST {
+        let reviewer = format!("AKIDREVIEWER{index}");
+        fixture.hold(&reviewer);
         ok_as(
             &fixture.router,
-            &format!("AKIDREVIEWER{index}"),
+            &reviewer,
             OPERATION,
             &fixture.body(&revision, APPROVE),
         )
@@ -859,9 +870,11 @@ async fn a_pull_request_holds_no_more_approvals_than_the_published_maximum() {
     // One further identity: the approval it asks for is the write the bound refuses,
     // while the revoke it asks for records nothing in the first place, so the pull
     // request answers it without storing anything.
+    let one_too_many = "AKIDONETOOMANY";
+    fixture.hold(one_too_many);
     let (code, message) = refusal_as(
         &fixture.router,
-        "AKIDONETOOMANY",
+        one_too_many,
         OPERATION,
         &fixture.body(&revision, APPROVE),
         CLIENT_ERROR_STATUS,
@@ -881,7 +894,7 @@ async fn a_pull_request_holds_no_more_approvals_than_the_published_maximum() {
     );
     ok_as(
         &fixture.router,
-        "AKIDONETOOMANY",
+        one_too_many,
         OPERATION,
         &fixture.body(&revision, REVOKE),
     )

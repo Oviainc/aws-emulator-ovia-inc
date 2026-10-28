@@ -23,8 +23,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::error_with_message;
-use crate::repository_lifecycle::{base64, emulator, ok, string_at};
-use crate::wire::{caller_arn, ok_as};
+use crate::repository_lifecycle::{base64, ok, string_at};
+use crate::wire::{caller_arn, emulator_with_callers, ok_as};
 
 /// The status every error asserted here models (`errorKind: client`, `httpError:
 /// 400` on each of these error shapes).
@@ -38,9 +38,9 @@ const REPOSITORY: &str = "pull-request-events";
 const DESTINATION: &str = "main";
 const SOURCE: &str = "feature";
 
-/// The principals the changes below are made by. A caller is identified by the
-/// access key id its request is signed with, so an event's `actorArn` is that
-/// caller's ARN.
+/// The principals the changes below are made by. A request speaks for the identity
+/// the access key id it is signed with resolves to — the IAM user the account holds
+/// that key for — so an event's `actorArn` is that user's ARN.
 const AUTHOR: &str = "AKIDAUTHOR";
 const PUSHER: &str = "AKIDPUSHER";
 const REVIEWER: &str = "AKIDREVIEWER";
@@ -194,7 +194,7 @@ async fn stored_pull_request(router: &MultiServiceRouter, pull_request_id: &str)
 /// Make every change an implemented operation can make to one pull request, and
 /// report what each of them must have appended to its log.
 async fn history() -> History {
-    let router = emulator();
+    let (router, _engine) = emulator_with_callers(&[AUTHOR, PUSHER, REVIEWER, MERGER, BYSTANDER]);
     ok_as(
         &router,
         AUTHOR,

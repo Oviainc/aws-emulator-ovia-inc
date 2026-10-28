@@ -37,6 +37,11 @@ pub(crate) const ENDPOINT_AUTHORITY: &str = "codecommit.us-west-2.amazonaws.com"
 /// mounted on it, request authentication off so the test signs nothing. The
 /// engine is returned too, so a test can read the store the handlers write.
 ///
+/// The account holds the default caller's long-term access key for an IAM user of
+/// its own ([`crate::wire::hold_long_term_key`]), which is the position a long-term
+/// key is in on AWS: it belongs to a user, and that user is the principal every ARN
+/// this service records for the request names.
+///
 /// `pub(crate)` here and below: this module is the wire harness every suite in
 /// this test target shares, so a sibling suite drives the emulator exactly the
 /// same way rather than building a second copy of it.
@@ -49,6 +54,7 @@ pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemor
             &engine,
         )),
     );
+    crate::wire::hold_long_term_key(&engine, crate::wire::DEFAULT_ACCESS_KEY_ID);
     (router, engine)
 }
 

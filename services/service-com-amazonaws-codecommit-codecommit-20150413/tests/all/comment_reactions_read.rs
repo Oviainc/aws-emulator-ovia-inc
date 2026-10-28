@@ -171,6 +171,7 @@ async fn a_read_reports_each_reaction_held_with_the_principals_that_left_it() {
     // and one leaving another, so an entry can carry more than one user and a
     // comment more than one entry.
     const THIRD_ACCESS_KEY_ID: &str = "AKIDTHIRDUSER";
+    fixture.hold(THIRD_ACCESS_KEY_ID);
     for (access_key_id, sent) in [
         (DEFAULT_ACCESS_KEY_ID, "\u{1f44d}"),
         (OTHER_ACCESS_KEY_ID, ":+1:"),
@@ -240,10 +241,12 @@ async fn a_read_reports_each_reaction_held_with_the_principals_that_left_it() {
 
     // `reactionUserArn` narrows the read to one principal's own reaction; a
     // principal that left none is reported nothing at all.
+    let no_reaction = "AKIDNOREACTION";
+    fixture.hold(no_reaction);
     for (label, access_key_id, expected_entries) in [
         ("a user holding a shared reaction", DEFAULT_ACCESS_KEY_ID, 1),
         ("a user holding its own reaction", THIRD_ACCESS_KEY_ID, 1),
-        ("a user holding none", "AKIDNOREACTION", 0),
+        ("a user holding none", no_reaction, 0),
     ] {
         let arn = caller_arn(access_key_id);
         let (narrowed, _) = reactions_of(
@@ -305,9 +308,11 @@ async fn a_read_pages_the_reactions_it_holds() {
     // in, whatever order they were left in.
     let left: Vec<&str> = vec![":rocket:", ":eyes:", ":smile:", ":thumbsdown:"];
     for (index, reaction) in left.iter().enumerate() {
+        let page_user = format!("AKIDPAGEUSER{index}");
+        fixture.hold(&page_user);
         ok_as(
             &fixture.router,
-            &format!("AKIDPAGEUSER{index}"),
+            &page_user,
             "PutCommentReaction",
             &json!({ "commentId": comment_id, "reactionValue": reaction }),
         )

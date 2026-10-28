@@ -4083,6 +4083,11 @@ fn session_registry<Eng: Send + Sync + 'static>(
 /// session whose expiry the clock has passed resolves there too: STS refuses such a
 /// credential, and the same call materialises the expiry, deleting the credential
 /// from the store so the next request presenting it does not verify at all.
+///
+/// Every answer therefore comes from ONE resolution of the access key id — the one
+/// `sts:GetCallerIdentity` answers that same request with — so an ARN this service
+/// records (a comment's author, a reaction's owner, an approval's reviewer) is a value
+/// the caller can compare with its own identity, and never an identity invented here.
 pub fn caller_identity_arn<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
@@ -4103,73 +4108,27 @@ pub fn caller_identity_arn<Eng: Send + Sync + 'static>(
     resolved.unwrap_or(long_term).arn
 }
 
-/// The identity a LONG-TERM access key speaks for: the principal the account holds
-/// that key for, read through STS's own resolution of such a key, so a caller signing
-/// with it is the principal `sts:GetCallerIdentity` answers for the same credential.
+/// The identity a LONG-TERM access key speaks for: STS's OWN resolution of such a
+/// key against the account's IAM records ([`sts_state::long_term_identity`]) — the
+/// user the account holds the key for, and, for a key no IAM record names, the
+/// account's own principal, which is the identity the key pair this emulator
+/// publishes at start speaks for.
 ///
-/// Two kinds of long-term key resolve to a principal. One is an access key the account
-/// holds for an IAM user, which speaks for that user. The other is the key pair THIS
-/// EMULATOR publishes at start: a long-term access key belongs to an IAM user of the
-/// account, and the user that key is published for is the one
-/// [`::service_common::caller_principal`] states — the record IAM holds for it and the
-/// principal STS reports for it — so a request signed with the credential the emulator
-/// itself issued speaks for that user, and this service cannot name its caller anything
-/// else without disagreeing with `sts:GetCallerIdentity` about one credential.
-///
-/// An access key id the emulator never issued and no record names speaks for no
-/// principal at all. This emulator serves such a key anyway, and STS's answer for it is
-/// its ambient caller, which would make every one of them ONE identity: such a key keeps
-/// [`stand_in_identity`], so two callers signing with two different unissued keys stay
-/// two identities.
+/// The resolution is called rather than reproduced, and no answer of its own is
+/// substituted for the one it gives: a caller reading its identity through
+/// `sts:GetCallerIdentity` and a caller reading an ARN this service recorded for the
+/// same credential have to see one principal, which they cannot if this service
+/// derives an identity from the key id's text. Two callers that have to be two
+/// principals are two IAM users of the account, each holding its own access key —
+/// the records this resolution reads — which is the position two callers are in on
+/// AWS.
 fn long_term_caller_identity<Eng: Send + Sync + 'static>(
     engine: &Eng,
     access_key_id: &str,
 ) -> sts_state::Identity {
     let iam = sts_state::iam_state(engine);
     let guard = iam.as_ref().map(|iam| iam.lock());
-    let held = sts_state::long_term_identity(guard.as_deref(), access_key_id);
-    if held.arn != sts_state::ambient_identity().arn || emulator_published_key(access_key_id) {
-        held
-    } else {
-        stand_in_identity(access_key_id)
-    }
-}
-
-/// Is `access_key_id` the long-term key pair this emulator process publishes at start —
-/// the one credential it issues to its own clients?
-///
-/// Asked of the authenticator that MINTED that pair rather than of a copy of its text,
-/// so the key this answers for is exactly the one requests are verified against. `None`
-/// means nothing in this process published a key pair at all, and then no access key id
-/// can be it.
-fn emulator_published_key(access_key_id: &str) -> bool {
-    ::emulator_server::request_authentication::SigV4Authenticator::minted_credentials()
-        .is_some_and(|published| published.access_key_id == access_key_id)
-}
-
-/// The identity this service stands in with for an access key id neither store
-/// names an identity for: an IAM user of the emulator's account named by the key id,
-/// with the user id STS derives from an identity's ARN.
-///
-/// The access key id is caller-controlled text, so it is first reduced to the
-/// characters an access key id can hold.
-fn stand_in_identity(access_key_id: &str) -> sts_state::Identity {
-    let filtered: String = access_key_id
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .take(128)
-        .collect();
-    let akid = if filtered.is_empty() {
-        "default"
-    } else {
-        filtered.as_str()
-    };
-    let arn = ::engine::emulator_arn("iam", "", &format!("user/{akid}"));
-    sts_state::Identity {
-        user_id: sts_state::unique_id("AIDA", &arn),
-        account: ::engine::emulator_account_id().to_string(),
-        arn,
-    }
+    sts_state::long_term_identity(guard.as_deref(), access_key_id)
 }
 
 /// A `SystemTime` as the modeled timestamp type.

@@ -24,8 +24,8 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::repository_lifecycle::{base64, emulator, ok, string_at};
-use crate::wire::{caller_arn, ok_as, refusal_as};
+use crate::repository_lifecycle::{base64, ok, string_at};
+use crate::wire::{caller_arn, emulator_with_callers, ok_as, refusal_as};
 
 /// The operation under test, and the writer whose records it reads back.
 const OPERATION: &str = "GetPullRequestApprovalStates";
@@ -88,7 +88,8 @@ struct Fixture {
 }
 
 async fn fixture() -> Fixture {
-    let router = emulator();
+    let (router, _engine) =
+        emulator_with_callers(&[AUTHOR, REVIEWER, OTHER_REVIEWER, THIRD_REVIEWER]);
     ok(
         &router,
         "CreateRepository",

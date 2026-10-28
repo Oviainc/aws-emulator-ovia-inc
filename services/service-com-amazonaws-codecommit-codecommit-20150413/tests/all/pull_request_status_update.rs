@@ -24,8 +24,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::error_with_message;
-use crate::repository_lifecycle::{base64, emulator, ok, string_at};
-use crate::wire::{caller_arn, ok_as, refusal_as};
+use crate::repository_lifecycle::{base64, ok, string_at};
+use crate::wire::{caller_arn, emulator_with_callers, ok_as, refusal_as};
 
 /// Every value of `PullRequestStatusEnum`
 /// (`smithy_query(query="shape",shape="PullRequestStatusEnum")`), which is the
@@ -82,7 +82,7 @@ struct Opened {
 
 /// Open one pull request between two branches of a fresh repository, as [`AUTHOR`].
 async fn opened(repository: &str) -> Opened {
-    let router = emulator();
+    let (router, _engine) = emulator_with_callers(&[AUTHOR, CLOSER]);
     ok_as(
         &router,
         AUTHOR,

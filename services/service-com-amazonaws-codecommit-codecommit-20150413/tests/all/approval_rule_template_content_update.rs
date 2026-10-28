@@ -34,8 +34,8 @@
 use serde_json::{json, Value};
 use sha2::Digest;
 
-use crate::repository_lifecycle::{emulator, string_at};
-use crate::wire::{caller_arn, call_as, error_as, ok_as};
+use crate::repository_lifecycle::string_at;
+use crate::wire::{caller_arn, call_as, emulator_with_callers, error_as, ok_as};
 
 /// The `Version` and statement `Type` CodeCommit's approval rule template schema
 /// defines (the structure the CodeCommit User Guide documents for approval rule
@@ -206,7 +206,7 @@ fn timestamp_at(payload: &Value, pointer: &str, case: &str) -> f64 {
 
 #[tokio::test]
 async fn an_update_replaces_only_the_content_and_is_read_back_from_state() {
-    let router = emulator();
+    let (router, _engine) = emulator_with_callers(&[AUTHOR_KEY_ID, EDITOR_KEY_ID]);
 
     for (index, case) in update_cases().into_iter().enumerate() {
         let label = case.label;
@@ -320,7 +320,7 @@ async fn an_update_replaces_only_the_content_and_is_read_back_from_state() {
 
 #[tokio::test]
 async fn successive_updates_each_replace_the_content_the_previous_one_left() {
-    let router = emulator();
+    let (router, _engine) = emulator_with_callers(&[AUTHOR_KEY_ID, EDITOR_KEY_ID]);
     let name = "chained-updates";
     let first = document(1, &[]);
     ok_as(
@@ -403,7 +403,7 @@ async fn successive_updates_each_replace_the_content_the_previous_one_left() {
 
 #[tokio::test]
 async fn a_precondition_that_is_not_the_stored_signature_is_refused_and_nothing_changes() {
-    let router = emulator();
+    let (router, _engine) = emulator_with_callers(&[AUTHOR_KEY_ID, EDITOR_KEY_ID]);
     let name = "guarded-template";
     let stored = document(2, &["arn:aws:iam::111122223333:user/one"]);
     ok_as(
@@ -474,7 +474,7 @@ async fn a_precondition_that_is_not_the_stored_signature_is_refused_and_nothing_
 
 #[tokio::test]
 async fn content_that_is_not_a_complete_approval_rule_document_is_refused() {
-    let router = emulator();
+    let (router, _engine) = emulator_with_callers(&[AUTHOR_KEY_ID, EDITOR_KEY_ID]);
     let name = "preserved-template";
     let stored = document(2, &[]);
     ok_as(
@@ -635,7 +635,7 @@ async fn content_that_is_not_a_complete_approval_rule_document_is_refused() {
 
 #[tokio::test]
 async fn a_name_that_names_no_template_is_refused_with_the_modeled_error() {
-    let router = emulator();
+    let (router, _engine) = emulator_with_callers(&[AUTHOR_KEY_ID, EDITOR_KEY_ID]);
     let existing = "cased-template";
     ok_as(
         &router,

@@ -23,8 +23,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::error_with_message;
-use crate::repository_lifecycle::{base64, emulator, ok, string_at};
-use crate::wire::{caller_arn, ok_as};
+use crate::repository_lifecycle::{base64, ok, string_at};
+use crate::wire::{caller_arn, emulator_with_callers, ok_as};
 
 /// The status every error asserted here models (`errorKind: client`, `httpError:
 /// 400` on each of these error shapes).
@@ -40,9 +40,9 @@ const EMPTY_REPOSITORY: &str = "pull-request-listing-empty";
 /// repository's first commit, so it is that repository's default branch.
 const DESTINATION: &str = "main";
 
-/// The principals that open the pull requests. A caller is identified by the access
-/// key id its request is signed with, so a pull request's `authorArn` is that
-/// caller's ARN.
+/// The principals that open the pull requests. A request speaks for the identity the
+/// access key id it is signed with resolves to — the IAM user the account holds that
+/// key for — so a pull request's `authorArn` is that user's ARN.
 const AUTHOR_ONE: &str = "AKIDAUTHORONE";
 const AUTHOR_TWO: &str = "AKIDAUTHORTWO";
 /// A principal that opens nothing, so no pull request names it.
@@ -186,7 +186,7 @@ async fn stored_pull_request(router: &MultiServiceRouter, pull_request_id: &str)
 /// Open every pull request [`PLANS`] describes, and report what the store then
 /// holds.
 async fn listing() -> Listing {
-    let router = emulator();
+    let (router, _engine) = emulator_with_callers(&[AUTHOR_ONE, AUTHOR_TWO, BYSTANDER]);
     let mut base: Vec<(&str, String)> = Vec::new();
     for repository in [REPOSITORY, OTHER_REPOSITORY, EMPTY_REPOSITORY] {
         ok_as(
