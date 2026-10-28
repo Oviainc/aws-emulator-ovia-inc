@@ -17,6 +17,12 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// What `AssociateIpamResourceDiscovery` links, what the IPAM then counts, and what the
+// associate refuses. Declared beside `prefix_lists` for the reason the note above gives: the
+// sorted neighbourhood and the tail of this file are where every new ec2 suite inserts its
+// lines.
+#[path = "all/ipam_resource_discovery_associations.rs"]
+mod ipam_resource_discovery_associations;
 // What `SendDiagnosticInterrupt` delivers to one instance, which states it can be sent
 // from, and what it refuses. Declared beside `prefix_lists` for the reason the note above
 // gives: the sorted neighbourhood and the tail of this file are where every new ec2 suite

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The tagging read surface — `ListTagsForResource` — end to end over HTTP.
+//! The tagging surface — `ListTagsForResource` and `TagResource` — end to end over
+//! HTTP.
 //!
 //! Every case drives the real wire path — `MultiServiceRouter::dispatch` with this
 //! service registered — so routing, deserialization, the handler and serialization are
@@ -14,6 +15,14 @@
 //! resource ARN, or that names no resource within one, is refused as invalid input,
 //! and an SES resource ARN resolving to no record is refused with the modelled
 //! terminal 404.
+//!
+//! The rule the write cases pin: `TagResource` stores the tags the request carries on
+//! that same resource, keyed by tag key — a key the resource does not carry yet is
+//! appended and a key it does carry takes the request's value, since each key is unique
+//! on a resource and carries one value — and it refuses, storing nothing, a tag no
+//! caller may define (a key or value outside the documented length or character set, or
+//! one carrying the reserved prefix) or a request that would leave the resource carrying
+//! more than the documented maximum of tags.
 //!
 //! The accepted table below spans what the rule generalises over: the KIND of resource
 //! the ARN names (contact list, email identity by address and by domain, configuration
@@ -60,6 +69,40 @@ const MAX_TAGS_PER_RESOURCE: usize =
 /// here rather than read from the crate, so a change to the handler's wording fails
 /// these rows.
 const NOT_AN_SES_RESOURCE_ARN: &str = "Provided ARN is not in SES resource ARN format";
+
+/// The longest a tag key may be, taken from the crate's own constant: `Tag$Key`
+/// documents "The maximum length of a tag key is 128 characters. The minimum length is
+/// 1 character" (`smithy_query(query="doc",shape="Tag",member="Key")`).
+const MAX_TAG_KEY_CHARS: usize =
+    service_com_amazonaws_sesv2_simpleemailservice_v2::state::MAX_TAG_KEY_CHARS;
+
+/// The longest a tag value may be, taken from the crate's own constant: `Tag$Value`
+/// documents "The maximum length of a tag value is 256 characters. The minimum length
+/// is 0 characters" (`smithy_query(query="doc",shape="Tag",member="Value")`).
+const MAX_TAG_VALUE_CHARS: usize =
+    service_com_amazonaws_sesv2_simpleemailservice_v2::state::MAX_TAG_VALUE_CHARS;
+
+/// The sentence the surface answers a tag key or value carrying a character outside the
+/// set it accepts, spelled out here rather than read from the crate.
+const TAG_CHARSET_REFUSAL: &str = "Tags can only contain letters, numbers, spaces, and \
+                                   the following special characters: _ . : / = + - @";
+
+/// The sentence the surface answers a tag key outside its documented length.
+const TAG_KEY_LENGTH_REFUSAL: &str = "A tag key must be between 1 and 128 characters long.";
+
+/// The sentence the surface answers a tag value longer than its documented maximum.
+const TAG_VALUE_LENGTH_REFUSAL: &str = "A tag value must be no more than 256 characters long.";
+
+/// The sentence the surface answers a tag key or value carrying the prefix the model's
+/// `Tag` documentation reserves for Amazon Web Services.
+const RESERVED_TAG_PREFIX_REFUSAL: &str =
+    "The aws: prefix is reserved and cannot be used in a tag key or value.";
+
+/// The sentence the surface answers a request that would leave one resource carrying
+/// `total` tags, more than it may hold.
+fn too_many_tags(total: usize) -> String {
+    format!("A resource can have as many as {MAX_TAGS_PER_RESOURCE} tags, got {total}.")
+}
 
 /// One answered request: the status, the error shape when there was one, and the parsed
 /// body.
@@ -204,6 +247,21 @@ impl Ses {
             .await
     }
 
+    /// `TagResource` for `resource_arn` with `tags`, which the operation carries in its
+    /// POST body.
+    async fn tag_resource(&self, resource_arn: &str, tags: &[(String, String)]) -> Reply {
+        let tags: Vec<Value> = tags
+            .iter()
+            .map(|(key, value)| json!({"Key": key, "Value": value}))
+            .collect();
+        self.call(
+            "POST",
+            "/v2/email/tags",
+            Some(json!({"ResourceArn": resource_arn, "Tags": tags})),
+        )
+        .await
+    }
+
     /// Create the row's resource with the tags it carries, and answer the ARN that
     /// addresses it.
     async fn create(&self, case: &TagCase) -> String {
@@ -232,6 +290,11 @@ impl Ses {
                 "/v2/email/tenants",
                 json!({"TenantName": case.name, "Tags": tags}),
                 "TenantName",
+            ),
+            Kind::DedicatedIpPool => (
+                "/v2/email/dedicated-ip-pools",
+                json!({"PoolName": case.name, "Tags": tags}),
+                "PoolName",
             ),
         };
         let reply = self.call("POST", path, Some(body)).await;
@@ -267,19 +330,21 @@ enum Kind {
     EmailIdentity,
     ConfigurationSet,
     Tenant,
+    DedicatedIpPool,
 }
 
 impl Kind {
     /// The resource-type token SES writes this kind of resource under in the resource
     /// field of its ARN, as the service's ARN forms for its own resources state them:
-    /// `identity/<identity>`, `contact-list/<name>`, `configuration-set/<name>` and
-    /// `tenant/<name>/<id>`.
+    /// `identity/<identity>`, `contact-list/<name>`, `configuration-set/<name>`,
+    /// `tenant/<name>/<id>` and `dedicated-ip-pool/<name>`.
     fn resource_type(self) -> &'static str {
         match self {
             Self::ContactList => "contact-list",
             Self::EmailIdentity => "identity",
             Self::ConfigurationSet => "configuration-set",
             Self::Tenant => "tenant",
+            Self::DedicatedIpPool => "dedicated-ip-pool",
         }
     }
 }
@@ -681,3 +746,553 @@ async fn list_tags_for_resource_refuses_an_arn_it_cannot_resolve() {
         tenant.tags
     );
 }
+
+/// One accepted write row: the resource to create with the tags it starts out carrying,
+/// the tags one `TagResource` call then adds, and the tag set the resource is left
+/// carrying.
+struct WriteCase {
+    /// What this row varies, named in every assertion.
+    case: &'static str,
+    kind: Kind,
+    /// The name or identity the resource is created with.
+    name: &'static str,
+    /// The id the ARN spells, when the row varies it from `name`.
+    addressed_by: Option<&'static str>,
+    /// The tags the create supplies, in the order it supplies them.
+    initial: Vec<(String, String)>,
+    /// The tags the `TagResource` call supplies, in the order it supplies them.
+    added: Vec<(String, String)>,
+    /// The tags the resource carries afterwards, in the order it reports them.
+    expected: Vec<(String, String)>,
+}
+
+impl WriteCase {
+    /// The row's resource as the create table states one, so both tables build a
+    /// resource the same way.
+    fn creation(&self) -> TagCase {
+        TagCase {
+            case: self.case,
+            kind: self.kind,
+            name: self.name,
+            addressed_by: self.addressed_by,
+            tags: self.initial.clone(),
+        }
+    }
+}
+
+/// `count` distinct tags, keyed in ascending order, for a row that varies the COUNT.
+fn generated_tags(count: usize) -> Vec<(String, String)> {
+    (0..count)
+        .map(|index| tag(&format!("key-{index:02}"), &format!("value-{index:02}")))
+        .collect()
+}
+
+/// The accepted write table: the rule generalises over the KIND of resource the ARN
+/// names, over whether a supplied key is one the resource already carries, over the
+/// number of tags supplied and already held, and over the characters and lengths a key
+/// and a value carry.
+fn accepted_write_cases() -> Vec<WriteCase> {
+    vec![
+        WriteCase {
+            case: "two tags added to a contact list carrying none",
+            kind: Kind::ContactList,
+            name: "weekly-digest",
+            addressed_by: None,
+            initial: Vec::new(),
+            added: vec![tag("owner", "marketing"), tag("env", "prod")],
+            expected: vec![tag("owner", "marketing"), tag("env", "prod")],
+        },
+        WriteCase {
+            case: "a tag added to a contact list that already carries others",
+            kind: Kind::ContactList,
+            name: "appended",
+            addressed_by: None,
+            initial: vec![tag("owner", "marketing"), tag("env", "prod")],
+            added: vec![tag("tier", "gold")],
+            expected: vec![
+                tag("owner", "marketing"),
+                tag("env", "prod"),
+                tag("tier", "gold"),
+            ],
+        },
+        WriteCase {
+            case: "a key the resource already carries, which takes the supplied value",
+            kind: Kind::ContactList,
+            name: "replaced",
+            addressed_by: None,
+            initial: vec![tag("owner", "marketing"), tag("env", "prod")],
+            added: vec![tag("env", "staging")],
+            // Each key is unique on the resource and carries one value, so the key keeps
+            // its place and only its value changes.
+            expected: vec![tag("owner", "marketing"), tag("env", "staging")],
+        },
+        WriteCase {
+            case: "one call that both replaces a key and adds a new one",
+            kind: Kind::ContactList,
+            name: "mixed",
+            addressed_by: None,
+            initial: vec![tag("owner", "marketing")],
+            added: vec![tag("owner", "platform"), tag("env", "prod")],
+            expected: vec![tag("owner", "platform"), tag("env", "prod")],
+        },
+        WriteCase {
+            case: "the same key supplied twice in one call, which carries one value",
+            kind: Kind::ContactList,
+            name: "repeated-key",
+            addressed_by: None,
+            initial: Vec::new(),
+            added: vec![tag("env", "prod"), tag("env", "staging")],
+            expected: vec![tag("env", "staging")],
+        },
+        WriteCase {
+            case: "a tag whose value is empty",
+            kind: Kind::ContactList,
+            // `Tag$Value` documents "The minimum length is 0 characters", so a tag may
+            // carry a key and no value.
+            name: "empty-value",
+            addressed_by: None,
+            initial: Vec::new(),
+            added: vec![tag("retired", "")],
+            expected: vec![tag("retired", "")],
+        },
+        WriteCase {
+            case: "tags using the documented symbol set and white space",
+            kind: Kind::ContactList,
+            name: "symbols",
+            addressed_by: None,
+            initial: Vec::new(),
+            added: vec![
+                tag("cost_center.1:a/b", "x=y+z-1"),
+                tag("team name", "platform ops"),
+                tag("contact", "ops@example.com"),
+            ],
+            expected: vec![
+                tag("cost_center.1:a/b", "x=y+z-1"),
+                tag("team name", "platform ops"),
+                tag("contact", "ops@example.com"),
+            ],
+        },
+        WriteCase {
+            case: "tags written in scripts other than Latin, which round-trip unchanged",
+            kind: Kind::ContactList,
+            // The documented set is "Unicode letters, digits, white space" and the
+            // symbols, so a key or value written in any script is in it.
+            name: "unicode",
+            addressed_by: None,
+            initial: Vec::new(),
+            added: vec![
+                tag("所有者", "マーケティング"),
+                tag("Ключ", "значение"),
+                tag("مفتاح", "قيمة"),
+            ],
+            expected: vec![
+                tag("所有者", "マーケティング"),
+                tag("Ключ", "значение"),
+                tag("مفتاح", "قيمة"),
+            ],
+        },
+        WriteCase {
+            case: "a key of one character and a value of none, the documented minimums",
+            kind: Kind::ContactList,
+            name: "minimums",
+            addressed_by: None,
+            initial: Vec::new(),
+            added: vec![tag("k", "")],
+            expected: vec![tag("k", "")],
+        },
+        WriteCase {
+            case: "a key and a value at exactly their documented maximum lengths",
+            kind: Kind::ContactList,
+            name: "maximums",
+            addressed_by: None,
+            initial: Vec::new(),
+            added: vec![tag(
+                &"k".repeat(MAX_TAG_KEY_CHARS),
+                &"v".repeat(MAX_TAG_VALUE_CHARS),
+            )],
+            expected: vec![tag(
+                &"k".repeat(MAX_TAG_KEY_CHARS),
+                &"v".repeat(MAX_TAG_VALUE_CHARS),
+            )],
+        },
+        WriteCase {
+            case: "as many tags as a resource may carry, added to one carrying none",
+            kind: Kind::ContactList,
+            name: "fully-tagged",
+            addressed_by: None,
+            initial: Vec::new(),
+            added: generated_tags(MAX_TAGS_PER_RESOURCE),
+            expected: generated_tags(MAX_TAGS_PER_RESOURCE),
+        },
+        WriteCase {
+            case: "a key re-tagged on a resource already carrying as many as it may",
+            kind: Kind::ContactList,
+            name: "at-the-ceiling",
+            addressed_by: None,
+            initial: generated_tags(MAX_TAGS_PER_RESOURCE),
+            // Replacing a key the resource carries adds nothing, so the ceiling is not
+            // reached by it.
+            added: vec![tag("key-00", "replaced")],
+            expected: {
+                let mut expected = generated_tags(MAX_TAGS_PER_RESOURCE);
+                expected[0] = tag("key-00", "replaced");
+                expected
+            },
+        },
+        WriteCase {
+            case: "an email identity that is an address",
+            kind: Kind::EmailIdentity,
+            name: "sender@example.com",
+            addressed_by: None,
+            initial: vec![tag("purpose", "transactional")],
+            added: vec![tag("env", "prod")],
+            expected: vec![tag("purpose", "transactional"), tag("env", "prod")],
+        },
+        WriteCase {
+            case: "an email identity that is a domain, addressed in another case",
+            kind: Kind::EmailIdentity,
+            name: "example.org",
+            // A domain is compared the way DNS compares labels, so an ARN spelling it in
+            // another case names the same identity.
+            addressed_by: Some("EXAMPLE.ORG"),
+            initial: vec![tag("owner", "web")],
+            added: vec![tag("owner", "platform"), tag("env", "staging")],
+            expected: vec![tag("owner", "platform"), tag("env", "staging")],
+        },
+        WriteCase {
+            case: "a configuration set",
+            kind: Kind::ConfigurationSet,
+            name: "nightly",
+            addressed_by: None,
+            initial: Vec::new(),
+            added: vec![tag("schedule", "nightly")],
+            expected: vec![tag("schedule", "nightly")],
+        },
+        WriteCase {
+            case: "a tenant, addressed by the ARN its create minted",
+            kind: Kind::Tenant,
+            name: "tenant_one",
+            addressed_by: None,
+            initial: vec![tag("tier", "gold")],
+            added: vec![tag("tier", "platinum"), tag("region", "eu")],
+            expected: vec![tag("tier", "platinum"), tag("region", "eu")],
+        },
+        WriteCase {
+            case: "a dedicated IP pool",
+            kind: Kind::DedicatedIpPool,
+            name: "transactional-pool",
+            addressed_by: None,
+            initial: Vec::new(),
+            added: vec![tag("owner", "platform")],
+            expected: vec![tag("owner", "platform")],
+        },
+    ]
+}
+
+#[tokio::test]
+async fn tag_resource_stores_the_tags_it_carries_on_the_resource_the_arn_names() {
+    for case in accepted_write_cases() {
+        let ses = Ses::new();
+        let resource_arn = ses.create(&case.creation()).await;
+
+        let reply = ses.tag_resource(&resource_arn, &case.added).await;
+        assert_eq!(
+            reply.status,
+            200,
+            "case {:?}: TagResource for {resource_arn:?} answered {} {:?} ({:?})",
+            case.case,
+            reply.status,
+            reply.error_code(),
+            reply.message()
+        );
+        assert!(
+            !reply.has_tags(),
+            "case {:?}: TagResourceResponse carries no members, but the response carried {:?}",
+            case.case,
+            reply.body
+        );
+
+        let reported = ses.list_tags(&resource_arn).await.tags("Tags");
+        assert_eq!(
+            reported, case.expected,
+            "case {:?}: expected the resource to carry {:?}, got {reported:?}",
+            case.case, case.expected
+        );
+
+        // A second identical call is the same merge over the same keys, so the resource
+        // is left carrying exactly what it already did.
+        let again = ses.tag_resource(&resource_arn, &case.added).await;
+        assert_eq!(
+            again.status,
+            200,
+            "case {:?}: a repeated TagResource answered {} {:?}",
+            case.case,
+            again.status,
+            again.message()
+        );
+        let after_repeat = ses.list_tags(&resource_arn).await.tags("Tags");
+        assert_eq!(
+            after_repeat, case.expected,
+            "case {:?}: after a repeated call the resource carried {after_repeat:?}, expected {:?}",
+            case.case, case.expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn tags_written_by_tag_resource_are_reported_by_the_resources_own_read() {
+    // The tags one write stores have two readers, so the rows that write to a contact
+    // list pin that both report them.
+    for case in accepted_write_cases()
+        .into_iter()
+        .filter(|case| case.kind == Kind::ContactList)
+    {
+        let ses = Ses::new();
+        let resource_arn = ses.create(&case.creation()).await;
+        let written = ses.tag_resource(&resource_arn, &case.added).await;
+        assert_eq!(
+            written.status,
+            200,
+            "case {:?}: TagResource answered {} {:?}",
+            case.case,
+            written.status,
+            written.message()
+        );
+
+        let on_the_resource = ses.get_contact_list(case.name).await.tags("Tags");
+        assert_eq!(
+            on_the_resource, case.expected,
+            "case {:?}: GetContactList reported {on_the_resource:?}, expected {:?}",
+            case.case, case.expected
+        );
+    }
+}
+
+/// One refused write row: the `ResourceArn` and tags to send, and the refusal they earn.
+struct WriteRefusalCase {
+    /// What this row varies, named in every assertion.
+    case: &'static str,
+    resource_arn: String,
+    tags: Vec<(String, String)>,
+    status: u16,
+    error_code: &'static str,
+    message: String,
+}
+
+#[tokio::test]
+async fn tag_resource_refuses_an_arn_it_cannot_resolve_and_a_tag_no_caller_may_define() {
+    let ses = Ses::new();
+    let held = TagCase {
+        case: "the one resource the account holds",
+        kind: Kind::ContactList,
+        name: "news",
+        addressed_by: None,
+        tags: vec![tag("owner", "marketing")],
+    };
+    let held_arn = ses.create(&held).await;
+    let one_tag = vec![tag("env", "prod")];
+
+    let cases = vec![
+        WriteRefusalCase {
+            case: "a value that is no ARN at all",
+            resource_arn: held.name.to_string(),
+            tags: one_tag.clone(),
+            status: 400,
+            error_code: "BadRequestException",
+            message: NOT_AN_SES_RESOURCE_ARN.to_string(),
+        },
+        WriteRefusalCase {
+            case: "an ARN of another vendor",
+            resource_arn: format!("arn:aws:sqs:{HOME}:{ACCOUNT_ID}:queue/news"),
+            tags: one_tag.clone(),
+            status: 400,
+            error_code: "BadRequestException",
+            message: NOT_AN_SES_RESOURCE_ARN.to_string(),
+        },
+        WriteRefusalCase {
+            case: "an SES ARN carrying a bare resource type",
+            resource_arn: format!("arn:aws:ses:{HOME}:{ACCOUNT_ID}:contact-list"),
+            tags: one_tag.clone(),
+            status: 400,
+            error_code: "BadRequestException",
+            message: NOT_AN_SES_RESOURCE_ARN.to_string(),
+        },
+        WriteRefusalCase {
+            case: "a contact list the account never created",
+            resource_arn: arn(HOME, ACCOUNT_ID, "contact-list", "never-created"),
+            tags: one_tag.clone(),
+            status: 404,
+            error_code: "NotFoundException",
+            message: format!(
+                "Resource {} does not exist.",
+                arn(HOME, ACCOUNT_ID, "contact-list", "never-created")
+            ),
+        },
+        WriteRefusalCase {
+            case: "another resource type under a name the account does hold",
+            resource_arn: arn(HOME, ACCOUNT_ID, "configuration-set", held.name),
+            tags: one_tag.clone(),
+            status: 404,
+            error_code: "NotFoundException",
+            message: format!(
+                "Resource {} does not exist.",
+                arn(HOME, ACCOUNT_ID, "configuration-set", held.name)
+            ),
+        },
+        WriteRefusalCase {
+            case: "the held resource's name under another account",
+            resource_arn: arn(HOME, OTHER_ACCOUNT_ID, "contact-list", held.name),
+            tags: one_tag.clone(),
+            status: 404,
+            error_code: "NotFoundException",
+            message: format!(
+                "Resource {} does not exist.",
+                arn(HOME, OTHER_ACCOUNT_ID, "contact-list", held.name)
+            ),
+        },
+        WriteRefusalCase {
+            case: "the held resource's name in another Region",
+            resource_arn: arn(AWAY, ACCOUNT_ID, "contact-list", held.name),
+            tags: one_tag.clone(),
+            status: 404,
+            error_code: "NotFoundException",
+            message: format!(
+                "Resource {} does not exist.",
+                arn(AWAY, ACCOUNT_ID, "contact-list", held.name)
+            ),
+        },
+        WriteRefusalCase {
+            case: "a tag key with no characters at all",
+            resource_arn: held_arn.clone(),
+            tags: vec![tag("", "prod")],
+            status: 400,
+            error_code: "BadRequestException",
+            message: TAG_KEY_LENGTH_REFUSAL.to_string(),
+        },
+        WriteRefusalCase {
+            case: "a tag key one character past its documented maximum",
+            resource_arn: held_arn.clone(),
+            tags: vec![tag(&"k".repeat(MAX_TAG_KEY_CHARS + 1), "prod")],
+            status: 400,
+            error_code: "BadRequestException",
+            message: TAG_KEY_LENGTH_REFUSAL.to_string(),
+        },
+        WriteRefusalCase {
+            case: "a tag value one character past its documented maximum",
+            resource_arn: held_arn.clone(),
+            tags: vec![tag("env", &"v".repeat(MAX_TAG_VALUE_CHARS + 1))],
+            status: 400,
+            error_code: "BadRequestException",
+            message: TAG_VALUE_LENGTH_REFUSAL.to_string(),
+        },
+        WriteRefusalCase {
+            case: "a tag value carrying a symbol outside the set the surface accepts",
+            resource_arn: held_arn.clone(),
+            tags: vec![tag("env", "50%")],
+            status: 400,
+            error_code: "BadRequestException",
+            message: TAG_CHARSET_REFUSAL.to_string(),
+        },
+        WriteRefusalCase {
+            case: "a tag key carrying a symbol outside the set the surface accepts",
+            resource_arn: held_arn.clone(),
+            tags: vec![tag("env!", "prod")],
+            status: 400,
+            error_code: "BadRequestException",
+            message: TAG_CHARSET_REFUSAL.to_string(),
+        },
+        WriteRefusalCase {
+            case: "a tag value carrying a character that is no letter, digit or symbol",
+            resource_arn: held_arn.clone(),
+            tags: vec![tag("env", "prod\u{1f680}")],
+            status: 400,
+            error_code: "BadRequestException",
+            message: TAG_CHARSET_REFUSAL.to_string(),
+        },
+        WriteRefusalCase {
+            case: "a tag key carrying the prefix reserved for Amazon Web Services",
+            resource_arn: held_arn.clone(),
+            tags: vec![tag("aws:created-by", "me")],
+            status: 400,
+            error_code: "BadRequestException",
+            message: RESERVED_TAG_PREFIX_REFUSAL.to_string(),
+        },
+        WriteRefusalCase {
+            case: "a tag value carrying the prefix reserved for Amazon Web Services",
+            resource_arn: held_arn.clone(),
+            tags: vec![tag("creator", "aws:ses")],
+            status: 400,
+            error_code: "BadRequestException",
+            message: RESERVED_TAG_PREFIX_REFUSAL.to_string(),
+        },
+        WriteRefusalCase {
+            case: "one more tag than the resource may carry, once merged",
+            resource_arn: held_arn.clone(),
+            // The resource already carries one tag, so the merged set is one past the
+            // ceiling even though the request itself is not.
+            tags: generated_tags(MAX_TAGS_PER_RESOURCE),
+            status: 400,
+            error_code: "BadRequestException",
+            message: too_many_tags(MAX_TAGS_PER_RESOURCE + 1),
+        },
+        WriteRefusalCase {
+            case: "more tags in one request than any resource may carry",
+            resource_arn: held_arn.clone(),
+            // A request this size cannot be served whatever the resource carries, so it
+            // is refused on its own count, before the merge.
+            tags: generated_tags(MAX_TAGS_PER_RESOURCE + 10),
+            status: 400,
+            error_code: "BadRequestException",
+            message: too_many_tags(MAX_TAGS_PER_RESOURCE + 10),
+        },
+        WriteRefusalCase {
+            case: "a request whose first tag is acceptable and whose second is not",
+            resource_arn: held_arn.clone(),
+            tags: vec![tag("env", "prod"), tag("owner", "marketing!")],
+            status: 400,
+            error_code: "BadRequestException",
+            message: TAG_CHARSET_REFUSAL.to_string(),
+        },
+    ];
+
+    for case in &cases {
+        let reply = ses.tag_resource(&case.resource_arn, &case.tags).await;
+        assert_eq!(
+            reply.status, case.status,
+            "case {:?}: TagResource for {:?} answered {} {:?}, expected {}",
+            case.case,
+            case.resource_arn,
+            reply.status,
+            reply.message(),
+            case.status
+        );
+        assert_eq!(
+            reply.error_code(),
+            case.error_code,
+            "case {:?}: expected the modelled {}, got {:?}",
+            case.case,
+            case.error_code,
+            reply.error_code()
+        );
+        assert_eq!(
+            reply.message(),
+            case.message,
+            "case {:?}: expected the message {:?}, got {:?}",
+            case.case,
+            case.message,
+            reply.message()
+        );
+
+        // Nothing the refused request carried was stored, so the resource is left
+        // exactly as it was — including the acceptable tags of a request refused for one
+        // tag it carried.
+        let still_held = ses.list_tags(&held_arn).await.tags("Tags");
+        assert_eq!(
+            still_held, held.tags,
+            "case {:?}: after the refusal the held contact list reported {still_held:?}, \
+             expected {:?}",
+            case.case, held.tags
+        );
+    }
+}
+

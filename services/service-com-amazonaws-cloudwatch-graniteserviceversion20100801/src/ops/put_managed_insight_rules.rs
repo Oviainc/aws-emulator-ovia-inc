@@ -2,10 +2,10 @@
 
 //! @op PutManagedInsightRules
 //! Enables managed Contributor Insights rules for Amazon Web Services resources, one rule
-//! per `ManagedRule` the request carries whose `TemplateName` names a template this account's
-//! catalog publishes for that entry's resource; an entry naming no published template is
-//! reported back among the rules that could not be enabled. Implemented here, and the ONLY file
-//! to touch for this operation.
+//! per `ManagedRule` the request carries whose `ResourceARN` addresses a resource and whose
+//! `TemplateName` names a template this account's catalog publishes for that entry's resource;
+//! an entry naming no resource, or no published template, is reported back among the rules that
+//! could not be enabled. Implemented here, and the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -188,6 +188,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // iterating the failures never has to tell the two apart.
         let mut failures: Vec<PartialFailure> = Vec::new();
         for rule in &input.managed_rules {
+            // "The ARN of an Amazon Web Services resource that has managed Contributor
+            // Insights rules." (`ManagedRule$ResourceARN`) — an ARN that addresses no resource
+            // names nothing a managed rule could collect data for, so the entry's resource is
+            // read BEFORE its template: whatever the template name resolves to, the fault in
+            // the entry is its ARN. The entry is reported back among the rules that could not
+            // be enabled and the rest of the request still takes effect: "If the operation
+            // could not process one of the rules, the following data is returned for each of
+            // those rules." (`PartialFailure`)
+            if !crate::state::addresses_resource(&rule.resource_arn) {
+                failures.push(PartialFailure {
+                    failure_resource: Some(rule.template_name.clone()),
+                    exception_type: Some(INVALID_RESOURCE_ARN_EXCEPTION.to_string()),
+                    failure_code: Some(TEMPLATE_NAME_FAILURE_CODE.to_string()),
+                    failure_description: Some(INVALID_RESOURCE_ARN_ENTRY.to_string()),
+                });
+                continue;
+            }
             // "The template name for the managed Contributor Insights rule, as returned by
             // ListManagedInsightRules." (`ManagedRule$TemplateName`) — the template is one the
             // service publishes for the resource, so a name the catalog answers with no
@@ -321,6 +338,20 @@ const TEMPLATE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
 
 /// Which member of the entry the failure is about: its template name.
 const TEMPLATE_NAME_FAILURE_CODE: &str = "TEMPLATE_NAME";
+
+/// What an entry whose `ResourceARN` addresses no resource is reported with: the entry could
+/// not be processed because the value it carries for that member is not one the operation can
+/// act on.
+///
+/// The sentence is this error class's own and carries no variable part; the entry is still
+/// identified by its template name, the member every `PartialFailure` of this operation keys
+/// on ([`TEMPLATE_NAME_FAILURE_CODE`]). Named apart from `crate::state::INVALID_RESOURCE_ARN`,
+/// which is the WHOLE-request refusal of a value that is not an ARN at all.
+const INVALID_RESOURCE_ARN_ENTRY: &str = "Invalid ResourceArn.";
+
+/// The exception an entry naming no resource is reported as: the value of one of its
+/// parameters is not one the operation can use.
+const INVALID_RESOURCE_ARN_EXCEPTION: &str = "InvalidParameterException";
 
 /// The `Definition` a managed rule carries: the managed-rule schema, and the template and
 /// resource the rule was enabled from.

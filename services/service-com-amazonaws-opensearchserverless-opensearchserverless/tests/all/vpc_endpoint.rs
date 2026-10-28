@@ -30,21 +30,21 @@ use crate::collection_lifecycle::{at, call, emulator, text, CLIENT_ERROR};
 const VPC_ENDPOINT_STATUS_VALUES: &[&str] = &["ACTIVE", "DELETING", "FAILED", "PENDING"];
 
 /// `VpcEndpointStatus$PENDING` — "Pending VPCEndpoint resource".
-const PENDING: &str = "PENDING";
+pub(crate) const PENDING: &str = "PENDING";
 
 /// `VpcEndpointStatus$ACTIVE` — "VPCEndpoint resource is ready to use".
-const ACTIVE: &str = "ACTIVE";
+pub(crate) const ACTIVE: &str = "ACTIVE";
 
 /// The prefix `VpcEndpointId`'s own `^vpce-[0-9a-z]*$` fixes.
 const ID_PREFIX: &str = "vpce-";
 
 /// Long enough for the `PENDING -> ACTIVE` transition `CreateVpcEndpoint` starts to fall
 /// due; the emulator's span is 500 ms and nothing sleeps for it inside a handler.
-const SETTLE_WAIT: Duration = Duration::from_millis(700);
+pub(crate) const SETTLE_WAIT: Duration = Duration::from_millis(700);
 
 /// True when `id` satisfies `VpcEndpointId`'s modelled `^vpce-[0-9a-z]*$` and its
 /// `@length(min: 1, max: 255)`, with a non-empty suffix — a minted id names something.
-fn is_vpc_endpoint_id(id: &str) -> bool {
+pub(crate) fn is_vpc_endpoint_id(id: &str) -> bool {
     let Some(suffix) = id.strip_prefix(ID_PREFIX) else {
         return false;
     };
@@ -57,7 +57,7 @@ fn is_vpc_endpoint_id(id: &str) -> bool {
 
 /// Create the VPC endpoint `request` describes, asserting it was accepted, and answer its
 /// `createVpcEndpointDetail`.
-async fn create_endpoint(
+pub(crate) async fn create_endpoint(
     router: &smithy_server_runtime::MultiServiceRouter,
     case: &str,
     request: Value,
@@ -71,7 +71,7 @@ async fn create_endpoint(
 }
 
 /// The whole `BatchGetVpcEndpoint` answer for `ids`.
-async fn read_endpoints(
+pub(crate) async fn read_endpoints(
     router: &smithy_server_runtime::MultiServiceRouter,
     case: &str,
     ids: &[&str],
@@ -85,7 +85,7 @@ async fn read_endpoints(
 }
 
 /// The single `VpcEndpointDetail` `BatchGetVpcEndpoint` reports for `id`.
-async fn read_one(
+pub(crate) async fn read_one(
     router: &smithy_server_runtime::MultiServiceRouter,
     case: &str,
     id: &str,
@@ -107,7 +107,7 @@ async fn read_one(
 ///
 /// The `PENDING -> ACTIVE` move is owed by the clock, so this waits for the wall clock
 /// rather than for a call: no handler sleeps for it.
-async fn await_active(
+pub(crate) async fn await_active(
     router: &smithy_server_runtime::MultiServiceRouter,
     case: &str,
     id: &str,
@@ -124,7 +124,7 @@ async fn await_active(
 
 /// Assert that `detail` reports the identity and the inputs of the endpoint `request`
 /// created, whatever status it is in.
-fn assert_members(case: &str, id: &str, request: &Value, detail: &Value) {
+pub(crate) fn assert_members(case: &str, id: &str, request: &Value, detail: &Value) {
     assert_eq!(
         text(detail, "id"),
         id,

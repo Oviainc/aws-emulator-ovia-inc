@@ -53,6 +53,8 @@ mod rejected_validation_code_keeps_the_version;
 mod retired_units_and_portal_validation;
 #[path = "all/shared_marketplace_punch_out_rule.rs"]
 mod shared_marketplace_punch_out_rule;
+#[path = "all/shared_page_walk.rs"]
+mod shared_page_walk;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tag_write_quota_counts_distinct_keys.rs"]

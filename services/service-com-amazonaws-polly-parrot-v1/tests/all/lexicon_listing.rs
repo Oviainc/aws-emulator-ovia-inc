@@ -3,14 +3,16 @@
 //! End-to-end tests for the RULE that `ListLexicons` is not a paged read: one call
 //! reports the whole lexicon list of the Region it was signed for, in name order, and
 //! returns no `NextToken` (the model declares no page-size input for it and does not
-//! mark it `@paginated`).
+//! mark it `@paginated`) — so a `NextToken` presented to it is one the service could
+//! never have minted, and is refused rather than answered with part of the list.
 //!
 //! The rule is checked over a TABLE of store sizes rather than the one size an issue
 //! happens to quote: empty, one, several sizes either side of any page a reader might
 //! expect, and the per-Region count quota itself — the largest list a Region can hold,
 //! so the table spans every store size the operation can be asked about. Each row also
 //! lists in a Region of its own, so a rule that held only for the default Region could
-//! not pass.
+//! not pass. The token rule is checked over a table of token FORMS, since the service
+//! mints none and so no form of token is one it could have issued.
 
 use service_com_amazonaws_polly_parrot_v1::ops::put_lexicon::MAX_LEXICONS;
 
@@ -157,51 +159,92 @@ async fn every_listed_description_carries_its_own_attributes() {
     }
 }
 
-/// RULE: a `NextToken` this service could not have minted is
-/// `InvalidNextTokenException` (HTTP 400), and a well-formed one resumes after the
-/// name it carries — still in one untruncated response.
+/// RULE: this read is not paginated and so mints no continuation token — every
+/// non-empty `NextToken` it is handed is one the service could not have issued and is
+/// refused with `InvalidNextTokenException` (HTTP 400), never answered with a shorter
+/// list; the empty token the model admits (`NextToken` is len 0..4096) names no
+/// position and reads as no token at all.
 #[tokio::test]
-async fn a_next_token_is_checked_and_never_needed() {
+async fn a_next_token_this_read_never_mints_is_refused() {
     let polly = Polly::new();
     let content = pls("ipa", "en-US", 1);
     let size = 25;
     for index in 0..size {
         assert_eq!(
-            polly.put_lexicon(&lexicon_name(index), &content).await.status(),
+            polly
+                .put_lexicon(&lexicon_name(index), &content)
+                .await
+                .status(),
             200,
             "PutLexicon {} failed",
             lexicon_name(index)
         );
     }
+    let whole: Vec<String> = (0..size).map(lexicon_name).collect();
 
-    // Not hex at all, odd-length hex, and hex of bytes that are not UTF-8: none of
-    // them is a token this service could have issued.
-    for bad in ["not-a-token", "zzzz", "abc", "ff", "fffe"] {
-        let response = polly.list_lexicons(&format!("?NextToken={bad}")).await;
+    // Tokens that differ in form: prose, padded base64, hex of a stored lexicon's name
+    // and hex of a name no Region holds (the cursor shape a name-ordered range scan
+    // would resume from), hex of the field-separated cursor this crate's one paged read
+    // mints, not-hex, odd-length hex, hex of bytes that are not UTF-8, and a token at
+    // the modelled maximum length. The service mints no token for this read, so none of
+    // these is a token it could have issued.
+    let tokens: Vec<String> = vec![
+        "not-a-token".to_string(),
+        "this-was-never-issued-by-polly==".to_string(),
+        hex::encode(lexicon_name(0)),
+        hex::encode(lexicon_name(7)),
+        hex::encode(lexicon_name(size - 1)),
+        hex::encode("NoSuchLexicon"),
+        hex::encode("0\u{1f}completed"),
+        "zzzz".to_string(),
+        "abc".to_string(),
+        "ff".to_string(),
+        "fffe".to_string(),
+        "a".repeat(4_096),
+    ];
+    for token in &tokens {
+        let case = format!("?NextToken={token}");
+        let response = polly.list_lexicons(&case).await;
         assert_eq!(
             (response.status().as_u16(), error_code(&response)),
             (400, "InvalidNextTokenException".to_string()),
-            "token {bad:?}: expected a refusal, body {:?}",
+            "case {case:?}: a token this read never mints must be refused, body {:?}",
             json(&response)
         );
     }
 
-    // A well-formed cursor: the rest of the list, whole, with no token of its own.
-    for after in [0usize, 7, size - 1] {
-        let token = hex::encode(lexicon_name(after));
-        let body = json(&polly.list_lexicons(&format!("?NextToken={token}")).await);
-        let expected: Vec<String> = (after + 1..size).map(lexicon_name).collect();
+    // The refusals changed nothing: the list is still whole, and every lexicon a
+    // truncated answer would have dropped is still readable.
+    let body = json(&polly.list_lexicons("").await);
+    assert_eq!(
+        listed_names_in_order(&body),
+        whole,
+        "case \"after the refusals\": the list must still be whole"
+    );
+    for index in [0, 7, size - 1] {
+        let name = lexicon_name(index);
+        let got = polly.get_lexicon(&name).await;
         assert_eq!(
-            listed_names_in_order(&body),
-            expected,
-            "cursor after {after}: the remainder must be reported whole"
-        );
-        assert_eq!(
-            body["NextToken"].as_str(),
-            None,
-            "cursor after {after}: the response is never truncated, so no NextToken is owed, \
-             got {:?}",
-            body["NextToken"]
+            got.status(),
+            200,
+            "case {name:?}: a refused token must not hide a lexicon, body {:?}",
+            json(&got)
         );
     }
+
+    // An empty token names no position, so it reads as no token at all: the whole
+    // list, with no token in return.
+    let empty = json(&polly.list_lexicons("?NextToken=").await);
+    assert_eq!(
+        listed_names_in_order(&empty),
+        whole,
+        "case \"?NextToken=\": an empty token must read as no token"
+    );
+    assert_eq!(
+        empty["NextToken"].as_str(),
+        None,
+        "case \"?NextToken=\": the response is never truncated, so no NextToken is owed, \
+         got {:?}",
+        empty["NextToken"]
+    );
 }

@@ -59,8 +59,8 @@ impl Answer {
 }
 
 /// The router every test drives: this one service, on a fresh shared engine. The engine
-/// is handed back too, so a test can seed the store with state no request path produces
-/// (findings a real run's analysis would have written, or a store already at its quota).
+/// is handed back too, so a test can seed the store with state a request path would take
+/// many calls to reach (a chosen set of findings, or a store already at its quota).
 pub(crate) fn harness() -> (Arc<engine::InMemoryEngine>, MultiServiceRouter) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
@@ -479,7 +479,9 @@ async fn upload_url_then_scan_round_trips_through_get_scan_list_scans_and_findin
         settled.json
     );
 
-    // 8. GetFindings now reports the stored findings of that scan.
+    // 8. GetFindings now reports the stored findings of that scan. The archive uploaded
+    //    above carries no source file, so the run's analysis of it found nothing — what a
+    //    run finds in code that does carry a weakness is driven in `crate::scan_findings`.
     let findings = get_findings(&router, scan_name, "?status=All").await;
     assert_eq!(
         findings.status, 200,
@@ -489,7 +491,8 @@ async fn upload_url_then_scan_round_trips_through_get_scan_list_scans_and_findin
     let listed_findings = findings.get("findings").as_array().cloned().unwrap_or_default();
     assert!(
         listed_findings.is_empty(),
-        "GetFindings: no finding is stored for this scan, got {}",
+        "GetFindings: the analysed resource carries no detectable code, so the scan holds \
+         no finding, got {}",
         findings.json
     );
     assert!(
@@ -798,9 +801,10 @@ async fn list_scans_pages_every_scan_exactly_once_for_every_page_size() {
 // Findings of a scan: the status filter and the page cursor, over a POPULATED store
 // ---------------------------------------------------------------------------------
 
-/// A finding as a run's analysis would have stored it. Seeded directly into the store:
-/// no request path writes findings yet, so this is the only way to exercise the readers
-/// over a non-empty list.
+/// A finding as a run's analysis stores one. Seeded directly into the store, so the
+/// readers are exercised over a list of chosen statuses and ids without an upload per row;
+/// the findings a run's analysis of uploaded code actually produces are driven end to end
+/// in `crate::scan_findings`.
 fn seeded_finding(finding_id: &str, status: &str) -> Finding {
     Finding {
         id: Some(finding_id.to_string()),
@@ -990,6 +994,7 @@ fn settled_run(run_id: &str, now: i64) -> ScanRun {
         updated_at_millis: Some(now),
         error_message: Some("seeded".to_string()),
         resource_uploaded: false,
+        pending_analysis: Default::default(),
         settle_due_millis: now,
     }
 }

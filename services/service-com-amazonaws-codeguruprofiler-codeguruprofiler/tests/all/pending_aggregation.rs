@@ -24,7 +24,7 @@
 //! aggregation is let fall due through the one shared helper every suite uses.
 
 use crate::profiling_group_lifecycle::{
-    Answer, Harness, PROFILE_START_MILLIS, ion_profile, json_profile,
+    Answer, Harness, PROFILE_START_MILLIS, ion_profile, json_profile, servable_window,
 };
 
 /// The fixed text a 404 about absent profile DATA carries
@@ -138,7 +138,11 @@ fn rows() -> Vec<Row> {
         },
         Row {
             label: "both bounds",
-            query: format!("?startTime={WIDE_START}&endTime={WIDE_END}"),
+            // A `GetProfile` pair of bounds is bounded by the maximum range the
+            // operation's doc allows, so the window is the shared one that holds a
+            // just-posted receipt and stays inside that limit
+            // ([`crate::get_profile_window_length`] owns the rule over its width).
+            query: servable_window(),
             content_type: "application/json",
             filler: 24,
             posts: 3,

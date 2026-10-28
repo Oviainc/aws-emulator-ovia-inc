@@ -25,7 +25,7 @@
 //! harness, not a fork of it.
 
 use crate::interval_validation::{create_group, expected_refusal};
-use crate::profiling_group_lifecycle::Harness;
+use crate::profiling_group_lifecycle::{Harness, servable_window};
 
 /// The group the served rows run against, created through the API like any other.
 const GROUP: &str = "get-profile-window";
@@ -33,10 +33,6 @@ const GROUP: &str = "get-profile-window";
 /// A name no group is stored under, so a row can show the window is checked ahead of the
 /// group lookup (which would be a 404).
 const MISSING_GROUP: &str = "get-profile-window-never-created";
-
-/// A window wide enough to hold any instant these cases place a profile at, used to show
-/// that the group serves a profile over a range that IS an interval.
-const WIDE_WINDOW: &str = "?startTime=2000-01-01T00:00:00Z&endTime=2099-01-01T00:00:00Z";
 
 /// The profile every case here posts, in the representation it is posted under. It
 /// carries the `start` a submitted profile must state, which is what `PostAgentProfile`
@@ -384,8 +380,11 @@ async fn a_get_profile_window_that_is_not_an_interval_is_refused_however_it_is_n
     }
 
     // The group really does serve its profile over a range that IS an interval, so the
-    // non-refusals above are not a store that answers nothing whatever it is asked.
-    let served = harness.get_profile(GROUP, WIDE_WINDOW).await;
+    // non-refusals above are not a store that answers nothing whatever it is asked. The
+    // window is the shared one that both holds a just-posted profile's receipt and stays
+    // inside the maximum range the operation's doc allows; how WIDE a window may be is
+    // [`crate::get_profile_window_length`]'s rule, not this suite's.
+    let served = harness.get_profile(GROUP, &servable_window()).await;
     assert_eq!(
         served.status,
         200,
@@ -443,7 +442,8 @@ async fn a_refused_get_profile_window_changes_nothing_a_later_caller_sees() {
     let harness = Harness::new();
     group_holding_a_profile(&harness).await;
 
-    let before = harness.get_profile(GROUP, WIDE_WINDOW).await;
+    let window = servable_window();
+    let before = harness.get_profile(GROUP, &window).await;
     assert_eq!(
         before.status,
         200,
@@ -468,7 +468,7 @@ async fn a_refused_get_profile_window_changes_nothing_a_later_caller_sees() {
         );
     }
 
-    let after = harness.get_profile(GROUP, WIDE_WINDOW).await;
+    let after = harness.get_profile(GROUP, &window).await;
     assert_eq!(
         after.status, before.status,
         "a refused window must not change a later answer's status, got {} {}",

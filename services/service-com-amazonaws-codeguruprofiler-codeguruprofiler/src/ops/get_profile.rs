@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetProfile
-//! Returns the AGGREGATED profile of a group over a requested window, in the
+//! Returns the AGGREGATED profile of a group over a requested window — no wider than the
+//! maximum time range the operation's doc allows — in the
 //! representation the request accepts and bounded to the call-stack depth it asks for:
 //! the bytes exactly as `PostAgentProfile` uploaded them when the caller accepts the
 //! representation they were posted under and asks for no depth bound, and otherwise the
@@ -119,9 +120,26 @@
 use super::types::*;
 
 use ::std::cmp::Ordering;
+use ::std::time::Duration;
 
 use ::base64::Engine as _;
 use ::ion_rs::{Element, IonType, Sequence, Struct, Value as IonValue};
+
+/// The LONGEST time range this operation serves an aggregated profile over. Not an
+/// emulator choice: the operation's own doc states it — "Specify the time range for the
+/// requested aggregated profile using 1 or 2 of the following parameters: startTime,
+/// endTime, period. The maximum time range allowed is 7 days" — and it bounds the LENGTH
+/// of the range, so a request that names that length with a pair of bounds is bounded by
+/// it exactly as one that names it with `period`.
+const MAX_TIME_RANGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// [`MAX_TIME_RANGE`] in the ISO 8601 duration form `period` is stated in, for the refusal
+/// that states the limit.
+const MAX_TIME_RANGE_TEXT: &str = "P7D";
+
+/// What the operation's doc calls the range [`MAX_TIME_RANGE`] bounds, for that same
+/// refusal.
+const TIME_RANGE_SUBJECT: &str = "the time range for the requested aggregated profile";
 
 /// The time window a `GetProfile` request selects over, as (start, end) bounds either
 /// of which may be open.
@@ -129,10 +147,13 @@ use ::ion_rs::{Element, IonType, Sequence, Struct, Value as IonValue};
 /// The rule is this service's one reading of the `startTime`/`endTime`/`period` trio
 /// ([`crate::state::requested_window`]), which the operation's own doc states: "Specify
 /// the time range for the requested aggregated profile using 1 or 2 of the following
-/// parameters: startTime, endTime, period. … If you specify all 3 parameters, an
-/// exception is thrown. If you specify only period, the latest aggregated profile is
-/// returned." So `period` completes whichever single bound was given, and on its own
-/// leaves both bounds open — which is how this operation selects the LATEST profile.
+/// parameters: startTime, endTime, period. The maximum time range allowed is 7 days. If
+/// you specify all 3 parameters, an exception is thrown. If you specify only period, the
+/// latest aggregated profile is returned." So `period` completes whichever single bound
+/// was given, and on its own leaves both bounds open — which is how this operation selects
+/// the LATEST profile — and the range the request ends up naming is no longer than
+/// [`MAX_TIME_RANGE`], which the service's one window-length rule
+/// ([`crate::state::validate_window_length`]) bounds it by.
 #[allow(clippy::type_complexity)]
 fn requested_window(
     input: &GetProfileInput,
@@ -147,6 +168,14 @@ fn requested_window(
         input.start_time,
         input.end_time,
         input.period.as_deref(),
+    )
+    .map_err(crate::scaffolded::Scaffolded::validation)?;
+    crate::state::validate_window_length(
+        &window,
+        input.period.as_deref(),
+        MAX_TIME_RANGE,
+        MAX_TIME_RANGE_TEXT,
+        TIME_RANGE_SUBJECT,
     )
     .map_err(crate::scaffolded::Scaffolded::validation)?;
     Ok((window.start, window.end))

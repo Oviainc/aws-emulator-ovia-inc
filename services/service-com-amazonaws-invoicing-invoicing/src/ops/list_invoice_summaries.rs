@@ -138,11 +138,6 @@ const MAX_PAGE_SIZE: usize = 100;
 /// taken for one of these.
 const NEXT_TOKEN_PREFIX: &str = "invoice-summaries:";
 
-/// The `NextToken` that resumes the walk at `invoice_id`.
-fn encode_next_token(invoice_id: &str) -> String {
-    crate::state::encode_page_token(NEXT_TOKEN_PREFIX, invoice_id)
-}
-
 /// The invoice id a caller's `NextToken` resumes at, or `None` when it asked for the
 /// first page. A token this operation did not mint is refused with the model's own
 /// `invalidNextToken` reason — the one rendering every paginated walk of this service
@@ -356,14 +351,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let selected = Selected::new(&input.selector)?;
         let filter = SummaryFilter::new(input.filter.as_ref())?;
         let resume_at = decode_next_token(input.next_token.as_deref())?;
-        // The boundary validator already refused a `MaxResults` outside
-        // `@range(1..100)`; the member has no `@default`, so an omitted one asks for a
-        // full page.
-        let page_size = input
-            .max_results
-            .and_then(|requested| usize::try_from(requested).ok())
-            .unwrap_or(MAX_PAGE_SIZE)
-            .clamp(1, MAX_PAGE_SIZE);
+        // The walk's maximum, and the page size this request resolves to inside it: the
+        // rule every paginated listing of this service shares
+        // ([`crate::state::resolve_page_size`]). The boundary validator already refused a
+        // `MaxResults` outside `@range(1..100)`; the member has no `@default`, so an
+        // omitted one asks for a full page.
+        let page_size = crate::state::resolve_page_size(input.max_results, MAX_PAGE_SIZE);
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListInvoiceSummariesErrorModeled::InternalServerException(
@@ -398,30 +391,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        let mut invoice_summaries = Vec::new();
-        let mut next_token = None;
-        // `invoices` is a BTreeMap keyed by invoice id, so this walk is in one stable
-        // order and a token (the id the next page starts at) stays meaningful: the token
-        // is a POSITION in that order, so the resumed page seeks straight to it rather
-        // than re-walking the invoices the earlier pages already reported.
-        let page = match resume_at.as_deref() {
-            Some(from) => store.invoices.range(from.to_string()..),
-            None => store.invoices.range::<String, _>(..),
-        };
-        for (invoice_id, invoice) in page {
-            if !linked_to_account(invoice, account_id) || !filter.admits(invoice) {
-                continue;
-            }
-            if invoice_summaries.len() == page_size {
-                next_token = Some(encode_next_token(invoice_id));
-                break;
-            }
-            invoice_summaries.push(invoice.clone());
-        }
+        // `invoices` is a BTreeMap keyed by invoice id, so the shared walk
+        // ([`crate::state::page_by_key`]) takes this page in one stable order and the
+        // token it mints is a POSITION in that order — the invoice id the next page
+        // resumes at.
+        let page = crate::state::page_by_key(
+            &store.invoices,
+            resume_at.as_deref(),
+            page_size,
+            NEXT_TOKEN_PREFIX,
+            |invoice| {
+                (linked_to_account(invoice, account_id) && filter.admits(invoice))
+                    .then(|| invoice.clone())
+            },
+        );
 
         Ok(ListInvoiceSummariesOutput {
-            invoice_summaries,
-            next_token,
+            invoice_summaries: page.items,
+            next_token: page.next_token,
         })
     }
 }

@@ -95,6 +95,9 @@ mod pricing_plan_tier_and_pending;
 #[path = "all/pricing_plan_update.rs"]
 mod pricing_plan_update;
 
+#[path = "all/property_group_refinement.rs"]
+mod property_group_refinement;
+
 #[path = "all/property_listing.rs"]
 mod property_listing;
 

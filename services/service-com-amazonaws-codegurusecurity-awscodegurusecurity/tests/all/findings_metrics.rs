@@ -63,9 +63,9 @@ type Seed = (
     Option<i64>,
 );
 
-/// A finding as a scan run's analysis would have stored it. Seeded directly into the
-/// store: no request path writes findings yet, so this is the only way to exercise the
-/// metrics over a non-empty store.
+/// A finding as a scan run's analysis stores one. Seeded directly into the store, so the
+/// metrics are exercised over chosen severities, statuses and instants without one upload
+/// and one run per row.
 fn seed(engine: &std::sync::Arc<engine::InMemoryEngine>, seeds: &[Seed]) {
     let store = store_of(engine);
     let mut guard = store.lock();

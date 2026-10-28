@@ -12,10 +12,11 @@
 //! quota [`crate::ops::put_lexicon::MAX_LEXICONS`], not by a page size.
 //!
 //! The store is a `BTreeMap` keyed by Region and then name, so one Region's entries are
-//! contiguous in name order and the read is a range scan. The modelled `NextToken`
-//! input is still checked: a token this service could not have minted is
-//! `InvalidNextTokenException` (400) rather than a silently wrong list, and a
-//! well-formed one names the lexicon to resume after.
+//! contiguous in name order and the read is a range scan. Because the operation mints no
+//! continuation token, the modelled `NextToken` input can only ever carry a token this
+//! service could not have issued: a non-empty one is `InvalidNextTokenException` (400),
+//! refused before any state is read rather than answered with a silently short list
+//! (the empty token the model admits names no position and reads as no token at all).
 //!
 //! ## Shape of an operation
 //!
@@ -149,17 +150,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A token must be one this service could have minted; anything else is refused
-        // before any state is read, so a garbage token can never read as "the whole
-        // list". A well-formed one names the lexicon the listing resumes after.
-        let after = match input.next_token.as_deref() {
-            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
-                ListLexiconsErrorModeled::InvalidNextTokenException(
-                    crate::service::errors::invalid_next_token(),
-                )
-            })?),
-            None => None,
-        };
+        // This read is not paginated, so the service mints no continuation token for
+        // it: a non-empty `NextToken` is one it could not have issued, and is refused
+        // before any state is read rather than answered with a partial list. An empty
+        // token (the model admits length 0) names no position, so it reads as no token
+        // at all.
+        if crate::state::is_unmintable_page_token(input.next_token.as_deref()) {
+            return Err(ListLexiconsErrorModeled::InvalidNextTokenException(
+                crate::service::errors::invalid_next_token(),
+            )
+            .into());
+        }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListLexiconsErrorModeled::ServiceFailureException(
@@ -173,7 +174,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // another one is not reported here.
         let region = crate::state::request_region(ctx.parts());
         let lexicons: Vec<LexiconDescription> = guard
-            .lexicons_in_region(&region, after.as_deref())
+            .lexicons_in_region(&region)
             .map(|stored| LexiconDescription {
                 name: Some(stored.name.clone()),
                 attributes: Some(crate::state::lexicon_attributes(stored)),

@@ -116,15 +116,7 @@ impl From<DeleteCollectionErrorModeled> for DeleteCollectionError {
 /// documentation states them in — `'ACTIVE', 'FAILED', or 'UPDATE_FAILED'` — so the
 /// refusal text and the check it explains are read off one list and can never disagree.
 fn deletable_statuses_phrase() -> String {
-    let quoted: Vec<String> = crate::state::DELETABLE_STATUSES
-        .iter()
-        .map(|status| format!("'{status}'"))
-        .collect();
-    match quoted.split_last() {
-        Some((last, [])) => last.clone(),
-        Some((last, rest)) => format!("{}, or {last}", rest.join(", ")),
-        None => String::new(),
-    }
+    crate::state::statuses_phrase(&crate::state::DELETABLE_STATUSES)
 }
 
 /// The `DeleteCollection` operation.

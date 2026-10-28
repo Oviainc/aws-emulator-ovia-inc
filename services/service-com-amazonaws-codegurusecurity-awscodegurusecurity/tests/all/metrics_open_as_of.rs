@@ -65,9 +65,9 @@ type Seed = (
     Option<i64>,
 );
 
-/// Put `seeds` in the store both metrics handlers read. Seeded directly: no request path
-/// writes findings yet, so this is the only way to exercise the metrics over a store that
-/// holds closed findings.
+/// Put `seeds` in the store both metrics handlers read. Seeded directly, so the metrics
+/// are exercised over chosen creation and close instants without one upload and one run
+/// per row.
 fn seed(engine: &std::sync::Arc<engine::InMemoryEngine>, seeds: &[Seed]) {
     let store = store_of(engine);
     let mut guard = store.lock();

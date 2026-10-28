@@ -228,6 +228,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status: crate::state::VPC_ENDPOINT_PENDING.to_string(),
             created_date: crate::state::now_epoch_millis(),
             pending_status: None,
+            // Nothing is owed on a fresh endpoint but the transition below; a purge is owed
+            // only once a delete is accepted.
+            purge_at: None,
         };
         // The endpoint is returned in the non-terminal `PENDING` status and reaches
         // `ACTIVE` on its own a moment later, with nobody calling.

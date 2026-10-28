@@ -2030,6 +2030,75 @@ pub fn validate_interval(start: DateTime, end: DateTime) -> Result<(), String> {
     ))
 }
 
+/// What a read says when the time range a request names is LONGER than the maximum the
+/// operation's own doc allows: what that doc calls the range (`subject`), the limit in the
+/// ISO 8601 duration form the doc names it by (`limit`), and the range the request ended
+/// up naming (`named`) — after any open side was completed — so the caller can fix the
+/// request from the message alone.
+pub fn window_too_long_message(subject: &str, limit: &str, named: &str) -> String {
+    format!("{subject} must be at most {limit} long, got {named}")
+}
+
+/// This service's WINDOW-LENGTH rule for a window whose BOTH bounds are known: the range
+/// `[start, end]` is refused when it is longer than `maximum`, naming both bounds the way
+/// the request would have spelled them ([`iso8601`]).
+///
+/// For an operation that completes an open side itself before bounding the result;
+/// [`validate_window_length`] applies the same rule to the trio a request names a window
+/// with. Bounds are compared through [`instant_key`], exactly at nanosecond resolution, so
+/// a range a nanosecond over the maximum is refused rather than collapsing onto it through
+/// `f64` epoch seconds.
+pub fn validate_bounds_length(
+    start: DateTime,
+    end: DateTime,
+    maximum: Duration,
+    limit: &str,
+    subject: &str,
+) -> Result<(), String> {
+    let longest = shifted(start, span_nanos(maximum));
+    if instant_key(end) > instant_key(longest) {
+        return Err(window_too_long_message(
+            subject,
+            limit,
+            &format!("{} to {}", iso8601(start), iso8601(end)),
+        ));
+    }
+    Ok(())
+}
+
+/// This service's WINDOW-LENGTH rule, in one place for every operation whose doc bounds
+/// how LONG a time range it answers over may be — the way [`validate_interval`] holds the
+/// interval rule: a range longer than `maximum` is refused, however the request named it.
+///
+/// A window is named with 1 or 2 of `startTime`, `endTime` and `period`
+/// ([`requested_window`]), so the length a request states is either the distance between
+/// the two bounds it ended up with — the pair it gave, or the pair a `period` completed
+/// from a single bound — or, where it named no pair at all, the `period` on its own, which
+/// says how long the range is without saying where it sits. Both are bounded here; a
+/// request that named no length at all leaves nothing to bound.
+///
+/// `Err` carries the sentence this refusal states ([`window_too_long_message`]), for each
+/// handler to lift into its own modelled client-input error (HTTP 400).
+pub fn validate_window_length(
+    window: &RequestedWindow,
+    period: Option<&str>,
+    maximum: Duration,
+    limit: &str,
+    subject: &str,
+) -> Result<(), String> {
+    match (window.start, window.end) {
+        (Some(start), Some(end)) => validate_bounds_length(start, end, maximum, limit, subject),
+        // No pair of bounds, so the only length the request stated is the `period` itself,
+        // reported back as the request spelled it.
+        _ => match (window.span, period) {
+            (Some(span), Some(period)) if span > maximum => {
+                Err(window_too_long_message(subject, limit, period))
+            }
+            _ => Ok(()),
+        },
+    }
+}
+
 /// What every listing of this service says when the `nextToken` it was handed is not a
 /// cursor it could have issued: it names no position in the listing, so the request is
 /// refused rather than answered with a page. Each handler lifts this sentence into its

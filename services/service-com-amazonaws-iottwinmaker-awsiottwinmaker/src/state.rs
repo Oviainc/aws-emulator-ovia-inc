@@ -1518,23 +1518,34 @@ impl Workspace {
         chain
     }
 
-    /// The property group `group_name` as it applies to a component: the group
-    /// the component itself declares, else the one it inherits from the
-    /// component type it instantiates — the same resolution
+    /// The property group `group_name` as it applies to a component, RESOLVED
+    /// over every declaration that reaches it: the component's own where it has
+    /// one, then the declarations of the component type it instantiates and of
+    /// the types that type extends, nearest first — the same resolution
     /// [`effective_property_definition`](Self::effective_property_definition)
     /// makes for a definition.
-    pub fn effective_property_group<'a>(
-        &'a self,
+    ///
+    /// A nearer declaration may REFINE a further one rather than replace it
+    /// (every member of `ComponentPropertyGroupRequest` is optional, so a
+    /// declaration can restate only the members it changes), which is why the
+    /// whole set of declarations is folded ([`refined_property_group`]) instead
+    /// of the nearest one being taken whole. `None` when no declaration reaches
+    /// the group at all.
+    pub fn effective_property_group(
+        &self,
         component_type_id: Option<&str>,
-        property_groups: &'a BTreeMap<String, PropertyGroupRecord>,
+        property_groups: &BTreeMap<String, PropertyGroupRecord>,
         group_name: &str,
-    ) -> Option<&'a PropertyGroupRecord> {
-        if let Some(group) = property_groups.get(group_name) {
-            return Some(group);
-        }
-        self.component_type_chain(component_type_id?)
-            .into_iter()
-            .find_map(|component_type| component_type.property_groups.get(group_name))
+    ) -> Option<PropertyGroupRecord> {
+        let own = property_groups.get(group_name);
+        let chain = component_type_id
+            .map(|component_type_id| self.component_type_chain(component_type_id))
+            .unwrap_or_default();
+        refined_property_group(own.into_iter().chain(
+            chain
+                .iter()
+                .filter_map(|component_type| component_type.property_groups.get(group_name)),
+        ))
     }
 
     /// Every property a component HAS: the ones it stores itself, plus the ones
@@ -2348,7 +2359,7 @@ pub fn component_property_groups_response(
             let group =
                 workspace.effective_property_group(component_type_id, property_groups, &group_name)?;
             let response = component_property_group_response(
-                group,
+                &group,
                 property_group_is_inherited(property_groups, &group_name),
             );
             Some((group_name, response))
@@ -2961,6 +2972,40 @@ pub fn refined_property_definition<'a>(
             .display_name
             .take()
             .or_else(|| inherited.display_name.clone());
+    }
+    Some(resolved)
+}
+
+/// One property group RESOLVED over the declarations that reach it, NEAREST
+/// declaration first: `groupType` is the one the nearest declaration that
+/// carries it names, and `propertyNames` the list of the nearest declaration
+/// that carries any. `None` when no declaration reaches the group at all.
+///
+/// Both request shapes a group is written from (`PropertyGroupRequest` for a
+/// component type, `ComponentPropertyGroupRequest` for an entity component)
+/// make every member optional, so a declaration may REFINE an inherited group —
+/// restate only the part it changes — rather than replace it. A record stores an
+/// absent list as the empty one ([`PropertyGroupRecord::from_request`]), so a
+/// declaration with no names sets nothing and leaves the inherited group's names
+/// standing, exactly as a definition's unset member keeps the inherited value
+/// ([`refined_property_definition`]).
+///
+/// Shared by every resolver of a group — a component's
+/// ([`Workspace::effective_property_group`]) and a component type's own — so one
+/// group is resolved one way wherever it is read.
+pub fn refined_property_group<'a>(
+    declarations: impl IntoIterator<Item = &'a PropertyGroupRecord>,
+) -> Option<PropertyGroupRecord> {
+    let mut declarations = declarations.into_iter();
+    let mut resolved = declarations.next()?.clone();
+    for inherited in declarations {
+        resolved.group_type = resolved
+            .group_type
+            .take()
+            .or_else(|| inherited.group_type.clone());
+        if resolved.property_names.is_empty() {
+            resolved.property_names = inherited.property_names.clone();
+        }
     }
     Some(resolved)
 }

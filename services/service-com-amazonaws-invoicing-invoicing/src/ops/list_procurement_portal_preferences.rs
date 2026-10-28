@@ -180,12 +180,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::invalid_next_token(MessageKey::Capitalised),
             )
         })?;
-        // The boundary validator already refused a `MaxResults` outside `@range(1..100)`
-        // and the deserializer filled the `@default: 100` in, so this only guards the
-        // conversion.
-        let page_size = usize::try_from(input.max_results)
-            .unwrap_or(MAX_PAGE_SIZE)
-            .clamp(1, MAX_PAGE_SIZE);
+        // The walk's maximum, and the page size this request resolves to inside it: the
+        // rule every paginated listing of this service shares
+        // ([`crate::state::resolve_page_size`]). The boundary validator already refused a
+        // `MaxResults` outside `@range(1..100)` and the deserializer filled the
+        // `@default: 100` in.
+        let page_size = crate::state::resolve_page_size(Some(input.max_results), MAX_PAGE_SIZE);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListProcurementPortalPreferencesErrorModeled::InternalServerException(
                 crate::state::state_unavailable(),
@@ -193,30 +193,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let store = state.lock();
 
-        let mut procurement_portal_preferences = Vec::new();
-        let mut next_token = None;
-        // `procurement_portal_preferences` is a BTreeMap keyed by ARN, so this walk is in
-        // one stable order and a token (the ARN the next page starts at) stays
-        // meaningful: the token is a POSITION in that order, so the resumed page seeks
-        // straight to it rather than re-walking what the earlier pages reported.
-        let page = match resume_at.as_deref() {
-            Some(from) => store.procurement_portal_preferences.range(from.to_string()..),
-            None => store.procurement_portal_preferences.range::<String, _>(..),
-        };
-        for preference in page.map(|(_, preference)| preference) {
-            if procurement_portal_preferences.len() == page_size {
-                next_token = Some(crate::state::encode_page_token(
-                    NEXT_TOKEN_PREFIX,
-                    &preference.preference.procurement_portal_preference_arn,
-                ));
-                break;
-            }
-            procurement_portal_preferences.push(preference.to_summary());
-        }
+        // `procurement_portal_preferences` is a BTreeMap keyed by ARN, so the shared walk
+        // ([`crate::state::page_by_key`]) takes this page in one stable order and the
+        // token it mints is a POSITION in that order — the ARN the next page resumes at.
+        let page = crate::state::page_by_key(
+            &store.procurement_portal_preferences,
+            resume_at.as_deref(),
+            page_size,
+            NEXT_TOKEN_PREFIX,
+            |preference| Some(preference.to_summary()),
+        );
 
         Ok(ListProcurementPortalPreferencesOutput {
-            procurement_portal_preferences: Some(procurement_portal_preferences),
-            next_token,
+            procurement_portal_preferences: Some(page.items),
+            next_token: page.next_token,
         })
     }
 }

@@ -12,7 +12,8 @@
 //! policy its qualified `PolicyVersionArn` names, every member computed from that stored
 //! version and the policy that owns it; the ARN's version qualifier is either the
 //! version's id or `$DEFAULT`, which resolves against the policy's recorded default
-//! version; an ARN the catalog holds no version for is `ResourceNotFoundException` (404);
+//! version; an ARN the catalog holds no version for is `ResourceNotFoundException` (404)
+//! carrying this service's one not-found message ([`state::RESOURCE_NOT_FOUND_MESSAGE`]);
 //! and the read changes nothing a later caller sees.
 //!
 //! So the tables below span VERSION COUNT (one version, several, a full page and past
@@ -27,7 +28,7 @@
 //! document is checked to be the one the resource-policy reads report for the very same
 //! version, so the two readers cannot drift apart.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -389,7 +390,9 @@ async fn the_default_qualifier_resolves_to_the_recorded_default_version() {
 }
 
 /// An ARN the catalog holds no version for is `ResourceNotFoundException` (404), whatever
-/// its form — the catalog is the only thing consulted.
+/// its form — the catalog is the only thing consulted — and the body is the service-wide
+/// not-found answer ([`state::RESOURCE_NOT_FOUND_MESSAGE`]), identical across every row,
+/// so the refusal names nothing the request carried.
 #[tokio::test]
 async fn an_arn_the_catalog_holds_no_version_for_is_not_found() {
     let harness = Harness::without_organization();
@@ -449,6 +452,9 @@ async fn an_arn_the_catalog_holds_no_version_for_is_not_found() {
         ),
     ];
 
+    // Every (status, code, message) triple the table produced: the rule is that there is
+    // exactly ONE of them, whatever ARN was asked for.
+    let mut answers: BTreeSet<(u16, String, String)> = BTreeSet::new();
     for (case, arn) in rows {
         let (status, body) = get_policy_version(&harness, &arn).await;
         assert_eq!(
@@ -460,7 +466,23 @@ async fn an_arn_the_catalog_holds_no_version_for_is_not_found() {
             "ResourceNotFoundException",
             "case {case:?}: wrong error code in {body:?}"
         );
+        let reported = text(&body, "Message");
+        assert_eq!(
+            reported,
+            state::RESOURCE_NOT_FOUND_MESSAGE,
+            "case {case:?}: expected the service-wide not-found message, got {reported:?} in {body:?}"
+        );
+        assert!(
+            !reported.contains(&arn),
+            "case {case:?}: the refusal leaked the ARN asked for: {reported:?}"
+        );
+        answers.insert((status, error_code(&body), reported));
     }
+    assert_eq!(
+        answers.len(),
+        1,
+        "the not-found answer varied with the ARN asked for: {answers:?}"
+    );
 
     // The refusal is about the version's existence, not about the request: every version
     // the store does hold answers 200.

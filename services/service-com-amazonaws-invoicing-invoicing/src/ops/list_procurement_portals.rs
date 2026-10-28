@@ -182,37 +182,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::invalid_next_token(MessageKey::Capitalised),
                     )
                 })?;
-        // The boundary validator already refused a `MaxResults` outside `@range(1..100)`
-        // and the deserializer filled the `@default: 100` in, so this only guards the
-        // conversion.
-        let page_size = usize::try_from(input.max_results)
-            .unwrap_or(MAX_PAGE_SIZE)
-            .clamp(1, MAX_PAGE_SIZE);
+        // The walk's maximum, and the page size this request resolves to inside it: the
+        // rule every paginated listing of this service shares
+        // ([`crate::state::resolve_page_size`]). The boundary validator already refused a
+        // `MaxResults` outside `@range(1..100)` and the deserializer filled the
+        // `@default: 100` in.
+        let page_size = crate::state::resolve_page_size(Some(input.max_results), MAX_PAGE_SIZE);
 
-        // One stable, deterministic order (the catalog's `PortalIdentifier` keys), so a
-        // token — a POSITION in that order — stays meaningful across calls and the
-        // resumed page seeks straight to it rather than re-walking the earlier pages.
+        // One stable, deterministic order (the catalog's `PortalIdentifier` keys), so the
+        // shared walk ([`crate::state::page_by_key`]) mints a token that is a POSITION in
+        // that order and the resumed page seeks straight to it rather than re-walking the
+        // earlier pages.
         let catalog = crate::state::procurement_portals();
-        let mut procurement_portals = Vec::new();
-        let mut next_token = None;
-        let page = match resume_at.as_deref() {
-            Some(from) => catalog.range(from.to_string()..),
-            None => catalog.range::<String, _>(..),
-        };
-        for (portal_identifier, portal) in page {
-            if procurement_portals.len() == page_size {
-                next_token = Some(crate::state::encode_page_token(
-                    NEXT_TOKEN_PREFIX,
-                    portal_identifier,
-                ));
-                break;
-            }
-            procurement_portals.push(portal.clone());
-        }
+        let page = crate::state::page_by_key(
+            &catalog,
+            resume_at.as_deref(),
+            page_size,
+            NEXT_TOKEN_PREFIX,
+            |portal| Some(portal.clone()),
+        );
 
         Ok(ListProcurementPortalsOutput {
-            procurement_portals,
-            next_token,
+            procurement_portals: page.items,
+            next_token: page.next_token,
         })
     }
 }

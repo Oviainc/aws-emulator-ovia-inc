@@ -16,7 +16,10 @@
 //! against the policy's recorded default version, so the same ARN follows the default
 //! wherever it points; every other qualifier names the version whose id it spells. An ARN
 //! the catalog holds no version for earns `ResourceNotFoundException` (404), whatever its
-//! form, since the catalog is the only thing consulted.
+//! form, since the catalog is the only thing consulted. That refusal is raised through
+//! [`crate::state::resource_not_found`] — the one constructor every ARN-addressed lookup in
+//! this service refuses through — so its body is the service-wide one and names nothing the
+//! request carried.
 //!
 //! The answer is computed from the stored version and the policy that owns it, so a
 //! reported version can never disagree with the entry `ListPolicyVersions` lists or with
@@ -189,12 +192,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // holds no version for is not found.
         let Some((policy, version)) = state.policy_version(&input.policy_version_arn) else {
             return Err(GetPolicyVersionErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: crate::state::bounded_message(format!(
-                        "No policy version found for ARN '{}'.",
-                        input.policy_version_arn
-                    )),
-                },
+                crate::state::resource_not_found(),
             )
             .into());
         };
