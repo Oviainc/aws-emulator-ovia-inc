@@ -75,6 +75,8 @@ mod receipt_handle_provenance;
 mod receive_message_attribute_names;
 #[path = "all/recreate_and_tag_rules.rs"]
 mod recreate_and_tag_rules;
+#[path = "all/redrive_allow_policy.rs"]
+mod redrive_allow_policy;
 #[path = "all/refusal_message_reasons.rs"]
 mod refusal_message_reasons;
 #[path = "all/refusal_taxonomy.rs"]

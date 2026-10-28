@@ -399,6 +399,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // so what this sees is what the walk below would deliver.
                     queue.materialise_due(now);
                 }
+                // A message a movement task's schedule has reached is moved before this
+                // receive decides what there is to deliver: the task owed that move at
+                // this instant whether or not anybody polled, so a consumer of the
+                // destination queue sees what the task has delivered and one of the source
+                // queue no longer sees what it has taken.
+                state.advance_message_move_tasks(now);
                 // A message this queue has already handed over as many times as its
                 // `RedrivePolicy` allows is not handed over again: it goes to the
                 // dead-letter queue that policy names, BEFORE this receive decides what

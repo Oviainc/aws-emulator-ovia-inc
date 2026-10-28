@@ -279,6 +279,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(why));
         }
+        // Whether a queue may drive its messages to a given dead-letter queue is that
+        // queue's own `RedriveAllowPolicy` to decide, and the decision is taken when the
+        // association is made: a policy the target does not admit this queue under is
+        // refused rather than stored, so a queue the permission denies is never wired to
+        // it.
+        if let Some(why) = input.attributes.get(state::REDRIVE_POLICY).and_then(|value| {
+            store.redrive_allow_policy_refusal(&region, &state::queue_arn(&region, &name), value)
+        }) {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(why));
+        }
 
         // The queue's own policy decides whether this caller may change it, so the
         // decision is taken against the document in force BEFORE this call.

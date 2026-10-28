@@ -215,7 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = sqs::service_state(&*self.engine).ok_or_else(|| {
             ListMessageMoveTasksErrorModeled::UnsupportedOperation(sqs::store_unavailable())
         })?;
-        let state = store.lock();
+        let mut state = store.lock();
 
         // "One or more specified resources don't exist" (`ResourceNotFoundException`): the
         // queue whose message movement tasks are to be listed has to be one of this
@@ -227,12 +227,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let results = state.reported_message_move_tasks(
-            &region,
-            &source_name,
-            SystemTime::now(),
-            max_results,
-        );
+        let now = SystemTime::now();
+        // What each recorded task has moved by now was owed by the CLOCK whether or not
+        // anybody listed it, so applying it here is what makes the progress below the
+        // progress a caller would have seen at this instant anyway. Reporting a task
+        // neither starts one nor moves a message the task's own schedule had not reached.
+        state.materialise_due(now);
+
+        let results = state.reported_message_move_tasks(&region, &source_name, now, max_results);
 
         // A source queue with no task recorded under it answers with the member absent,
         // which is how every listing in this service reports an empty result.

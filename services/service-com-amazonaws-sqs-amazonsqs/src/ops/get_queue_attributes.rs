@@ -181,11 +181,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // another region's endpoint names that region's queue of the same name, and
         // nothing at all where it holds none.
         let region = state::request_region(ctx.parts());
-        let queue = store
-            .queue_by_url_mut(&region, &input.queue_url)
-            .ok_or_else(|| {
+        if store.queue_by_url(&region, &input.queue_url).is_none() {
+            return Err(
                 GetQueueAttributesErrorModeled::QueueDoesNotExist(state::queue_does_not_exist())
-            })?;
+                    .into(),
+            );
+        }
+        // What a message movement task has moved by now was owed by the clock whether or
+        // not anybody read this queue, so the message counters below count the messages
+        // each queue of the pair really holds at this instant.
+        store.advance_message_move_tasks(now);
+        let Some(queue) = store.queue_by_url_mut(&region, &input.queue_url) else {
+            return Err(
+                GetQueueAttributesErrorModeled::QueueDoesNotExist(state::queue_does_not_exist())
+                    .into(),
+            );
+        };
         // Retention lapses and visibility timeouts were owed by the clock whether or
         // not anybody asked, so applying them here is what makes the message counters
         // below the counts a caller would have seen at this instant anyway. Nothing

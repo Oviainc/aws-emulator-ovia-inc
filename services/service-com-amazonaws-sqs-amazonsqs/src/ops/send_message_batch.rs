@@ -538,7 +538,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 queue_receive_count: 0,
                 first_received_at: None,
                 last_received_at: None,
-                moved_by_task: None,
             });
             if let (Some(key), Some(sequence_number)) =
                 (deduplication_key, sequence_number.clone())

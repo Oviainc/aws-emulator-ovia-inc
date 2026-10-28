@@ -356,6 +356,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Whether the new queue may drive its messages to the dead-letter queue its
+        // `RedrivePolicy` names is that queue's own `RedriveAllowPolicy` to decide, and the
+        // decision is taken when the association is made: a policy the target does not
+        // admit this queue under is refused, so no queue is created wired to a dead-letter
+        // queue whose permission denies it.
+        if let Some(why) = supplied.get(state::REDRIVE_POLICY).and_then(|value| {
+            store.redrive_allow_policy_refusal(
+                &region,
+                &state::queue_arn(&region, &input.queue_name),
+                value,
+            )
+        }) {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(why));
+        }
+
         if store.queues.len() >= state::MAX_QUEUES {
             // The emulator's own store ceiling, counted across every region together: the
             // region a request is served in comes from its own credential scope, so a

@@ -80,26 +80,36 @@
 //! queue's `ApproximateNumberOfMessages` falls as the target's rises and the move task
 //! below has something to drive back.
 //!
+//! # Dead-letter redrive permission
+//!
+//! WHICH queues may drive their messages to a dead-letter queue is that queue's own
+//! `RedriveAllowPolicy` to say ([`Queue::admits_dead_letter_source`]), and both paths that
+//! would make a queue a source of it ask: the write that associates the pair
+//! ([`ComAmazonawsSqsAmazonsqsState::redrive_allow_policy_refusal`], from `CreateQueue` and
+//! `SetQueueAttributes`) and every automatic move out of an already associated source queue
+//! ([`ComAmazonawsSqsAmazonsqsState::dead_letter_due`]) — so a permission tightened after
+//! the wiring was made governs the next move as well.
+//!
 //! # Message movement tasks
 //!
-//! `StartMessageMoveTask` takes the messages a dead-letter queue can hand out and puts
-//! them in the destination queue, each one deliverable at the instant the task's rate
-//! schedules it, and records a [`MessageMoveTask`] in
-//! [`ComAmazonawsSqsAmazonsqsState::message_move_tasks`]. The task's progress is a
-//! function of that record and the clock — [`MessageMoveTask::messages_moved`] and
-//! [`MessageMoveTask::status`] — so no handler stores a status it then has to keep up
-//! to date. `ListMessageMoveTasks` reports those records through
+//! `StartMessageMoveTask` records a [`MessageMoveTask`] in
+//! [`ComAmazonawsSqsAmazonsqsState::message_move_tasks`] and the TASK does the moving, over
+//! its own schedule: [`ComAmazonawsSqsAmazonsqsState::advance_message_move_tasks`] takes
+//! what the source queue can hand out as each message's slot comes round, counts it on the
+//! record and marks the task completed once that queue holds nothing more. Every reader
+//! applies what was already due before it reports, so a `COMPLETED` status is only ever
+//! reported over a drain that really happened and no two readers disagree about a task's
+//! progress. `ListMessageMoveTasks` reports those records through
 //! [`ComAmazonawsSqsAmazonsqsState::reported_message_move_tasks`], which projects the
-//! wire entry from the record and the clock exactly as
+//! wire entry from the record exactly as
 //! [`Queue::reported_attributes`] projects a queue's attributes — including which of that
 //! entry's members are populated at all, each one only in the condition the member is
 //! documented for.
 //!
 //! `CancelMessageMoveTask` stops such a task through
-//! [`ComAmazonawsSqsAmazonsqsState::cancel_message_move_task`]: the messages whose
-//! delivery slot is still ahead go back to the source queue and the cancellation instant
-//! is recorded on the task, which is all every later reader needs to report its status
-//! and its progress.
+//! [`ComAmazonawsSqsAmazonsqsState::cancel_message_move_task`]: what the task has not moved
+//! is still the source queue's own, so the cancellation instant recorded on the task is all
+//! every later reader needs to report its status and its progress.
 //!
 //! # Queue permissions
 //!
@@ -500,7 +510,7 @@ pub const SETTABLE_ATTRIBUTES: &[AttributeSpec] = &[
     AttributeSpec {
         // "The string that includes the parameters for the permissions for the
         // dead-letter queue redrive permission ... as a JSON object."
-        name: "RedriveAllowPolicy",
+        name: REDRIVE_ALLOW_POLICY,
         kind: AttributeKind::Json,
         create_only: false,
         fifo_only: false,
@@ -555,6 +565,33 @@ pub const POLICY: &str = "Policy";
 /// The attribute that makes a queue a dead-letter SOURCE queue: it names the queue its
 /// messages are driven to.
 pub const REDRIVE_POLICY: &str = "RedrivePolicy";
+
+/// The attribute a dead-letter queue carries to say WHICH queues may drive their messages
+/// to it: "the parameters for the permissions for the dead-letter queue redrive permission
+/// and which source queues can specify dead-letter queues as a JSON object" (the
+/// `Attributes` member's own documentation).
+pub const REDRIVE_ALLOW_POLICY: &str = "RedriveAllowPolicy";
+
+/// The member of a `RedriveAllowPolicy` carrying its permission type: "the permission type
+/// that defines which source queues can specify the current queue as the dead-letter
+/// queue".
+const REDRIVE_PERMISSION_MEMBER: &str = "redrivePermission";
+
+/// The member of a `RedriveAllowPolicy` listing the queues `byQueue` admits: "the Amazon
+/// Resource Names (ARN)s of the source queues that can specify this queue as the
+/// dead-letter queue and redrive messages".
+const SOURCE_QUEUE_ARNS_MEMBER: &str = "sourceQueueArns";
+
+/// "`allowAll` – (Default) Any source queues in this Amazon Web Services account in the
+/// same Region can specify this queue as the dead-letter queue."
+pub const REDRIVE_PERMISSION_ALLOW_ALL: &str = "allowAll";
+
+/// "`denyAll` – No source queues can specify this queue as the dead-letter queue."
+pub const REDRIVE_PERMISSION_DENY_ALL: &str = "denyAll";
+
+/// "`byQueue` – Only queues specified by the `sourceQueueArns` parameter can specify this
+/// queue as the dead-letter queue."
+pub const REDRIVE_PERMISSION_BY_QUEUE: &str = "byQueue";
 
 /// The inclusive `(min, max)` the documentation gives integer attribute `name`, from
 /// [`SETTABLE_ATTRIBUTES`] — the one place those bounds are written.
@@ -877,13 +914,6 @@ pub struct StoredMessage {
     /// counted from here, so a change of this message's visibility timeout cannot keep
     /// it hidden for longer than the span one receive may hide it for.
     pub last_received_at: Option<SystemTime>,
-    /// The handle of the message movement task that still owes this message's delivery
-    /// into the queue holding it: set while the task has not reached its
-    /// [`available_at`](Self::available_at) slot, and cleared by
-    /// [`Queue::materialise_due`] once the clock has. A cancelled task takes back
-    /// exactly the messages still carrying its handle, and leaves the ones it has
-    /// already delivered where they are.
-    pub moved_by_task: Option<String>,
 }
 
 impl StoredMessage {
@@ -1136,6 +1166,49 @@ impl Queue {
         let policy = parsed_redrive_policy(self.attributes.get(REDRIVE_POLICY)?)?;
         let target = queue_name_from_arn(redrive_target_arn(&policy)?, &self.region)?.to_string();
         Some((target, redrive_max_receive_count(&policy)?))
+    }
+
+    /// Whether this queue, AS A DEAD-LETTER TARGET, admits the queue whose ARN is
+    /// `source_arn` as one of its dead-letter source queues.
+    ///
+    /// The decision is this queue's own `RedriveAllowPolicy`, whose `redrivePermission`
+    /// "defines which source queues can specify the current queue as the dead-letter
+    /// queue": `allowAll` — the documented DEFAULT, which is what a queue carrying no such
+    /// policy is on — admits every source queue of the account and region, `denyAll` admits
+    /// none, and `byQueue` admits "only queues specified by the `sourceQueueArns`
+    /// parameter". A value that is not a JSON object, or that names a permission outside
+    /// that published set, restricts nothing: it leaves the queue on the documented
+    /// default rather than inventing a fourth permission type.
+    ///
+    /// Every path that would make this queue the dead-letter target of another asks this:
+    /// the association a `RedrivePolicy` write creates, and each automatic redrive of a
+    /// message out of a queue already associated — the permission is the dead-letter
+    /// queue's current one, so one tightened after the wiring was made governs the next
+    /// move as well.
+    pub fn admits_dead_letter_source(&self, source_arn: &str) -> bool {
+        let Some(policy) = self.attributes.get(REDRIVE_ALLOW_POLICY) else {
+            return true;
+        };
+        let Ok(document) = ::serde_json::from_str::<::serde_json::Value>(policy) else {
+            return true;
+        };
+        match document
+            .get(REDRIVE_PERMISSION_MEMBER)
+            .and_then(::serde_json::Value::as_str)
+            .map(str::trim)
+        {
+            Some(REDRIVE_PERMISSION_DENY_ALL) => false,
+            Some(REDRIVE_PERMISSION_BY_QUEUE) => document
+                .get(SOURCE_QUEUE_ARNS_MEMBER)
+                .and_then(::serde_json::Value::as_array)
+                .is_some_and(|listed| {
+                    listed
+                        .iter()
+                        .filter_map(::serde_json::Value::as_str)
+                        .any(|arn| arn.trim() == source_arn)
+                }),
+            _ => true,
+        }
     }
 
     /// The customer master key this queue's messages are encrypted under, or `None` for
@@ -1415,12 +1488,6 @@ impl Queue {
             if message.invisible_until.is_some_and(|until| now >= until) {
                 message.invisible_until = None;
             }
-            // A message whose delivery slot has passed has been moved: the delivery was
-            // owed at that instant whether or not anybody called, so no movement task
-            // still owes it and no cancellation can take it back.
-            if now >= message.available_at {
-                message.moved_by_task = None;
-            }
         }
         // A token suppresses a resend only "during the 5-minute deduplication
         // interval"; past it, "Amazon SQS can't detect duplicate messages".
@@ -1452,15 +1519,14 @@ impl Queue {
     /// message was sent loses nothing.
     ///
     /// A delay governs a message's FIRST delivery, so a message already handed to a
-    /// consumer keeps the availability it was delivered under; a message a movement task
-    /// still owes carries that task's delivery slot rather than a delay of its own.
+    /// consumer keeps the availability it was delivered under.
     pub fn reapply_delay_seconds(&mut self) {
         if !self.is_fifo() {
             return;
         }
         let delay = self.integer(DELAY_SECONDS);
         for message in &mut self.messages {
-            if message.first_received_at.is_some() || message.moved_by_task.is_some() {
+            if message.first_received_at.is_some() {
                 continue;
             }
             message.available_at = after(message.sent_at, delay);
@@ -1966,12 +2032,14 @@ impl ComAmazonawsSqsAmazonsqsState {
         self.queues.values().map(Queue::retained_message_bytes).sum()
     }
 
-    /// Materialise everything the CLOCK already made due across every queue; see
-    /// [`Queue::materialise_due`].
+    /// Materialise everything the CLOCK already made due across every queue, and carry
+    /// every message movement task as far as it has made it due; see
+    /// [`Queue::materialise_due`] and [`Self::advance_message_move_tasks`].
     pub fn materialise_due(&mut self, now: SystemTime) {
         for queue in self.queues.values_mut() {
             queue.materialise_due(now);
         }
+        self.advance_message_move_tasks(now);
     }
 
     /// The queue called `name` in `region`, for reading: the one record every call signed
@@ -2157,6 +2225,39 @@ impl ComAmazonawsSqsAmazonsqsState {
             .collect()
     }
 
+    /// Why the queue whose ARN is `source_arn` may not take the `RedrivePolicy` value
+    /// `policy` — the dead-letter queue it names does not admit it as a source queue — as
+    /// the text of the refusal a caller has to fix the request from, or `None` when it may.
+    ///
+    /// A dead-letter queue decides which queues may drive their messages to it
+    /// ([`Queue::admits_dead_letter_source`]), and that decision is taken at the moment a
+    /// source queue associates itself with the target: a `RedrivePolicy` the target's
+    /// `RedriveAllowPolicy` does not admit is refused rather than stored, so a queue the
+    /// permission denies never ends up wired to it. The target is resolved in `region`,
+    /// where a redrive link lives (see [`Queue::dead_letter_target`]); a policy naming a
+    /// target this region holds no queue for, or carrying no delivery count to pass,
+    /// configures no association for any permission to refuse.
+    pub fn redrive_allow_policy_refusal(
+        &self,
+        region: &str,
+        source_arn: &str,
+        policy: &str,
+    ) -> Option<String> {
+        let parsed = parsed_redrive_policy(policy)?;
+        let target_arn = redrive_target_arn(&parsed)?;
+        let count = redrive_max_receive_count_text(&parsed)?;
+        redrive_max_receive_count(&parsed)?;
+        let target = self.queue(region, queue_name_from_arn(target_arn, region)?)?;
+        if target.admits_dead_letter_source(source_arn) {
+            return None;
+        }
+        Some(invalid_parameter_message(
+            &refused_redrive_policy_value(&count, target_arn),
+            REDRIVE_POLICY,
+            REDRIVE_ALLOW_POLICY_REASON,
+        ))
+    }
+
     /// Move every message of the queue called `source_queue_name` that has had all the
     /// deliveries its `RedrivePolicy` allows onto the dead-letter queue that policy
     /// names, and answer how many moved.
@@ -2195,6 +2296,12 @@ impl ComAmazonawsSqsAmazonsqsState {
     ///
     /// Both queues are the ones `region` holds: a redrive link never crosses a region
     /// (see [`Queue::dead_letter_target`]).
+    ///
+    /// The target queue's `RedriveAllowPolicy` is consulted HERE as well as when the
+    /// association was made ([`Self::redrive_allow_policy_refusal`]): the permission that
+    /// governs a move is the one the dead-letter queue carries at the instant of the move,
+    /// so a target that no longer admits this source takes none of its messages and the
+    /// message stays visible on the source queue, to be handed over again.
     pub fn dead_letter_due(
         &mut self,
         region: &str,
@@ -2218,6 +2325,16 @@ impl ComAmazonawsSqsAmazonsqsState {
         let Some(source) = self.queues.get(&source_key) else {
             return 0;
         };
+        // Whether the dead-letter queue takes this source queue's messages at all is its
+        // own permission to give, re-read on every move.
+        let source_arn = source.arn.clone();
+        if !self
+            .queues
+            .get(&target_key)
+            .is_some_and(|target| target.admits_dead_letter_source(&source_arn))
+        {
+            return 0;
+        }
         let exceeded: Vec<(String, usize)> = source
             .messages
             .iter()
@@ -2280,11 +2397,9 @@ impl ComAmazonawsSqsAmazonsqsState {
             for message in moved {
                 target.messages.push_back(StoredMessage {
                     // "SQS moves the message to the dead-letter queue", where a consumer
-                    // of that queue can take it: it is deliverable from the move, and no
-                    // movement task owes it.
+                    // of that queue can take it: it is deliverable from the move.
                     available_at: now,
                     invisible_until: None,
-                    moved_by_task: None,
                     // The deliveries it had from the queue it has left are not deliveries
                     // of this one; its cross-queue `receive_count` is untouched.
                     queue_receive_count: 0,
@@ -2324,19 +2439,16 @@ impl ComAmazonawsSqsAmazonsqsState {
     }
 
     /// Stop the message movement task called `task_handle` at `now`, and answer how many
-    /// of its messages had been moved by then.
+    /// of its messages it had moved by then.
     ///
-    /// Cancelling stops the messages the task has not moved yet and leaves the ones it
-    /// has already moved where they are: the messages still owed a delivery slot go back
-    /// to the task's source queue, so the pair of queues holds every message it held
-    /// before the task started, and the ones already handed to the destination queue stay
-    /// its own. The cancellation is recorded on the task record, which is what every
-    /// later reader projects the task's status and progress from.
-    ///
-    /// Putting messages back into a queue is bounded like every other path that adds
-    /// messages to one — see [`Queue::batch_rejection`] — because the source queue may
-    /// have been refilled while the task ran: what it cannot take back keeps its place in
-    /// the destination queue, which still leaves the pair holding every message.
+    /// "Cancelling a message movement task does not revert the messages that have already
+    /// been moved. It can only stop the messages that have not been moved yet"
+    /// (`CancelMessageMoveTask`): a task takes a message out of its source queue only when
+    /// its own schedule has reached that message ([`Self::advance_message_move_tasks`]), so
+    /// the messages it has not moved are still the source queue's own and stopping the task
+    /// is simply recording that it moves nothing more. The cancellation instant is kept on
+    /// the task record, which is what every later reader projects its status and its
+    /// progress from.
     ///
     /// `None` when no task answers to the handle.
     pub fn cancel_message_move_task(
@@ -2350,100 +2462,172 @@ impl ComAmazonawsSqsAmazonsqsState {
             .iter_mut()
             .find(|task| task.region == region && task.task_handle == task_handle)?;
         task.cancelled_at = Some(now);
-        let moved = task.messages_moved(now);
-        let source_key = queue_key(region, &task.source_queue_name);
-        let destination_key = queue_key(region, &task.destination_queue_name);
+        Some(task.messages_moved())
+    }
 
-        // What the task has not moved yet is exactly what still carries its handle and
-        // whose delivery slot is still ahead; a message not yet deliverable has never
-        // been handed to a consumer, so no receipt handle refers to it.
-        //
-        // The source queue may have been refilled while the task ran, so what it takes
-        // back is judged against the SAME bounds every other path that adds messages to
-        // a queue is: without that, a caller looping on start / refill / cancel could
-        // grow one queue past its allowance each cycle. The oldest are taken back first,
-        // which is the order they would be handed out in, and a message the queue cannot
-        // take back is NOT dropped — dropping one would lose a message a client was told
-        // had been accepted. It stays in the place it holds in the destination queue,
-        // with the task owing it nothing any more.
+    /// Carry every message movement task still in progress as far as `now` has made it
+    /// due, moving the messages each task's schedule has reached out of its source queue
+    /// and into its destination queue, and completing a task whose source queue holds no
+    /// more messages.
+    ///
+    /// `StartMessageMoveTask` "starts an ASYNCHRONOUS task": the movement is work the task
+    /// owes over time rather than work its start call does, so what has been moved is a
+    /// function of the task record and the clock. Every reader applies what was already
+    /// due — the same way [`Queue::materialise_due`] applies a lapsed visibility timeout —
+    /// so no reader can see a task that is further on than the messages are.
+    ///
+    /// What a task may take is what its source queue can hand out at `now`: a message in
+    /// flight with a consumer is not the queue's to give away, and a delayed one has never
+    /// been delivered at all, so each is left and taken by a later turn once the clock
+    /// makes it available. That is also why a task is COMPLETED only once the source queue
+    /// holds nothing more: a `COMPLETED` status is the client's only statement that the
+    /// drain finished, so it is reported over a source queue that really is empty.
+    ///
+    /// Handing messages to the destination queue is bounded like every other path that adds
+    /// messages to a queue ([`Queue::batch_rejection`]): what the destination cannot take
+    /// stays in the source queue and the task keeps owing it, so no message a client was
+    /// told had been accepted is lost.
+    pub fn advance_message_move_tasks(&mut self, now: SystemTime) {
+        let in_progress: Vec<String> = self
+            .message_move_tasks
+            .iter()
+            .filter(|task| task.in_progress())
+            .map(|task| task.task_handle.clone())
+            .collect();
+        for handle in in_progress {
+            self.advance_message_move_task(&handle, now);
+        }
+    }
+
+    /// [`Self::advance_message_move_tasks`] for the one task `task_handle` names.
+    fn advance_message_move_task(&mut self, task_handle: &str, now: SystemTime) {
+        let Some(task) = self
+            .message_move_tasks
+            .iter()
+            .find(|task| task.task_handle == task_handle)
+        else {
+            return;
+        };
+        // Nothing is owed before the task's first delivery slot: a consumer polling the
+        // destination queue the moment the start call answered sees none of the messages
+        // yet, and the task is still running.
+        let Some(allowance) = task.deliverable_by(now) else {
+            return;
+        };
+        let region = task.region.clone();
+        let source_key = queue_key(&region, &task.source_queue_name);
+        let destination_key = queue_key(&region, &task.destination_queue_name);
+        // A task with nowhere to move messages to — a queue of the pair deleted since the
+        // start — has nothing left to do, so it is finished rather than left running for
+        // ever against a source it cannot drain. A task's source and destination are never
+        // the same queue (`StartMessageMoveTask` refuses that pair), so that arm only
+        // guards a record whose queues have gone.
+        if source_key == destination_key
+            || !self.queues.contains_key(&source_key)
+            || !self.queues.contains_key(&destination_key)
+        {
+            self.complete_message_move_task(task_handle, now);
+            return;
+        }
+
+        // The messages the source queue can hand out, oldest first, as far as this turn's
+        // allowance and what the destination queue may hold reach.
         let store_bytes = self.retained_message_bytes();
-        let stopped: Vec<(String, usize)> = self
+        let available: Vec<(String, usize)> = self
             .queues
-            .get(&destination_key)
-            .map(|destination| {
-                destination
+            .get(&source_key)
+            .map(|source| {
+                source
                     .messages
                     .iter()
-                    .filter(|message| {
-                        message.moved_by_task.as_deref() == Some(task_handle)
-                            && now < message.available_at
-                    })
+                    .filter(|message| message.visibility(now) == Visibility::Visible)
+                    .take(usize::try_from(allowance).unwrap_or(usize::MAX))
                     .map(|message| (message.message_id.clone(), message.retained_bytes()))
                     .collect()
             })
             .unwrap_or_default();
-        let mut returning: BTreeSet<String> = BTreeSet::new();
-        if let Some(source) = self.queues.get(&source_key) {
-            let mut taken_bytes = 0usize;
-            for (message_id, message_bytes) in &stopped {
-                let bytes = taken_bytes.saturating_add(*message_bytes);
-                // The bytes leave the destination queue as they reach the source one, so
-                // the store-wide budget is judged on what the move would leave behind.
-                if source
+        let mut moving: BTreeSet<String> = BTreeSet::new();
+        if let Some(destination) = self.queues.get(&destination_key) {
+            let mut bytes = 0usize;
+            for (message_id, message_bytes) in &available {
+                let total = bytes.saturating_add(*message_bytes);
+                // The bytes leave the source queue as they reach the destination, so the
+                // store-wide budget is judged on what the move would leave behind.
+                if destination
                     .batch_rejection(
-                        returning.len().saturating_add(1),
-                        bytes,
-                        store_bytes.saturating_sub(bytes),
+                        moving.len().saturating_add(1),
+                        total,
+                        store_bytes.saturating_sub(total),
                     )
                     .is_none()
                 {
-                    taken_bytes = bytes;
-                    returning.insert(message_id.clone());
+                    bytes = total;
+                    moving.insert(message_id.clone());
                 }
             }
         }
 
-        let mut moving: Vec<StoredMessage> = Vec::with_capacity(returning.len());
-        if let Some(destination) = self.queues.get_mut(&destination_key) {
+        let mut taken: Vec<StoredMessage> = Vec::with_capacity(moving.len());
+        if let Some(source) = self.queues.get_mut(&source_key) {
             let mut staying: VecDeque<StoredMessage> = VecDeque::new();
-            for message in std::mem::take(&mut destination.messages) {
-                if returning.contains(&message.message_id) {
-                    moving.push(message);
-                } else if message.moved_by_task.as_deref() == Some(task_handle)
-                    && now < message.available_at
-                {
-                    // This one the source queue cannot take back: its delivery stands, so
-                    // it keeps its place here, is deliverable from now, and no later
-                    // cancellation can take it.
-                    staying.push_back(StoredMessage {
-                        available_at: now,
-                        moved_by_task: None,
-                        ..message
-                    });
+            for message in std::mem::take(&mut source.messages) {
+                if moving.contains(&message.message_id) {
+                    // The receipt handles the source queue minted for it go with the
+                    // message leaving that queue: a handle is only ever valid for the queue
+                    // that minted it.
+                    source.handles.retain(|_, id| *id != message.message_id);
+                    taken.push(message);
                 } else {
                     staying.push_back(message);
                 }
             }
-            destination.messages = staying;
+            source.messages = staying;
         }
-
-        // They go back in front of whatever the source queue took while the task ran,
-        // keeping the order it held them in: their sends preceded all of those. Retention
-        // runs from the return, which is when that queue took the message back, exactly as
-        // it runs from the move for a message the task delivers.
-        if let Some(source) = self.queues.get_mut(&source_key) {
-            for message in moving.into_iter().rev() {
-                source.messages.push_front(StoredMessage {
-                    sent_at: now,
-                    retention_from: now,
+        let moved = u64::try_from(taken.len()).unwrap_or(u64::MAX);
+        if let Some(destination) = self.queues.get_mut(&destination_key) {
+            for message in taken {
+                destination.messages.push_back(StoredMessage {
+                    // The message is deliverable from the move: the destination queue has
+                    // it, and a consumer of that queue can take it.
                     available_at: now,
                     invisible_until: None,
-                    moved_by_task: None,
+                    // Retention in the destination runs from the move, which is when that
+                    // queue enqueued it, and so does the per-queue delivery count its own
+                    // `RedrivePolicy` bounds: the deliveries the source queue made were
+                    // not deliveries of this one. Neither re-SENDS it — `SentTimestamp` is
+                    // the instant its sender was answered, whichever queue holds it now.
+                    retention_from: now,
+                    queue_receive_count: 0,
                     ..message
                 });
             }
         }
-        Some(moved)
+        let drained = self
+            .queues
+            .get(&source_key)
+            .is_some_and(|source| source.messages.is_empty());
+        if let Some(task) = self
+            .message_move_tasks
+            .iter_mut()
+            .find(|task| task.task_handle == task_handle)
+        {
+            task.moved_count = task.moved_count.saturating_add(moved);
+            if drained {
+                task.completed_at = Some(now);
+            }
+        }
+    }
+
+    /// Record that the task `task_handle` names finished at `now`, whatever it still had
+    /// to move: a task that cannot reach its source or its destination queue any more.
+    fn complete_message_move_task(&mut self, task_handle: &str, now: SystemTime) {
+        if let Some(task) = self
+            .message_move_tasks
+            .iter_mut()
+            .find(|task| task.task_handle == task_handle)
+        {
+            task.completed_at = Some(now);
+        }
     }
 
     /// Record a started message movement task, keeping at most
@@ -2504,8 +2688,8 @@ impl ComAmazonawsSqsAmazonsqsState {
     /// the StartMessageMoveTask request" and is NULL when the request specified none,
     /// `MaxNumberOfMessagesPerSecond` likewise carries only a rate the request fixed, and
     /// `FailureReason` is "only included if the task status is FAILED" — which no task this
-    /// store records reaches, because it takes its messages when it starts, so a status it
-    /// never reaches owes no reason.
+    /// store records reaches, because a task here keeps moving what its source queue can
+    /// give until there is nothing left, so a status it never reaches owes no reason.
     pub fn reported_message_move_tasks(
         &self,
         region: &str,
@@ -2531,7 +2715,7 @@ impl ComAmazonawsSqsAmazonsqsState {
                         self.reported_queue_arn(region, &task.destination_queue_name)
                     }),
                     max_number_of_messages_per_second: task.max_number_of_messages_per_second,
-                    approximate_number_of_messages_moved: count_as_i64(task.messages_moved(now)),
+                    approximate_number_of_messages_moved: count_as_i64(task.messages_moved()),
                     approximate_number_of_messages_to_move: Some(count_as_i64(
                         task.messages_to_move(),
                     )),
@@ -2589,13 +2773,12 @@ pub fn message_move_rate_out_of_range_message() -> String {
     )
 }
 
-/// How long after the start call the first moved message becomes deliverable in the
-/// destination queue.
+/// How long after the start call a message movement task may move its first message.
 ///
 /// `StartMessageMoveTask` "starts an asynchronous task": it answers with a task handle
-/// before the task has delivered anything, so this emulator owes the first delivery a
-/// short span after the call rather than at it — a consumer polling the destination
-/// queue straight away still sees the task running and none of its messages yet.
+/// before the task has moved anything, so this emulator owes the first move a short span
+/// after the call rather than at it — a consumer polling the destination queue straight
+/// away still sees the task running and none of its messages yet.
 pub const MESSAGE_MOVE_TASK_START_DELAY: Duration = Duration::from_millis(500);
 
 /// How many message movement task records one source queue keeps, and the most
@@ -2645,12 +2828,17 @@ pub const MESSAGE_MOVE_CANCELLATION_SPAN: Duration = Duration::from_millis(500);
 /// One message movement task `StartMessageMoveTask` started.
 ///
 /// The record holds only what the start call RESOLVED — the queues it found, the rate and
-/// how many messages the task took — and nothing a request supplied verbatim: each queue
+/// the depth it sized the move over — and nothing a request supplied verbatim: each queue
 /// is held as the `QueueName` its ARN resolved to, which is the identity every reader and
 /// every bound keys on, and the ARNs a reader reports are projected from those queue
-/// records rather than stored a second time. How far the task has got is computed from
-/// this record and the clock by [`messages_moved`](Self::messages_moved) and
-/// [`status`](Self::status), so no two readers can disagree about a task's progress.
+/// records rather than stored a second time.
+///
+/// A task's PROGRESS is the moving itself: the messages it has taken out of its source
+/// queue, counted in [`moved_count`](Self::moved_count) as
+/// [`ComAmazonawsSqsAmazonsqsState::advance_message_move_tasks`] takes them, and the
+/// instant it ran out of messages to take, in [`completed_at`](Self::completed_at). So a
+/// status is never a function of a timer alone: `COMPLETED` is reported over a drain that
+/// really happened, and every reader of the record agrees about it.
 #[derive(Debug, Clone)]
 pub struct MessageMoveTask {
     /// The opaque handle the start call returned, which `CancelMessageMoveTask` names.
@@ -2659,7 +2847,7 @@ pub struct MessageMoveTask {
     /// task moves messages between two queues of one region, so every reader resolves a
     /// task in the region it was started in and nowhere else.
     pub region: String,
-    /// The name of the dead-letter queue the messages were taken from.
+    /// The name of the dead-letter queue the messages are taken from.
     pub source_queue_name: String,
     /// The name of the queue they are being delivered to.
     pub destination_queue_name: String,
@@ -2673,10 +2861,19 @@ pub struct MessageMoveTask {
     pub max_number_of_messages_per_second: Option<i32>,
     /// When the start call accepted the task.
     pub started_at: SystemTime,
-    /// How many messages the task took from the source queue.
-    pub message_count: u64,
+    /// How many messages the source queue held when this task was started, which is what
+    /// `ApproximateNumberOfMessagesToMove` reports: "this number is obtained at the time of
+    /// starting the message movement task", so it stays as it was sized.
+    pub sized_count: u64,
+    /// How many messages this task has moved to the destination queue so far, which is what
+    /// `ApproximateNumberOfMessagesMoved` reports: "the approximate number of messages
+    /// already moved to the destination queue".
+    pub moved_count: u64,
+    /// When this task ran out of messages to move, if it has: from that instant it reports
+    /// `COMPLETED`, and a completed task moves nothing more.
+    pub completed_at: Option<SystemTime>,
     /// When `CancelMessageMoveTask` stopped the task, if it was cancelled: from that
-    /// instant the task delivers nothing more, so its progress stops there too.
+    /// instant the task moves nothing more, so its progress stops there too.
     pub cancelled_at: Option<SystemTime>,
 }
 
@@ -2686,19 +2883,21 @@ impl MessageMoveTask {
     fn is_of(&self, key: &(String, String)) -> bool {
         self.region == key.0 && self.source_queue_name == key.1
     }
-    /// When the `index`-th message of this task becomes deliverable: the start delay,
-    /// then one message per rate slot. With no rate fixed, every message is deliverable
-    /// at the end of the start delay.
+
+    /// Whether this task still has moving to do: one neither cancelled nor finished.
+    fn in_progress(&self) -> bool {
+        self.cancelled_at.is_none() && self.completed_at.is_none()
+    }
+
+    /// When this task's `index`-th message may be moved: the start delay, then one message
+    /// per rate slot. With no rate fixed, every message may be moved at the end of the
+    /// start delay ("the system will optimize the rate").
     pub fn delivery_instant(&self, index: u64) -> SystemTime {
         let first = self
             .started_at
             .checked_add(MESSAGE_MOVE_TASK_START_DELAY)
             .unwrap_or(self.started_at);
-        let Some(rate) = self
-            .max_number_of_messages_per_second
-            .and_then(|rate| u64::try_from(rate).ok())
-            .filter(|rate| *rate > 0)
-        else {
+        let Some(rate) = self.rate() else {
             return first;
         };
         let nanos =
@@ -2709,50 +2908,52 @@ impl MessageMoveTask {
             .unwrap_or(first)
     }
 
-    /// When the last message this task took becomes deliverable, which is when the task
-    /// is done.
-    pub fn completes_at(&self) -> SystemTime {
-        self.delivery_instant(self.message_count.saturating_sub(1))
-    }
-
-    /// How many of this task's messages have been delivered by `now`.
+    /// How many messages BEYOND the ones it has already moved this task may move at `now`,
+    /// `None` while its first delivery slot is still ahead and `Some(u64::MAX)` for a task
+    /// whose rate the service optimizes, which is bounded only by what its source queue can
+    /// hand out.
     ///
-    /// A cancelled task moved nothing after it was stopped, so its progress is measured
-    /// at the instant of the cancellation rather than at `now`.
-    pub fn messages_moved(&self, now: SystemTime) -> u64 {
-        let now = match self.cancelled_at {
-            Some(cancelled_at) if cancelled_at < now => cancelled_at,
-            _ => now,
+    /// A fixed rate is "the number of messages to be moved per second", so the slot of the
+    /// `index`-th message is `index / rate` after the first: the number of slots `now` has
+    /// reached, less what the task has moved, is what this turn may take.
+    fn deliverable_by(&self, now: SystemTime) -> Option<u64> {
+        let first = self.delivery_instant(0);
+        let elapsed = now.duration_since(first).ok()?;
+        let Some(rate) = self.rate() else {
+            return Some(u64::MAX);
         };
-        let Ok(elapsed) = now.duration_since(self.delivery_instant(0)) else {
-            return 0;
-        };
-        let Some(rate) = self
-            .max_number_of_messages_per_second
-            .and_then(|rate| u64::try_from(rate).ok())
-            .filter(|rate| *rate > 0)
-        else {
-            return self.message_count;
-        };
-        let delivered = u64::try_from(elapsed.as_nanos() * u128::from(rate) / NANOS_PER_SECOND)
+        let slots = u64::try_from(elapsed.as_nanos() * u128::from(rate) / NANOS_PER_SECOND)
             .unwrap_or(u64::MAX)
             .saturating_add(1);
-        delivered.min(self.message_count)
+        Some(slots.saturating_sub(self.moved_count))
+    }
+
+    /// The fixed message movement rate of this task, or `None` when the request left the
+    /// rate to the service. A rate of zero or less would move nothing, so it is no rate.
+    fn rate(&self) -> Option<u64> {
+        self.max_number_of_messages_per_second
+            .and_then(|rate| u64::try_from(rate).ok())
+            .filter(|rate| *rate > 0)
+    }
+
+    /// How many messages this task has moved to the destination queue.
+    pub fn messages_moved(&self) -> u64 {
+        self.moved_count
     }
 
     /// How many messages this task is moving, which is "obtained at the time of starting
     /// the message movement task" (the `ApproximateNumberOfMessagesToMove` member's own
-    /// documentation): the number the source queue held when the task took them, so it
-    /// does not fall as the task delivers them and a finished task still reports the size
-    /// it was started over.
+    /// documentation): the depth the source queue had when the task was started, so it
+    /// does not fall as the task moves them and a finished task still reports the size it
+    /// was started over.
     pub fn messages_to_move(&self) -> u64 {
-        self.message_count
+        self.sized_count
     }
 
-    /// This task's status at `now`: it runs until the last message it took is
-    /// deliverable, and is completed from that instant on. A cancelled task is
-    /// cancelling for [`MESSAGE_MOVE_CANCELLATION_SPAN`] after the cancel call and
-    /// cancelled from then on, whatever it had still to deliver.
+    /// This task's status at `now`: it runs until it has moved everything its source queue
+    /// had to give, and is completed from that instant on. A cancelled task is cancelling
+    /// for [`MESSAGE_MOVE_CANCELLATION_SPAN`] after the cancel call and cancelled from then
+    /// on, whatever it had still to move.
     pub fn status(&self, now: SystemTime) -> &'static str {
         if let Some(cancelled_at) = self.cancelled_at {
             let settled = cancelled_at
@@ -2764,7 +2965,10 @@ impl MessageMoveTask {
                 MESSAGE_MOVE_CANCELLING
             };
         }
-        if now >= self.completes_at() {
+        if self
+            .completed_at
+            .is_some_and(|completed_at| now >= completed_at)
+        {
             MESSAGE_MOVE_COMPLETED
         } else {
             MESSAGE_MOVE_RUNNING
@@ -2862,6 +3066,39 @@ pub fn redrive_policy_refusal(region: &str, policy: &str) -> Option<String> {
             DEAD_LETTER_TARGET_NAMESPACE_REASON,
         )),
     }
+}
+
+/// The reason a refusal gives for a `RedrivePolicy` whose dead-letter target does not admit
+/// the queue that would be driving its messages there.
+///
+/// The target queue's `RedriveAllowPolicy` is what admits a source queue
+/// ([`Queue::admits_dead_letter_source`]); the sentence states that the attribute of the
+/// dead-letter queue is what stopped the request, which is the one thing the caller has to
+/// go and change.
+pub const REDRIVE_ALLOW_POLICY_REASON: &str =
+    "The value for the dead-letter queue's RedriveAllowPolicy attribute prevents you from \
+     completing this request.";
+
+/// How a refusal of a `RedrivePolicy` VALUE names the policy it refused: the two parameters
+/// the policy carries, each as the request supplied it, rather than the document's own
+/// spelling — whitespace, member order and whether the count came as a number or as a
+/// string of digits are a caller's formatting and say nothing about what was refused.
+fn refused_redrive_policy_value(max_receive_count: &str, dead_letter_target_arn: &str) -> String {
+    format!(
+        "RedrivePolicy(maxReceiveCount={max_receive_count}, \
+         deadLetterTargetArn={dead_letter_target_arn})"
+    )
+}
+
+/// The `maxReceiveCount` a parsed `RedrivePolicy` carries, as the digits the request
+/// supplied: the member is read whether the JSON carries it as a number or as a string
+/// (see [`redrive_max_receive_count`]), and a refusal quotes back what the caller wrote.
+fn redrive_max_receive_count_text(policy: &::serde_json::Value) -> Option<String> {
+    let count = policy.get("maxReceiveCount")?;
+    count
+        .as_str()
+        .map(|raw| raw.trim().to_string())
+        .or_else(|| count.as_i64().map(|count| count.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -3834,6 +4071,17 @@ pub const DEAD_LETTER_SOURCE_REQUIRED: &str =
 pub const TASK_ALREADY_RUNNING: &str =
     "There is already a task running. Only one active task is allowed for a source queue \
      arn at a given time.";
+
+/// How a refusal states that a message movement task was asked to move a queue's messages
+/// onto the queue they are already in.
+///
+/// Fixed text: the two parameters that cannot be equal are the only thing the sentence is
+/// about, and the ARN they both carry is the caller's own and tells it nothing it did not
+/// send. The rule is a cross-member one the model does not carry — `SourceArn` and
+/// `DestinationArn` are plain strings with no modelled relationship — so it is stated here
+/// once, where every refusal wording of this service lives.
+pub const SAME_SOURCE_AND_DESTINATION: &str =
+    "Source queue arn and destination queue arn cannot be the same.";
 
 /// The reason a refusal gives for a parameter that does not apply to the KIND of queue
 /// the call addresses: a FIFO-only member supplied to a standard queue, or a

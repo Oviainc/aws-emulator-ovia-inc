@@ -1,23 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartMessageMoveTask
-//! IMPLEMENTED: this operation takes the messages the source dead-letter queue can hand
-//! out, puts them in the destination queue each deliverable at the instant this task's
-//! rate schedules it, and records the task in [`crate::state`] under the handle it
-//! returns. It is the ONLY file to touch for `StartMessageMoveTask`.
+//! IMPLEMENTED: this operation records a task that moves the messages of the source
+//! dead-letter queue into the destination queue at the rate it was started at, sizes it
+//! over the depth the source queue has at that instant, and answers with the handle the
+//! task is recorded under in [`crate::state`]. It is the ONLY file to touch for
+//! `StartMessageMoveTask`.
 //!
 //! ## How the asynchronous task is modelled here
 //!
-//! The task takes its messages from the source queue when it starts and schedules each
-//! one's delivery in the destination queue at `start + 500 ms + index/rate`, so nothing
-//! sleeps and no background work is owed to a later call: a consumer of the destination
-//! sees the messages arrive over the task's duration, and one polling the instant the
-//! start call answers sees none of them yet. What this does NOT model is a source queue
-//! that drains gradually — the messages leave it when the task starts, so a future
-//! `CancelMessageMoveTask` can return the ones not yet delivered but cannot leave them
-//! where they were. `CancelMessageMoveTask` puts the ones it has not delivered yet back
-//! in the source queue, so a cancelled move leaves the pair of queues holding every
-//! message it held before the task started.
+//! The movement is work the task owes over time, not work this call does: each later call
+//! carries every recorded task as far as the clock has made it due
+//! ([`crate::state::ComAmazonawsSqsAmazonsqsState::advance_message_move_tasks`]), moving
+//! what the source queue can hand out at `start + 500 ms + index/rate`. So nothing sleeps
+//! and no background thread is needed: a consumer polling the destination the instant the
+//! start call answers sees none of the messages yet, one polling later sees them arrive
+//! over the task's duration, and the source queue drains as they go. A message in flight
+//! with a consumer, or one a delay still hides, is not the queue's to give away at that
+//! instant and is moved by a later turn once the clock makes it available — which is also
+//! why the task reports `COMPLETED` only once its source queue holds no message at all.
+//! `CancelMessageMoveTask` stops the task there: what it has not moved never left the
+//! source queue, and what it has moved stays the destination's.
 //!
 //! Two documented shapes this store cannot answer faithfully are refused rather than
 //! guessed: a blank `DestinationArn` for a dead-letter queue with several source queues
@@ -110,7 +113,6 @@
 use super::types::*;
 use crate::scaffolded::Scaffolded;
 use crate::state as sqs;
-use std::collections::VecDeque;
 use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -253,6 +255,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
+        // "Source queue arn and destination queue arn cannot be the same": a task whose
+        // destination IS its source would move a queue's messages onto itself, so the pair
+        // is refused before any task state is allocated. The two are compared as the queues
+        // they RESOLVE to, so a second spelling of the one queue is the same queue here.
+        if named_destination
+            .as_deref()
+            .is_some_and(|name| name == source_name)
+        {
+            return Err(Scaffolded::invalid_parameter_value(
+                sqs::SAME_SOURCE_AND_DESTINATION,
+            ));
+        }
+
         let store = sqs::service_state(&*self.engine).ok_or_else(|| {
             StartMessageMoveTaskErrorModeled::UnsupportedOperation(sqs::store_unavailable())
         })?;
@@ -337,6 +352,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into())
             }
         };
+        // The pair the task would run over has to be two queues, whether the request named
+        // the destination or left it to the queue that drives its messages here: a queue
+        // whose own `RedrivePolicy` names itself is its own dead-letter source, so the
+        // blank-destination form can resolve to the source queue too, and moving a queue's
+        // messages onto itself is the same degenerate move.
+        if destination_name == source_name {
+            return Err(Scaffolded::invalid_parameter_value(
+                sqs::SAME_SOURCE_AND_DESTINATION,
+            ));
+        }
 
         // "Only one active message movement task is supported per queue at any given
         // time." A source whose task is still running is a PARAMETER this call cannot be
@@ -351,47 +376,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // The task takes the messages the source queue can hand out at the instant it
-        // starts. A message still delayed, or in flight with a consumer, is not the
-        // queue's to give away, so it stays where it is.
+        // "The number of messages to be moved from the source queue. This number is
+        // obtained at the time of starting the message movement task"
+        // (`ListMessageMoveTasksResultEntry$ApproximateNumberOfMessagesToMove`): the depth
+        // the source queue has at this instant — every message it holds is one the task
+        // will move, including the ones a consumer has in flight or a delay still hides,
+        // which the task takes once the clock makes them available again.
         let source = state.queue(&region, &source_name).ok_or_else(|| {
             StartMessageMoveTaskErrorModeled::ResourceNotFoundException(sqs::resource_not_found(
                 "SourceArn",
             ))
         })?;
-        let moving_count = source
+        let sized_count = source.messages.len();
+        let sized_bytes = source
             .messages
             .iter()
-            .filter(|message| message.visibility(now) == sqs::Visibility::Visible)
-            .count();
-        let moving_bytes = source
-            .messages
-            .iter()
-            .filter(|message| message.visibility(now) == sqs::Visibility::Visible)
             .map(sqs::StoredMessage::retained_bytes)
             .fold(0usize, usize::saturating_add);
 
         // A move does not change what the store holds in total, so the store-wide budget
         // is measured without the bytes already accounted for in the source queue; the
-        // destination queue's own bounds still apply to what it is handed.
-        let store_bytes = state.retained_message_bytes().saturating_sub(moving_bytes);
+        // destination queue's own bounds still apply to what it is handed. A destination
+        // that could not take the backlog at all is refused here rather than leaving a task
+        // that can never drain its source.
+        let store_bytes = state.retained_message_bytes().saturating_sub(sized_bytes);
         let destination = state.queue(&region, &destination_name).ok_or_else(|| {
             StartMessageMoveTaskErrorModeled::ResourceNotFoundException(sqs::resource_not_found(
                 "DestinationArn",
             ))
         })?;
-        if destination_name != source_name {
-            if let Some(reason) = destination.batch_rejection(moving_count, moving_bytes, store_bytes)
-            {
-                return Err(StartMessageMoveTaskErrorModeled::UnsupportedOperation(
-                    UnsupportedOperation {
-                        message: Some(reason),
-                    },
-                )
-                .into());
-            }
+        if let Some(reason) = destination.batch_rejection(sized_count, sized_bytes, store_bytes) {
+            return Err(StartMessageMoveTaskErrorModeled::UnsupportedOperation(
+                UnsupportedOperation {
+                    message: Some(reason),
+                },
+            )
+            .into());
         }
 
+        // The task itself does the moving, over its own schedule: this call records what it
+        // resolved and answers with the handle, and every later call carries the task as far
+        // as the clock has made it due
+        // (`crate::state::ComAmazonawsSqsAmazonsqsState::advance_message_move_tasks`), so a
+        // consumer polling the destination the instant this answers sees none of the
+        // messages yet and the status is `COMPLETED` only once the source queue is drained.
         let task = sqs::MessageMoveTask {
             task_handle: sqs::new_identifier(),
             region: region.clone(),
@@ -400,56 +428,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             destination_specified,
             max_number_of_messages_per_second: input.max_number_of_messages_per_second,
             started_at: now,
-            message_count: u64::try_from(moving_count).unwrap_or(u64::MAX),
+            sized_count: u64::try_from(sized_count).unwrap_or(u64::MAX),
+            moved_count: 0,
+            completed_at: None,
             cancelled_at: None,
         };
-
-        // Take the messages out of the source queue, with the receipt handles it minted
-        // for them: a receipt handle is only ever valid for the queue that minted it.
-        let mut taken: Vec<sqs::StoredMessage> = Vec::with_capacity(moving_count);
-        {
-            let source = state.queue_mut(&region, &source_name).ok_or_else(|| {
-                StartMessageMoveTaskErrorModeled::ResourceNotFoundException(
-                    sqs::resource_not_found("SourceArn"),
-                )
-            })?;
-            let mut staying: VecDeque<sqs::StoredMessage> = VecDeque::new();
-            for message in std::mem::take(&mut source.messages) {
-                if message.visibility(now) == sqs::Visibility::Visible {
-                    source.handles.retain(|_, id| *id != message.message_id);
-                    taken.push(message);
-                } else {
-                    staying.push_back(message);
-                }
-            }
-            source.messages = staying;
-        }
-
-        // Hand them to the destination queue in the order the source held them, each one
-        // deliverable at the instant this task's rate schedules it. The message keeps its
-        // id, body and attributes — it is the same message in another queue — and its
-        // receive count, which counts receives "across all queues"; retention in the
-        // destination runs from the move, which is when that queue took it, and so does
-        // the per-queue delivery count the destination's own `RedrivePolicy` bounds,
-        // because the deliveries the source queue made were not deliveries of this one.
-        let destination = state.queue_mut(&region, &destination_name).ok_or_else(|| {
-            StartMessageMoveTaskErrorModeled::ResourceNotFoundException(sqs::resource_not_found(
-                "DestinationArn",
-            ))
-        })?;
-        for (index, message) in taken.into_iter().enumerate() {
-            destination.messages.push_back(sqs::StoredMessage {
-                sent_at: now,
-                retention_from: now,
-                available_at: task.delivery_instant(u64::try_from(index).unwrap_or(u64::MAX)),
-                invisible_until: None,
-                queue_receive_count: 0,
-                // Until its slot comes round the message is one this task still owes the
-                // destination queue, which is what a cancellation of this task takes back.
-                moved_by_task: Some(task.task_handle.clone()),
-                ..message
-            });
-        }
 
         let task_handle = task.task_handle.clone();
         state.record_message_move_task(task);
@@ -463,7 +446,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             source_queue = %source_name,
             destination_queue = %destination_name,
             task_handle = %task_handle,
-            message_count = moving_count,
+            message_count = sized_count,
             outcome = "started",
             "message movement task started"
         );

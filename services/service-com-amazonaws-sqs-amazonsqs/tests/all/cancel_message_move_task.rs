@@ -5,11 +5,12 @@
 //! [`super::support`].
 //!
 //! The rule under test: cancelling a running message movement task stops the messages it
-//! has not moved yet and leaves the ones it has already moved where they are — the
-//! stopped messages are back in the source queue, the moved ones stay in the destination
-//! queue, the call answers with how many had been moved, and every later reader reports
-//! that same progress under a cancelled status; a handle no recorded task answers to and
-//! a task whose status is not running are refused, and a refusal moves nothing.
+//! has not moved yet and leaves the ones it has already moved where they are — the stopped
+//! messages are still the source queue's own (a task takes a message out of it only when
+//! its schedule reaches that message), the moved ones stay in the destination queue, the
+//! call answers with how many had been moved, and every later reader reports that same
+//! progress under a cancelled status; a handle no recorded task answers to and a task whose
+//! status is not running are refused, and a refusal moves nothing.
 //!
 //! The delivery table spans what the rule generalises over rather than one example: the
 //! message count, the movement rate (fixed, or left to the service), both ways of
@@ -226,8 +227,8 @@ async fn cancelling_a_running_task_stops_what_it_had_not_moved_and_keeps_what_it
         )
         .await;
 
-        // Messages the source queue takes while the task runs are none of the task's
-        // business: it took its own when it started.
+        // Messages the source queue takes while the task runs queue up behind the ones it
+        // was sized over, so a cancel this early never reaches them.
         let meanwhile: Vec<String> = (0..*sent_meanwhile)
             .map(|number| format!("{case} sent meanwhile #{number}"))
             .collect();
@@ -269,9 +270,9 @@ async fn cancelling_a_running_task_stops_what_it_had_not_moved_and_keeps_what_it
         }
         let stopped = held_count - moved;
 
-        // (case, queue, attribute, what it must report). The stopped messages are the
-        // source queue's again, the moved ones are the destination queue's, and the
-        // destination owes no further delivery: the pair holds every message it held.
+        // (case, queue, attribute, what it must report). The stopped messages are still the
+        // source queue's, the moved ones are the destination queue's, and the destination
+        // owes no further delivery: the pair holds every message it held.
         let meanwhile_count = i64::try_from(*sent_meanwhile).expect("a small count");
         for (which, url, attribute, expected) in [
             (
@@ -577,44 +578,63 @@ async fn a_cancelled_task_frees_its_source_queue_for_another_task() {
     );
 }
 
-/// A cancellation puts messages back into the source queue, so it is bounded by what that
-/// queue may hold like every other path that adds messages to one: a queue refilled to its
-/// allowance while the task ran takes none of them back, and the messages it cannot take
-/// keep their place in the destination queue rather than being dropped — the pair still
-/// holds every message between them.
+/// A move puts messages INTO the destination queue, so it is bounded by what that queue
+/// may hold like every other path that adds messages to one: a destination filled to its
+/// allowance while the task runs takes no more of them, the messages it cannot take stay in
+/// the source queue rather than being dropped, and cancelling the task leaves every message
+/// in one of the two queues.
 #[tokio::test]
-async fn a_cancel_cannot_push_the_source_queue_past_what_it_may_hold() {
+async fn a_move_cannot_push_the_destination_queue_past_what_it_may_hold() {
     let router = emulator();
     // Enough messages, at the slowest rate the member admits (one per second), that the
-    // task still owes several of them however long the refill below takes: a row where
-    // the whole schedule had elapsed would assert the same thing without exercising the
-    // bound at all.
+    // task still owes several of them however long the refill below takes: a row where the
+    // whole schedule had elapsed would assert the same thing without exercising the bound
+    // at all.
     let moving: Vec<String> = (0..10).map(|number| format!("moving #{number}")).collect();
-    let (dead_letter_url, _, destination_url, handle, _) =
-        start_task(&router, "cancel-bounded", &moving, Some(1), true).await;
+    let (dead_letter_url, dead_letter_arn, destination_url, handle, _) =
+        start_task(&router, "move-bounded", &moving, Some(1), true).await;
 
-    // Refill the dead-letter queue to the whole allowance this store holds per queue
-    // while the task runs, in batches of the ten entries a batch send accepts.
-    let batch = 10;
-    for first in (0..MAX_MESSAGES_PER_QUEUE).step_by(batch) {
-        let entries: Vec<Value> = (first..first + batch)
-            .map(|number| json!({"Id": format!("e{number}"), "MessageBody": format!("fill #{number}")}))
+    // Fill the destination queue to the whole allowance this store holds per queue while
+    // the task runs, in batches of the ten entries a batch send accepts. What the task has
+    // already moved into it counts toward that allowance, so the room left is re-read
+    // before every send rather than assumed.
+    let allowance = i64::try_from(MAX_MESSAGES_PER_QUEUE).expect("a small count");
+    let mut filled = 0i64;
+    let fill_deadline = Instant::now() + DEADLINE;
+    loop {
+        let (visible, delayed, in_flight) = message_counts(&router, &destination_url).await;
+        let room = allowance - (visible + delayed + in_flight);
+        if room <= 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < fill_deadline,
+            "case the refill: expected the destination queue filled to its allowance of \
+             {allowance} within {DEADLINE:?}, still {room} short"
+        );
+        let batch = room.min(10);
+        let entries: Vec<Value> = (0..batch)
+            .map(|number| {
+                json!({
+                    "Id": format!("e{filled}x{number}"),
+                    "MessageBody": format!("fill #{filled}x{number}"),
+                })
+            })
             .collect();
-        ok(
+        let (status, _) = call(
             &router,
             "SendMessageBatch",
-            json!({"QueueUrl": dead_letter_url, "Entries": entries}),
+            &json!({"QueueUrl": destination_url, "Entries": entries}),
         )
         .await;
+        if status == 200 {
+            filled += batch;
+        }
     }
-    let filled = count(&router, &dead_letter_url, "ApproximateNumberOfMessages").await;
-    let allowance = i64::try_from(MAX_MESSAGES_PER_QUEUE).expect("a small count");
-    assert_eq!(
-        filled, allowance,
-        "case the refill: expected the dead-letter queue at its whole allowance of {allowance}, \
-         got {filled}"
-    );
 
+    // Past the whole schedule the task was started over, so every slot it had has come
+    // round: what it has not moved by now is what the destination queue would not take.
+    tokio::time::sleep(schedule_span(moving.len(), Some(1))).await;
     let parsed = ok(
         &router,
         "CancelMessageMoveTask",
@@ -624,13 +644,7 @@ async fn a_cancel_cannot_push_the_source_queue_past_what_it_may_hold() {
     let moved = parsed["ApproximateNumberOfMessagesMoved"]
         .as_i64()
         .unwrap_or_else(|| panic!("case the cancel: no ApproximateNumberOfMessagesMoved in {parsed}"));
-    let owed = i64::try_from(moving.len()).expect("a small count") - moved;
-    assert!(
-        owed > 0,
-        "case the cancel: expected the task to still owe messages for the source queue to \
-         refuse, with {moved} of {} already moved",
-        moving.len()
-    );
+    let held = i64::try_from(moving.len()).expect("a small count");
 
     // Every message either queue holds is counted — visible, in flight or delayed — so
     // none can hide from the allowance or from the total.
@@ -648,23 +662,49 @@ async fn a_cancel_cannot_push_the_source_queue_past_what_it_may_hold() {
         );
         totals.push(total);
     }
-    let held: i64 = totals.iter().sum();
-    let expected = allowance + i64::try_from(moving.len()).expect("a small count");
+    let pair: i64 = totals.iter().sum();
     assert_eq!(
-        held, expected,
-        "case the pair of queues: expected every one of {expected} messages still held, got \
-         {totals:?}"
+        pair,
+        filled + held,
+        "case the pair of queues: expected every one of the {} messages still held, got \
+         {totals:?} with {moved} of the {held} moved",
+        filled + held
     );
-    let stayed = receive_bodies(
+
+    // The messages the destination queue could not take are the source queue's own, in the
+    // order it held them: a move the bound withheld left them where they were.
+    if filled + held > allowance {
+        let owed = held - moved;
+        assert!(
+            owed > 0,
+            "case the withheld move: expected the destination queue to have refused some of \
+             the {held} messages, got {moved} moved"
+        );
+        let in_source = receive_bodies(
+            &router,
+            &dead_letter_url,
+            usize::try_from(owed).expect("a small count"),
+            Instant::now() + DEADLINE,
+        )
+        .await;
+        assert_eq!(
+            in_source,
+            moving[usize::try_from(moved).expect("a small count")..].to_vec(),
+            "case the source queue: expected it to still hold the messages the destination \
+             could not take, got {in_source:?}"
+        );
+    }
+
+    // A cancelled task is past RUNNING, whatever it still had to move.
+    let settled = wait_for_status(
         &router,
-        &destination_url,
-        moving.len(),
+        &dead_letter_arn,
+        CANCELLED,
         Instant::now() + DEADLINE,
     )
     .await;
     assert_eq!(
-        stayed, moving,
-        "case the destination queue: expected it to keep every message, including the {owed} the \
-         source queue could not take back, got {stayed:?}"
+        settled, CANCELLED,
+        "case the cancelled task: expected it to settle at {CANCELLED}"
     );
 }
