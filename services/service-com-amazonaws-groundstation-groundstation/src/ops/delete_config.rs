@@ -165,18 +165,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
             })?;
 
-        // A config a live mission profile still depends on is NOT deleted: a mission
-        // profile names its configs by ARN, and dropping one out from under it would
-        // leave it pointing at a reference that no longer resolves. So the inbound
-        // references are counted first and, when there are any, the delete is refused as
-        // a bad parameter naming the profiles that hold them — the caller deletes those
-        // first and retries. Nothing is written on this path, so both the config and
-        // every profile are left exactly as they were.
-        let referencing = guard.mission_profiles_referencing(&config_arn);
-        if !referencing.is_empty() {
+        // A config another resource this account still holds depends on is NOT deleted:
+        // a holder names the config by ARN, and dropping it out from under the holder
+        // would leave that holder pointing at a reference that no longer resolves — the
+        // very state this crate's create and update gates refuse to let a caller build.
+        // So the inbound references are counted first, over EVERY kind of resource that
+        // can hold one, and when there are any the delete is refused as a bad parameter
+        // naming the holders — the caller deletes those first and retries. Nothing is
+        // written on this path, so the config and every holder are left as they were.
+        //
+        // A mission profile holds one through any of its `ConfigArn` members.
+        let profiles_referencing = guard.mission_profiles_referencing(&config_arn);
+        if !profiles_referencing.is_empty() {
             return Err(DeleteConfigErrorModeled::InvalidParameterException(
                 InvalidParameterException {
-                    message: Some(crate::state::config_in_use_message(&referencing)),
+                    message: Some(crate::state::config_in_use_message(&profiles_referencing)),
+                    parameter_name: None,
+                },
+            )
+            .into());
+        }
+
+        // And a config holds one through a `ConfigArn` member of its own `configData` —
+        // an `uplinkEchoConfig` echoes the `antenna-uplink` config it names. That
+        // reference is as real as a mission profile's: this crate's `CreateConfig` and
+        // `UpdateConfig` both refuse such a config whose ARN resolves to nothing, so
+        // deleting the echoed config would leave behind a stored echo config the service
+        // itself would no longer accept.
+        let configs_referencing = guard.configs_referencing(&config_arn);
+        if !configs_referencing.is_empty() {
+            return Err(DeleteConfigErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(crate::state::config_in_use_by_configs_message(
+                        &configs_referencing,
+                    )),
                     parameter_name: None,
                 },
             )

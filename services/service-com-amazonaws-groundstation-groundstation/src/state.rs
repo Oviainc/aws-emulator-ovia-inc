@@ -1157,6 +1157,38 @@ pub struct Config {
     pub tags: HashMap<String, String>,
 }
 
+impl Config {
+    /// Whether this config references the config `config_arn` names, through ANY member of
+    /// its `configData` that carries a `ConfigArn`.
+    ///
+    /// One member of the union does: an `uplinkEchoConfig` echoes the `antenna-uplink`
+    /// config its `antennaUplinkConfigArn` names (`smithy_query(query="shape",
+    /// shape="ConfigTypeData,UplinkEchoConfig")` — the only `ConfigArn`-targeted member of
+    /// the eight capability bodies). It is matched with [`addresses_config`], like every
+    /// other inbound reference, so a reference naming one NODE of a config is as much a
+    /// reference to it as one naming the config whole.
+    ///
+    /// This is what makes the referenced config "in use" for [`DeleteConfig`]'s referential
+    /// integrity check, beside the mission profile's references
+    /// ([`MissionProfile::references_config`]).
+    ///
+    /// [`DeleteConfig`]: crate::ops::delete_config
+    pub fn references_config(&self, config_arn: &str) -> bool {
+        match &self.config_data {
+            ConfigTypeData::uplinkEchoConfig(echo) => {
+                addresses_config(&echo.antenna_uplink_config_arn, config_arn)
+            }
+            ConfigTypeData::antennaDownlinkConfig(_)
+            | ConfigTypeData::antennaDownlinkDemodDecodeConfig(_)
+            | ConfigTypeData::antennaUplinkConfig(_)
+            | ConfigTypeData::dataflowEndpointConfig(_)
+            | ConfigTypeData::s3RecordingConfig(_)
+            | ConfigTypeData::telemetrySinkConfig(_)
+            | ConfigTypeData::trackingConfig(_) => false,
+        }
+    }
+}
+
 /// A mission profile as `CreateMissionProfile` stored it.
 #[derive(Debug, Clone)]
 pub struct MissionProfile {
@@ -2090,10 +2122,28 @@ pub fn contact_mutation_not_found_message(contact_id: &str) -> String {
 /// this is the wording that goes with them, and the ARNs in it are the ones the store
 /// holds rather than anything echoed from the request.
 pub fn config_in_use_message(mission_profile_arns: &[String]) -> String {
+    config_in_use_text("Mission Profiles", mission_profile_arns)
+}
+
+/// What `DeleteConfig` answers while another config this account still holds references
+/// the config — an `uplinkEchoConfig` echoing the `antenna-uplink` config the delete
+/// addressed: the refusal names the referencing config ARNs, which is what tells a caller
+/// what to delete first.
+///
+/// Same status (431), error code (`InvalidParameterException`) and sentence as the
+/// mission-profile refusal above; only the kind of resource that holds the reference
+/// differs, so the two are composed from one template rather than written twice.
+pub fn config_in_use_by_configs_message(config_arns: &[String]) -> String {
+    config_in_use_text("Configs", config_arns)
+}
+
+/// The in-use refusal `DeleteConfig` answers, for holders of one kind: the plural name of
+/// the resource kind that holds the inbound references, then the ARNs the store holds.
+fn config_in_use_text(holder_kind_plural: &str, holder_arns: &[String]) -> String {
     format!(
-        "Config cannot be deleted; it is currently being used by the following Mission \
-         Profiles: {}",
-        mission_profile_arns.join(", ")
+        "Config cannot be deleted; it is currently being used by the following \
+         {holder_kind_plural}: {}",
+        holder_arns.join(", ")
     )
 }
 
@@ -4000,6 +4050,28 @@ impl ComAmazonawsGroundstationGroundstationState {
             .values()
             .filter(|profile| profile.references_config(config_arn))
             .map(|profile| profile.mission_profile_arn.clone())
+            .collect();
+        referencing.sort();
+        referencing
+    }
+
+    /// The ARNs of the configs that reference the config `config_arn` names, in a stable
+    /// order; empty when no config references it.
+    ///
+    /// A config's own `configData` can carry a `ConfigArn`
+    /// ([`Config::references_config`]), so a config is an inbound reference holder exactly
+    /// as a mission profile is ([`Self::mission_profiles_referencing`]) and makes the
+    /// config it names in use. The config `config_arn` names is never counted as a holder
+    /// of itself. Sorted, so a refusal listing them reads the same on every call whatever
+    /// order the map iterates in.
+    pub fn configs_referencing(&self, config_arn: &str) -> Vec<String> {
+        let mut referencing: Vec<String> = self
+            .configs
+            .values()
+            .filter(|config| {
+                config.config_arn != config_arn && config.references_config(config_arn)
+            })
+            .map(|config| config.config_arn.clone())
             .collect();
         referencing.sort();
         referencing
