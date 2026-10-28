@@ -289,6 +289,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // "Account IDs must be a part of the consolidated billing family" — the first
+        // of the two preconditions `AccountGrouping.LinkedAccountIds` documents, the
+        // same one `AssociateAccounts` enforces on the account list it takes, decided by
+        // the same state predicate: a group cannot be created over an account an
+        // association could not add to it either.
+        for account_id in &linked_account_ids {
+            if state.is_outside_billing_family(account_id) {
+                return Err(CreateBillingGroupErrorModeled::ValidationException(
+                    crate::state::account_not_in_billing_family(
+                        "AccountGrouping.LinkedAccountIds",
+                        account_id,
+                    ),
+                )
+                .into());
+            }
+        }
+
         // "Account IDs must be ... not associated with another billing group." The
         // same state method `AssociateAccounts` uses decides it, so the
         // one-account-one-group rule lives in one place; the group being created has
