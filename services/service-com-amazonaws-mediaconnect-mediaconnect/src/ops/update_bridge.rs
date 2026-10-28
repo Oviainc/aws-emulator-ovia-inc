@@ -308,6 +308,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(bad_request(rejection));
         }
 
+        // `SourcePriority$PrimarySource` is "the name of the source you choose as the
+        // primary source", so it has to name a source the bridge has — resolved through
+        // the one function every path that writes a source priority resolves it with
+        // (CreateBridge resolves the create shape there too). Only the priority THIS
+        // request carries is resolved: a request that does not touch it may not be refused
+        // for a stored value it did not introduce.
+        if let Some(rejection) = crate::state::bridge_primary_source_rejection(
+            input
+                .source_failover_config
+                .as_ref()
+                .and_then(|update| update.source_priority.as_ref()),
+            bridge.sources.iter().map(crate::state::bridge_source_name),
+        ) {
+            return Err(bad_request(rejection));
+        }
+
         bridge.egress_gateway_bridge = egress_gateway_bridge;
         bridge.ingress_gateway_bridge = ingress_gateway_bridge;
         bridge.source_failover_config = source_failover_config;

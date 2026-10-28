@@ -50,6 +50,7 @@ use crate::ops::types::{
     RouterNetworkInterface, RouterNetworkInterfaceConfiguration,
     RouterOutput, RouterOutputConfiguration, RouterOutputMessage,
     RouterOutputProtocolConfiguration, RouterOutputStreamDetails, SetSourceRequest, Source,
+    SourcePriority,
     StandardRouterInputStreamDetails, StandardRouterOutputConfiguration,
     StandardRouterOutputStreamDetails, Transport, UpdateEncryption,
     UpdateFailoverConfig, VpcInterface,
@@ -1319,6 +1320,63 @@ pub fn merged_failover_config(
         merged.state = Some(state);
     }
     resolved_failover_config(merged)
+}
+
+/// Why `priority` cannot be the source priority of a FLOW holding the sources named by
+/// `source_names`, or `None` when it can.
+///
+/// See [`primary_source_rejection`], which both the flow side and the bridge side resolve
+/// the reference through.
+pub fn flow_primary_source_rejection<'a>(
+    priority: Option<&SourcePriority>,
+    source_names: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    primary_source_rejection("flow", priority, source_names)
+}
+
+/// Why `priority` cannot be the source priority of a BRIDGE holding the sources named by
+/// `source_names`, or `None` when it can.
+///
+/// See [`primary_source_rejection`], which both the flow side and the bridge side resolve
+/// the reference through.
+pub fn bridge_primary_source_rejection<'a>(
+    priority: Option<&SourcePriority>,
+    source_names: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    primary_source_rejection("bridge", priority, source_names)
+}
+
+/// The detail a request is refused with when the `SourcePriority` it carries names a
+/// primary source that `resource` — a flow or a bridge, the two resources whose sources one
+/// `SourceFailoverConfig` governs — does not have, or `None` when it names one of
+/// `source_names` (or names no primary source at all).
+///
+/// `SourcePriority$PrimarySource` is "the name of the source you choose as the primary
+/// source for this flow", so it is a reference to one of the resource's OWN sources, and a
+/// failover setting may only be stored when that name resolves against the sources the
+/// resource holds once the request has been applied — exactly as a source's or an output's
+/// media-stream and VPC-interface names are resolved against the ones its resource holds
+/// (see [`source_request_reference_rejection`]).
+///
+/// Every operation that writes a source priority resolves the reference HERE: the create
+/// paths against the sources THAT request creates, which are all the sources the new
+/// resource has, and the update paths against the sources the resource already holds. So a
+/// stored failover setting never names a source its resource has not got, whichever call
+/// wrote it. The refusal is `BadRequestException`, the error the model describes as the one
+/// for "a semantic error" in the request.
+fn primary_source_rejection<'a>(
+    resource: &str,
+    priority: Option<&SourcePriority>,
+    source_names: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    let primary = priority.and_then(|priority| priority.primary_source.as_deref())?;
+    if source_names.into_iter().any(|name| name == primary) {
+        return None;
+    }
+    Some(format!(
+        "Source {primary:?} is not a source of this {resource}, so it cannot be its \
+         primary source."
+    ))
 }
 
 /// The encryption a resource holds after `update` is applied to `stored`, or `None` when

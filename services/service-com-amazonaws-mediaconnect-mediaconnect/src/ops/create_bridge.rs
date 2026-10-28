@@ -285,6 +285,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(bad_request(detail));
         }
 
+        // Which of them is the primary one is a reference to the bridge's OWN sources:
+        // `SourcePriority$PrimarySource` is "the name of the source you choose as the
+        // primary source", so it has to name one of the sources THIS request creates —
+        // all the sources a bridge being created has. Resolved through the one function
+        // every path that writes a source priority resolves it with, so a create stores
+        // no failover setting UpdateBridge would refuse.
+        if let Some(detail) = crate::state::bridge_primary_source_rejection(
+            input
+                .source_failover_config
+                .as_ref()
+                .and_then(|config| config.source_priority.as_ref()),
+            source_names.iter().map(String::as_str),
+        ) {
+            return Err(bad_request(detail));
+        }
+
         // The same two rules for the outputs the request optionally carries
         // (`AddBridgeNetworkOutputRequest$Name` "must be unique among outputs in this
         // bridge"), on top of the bound the addressed bridge's own type puts on how many
