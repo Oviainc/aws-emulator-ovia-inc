@@ -5636,7 +5636,23 @@ impl ComAmazonawsMediaconnectMediaconnectState {
         flow_arn: Option<&str>,
         arn: &str,
     ) -> Option<String> {
-        let held = match flow_arn {
+        if self.holds_flow_source(flow_arn, arn) {
+            return None;
+        }
+        Some(format!(
+            "{member} {arn:?} does not name a flow source this account holds."
+        ))
+    }
+
+    /// Whether the store holds the flow SOURCE `arn`: on the flow `flow_arn` when a caller
+    /// names one, and across the account's flows when it does not.
+    ///
+    /// The crate's ONE reading of that relation: both the refusal a write path answers with
+    /// ([`Self::unknown_flow_source_rejection`]) and the repair a removal performs
+    /// ([`Self::clear_unresolvable_flow_references`]) ask here, so the two cannot disagree
+    /// about what the account holds.
+    pub fn holds_flow_source(&self, flow_arn: Option<&str>, arn: &str) -> bool {
+        match flow_arn {
             Some(flow_arn) => self
                 .flows
                 .get(flow_arn)
@@ -5645,13 +5661,7 @@ impl ComAmazonawsMediaconnectMediaconnectState {
                 .flows
                 .values()
                 .any(|flow| flow.sources.iter().any(|source| source.source_arn == arn)),
-        };
-        if held {
-            return None;
         }
-        Some(format!(
-            "{member} {arn:?} does not name a flow source this account holds."
-        ))
     }
 
     /// Why `arn` names no flow OUTPUT this account holds, or `None` when the store holds one
@@ -5668,7 +5678,21 @@ impl ComAmazonawsMediaconnectMediaconnectState {
         flow_arn: Option<&str>,
         arn: &str,
     ) -> Option<String> {
-        let held = match flow_arn {
+        if self.holds_flow_output(flow_arn, arn) {
+            return None;
+        }
+        Some(format!(
+            "{member} {arn:?} does not name a flow output this account holds."
+        ))
+    }
+
+    /// Whether the store holds the flow OUTPUT `arn`: on the flow `flow_arn` when a caller
+    /// names one, and across the account's flows when it does not.
+    ///
+    /// The output-side counterpart of [`Self::holds_flow_source`], and the crate's one
+    /// reading of that relation for the same reason.
+    pub fn holds_flow_output(&self, flow_arn: Option<&str>, arn: &str) -> bool {
+        match flow_arn {
             Some(flow_arn) => self
                 .flows
                 .get(flow_arn)
@@ -5677,24 +5701,24 @@ impl ComAmazonawsMediaconnectMediaconnectState {
                 .flows
                 .values()
                 .any(|flow| flow.outputs.iter().any(|output| output.output_arn == arn)),
-        };
-        if held {
-            return None;
         }
-        Some(format!(
-            "{member} {arn:?} does not name a flow output this account holds."
-        ))
     }
 
     /// Why `arn` names no flow this account holds, or `None` when the store holds one for
     /// it. `member` is the request member that named it, for the refusal detail.
     pub fn unknown_flow_rejection(&self, member: &str, arn: &str) -> Option<String> {
-        if self.flows.contains_key(arn) {
+        if self.holds_flow(arn) {
             return None;
         }
         Some(format!(
             "{member} {arn:?} does not name a flow this account holds."
         ))
+    }
+
+    /// Whether the store holds the flow `arn` — the flow-level counterpart of
+    /// [`Self::holds_flow_source`] and [`Self::holds_flow_output`].
+    pub fn holds_flow(&self, arn: &str) -> bool {
+        self.flows.contains_key(arn)
     }
 
     /// Why `network_name` names no network the gateway `placement_arn` declares, or `None`
@@ -5842,6 +5866,105 @@ impl ComAmazonawsMediaconnectMediaconnectState {
                 )
             }
             RouterOutputConfiguration::MediaLiveInput(_) => None,
+        }
+    }
+
+    /// Drop every stored router reference to a flow, a flow OUTPUT or a flow SOURCE this
+    /// store no longer holds, and move the `UpdatedAt` of each record a reference is dropped
+    /// from.
+    ///
+    /// A reference a write path resolves against the store
+    /// ([`Self::router_input_configuration_rejection`],
+    /// [`Self::router_output_configuration_rejection`]) must not outlive what it names: a
+    /// record that kept one would report a configuration no later call could restate, and the
+    /// resource it points into cannot be read back from either side. Each of these references
+    /// is OPTIONAL and its absence is a modelled state of the configuration — "to connect the
+    /// router input to the flow output, provide both `flowArn` and `flowOutputArn`. To
+    /// disconnect it … omit both fields while keeping this configuration object"
+    /// (`smithy_query(query="shape",shape="MediaConnectFlowRouterInputConfiguration")`, and
+    /// the same on `MediaConnectFlowRouterOutputConfiguration`) — so the connection goes with
+    /// the resource and the holder is DISCONNECTED again, exactly as a router output's route
+    /// into a router input the clock has taken away is cleared
+    /// ([`Self::settle_due_transitions`]). A reference the model makes REQUIRED cannot be
+    /// dropped off a record, which is why taking its target away is refused instead
+    /// ([`Self::associated_router_resource_rejection`]).
+    ///
+    /// Called by every operation that takes a flow, a flow output or a flow source out of the
+    /// store, as part of that same write: nothing else owes the repair, so no read has to
+    /// perform it.
+    pub fn clear_unresolvable_flow_references(&mut self, now: SystemTime) {
+        // Which references still resolve is read FIRST, against the store as it stands and
+        // through the same lookups the write paths resolve a configuration through; the
+        // records are then rewritten, because one cannot be mutated while the store is read.
+        let unresolved_inputs: Vec<(String, bool, bool)> = self
+            .router_inputs
+            .iter()
+            .filter_map(|(arn, router_input)| {
+                let RouterInputConfiguration::MediaConnectFlow(flow) = &router_input.configuration
+                else {
+                    return None;
+                };
+                let flow_arn = flow.flow_arn.as_deref();
+                let drop_flow = flow_arn.is_some_and(|flow_arn| !self.holds_flow(flow_arn));
+                let drop_output = flow
+                    .flow_output_arn
+                    .as_deref()
+                    .is_some_and(|output_arn| !self.holds_flow_output(flow_arn, output_arn));
+                (drop_flow || drop_output).then(|| (arn.clone(), drop_flow, drop_output))
+            })
+            .collect();
+        for (arn, drop_flow, drop_output) in unresolved_inputs {
+            let Some(router_input) = self.router_inputs.get_mut(&arn) else {
+                continue;
+            };
+            if let RouterInputConfiguration::MediaConnectFlow(flow) =
+                &mut router_input.configuration
+            {
+                if drop_flow {
+                    flow.flow_arn = None;
+                }
+                if drop_output {
+                    flow.flow_output_arn = None;
+                }
+                // The configuration the record holds changed, so its `UpdatedAt` moves with
+                // it, as it does for every other write to the record.
+                router_input.updated_at = now;
+            }
+        }
+
+        let unresolved_outputs: Vec<(String, bool, bool)> = self
+            .router_outputs
+            .iter()
+            .filter_map(|(arn, router_output)| {
+                let RouterOutputConfiguration::MediaConnectFlow(flow) =
+                    &router_output.configuration
+                else {
+                    return None;
+                };
+                let flow_arn = flow.flow_arn.as_deref();
+                let drop_flow = flow_arn.is_some_and(|flow_arn| !self.holds_flow(flow_arn));
+                let drop_source = flow
+                    .flow_source_arn
+                    .as_deref()
+                    .is_some_and(|source_arn| !self.holds_flow_source(flow_arn, source_arn));
+                (drop_flow || drop_source).then(|| (arn.clone(), drop_flow, drop_source))
+            })
+            .collect();
+        for (arn, drop_flow, drop_source) in unresolved_outputs {
+            let Some(router_output) = self.router_outputs.get_mut(&arn) else {
+                continue;
+            };
+            if let RouterOutputConfiguration::MediaConnectFlow(flow) =
+                &mut router_output.configuration
+            {
+                if drop_flow {
+                    flow.flow_arn = None;
+                }
+                if drop_source {
+                    flow.flow_source_arn = None;
+                }
+                router_output.updated_at = now;
+            }
         }
     }
 

@@ -215,9 +215,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let removed = flow.sources.remove(position);
+        let flow_arn = flow.flow_arn.clone();
+        let removed_source_arn = removed.source_arn;
+
+        // The source stops existing, so every record of this store that NAMED it stops
+        // naming it: the reference goes with the source, through the one repair every
+        // operation that takes a flow, a flow output or a flow source out of the store
+        // performs.
+        store.clear_unresolvable_flow_references(now);
+
         Ok(RemoveFlowSourceOutput {
-            flow_arn: Some(flow.flow_arn.clone()),
-            source_arn: Some(removed.source_arn),
+            flow_arn: Some(flow_arn),
+            source_arn: Some(removed_source_arn),
         })
     }
 }

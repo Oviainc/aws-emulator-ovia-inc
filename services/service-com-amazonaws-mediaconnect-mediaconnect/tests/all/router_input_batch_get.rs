@@ -57,7 +57,12 @@ const MAX_ARNS: usize = 20;
 /// BatchGetRouterInput binds its `Arns` member to the `arns` query parameter, one parameter
 /// per ARN (`smithy_query(query="operation",operation="BatchGetRouterInput")`:
 /// `GET /v1/routerInputs`, `Arns` `@httpQuery("arns")`).
-async fn batch_get_router_inputs(
+///
+/// `pub(crate)` because the suite that pins what a flow removal does to the router records
+/// pointing into it reads its holders back through the batch read too (see
+/// `tests/all/flow_removal_clears_router_references.rs`), so there is one spelling of this
+/// request.
+pub(crate) async fn batch_get_router_inputs(
     emulator: &Emulator,
     arns: &[&str],
 ) -> (u16, Option<String>, Value) {

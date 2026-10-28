@@ -54,8 +54,9 @@ fn automatic_decryption() -> Value {
     })
 }
 
-/// A STANDARD configuration ingesting on `interface_arn`.
-fn standard(interface_arn: &str) -> Value {
+/// A STANDARD configuration ingesting on `interface_arn`. `pub(crate)` for the same reason
+/// as [`mediaconnect_flow`]: a suite that needs an input naming NO flow uses this one.
+pub(crate) fn standard(interface_arn: &str) -> Value {
     union(
         "Standard",
         "standard",
@@ -104,7 +105,14 @@ fn merge(interface_arn: &str) -> Value {
 /// A MEDIACONNECT FLOW configuration naming `flow_arn` and `flow_output_arn`, each only
 /// where the case carries one: the model makes both optional, so a configuration may name
 /// the flow, the output, both or neither.
-fn mediaconnect_flow(flow_arn: Option<&str>, flow_output_arn: Option<&str>) -> Value {
+///
+/// `pub(crate)` because the suite that pins what a flow removal does to the router records
+/// pointing into it builds the same configurations (see
+/// `tests/all/flow_removal_clears_router_references.rs`).
+pub(crate) fn mediaconnect_flow(
+    flow_arn: Option<&str>,
+    flow_output_arn: Option<&str>,
+) -> Value {
     let mut payload = json!({ "sourceTransitDecryption": automatic_decryption() });
     if let Some(flow_arn) = flow_arn {
         payload["flowArn"] = json!(flow_arn);

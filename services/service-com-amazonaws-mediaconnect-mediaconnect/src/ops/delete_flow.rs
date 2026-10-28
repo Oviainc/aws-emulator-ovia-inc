@@ -196,6 +196,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let flow_arn = flow.flow_arn.clone();
         store.flows.remove(&input.flow_arn);
+        // The flow goes, and its sources and outputs go with it, so every record of this
+        // store that NAMED one of them stops naming it: the references go with the resources
+        // they pointed at, through the one repair every operation that takes a flow, a flow
+        // output or a flow source out of the store performs.
+        store.clear_unresolvable_flow_references(now);
 
         Ok(DeleteFlowOutput {
             flow_arn: Some(flow_arn),

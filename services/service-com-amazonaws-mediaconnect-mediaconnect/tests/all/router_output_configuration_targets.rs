@@ -39,14 +39,22 @@ use crate::router_outputs::{
 
 /// GetRouterOutput, the single-ARN read side (`GET /v1/routerOutput/{Arn}`) — what proves
 /// an accepted configuration is the one the store now holds.
-async fn get_router_output(emulator: &Emulator, arn: &str) -> (u16, Option<String>, Value) {
+///
+/// `pub(crate)` because the suite that pins what a flow removal does to the router records
+/// pointing into it reads its holders back the same way (see
+/// `tests/all/flow_removal_clears_router_references.rs`).
+pub(crate) async fn get_router_output(
+    emulator: &Emulator,
+    arn: &str,
+) -> (u16, Option<String>, Value) {
     emulator
         .send("GET", &format!("/v1/routerOutput/{arn}"), None)
         .await
 }
 
-/// UpdateRouterOutput (`PUT /v1/routerOutput/{Arn}`).
-async fn update_router_output(
+/// UpdateRouterOutput (`PUT /v1/routerOutput/{Arn}`). `pub(crate)` for the same reason as
+/// [`get_router_output`].
+pub(crate) async fn update_router_output(
     emulator: &Emulator,
     arn: &str,
     body: Value,
@@ -69,7 +77,12 @@ fn stored_count(emulator: &Emulator) -> usize {
 /// A `MediaConnectFlow` configuration naming `flow_arn` and `flow_source_arn`, each only
 /// where the case carries one: the model makes both optional, so a configuration may name
 /// the flow, the source, both or neither.
-fn mediaconnect_flow(flow_arn: Option<&str>, flow_source_arn: Option<&str>) -> Value {
+///
+/// `pub(crate)` for the same reason as [`get_router_output`].
+pub(crate) fn mediaconnect_flow(
+    flow_arn: Option<&str>,
+    flow_source_arn: Option<&str>,
+) -> Value {
     let mut payload = json!({
         "destinationTransitEncryption": {"encryptionKeyType": "AUTOMATIC",
             "encryptionKeyConfiguration": {"Automatic": {}}},
@@ -244,8 +257,8 @@ fn target_cases(targets: &ConfigurationTargets, other: &ConfigurationTargets) ->
 }
 
 /// A create body carrying `configuration`, named after the row so each accepted case stores
-/// a record of its own.
-fn create_body(name: &str, configuration: Value) -> Value {
+/// a record of its own. `pub(crate)` for the same reason as [`get_router_output`].
+pub(crate) fn create_body(name: &str, configuration: Value) -> Value {
     json!({
         "name": name,
         "configuration": configuration,

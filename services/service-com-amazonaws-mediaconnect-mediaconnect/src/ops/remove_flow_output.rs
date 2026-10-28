@@ -218,15 +218,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_found(&input.output_arn));
         };
         let removed = flow.outputs.remove(position);
+        let flow_arn = flow.flow_arn.clone();
+        let removed_output_arn = removed.output_arn;
+
+        // Removing an output moves nothing else about the FLOW: its status is left as it was,
+        // because no clock owes a change for a removed output. What the removal does move is
+        // every record of this store that NAMED that output: the ARN resolves to nothing from
+        // now on, so the reference goes with the output it pointed at, through the one repair
+        // every operation that takes a flow, a flow output or a flow source out of the store
+        // performs (`crate::state::ComAmazonawsMediaconnectMediaconnectState::clear_unresolvable_flow_references`).
+        store.clear_unresolvable_flow_references(now);
 
         // "The ARN of the flow that the output was removed from" and "the ARN of the
         // output that was removed" — both read out of the STORE rather than echoed from
         // the request, so the response can only name what this call actually removed.
-        // Removing an output moves nothing else about the flow: its status is left as it
-        // was, because no clock owes a change for a removed output.
         Ok(RemoveFlowOutputOutput {
-            flow_arn: Some(flow.flow_arn.clone()),
-            output_arn: Some(removed.output_arn),
+            flow_arn: Some(flow_arn),
+            output_arn: Some(removed_output_arn),
         })
     }
 }

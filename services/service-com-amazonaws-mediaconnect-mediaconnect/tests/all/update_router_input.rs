@@ -79,7 +79,11 @@ const PERSISTED_MEMBERS: [&str; 25] = [
 /// UpdateRouterInput binds its `Arn` member to the URI
 /// (`smithy_query(query="operation",operation="UpdateRouterInput")`:
 /// `PUT /v1/routerInput/{Arn}`).
-async fn update_router_input(
+///
+/// `pub(crate)` because the suite that pins what a flow removal does to the router records
+/// pointing into it re-states the configuration a read reports through this same request
+/// (see `tests/all/flow_removal_clears_router_references.rs`).
+pub(crate) async fn update_router_input(
     emulator: &Emulator,
     arn: &str,
     body: Value,
