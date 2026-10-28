@@ -57,6 +57,8 @@ mod reserved_tag_keys;
 mod resource_group_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_character_class.rs"]
+mod tag_character_class;
 #[path = "all/tag_sync_tasks.rs"]
 mod tag_sync_tasks;
 #[path = "all/ungroup_after_configuration_change.rs"]

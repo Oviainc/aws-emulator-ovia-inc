@@ -24,6 +24,10 @@ tracing = { workspace = true }
 # ULIDs: the 26-character lowercase ids this service's modelled ARNs qualify a
 # group's name and a tag-sync task with.
 ulid = "1"
+# The modelled tag pattern is a character class over Unicode general categories,
+# which this crate matches with the same regex engine the request boundary
+# compiles a modelled pattern with rather than re-deciding the categories itself.
+regex = "1.13"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

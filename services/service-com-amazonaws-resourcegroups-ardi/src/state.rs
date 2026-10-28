@@ -29,6 +29,7 @@
 //! the endpoint that reports it.
 
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
@@ -301,17 +302,40 @@ pub const MAX_TAG_KEY_LENGTH: usize = 128;
 /// Source: `smithy_query(query="shape",shape="TagValue")`.
 pub const MAX_TAG_VALUE_LENGTH: usize = 256;
 
-/// Whether `c` is a character a tag key or a tag value may carry.
+/// The character class the modelled tag pattern is built from, as regex source.
 ///
 /// The modelled `TagKey` and `TagValue` share one pattern,
-/// `^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$`: Unicode letters and numbers (which is what
-/// [`char::is_alphanumeric`] answers), the separator categories, and the eight
-/// punctuation characters it lists. A whitespace character that is not a control
-/// character is exactly a separator, so a tab or a newline is NOT one.
-fn is_tag_character(c: char) -> bool {
-    c.is_alphanumeric()
-        || (c.is_whitespace() && !c.is_control())
-        || matches!(c, '_' | '.' | ':' | '/' | '=' | '+' | '-' | '@')
+/// `^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$`
+/// (`smithy_query(query="shape",shape="TagKey,TagValue")`): any run of the
+/// characters listed here — the Unicode general categories L (letters), Z
+/// (separators) and N (numbers), plus the eight punctuation characters.
+///
+/// The class is kept as the model writes it and judged by a regex engine, the way
+/// the request boundary judges a modelled pattern, so a general category means
+/// here exactly what it means in the model. Rust's own `char` predicates answer
+/// Unicode PROPERTIES rather than general categories and do not substitute for
+/// it: [`char::is_alphabetic`] (and so [`char::is_alphanumeric`]) is the
+/// `Alphabetic` property, which also holds every `Other_Alphabetic` character —
+/// the combining vowel signs and marks of categories Mn and Mc — and none of L, Z
+/// and N contains those.
+const TAG_CHARACTER_CLASS: &str = r"\p{L}\p{Z}\p{N}_.:/=+\-@";
+
+/// The first character of `text` the modelled tag pattern refuses, or `None` when
+/// the text satisfies that pattern (as the empty string vacuously does).
+///
+/// The pattern is a run of [`TAG_CHARACTER_CLASS`] anchored at both ends, so a
+/// text satisfies it exactly when no character of it falls OUTSIDE the class —
+/// which is what the complement of the class finds, compiled once for the process
+/// and reporting the offending character so the refusal can name it.
+fn first_non_tag_character(text: &str) -> Option<char> {
+    static OUTSIDE_THE_CLASS: OnceLock<regex::Regex> = OnceLock::new();
+    OUTSIDE_THE_CLASS
+        .get_or_init(|| {
+            regex::Regex::new(&format!("[^{TAG_CHARACTER_CLASS}]"))
+                .expect("the modelled tag character class compiles")
+        })
+        .find(text)
+        .and_then(|found| found.as_str().chars().next())
 }
 
 /// The request member a tagging call carries its pairs in, as the refusal names it.
@@ -330,7 +354,7 @@ pub const TAG_KEYS_MEMBER: &str = "Keys";
 /// key the same way:
 ///
 /// * it stays inside the modelled key length and character set
-///   ([`MAX_TAG_KEY_LENGTH`], [`is_tag_character`]);
+///   ([`MAX_TAG_KEY_LENGTH`], [`TAG_CHARACTER_CLASS`]);
 /// * it is outside the reserved [`RESERVED_TAG_KEY_PREFIX`] namespace, which a
 ///   caller can neither write nor remove.
 pub fn check_tag_key(member: &str, key: &str) -> Result<(), String> {
@@ -341,7 +365,7 @@ pub fn check_tag_key(member: &str, key: &str) -> Result<(), String> {
              and this one is {key_length}",
         ));
     }
-    if let Some(character) = key.chars().find(|c| !is_tag_character(*c)) {
+    if let Some(character) = first_non_tag_character(key) {
         return Err(format!(
             "{member} is not valid: the tag key {key} carries {character:?}, which is not one of \
              the letters, numbers, separators and `_ . : / = + - @` a tag may use",
@@ -375,7 +399,7 @@ pub fn check_tag_keys<'a>(keys: impl IntoIterator<Item = &'a str>) -> Result<(),
 /// that stores tags — a create that carries them and a later tagging call —
 /// refuses the same pairs the same way: the key is one [`check_tag_key`] admits,
 /// and the value stays inside the modelled length and character set
-/// ([`MAX_TAG_VALUE_LENGTH`], [`is_tag_character`]).
+/// ([`MAX_TAG_VALUE_LENGTH`], [`TAG_CHARACTER_CLASS`]).
 pub fn check_tag(key: &str, value: &str) -> Result<(), String> {
     check_tag_key(TAGS_MEMBER, key)?;
     let value_length = value.chars().count();
@@ -385,7 +409,7 @@ pub fn check_tag(key: &str, value: &str) -> Result<(), String> {
              characters long, and the value of {key} is {value_length}",
         ));
     }
-    if let Some(character) = value.chars().find(|c| !is_tag_character(*c)) {
+    if let Some(character) = first_non_tag_character(value) {
         return Err(format!(
             "{TAGS_MEMBER} is not valid: the value of the tag key {key} carries {character:?}, \
              which is not one of the letters, numbers, separators and `_ . : / = + - @` a tag \
