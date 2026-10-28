@@ -99,8 +99,6 @@
 //! * `ValidationException` (HTTP 400) — The input fails to satisfy the constraints specified
 //!   by an Amazon Web Services service.
 
-use std::ops::Bound;
-
 #[allow(unused_imports)]
 use super::types::*;
 
@@ -190,10 +188,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // The width one `MaxResults` asks for, from the one place this service decides it
-        // ([`crate::state::list_page_size`]).
-        let page_size = crate::state::list_page_size(input.max_results);
-
         let state = store.lock();
 
         let Some(policy) = state.policy(&input.policy_arn) else {
@@ -205,56 +199,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The token is this listing's own: it names THIS listing — this operation, for
-        // this policy — and the version id of the last version the previous page
-        // reported. A token this listing cannot read, or one naming a version id this
-        // policy does not hold, never came from here.
+        // The whole paging rule of a listing that pages over a key the store itself
+        // orders by, from the one place this service states it
+        // ([`crate::state::page_by_key_token`], which cuts the page with the one cut
+        // every listing of this service is cut by): the token names THIS listing — this
+        // operation, for this policy — and the version id of the last version the
+        // previous page reported, the page is the versions ordered after it — at most
+        // what one `MaxResults` asks for — and the next token names the last version
+        // reported exactly while versions remain. A token this listing cannot read, or
+        // one naming a version id this policy does not hold, never came from here.
         let listing = crate::state::Listing::PolicyVersions {
             policy_arn: &input.policy_arn,
         };
-        let after = match crate::state::token_key(listing, input.next_token.as_deref())
-            .map_err(ListPolicyVersionsErrorModeled::ValidationException)?
-        {
-            None => None,
-            Some(key) => match key.parse::<i32>() {
-                Ok(version_id) if policy.version(version_id).is_some() => Some(version_id),
-                _ => {
-                    return Err(ListPolicyVersionsErrorModeled::ValidationException(
-                        crate::state::foreign_next_token(),
-                    )
-                    .into())
-                }
-            },
-        };
-
-        // At most one entry past the page is read: enough to know whether more remain,
-        // without materialising the whole tail of a version history that has no fixed
-        // size.
-        let mut window: Vec<&crate::state::CatalogPolicyVersion> = match after {
-            None => policy.versions.values().take(page_size + 1).collect(),
-            Some(version_id) => policy
-                .versions
-                .range((Bound::Excluded(version_id), Bound::Unbounded))
-                .map(|(_, version)| version)
-                .take(page_size + 1)
-                .collect(),
-        };
-        let more_remain = window.len() > page_size;
-        window.truncate(page_size);
-        let next_token = window
-            .last()
-            .filter(|_| more_remain)
-            .map(|version| crate::state::listing_token(listing, &version.version_id.to_string()));
+        let page = crate::state::page_by_key_token(
+            listing,
+            &policy.versions,
+            input.next_token.as_deref(),
+            input.max_results,
+        )
+        .map_err(ListPolicyVersionsErrorModeled::ValidationException)?;
 
         Ok(ListPolicyVersionsOutput {
             policy_versions: Some(
-                window
-                    .iter()
-                    .copied()
+                page.records
+                    .into_iter()
                     .map(|version| entry(policy, version))
                     .collect(),
             ),
-            next_token,
+            next_token: page.next_token,
         })
     }
 }
