@@ -1,28 +1,35 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! What a `CreateJob` that names a `ClusterId` does with the job-level members the request
-//! carries, driven end to end over HTTP.
+//! What a `CreateJob` that names a `ClusterId` does with the members the request carries,
+//! driven end to end over HTTP.
 //!
-//! One rule, asserted over a TABLE of inputs rather than over a single request: a node
-//! job's attributes are the cluster's only for the members the request leaves OUT — "you
-//! only need to provide the clusterId value; the other job attributes are inherited from
-//! the cluster" — while a member the request does carry is that job's own and is what
-//! `DescribeJob` reports for it, and an id the request supplies in `AddressId` or
-//! `ForwardingAddressId` has to name a stored address whether or not the job joins a
-//! cluster.
+//! One rule, asserted over a TABLE of inputs rather than over a single request: every
+//! attribute a cluster's own record holds for the order it ships — the members
+//! `ClusterMetadata` reports, ONE value of each for the whole cluster — is carried by every
+//! node job of that cluster rather than copied per node ("you only need to provide the
+//! clusterId value; the other job attributes are inherited from the cluster"), so a node
+//! create either names such an attribute with the value the cluster already holds, which
+//! changes nothing, or names a different one and is refused with
+//! `InvalidInputCombinationException`, storing nothing. The members a cluster holds no
+//! order-wide value for — the capacity a device is configured with and whether it is
+//! managed remotely, neither of which `ClusterMetadata` reports — are inherited only where
+//! the node's own request named none, and the members only a job models are the node's own
+//! throughout. An id the request supplies in `AddressId` or `ForwardingAddressId` has to
+//! name a stored address whether or not the job joins a cluster.
 //!
 //! The rows differ along what the rule generalises over: which members the request carries
-//! (none, one, several, every one of them), the enum value from each modelled catalog
+//! (none, one, several, every one of them), whether each named attribute agrees with the
+//! cluster or differs from it, the enum value from each modelled catalog
 //! (`SHIPPING_OPTION_VALUES`, `SNOWBALL_CAPACITY_VALUES`, `REMOTE_MANAGEMENT_VALUES`, read
 //! from the crate rather than restated), the length of a value at each published bound of
 //! `Description` and a value past it, the form of the structure members, the number of
 //! buckets a `Resources` carries, and the number of nodes one cluster holds.
 //!
-//! The harness (`router`, `ok`, `refused`, `create_address`, `deliverable_address`,
-//! `string`, `assert_prefixed_uuid`, `base_cluster`, `create_cluster`, `job_metadata`) is
-//! the one `job_lifecycle` and `cluster_updates` already drive the service with, so every
-//! call here goes through the same front door a client uses and nothing reaches into the
-//! state struct.
+//! The harness (`router`, `ok`, `refused`, `call_in_region`, `create_address`,
+//! `deliverable_address`, `string`, `assert_prefixed_uuid`, `base_cluster`,
+//! `create_cluster`, `cluster_metadata`, `job_metadata`) is the one `job_lifecycle` and
+//! `cluster_updates` already drive the service with, so every call here goes through the
+//! same front door a client uses and nothing reaches into the state struct.
 
 use serde_json::{json, Value};
 // The catalogs the modelled enums admit and the quorum this service holds a cluster to,
@@ -34,11 +41,15 @@ use service_com_amazonaws_snowball_awsiesnowballjobmanagementservice::ops::types
 use service_com_amazonaws_snowball_awsiesnowballjobmanagementservice::state::CLUSTER_NODE_QUORUM;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::cluster_updates::{base_cluster, create_cluster, job_metadata};
+use super::cluster_node_creation_window::listed_node_ids;
+use super::cluster_updates::{base_cluster, cluster_metadata, create_cluster, job_metadata};
 use super::job_lifecycle::{
-    assert_prefixed_uuid, complete_order, create_address, deliverable_address, ok, refused, router,
-    string,
+    assert_prefixed_uuid, call_in_region, complete_order, create_address, deliverable_address, ok,
+    refused, router, string,
 };
+
+/// The region every call in this suite is signed for, as the rest of the suites sign them.
+const REGION: &str = "us-west-2";
 
 /// `CreateJobRequest$Description` is modelled `length 1..1024`
 /// (`smithy_query(query="operation", operation="CreateJob")`), so these are the shortest
@@ -49,15 +60,14 @@ const DESCRIPTION_MAX_LEN: usize = 1024;
 /// An address id in the modelled `AddressId` form that names no stored address.
 const UNKNOWN_ADDRESS_ID: &str = "ADID00000000-0000-0000-0000-000000000000";
 
-/// The members a cluster carries that a node job of it inherits: every member
-/// `CreateClusterRequest` and `CreateJobRequest` both model, as `JobMetadata` names them
-/// (`smithy_query(query="operation", operation="CreateCluster")` beside
-/// `smithy_query(query="operation", operation="CreateJob")`).
-const INHERITED_MEMBERS: &[&str] = &[
+/// The attributes a cluster holds for the whole order it ships: every member
+/// `ClusterMetadata` reports (`smithy_query(query="shape", shape="ClusterMetadata")`) that
+/// `CreateJobRequest` also models. A node job of the cluster carries the cluster's value
+/// for each of them, so a create can only repeat it.
+const ORDER_ATTRIBUTES: &[&str] = &[
     "JobType",
     "SnowballType",
     "ShippingOption",
-    "SnowballCapacityPreference",
     "AddressId",
     "ForwardingAddressId",
     "Description",
@@ -66,9 +76,14 @@ const INHERITED_MEMBERS: &[&str] = &[
     "Resources",
     "Notification",
     "TaxDocuments",
-    "RemoteManagement",
     "OnDeviceServiceConfiguration",
 ];
+
+/// The members a cluster keeps for the node jobs it mints but holds no order-wide value
+/// for: `ClusterMetadata` reports neither (`smithy_query(query="shape",
+/// shape="ClusterMetadata")`), so a node inherits one only where its own request named
+/// none.
+const NODE_INHERITED_MEMBERS: &[&str] = &["SnowballCapacityPreference", "RemoteManagement"];
 
 /// The members only a job models, which a cluster holds nothing to inherit them from, so a
 /// node reports one exactly when the request supplied it.
@@ -102,20 +117,19 @@ fn node_cluster(address_id: &str, forwarding_address_id: &str) -> Value {
 }
 
 /// What `DescribeJob` must report for a node created from `cluster` with `supplied`: the
-/// cluster's value for every member the request left out, and the request's own value for
-/// every member it carried.
+/// cluster's value for every attribute of the order, and the request's own value for a
+/// member the cluster holds no order-wide value for.
 fn expected_node(cluster: &Value, supplied: &Value) -> Value {
     let mut expected = json!({});
-    for member in INHERITED_MEMBERS {
+    for member in ORDER_ATTRIBUTES {
         if let Some(value) = cluster.get(*member) {
             expected[*member] = value.clone();
         }
     }
-    for (member, value) in supplied
-        .as_object()
-        .expect("the supplied members are a JSON object")
-    {
-        expected[member] = value.clone();
+    for member in NODE_INHERITED_MEMBERS {
+        if let Some(value) = supplied.get(*member).or_else(|| cluster.get(*member)) {
+            expected[*member] = value.clone();
+        }
     }
     expected
 }
@@ -149,9 +163,38 @@ async fn create_node(
     job_id
 }
 
-/// Assert the node `cluster_id` minted for `supplied` reports the merge of the cluster and
-/// the request, as [`expected_node`] computes it.
-async fn assert_node_reports_the_merge(
+/// Drive a node create that must be refused as a combination that cannot hold, answering
+/// the `Message` the refusal carried.
+pub(crate) async fn refused_combination(
+    router: &MultiServiceRouter,
+    cluster_id: &str,
+    supplied: &Value,
+    case: &str,
+) -> String {
+    let mut body = supplied.clone();
+    body["ClusterId"] = json!(cluster_id);
+    let (status, parsed) = call_in_region(router, REGION, "CreateJob", body).await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected a node differing from its cluster to be refused, got \
+         {status} with {parsed}"
+    );
+    let wire_type = parsed["__type"].as_str().unwrap_or_default();
+    assert!(
+        wire_type.contains("InvalidInputCombinationException"),
+        "case {case:?}: expected an InvalidInputCombinationException, got {parsed}"
+    );
+    parsed["Message"]
+        .as_str()
+        .or_else(|| parsed["message"].as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Assert the node `cluster_id` minted for `supplied` reports the cluster's whole order, as
+/// [`expected_node`] computes it, plus the members only a job models that the request
+/// carried.
+async fn assert_node_reports_the_clusters_order(
     router: &MultiServiceRouter,
     cluster_body: &Value,
     cluster_id: &str,
@@ -197,61 +240,130 @@ async fn assert_node_reports_the_merge(
     }
 }
 
-/// Every node row: one carrying nothing but the cluster id, one per job-level member the
-/// request can carry, one per value each modelled catalog admits, one at each published
-/// bound of `Description`, one per form of the structure members, and one carrying every
-/// job-level member at once.
-fn node_rows(forwarding_address_id: &str, alternate_address_id: &str) -> Vec<(String, Value)> {
+/// Every node row a cluster created from `cluster_body` accepts: one carrying nothing but
+/// the cluster id, one per attribute of the order stated back as the cluster holds it, one
+/// carrying the whole order at once, one per value each catalog of a node's own members
+/// admits, one per member only a job models, and one carrying everything a node may ask for.
+fn accepted_rows(cluster_body: &Value) -> Vec<(String, Value)> {
     let mut rows: Vec<(String, Value)> = vec![
         (
             "the cluster id alone, carrying no member of its own".to_string(),
             json!({}),
         ),
         (
+            "the whole order stated back as the cluster holds it".to_string(),
+            cluster_body.clone(),
+        ),
+    ];
+    // One row per attribute of the order, each repeating the cluster's own value: a node
+    // create that names one is asking for what it would have inherited anyway.
+    for member in ORDER_ATTRIBUTES {
+        if let Some(value) = cluster_body.get(*member) {
+            let mut row = json!({});
+            row[*member] = value.clone();
+            rows.push((format!("the cluster's own {member} stated back"), row));
+        }
+    }
+    // One row per value each catalog of a member a node holds for itself admits, so a row
+    // cannot be keyed to the one value an example used.
+    for capacity in SNOWBALL_CAPACITY_VALUES {
+        rows.push((
+            format!("the capacity preference {capacity} for this node"),
+            json!({ "SnowballCapacityPreference": capacity }),
+        ));
+    }
+    for remote in REMOTE_MANAGEMENT_VALUES {
+        rows.push((
+            format!("the remote management setting {remote} for this node"),
+            json!({ "RemoteManagement": remote }),
+        ));
+    }
+    rows.push((
+        "the members only a job models".to_string(),
+        json!({
+            "ImpactLevel": "IL4",
+            "PickupDetails": {
+                "Name": "Pickup Person",
+                "PhoneNumber": "+1 206 555 0144",
+                "Email": "pickup@example.com"
+            },
+            "DeviceConfiguration": {
+                "SnowconeDeviceConfiguration": {
+                    "WirelessConnection": { "IsWifiEnabled": true }
+                }
+            },
+        }),
+    ));
+    // Everything at once: the whole order stated back beside every member that is the
+    // node's own.
+    let mut everything = cluster_body.clone();
+    everything["SnowballCapacityPreference"] = json!(SNOWBALL_CAPACITY_VALUES[0]);
+    everything["RemoteManagement"] = json!(REMOTE_MANAGEMENT_VALUES[0]);
+    everything["ImpactLevel"] = json!("IL2");
+    rows.push((
+        "the whole order stated back beside every member of the node's own".to_string(),
+        everything,
+    ));
+    rows
+}
+
+/// Every node row that asks for an attribute of the order other than the one its cluster
+/// holds, with the member the refusal must be about: the one the request disagrees on, or
+/// the first of them where more than one does.
+fn refused_rows(
+    cluster_body: &Value,
+    alternate_address_id: &str,
+) -> Vec<(String, Value, Option<&'static str>)> {
+    let mut rows: Vec<(String, Value, Option<&'static str>)> = vec![
+        (
+            "another job type".to_string(),
+            json!({ "JobType": "IMPORT" }),
+            Some("JobType"),
+        ),
+        (
+            "another device type".to_string(),
+            json!({ "SnowballType": "EDGE_C" }),
+            Some("SnowballType"),
+        ),
+        (
+            "a shipping address of its own".to_string(),
+            json!({ "AddressId": alternate_address_id }),
+            Some("AddressId"),
+        ),
+        (
+            "a forwarding address of its own".to_string(),
+            json!({ "ForwardingAddressId": alternate_address_id }),
+            Some("ForwardingAddressId"),
+        ),
+        (
             "a description of this specific node".to_string(),
             json!({ "Description": "node 1" }),
+            Some("Description"),
         ),
         (
             "the shortest description the member admits".to_string(),
             json!({ "Description": "x".repeat(DESCRIPTION_MIN_LEN) }),
+            Some("Description"),
         ),
         (
             "the longest description the member admits".to_string(),
             json!({ "Description": "y".repeat(DESCRIPTION_MAX_LEN) }),
+            Some("Description"),
         ),
         (
             "a non-ascii description".to_string(),
             json!({ "Description": "ノード計画 — Núñez" }),
+            Some("Description"),
         ),
         (
-            "the cluster's own description repeated".to_string(),
-            json!({ "Description": "the plan the cluster was created with" }),
+            "a role of its own".to_string(),
+            json!({ "RoleARN": "arn:aws:iam::123456789012:role/snowball-node" }),
+            Some("RoleARN"),
         ),
         (
-            "a notification for every job state of this node".to_string(),
-            json!({
-                "Notification": {
-                    "SnsTopicARN": "arn:aws:sns:us-west-2:123456789012:node-all",
-                    "NotifyAll": true
-                }
-            }),
-        ),
-        (
-            "a notification for two named job states".to_string(),
-            json!({
-                "Notification": {
-                    "SnsTopicARN": "arn:aws:sns:us-west-2:123456789012:node-some",
-                    "JobStatesToNotify": ["InTransitToCustomer", "Complete"],
-                    "NotifyAll": false
-                }
-            }),
-        ),
-        (
-            "a role and a key of this node's own".to_string(),
-            json!({
-                "RoleARN": "arn:aws:iam::123456789012:role/snowball-node",
-                "KmsKeyARN": "arn:aws:kms:us-west-2:123456789012:key/node-key"
-            }),
+            "a key of its own".to_string(),
+            json!({ "KmsKeyARN": "arn:aws:kms:us-west-2:123456789012:key/node-key" }),
+            Some("KmsKeyARN"),
         ),
         (
             "resources over one bucket with a key range".to_string(),
@@ -263,6 +375,7 @@ fn node_rows(forwarding_address_id: &str, alternate_address_id: &str) -> Vec<(St
                     }]
                 }
             }),
+            Some("Resources"),
         ),
         (
             "resources over two buckets and a Lambda association".to_string(),
@@ -280,97 +393,115 @@ fn node_rows(forwarding_address_id: &str, alternate_address_id: &str) -> Vec<(St
                     }]
                 }
             }),
+            Some("Resources"),
         ),
         (
-            "tax documents of this node's own".to_string(),
+            "a notification for every job state of this node".to_string(),
+            json!({
+                "Notification": {
+                    "SnsTopicARN": "arn:aws:sns:us-west-2:123456789012:node-all",
+                    "NotifyAll": true
+                }
+            }),
+            Some("Notification"),
+        ),
+        (
+            "a notification for two named job states".to_string(),
+            json!({
+                "Notification": {
+                    "SnsTopicARN": "arn:aws:sns:us-west-2:123456789012:node-some",
+                    "JobStatesToNotify": ["InTransitToCustomer", "Complete"],
+                    "NotifyAll": false
+                }
+            }),
+            Some("Notification"),
+        ),
+        (
+            "tax documents of its own".to_string(),
             json!({ "TaxDocuments": { "IND": { "GSTIN": "29AAPFU0939F1ZV" } } }),
+            Some("TaxDocuments"),
         ),
         (
-            "on-device services of this node's own".to_string(),
+            "on-device services of its own".to_string(),
             json!({
                 "OnDeviceServiceConfiguration": {
                     "TGWOnDeviceService": { "StorageLimit": 2, "StorageUnit": "TB" }
                 }
             }),
-        ),
-        (
-            "a shipping address of this node's own".to_string(),
-            json!({ "AddressId": alternate_address_id }),
-        ),
-        (
-            "a forwarding address of this node's own".to_string(),
-            json!({ "ForwardingAddressId": alternate_address_id }),
-        ),
-        (
-            "back to the forwarding address the cluster was created with".to_string(),
-            json!({ "ForwardingAddressId": forwarding_address_id }),
-        ),
-        (
-            "the members only a job models".to_string(),
-            json!({
-                "ImpactLevel": "IL4",
-                "PickupDetails": {
-                    "Name": "Pickup Person",
-                    "PhoneNumber": "+1 206 555 0144",
-                    "Email": "pickup@example.com"
-                },
-                "DeviceConfiguration": {
-                    "SnowconeDeviceConfiguration": {
-                        "WirelessConnection": { "IsWifiEnabled": true }
-                    }
-                },
-            }),
+            Some("OnDeviceServiceConfiguration"),
         ),
     ];
-    // One row per value each modelled catalog admits, so a row cannot be keyed to the one
-    // value an example used.
-    for option in SHIPPING_OPTION_VALUES {
+
+    // One row per shipping speed the catalog admits other than the cluster's own, so the
+    // rule is exercised across that catalog rather than on one value.
+    let held_speed = cluster_body
+        .get("ShippingOption")
+        .and_then(Value::as_str)
+        .expect("the cluster carries a shipping speed");
+    for speed in SHIPPING_OPTION_VALUES
+        .iter()
+        .filter(|speed| **speed != held_speed)
+    {
         rows.push((
-            format!("the shipping speed {option} for this node"),
-            json!({ "ShippingOption": option }),
+            format!("the shipping speed {speed} for this node alone"),
+            json!({ "ShippingOption": speed }),
+            Some("ShippingOption"),
         ));
     }
-    for capacity in SNOWBALL_CAPACITY_VALUES {
-        rows.push((
-            format!("the capacity preference {capacity} for this node"),
-            json!({ "SnowballCapacityPreference": capacity }),
-        ));
-    }
-    for remote in REMOTE_MANAGEMENT_VALUES {
-        rows.push((
-            format!("the remote management setting {remote} for this node"),
-            json!({ "RemoteManagement": remote }),
-        ));
-    }
-    // Every job-level member at once, each differing from what the cluster carries.
-    let everything = json!({
-        "Description": "every member of this node's own",
-        "ShippingOption": SHIPPING_OPTION_VALUES[0],
-        "SnowballCapacityPreference": SNOWBALL_CAPACITY_VALUES[0],
-        "RemoteManagement": REMOTE_MANAGEMENT_VALUES[0],
-        "AddressId": alternate_address_id,
-        "ForwardingAddressId": alternate_address_id,
-        "RoleARN": "arn:aws:iam::123456789012:role/snowball-every-member",
-        "KmsKeyARN": "arn:aws:kms:us-west-2:123456789012:key/every-member",
-        "Resources": {
-            "S3Resources": [{ "BucketArn": "arn:aws:s3:::node-every-member" }]
-        },
-        "Notification": {
-            "SnsTopicARN": "arn:aws:sns:us-west-2:123456789012:node-every-member",
-            "NotifyAll": true
-        },
-        "TaxDocuments": { "IND": { "GSTIN": "07AAPFU0939F1ZV" } },
-        "OnDeviceServiceConfiguration": {
-            "NFSOnDeviceService": { "StorageLimit": 4, "StorageUnit": "TB" }
-        },
-        "ImpactLevel": "IL2",
-    });
-    rows.push(("every job-level member at once".to_string(), everything));
+
+    // A member the node does hold for itself does not make a differing order attribute
+    // acceptable, and neither does repeating the rest of the order correctly.
+    rows.push((
+        "a description of its own beside the members only a job models".to_string(),
+        json!({
+            "Description": "node beside its own capacity",
+            "SnowballCapacityPreference": SNOWBALL_CAPACITY_VALUES[0],
+            "ImpactLevel": "IL2",
+        }),
+        Some("Description"),
+    ));
+    let mut whole_order_but_one = cluster_body.clone();
+    whole_order_but_one["AddressId"] = json!(alternate_address_id);
+    rows.push((
+        "the whole order stated back but for the address".to_string(),
+        whole_order_but_one,
+        Some("AddressId"),
+    ));
+    rows.push((
+        "every attribute of the order differing at once".to_string(),
+        json!({
+            "JobType": "IMPORT",
+            "SnowballType": "EDGE_C",
+            "ShippingOption": SHIPPING_OPTION_VALUES
+                .iter()
+                .find(|speed| **speed != held_speed)
+                .expect("a shipping speed other than the cluster's"),
+            "AddressId": alternate_address_id,
+            "ForwardingAddressId": alternate_address_id,
+            "Description": "every attribute of this node's own",
+            "RoleARN": "arn:aws:iam::123456789012:role/snowball-every-member",
+            "KmsKeyARN": "arn:aws:kms:us-west-2:123456789012:key/every-member",
+            "Resources": {
+                "S3Resources": [{ "BucketArn": "arn:aws:s3:::node-every-member" }]
+            },
+            "Notification": {
+                "SnsTopicARN": "arn:aws:sns:us-west-2:123456789012:node-every-member",
+                "NotifyAll": true
+            },
+            "TaxDocuments": { "IND": { "GSTIN": "07AAPFU0939F1ZV" } },
+            "OnDeviceServiceConfiguration": {
+                "NFSOnDeviceService": { "StorageLimit": 4, "StorageUnit": "TB" }
+            },
+        }),
+        // The refusal names the first attribute it finds disagreeing, and the job type is
+        // the first one it considers.
+        Some("JobType"),
+    ));
     rows
 }
 
 #[tokio::test]
-async fn a_node_job_carries_the_members_its_request_supplied_and_inherits_the_rest() {
+async fn a_node_job_carries_the_clusters_whole_order_and_its_own_job_level_members() {
     let router = router();
     let address_id = create_address(
         &router,
@@ -384,19 +515,20 @@ async fn a_node_job_carries_the_members_its_request_supplied_and_inherits_the_re
         "the cluster's forwarding address",
     )
     .await;
-    let alternate_address_id = create_address(
-        &router,
-        deliverable_address("Node Alternate", "3 Node Way", json!({})),
-        "the address a node asks for instead",
-    )
-    .await;
 
     let cluster_body = node_cluster(&address_id, &forwarding_address_id);
-    for (case, supplied) in node_rows(&forwarding_address_id, &alternate_address_id) {
+    for (case, supplied) in accepted_rows(&cluster_body) {
         // A cluster takes only its quorum of nodes, so each row gets a cluster of its own
         // and the whole table stays inside that bound.
         let (cluster_id, _) = create_cluster(&router, cluster_body.clone(), &case).await;
-        assert_node_reports_the_merge(&router, &cluster_body, &cluster_id, &supplied, &case).await;
+        assert_node_reports_the_clusters_order(
+            &router,
+            &cluster_body,
+            &cluster_id,
+            &supplied,
+            &case,
+        )
+        .await;
     }
 
     // A description outside the published bounds is not a node description the request can
@@ -426,37 +558,130 @@ async fn a_node_job_carries_the_members_its_request_supplied_and_inherits_the_re
         )
         .await;
     }
-    let bounded_case = "the cluster after the out-of-bound descriptions";
-    let listed = ok(
-        &router,
-        "ListClusterJobs",
-        json!({ "ClusterId": bounded_cluster_id }),
-        bounded_case,
-    )
-    .await;
-    let entries = listed
-        .get("JobListEntries")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
     assert!(
-        entries.is_empty(),
-        "case {bounded_case:?}: a refused create added a node job, got {entries:?}"
+        listed_node_ids(
+            &router,
+            &bounded_cluster_id,
+            "the cluster after the out-of-bound descriptions"
+        )
+        .await
+        .is_empty(),
+        "a refused create added a node job to the cluster"
     );
+
+    // The rule holds at each published bound of the one order attribute that has them: a
+    // node repeating a description of that length is accepted and inherits it, and one
+    // differing from it by a single character is refused.
+    for len in [DESCRIPTION_MIN_LEN, DESCRIPTION_MAX_LEN] {
+        let case = format!("a cluster described in {len} characters");
+        let mut body = cluster_body.clone();
+        body["Description"] = json!("d".repeat(len));
+        let (cluster_id, _) = create_cluster(&router, body.clone(), &case).await;
+        assert_node_reports_the_clusters_order(
+            &router,
+            &body,
+            &cluster_id,
+            &json!({ "Description": "d".repeat(len) }),
+            &format!("{case}, the node repeating it"),
+        )
+        .await;
+        let differing = format!("{}e", "d".repeat(len - 1));
+        refused_combination(
+            &router,
+            &cluster_id,
+            &json!({ "Description": differing }),
+            &format!("{case}, a node differing in one character"),
+        )
+        .await;
+    }
 }
 
 #[tokio::test]
-async fn each_node_of_one_cluster_keeps_the_members_its_own_request_supplied() {
+async fn a_node_asking_for_an_order_attribute_of_its_own_is_refused_and_stores_nothing() {
     let router = router();
     let address_id = create_address(
         &router,
-        deliverable_address("Quorum Receiver", "4 Node Way", json!({})),
+        deliverable_address("Divergence Receiver", "3 Node Way", json!({})),
         "the cluster's address",
     )
     .await;
     let forwarding_address_id = create_address(
         &router,
-        deliverable_address("Quorum Forwarder", "5 Node Way", json!({})),
+        deliverable_address("Divergence Forwarder", "4 Node Way", json!({})),
+        "the cluster's forwarding address",
+    )
+    .await;
+    let alternate_address_id = create_address(
+        &router,
+        deliverable_address("Divergence Alternate", "5 Node Way", json!({})),
+        "the address a node asks for instead",
+    )
+    .await;
+
+    let cluster_body = node_cluster(&address_id, &forwarding_address_id);
+    let setup = "the cluster every refused row names";
+    let (cluster_id, _) = create_cluster(&router, cluster_body.clone(), setup).await;
+    // One node of the cluster, created the way a node is ("you only need to provide the
+    // clusterId value"), so each refusal below is shown to leave an existing node alone too.
+    let node_id = create_node(&router, &cluster_id, &json!({}), setup).await;
+    let cluster_before = cluster_metadata(&router, &cluster_id, setup).await;
+    let node_before = job_metadata(&router, &node_id, setup).await;
+
+    for (case, supplied, member) in refused_rows(&cluster_body, &alternate_address_id) {
+        let message = refused_combination(&router, &cluster_id, &supplied, &case).await;
+        if let Some(member) = member {
+            assert!(
+                message.contains(member),
+                "case {case:?}: expected the refusal to name the {member} it is about, got \
+                 {message:?}"
+            );
+            // The model documents this error's sentence for the job-type/device-type pair,
+            // and that sentence names the two request members rather than a cluster; every
+            // other attribute is refused naming the cluster whose value it disagrees with.
+            if !matches!(member, "JobType" | "SnowballType") {
+                assert!(
+                    message.contains(&cluster_id),
+                    "case {case:?}: expected the refusal to name the cluster {cluster_id}, \
+                     got {message:?}"
+                );
+            }
+        }
+
+        // Nothing was stored: the cluster still reports its own order, its node set still
+        // holds the one node it held, and that node is as it was created.
+        let cluster_after = cluster_metadata(&router, &cluster_id, &case).await;
+        assert_eq!(
+            cluster_after, cluster_before,
+            "case {case:?}: a refused node create changed the cluster, got {cluster_after} \
+             after {cluster_before}"
+        );
+        let listed = listed_node_ids(&router, &cluster_id, &case).await;
+        assert_eq!(
+            listed,
+            vec![node_id.clone()],
+            "case {case:?}: a refused node create changed the cluster's node listing"
+        );
+        let node_after = job_metadata(&router, &node_id, &case).await;
+        assert_eq!(
+            node_after, node_before,
+            "case {case:?}: a refused node create changed the node the cluster held, got \
+             {node_after} after {node_before}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn each_node_of_one_cluster_reports_the_clusters_order_and_keeps_its_own_members() {
+    let router = router();
+    let address_id = create_address(
+        &router,
+        deliverable_address("Quorum Receiver", "6 Node Way", json!({})),
+        "the cluster's address",
+    )
+    .await;
+    let forwarding_address_id = create_address(
+        &router,
+        deliverable_address("Quorum Forwarder", "7 Node Way", json!({})),
         "the cluster's forwarding address",
     )
     .await;
@@ -464,19 +689,18 @@ async fn each_node_of_one_cluster_keeps_the_members_its_own_request_supplied() {
     let setup = "the cluster whose nodes are created one by one";
     let (cluster_id, _) = create_cluster(&router, cluster_body.clone(), setup).await;
 
-    // Each node of the same cluster is created with a description and a notification of
-    // its own, except the last, which carries nothing and so inherits the cluster's: a
-    // caller has to be able to tell its nodes apart afterwards.
+    // Each node of the same cluster is created with a capacity and pickup details of its
+    // own — members the cluster holds no order-wide value for — except the last, which
+    // carries nothing and so inherits the cluster's: a caller has to be able to tell its
+    // nodes apart afterwards.
     let mut submitted: Vec<(String, Value)> = Vec::new();
     for node_number in 1..CLUSTER_NODE_QUORUM {
         submitted.push((
             format!("node {node_number} of the cluster"),
             json!({
-                "Description": format!("node {node_number}"),
-                "Notification": {
-                    "SnsTopicARN": format!("arn:aws:sns:us-west-2:123456789012:node-{node_number}"),
-                    "NotifyAll": true
-                },
+                "SnowballCapacityPreference":
+                    SNOWBALL_CAPACITY_VALUES[node_number % SNOWBALL_CAPACITY_VALUES.len()],
+                "PickupDetails": { "Name": format!("Pickup Person {node_number}") },
             }),
         ));
     }
@@ -491,8 +715,8 @@ async fn each_node_of_one_cluster_keeps_the_members_its_own_request_supplied() {
         nodes.push((case.clone(), job_id, supplied.clone()));
     }
 
-    // Every node still reports what its own create asked for, after every other node of
-    // the cluster was created.
+    // Every node reports the cluster's whole order and still reports what its own create
+    // asked for, after every other node of the cluster was created.
     for (case, job_id, supplied) in &nodes {
         let node = job_metadata(&router, job_id, case).await;
         let expected = expected_node(&cluster_body, supplied);
@@ -506,10 +730,18 @@ async fn each_node_of_one_cluster_keeps_the_members_its_own_request_supplied() {
                 "case {case:?}: expected {member} to read back as {value}, got {node}"
             );
         }
+        if let Some(details) = supplied.get("PickupDetails") {
+            assert_eq!(
+                reported(&node, "PickupDetails"),
+                details,
+                "case {case:?}: expected the node to keep the pickup details only it has, \
+                 got {node}"
+            );
+        }
     }
 
-    // The descriptions `ListClusterJobs` reports are the ones each node was created with,
-    // in creation order.
+    // The descriptions `ListClusterJobs` reports are the cluster's, since the order holds
+    // one description for every device it ships, and the entries come in creation order.
     let listing_case = "the cluster's whole node listing";
     let listed = ok(
         &router,
@@ -528,16 +760,15 @@ async fn each_node_of_one_cluster_keeps_the_members_its_own_request_supplied() {
         nodes.len(),
         "case {listing_case:?}: expected one entry per node, got {entries:?}"
     );
-    for (entry, (case, job_id, supplied)) in entries.iter().zip(nodes.iter()) {
+    let expected_description = cluster_body
+        .get("Description")
+        .expect("the cluster carries a description");
+    for (entry, (case, job_id, _)) in entries.iter().zip(nodes.iter()) {
         assert_eq!(
             entry.get("JobId").and_then(Value::as_str),
             Some(job_id.as_str()),
             "case {case:?}: expected the listing in creation order, got {entries:?}"
         );
-        let expected_description = supplied
-            .get("Description")
-            .or_else(|| cluster_body.get("Description"))
-            .expect("a description from the request or the cluster");
         assert_eq!(
             entry.get("Description").unwrap_or(&Value::Null),
             expected_description,
@@ -552,13 +783,13 @@ async fn an_address_a_job_names_has_to_be_stored_whether_or_not_it_joins_a_clust
     let router = router();
     let address_id = create_address(
         &router,
-        deliverable_address("Refusal Receiver", "6 Node Way", json!({})),
+        deliverable_address("Refusal Receiver", "8 Node Way", json!({})),
         "the cluster's address",
     )
     .await;
     let forwarding_address_id = create_address(
         &router,
-        deliverable_address("Refusal Forwarder", "7 Node Way", json!({})),
+        deliverable_address("Refusal Forwarder", "9 Node Way", json!({})),
         "the cluster's forwarding address",
     )
     .await;
@@ -620,26 +851,17 @@ async fn an_address_a_job_names_has_to_be_stored_whether_or_not_it_joins_a_clust
 
     // A refused create stored nothing, so the cluster still holds no node.
     let listing_case = "the cluster after every refused create";
-    let listed = ok(
-        &router,
-        "ListClusterJobs",
-        json!({ "ClusterId": cluster_id }),
-        listing_case,
-    )
-    .await;
-    let entries = listed
-        .get("JobListEntries")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
     assert!(
-        entries.is_empty(),
-        "case {listing_case:?}: a refused create added a node job, got {entries:?}"
+        listed_node_ids(&router, &cluster_id, listing_case)
+            .await
+            .is_empty(),
+        "case {listing_case:?}: a refused create added a node job"
     );
 
-    // The same two members naming stored addresses are accepted, so the refusal is about
-    // the record the id names and not about the member being present at all.
-    let accepted_case = "both addresses naming stored records";
+    // The same two members naming the addresses the cluster itself ships to are accepted,
+    // so the refusal is about the record the id names and not about the member being
+    // present at all.
+    let accepted_case = "both addresses naming the cluster's own stored records";
     let job_id = create_node(
         &router,
         &cluster_id,
@@ -654,12 +876,11 @@ async fn an_address_a_job_names_has_to_be_stored_whether_or_not_it_joins_a_clust
     assert_eq!(
         node.get("AddressId").and_then(Value::as_str),
         Some(address_id.as_str()),
-        "case {accepted_case:?}: expected the address the node asked for, got {node}"
+        "case {accepted_case:?}: expected the address the order ships to, got {node}"
     );
     assert_eq!(
         node.get("ForwardingAddressId").and_then(Value::as_str),
         Some(forwarding_address_id.as_str()),
-        "case {accepted_case:?}: expected the forwarding address the node asked for, \
-         got {node}"
+        "case {accepted_case:?}: expected the order's forwarding address, got {node}"
     );
 }

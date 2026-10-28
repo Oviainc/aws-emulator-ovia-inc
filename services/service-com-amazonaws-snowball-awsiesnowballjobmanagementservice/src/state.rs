@@ -1127,6 +1127,85 @@ impl StoredCluster {
             unlock_code,
         }
     }
+
+    /// The first attribute of the order this cluster ships that `input` asks a node of it
+    /// to hold a different value for, named as `CreateJobRequest` names the member that
+    /// carried it — or `None` when every attribute the request names is the one the cluster
+    /// already holds.
+    ///
+    /// `ClusterMetadata` reports ONE value per attribute for the whole cluster — one job
+    /// type, one device type, one address, one forwarding address, one description, one
+    /// shipping speed, one role, one key, one set of resources, one notification, one set of
+    /// tax documents, one on-device service configuration — and a node job of the cluster
+    /// carries those attributes rather than copies of its own: "you need to provide only
+    /// this clusterId value. The other job attributes are inherited from the cluster"
+    /// (`CreateJobRequest$ClusterId`). So a create that names one of them is repeating what
+    /// the cluster holds, which changes nothing, or it is asking for a node whose devices
+    /// ship elsewhere, at another speed, under another role than the rest of the order,
+    /// which is a set of inputs that cannot hold together. Asking this question in one place
+    /// is what keeps the create from storing a divergence the two updates
+    /// ([`ClusterOrderMembers`]) then silently write away.
+    ///
+    /// An attribute the cluster holds NO value for is no different: the order has none, so
+    /// a node of it has none either, and a request that names one is asking for the same
+    /// divergence. The structure members are compared by value, and the order of a list
+    /// member is part of that value, since both records report such a list exactly as it was
+    /// supplied.
+    ///
+    /// The eight attributes an update can still change are asked about through
+    /// [`ClusterOrderMembers`], which is the ONE place that set is written down, so this
+    /// check and the two updates cannot drift apart over what a cluster's order carries.
+    /// Only the four `ClusterMetadata` members no update models are named here: the job type
+    /// and the device type the order was placed in, the key its manifests are encrypted
+    /// under and the tax documents it carries.
+    ///
+    /// The members `ClusterMetadata` does not model — the capacity a device is configured
+    /// with, the remote-management setting, and the members only a job has (its long-term
+    /// pricing, its device configuration, its impact level, its pickup details) — are the
+    /// node's own, so they are not compared here.
+    pub fn first_disagreeing_order_attribute(
+        &self,
+        input: &CreateJobInput,
+    ) -> Option<&'static str> {
+        for (member, requested, held) in [
+            (
+                "JobType",
+                input.job_type.as_deref(),
+                Some(self.job_type.as_str()),
+            ),
+            (
+                "SnowballType",
+                input.snowball_type.as_deref(),
+                Some(self.snowball_type.as_str()),
+            ),
+            (
+                "KmsKeyARN",
+                input.kms_key_arn.as_deref(),
+                self.kms_key_arn.as_deref(),
+            ),
+        ] {
+            if supplied_value(requested).is_some_and(|requested| held != Some(requested)) {
+                return Some(member);
+            }
+        }
+        if input
+            .tax_documents
+            .as_ref()
+            .is_some_and(|requested| self.tax_documents.as_ref() != Some(requested))
+        {
+            return Some("TaxDocuments");
+        }
+
+        ClusterOrderMembers::from(input).first_disagreeing_with(self)
+    }
+}
+
+/// What a request supplied for an optional string member: a member the caller left out and
+/// a member the caller sent empty both name nothing, so each counts as not supplied.
+///
+/// `RoleARN` is modelled `length 0..255`, so an empty string does reach a handler.
+fn supplied_value(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !value.is_empty())
 }
 
 /// The members a cluster holds for its whole order, as one request supplied them: the
@@ -1242,6 +1321,83 @@ impl<'a> ClusterOrderMembers<'a> {
         }
         if let Some(configuration) = self.on_device_service_configuration {
             job.on_device_service_configuration = Some(configuration.clone());
+        }
+    }
+
+    /// The first of these members `cluster` holds a different value for, named as the
+    /// requests spell it — or `None` when every member supplied is the one the cluster
+    /// already holds.
+    ///
+    /// The question [`Self::apply_to_cluster`] and [`Self::apply_to_job`] answer for an
+    /// update, asked instead of answered: a `CreateJob` that names a cluster does not change
+    /// the order it joins, so for it a member that disagrees with the cluster is a set of
+    /// inputs that cannot hold together rather than a value to write. Asked over the same
+    /// set those two write, from this one declaration of it, so the create and the updates
+    /// cannot drift apart over what a cluster's order carries. A member the cluster holds no
+    /// value for counts as disagreeing with any value supplied for it: the order has none,
+    /// so no record of it has one.
+    pub fn first_disagreeing_with(&self, cluster: &StoredCluster) -> Option<&'static str> {
+        for (member, requested, held) in [
+            ("AddressId", self.address_id, Some(cluster.address_id.as_str())),
+            (
+                "ForwardingAddressId",
+                self.forwarding_address_id,
+                cluster.forwarding_address_id.as_deref(),
+            ),
+            (
+                "Description",
+                self.description,
+                cluster.description.as_deref(),
+            ),
+            ("RoleARN", self.role_arn, cluster.role_arn.as_deref()),
+            (
+                "ShippingOption",
+                self.shipping_option,
+                Some(cluster.shipping_option.as_str()),
+            ),
+        ] {
+            if supplied_value(requested).is_some_and(|requested| held != Some(requested)) {
+                return Some(member);
+            }
+        }
+        if self
+            .notification
+            .is_some_and(|requested| cluster.notification.as_ref() != Some(requested))
+        {
+            return Some("Notification");
+        }
+        if self
+            .resources
+            .is_some_and(|requested| cluster.resources.as_ref() != Some(requested))
+        {
+            return Some("Resources");
+        }
+        if self.on_device_service_configuration.is_some_and(|requested| {
+            cluster.on_device_service_configuration.as_ref() != Some(requested)
+        }) {
+            return Some("OnDeviceServiceConfiguration");
+        }
+        None
+    }
+}
+
+impl<'a> From<&'a CreateJobInput> for ClusterOrderMembers<'a> {
+    /// `CreateJobRequest` models all eight too, beside the cluster it may name, the two
+    /// `ClusterMetadata` members no update models and the members that are the node's own.
+    /// A create never APPLIES this projection — a node carries the cluster's values for
+    /// these, so there is nothing for it to write — it only asks
+    /// [`Self::first_disagreeing_with`] whether what the request names is what the cluster
+    /// already holds.
+    fn from(input: &'a CreateJobInput) -> Self {
+        Self {
+            address_id: input.address_id.as_deref(),
+            forwarding_address_id: input.forwarding_address_id.as_deref(),
+            description: input.description.as_deref(),
+            role_arn: input.role_arn.as_deref(),
+            shipping_option: input.shipping_option.as_deref(),
+            notification: input.notification.as_ref(),
+            resources: input.resources.as_ref(),
+            on_device_service_configuration: input.on_device_service_configuration.as_ref(),
         }
     }
 }

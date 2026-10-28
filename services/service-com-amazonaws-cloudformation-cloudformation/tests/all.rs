@@ -45,6 +45,8 @@ mod delete_canceled_export_in_use;
 mod delete_stack_export_in_use;
 #[path = "all/delete_stack_instances.rs"]
 mod delete_stack_instances;
+#[path = "all/delete_stack_set.rs"]
+mod delete_stack_set;
 #[path = "all/denied_replacement_identity.rs"]
 mod denied_replacement_identity;
 #[path = "all/detect_resource_drift.rs"]

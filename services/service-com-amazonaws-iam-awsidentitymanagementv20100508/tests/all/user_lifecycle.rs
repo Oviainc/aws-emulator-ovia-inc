@@ -234,12 +234,15 @@ pub(crate) fn element(body: &str, tag: &str) -> String {
 pub(crate) const HARNESS_REGION: &str = "us-east-1";
 
 /// Assert that `actual` is the whole `AccessDenied` message AWS words for a refused IAM
-/// call: one sentence naming the principal that signed it, the action it asked for and
+/// call: the sentence naming the principal that signed it, the action it asked for and
 /// the resource the decision was made on, closed by `reason` (an explicit deny, or no
-/// policy allowing the action) and nothing further.
+/// policy allowing the action) — followed either by nothing, or by the pointer at the
+/// authorization details of the evaluation that withheld the grant.
 ///
-/// Every character of the message is a fact of the request and of the documents in force,
-/// so the whole of it is compared exactly — there is no part a case cannot predict.
+/// Which of the two a given refusal carries is what `tests/all/access_denied_message_wording.rs`
+/// is the table for; every other suite asserts the part it set up — the principal, the
+/// action, the resource and the reason — and that a continuation, where there is one, is
+/// exactly that pointer and carries one id in both of its slots.
 pub(crate) fn assert_access_denied_message(
     case: &str,
     actual: &str,
@@ -252,11 +255,40 @@ pub(crate) fn assert_access_denied_message(
         "User: {principal} is not authorized to perform: {action} on resource: {named_as} \
          {reason}"
     );
-    assert_eq!(
-        actual, expected,
-        "case {case:?}: expected the refusal to name the principal, the action and the \
-         resource, and to end at the reason, got {actual:?}"
+    let Some(rest) = actual.strip_prefix(&expected) else {
+        panic!(
+            "case {case:?}: expected the refusal to name the principal, the action and the \
+             resource and to close with the reason {expected:?}, got {actual:?}"
+        );
+    };
+    assert!(
+        rest.is_empty() || authorization_details_id(rest).is_some(),
+        "case {case:?}: expected the refusal to end at the reason or to continue with the \
+         authorization-details pointer, got {rest:?} after it"
     );
+}
+
+/// The fixed text of the clause a refusal that withheld a grant continues with, up to the
+/// authorization id: the page the details are read on.
+pub(crate) const AUTHORIZATION_DETAILS_PREFIX: &str =
+    ". Go to https://us-east-1.console.aws.amazon.com/iam/home?region=us-east-1\
+     #/authorization-details/";
+
+/// The fixed text between the pointer's two slots, both of which carry the SAME
+/// authorization id.
+pub(crate) const AUTHORIZATION_DETAILS_INFIX: &str =
+    " for complete details, or call the GetRequestAuthorizationDetails API with the \
+     following authorization id: ";
+
+/// The authorization id `clause` names, when `clause` is exactly the authorization-details
+/// pointer and names one id in both of its slots; `None` when it is anything else.
+pub(crate) fn authorization_details_id(clause: &str) -> Option<&str> {
+    let body = clause.strip_prefix(AUTHORIZATION_DETAILS_PREFIX)?;
+    let (page_id, trailing) = body.split_once(AUTHORIZATION_DETAILS_INFIX)?;
+    (page_id == trailing
+        && !page_id.is_empty()
+        && page_id.chars().all(|character| character.is_ascii_alphanumeric()))
+    .then_some(page_id)
 }
 
 /// Resolve the references the response serializer emits.

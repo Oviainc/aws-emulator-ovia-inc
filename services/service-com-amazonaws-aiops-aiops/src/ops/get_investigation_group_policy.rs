@@ -164,25 +164,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
 
         let store = state.lock();
-        // Which resource is missing decides which 404 this answers: an absent GROUP is
-        // reported as the absent group — the policy operations report the group they
-        // could not find, not a policy on a group that does not exist — and a group
-        // that exists with no policy attached is reported as the absent policy, so a
-        // client can tell the two conditions apart.
-        let group = store.group(&input.identifier, &region).ok_or_else(|| {
-            GetInvestigationGroupPolicyErrorModeled::ResourceNotFoundException(
-                crate::state::investigation_group_not_found(),
-            )
-        })?;
-        let policy = group.policy.clone().ok_or_else(|| {
-            GetInvestigationGroupPolicyErrorModeled::ResourceNotFoundException(
-                crate::state::investigation_group_policy_not_found(),
-            )
-        })?;
+        // Resolving the identifier and deciding which of the two resources a 404
+        // reports absent is the store's own two-step, which every policy operation
+        // takes the same way: it hands back a group that carries a policy, or the
+        // modelled not-found answer for whichever resource is the missing one.
+        let group = store
+            .policy_group(&input.identifier, &region)
+            .map_err(GetInvestigationGroupPolicyErrorModeled::ResourceNotFoundException)?;
 
         Ok(GetInvestigationGroupPolicyOutput {
             investigation_group_arn: Some(group.arn.clone()),
-            policy: Some(policy),
+            policy: group.policy.clone(),
         })
     }
 }
