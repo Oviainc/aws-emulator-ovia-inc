@@ -176,13 +176,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // or not anybody called.
         guard.advance_clock(now);
 
+        // The cluster the `serviceArn` names, resolved from the store BEFORE the record
+        // is borrowed, so the refusal below is worded from that cluster's own stored
+        // record — the resolution checks the cluster before the service it names.
+        let referenced_cluster = match crate::state::express_gateway_reference(&input.service_arn) {
+            Some((cluster, _)) => cluster,
+            None => String::new(),
+        };
+        let cluster_message =
+            crate::state::cluster_refusal_message(guard.clusters.get(&referenced_cluster));
+
         let stored = guard
             .express_gateway_service(&input.service_arn)
             .map_err(|refusal| match refusal {
                 crate::state::ExpressGatewayRefusal::ClusterNotFound => {
                     DescribeExpressGatewayServiceErrorModeled::ClusterNotFoundException(
                         ClusterNotFoundException {
-                            message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
+                            message: Some(cluster_message),
                         },
                     )
                 }

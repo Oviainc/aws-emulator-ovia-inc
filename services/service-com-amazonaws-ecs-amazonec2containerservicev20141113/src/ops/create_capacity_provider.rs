@@ -281,13 +281,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         guard.advance_clock(::std::time::SystemTime::now());
 
         // A deleted cluster is not one this provider can be scoped to ("The cluster has
-        // been deleted"), so a tombstone is refused exactly as a name that never existed.
+        // been deleted"), so a tombstone is refused too — as the inactive cluster it is,
+        // which is what tells it apart from a name that never existed.
         if let Some(cluster_name) = cluster_name.as_deref() {
             if !guard.has_active_cluster(cluster_name) {
                 return Err(
                     CreateCapacityProviderErrorModeled::ClusterNotFoundException(
                         ClusterNotFoundException {
-                            message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
+                            message: Some(crate::state::cluster_refusal_message(
+                                guard.clusters.get(cluster_name),
+                            )),
                         },
                     )
                     .into(),

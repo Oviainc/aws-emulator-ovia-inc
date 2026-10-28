@@ -235,7 +235,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // operation answers it with.
         if !guard.has_active_cluster(&cluster_name) {
             return Err(SubmitTaskStateChangeErrorModeled::ClientException(ClientException {
-                message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
+                message: Some(crate::state::cluster_refusal_message(
+                    guard.clusters.get(&cluster_name),
+                )),
             })
             .into());
         }

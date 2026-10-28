@@ -97,6 +97,11 @@ use crate::ops::types::{
     CLUSTER_SETTING_NAME_VALUES,
 };
 
+/// How a `cluster` an operation cannot act in is WORDED: the two sentences behind the one
+/// error code, and the function that chooses between them off the stored cluster record.
+mod cluster_refusal;
+pub use cluster_refusal::{cluster_refusal_message, CLUSTER_INACTIVE_MESSAGE};
+
 /// The region an ARN carries when the request is unsigned (so it has no SigV4
 /// credential scope to read a region from). `emulator_arn`'s own documented default.
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -1575,7 +1580,7 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 // [`container_instance_not_found_message`]) names the member or the value instead, and
 // is built by a function rather than being a constant.
 
-/// `ClusterNotFoundException$message` for a `cluster` that names no stored cluster.
+/// `ClusterNotFoundException$message` for a `cluster` that names no stored cluster at all.
 pub const CLUSTER_NOT_FOUND_MESSAGE: &str = "Cluster not found.";
 
 /// `ServiceNotFoundException$message` for a `service` that names no stored service.
@@ -4178,7 +4183,9 @@ pub fn express_gateway_reference(reference: &str) -> Option<(String, String)> {
 /// Why a `serviceArn` resolves to no stored Express service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExpressGatewayRefusal {
-    /// The ARN names a cluster this account does not hold.
+    /// The ARN names a cluster this account does not hold as one an operation may act in.
+    /// The operation words it from that cluster's own stored record, exactly as the
+    /// operations that take a `cluster` member do (see [`cluster_refusal_message`]).
     ClusterNotFound,
     /// The ARN names no Express service of this account: the cluster it names holds none
     /// of that name, or the value names no cluster-and-service pair at all.
@@ -6568,10 +6575,11 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     ///
     /// A tombstone (`status` [`CLUSTER_INACTIVE`]) is not one — the `Cluster$status` doc:
     /// "The cluster has been deleted" — so every operation that resolves a `cluster` to
-    /// work in refuses it exactly as it refuses a name that never existed. The three
-    /// operations that own the tombstone read `clusters` directly instead:
-    /// `DescribeClusters` reports it, `DeleteCluster` answers idempotently with it, and
-    /// `CreateCluster` creates a new cluster over it.
+    /// work in refuses it with the same error code it answers for a name that never
+    /// existed, and with the sentence that condition carries
+    /// ([`Self::cluster_not_found_message`]). The three operations that own the tombstone
+    /// read `clusters` directly instead: `DescribeClusters` reports it, `DeleteCluster`
+    /// answers idempotently with it, and `CreateCluster` creates a new cluster over it.
     pub fn active_cluster(&self, cluster_name: &str) -> Option<&ClusterRecord> {
         self.clusters
             .get(cluster_name)

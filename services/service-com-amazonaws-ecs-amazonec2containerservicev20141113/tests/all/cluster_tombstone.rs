@@ -943,8 +943,10 @@ async fn a_tombstoned_cluster_is_no_longer_a_cluster_an_operation_can_work_in() 
 
     // "The cluster has been deleted": the tombstone is discoverable, but it is not a
     // cluster anything can run, register or read resources in — every one of those
-    // operations refuses it exactly as it refuses a name that never existed. Rows: every
-    // implemented operation that resolves a `cluster` to work in.
+    // operations refuses it with the same error code it answers for a name that never
+    // existed, and with the sentence that says the cluster is STILL there and inactive,
+    // which is what tells the two states apart. Rows: every implemented operation that
+    // resolves a `cluster` to work in.
     let rows: [TombstoneRow; 11] = [
         ("RunTask", |cluster| {
             json!({ "cluster": cluster, "taskDefinition": "gonefamily" })
@@ -997,8 +999,22 @@ async fn a_tombstoned_cluster_is_no_longer_a_cluster_an_operation_can_work_in() 
              with {message:?}"
         );
         assert_eq!(
+            message, "The referenced cluster was inactive.",
+            "case {case:?}: expected the fixed inactive-cluster sentence, got {message:?}"
+        );
+
+        // The SAME request against a name this account never held keeps the other fixed
+        // sentence: the selector is the cluster's own state, not the request.
+        let missing = format!("{operation} against a cluster that never existed");
+        let (code, message) = refusal(&router, operation, build("nosuchcluster"), &missing).await;
+        assert_eq!(
+            code, "ClusterNotFoundException",
+            "case {missing:?}: expected a missing cluster to be not found, got {code:?} \
+             with {message:?}"
+        );
+        assert_eq!(
             message, "Cluster not found.",
-            "case {case:?}: expected the fixed not-found sentence, got {message:?}"
+            "case {missing:?}: expected the fixed not-found sentence, got {message:?}"
         );
     }
 

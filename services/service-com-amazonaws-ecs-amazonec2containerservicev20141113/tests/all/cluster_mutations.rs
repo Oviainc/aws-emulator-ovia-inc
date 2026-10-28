@@ -43,9 +43,13 @@ const ONE_SPAN: Duration = Duration::from_millis(900);
 /// supported values are `enhanced`, `enabled`, and `disabled`."
 const CLUSTER_SETTING_VALUES: [&str; 3] = ["enhanced", "enabled", "disabled"];
 
-/// The fixed sentence Amazon ECS answers for `ClusterNotFoundException`, as the wire
-/// corpus records it for every operation that raises it.
+/// The fixed sentence Amazon ECS answers for `ClusterNotFoundException` when the name
+/// resolves to no cluster record at all, as the wire corpus records it.
 const CLUSTER_NOT_FOUND_MESSAGE: &str = "Cluster not found.";
+
+/// The fixed sentence the same error code carries when the cluster IS still there, in the
+/// status a delete leaves it in, as the wire corpus records it.
+const CLUSTER_INACTIVE_MESSAGE: &str = "The referenced cluster was inactive.";
 
 /// The Amazon ECS service quota "Capacity providers per cluster", which bounds both
 /// lists one `PutClusterCapacityProviders` may carry (the handler's
@@ -614,9 +618,10 @@ async fn an_override_log_configuration_is_required_and_a_setting_value_is_checke
 
     // And an unknown cluster is a ClusterNotFoundException from every mutation, with
     // the fixed sentence Amazon ECS answers for that condition — a constant that names
-    // no cluster, the same for every request. A DELETED cluster is the same answer: the
-    // `Cluster$status` doc for INACTIVE is "the cluster has been deleted", so a
-    // tombstone is no cluster to act in either.
+    // no cluster, the same for every request. A DELETED cluster is the same error CODE
+    // (the `Cluster$status` doc for INACTIVE is "the cluster has been deleted", so a
+    // tombstone is no cluster to act in either) with the OTHER fixed sentence, the one
+    // that says the cluster is still there but inactive.
     ok(
         &router,
         "CreateCluster",
@@ -694,10 +699,18 @@ async fn an_override_log_configuration_is_required_and_a_setting_value_is_checke
             &format!("{operation} against {}", request["cluster"]),
         )
         .await;
+        // Which of the two fixed sentences is correct is selected by the cluster's own
+        // observable state, not by the request: the tombstone still describes, so it is
+        // reported as inactive, and the name that never existed as not found.
+        let expected = match request["cluster"] == "deleted" {
+            true => CLUSTER_INACTIVE_MESSAGE,
+            false => CLUSTER_NOT_FOUND_MESSAGE,
+        };
         assert_eq!(
             body["message"].as_str(),
-            Some(CLUSTER_NOT_FOUND_MESSAGE),
-            "case {operation:?}: expected the fixed cluster-not-found sentence, got {body}"
+            Some(expected),
+            "case {operation:?} against {}: expected {expected:?}, got {body}",
+            request["cluster"]
         );
     }
 }

@@ -59,6 +59,8 @@ mod error_messages;
 mod express_gateway_services;
 #[path = "all/forced_service_delete_status.rs"]
 mod forced_service_delete_status;
+#[path = "all/inactive_cluster_refusals.rs"]
+mod inactive_cluster_refusals;
 #[path = "all/integer_bound_refusals.rs"]
 mod integer_bound_refusals;
 #[path = "all/invalid_request_refusals.rs"]

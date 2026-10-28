@@ -269,9 +269,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .express_gateway_key(&input.service_arn)
             .map_err(|refusal| match refusal {
                 crate::state::ExpressGatewayRefusal::ClusterNotFound => {
+                    // The cluster the ARN names, worded from that cluster's own stored
+                    // record — the resolution checks the cluster before the service.
+                    let referenced_cluster =
+                        match crate::state::express_gateway_reference(&input.service_arn) {
+                            Some((cluster, _)) => cluster,
+                            None => String::new(),
+                        };
                     UpdateExpressGatewayServiceErrorModeled::ClusterNotFoundException(
                         ClusterNotFoundException {
-                            message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
+                            message: Some(crate::state::cluster_refusal_message(
+                                guard.clusters.get(&referenced_cluster),
+                            )),
                         },
                     )
                 }
