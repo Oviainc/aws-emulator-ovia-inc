@@ -15,6 +15,8 @@
 mod account_limits;
 #[path = "all/account_settings.rs"]
 mod account_settings;
+#[path = "all/account_settings_reporting.rs"]
+mod account_settings_reporting;
 #[path = "all/batch_write_failure_count.rs"]
 mod batch_write_failure_count;
 #[path = "all/capacity_mode.rs"]

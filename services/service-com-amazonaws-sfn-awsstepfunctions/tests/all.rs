@@ -35,6 +35,8 @@ mod arn_validation;
 mod client_error_wrappers;
 #[path = "all/definition_path_diagnostics.rs"]
 mod definition_path_diagnostics;
+#[path = "all/definition_refusal_text.rs"]
+mod definition_refusal_text;
 #[path = "all/definition_state_rules.rs"]
 mod definition_state_rules;
 #[path = "all/definition_validation.rs"]

@@ -178,8 +178,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // The diagnostics come from the ONE walk `CreateStateMachine` and
         // `UpdateStateMachine` refuse a definition with (`crate::state::asl::validate`
-        // reports its first error), so "The result value will be OK when your
-        // workflow definition can be successfully created or updated" holds by
+        // states every error that walk reports), so "The result value will be OK when
+        // your workflow definition can be successfully created or updated" holds by
         // construction rather than by two validators agreeing.
         let found = crate::state::asl::diagnose(&input.definition);
 

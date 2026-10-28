@@ -68,25 +68,26 @@ const READ_OF_SEALED_DATA: &[&str] = &[DECRYPT_OPERATION];
 const WRITE_OF_SEALED_DATA: &[&str] = &[GENERATE_DATA_KEY_OPERATION, DECRYPT_OPERATION];
 
 /// The service name KMS's own error metadata carries.
-const KMS_SERVICE_NAME: &str = "AWSKMS";
+const KMS_SERVICE_NAME: &str = "Kms";
 
 /// The status KMS answers an authorization refusal with, which is also the status the
 /// `Kms*` shapes this service relays it as carry.
 const KMS_REFUSAL_STATUS: u16 = 400;
 
-/// The error code KMS's own authorization refusal carries, which is not the code this
-/// service answers with: the first names the shape KMS returned, the second the shape
-/// Step Functions relays it as.
-const KMS_ACCESS_DENIED_CODE: &str = "AccessDeniedException";
+/// How many attempts the refused KMS call took, which the relayed metadata reports
+/// last: an authorization refusal is a condition retrying cannot change, so the call
+/// that was refused was made once and not again.
+const KMS_ATTEMPTS: u32 = 1;
 
 /// A refusal KMS answered, as the caller sees it: Step Functions does not word these
 /// refusals itself, it RELAYS what its KMS call failed with, so the message is KMS's
-/// own sentence followed by the metadata block an AWS error carries — the service that
-/// refused, the status, the error code, and the id of the request that was refused.
+/// own sentence followed by the metadata an AWS error carries — the service that
+/// refused, the status and the id of the request that was refused, then how many
+/// attempts it took.
 fn relayed(message: &str) -> String {
     format!(
-        "{message} (Service: {KMS_SERVICE_NAME}; Status Code: {KMS_REFUSAL_STATUS}; \
-         Error Code: {KMS_ACCESS_DENIED_CODE}; Request ID: {}; Proxy: null)",
+        "{message} (Service: {KMS_SERVICE_NAME}, Status Code: {KMS_REFUSAL_STATUS}, \
+         Request ID: {}) (SDK Attempt Count: {KMS_ATTEMPTS})",
         ::service_common::query_error_envelope::new_request_id()
     )
 }

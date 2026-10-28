@@ -17,6 +17,8 @@ mod batch_entry_faults;
 mod batch_payload_ceiling;
 #[path = "all/cancel_message_move_task.rs"]
 mod cancel_message_move_task;
+#[path = "all/dead_letter_drain_cycle.rs"]
+mod dead_letter_drain_cycle;
 #[path = "all/dead_letter_instants.rs"]
 mod dead_letter_instants;
 #[path = "all/dead_letter_redrive.rs"]

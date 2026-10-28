@@ -63,6 +63,8 @@ mod refusal_classification;
 mod refusal_contract;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/response_request_id.rs"]
+mod response_request_id;
 #[path = "all/scheduling_policies.rs"]
 mod scheduling_policies;
 #[path = "all/scheduling_policy_listing.rs"]

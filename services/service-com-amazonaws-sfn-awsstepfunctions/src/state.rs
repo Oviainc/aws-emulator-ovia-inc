@@ -5019,8 +5019,8 @@ pub const INVALID_NAME: &str = "Invalid Name";
 
 /// `InvalidDefinition`'s, for [`resource_error_message`]. RECORDED text: the
 /// service names the thing that is invalid rather than spelling the shape name,
-/// and the quoted value is one definition diagnostic, `<code>: <detail>` (see
-/// [`asl::validate`]).
+/// and the quoted value is the definition's diagnostics, one subject per error as
+/// `<code>: <detail> at <location>` (see [`asl::validate`]).
 pub const INVALID_STATE_MACHINE_DEFINITION: &str = "Invalid State Machine Definition";
 
 /// `InvalidExecutionInput`'s, for [`resource_error_message`]. RECORDED text

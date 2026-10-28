@@ -69,8 +69,15 @@ fn schedule_span(held: usize, rate: Option<i64>) -> Duration {
         })
 }
 
-/// The `ListMessageMoveTasks` entry for the task called `handle` under `source_arn`.
-async fn task_entry(router: &MultiServiceRouter, source_arn: &str, handle: &str) -> Value {
+/// The `ListMessageMoveTasks` entry for the most recent task under `source_arn`, which is
+/// the one task each queue in this suite is started over.
+///
+/// The entry is located by the queue rather than by the handle its start answered with:
+/// "When this field is returned in the response of the `ListMessageMoveTasks` action, it is
+/// only populated for tasks that are in RUNNING status"
+/// (`ListMessageMoveTasksResultEntry$TaskHandle`), and every status this suite waits for is
+/// one the task has already left running for.
+async fn task_entry(router: &MultiServiceRouter, source_arn: &str) -> Value {
     let reply = ok(
         router,
         "ListMessageMoveTasks",
@@ -80,26 +87,20 @@ async fn task_entry(router: &MultiServiceRouter, source_arn: &str, handle: &str)
     reply
         .get("Results")
         .and_then(Value::as_array)
-        .and_then(|results| {
-            results
-                .iter()
-                .find(|entry| entry["TaskHandle"].as_str() == Some(handle))
-        })
-        .cloned()
-        .unwrap_or_else(|| panic!("case the task listing: no entry for {handle} in {reply}"))
+        .and_then(|results| results.first().cloned())
+        .unwrap_or_else(|| panic!("case the task listing: no entry under {source_arn} in {reply}"))
 }
 
-/// Wait until the task called `handle` reports `wanted`, and answer whether it did before
-/// the deadline.
+/// Wait until the most recent task of `source_arn` reports `wanted`, and answer whether it
+/// did before the deadline.
 async fn wait_for_status(
     router: &MultiServiceRouter,
     source_arn: &str,
-    handle: &str,
     wanted: &str,
     deadline: Instant,
 ) -> String {
     loop {
-        let entry = task_entry(router, source_arn, handle).await;
+        let entry = task_entry(router, source_arn).await;
         let status = entry["Status"].as_str().unwrap_or_default().to_string();
         if status == wanted || Instant::now() >= deadline {
             return status;
@@ -309,8 +310,13 @@ async fn cancelling_a_running_task_stops_what_it_had_not_moved_and_keeps_what_it
         // The task reports the same progress the cancel call answered with, under a
         // cancelling status that settles into a cancelled one.
         let before = Instant::now();
-        let entry = task_entry(&router, &dead_letter_arn, &handle).await;
+        let entry = task_entry(&router, &dead_letter_arn).await;
         let after = Instant::now();
+        // A task that has left RUNNING reports no handle for a caller to cancel again.
+        assert!(
+            entry.get("TaskHandle").is_none(),
+            "case {case}: expected a cancelled task to report no handle, got {entry}"
+        );
         let reported = entry["Status"].as_str().unwrap_or_default().to_string();
         assert!(
             [CANCELLING, CANCELLED].contains(&reported.as_str()),
@@ -338,7 +344,6 @@ async fn cancelling_a_running_task_stops_what_it_had_not_moved_and_keeps_what_it
         let settled = wait_for_status(
             &router,
             &dead_letter_arn,
-            &handle,
             CANCELLED,
             Instant::now() + DEADLINE,
         )
@@ -347,7 +352,7 @@ async fn cancelling_a_running_task_stops_what_it_had_not_moved_and_keeps_what_it
             settled, CANCELLED,
             "case {case}: expected the task to have settled at {CANCELLED}"
         );
-        let entry = task_entry(&router, &dead_letter_arn, &handle).await;
+        let entry = task_entry(&router, &dead_letter_arn).await;
         assert_eq!(
             (
                 entry["ApproximateNumberOfMessagesMoved"].as_i64(),
@@ -434,14 +439,7 @@ async fn a_cancel_naming_no_running_task_is_refused() {
         false,
     )
     .await;
-    let done_status = wait_for_status(
-        &router,
-        &done_arn,
-        &done_handle,
-        COMPLETED,
-        Instant::now() + DEADLINE,
-    )
-    .await;
+    let done_status = wait_for_status(&router, &done_arn, COMPLETED, Instant::now() + DEADLINE).await;
     assert_eq!(
         done_status, COMPLETED,
         "case the completed task: expected it to finish its one message"
@@ -529,7 +527,7 @@ async fn a_cancel_naming_no_running_task_is_refused() {
         "case the refused cancels: expected them to move nothing, with the cancelled task's \
          queue at {before:?}"
     );
-    let still_cancelled = task_entry(&router, &cancelled_arn, &cancelled_handle).await;
+    let still_cancelled = task_entry(&router, &cancelled_arn).await;
     assert!(
         [CANCELLING, CANCELLED]
             .contains(&still_cancelled["Status"].as_str().unwrap_or_default()),
