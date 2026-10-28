@@ -12,18 +12,32 @@
 //! the policy size quota is refused, and a policy already carrying its full complement
 //! of versions takes no further one.
 //!
+//! A create is also DECIDED before it writes: IAM authorizes its own API, so a signed
+//! create is answered from the signing principal's identity-based policies before the
+//! store is consulted for the policy its ARN names; and a create that is served moves
+//! the addressed policy's update instant to the instant the version it added was
+//! created, leaving that policy's creation instant and every other policy alone.
+//!
 //! Each suite is a TABLE whose rows differ along what the rule generalises over: the
 //! policy's path depth, how many versions it already holds and whether their numbers
 //! are contiguous, the document's content, shape and size, whether `SetAsDefault` is
-//! absent, false or true, and the form of an ARN or a document that is refused.
+//! absent, false or true, the form of an ARN or a document that is refused, and which
+//! statements are in force on the caller.
 //!
 //! The awsQuery harness is the one `tests/all/user_lifecycle.rs` owns and the other
-//! suites in this crate share, so every request here is built and read exactly one way.
+//! suites in this crate share, so every request here is built and read exactly one way;
+//! the signing principal and the documents in force on it are
+//! `tests/all/identity_policy_enforcement.rs`'s, as in the sibling signed-write suite
+//! `tests/all/policy_tag_authorization.rs`.
 
 use service_com_amazonaws_iam_awsidentitymanagementv20100508::state;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::user_lifecycle::{account_id, call, element, elements, error_code, router};
+use crate::identity_policy_enforcement::{principal, statement};
+use crate::user_lifecycle::{
+    account_id, assert_access_denied_message, call, call_signed_by, element, elements, error_code,
+    router,
+};
 
 /// A trust policy every fixture `CreateRole` sends.
 const TRUST_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}"#;
@@ -747,4 +761,410 @@ async fn a_version_cannot_be_added_to_a_policy_that_was_deleted() {
             "case {case:?}: the version must be numbered after the one the create minted: {body}"
         );
     }
+}
+
+/// One `CreatePolicyVersion` presented as signed by `access_key_id`, which is the only
+/// place a request carries the credential the caller speaks for.
+async fn create_version_signed(
+    router: &MultiServiceRouter,
+    access_key_id: &str,
+    policy_arn: &str,
+    document: &str,
+) -> (u16, String) {
+    call_signed_by(
+        router,
+        Some(access_key_id),
+        "CreatePolicyVersion",
+        &[
+            ("PolicyArn", policy_arn),
+            ("PolicyDocument", document),
+            ("SetAsDefault", "true"),
+        ],
+    )
+    .await
+}
+
+/// What a signed row expects the create to be answered with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decided {
+    /// HTTP 200: the documents in force permit the create.
+    Served,
+    /// HTTP 403 `AccessDenied` because a statement about the request says `Deny`.
+    ExplicitDeny,
+    /// HTTP 403 `AccessDenied` because no statement about the request says `Allow`.
+    NoAllow,
+}
+
+/// The documents in force on the row's caller, built from the row's own policy ARN —
+/// which is only known once that policy exists.
+type Policies = Box<dyn Fn(&str) -> Vec<(String, String)>>;
+
+/// RULE: IAM authorizes its own API, so a signed create is decided against the signing
+/// principal's identity-based policies before a version is written — a statement about
+/// the request that says `Deny` refuses it whatever any `Allow` says, an `Allow` with no
+/// such `Deny` serves it, and a principal with neither is refused — and a refusal is HTTP
+/// 403 `AccessDenied` naming the principal, the action and the policy the decision was
+/// made on, with no version added.
+///
+/// Rows: whether a statement is in force at all, its effect, whether its action element
+/// is a literal, a wildcard run or another policy-writing action, and whether its
+/// resource element covers the policy the request addresses.
+#[tokio::test]
+async fn a_signed_create_is_decided_against_the_callers_identity_policies() {
+    let router = router();
+
+    let rows: Vec<(&str, Policies, Decided)> = vec![
+        (
+            "no identity-based policy at all",
+            Box::new(|_arn: &str| Vec::new()),
+            Decided::NoAllow,
+        ),
+        (
+            "an Allow naming the action on every resource",
+            Box::new(|_arn: &str| {
+                vec![(
+                    "allow-create-version".to_string(),
+                    statement("Allow", "iam:CreatePolicyVersion", "*"),
+                )]
+            }),
+            Decided::Served,
+        ),
+        (
+            "an Allow scoped to the policy the request addresses",
+            Box::new(|arn: &str| {
+                vec![(
+                    "allow-this-policy".to_string(),
+                    statement("Allow", "iam:CreatePolicyVersion", arn),
+                )]
+            }),
+            Decided::Served,
+        ),
+        (
+            "an Allow whose action element is a wildcard run",
+            Box::new(|_arn: &str| {
+                vec![(
+                    "allow-create-star".to_string(),
+                    statement("Allow", "iam:CreatePolicy*", "*"),
+                )]
+            }),
+            Decided::Served,
+        ),
+        (
+            "an Allow for the deleting action only",
+            Box::new(|_arn: &str| {
+                vec![(
+                    "allow-delete-version".to_string(),
+                    statement("Allow", "iam:DeletePolicyVersion", "*"),
+                )]
+            }),
+            Decided::NoAllow,
+        ),
+        (
+            "an Allow scoped to another policy's ARN",
+            Box::new(|_arn: &str| {
+                vec![(
+                    "allow-other-policy".to_string(),
+                    statement(
+                        "Allow",
+                        "iam:CreatePolicyVersion",
+                        &customer_policy_arn("/", "SomeOtherPolicy"),
+                    ),
+                )]
+            }),
+            Decided::NoAllow,
+        ),
+        (
+            "a Deny naming the action beside an Allow",
+            Box::new(|_arn: &str| {
+                vec![
+                    (
+                        "allow-create-version".to_string(),
+                        statement("Allow", "iam:CreatePolicyVersion", "*"),
+                    ),
+                    (
+                        "deny-create-version".to_string(),
+                        statement("Deny", "iam:CreatePolicyVersion", "*"),
+                    ),
+                ]
+            }),
+            Decided::ExplicitDeny,
+        ),
+        (
+            "a Deny scoped to the policy the request addresses",
+            Box::new(|arn: &str| {
+                vec![
+                    (
+                        "allow-create-version".to_string(),
+                        statement("Allow", "iam:CreatePolicyVersion", "*"),
+                    ),
+                    (
+                        "deny-this-policy".to_string(),
+                        statement("Deny", "iam:CreatePolicyVersion", arn),
+                    ),
+                ]
+            }),
+            Decided::ExplicitDeny,
+        ),
+    ];
+
+    for (index, (case, policies, expect)) in rows.iter().enumerate() {
+        let policy_name = format!("SignedVersioned{index}");
+        let arn = create_policy(&router, &policy_name, "/").await;
+        let user_name = format!("versioner{index}");
+        let access_key_id = principal(&router, case, &user_name, &policies(&arn)).await;
+
+        let (status, body) = create_version_signed(&router, &access_key_id, &arn, DOCUMENTS[1]).await;
+
+        match expect {
+            Decided::Served => {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected the create to be served, got {status}: {body}"
+                );
+                let (listed, _, default_version) = versions_and_default(&router, &arn).await;
+                assert_eq!(
+                    (listed, default_version),
+                    (vec!["v1".to_string(), "v2".to_string()], "v2".to_string()),
+                    "case {case:?}: the served create must add the next version and make it \
+                     operative"
+                );
+                assert_eq!(
+                    read_document(&router, &arn, "v2").await,
+                    DOCUMENTS[1],
+                    "case {case:?}: the version stored by a signed create must carry the \
+                     document the request supplied"
+                );
+            }
+            Decided::ExplicitDeny | Decided::NoAllow => {
+                assert_eq!(
+                    status, 403,
+                    "case {case:?}: expected HTTP 403, got {status}: {body}"
+                );
+                assert_eq!(
+                    error_code(&body),
+                    "AccessDenied",
+                    "case {case:?}: expected the error code AccessDenied, got {body}"
+                );
+                // The message is built from the request: the principal that signed it, the
+                // action it named, the policy the decision was made on, and which of the
+                // two refusals this is — asserted through the one reader of that wording
+                // this crate's test tree holds.
+                let reason = if *expect == Decided::ExplicitDeny {
+                    "with an explicit deny in an identity-based policy".to_string()
+                } else {
+                    "because no identity-based policy allows the iam:CreatePolicyVersion action"
+                        .to_string()
+                };
+                assert_access_denied_message(
+                    case,
+                    &element(&body, "Message"),
+                    &format!("arn:aws:iam::{}:user/{user_name}", account_id()),
+                    "iam:CreatePolicyVersion",
+                    &format!("policy {arn}"),
+                    &reason,
+                );
+                let (listed, _, default_version) = versions_and_default(&router, &arn).await;
+                assert_eq!(
+                    (listed, default_version),
+                    (vec!["v1".to_string()], "v1".to_string()),
+                    "case {case:?}: a refused create must add no version"
+                );
+            }
+        }
+    }
+}
+
+/// RULE: the decision precedes the store lookup, so a caller whose documents do not allow
+/// the create is refused with HTTP 403 `AccessDenied` for an ARN the account holds no
+/// policy under — learning nothing about whether that policy exists — while the same
+/// request from a caller the documents DO allow reaches the lookup and is answered with
+/// the missing entity.
+///
+/// One row per ARN the account holds no policy under, differing in the name and the path
+/// the ARN carries.
+#[tokio::test]
+async fn an_unauthorized_create_is_refused_before_the_policy_is_looked_up() {
+    let router = router();
+
+    let absent = [
+        (
+            "a name at the account root",
+            customer_policy_arn("/", "AbsentPolicy"),
+        ),
+        (
+            "a name under a nested path",
+            customer_policy_arn("/a/b/c/", "AbsentPolicy"),
+        ),
+        (
+            "a name whose only unusual feature is its case",
+            customer_policy_arn("/", "absentpolicy"),
+        ),
+    ];
+
+    // The caller with no grant: every absent ARN answers the authorization refusal rather
+    // than the missing entity, so the refusal reveals nothing about the account's
+    // contents.
+    let refused_key = principal(&router, "no grant", "unauthorized-versioner", &[]).await;
+    for (case, arn) in &absent {
+        let (status, body) = create_version_signed(&router, &refused_key, arn, DOCUMENTS[0]).await;
+        assert_eq!(
+            status, 403,
+            "case {case:?}: expected HTTP 403 for {arn:?}, got {status}: {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "AccessDenied",
+            "case {case:?}: expected the error code AccessDenied, got {body}"
+        );
+    }
+
+    // The caller the documents allow reaches the lookup, which is where an ARN naming no
+    // held policy becomes the missing entity.
+    let allowed_key = principal(
+        &router,
+        "an Allow on every resource",
+        "authorized-versioner",
+        &[(
+            "allow-create-version".to_string(),
+            statement("Allow", "iam:CreatePolicyVersion", "*"),
+        )],
+    )
+    .await;
+    for (case, arn) in &absent {
+        let (status, body) = create_version_signed(&router, &allowed_key, arn, DOCUMENTS[0]).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected HTTP 404 for {arn:?}, got {status}: {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "NoSuchEntity",
+            "case {case:?}: expected the error code NoSuchEntity, got {body}"
+        );
+    }
+
+    // And that same allowed caller adds a version to a policy the account does hold, so
+    // the grant is what the two answers above differ by rather than the request.
+    let arn = create_policy(&router, "HeldByTheAccount", "/").await;
+    let (status, body) = create_version_signed(&router, &allowed_key, &arn, DOCUMENTS[2]).await;
+    assert_eq!(
+        status, 200,
+        "an allowed caller must add a version to a held policy, got {status}: {body}"
+    );
+    assert_eq!(
+        read_document(&router, &arn, &element(&body, "VersionId")).await,
+        DOCUMENTS[2],
+        "the version the allowed caller created must carry the document it supplied"
+    );
+}
+
+/// The instants the policy `policy_arn` names reports right now: its creation instant and
+/// its update instant, as `GetPolicy` publishes them.
+async fn policy_instants(router: &MultiServiceRouter, policy_arn: &str) -> (String, String) {
+    let (status, body) = call(router, "GetPolicy", &[("PolicyArn", policy_arn)]).await;
+    assert_eq!(
+        status, 200,
+        "case {policy_arn:?}: GetPolicy must succeed, got {status}: {body}"
+    );
+    (element(&body, "CreateDate"), element(&body, "UpdateDate"))
+}
+
+/// RULE: `Policy$UpdateDate` is "the date and time when the most recent policy version
+/// was created", so a served create moves the addressed policy's update instant to the
+/// instant of the version it added, leaves that policy's creation instant where it
+/// stands, and touches no other policy — and a refused create moves nothing at all.
+///
+/// Rows: creates whose `SetAsDefault` is true, false and absent (the update instant
+/// follows the creation of a version, not the moving of the operative one), then the
+/// refusals — a document that is not an IAM policy, one past the policy size quota, and
+/// a create past the version quota.
+#[tokio::test]
+async fn a_served_create_moves_only_the_addressed_policys_update_instant() {
+    let router = router();
+    let arn = create_policy(&router, "UpdatedPolicy", "/").await;
+    // A bystander policy of the same account: what a create addressed elsewhere must
+    // leave untouched.
+    let bystander = create_policy(&router, "BystanderPolicy", "/eng/").await;
+    let bystander_before = policy_instants(&router, &bystander).await;
+
+    let (created_at, updated_at) = policy_instants(&router, &arn).await;
+    assert_eq!(
+        created_at, updated_at,
+        "a policy carrying only the version its create minted must report its update \
+         instant as its creation instant, got {updated_at:?} against {created_at:?}"
+    );
+
+    for (case, set_as_default) in [
+        ("a create that becomes the operative version", Some("true")),
+        ("a create that does not", Some("false")),
+        ("a create leaving SetAsDefault absent", None),
+    ] {
+        let (status, body) = create_version(&router, &arn, DOCUMENTS[1], set_as_default).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the create must succeed, got {status}: {body}"
+        );
+        let version_created = element(&body, "CreateDate");
+        let (reported_create, reported_update) = policy_instants(&router, &arn).await;
+        assert_eq!(
+            reported_update, version_created,
+            "case {case:?}: the policy's update instant must be the instant its most recent \
+             version was created, got {reported_update:?} against {version_created:?}"
+        );
+        assert_eq!(
+            reported_create, created_at,
+            "case {case:?}: a create must leave the policy's creation instant where it \
+             stands, got {reported_create:?}"
+        );
+    }
+
+    // Fill the policy to the version quota, so one of the refusal rows below is a create
+    // the quota refuses rather than the document.
+    let (held, _, _) = versions_and_default(&router, &arn).await;
+    for filled in held.len() + 1..=state::MAX_POLICY_VERSIONS {
+        let (status, body) = create_version(&router, &arn, DOCUMENTS[0], Some("false")).await;
+        assert_eq!(
+            status, 200,
+            "the fixture create of v{filled} must succeed, got {status}: {body}"
+        );
+    }
+    let expected = policy_instants(&router, &arn).await;
+
+    let refusals: Vec<(&str, String)> = vec![
+        (
+            "a document that is not an IAM policy",
+            "not a policy at all".to_string(),
+        ),
+        (
+            "a document past the policy size quota",
+            document_of_size(state::MAX_MANAGED_POLICY_CHARACTERS + 1),
+        ),
+        ("a create past the version quota", DOCUMENTS[3].to_string()),
+    ];
+    for (case, document) in &refusals {
+        let (status, body) = create_version(&router, &arn, document, Some("true")).await;
+        assert!(
+            status >= 400,
+            "case {case:?}: the create must be refused, got {status}: {body}"
+        );
+        assert_eq!(
+            policy_instants(&router, &arn).await,
+            expected,
+            "case {case:?}: a refused create must leave the policy's instants where they \
+             stand"
+        );
+    }
+
+    assert_eq!(
+        policy_instants(&router, &bystander).await,
+        bystander_before,
+        "a create addressed to another policy must leave this one's instants where they \
+         stand"
+    );
+    let (listed, _, default_version) = versions_and_default(&router, &bystander).await;
+    assert_eq!(
+        (listed, default_version),
+        (vec!["v1".to_string()], "v1".to_string()),
+        "a create addressed to another policy must add no version to this one"
+    );
 }
