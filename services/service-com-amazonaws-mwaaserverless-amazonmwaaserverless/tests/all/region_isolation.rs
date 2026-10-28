@@ -283,8 +283,8 @@ async fn a_workflow_reference_resolves_to_nothing_outside_the_region_that_create
             .as_str()
             .expect("setup: a started run has a RunId")
             .to_string();
-        // Nothing in this API creates a task instance (no Apache Airflow engine runs a
-        // definition here), so the one `GetTaskInstance` reads is seeded into the store.
+        // This workflow's version snapshotted no definition, so its run declares no task
+        // of its own: the one `GetTaskInstance` reads is seeded into the store.
         seed(
             &harness,
             &arn,

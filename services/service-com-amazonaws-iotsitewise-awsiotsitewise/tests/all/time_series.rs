@@ -436,10 +436,10 @@ async fn a_lookup_that_names_no_one_time_series_is_a_modelled_refusal() {
             format!("assetId={asset_id}&propertyId=externalId:no-such-property"),
         ),
         ("unbound alias", "alias=/no/such/stream".to_string()),
-        // `workspaceName` scopes the lookup to a workspace, and no time series is
-        // stored inside one — nothing that ingests a series records a workspace for
-        // it — so a scoped lookup resolves to nothing whether or not the workspace
-        // itself exists.
+        // `workspaceName` scopes the lookup to the time series one workspace holds,
+        // and this store holds no workspace of that name at all, so the lookup is
+        // the absent workspace it names. The workspace-scoped lookups that DO
+        // resolve are pinned in `workspace_time_series`.
         (
             "workspace scoped",
             format!("assetId={asset_id}&propertyId={pid}&workspaceName=plant_1"),

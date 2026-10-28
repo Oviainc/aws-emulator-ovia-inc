@@ -214,15 +214,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // instant, not the one it was last written with.
         job.materialise_due_transitions(at);
 
-        if input
-            .e_tag
-            .as_deref()
-            .is_some_and(|presented| presented != job.etag)
+        // The precondition, judged against the status the job HAS at this instant, by the
+        // ONE rule every conditional writer of this service shares
+        // (`crate::state::stale_entity_tag_rejection`).
+        if let Some(conflict) =
+            crate::state::stale_entity_tag_rejection(input.e_tag.as_deref(), &job.etag)
         {
-            return Err(CancelHarvestJobErrorModeled::ConflictException(
-                crate::state::conflicting_operation(),
-            )
-            .into());
+            return Err(CancelHarvestJobErrorModeled::ConflictException(conflict).into());
         }
         if job.is_terminal() {
             return Err(CancelHarvestJobErrorModeled::ValidationException(

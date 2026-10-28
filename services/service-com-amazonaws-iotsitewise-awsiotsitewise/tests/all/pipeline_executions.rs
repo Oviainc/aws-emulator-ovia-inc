@@ -1100,9 +1100,10 @@ async fn a_retry_with_the_same_client_token_replays_its_answer() {
 
 #[tokio::test]
 async fn a_workspace_scoped_time_series_lookup_resolves_to_nothing() {
-    // The time-series store holds no series inside a workspace, so a scoped
-    // lookup or delete is an absence whether or not the workspace exists — the
-    // rows are a workspace this store holds and one it does not.
+    // A workspace this store holds NO time series under: a scoped lookup or delete
+    // is an absence there, as it is for a workspace that was never created — the
+    // rows are one of each. (A workspace that does hold series is pinned by the
+    // `workspace_time_series` suite.)
     let router = router();
     create_workspace(&router, WORKSPACE).await;
     let cases: [(&str, &str); 2] = [
@@ -1135,7 +1136,8 @@ async fn a_workspace_scoped_time_series_lookup_resolves_to_nothing() {
     }
 
     // A LISTING is not a lookup of one series: scoped to a workspace the store
-    // holds it is empty, and only a workspace it does not hold is the refusal.
+    // holds nothing under, it is empty, and only a workspace it does not hold at
+    // all is the refusal.
     let (status, body) = call(
         &router,
         "GET",
@@ -1147,7 +1149,7 @@ async fn a_workspace_scoped_time_series_lookup_resolves_to_nothing() {
     assert_eq!(
         body["TimeSeriesSummaries"].as_array().map(Vec::len),
         Some(0),
-        "a workspace holds no time series, so the listing is empty, got {body}"
+        "this workspace holds no time series, so the listing is empty, got {body}"
     );
     assert_eq!(
         body["workspaceName"].as_str(),

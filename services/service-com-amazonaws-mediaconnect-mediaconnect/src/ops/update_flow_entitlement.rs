@@ -229,6 +229,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(internal_error("the mediaconnect flow store is unavailable"));
         };
 
+        // `Subscribers` replaces the whole list of ACCOUNTS the content is shared with, so
+        // each entry has to be able to be an account ID — the same rule the grant paths
+        // write the list under (see `crate::state::subscribers_rejection`). The request's
+        // content is judged before the store is reached, so a refused update leaves the
+        // stored entitlement exactly as it was.
+        if let Some(subscribers) = input.subscribers.as_deref() {
+            if let Some(rejection) = crate::state::subscribers_rejection("", subscribers) {
+                return Err(bad_request(rejection));
+            }
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // The only write this operation owes beyond the request: a status change the clock

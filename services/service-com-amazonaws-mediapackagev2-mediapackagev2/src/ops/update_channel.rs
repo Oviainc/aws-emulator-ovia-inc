@@ -284,18 +284,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let stored_etag = channel.etag.clone();
         let stored_input_type = channel.input_type.clone();
 
-        // The precondition: a presented entity tag that is not the committed one means
-        // somebody else committed first, which is what the model's `ConflictException` /
-        // `CONFLICTING_OPERATION` describes.
-        if input
-            .e_tag
-            .as_deref()
-            .is_some_and(|presented| presented != stored_etag)
+        // The precondition, resolved through the ONE rule every conditional writer of this
+        // service shares (`crate::state::stale_entity_tag_rejection`): a presented entity
+        // tag that is not the committed one means somebody else committed first, which is
+        // what the model's `ConflictException` / `CONFLICTING_OPERATION` describes.
+        if let Some(conflict) =
+            crate::state::stale_entity_tag_rejection(input.e_tag.as_deref(), &stored_etag)
         {
-            return Err(UpdateChannelErrorModeled::ConflictException(
-                crate::state::conflicting_operation(),
-            )
-            .into());
+            return Err(UpdateChannelErrorModeled::ConflictException(conflict).into());
         }
 
         // Every member the model restricts to particular input types is checked against

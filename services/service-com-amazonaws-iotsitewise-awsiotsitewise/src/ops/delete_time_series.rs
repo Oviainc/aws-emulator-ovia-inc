@@ -3,8 +3,9 @@
 //! @op DeleteTimeSeries
 //! IMPLEMENTED: this operation removes the time series the request identifies — by
 //! alias, or by the `(assetId, propertyId)` pair — from the shared engine store
-//! (`crate::state`), leaving the asset property itself in place; this is the ONLY
-//! file to touch for it.
+//! (`crate::state`), leaving the asset property itself in place; a delete carrying a
+//! `workspaceName` removes the series stored under THAT workspace instead
+//! ([`crate::state::CaptureSourceRecord`]). This is the ONLY file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -225,24 +226,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::TokenVerdict::Serve => {}
         }
 
-        // `workspaceName` scopes the delete to one SiteWise workspace. This store
-        // holds no time series inside a workspace — nothing that ingests one
-        // records a workspace for it — so a scoped delete resolves to nothing: to
-        // the workspace itself when the store does not hold that either, and
-        // otherwise to the series the request identified inside it.
-        if let Some(workspace) = input.workspace_name.as_deref() {
-            if !store.workspaces.contains_key(workspace) {
-                return Err(not_found(crate::state::not_found_message(
-                    crate::state::RESOURCE_WORKSPACE,
-                    workspace,
-                )));
-            }
-            return Err(not_found(format!(
-                "The time series the request identifies could not be found in the workspace \
-                 {workspace}."
-            )));
-        }
-
         // "To identify a time series, do one of the following: If the time series
         // isn't associated with an asset property, specify the alias of the time
         // series. If the time series is associated with an asset property, specify
@@ -250,15 +233,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // propertyId that identifies the asset property." — so the request must carry
         // EXACTLY one of the two identifying forms. Neither form, half of the pair, or
         // both at once identifies no one series, which is a request error and not a
-        // missing resource.
-        let stream = match (
+        // missing resource, whatever scope the request names.
+        let form = match (
             input.alias.as_deref(),
             input.asset_id.as_deref(),
             input.property_id.as_deref(),
         ) {
+            (Some(alias), None, None) => crate::state::SeriesLookup::Alias(alias),
+            (None, Some(asset_label), Some(property_label)) => {
+                crate::state::SeriesLookup::Pair(asset_label, property_label)
+            }
+            _ => {
+                return Err(invalid_request(
+                    "Specify either alias, or assetId and propertyId.".to_string(),
+                ))
+            }
+        };
+
+        // `workspaceName` scopes the delete to one SiteWise workspace, so what goes
+        // is the time series stored under that workspace — the stream `GetCaptureData`
+        // reads back by the same identifiers, video and all, so neither the id nor the
+        // alias names anything there afterwards. An identifier that names none of that
+        // workspace's series, or a workspace this store does not hold, is the absence
+        // it is, and nothing is removed for it.
+        if let Some(workspace) = input.workspace_name.as_deref() {
+            let time_series_id = store
+                .workspace_series(workspace, form)
+                .map_err(|miss| workspace_series_miss(workspace, &miss))?
+                .time_series_id
+                .clone();
+            store.forget_capture_source(workspace, &time_series_id);
+            // The token is spent only now that the delete has succeeded, and names
+            // the series this call removed — the same rule the account-scoped path
+            // below follows, so a retry of either replays its success.
+            store.record_idempotent_call(
+                Self::NAME,
+                input.client_token.as_deref(),
+                fingerprint,
+                &time_series_id,
+                now,
+            );
+            return Ok(DeleteTimeSeriesOutput);
+        }
+
+        // Outside a workspace the same two forms name one of the account's own
+        // streams.
+        let stream = match form {
             // The one stream the alias names, associated or not, resolved through
             // the shared resolver every alias-addressed operation uses.
-            (Some(alias), None, None) => {
+            crate::state::SeriesLookup::Alias(alias) => {
                 store.resolve_alias_series(alias).ok_or_else(|| {
                     not_found(crate::state::not_found_message(
                         crate::state::RESOURCE_TIME_SERIES,
@@ -266,7 +289,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ))
                 })?
             }
-            (None, Some(asset_label), Some(property_label)) => {
+            crate::state::SeriesLookup::Pair(asset_label, property_label) => {
                 let asset_id = store.resolve_asset_id(asset_label).ok_or_else(|| {
                     not_found(crate::state::not_found_message(
                         crate::state::RESOURCE_ASSET,
@@ -284,11 +307,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         ))
                     })?;
                 crate::state::SeriesKey::Property(asset_id, property_id)
-            }
-            _ => {
-                return Err(invalid_request(
-                    "Specify either alias, or assetId and propertyId.".to_string(),
-                ))
             }
         };
 
@@ -357,6 +375,17 @@ fn not_found(message: String) -> DeleteTimeSeriesError {
     DeleteTimeSeriesError::Modeled(DeleteTimeSeriesErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException { message },
     ))
+}
+
+/// The refusal a workspace-scoped delete that resolved nothing answers with:
+/// every absence it can stop at is a missing resource, named as the resource it
+/// is and echoing the identifier the request supplied for it — the same wording
+/// a workspace-scoped `DescribeTimeSeries` states for the same store state.
+fn workspace_series_miss(
+    workspace: &str,
+    miss: &crate::state::WorkspaceSeriesMiss,
+) -> DeleteTimeSeriesError {
+    not_found(crate::state::workspace_series_miss_message(workspace, miss))
 }
 
 /// HTTP 400 `InvalidRequestException` carrying `message`.

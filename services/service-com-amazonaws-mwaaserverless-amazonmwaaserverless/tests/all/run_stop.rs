@@ -21,9 +21,9 @@
 use std::time::{Duration, SystemTime};
 
 use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::state::{
-    RUN_STATUS_FAILED, RUN_STATUS_QUEUED, RUN_STATUS_STARTING, RUN_STATUS_STOPPED,
-    RUN_STATUS_STOPPING, RUN_STATUS_SUCCESS, RUN_STATUS_TIMEOUT, RUN_STOPPED_AFTER,
-    RUN_TERMINAL_STATUSES,
+    RUN_STATUS_FAILED, RUN_STATUS_QUEUED, RUN_STATUS_RUNNING, RUN_STATUS_STARTING,
+    RUN_STATUS_STOPPED, RUN_STATUS_STOPPING, RUN_STATUS_SUCCESS, RUN_STATUS_TIMEOUT,
+    RUN_STOPPED_AFTER, RUN_TERMINAL_STATUSES,
 };
 
 use crate::missing_resource_lookups::{ghost_arns, LOOKUP_MISS_STATUS, WORKFLOW_MISSING};
@@ -32,14 +32,11 @@ use crate::task_instance_reads::epoch_seconds;
 use crate::workflow_lifecycle::{role_arn, Harness};
 
 /// Every `WorkflowRunStatus` value the model declares, in the model's own order
-/// (`smithy_query(query="shape", shape="WorkflowRunStatus")`). `RUNNING` has no
-/// constant in `crate::state` because nothing here assigns it — no Apache Airflow
-/// engine executes a definition in this emulator — but it IS a state a stop has to
-/// answer for, so the table covers it.
+/// (`smithy_query(query="shape", shape="WorkflowRunStatus")`).
 const RUN_STATUSES: &[&str] = &[
     RUN_STATUS_STARTING,
     RUN_STATUS_QUEUED,
-    "RUNNING",
+    RUN_STATUS_RUNNING,
     RUN_STATUS_SUCCESS,
     RUN_STATUS_FAILED,
     RUN_STATUS_TIMEOUT,

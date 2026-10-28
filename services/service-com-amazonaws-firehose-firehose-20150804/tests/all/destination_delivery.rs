@@ -42,18 +42,21 @@ const DELIVERY_DEADLINE: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// What a dispatched request answered.
-struct Answer {
-    status: u16,
-    body: bytes::Bytes,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) body: bytes::Bytes,
 }
 
 /// Firehose and Amazon S3 on one shared engine.
-struct Emulator {
+///
+/// `pub(crate)`, like the single-service harness of `delivery_stream_lifecycle`, so a
+/// sibling suite needing BOTH services reuses it instead of standing up a second one.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -69,7 +72,7 @@ impl Emulator {
     }
 
     /// Call one Firehose operation; answer its HTTP status and JSON body.
-    async fn firehose(&self, operation: &str, body: Value) -> (u16, Value) {
+    pub(crate) async fn firehose(&self, operation: &str, body: Value) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
@@ -92,7 +95,7 @@ impl Emulator {
     }
 
     /// Call one Firehose operation and require it to succeed.
-    async fn firehose_ok(&self, operation: &str, body: Value) -> Value {
+    pub(crate) async fn firehose_ok(&self, operation: &str, body: Value) -> Value {
         let (status, answered) = self.firehose(operation, body).await;
         assert_eq!(status, 200, "{operation} must succeed, got {answered:?}");
         answered
@@ -116,7 +119,7 @@ impl Emulator {
     }
 
     /// One path-style Amazon S3 request.
-    async fn s3(&self, method: &str, path: &str) -> Answer {
+    pub(crate) async fn s3(&self, method: &str, path: &str) -> Answer {
         self.s3_with_body(method, path, b"").await
     }
 
@@ -125,7 +128,7 @@ impl Emulator {
     /// The create names its `LocationConstraint`: a create that names none can only mean
     /// us-east-1, the Region the unspecified constraint stands for, so S3 refuses one sent
     /// to any other Region's endpoint and this harness signs for [`REGION`].
-    async fn create_bucket(&self, bucket: &str) {
+    pub(crate) async fn create_bucket(&self, bucket: &str) {
         let answer = self
             .s3_with_body(
                 "PUT",
@@ -166,7 +169,7 @@ impl Emulator {
 
     /// Create a stream whose only destination is `member`: `config`, and wait for it to
     /// be `ACTIVE` — a put is accepted only then.
-    async fn create_active_stream(&self, stream: &str, member: &str, config: Value) {
+    pub(crate) async fn create_active_stream(&self, stream: &str, member: &str, config: Value) {
         self.create_active_stream_typed(stream, None, member, config)
             .await;
     }
@@ -206,7 +209,7 @@ impl Emulator {
 
     /// `PutRecord` with `data` as the one record — what a producer writing its records
     /// one at a time calls.
-    async fn put_record(&self, stream: &str, data: &[u8]) -> (u16, Value) {
+    pub(crate) async fn put_record(&self, stream: &str, data: &[u8]) -> (u16, Value) {
         self.firehose(
             "PutRecord",
             json!({
@@ -275,7 +278,7 @@ impl Emulator {
 
     /// Every key under `bucket` once the bucket holds at least `want` of them, or a
     /// failure naming `case` once [`DELIVERY_DEADLINE`] has passed.
-    async fn delivered_keys(&self, case: &str, bucket: &str, want: usize) -> Vec<String> {
+    pub(crate) async fn delivered_keys(&self, case: &str, bucket: &str, want: usize) -> Vec<String> {
         let deadline = Instant::now() + DELIVERY_DEADLINE;
         loop {
             let keys = self.keys(bucket).await;
@@ -292,7 +295,7 @@ impl Emulator {
     }
 
     /// The bytes of every object `bucket` holds, keyed by key.
-    async fn delivered_bodies(&self, bucket: &str) -> BTreeMap<String, Vec<u8>> {
+    pub(crate) async fn delivered_bodies(&self, bucket: &str) -> BTreeMap<String, Vec<u8>> {
         let mut bodies = BTreeMap::new();
         for key in self.keys(bucket).await {
             let body = self.object(bucket, &key).await;

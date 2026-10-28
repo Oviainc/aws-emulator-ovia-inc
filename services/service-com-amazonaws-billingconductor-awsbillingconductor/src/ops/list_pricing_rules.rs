@@ -236,8 +236,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|(arn, rule)| (arn.clone(), rule))
             .collect();
 
-        let (page, next_token) =
-            crate::state::paginate(selected, input.next_token.as_deref(), input.max_results);
+        let (page, next_token) = crate::state::paginate(
+            Self::NAME,
+            selected,
+            input.next_token.as_deref(),
+            input.max_results,
+        )
+        .map_err(ListPricingRulesErrorModeled::ValidationException)?;
         let pricing_rules: Vec<PricingRuleListElement> = page
             .iter()
             .filter_map(|rule| {

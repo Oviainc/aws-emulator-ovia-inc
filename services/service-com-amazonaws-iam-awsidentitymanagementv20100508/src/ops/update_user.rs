@@ -9,6 +9,11 @@
 //! the account holds no user under is a `NoSuchEntityException`, and a new name the
 //! account already holds is an `EntityAlreadyExistsException`.
 //!
+//! The call is decided against the calling principal's identity-based policies on BOTH
+//! names before anything changes — "to change a user name, the requester must have
+//! appropriate permissions on both the source object and the target object" — so a caller
+//! permitted on only one of the two is refused and the user stays where it was.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -188,9 +193,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; nothing here depends on it — IAM is global
-        // and the user is named by the request.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateUserErrorModeled::ServiceFailureException(
                 ServiceFailureException {
@@ -205,10 +207,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // IAM entity names "are not distinguished by case", so the user is found under
-        // the case-folded name whatever case the request spelled it in; a name the account
-        // holds no user under "referenced a resource entity that does not exist".
+        // the case-folded name whatever case the request spelled it in — the key
+        // `CreateUser` stored it under.
         let key = crate::state::name_key(&input.user_name);
-        let Some(held) = store.users.get(&key) else {
+
+        // The user the request addresses, if the account holds one. The LOOKUP comes
+        // first, but the answer to it is withheld until the call has been authorized,
+        // because IAM decides a call against the caller's policies before it reads the
+        // resource.
+        let held = store.users.get(&key).cloned();
+
+        // "Include this parameter only if you're changing the user's name" / "… the
+        // user's path": a member the request leaves out changes nothing, so the user keeps
+        // the value it holds, down to the case the stored name is spelled in — the
+        // request's own spelling of the addressed name identifies the user, it does not
+        // re-spell it. For a name the account holds no user under there is no held value
+        // to keep, so the request's own name and the account root stand in, purely so the
+        // call can be decided before the lookup's answer is given away.
+        let user_name: String = match (&input.new_user_name, &held) {
+            (Some(new_user_name), _) => new_user_name.clone(),
+            (None, Some(user)) => user.user_name.clone(),
+            (None, None) => input.user_name.clone(),
+        };
+        let path: String = match (&input.new_path, &held) {
+            (Some(new_path), _) => new_path.clone(),
+            (None, Some(user)) => user.path.clone(),
+            (None, None) => crate::state::DEFAULT_PATH.to_string(),
+        };
+
+        // IAM authorizes its own API, and this call is decided against BOTH names: "to
+        // change a user name, the requester must have appropriate permissions on both the
+        // source object and the target object", so a caller permitted on only one of the
+        // two is refused — before the store changes and before the lookup's answer is
+        // given away. Each decision is made on the ARN the user carries under that name:
+        // the held user's own ARN, and the one the update would leave it under; for a name
+        // the account holds no user under, that is the ARN the name would carry at the
+        // default path, since there is no other path to attribute it to. A refusal names
+        // the user as the request named it (`user Bob`) rather than by ARN.
+        let addressed = held.as_ref().map_or_else(
+            || crate::state::user_arn(crate::state::DEFAULT_PATH, &input.user_name),
+            |user| user.arn.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::UPDATE_USER,
+            &addressed,
+            &format!("user {}", input.user_name),
+        )?;
+        let requested = crate::state::user_arn(&path, &user_name);
+        if requested != addressed {
+            crate::state::authorization::authorize_named(
+                &store,
+                ctx,
+                crate::state::authorization::UPDATE_USER,
+                &requested,
+                &format!("user {user_name}"),
+            )?;
+        }
+
+        // Only a user the account holds can be updated: a name it holds none under
+        // "referenced a resource entity that does not exist", which is the modelled client
+        // error this operation declares for it.
+        if held.is_none() {
             return Err(UpdateUserErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
                     message: Some(format!(
@@ -218,13 +279,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
-        };
-
-        // "Include this parameter only if you're changing the user's name" / "… the
-        // user's path": a member the request leaves out changes nothing, so the user keeps
-        // the value it holds.
-        let user_name = input.new_user_name.unwrap_or_else(|| held.user_name.clone());
-        let path = input.new_path.unwrap_or_else(|| held.path.clone());
+        }
 
         // "IAM user, group, role, and policy names must be unique within the account.
         // Names are not distinguished by case" (`$NewUserName`): a new name the account
@@ -248,6 +303,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // memberships and its password (`crate::state::rename_user`).
         store.rename_user(&key, &user_name, &path);
 
+        // Audit record for the change: the acting principal, the operation and the name the
+        // user now carries, so a state-changing call leaves a local record.
+        ::tracing::info!(
+            audit = true,
+            operation = "UpdateUser",
+            outcome = "updated",
+            caller_akid = %::engine::extract_akid(&ctx.parts().headers),
+            user_name = %user_name,
+            "a user was updated"
+        );
         Ok(UpdateUserOutput)
     }
 }

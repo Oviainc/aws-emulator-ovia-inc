@@ -6,7 +6,7 @@
 //! that record and nothing else.
 //!
 //! A domain's nodes come in the roles its cluster configuration turns on: data nodes
-//! always ([`NODE_TYPE_DATA`]), dedicated master nodes while
+//! always ([`crate::state::NODE_TYPE_DATA`]), dedicated master nodes while
 //! `DedicatedMasterEnabled` is on, and warm nodes while `WarmEnabled` is — each in
 //! the number and of the instance type the `ClusterConfig` member that defines that
 //! role names, each placed in one of the domain's Availability Zones by the shared
@@ -25,8 +25,8 @@
 //! written.
 //!
 //! Nothing a caller sends sizes this answer: the per-role counts are request fields,
-//! so they are reported only up to [`NODE_CENSUS_LIMIT`], and the zones they spread
-//! over only within the values `ZoneAwarenessConfig$AvailabilityZoneCount`
+//! so they are reported only up to [`crate::state::NODE_CENSUS_LIMIT`], and the zones
+//! they spread over only within the values `ZoneAwarenessConfig$AvailabilityZoneCount`
 //! publishes.
 //!
 //! ## Shape of an operation
@@ -98,21 +98,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{configured_zone_count, nodes_per_zone, standby_zone_count, zone_name, Domain};
-
-/// `NodeType`'s `Data`: a data node, the role `ClusterConfig$InstanceCount` and
-/// `InstanceType` configure.
-const NODE_TYPE_DATA: &str = "Data";
-
-/// `NodeType`'s `Master`: a dedicated master node, the role
-/// `ClusterConfig$DedicatedMasterCount` and `DedicatedMasterType` configure.
-const NODE_TYPE_MASTER: &str = "Master";
-
-/// `NodeType`'s `Ultrawarm`: a warm node, the role `ClusterConfig$WarmCount` and
-/// `WarmType` configure. `NodeType` is documented as saying "whether the nodes is a
-/// data, master, or UltraWarm node", and `OpenSearchWarmPartitionInstanceType` names
-/// only `ultrawarm1` instances, so a warm node is reported under this value.
-const NODE_TYPE_ULTRAWARM: &str = "Ultrawarm";
+use crate::state::{
+    census_size, configured_zone_count, node_id, nodes_per_zone, standby_zone_count, zone_name,
+    Domain, NODE_TYPE_DATA, NODE_TYPE_MASTER, NODE_TYPE_ULTRAWARM,
+};
 
 /// `NodeStatus`'s `Active`: the node sits in a zone serving the cluster.
 const NODE_STATUS_ACTIVE: &str = "Active";
@@ -131,16 +120,6 @@ const STORAGE_TYPE_EBS: &str = "ebs";
 
 /// `StorageTypeName`'s `instance`: "built-in storage available for the instance".
 const STORAGE_TYPE_INSTANCE: &str = "instance";
-
-/// How many nodes of ONE role this operation reports.
-///
-/// This is the emulator's OWN bound on the answer — it models neither Service Quotas
-/// nor an account's adjustments — set at the number OpenSearch Service publishes as
-/// its default data-nodes-per-domain quota. The per-role counts are request fields
-/// (`CreateDomain` and `UpdateDomainConfig` persist the caller's `ClusterConfig`
-/// verbatim, and `IntegerClass` carries no `@range`), so without this bound one
-/// create could size an unbounded response; nothing a caller sends may do that.
-const NODE_CENSUS_LIMIT: i32 = 80;
 
 /// One role a domain's nodes are provisioned in: the `NodeType` the response reports
 /// them under, how many of them the record configures, the instance type they run,
@@ -205,18 +184,16 @@ fn roles(cluster: &ClusterConfig) -> Vec<NodeRole> {
 ///
 /// Empty for a count the record carries no value for, or a negative one: the role's
 /// nodes are then unknown, and an unknown node is not reported as a node. A count
-/// above [`NODE_CENSUS_LIMIT`] is reported up to that bound.
+/// above the census bound is reported up to that bound ([`census_size`]).
 fn node_zones(count: Option<i32>, zones: Option<i32>) -> Vec<Option<usize>> {
-    let Some(count) = count
-        .filter(|count| *count >= 0)
-        .map(|count| count.min(NODE_CENSUS_LIMIT))
-    else {
+    let count = census_size(count);
+    if count == 0 {
         return Vec::new();
-    };
+    }
     let Some(zones) = zones else {
-        return vec![None; usize::try_from(count).unwrap_or(0)];
+        return vec![None; count];
     };
-    nodes_per_zone(Some(count), zones)
+    nodes_per_zone(i32::try_from(count).ok(), zones)
         .into_iter()
         .enumerate()
         .flat_map(|(zone, nodes)| {
@@ -224,23 +201,6 @@ fn node_zones(count: Option<i32>, zones: Option<i32>) -> Vec<Option<usize>> {
             (0..nodes).map(move |_| Some(zone))
         })
         .collect()
-}
-
-/// The `NodeId` of the `index`-th node of one role.
-///
-/// DERIVED from the domain the node belongs to, the role it fills and its index
-/// within that role as a name-based v5 UUID — the way this service derives every id
-/// that has to be the same on the next call — so no two nodes share an id and the id
-/// a caller read in one call is the id the next call reports, which a freshly
-/// generated id would not be. The hyphen-free form's 32 hexadecimal digits sit inside
-/// `NodeId`'s `@length(min: 10, max: 40)`.
-fn node_id(domain_id: &str, node_type: &str, index: usize) -> String {
-    ::uuid::Uuid::new_v5(
-        &::uuid::Uuid::NAMESPACE_OID,
-        format!("opensearch/domainNode/{domain_id}/{node_type}/{index}").as_bytes(),
-    )
-    .simple()
-    .to_string()
 }
 
 /// What a node's storage is reported as.

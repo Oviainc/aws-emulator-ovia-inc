@@ -3003,6 +3003,49 @@ pub const MAX_PORTAL_PRODUCTS: usize = 300;
 /// reports a policy document carrying no statements rather than no document at all.
 pub const EMPTY_SHARING_POLICY: &str = "{}";
 
+/// The owners `ListPortalProducts$ResourceOwner` selects between, in the order a
+/// refusal lists them.
+///
+/// The member targets `__string` in this service's model and documents only "The
+/// resource owner of the portal product", so the catalog is not modelled here; API
+/// Gateway spells the SAME `resourceOwner` query parameter as an enum of
+/// `OTHER_ACCOUNTS | SELF` on its REST collections, and these are those two values. A
+/// value outside the catalog names no owner, so the request is not valid
+/// (`BadRequestException`) rather than served as one owner or the other.
+pub const RESOURCE_OWNER_VALUES: &[&str] = &["OTHER_ACCOUNTS", "SELF"];
+
+/// The `ResourceOwner` that selects the portal products of ANOTHER account, from
+/// [`RESOURCE_OWNER_VALUES`].
+///
+/// A portal product becomes visible to another account through the product's SHARING
+/// POLICY (`PutPortalProductSharingPolicy`), which is why the single-product readers take
+/// an owning account id at all. This emulator serves exactly one account
+/// ([`::engine::emulator_account_id`]) and every product it holds was created by that
+/// account's own call, so nothing it holds has another owner: a request for this owner
+/// gets an empty page rather than this account's own products reported as somebody
+/// else's.
+pub const OTHER_ACCOUNTS_RESOURCE_OWNER: &str = "OTHER_ACCOUNTS";
+
+/// Which portal products a `ResourceOwner` selects, or the message for the operation's
+/// `BadRequestException` when the value names no owner at all.
+///
+/// `true` is "the products this account owns", which is what a request naming no owner
+/// gets: `SELF` is the owner a collection reader reports when the caller does not choose
+/// one, since the products an account can enumerate without naming an owner are its own.
+/// TOTAL over its input, so every string a caller can send either selects one of the two
+/// owners or is refused.
+pub fn resource_owner_selects_own_products(requested: Option<&str>) -> Result<bool, String> {
+    match requested {
+        None => Ok(true),
+        Some(OTHER_ACCOUNTS_RESOURCE_OWNER) => Ok(false),
+        Some(owner) if RESOURCE_OWNER_VALUES.contains(&owner) => Ok(true),
+        Some(owner) => Err(format!(
+            "Invalid value for ResourceOwner: '{owner}'. Valid values are: {}.",
+            RESOURCE_OWNER_VALUES.join(", ")
+        )),
+    }
+}
+
 /// A persisted `PortalProduct` resource.
 ///
 /// "Creates a new portal product" (`CreatePortalProduct`): an account-level resource,
@@ -3102,6 +3145,30 @@ impl PortalProduct {
     pub fn mint_product_page_id(&mut self) -> String {
         self.product_page_id_seed = self.product_page_id_seed.wrapping_add(1);
         mint_id(IdKind::ProductPage, self.product_page_id_seed)
+    }
+
+    /// Project the record onto the modelled `PortalProductSummary` shape the collection
+    /// reader serializes — the SAME values [`Self::to_wire`] projects, so a listed
+    /// product and the one the single-product reader reports cannot drift.
+    ///
+    /// `PortalProductSummary$Description` is a REQUIRED member of the summary
+    /// (`smithy_query(query="shape", shape="PortalProductSummary")`) while
+    /// `GetPortalProduct$Description` is optional, and its shape admits the empty string
+    /// (`len 0..1024`): a product created without a description is summarised with no
+    /// description text rather than with text this service invented.
+    pub fn to_summary(&self) -> wire::PortalProductSummary {
+        let view = self.to_wire();
+        wire::PortalProductSummary {
+            // [`Self::to_wire`] is what decides how a missing description and the tag
+            // collection are reported, so the summary takes both from it rather than
+            // deciding a second time.
+            description: view.description.unwrap_or_default(),
+            tags: view.tags,
+            display_name: self.display_name.clone(),
+            last_modified: to_timestamp(self.last_modified),
+            portal_product_arn: self.portal_product_arn.clone(),
+            portal_product_id: self.portal_product_id.clone(),
+        }
     }
 
     /// Project the record onto the members every portal-product reader reports.

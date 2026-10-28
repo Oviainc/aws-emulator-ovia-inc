@@ -72,6 +72,12 @@
 //! never written here, so an oversized NON-sensitive member stays the modelled 400 until
 //! a recording says otherwise.
 //!
+//! Which member that is comes from the MODEL's own trail to it ([`SENSITIVE_MEMBER_PATHS`])
+//! and never from the text of a path segment: a segment inside a collection is a value the
+//! caller chose, so an entry of a tag map keyed like a member name is still a tag, and an
+//! entry of it outside its own modelled bounds is the modelled 400 `ValidationException`
+//! with its value echoed like any other tag's.
+//!
 //! [`EmulatedService::front_door_refuses`] is that check, reached through
 //! [`Service::override_operation`] because the refusal PRECEDES the modelled walk:
 //! constraint validation runs before a handler, so no handler can answer ahead of it.
@@ -143,19 +149,29 @@ mod modelled_refusal;
 /// `override_refusal` replaces the code and the message together.
 const VALIDATION_EXCEPTION: &str = "ValidationException";
 
-/// The members this service marks `@sensitive`, as a validation path spells them.
+/// The members this service marks `@sensitive`, each as the WHOLE trail a validation
+/// path spells it with, from the operation input down.
 ///
 /// `smithy_query(query="shape",shape="SecretString")`: `SecretString` is the only
 /// shape in this model carrying `sensitive: true`, and it is reached as
-/// `DeploymentParameterInput$secretString`, so a violation on it is reported at
-/// `deploymentParameter.secretString` — the LAST segment is the member whose value
-/// would be echoed.
-const SENSITIVE_MEMBERS: &[&str] = &["secretString"];
+/// `DeploymentParameterInput$secretString`, which `PutDeploymentParameterRequest`
+/// reaches through its `deploymentParameter` member — so a violation on it is
+/// reported at `deploymentParameter.secretString`.
+///
+/// The trail is spelled out, rather than just the member's own name, because only a
+/// STRUCTURE member contributes a segment the model named: a segment inside a
+/// collection is the caller's own data (a map key, a list position), so a path's last
+/// segment alone does not say which modelled member — if any — a violation is about.
+/// `TagsMap`'s key shape admits the text of any member name
+/// (`smithy_query(query="shape",shape="TagsMap")`: `TagKey`, `length 1..128`,
+/// `^[a-zA-Z0-9/_+=.:@-]+$`), and a violation on an entry's VALUE is reported at
+/// `tags.<that key>`, so matching the last segment alone would let a caller's choice of
+/// tag key decide how this service answers.
+const SENSITIVE_MEMBER_PATHS: &[&str] = &["deploymentParameter.secretString"];
 
-/// Whether `path` ends in a member this service marks `@sensitive`.
+/// Whether `path` names a member this service marks `@sensitive`.
 fn names_a_sensitive_member(path: &str) -> bool {
-    let member = path.split('.').next_back().unwrap_or(path);
-    SENSITIVE_MEMBERS.contains(&member)
+    SENSITIVE_MEMBER_PATHS.contains(&path)
 }
 
 /// Whether `violation` is the one the front door answers for: a `@sensitive` payload

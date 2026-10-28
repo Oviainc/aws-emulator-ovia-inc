@@ -10,15 +10,18 @@
 //! deployed under, each carrying the distinct Regions it is deployed to there, both in
 //! first-seen order and one bounded page at a time; a `StackSetName` that resolves to no
 //! StackSet is refused with `StackSetNotFoundException` rather than answered with an empty
-//! list, and a StackSet deployed under no organizational unit answers the empty list.**
+//! list, a StackSet whose permission model is not the service-managed one is refused with
+//! `ValidationError` — automatic deployment is deployment through Organizations, so such a
+//! StackSet has no automatic-deployment targets at all — and a service-managed StackSet
+//! deployed under no organizational unit answers the empty list.**
 //!
 //! The table below is one row per shape of deployment a StackSet can hold: its rows differ
 //! in how many targets the StackSet has (none, one, several), how many Regions each target
 //! carries (one, several), both published forms of an `OrganizationalUnitId` (an
 //! organization root and an OU — `smithy_query(query="shape",
 //! shape="StackSetAutoDeploymentTargetSummary")` gives the member's
-//! `^(ou-[a-z0-9]{4,32}-[a-z0-9]{8,32}|r-[a-z0-9]{4,32})$`), a target reached from several
-//! accounts in one Region, and a self-managed StackSet whose instances carry no OU at all.
+//! `^(ou-[a-z0-9]{4,32}-[a-z0-9]{8,32}|r-[a-z0-9]{4,32})$`) and a target reached from several
+//! accounts in one Region. The permission-model gate has a table of its own below them.
 //!
 //! The store's remaining WRITERS of a service-managed deployment are scaffolds with stub
 //! issues of their own, so the records below are seeded straight into the store through
@@ -202,24 +205,6 @@ const ROWS: &[Row] = &[
             ("r-wxyz", &["ca-central-1", "ap-northeast-1"]),
             ("ou-wxyz-77777777", &["ap-northeast-1"]),
         ],
-    },
-    Row {
-        case: "a self-managed StackSet, whose instances carry no OU",
-        stack_set: "fleet-self-managed",
-        permission_model: permission_model::SELF_MANAGED,
-        instances: &[
-            Instance {
-                account: "111111111111",
-                region: "us-east-1",
-                organizational_unit: None,
-            },
-            Instance {
-                account: "222222222222",
-                region: "eu-west-1",
-                organizational_unit: None,
-            },
-        ],
-        targets: &[],
     },
     Row {
         case: "a StackSet nothing is deployed for",
@@ -645,6 +630,137 @@ async fn the_collection_is_paged_and_a_token_resumes_just_past_the_page() {
             Some(format!("{token} is not a valid NextToken").as_str()),
             "case {case:?}: expected the invalid-token refusal, got {body}"
         );
+    }
+}
+
+/// One row of the permission-model table: a StackSet the store holds, and whether a request
+/// for its automatic-deployment targets is served or refused.
+struct ModelRow {
+    case: &'static str,
+    stack_set: &'static str,
+    permission_model: &'static str,
+    /// Instances to seed, so a refusal is not merely "the StackSet has no targets".
+    instances: &'static [Instance],
+}
+
+/// The permission models a StackSet can carry (`smithy_query(query="shape",
+/// shape="PermissionModels")` gives SELF_MANAGED | SERVICE_MANAGED), each with and without
+/// deployments behind it: automatic deployment belongs to the service-managed model alone.
+const MODEL_ROWS: &[ModelRow] = &[
+    ModelRow {
+        case: "a self-managed StackSet whose instances name accounts directly",
+        stack_set: "gate-self-managed",
+        permission_model: permission_model::SELF_MANAGED,
+        instances: &[
+            Instance {
+                account: "111111111111",
+                region: "us-east-1",
+                organizational_unit: None,
+            },
+            Instance {
+                account: "222222222222",
+                region: "eu-west-1",
+                organizational_unit: None,
+            },
+        ],
+    },
+    ModelRow {
+        case: "a self-managed StackSet nothing is deployed for",
+        stack_set: "gate-self-managed-empty",
+        permission_model: permission_model::SELF_MANAGED,
+        instances: &[],
+    },
+    ModelRow {
+        case: "a self-managed StackSet whose instances DO carry an OU",
+        stack_set: "gate-self-managed-with-ou",
+        permission_model: permission_model::SELF_MANAGED,
+        instances: &[Instance {
+            account: "333333333333",
+            region: "us-east-1",
+            organizational_unit: Some("ou-abcd-88888888"),
+        }],
+    },
+    ModelRow {
+        case: "a service-managed StackSet, which is the model automatic deployment belongs to",
+        stack_set: "gate-service-managed",
+        permission_model: permission_model::SERVICE_MANAGED,
+        instances: &[Instance {
+            account: "444444444444",
+            region: "us-east-1",
+            organizational_unit: Some("ou-abcd-99999999"),
+        }],
+    },
+];
+
+#[tokio::test]
+async fn a_stackset_outside_the_service_managed_model_is_refused() {
+    let (router, engine) = router_with_engine();
+    let mut ids: Vec<String> = Vec::new();
+    {
+        let state = store(&engine);
+        let mut held = state.lock();
+        for row in MODEL_ROWS {
+            let mut stack_set = StoredStackSet::new(row.stack_set, REGION);
+            stack_set.permission_model = row.permission_model.to_string();
+            for seeded in row.instances {
+                let mut instance =
+                    StoredStackInstance::new(seeded.account, seeded.region, OPERATION);
+                instance.organizational_unit_id =
+                    seeded.organizational_unit.map(|unit| unit.to_string());
+                stack_set.record_instance(instance);
+            }
+            ids.push(stack_set.stack_set_id.clone());
+            held.record_stack_set(stack_set);
+        }
+    }
+
+    for (row, stack_set_id) in MODEL_ROWS.iter().zip(&ids) {
+        let case = row.case;
+        let service_managed = row.permission_model == permission_model::SERVICE_MANAGED;
+        // The gate is on the StackSet the request RESOLVES, so it holds however the request
+        // addresses it — by name or by its unique id.
+        for (addressed_as, name) in [
+            ("by name", row.stack_set.to_string()),
+            ("by id", stack_set_id.clone()),
+        ] {
+            let (status, body) = call(
+                &router,
+                "ListStackSetAutoDeploymentTargets",
+                &[member("StackSetName", &name)],
+            )
+            .await;
+            if service_managed {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?} ({addressed_as}): a service-managed StackSet is served, \
+                     got {status} {body}"
+                );
+                continue;
+            }
+            assert_eq!(
+                status, 400,
+                "case {case:?} ({addressed_as}): expected the request refused, got {status} \
+                 {body}"
+            );
+            assert_eq!(
+                xml_text(&body, "Code").as_deref(),
+                Some("ValidationError"),
+                "case {case:?} ({addressed_as}): expected the ValidationError code, got {body}"
+            );
+            // The whole sentence, spelled out: it is the refusal's wording that is under
+            // test, and no part of it comes from the request.
+            assert_eq!(
+                xml_text(&body, "Message").as_deref(),
+                Some("Auto-deployment targets are only available for service-managed stack sets"),
+                "case {case:?} ({addressed_as}): expected the fixed refusal sentence, got \
+                 {body}"
+            );
+            assert!(
+                !body.contains("<Summaries"),
+                "case {case:?} ({addressed_as}): a refused request reports no targets, got \
+                 {body}"
+            );
+        }
     }
 }
 

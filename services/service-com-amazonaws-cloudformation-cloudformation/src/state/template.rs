@@ -850,28 +850,35 @@ pub fn quota_violation(body: &str) -> Option<String> {
 /// than disagreeing about them.
 fn quota_violation_in(document: &Value) -> Option<String> {
     // In section order, so a template past more than one is refused for the same quota
-    // however its body is spelled. The refusal counts the ENTRIES of the section and names
-    // them by what one entry IS — a parameter, a resource, an output — which is the form the
-    // service words it in, rather than by the section's own plural key.
-    [
-        ("Parameters", "Parameter", MAX_PARAMETERS_PER_TEMPLATE),
-        ("Resources", "Resource", MAX_RESOURCES_PER_TEMPLATE),
-        ("Outputs", "Output", MAX_OUTPUTS_PER_TEMPLATE),
-    ]
-    .into_iter()
-    .find_map(|(section, entry, quota)| {
-        let declared = document
-            .get(section)
-            .and_then(Value::as_object)
-            .map_or(0, Map::len);
-        (declared > quota).then(|| {
-            format!(
-                "Template format error: {entry} count {declared} is greater than max \
-                 allowed {quota}"
-            )
+    // however its body is spelled.
+    METERED_SECTIONS
+        .iter()
+        .find_map(|(section, counted, quota)| {
+            let declared = document
+                .get(section)
+                .and_then(Value::as_object)
+                .map_or(0, Map::len);
+            (declared > *quota).then(|| {
+                format!(
+                    "Template format error: {counted} count {declared} is greater than max \
+                     allowed {quota}"
+                )
+            })
         })
-    })
 }
+
+/// The sections the template reader meters, each with the quota on it and the noun its
+/// refusal counts that section's entries by.
+///
+/// The noun is the SERVICE's wording for that ONE limit rather than something derived from
+/// the section's key: a parameter and a resource are counted in the singular, the outputs by
+/// the section's own plural. Recorded behaviour, so each is listed rather than computed —
+/// pluralising or singularising them together would word one limit's refusal with another's.
+const METERED_SECTIONS: &[(&str, &str, usize)] = &[
+    ("Parameters", "Parameter", MAX_PARAMETERS_PER_TEMPLATE),
+    ("Resources", "Resource", MAX_RESOURCES_PER_TEMPLATE),
+    ("Outputs", "Outputs", MAX_OUTPUTS_PER_TEMPLATE),
+];
 
 /// The `Description` a template declares, if it declares one.
 pub fn description(body: &str) -> Option<String> {

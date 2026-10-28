@@ -582,7 +582,7 @@ pub fn delivery_window(hints: Option<&BufferingHints>, buffered_bytes: usize) ->
 ///
 /// An S3 bucket ARN has neither account nor Region — `arn:<partition>:s3:::<name>`, the
 /// form `BucketARN`'s own modelled pattern requires — so the name is the resource part.
-fn bucket_name(bucket_arn: &str) -> Option<&str> {
+pub(crate) fn bucket_name(bucket_arn: &str) -> Option<&str> {
     let name = bucket_arn.rsplit(':').next().unwrap_or_default();
     (!name.is_empty()).then_some(name)
 }

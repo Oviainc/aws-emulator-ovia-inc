@@ -219,53 +219,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Each of the three members narrows the listing to ONE resource INSIDE the
         // cluster, so they are alternatives rather than filters that compose: a request
-        // naming two of them names no single resource to list the updates of. The named
-        // resource must exist, else there is no update history to report — the generic
-        // not-found payload every read of a resource inside a cluster carries.
-        let scope = match (
+        // naming two of them names no single resource to list the updates of. The
+        // resolution is shared with `DescribeUpdate` ([`state::update_scope_of`]), so
+        // the two cannot disagree about which updates belong to the resource a request
+        // names.
+        let Some(scope) = state::update_scope_of(
             input.nodegroup_name.as_deref(),
             input.addon_name.as_deref(),
             input.capability_name.as_deref(),
-        ) {
-            (None, None, None) => UpdateScope::Cluster,
-            (Some(nodegroup), None, None) => {
-                let key = (region.clone(), input.name.clone(), nodegroup.to_string());
-                if !guard.nodegroups.contains_key(&key) {
-                    return Err(ListUpdatesErrorModeled::ResourceNotFoundException(
-                        state::resource_not_found(),
-                    )
-                    .into());
-                }
-                UpdateScope::Nodegroup(nodegroup.to_string())
-            }
-            (None, Some(addon), None) => {
-                let key = (region.clone(), input.name.clone(), addon.to_string());
-                if !guard.addons.contains_key(&key) {
-                    return Err(ListUpdatesErrorModeled::ResourceNotFoundException(
-                        state::resource_not_found(),
-                    )
-                    .into());
-                }
-                UpdateScope::Addon(addon.to_string())
-            }
-            (None, None, Some(capability)) => {
-                let key = (region.clone(), input.name.clone(), capability.to_string());
-                if !guard.capabilities.contains_key(&key) {
-                    return Err(ListUpdatesErrorModeled::ResourceNotFoundException(
-                        state::resource_not_found(),
-                    )
-                    .into());
-                }
-                UpdateScope::Capability(capability.to_string())
-            }
-            _ => {
-                return Err(invalid_parameter(
-                    "Only one of nodegroupName, addonName and capabilityName can be \
-                     specified."
-                        .to_string(),
-                ))
-            }
+        ) else {
+            return Err(invalid_parameter(
+                state::ONE_UPDATE_SCOPE_MESSAGE.to_string(),
+            ));
         };
+        // The named resource must exist, else there is no update history to report —
+        // the generic not-found payload every read of a resource inside a cluster
+        // carries.
+        let named_resource_exists = match &scope {
+            UpdateScope::Cluster => true,
+            UpdateScope::Nodegroup(nodegroup) => guard
+                .nodegroups
+                .contains_key(&(region.clone(), input.name.clone(), nodegroup.clone())),
+            UpdateScope::Addon(addon) => guard
+                .addons
+                .contains_key(&(region.clone(), input.name.clone(), addon.clone())),
+            UpdateScope::Capability(capability) => guard
+                .capabilities
+                .contains_key(&(region.clone(), input.name.clone(), capability.clone())),
+        };
+        if !named_resource_exists {
+            return Err(ListUpdatesErrorModeled::ResourceNotFoundException(
+                state::resource_not_found(),
+            )
+            .into());
+        }
 
         // A `nextToken` names the update id to resume AFTER. One this listing did not
         // issue is a bad parameter, not an empty page.

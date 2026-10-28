@@ -1,0 +1,245 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The DAG a workflow run EXECUTES: the tasks the run's version declared, the order the
+//! dependencies between them put those tasks in, and what the run therefore finishes as.
+//!
+//! `StartWorkflowRun` "creates a workflow run that executes the tasks defined in your
+//! workflow definition", and a definition "defines the workflow structure using supported
+//! Amazon Web Services operators and tasks" with "task dependencies" in it
+//! (`smithy_query(query="doc", shape="CreateWorkflowRequest",
+//! member="DefinitionS3Location")`). So a run is not a status that moves on its own: it is
+//! the execution of the task graph its version froze, and the status it finishes in is the
+//! one that execution produced.
+//!
+//! The plan is built ONCE, when the run is recorded, out of the definition that version
+//! snapshotted — a version is immutable, so what it holds IS what the run executes, and a
+//! plan built once is what makes two reads of the same run answer identically. Nothing is
+//! slept on: the plan says what happens and at which dependency LEVEL, and
+//! [`crate::state::WorkflowRun::settle`] materialises each level as the clock makes it
+//! due.
+//!
+//! ## What the plan decides
+//!
+//! * A graph that can be ordered runs: every task declared in it gets one task instance,
+//!   the tasks that wait for nothing run first, and a task runs once the tasks it
+//!   declared as dependencies have finished. The run finishes in the modelled `SUCCESS`
+//!   status with no `ErrorMessage`, which is the outcome `WorkflowRunDetail$ErrorMessage`
+//!   documents ("This value is null if the run completed successfully").
+//! * A graph that CANNOT be ordered is a workflow definition no run of it can execute: a
+//!   task that depends on a task the definition does not declare, a dependency cycle, two
+//!   tasks declaring one identifier, a task identifier outside what the modelled
+//!   `TaskInstanceId`/`TaskId` can carry, or more tasks than
+//!   [`workflow_definition::MAX_DECLARED_TASKS`]. Such a run reaches the modelled `FAILED`
+//!   status with an `ErrorMessage` naming the condition and the task it was found on, and
+//!   holds no task instance: nothing of it ran.
+//!
+//! What a task's operator DOES to the resources it names is the operator's own work
+//! against another service, performed by the worker the real service runs it on; this
+//! emulator serves the orchestration — admitting the run, building the graph, ordering it
+//! and recording an instance per task through the modelled statuses — and carries out no
+//! operator's side effect. Nothing here invents a failure for a task either: a task
+//! instance reports the outcome of the orchestration it took part in.
+
+use std::collections::HashMap;
+
+use super::workflow_definition::{self, TaskDeclaration, MAX_DECLARED_TASKS};
+use super::{ConstrainedValue, M_TASK_INSTANCE_ID};
+
+/// The most characters a run's `ErrorMessage` carries: the modelled length of the
+/// `GenericString` it targets (`smithy_query(query="shape", shape="WorkflowRunDetail")`
+/// declares `ErrorMessage` 1..255).
+const MAX_ERROR_MESSAGE_CHARS: usize = 255;
+
+/// ONE task of a run's plan: the instance the run records for it, and the dependency
+/// LEVEL that instance runs at.
+#[derive(Debug, Clone)]
+pub struct PlannedTask {
+    /// `TaskInstanceId`: the identifier the run's instance of this task is stored and
+    /// reported under. It is the task's own identifier, because a run executes a declared
+    /// task once.
+    pub task_instance_id: String,
+    /// `TaskId`: the task in the workflow definition this instance executes.
+    pub task_id: String,
+    /// `OperatorName`: the operator the definition declared for the task, when it
+    /// declared one.
+    pub operator_name: Option<String>,
+    /// How many dependency levels deep this task sits: 0 for a task that waits for
+    /// nothing, and otherwise one past the deepest task it waits for. Tasks at one level
+    /// run together, because nothing between them has to wait.
+    pub level: usize,
+}
+
+/// What a run executes: the plan built from its version's definition.
+#[derive(Debug, Clone, Default)]
+pub struct ExecutionPlan {
+    /// One entry per task the definition declares, in declaration order.
+    pub tasks: Vec<PlannedTask>,
+    /// Why this definition's graph could not be built, when it could not be: the
+    /// `ErrorMessage` the run reports when it fails. `None` for a graph that runs.
+    pub build_error: Option<String>,
+}
+
+impl ExecutionPlan {
+    /// The plan for a run of `definition`.
+    ///
+    /// A version that snapshotted no definition content, and a definition that declares
+    /// no task, both plan NO task: there is nothing to run and so nothing that can fail,
+    /// which is a run that completes successfully.
+    pub fn of(definition: Option<&str>) -> Self {
+        let Some(definition) = definition else {
+            return Self::default();
+        };
+        let declared = workflow_definition::declared_tasks(definition);
+        if declared.past_ceiling {
+            return Self::unbuildable(format!(
+                "This workflow definition declares more than the {MAX_DECLARED_TASKS} tasks \
+                 this emulator runs in one workflow run."
+            ));
+        }
+        match plan_tasks(&declared.tasks) {
+            Ok(tasks) => Self {
+                tasks,
+                build_error: None,
+            },
+            Err(reason) => Self::unbuildable(reason),
+        }
+    }
+
+    /// How many dependency levels the plan has: 0 for a plan with no task.
+    pub fn levels(&self) -> usize {
+        self.tasks
+            .iter()
+            .map(|task| task.level + 1)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The tasks that run at `level`.
+    pub fn tasks_at(&self, level: usize) -> impl Iterator<Item = &PlannedTask> {
+        self.tasks.iter().filter(move |task| task.level == level)
+    }
+
+    /// A plan for a definition whose graph could not be built: nothing runs, and `reason`
+    /// is what the run reports as the reason it failed.
+    fn unbuildable(reason: String) -> Self {
+        Self {
+            tasks: Vec::new(),
+            build_error: Some(clipped(reason)),
+        }
+    }
+}
+
+/// Order the declared tasks: resolve the dependencies each one declares and give every
+/// task the level it runs at, or report why this graph cannot be ordered.
+///
+/// A declaration this reader found no identifier in is not a task it can run — a task
+/// instance is reported BY its identifier — so it takes no part in the graph, the same way
+/// the schedule walk ignores a declaration it cannot name.
+fn plan_tasks(declared: &[TaskDeclaration]) -> Result<Vec<PlannedTask>, String> {
+    let named: Vec<(&str, &TaskDeclaration)> = declared
+        .iter()
+        .filter_map(|task| Some((task.task_id.as_deref()?, task)))
+        .collect();
+
+    let mut position: HashMap<&str, usize> = HashMap::with_capacity(named.len());
+    for (index, (task_id, _)) in named.iter().enumerate() {
+        if !reportable_task_id(task_id) {
+            return Err(format!(
+                "Task id {task_id:?} has to be made of at most 255 alphanumeric characters, \
+                 dashes, dots and underscores, starting with an alphanumeric one."
+            ));
+        }
+        if position.insert(*task_id, index).is_some() {
+            return Err(format!(
+                "Task id {task_id:?} has already been added to this workflow definition."
+            ));
+        }
+    }
+
+    // The dependencies, as positions in `named`. A dependency naming no declared task is
+    // one no run can wait for, so the graph cannot be ordered.
+    let mut upstream: Vec<Vec<usize>> = Vec::with_capacity(named.len());
+    for (task_id, task) in &named {
+        let mut edges = Vec::with_capacity(task.dependencies.len());
+        for dependency in &task.dependencies {
+            let Some(at) = position.get(dependency.as_str()) else {
+                return Err(format!(
+                    "Task {dependency:?}, declared as a dependency of task {task_id:?}, is not \
+                     defined in this workflow definition."
+                ));
+            };
+            edges.push(*at);
+        }
+        upstream.push(edges);
+    }
+
+    // Level by level: a task whose dependencies all have a level sits one past the
+    // deepest of them, and a task that waits for nothing sits at level 0. The walk stops
+    // when a pass places nothing, which is exactly when what is left depends on itself.
+    let mut levels: Vec<Option<usize>> = vec![None; named.len()];
+    loop {
+        let mut placed = false;
+        for index in 0..named.len() {
+            if levels[index].is_some() {
+                continue;
+            }
+            let mut level = 0;
+            let mut ready = true;
+            for at in &upstream[index] {
+                match levels[*at] {
+                    Some(above) => level = level.max(above + 1),
+                    None => {
+                        ready = false;
+                        break;
+                    }
+                }
+            }
+            if ready {
+                levels[index] = Some(level);
+                placed = true;
+            }
+        }
+        if !placed {
+            break;
+        }
+    }
+
+    if let Some(index) = levels.iter().position(Option::is_none) {
+        let (task_id, _) = named[index];
+        return Err(format!(
+            "Cycle detected in this workflow definition. Faulty task: {task_id:?}."
+        ));
+    }
+
+    Ok(named
+        .iter()
+        .zip(levels)
+        .map(|((task_id, task), level)| PlannedTask {
+            task_instance_id: (*task_id).to_string(),
+            task_id: (*task_id).to_string(),
+            operator_name: task.operator_name.clone(),
+            level: level.unwrap_or_default(),
+        })
+        .collect())
+}
+
+/// Whether a declared task identifier is one this service can REPORT: `TaskInstanceId`
+/// and `TaskId` both target the modelled `IdString`, so one check covers the identifier a
+/// run's instance is stored under and the task it names.
+///
+/// The check is the framework's own constraint walk over that member's schema
+/// ([`super::validate_members`]), so the pattern and length are the model's rather than
+/// this module's.
+fn reportable_task_id(task_id: &str) -> bool {
+    super::validate_members(&[(&M_TASK_INSTANCE_ID, ConstrainedValue::Text(task_id))]).is_empty()
+}
+
+/// `message`, cut to what the modelled `ErrorMessage` can carry
+/// ([`MAX_ERROR_MESSAGE_CHARS`]) on a character boundary, so a long task identifier in it
+/// cannot push the reported reason past its declared length.
+fn clipped(message: String) -> String {
+    match message.char_indices().nth(MAX_ERROR_MESSAGE_CHARS) {
+        Some((at, _)) => message[..at].to_string(),
+        None => message,
+    }
+}

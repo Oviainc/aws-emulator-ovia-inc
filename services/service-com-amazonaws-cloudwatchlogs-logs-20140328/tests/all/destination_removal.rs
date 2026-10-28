@@ -64,8 +64,17 @@ const NOT_FOUND: &str = "ResourceNotFoundException";
 const INVALID_PARAMETER: &str = "InvalidParameterException";
 
 /// The sentence this service states when the resource an operation names is not there, for
-/// the destination kind.
+/// the destination kind — what an operation modelling `ResourceNotFoundException` ("The
+/// specified resource does not exist.") refuses a missing destination with.
 const DESTINATION_NOT_FOUND_MESSAGE: &str = "The specified destination does not exist.";
+
+/// What an operation that models NO `ResourceNotFoundException` refuses a destination the
+/// account does not hold with: `InvalidParameterException` carries no sentence of its own
+/// ("A parameter is specified incorrectly"), so the message names the rejected
+/// `destinationName`. Asserted per name in `tests/all/missing_destination_refusal.rs`.
+fn missing_destination_message(destination_name: &str) -> String {
+    format!("Destination with name {destination_name} does not exist")
+}
 
 /// One physical target of each vendor a destination can deliver to, and the roles it can be
 /// created with — a destination is "used only to create destinations for cross-account
@@ -309,7 +318,9 @@ async fn a_delete_removes_only_the_named_destination() {
         }
 
         // An access policy is "associated with an existing destination", and this one no
-        // longer exists, so there is nothing to attach one to.
+        // longer exists, so there is nothing to attach one to — and the refusal names the
+        // destination it was asked for.
+        let expected = missing_destination_message(&case.name);
         let (code, message) = logs
             .refusal(
                 PUT_POLICY,
@@ -318,9 +329,9 @@ async fn a_delete_removes_only_the_named_destination() {
             .await;
         assert_eq!(
             (code.as_str(), message.as_str()),
-            (INVALID_PARAMETER, DESTINATION_NOT_FOUND_MESSAGE),
+            (INVALID_PARAMETER, expected.as_str()),
             "case {:?}: expected a policy put against the deleted destination to be refused \
-             ({INVALID_PARAMETER}, {DESTINATION_NOT_FOUND_MESSAGE:?}), got ({code}, {message:?})",
+             ({INVALID_PARAMETER}, {expected:?}), got ({code}, {message:?})",
             case.label
         );
 

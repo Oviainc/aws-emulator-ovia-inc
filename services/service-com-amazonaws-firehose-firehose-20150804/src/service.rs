@@ -633,6 +633,18 @@ pub fn unassumable_role_message(role_arn: &str) -> String {
     format!("Firehose is unable to assume role {role_arn}. Please check the role provided.")
 }
 
+/// An Amazon S3 bucket a destination configuration names that Amazon S3 does not hold: the
+/// bucket the `BucketARN` named, stated as the refusal states it.
+///
+/// Beside [`unassumable_role_message`] for the same reason: the sentence a destination's
+/// unresolvable resource is refused with belongs with this service's other refusal wording,
+/// not inside one operation. The bucket NAME is the part the sentence carries — the name is
+/// the caller's own value, and a bucket name is not a name in this account's namespace a
+/// refusal could disclose by echoing.
+pub fn absent_bucket_message(bucket: &str) -> String {
+    format!("S3 Bucket {bucket} does not exist.")
+}
+
 /// The `com-amazonaws-firehose-firehose-20150804` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///

@@ -21973,6 +21973,46 @@ pub fn require_visible_image<E>(
     Ok(())
 }
 
+/// Refuse an AMI id an operation with EC2's STRICT image-id validator cannot resolve: HTTP
+/// 400 [`INVALID_AMI_ID_MALFORMED`], `The image ID '<id>' is malformed`.
+///
+/// EC2's per-operation validators do NOT agree about an id they cannot resolve. The strict
+/// ones answer this one code and wording for ANY value that does not name an image this
+/// account can see — including a value in the long `ami-` id form that names none — where
+/// the describes of the account's images draw the distinction the shared
+/// [`require_visible_image`] keeps: [`invalid_ami_id_malformed`] for a value that is no AMI
+/// id at all and [`invalid_ami_id_not_found`] for a well-formed id no visible image has.
+/// Two recorded units pin the strict answer, `ec2-image-describes#task#4` for
+/// `DescribeImageAttribute` and `ec2-image-store-restore-error-paths#task#1` for
+/// `CreateStoreImageTask`, so the wording lives here rather than beside either caller. The
+/// message's one variable part is the id the request sent.
+pub fn unresolvable_image_id<E>(image_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_AMI_ID_MALFORMED,
+        400,
+        format!("The image ID '{image_id}' is malformed"),
+    )
+}
+
+/// Resolve the image an operation with EC2's strict image-id validator names, or refuse the
+/// id with [`unresolvable_image_id`].
+///
+/// The images an account may name are the ones it can see at all, read through the crate's
+/// one definition of that question ([`image_is_visible`]), so a strict operation and the
+/// describes agree about which AMIs exist for a caller. The resolved image is handed back,
+/// so a caller that needs a fact of it reads it once rather than looking the same id up
+/// again.
+pub fn require_resolvable_image<'store, E>(
+    store: &'store ComAmazonawsEc2Amazonec2State,
+    image_id: &str,
+) -> Result<&'store Image, Scaffolded<E>> {
+    store
+        .images
+        .get(image_id)
+        .filter(|image| image_is_visible(image, ::engine::emulator_account_id()))
+        .ok_or_else(|| unresolvable_image_id(image_id))
+}
+
 /// Refuse an image id a Windows fast launch change names that cannot carry one.
 ///
 /// Either the account cannot resolve it ([`require_visible_image`]), or the image is not a
@@ -28987,6 +29027,20 @@ pub fn s3_bucket_name_is_well_formed(name: &str) -> bool {
 /// `InaccessibleStorageLocation`.
 pub fn inaccessible_storage_location<E>(message: impl Into<String>) -> Scaffolded<E> {
     Scaffolded::service_error(INACCESSIBLE_STORAGE_LOCATION, 400, message)
+}
+
+/// Refuse a `Bucket` that is outside the Amazon S3 general purpose bucket naming rules
+/// ([`s3_bucket_name_is_well_formed`]): HTTP 400 [`INVALID_REQUEST`], `The S3 bucket name
+/// contains invalid characters.`
+///
+/// Such a value names no bucket at all, so it is a malformed PARAMETER rather than a location
+/// that could not be reached — a permanent fault of the request, not something to retry or
+/// get access to. The message is fixed text with no variable part: the parameter is reported
+/// as unusable, and nothing is said about a bucket, because such a name reaches none. The ONE
+/// answer the operations that take an AMI storage location share, so a bad bucket name reads
+/// the same whichever of them a caller sent it to.
+pub fn invalid_s3_bucket_name<E>() -> Scaffolded<E> {
+    invalid_request("The S3 bucket name contains invalid characters.")
 }
 
 /// The bucket and the key of a storage location a request named.

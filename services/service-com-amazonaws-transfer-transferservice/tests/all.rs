@@ -29,6 +29,8 @@ mod connector_listing;
 mod connector_updates;
 #[path = "all/connector_transfers.rs"]
 mod connector_transfers;
+#[path = "all/enum_value_set_listing.rs"]
+mod enum_value_set_listing;
 #[path = "all/error_message_rules.rs"]
 mod error_message_rules;
 // `workflow_step_contract` is declared HERE rather than in its alphabetical place at the

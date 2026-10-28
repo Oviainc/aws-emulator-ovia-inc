@@ -20,18 +20,23 @@
 use std::time::{Duration, SystemTime};
 
 use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::state::{
-    Workflow, RUN_STATUS_FAILED, RUN_STATUS_QUEUED, RUN_STATUS_STARTING, RUN_TYPE_ON_DEMAND,
-    RUN_TYPE_SCHEDULED, SCHEDULED_RUN_EVERY, TRIGGER_MODE_SCHEDULED,
+    Workflow, RUN_STATUS_QUEUED, RUN_STATUS_RUNNING, RUN_STATUS_STARTING, RUN_STATUS_SUCCESS,
+    RUN_TYPE_ON_DEMAND, RUN_TYPE_SCHEDULED, SCHEDULED_RUN_EVERY, TRIGGER_MODE_SCHEDULED,
 };
 use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::ComAmazonawsMwaaserverlessAmazonmwaaserverlessState;
 
 use crate::task_instance_reads::epoch_seconds;
 use crate::workflow_lifecycle::{role_arn, Harness};
 
-/// The `WorkflowRunStatus` values a run of this emulator can be reported in, in the
-/// order the clock owes them: a run nothing executed is admitted, waits for an executor
-/// and then reaches the modelled failure state.
-const LIFECYCLE: &[&str] = &[RUN_STATUS_STARTING, RUN_STATUS_QUEUED, RUN_STATUS_FAILED];
+/// The `WorkflowRunStatus` values an automated run can be reported in, in the order the
+/// clock owes them: it is admitted, waits for an executor, executes the tasks its
+/// definition declares and completes.
+const LIFECYCLE: &[&str] = &[
+    RUN_STATUS_STARTING,
+    RUN_STATUS_QUEUED,
+    RUN_STATUS_RUNNING,
+    RUN_STATUS_SUCCESS,
+];
 
 /// How closely two timestamps must agree to be the same instant on the wire, in seconds.
 const TIMESTAMP_TOLERANCE: f64 = 0.002;

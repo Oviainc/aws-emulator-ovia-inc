@@ -353,7 +353,10 @@ impl Session {
                 // The record behind the slot is gone, so nothing can execute it: release
                 // the slot rather than block the session on it for ever.
                 self.sequence_index.remove(&self.next_sequence_number);
-                self.next_sequence_number = self.next_sequence_number.saturating_add(1);
+                let Some(next) = self.next_sequence_number.checked_add(1) else {
+                    return;
+                };
+                self.next_sequence_number = next;
                 continue;
             };
             let terminal = self.start_or_settle_training(&mut op, now);
@@ -361,7 +364,13 @@ impl Session {
             if !terminal {
                 return;
             }
-            self.next_sequence_number = self.next_sequence_number.saturating_add(1);
+            // The cursor must MOVE for the next turn of the loop to read another slot, so
+            // a cursor that cannot be incremented ends the drain instead of re-reading
+            // the slot it just settled.
+            let Some(next) = self.next_sequence_number.checked_add(1) else {
+                return;
+            };
+            self.next_sequence_number = next;
         }
     }
 

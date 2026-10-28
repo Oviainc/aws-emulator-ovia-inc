@@ -424,6 +424,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The change this create starts is recorded by `begin_change` below,
             // once every option it set has a revision.
             changes: VecDeque::new(),
+            // No maintenance action has been started on a domain this create has
+            // just minted; `StartDomainMaintenance` is what records one.
+            maintenances: VecDeque::new(),
             // A new domain has been through no engine version upgrade and no upgrade
             // eligibility check; `UpgradeDomain` is what records one.
             upgrades: VecDeque::new(),

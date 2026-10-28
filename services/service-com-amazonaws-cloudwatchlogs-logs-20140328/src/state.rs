@@ -7000,6 +7000,23 @@ pub fn s3_table_integration_source_not_found_message(identifier: &str) -> String
     format!("Association not found for identifier: {identifier}")
 }
 
+/// The refusal CloudWatch Logs builds from the request when the `destinationName` it names
+/// is not a destination this account holds and the operation models no
+/// `ResourceNotFoundException`, so the missing destination is reported through
+/// `InvalidParameterException` — an error class documented only as "A parameter is specified
+/// incorrectly", which carries no sentence of its own, so the message states WHICH parameter
+/// value was rejected. The fixed text is "Destination with name " … " does not exist" and the
+/// one variable part is the requested name, taken verbatim from the request, so a caller
+/// managing several destinations can attribute the refusal to one request instead of guessing
+/// which of them failed.
+///
+/// Unlike this, an operation that DOES model `ResourceNotFoundException` refuses a missing
+/// destination with that error class's own documented sentence ("The specified resource does
+/// not exist."), specialised per resource kind by [`resource_not_found_message`].
+pub fn destination_not_found_message(destination_name: &str) -> String {
+    format!("Destination with name {destination_name} does not exist")
+}
+
 /// The refusal CloudWatch Logs builds from the request when the resource policy the
 /// caller named is not there. The message interpolates the requested `policyName`, so a
 /// caller deleting policies in a loop can attribute the refusal to one policy name
