@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SetReceiptRulePosition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SetReceiptRulePosition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SetReceiptRulePosition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +131,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SetReceiptRulePosition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SetReceiptRulePositionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SetReceiptRulePosition"))
+        // `ctx` carries only request metadata; this operation needs none of it.
+        let _ = ctx;
+        let rule_set_name = input.rule_set_name;
+        let rule_name = input.rule_name;
+        let after = input.after;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // See `reorder_receipt_rule_set.rs`: an engine with no store for this
+            // service cannot serve the operation at all, and every error this
+            // operation models is a client error, so none of them fits.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "SetReceiptRulePosition",
+            ));
+        };
+        let mut state = state.lock();
+
+        // `RuleSetName` IDENTIFIES a set the account already holds, so a name
+        // outside the documented form needs no refusal of its own: a name SES
+        // cannot hold is a name the store does not hold, which is the refusal
+        // below. The set is resolved FIRST — a position within a set that does
+        // not exist is nothing this account can set.
+        let Some(rule_set) = state.receipt_rule_sets.get_mut(&rule_set_name) else {
+            return Err(
+                SetReceiptRulePositionErrorModeled::RuleSetDoesNotExistException(
+                    RuleSetDoesNotExistException {
+                        name: Some(rule_set_name.clone()),
+                        message: Some(format!("Rule set does not exist: {rule_set_name}")),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "The name of the receipt rule to reposition": a name this set does not
+        // hold names no rule to reposition, which is the modelled refusal this
+        // operation declares for it, and nothing about the set changes.
+        let Some(from) = rule_set.rule_position(&rule_name) else {
+            return Err(
+                SetReceiptRulePositionErrorModeled::RuleDoesNotExistException(
+                    RuleDoesNotExistException {
+                        name: Some(rule_name.clone()),
+                        message: Some(format!("Rule does not exist: {rule_name}")),
+                    },
+                )
+                .into(),
+            );
+        };
+        // `After` is "the name of the receipt rule after which to place the
+        // specified receipt rule": it ANCHORS the new position to a rule of this
+        // same set, so a value naming no rule of it names no place to move the
+        // rule to — again the modelled refusal, with the order left as it was.
+        // A request anchoring the rule to ITSELF asks for the position it already
+        // occupies, which is a rule the set holds rather than an absent anchor.
+        let anchor = match &after {
+            None => None,
+            Some(after) if after == &rule_name => Some(from),
+            Some(after) => match rule_set.rule_position(after) {
+                Some(at) => Some(at),
+                None => {
+                    return Err(
+                        SetReceiptRulePositionErrorModeled::RuleDoesNotExistException(
+                            RuleDoesNotExistException {
+                                name: Some(after.clone()),
+                                message: Some(format!("Rule does not exist: {after}")),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            },
+        };
+
+        // Both names resolve, so the move IS the set's new evaluation order: the
+        // rule lands directly after its anchor (first in the order when the
+        // request named none), the rules it passes shift one place to close the
+        // gap it left and open the one it takes, and every rule — the moved one
+        // included — keeps everything but its position.
+        rule_set.move_rule(from, anchor);
+
+        Ok(SetReceiptRulePositionOutput {})
     }
 }

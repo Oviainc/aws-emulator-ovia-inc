@@ -1029,6 +1029,41 @@ impl ReceiptRuleSet {
         true
     }
 
+    /// Move the rule held at `from` so that it sits directly AFTER the rule held
+    /// at `after`, or first in the evaluation order when `after` is `None`.
+    ///
+    /// The rule travels whole and the set's length never changes — a move
+    /// rewrites positions and nothing else — so this applies no ceiling of its
+    /// own ([`Self::insert_rule`] is where a GROWING set meets
+    /// [`MAX_RECEIPT_RULES_PER_RULE_SET`]). The index arithmetic lives here
+    /// rather than in a handler: taking the rule out first shifts every later
+    /// rule one place earlier, so the target index depends on which side of the
+    /// rule its anchor sits on. Asking for the position a rule already occupies
+    /// (its anchor is itself, or the rule directly before it) leaves the order
+    /// untouched.
+    pub fn move_rule(&mut self, from: usize, after: Option<usize>) {
+        if from >= self.rules.len() {
+            return;
+        }
+        let to = match after {
+            // "If this parameter is null, the rule is inserted at the beginning
+            // of the rule list" — the first position in the evaluation order.
+            None => 0,
+            // The anchor sits before the rule: once the rule is taken out the
+            // anchor keeps its index, so the place directly after it is `at + 1`.
+            Some(at) if at < from => at + 1,
+            // The anchor sits at or after the rule: taking the rule out moves
+            // the anchor to `at - 1`, so the place directly after it is `at`.
+            // An anchor past the end of the list anchors to the last rule.
+            Some(at) => at.min(self.rules.len() - 1),
+        };
+        if to == from {
+            return;
+        }
+        let rule = self.rules.remove(from);
+        self.rules.insert(to, rule);
+    }
+
     /// Take the rule named `name` out of this set, and say whether a rule was
     /// taken out.
     ///

@@ -75,6 +75,8 @@ mod ses_receipt_rule_sets;
 mod ses_reorder_receipt_rule_set;
 #[path = "all/ses_send_raw_email.rs"]
 mod ses_send_raw_email;
+#[path = "all/ses_set_receipt_rule_position.rs"]
+mod ses_set_receipt_rule_position;
 #[path = "all/ses_source_identity_gate.rs"]
 mod ses_source_identity_gate;
 #[path = "all/ses_store_bounds.rs"]
