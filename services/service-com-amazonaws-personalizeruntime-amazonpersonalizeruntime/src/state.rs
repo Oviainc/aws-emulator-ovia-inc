@@ -656,18 +656,26 @@ pub fn requested_metadata_columns(
     Ok(Some(columns))
 }
 
-/// The `PredictedItem$metadata` map for one stored item, or `None` when the request
-/// asked for no metadata — in which case the member is omitted entirely.
+/// The `PredictedItem$metadata` map for one reported entry, from the Items-dataset
+/// attributes that entry stores, or `None` when the request asked for no metadata —
+/// in which case the member is omitted entirely.
 ///
-/// A requested column the item itself does not carry is left out of the map rather
-/// than reported empty: the value is absent in the stored Items dataset.
-pub fn metadata_for(item: &Item, columns: Option<&[String]>) -> Option<HashMap<String, String>> {
+/// Whether the member is present is a fact about the REQUEST, so it is decided here
+/// for every reported entry alike: the argument is the entry's attribute set, which an
+/// entry the catalog never held supplies as an empty one. A requested column the entry
+/// does not carry is left out of the map rather than reported empty: the value is
+/// absent in the stored Items dataset, and an entry carrying none of the requested
+/// columns is therefore reported with an empty map, not with no member.
+pub fn metadata_for(
+    attributes: &BTreeMap<String, String>,
+    columns: Option<&[String]>,
+) -> Option<HashMap<String, String>> {
     let columns = columns?;
     Some(
         columns
             .iter()
             .filter_map(|column| {
-                item.attributes
+                attributes
                     .get(column)
                     .map(|value| (column.clone(), value.clone()))
             })
