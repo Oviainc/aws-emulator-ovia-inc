@@ -1690,6 +1690,21 @@ pub fn arn_account(arn: &str) -> Option<&str> {
     arn.split(':').nth(4)
 }
 
+/// The owning account a modelled `accountId` member reports for a resource,
+/// derived from that resource's own ARN: its account segment, owned, and `None`
+/// when the ARN names no account at all — it carries fewer segments than an ARN,
+/// or its account segment is EMPTY, which (see [`arn_account`]) is what the
+/// segment is for a resource type whose ARNs carry no account.
+///
+/// Every view that reports a stored resource's owning account goes through this,
+/// so the account-level and the organization-level view of one stored resource
+/// cannot report its account differently.
+pub fn arn_account_id(arn: &str) -> Option<String> {
+    arn_account(arn)
+        .filter(|account| !account.is_empty())
+        .map(str::to_string)
+}
+
 /// The resource-authorization refusal: `Some(..)` when `aws_resource_arn` names a
 /// resource in an account other than the caller's, so the request is refused for
 /// THAT resource — 403 `AccessDeniedException`, whatever the caller's support
@@ -1700,11 +1715,9 @@ pub fn arn_account(arn: &str) -> Option<&str> {
 /// which is the only thing the service knows about the refusal and the only way a
 /// caller passing several ARNs learns which one was denied.
 pub fn foreign_resource_refusal(aws_resource_arn: &str) -> Option<AccessDeniedException> {
-    let account = arn_account(aws_resource_arn)?;
-    (!account.is_empty() && account != ::engine::emulator_account_id()).then(|| {
-        AccessDeniedException {
-            message: format!("Access denied to resource: {aws_resource_arn}"),
-        }
+    let account = arn_account_id(aws_resource_arn)?;
+    (account != ::engine::emulator_account_id()).then(|| AccessDeniedException {
+        message: format!("Access denied to resource: {aws_resource_arn}"),
     })
 }
 

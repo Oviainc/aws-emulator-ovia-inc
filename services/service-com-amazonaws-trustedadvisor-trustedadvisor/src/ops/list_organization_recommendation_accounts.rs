@@ -100,7 +100,9 @@ use super::types::*;
 ///
 /// Every member is read off the member account's own recommendation: the
 /// account id is that recommendation's ARN account segment (so the two can
-/// never disagree), and `lifecycleStage`, `updateReason`, `updateReasonCode`
+/// never disagree), taken through [`crate::state::arn_account_id`] — the one
+/// derivation every view of a stored resource's owning account shares — and
+/// `lifecycleStage`, `updateReason`, `updateReasonCode`
 /// and `lastUpdatedAt` are the ones a caller last wrote through
 /// `UpdateRecommendationLifecycle` on it.
 ///
@@ -114,9 +116,7 @@ fn account_lifecycle_summary(
     entry: &crate::state::RecommendationEntry,
 ) -> AccountRecommendationLifecycleSummary {
     AccountRecommendationLifecycleSummary {
-        account_id: crate::state::arn_account(&entry.arn)
-            .filter(|account| !account.is_empty())
-            .map(str::to_string),
+        account_id: crate::state::arn_account_id(&entry.arn),
         account_recommendation_arn: Some(entry.arn.clone()),
         lifecycle_stage: entry.lifecycle_stage.clone(),
         updated_on_behalf_of: None,

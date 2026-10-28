@@ -110,7 +110,8 @@ use super::types::*;
 ///
 /// * `accountId` is the account segment of the resource's own ARN — the account
 ///   that owns it — so no stored field can contradict the ARN a caller reads
-///   beside it;
+///   beside it, taken through [`crate::state::arn_account_id`], the one
+///   derivation every view of a stored resource's owning account shares;
 /// * `recommendationArn` is the ARN of the ORGANIZATION recommendation the
 ///   resource is reported under, which is what that member is modelled to
 ///   carry (`OrganizationRecommendationArn`, pattern
@@ -133,9 +134,7 @@ fn organization_resource_summary(
             .collect(),
         last_updated_at: crate::state::date_time(resource.last_updated_at_millis),
         exclusion_status: resource.exclusion_status.clone(),
-        account_id: crate::state::arn_account(&resource.arn)
-            .filter(|account| !account.is_empty())
-            .map(str::to_string),
+        account_id: crate::state::arn_account_id(&resource.arn),
         recommendation_arn: organization_recommendation_arn.to_string(),
     }
 }

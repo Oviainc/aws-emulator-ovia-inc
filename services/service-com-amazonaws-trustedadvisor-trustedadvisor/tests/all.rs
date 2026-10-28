@@ -31,6 +31,8 @@ mod organization_recommendation_read;
 mod organization_recommendation_resources;
 #[path = "all/organization_recommendations.rs"]
 mod organization_recommendations;
+#[path = "all/owning_account_from_arn.rs"]
+mod owning_account_from_arn;
 #[path = "all/recommendation_loop.rs"]
 mod recommendation_loop;
 #[path = "all/recommendations_for_resource.rs"]
