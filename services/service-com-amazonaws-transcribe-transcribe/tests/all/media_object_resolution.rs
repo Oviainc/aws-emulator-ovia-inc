@@ -122,7 +122,16 @@ pub(crate) async fn call(emulator: &MultiServiceRouter, operation: &str, input: 
 /// live in the URI and the body is the object's own bytes, so this is a raw request
 /// rather than a modelled call. The credential scope names `s3`, which is what the
 /// router claims on.
-async fn s3(emulator: &MultiServiceRouter, method: &str, path: &str, body: &[u8]) -> (u16, bytes::Bytes) {
+///
+/// `pub(crate)`, like the harness around it: the job-output suite
+/// (`crate::job_output_objects`) fetches the locations a finished job reports through
+/// this very helper rather than spelling the raw request a second time.
+pub(crate) async fn s3(
+    emulator: &MultiServiceRouter,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> (u16, bytes::Bytes) {
     let request = http::Request::builder()
         .method(method)
         .uri(format!("https://s3.{REGION}.amazonaws.com{path}"))

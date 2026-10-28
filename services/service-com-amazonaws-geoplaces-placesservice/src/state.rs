@@ -942,10 +942,8 @@ fn lookup_language<'a, T>(
         {
             return Some((tag.as_str(), value));
         }
-        match candidate.rfind('-') {
-            Some(cut) => candidate = &candidate[..cut],
-            None => return None,
-        }
+        let cut = candidate.rfind('-')?;
+        candidate = &candidate[..cut];
     }
 }
 

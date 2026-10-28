@@ -19,6 +19,8 @@ mod catalog_resource_identity;
 mod control_arn_resolution;
 #[path = "all/control_catalog.rs"]
 mod control_catalog;
+#[path = "all/control_mapping_filter_identity.rs"]
+mod control_mapping_filter_identity;
 #[path = "all/control_mappings.rs"]
 mod control_mappings;
 #[path = "all/framework_cross_walk.rs"]
