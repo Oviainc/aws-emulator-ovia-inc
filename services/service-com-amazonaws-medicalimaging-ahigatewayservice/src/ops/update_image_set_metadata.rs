@@ -30,7 +30,13 @@
 //!   member, so what `SearchImageSets` filters on and what the metadata document reports
 //!   never disagree. Every OTHER attribute — DICOM defines thousands — is persisted at the
 //!   path it was written at ([`crate::state::ImageSetAttributes::extra_attributes`]) and
-//!   reported from there, rather than accepted and dropped.
+//!   reported from there, rather than accepted and dropped. The model names the attributes
+//!   of ONE series per image set, the series its `dicomSeriesInstanceUID` identifies
+//!   ([`described_series`]), so the attributes of any OTHER series a document names — and
+//!   of every series it names while no identifier says which series the image set holds —
+//!   are among those others; and an identifier that leaves takes the attributes of the
+//!   series it identified to the path of that series with it, so no stored attribute is
+//!   left where the document cannot report it ([`settle_modelled_series`]).
 //! * `force` is what the model says it is: the flag that admits a change to
 //!   `Tag.StudyInstanceUID`, `Tag.SeriesInstanceUID`, `Tag.SOPInstanceUID` and
 //!   `Tag.StudyID`, and to a PRIVATE attribute of an individual SOP instance — a DICOM
@@ -278,6 +284,39 @@ impl ModelledAttribute {
         }
     }
 
+    /// What this attribute's modelled member HOLDS, spelled as the aggregated metadata
+    /// document spells the value, or `None` when nothing is stored there — the read that
+    /// pairs with [`ModelledAttribute::write`].
+    ///
+    /// The model types the two study counts as plain numbers rather than optional ones, so
+    /// each of them always holds one: zero is what an image set nothing has stored a count
+    /// for holds, which is what the document reports for it.
+    fn stored(self, tags: &DICOMTags) -> Option<Value> {
+        let text = |held: &Option<String>| held.clone().map(Value::String);
+        match self {
+            Self::PatientId => text(&tags.dicom_patient_id),
+            Self::PatientName => text(&tags.dicom_patient_name),
+            Self::PatientBirthDate => text(&tags.dicom_patient_birth_date),
+            Self::PatientSex => text(&tags.dicom_patient_sex),
+            Self::StudyInstanceUid => text(&tags.dicom_study_instance_uid),
+            Self::StudyId => text(&tags.dicom_study_id),
+            Self::StudyDescription => text(&tags.dicom_study_description),
+            Self::StudyDate => text(&tags.dicom_study_date),
+            Self::StudyTime => text(&tags.dicom_study_time),
+            Self::AccessionNumber => text(&tags.dicom_accession_number),
+            Self::StudyRelatedSeries => {
+                Some(Value::from(tags.dicom_number_of_study_related_series))
+            }
+            Self::StudyRelatedInstances => {
+                Some(Value::from(tags.dicom_number_of_study_related_instances))
+            }
+            Self::SeriesInstanceUid => text(&tags.dicom_series_instance_uid),
+            Self::SeriesModality => text(&tags.dicom_series_modality),
+            Self::SeriesBodyPart => text(&tags.dicom_series_body_part),
+            Self::SeriesNumber => tags.dicom_series_number.map(Value::from),
+        }
+    }
+
     /// Write `value` into this attribute's modelled member, or REMOVE what it held when
     /// `value` is `None`.
     ///
@@ -318,12 +357,14 @@ impl ModelledAttribute {
 
 /// The modelled attribute the document path `path` names, or `None` when the model names
 /// no attribute there — an attribute keyword it does not declare, a level it does not
-/// describe (one SOP instance's attributes), or the attributes of a series this image set
-/// does not hold.
+/// describe (one SOP instance's attributes), or the attributes of a series the modelled
+/// members do not describe.
 ///
-/// `series_instance_uid` is the series the image set holds: the model declares the
-/// attributes of ONE series per image set, so a path naming another series describes
-/// content the modelled members cannot hold and is kept as written.
+/// `series_instance_uid` is the series the modelled members describe ([`described_series`]):
+/// the model declares the attributes of ONE series per image set, identified by that one
+/// `dicomSeriesInstanceUID`, so a path naming any OTHER series — and every series path at
+/// all while the members describe none — names content the modelled members cannot hold and
+/// is kept as written.
 fn modelled_attribute(path: &[String], series_instance_uid: Option<&str>) -> Option<ModelledAttribute> {
     let keyword = path.last()?.as_str();
     let level: Vec<&str> = path.iter().map(String::as_str).collect();
@@ -347,10 +388,10 @@ fn modelled_attribute(path: &[String], series_instance_uid: Option<&str>) -> Opt
             _ => None,
         },
         [STUDY_KEY, SERIES_KEY, series, DICOM_KEY, _]
-            if series_instance_uid.is_none_or(|held| held == *series) =>
+            if series_instance_uid.is_some_and(|described| described == *series) =>
         {
             match keyword {
-                "SeriesInstanceUID" => Some(ModelledAttribute::SeriesInstanceUid),
+                SERIES_INSTANCE_UID_KEYWORD => Some(ModelledAttribute::SeriesInstanceUid),
                 "Modality" => Some(ModelledAttribute::SeriesModality),
                 "BodyPartExamined" => Some(ModelledAttribute::SeriesBodyPart),
                 "SeriesNumber" => Some(ModelledAttribute::SeriesNumber),
@@ -358,6 +399,127 @@ fn modelled_attribute(path: &[String], series_instance_uid: Option<&str>) -> Opt
             }
         }
         _ => None,
+    }
+}
+
+/// The attributes OF one series the model names, under the keyword the aggregated metadata
+/// document spells each with.
+///
+/// The three that DESCRIBE the series the modelled `dicomSeriesInstanceUID` identifies
+/// (`smithy_query(query="shape",shape="DICOMTags")`), rather than identifying it: they are
+/// the members that move with the series they belong to.
+const SERIES_ATTRIBUTES: [(&str, ModelledAttribute); 3] = [
+    ("Modality", ModelledAttribute::SeriesModality),
+    ("BodyPartExamined", ModelledAttribute::SeriesBodyPart),
+    ("SeriesNumber", ModelledAttribute::SeriesNumber),
+];
+
+/// The keyword the document spells the identifier of a series with — the attribute that
+/// says WHICH series a series level of the document is.
+const SERIES_INSTANCE_UID_KEYWORD: &str = "SeriesInstanceUID";
+
+/// The path the aggregated metadata document holds one attribute of the series
+/// `series_instance_uid` at: the series levels are keyed BY the Series Instance UID.
+fn series_path(series_instance_uid: &str, keyword: &str) -> Vec<String> {
+    [STUDY_KEY, SERIES_KEY, series_instance_uid, DICOM_KEY, keyword]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+/// What `attributes` holds at `path`, or `None` when it holds nothing there.
+fn value_at<'a>(attributes: &'a Map<String, Value>, path: &[String]) -> Option<&'a Value> {
+    let (name, rest) = path.split_first()?;
+    let held = attributes.get(name)?;
+    if rest.is_empty() {
+        return Some(held);
+    }
+    value_at(held.as_object()?, rest)
+}
+
+/// The series the modelled members describe while `document` is applied: the series the
+/// image set HOLDS, or — for an image set holding none — the series `document` itself
+/// identifies by writing that series' own `SeriesInstanceUID`.
+///
+/// The model declares the attributes of ONE series per image set, identified by that
+/// `dicomSeriesInstanceUID`, so a document naming SEVERAL series identifies none of them,
+/// and neither does one whose identifier disagrees with the series level it sits under:
+/// what the modelled members cannot describe is kept as written instead. A document of
+/// attributes to REMOVE identifies nothing either — it takes attributes away rather than
+/// saying which series the image set holds.
+fn described_series(
+    attributes: &ImageSetAttributes,
+    document: &Map<String, Value>,
+    removing: bool,
+) -> Option<String> {
+    if let Some(held) = attributes.dicom_tags.dicom_series_instance_uid.clone() {
+        return Some(held);
+    }
+    if removing {
+        return None;
+    }
+    let mut identified: Option<String> = None;
+    for DocumentAttribute { path, value } in attributes_of(document) {
+        let level: Vec<&str> = path.iter().map(String::as_str).collect();
+        let [STUDY_KEY, SERIES_KEY, series, DICOM_KEY, SERIES_INSTANCE_UID_KEYWORD] =
+            level.as_slice()
+        else {
+            continue;
+        };
+        if value.as_str() != Some(*series)
+            || identified
+                .as_deref()
+                .is_some_and(|already| already != *series)
+        {
+            return None;
+        }
+        identified = Some((*series).to_string());
+    }
+    identified
+}
+
+/// Keep the modelled members and the attributes kept as written describing ONE series
+/// each, once a document has been applied — `described` being the series the modelled
+/// members described while it was ([`described_series`]).
+///
+/// Those members describe the series their `dicomSeriesInstanceUID` identifies, so: once
+/// the image set holds that identifier, the attributes of that series belong in the
+/// modelled members, and one of them kept as written moves in; once it holds none, the
+/// members describe no series, so what they still hold is kept at the path of the series
+/// they described, which is where the metadata document reports it. Either way one
+/// attribute is held in ONE place, and a search and the metadata document report the same
+/// value for it.
+fn settle_modelled_series(attributes: &mut ImageSetAttributes, described: Option<&str>) {
+    if let Some(held) = attributes.dicom_tags.dicom_series_instance_uid.clone() {
+        for (keyword, modelled) in SERIES_ATTRIBUTES {
+            let at = series_path(&held, keyword);
+            let Some(value) = value_at(&attributes.extra_attributes, &at).cloned() else {
+                continue;
+            };
+            // A value of another kind than the model types the member as stays where it
+            // was written: the member carries what the model says it carries, and nothing
+            // is dropped for it.
+            if !modelled.admits(&value) {
+                continue;
+            }
+            modelled.write(&mut attributes.dicom_tags, Some(&value));
+            remove_at(&mut attributes.extra_attributes, &at);
+        }
+        return;
+    }
+    let Some(described) = described else {
+        return;
+    };
+    for (keyword, modelled) in SERIES_ATTRIBUTES {
+        let Some(value) = modelled.stored(&attributes.dicom_tags) else {
+            continue;
+        };
+        modelled.write(&mut attributes.dicom_tags, None);
+        write_at(
+            &mut attributes.extra_attributes,
+            &series_path(described, keyword),
+            value,
+        );
     }
 }
 
@@ -519,12 +681,12 @@ fn apply_document(
     removing: bool,
     path: &str,
 ) -> Result<(), UpdateImageSetMetadataError> {
+    // The series the modelled members describe while THIS document is applied, decided
+    // before any of it is: the image set holds the attributes of one series, so which
+    // series that is cannot depend on the order the document's attributes are walked in.
+    let described = described_series(attributes, document, removing);
     for DocumentAttribute { path: at, value } in attributes_of(document) {
-        // Read the series the image set holds for EACH attribute: a document may name the
-        // series it then describes, and the attributes under that series are the modelled
-        // ones from the moment it does.
-        let series_instance_uid = attributes.dicom_tags.dicom_series_instance_uid.clone();
-        match modelled_attribute(&at, series_instance_uid.as_deref()) {
+        match modelled_attribute(&at, described.as_deref()) {
             Some(modelled) if removing => {
                 modelled.write(&mut attributes.dicom_tags, None);
                 remove_at(&mut attributes.extra_attributes, &at);
@@ -547,6 +709,7 @@ fn apply_document(
             None => write_at(&mut attributes.extra_attributes, &at, value),
         }
     }
+    settle_modelled_series(attributes, described.as_deref());
     Ok(())
 }
 

@@ -49,7 +49,7 @@ use crate::image_set_copy::get_image_set;
 
 /// The Series Instance UID every seeded image set holds — the one series the model
 /// declares attributes for (`DICOMTags.dicomSeriesInstanceUID`).
-const SERIES_UID: &str = "1.2.840.113619.2.1.2.3";
+pub(crate) const SERIES_UID: &str = "1.2.840.113619.2.1.2.3";
 
 /// The SOP Instance UID the seeded pixel data came from, so the served document has an
 /// instance level for a case that writes an attribute of one SOP instance.
@@ -58,7 +58,8 @@ const SOP_UID: &str = "1.2.840.113619.2.1.1.4";
 /// The Study Instance UID a seeded image set holds unless a case names another.
 ///
 /// `pub(crate)` because `crate::image_set_capacity` puts a retired image set in the same
-/// study, which is that suite's rule rather than this one's.
+/// study, and `crate::image_set_series_attributes` seeds the same study while varying only
+/// the series — each of which is that suite's rule rather than this one's.
 pub(crate) const STUDY_UID: &str = "1.2.840.113619.2.1.9.1";
 
 /// The `contentType` `GetImageSetMetadata` serves the document with.
@@ -201,7 +202,7 @@ fn document(answer: &Answer, case: &str) -> Value {
 }
 
 /// What `document` holds at `path`, or `Value::Null` when it holds nothing there.
-fn at(document: &Value, path: &[&str]) -> Value {
+pub(crate) fn at(document: &Value, path: &[&str]) -> Value {
     let mut cursor = document;
     for name in path {
         cursor = &cursor[*name];
@@ -210,7 +211,7 @@ fn at(document: &Value, path: &[&str]) -> Value {
 }
 
 /// Read the whole document of `image_set_id` back.
-async fn read_document(
+pub(crate) async fn read_document(
     emulator: &Emulator,
     datastore_id: &str,
     image_set_id: &str,

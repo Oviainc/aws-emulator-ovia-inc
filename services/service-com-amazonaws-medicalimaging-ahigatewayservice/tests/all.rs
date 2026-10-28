@@ -45,6 +45,8 @@ mod image_set_promotion;
 mod image_set_properties;
 #[path = "all/image_set_search.rs"]
 mod image_set_search;
+#[path = "all/image_set_series_attributes.rs"]
+mod image_set_series_attributes;
 #[path = "all/image_set_version_listing.rs"]
 mod image_set_version_listing;
 #[path = "all/import_job_listing.rs"]
