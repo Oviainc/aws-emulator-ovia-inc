@@ -2219,6 +2219,12 @@ pub fn match_client_token<'a>(
 /// Two requests share a fingerprint exactly when they ask for the same resource with the
 /// same configuration, which is what distinguishes an SDK's retry of one create from a
 /// second, different create sent under the same token.
+///
+/// A caller renders each field; an OPTIONAL member is rendered so that ABSENT and
+/// present-but-default stay apart (`format!("{:?}", member)` does), because a member the
+/// request leaves out is materialised to the service's own default: were the two
+/// flattened to one field, a repeat that submitted that default would ask for a different
+/// resource under the first attempt's fingerprint.
 pub fn request_fingerprint(fields: &[String]) -> String {
     // The same length-prefixed digest an ETag is built with, for the same reason: no two
     // different field sequences may collide.
