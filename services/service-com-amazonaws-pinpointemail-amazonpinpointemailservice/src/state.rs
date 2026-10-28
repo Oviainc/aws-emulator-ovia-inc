@@ -9,6 +9,15 @@
 //! Both maps are [`BTreeMap`]s, so iteration order is the stored keys' order rather
 //! than a hash order that varies per process: `ListEmailIdentities` pages over a stable
 //! sequence, which is what makes its `NextToken` mean the same thing on the next call.
+//!
+//! The identity table here is this surface's VIEW of one account-wide set of email
+//! identities, which lives in the shared engine as
+//! [`::service_common::ses_identities::SesIdentityDirectory`] and which the two Amazon
+//! SES surfaces publish to and read as well: an identity belongs to the account rather
+//! than to the API that created it. What a record here adds to that set is what THIS
+//! API adds to an identity — its DKIM attributes, its tags, its custom MAIL FROM
+//! configuration — and [`reconcile_identities`] is where the two are brought back into
+//! agreement, on every operation this service serves.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, SystemTime};
@@ -123,6 +132,15 @@ pub struct EmailIdentityRecord {
     pub created_at: SystemTime,
     /// When this identity's verification comes due, or `None` once it has been applied.
     pub verification_due_at: Option<SystemTime>,
+    /// Whether the account's identity registry
+    /// ([`::service_common::ses_identities::SesIdentityDirectory`]) already carries this
+    /// identity.
+    ///
+    /// The registry is the account's SET of email identities, which the two Amazon SES
+    /// surfaces publish to and read as well, so this flag is what tells an identity
+    /// DELETED through one of them — registered here, gone from the registry — from one
+    /// this service has created but not published yet ([`reconcile_identities`]).
+    pub registered: bool,
 }
 
 impl EmailIdentityRecord {
@@ -145,7 +163,50 @@ impl EmailIdentityRecord {
             tags: Vec::new(),
             created_at,
             verification_due_at: Some(created_at + VERIFICATION_DUE_AFTER),
+            // Published to the account registry by the operation that created the
+            // identity, so the Amazon SES surfaces answer for it from the moment that
+            // call returns.
+            registered: false,
         }
+    }
+
+    /// An identity of this account that the registry holds and this service does not, as
+    /// this service's own record of it.
+    ///
+    /// The account holds the identity in the verification state the registry carries, so
+    /// the record is adopted in THAT state rather than started afresh as unverified: the
+    /// identity was created through another of the account's email APIs, and every one of
+    /// them reports one state for it. Everything this service's own API adds — tags, a
+    /// custom MAIL FROM domain — starts where `CreateEmailIdentity` starts it, since none
+    /// of it has been asked for.
+    pub fn adopted(
+        record: &::service_common::ses_identities::SesIdentityRecord,
+        now: SystemTime,
+    ) -> Self {
+        use ::service_common::ses_identities::SesVerificationState;
+
+        let mut adopted = Self::new(&record.name, now);
+        adopted.registered = true;
+        match record.verification {
+            // Verified: the same three facts this service writes itself when a
+            // verification falls due.
+            SesVerificationState::Success => {
+                adopted.verification_due_at = None;
+                adopted.verified_for_sending = true;
+                adopted.sending_enabled = true;
+                if let Some(dkim) = &mut adopted.dkim {
+                    dkim.status = Some(DKIM_STATUS_SUCCESS.to_string());
+                }
+            }
+            // Still being verified: the move is owed at the instant the registry
+            // carries, so this service reports it exactly when the others do.
+            SesVerificationState::Pending => adopted.verification_due_at = record.verification_due,
+            // A verification that failed or was never started is owed no move at all.
+            SesVerificationState::Failed
+            | SesVerificationState::TemporaryFailure
+            | SesVerificationState::NotStarted => adopted.verification_due_at = None,
+        }
+        adopted
     }
 
     /// Apply the verification the clock has already made due.
@@ -296,10 +357,117 @@ impl ComAmazonawsPinpointemailAmazonpinpointemailserviceState {
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.
+///
+/// Every call RECONCILES this service's identity table against the account's identity
+/// registry first ([`reconcile_identities`]), so an operation served here answers for
+/// every email identity the account holds — including the ones recorded through the
+/// Amazon SES surfaces — and for none it has deleted.
 pub fn service_state<Eng: Send + Sync + 'static>(
     engine: &Eng,
 ) -> Option<::engine::ServiceState<ComAmazonawsPinpointemailAmazonpinpointemailserviceState>> {
+    let engine = (engine as &dyn ::std::any::Any).downcast_ref::<::engine::InMemoryEngine>()?;
+    let state = engine.state::<ComAmazonawsPinpointemailAmazonpinpointemailserviceState>();
+    let registry = engine.state::<::service_common::ses_identities::SesIdentityDirectory>();
+    reconcile_identities(&state, &registry, SystemTime::now());
+    Some(state)
+}
+
+/// The account's identity registry in the shared engine, which this service and the two
+/// Amazon SES surfaces all publish to and read: call it with a handler's `&*self.engine`.
+///
+/// An operation that CREATES or DELETES an email identity publishes the change here, so
+/// the other surfaces answer for it from the moment the call returns. Take this lock
+/// while holding this service's own store, never the other way round, so two callers on
+/// different surfaces cannot wait on each other.
+pub fn identity_registry<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<::service_common::ses_identities::SesIdentityDirectory>> {
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
-        .map(::engine::InMemoryEngine::state::<ComAmazonawsPinpointemailAmazonpinpointemailserviceState>)
+        .map(::engine::InMemoryEngine::state::<
+            ::service_common::ses_identities::SesIdentityDirectory,
+        >)
+}
+
+/// Bring this service's identity table and the account's identity registry back into
+/// agreement at `now`, so every API over the account's email identities answers for ONE
+/// set of them.
+///
+/// The reconciliation itself is the registry's
+/// ([`::service_common::ses_identities::SesIdentityDirectory::reconcile`]), written once
+/// there rather than per surface; what this service contributes is its
+/// [`::service_common::ses_identities::AccountIdentityRecord`] impl below.
+fn reconcile_identities(
+    state: &::engine::ServiceState<ComAmazonawsPinpointemailAmazonpinpointemailserviceState>,
+    registry: &::engine::ServiceState<::service_common::ses_identities::SesIdentityDirectory>,
+    now: SystemTime,
+) {
+    // The lock order of this service: its own store, then the registry.
+    let mut state = state.lock();
+    let mut registry = registry.lock();
+    registry.reconcile(&mut state.identities, now);
+}
+
+impl ::service_common::ses_identities::AccountIdentityRecord for EmailIdentityRecord {
+    /// This service's table is keyed by the `EmailIdentity` as the request spelled it,
+    /// the way its own operations look one up.
+    fn table_key(name: &str) -> String {
+        name.to_string()
+    }
+
+    fn identity_name(&self) -> &str {
+        &self.identity_name
+    }
+
+    fn is_registered(&self) -> bool {
+        self.registered
+    }
+
+    fn mark_registered(
+        &mut self,
+        published: &::service_common::ses_identities::SesIdentityRecord,
+    ) {
+        // The TXT verification token the registry holds for a domain identity is not
+        // one this surface's model carries, so there is nothing of it to keep here.
+        let _ = published;
+        self.registered = true;
+    }
+
+    fn published(&self) -> ::service_common::ses_identities::SesIdentityRecord {
+        registry_record(self)
+    }
+
+    fn adopt(
+        published: &::service_common::ses_identities::SesIdentityRecord,
+        now: SystemTime,
+    ) -> Self {
+        Self::adopted(published, now)
+    }
+}
+
+/// How the account registry carries the identity `record`: the identity as it was
+/// created, its class, and the verification this service holds for it.
+pub fn registry_record(
+    record: &EmailIdentityRecord,
+) -> ::service_common::ses_identities::SesIdentityRecord {
+    use ::service_common::ses_identities::{SesIdentityKind, SesIdentityRecord, SesVerificationState};
+
+    SesIdentityRecord {
+        name: record.identity_name.clone(),
+        kind: if record.identity_type == IDENTITY_TYPE_DOMAIN {
+            SesIdentityKind::Domain
+        } else {
+            SesIdentityKind::EmailAddress
+        },
+        verification: if record.verified_for_sending {
+            SesVerificationState::Success
+        } else {
+            SesVerificationState::Pending
+        },
+        verification_due: record.verification_due_at,
+        // The TXT value a domain identity's owner publishes is the registry's own: no
+        // operation of this surface reports it, and the registry mints it once so the
+        // surface whose model carries one answers a stable value for the identity.
+        verification_token: None,
+    }
 }

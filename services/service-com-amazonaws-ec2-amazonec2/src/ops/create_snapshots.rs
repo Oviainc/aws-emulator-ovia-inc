@@ -20,11 +20,13 @@
 //! disagree about which volumes an instance has.
 //!
 //! Which of those volumes is the ROOT one is a fact of the attachment's device: the
-//! instance's root device name is the one its AMI publishes (`Image$RootDeviceName`), so an
-//! attachment at that device is the boot volume and every other attachment is a data
-//! volume. That is what `ExcludeBootVolume` excludes, and why naming the root volume in
-//! `ExcludeDataVolumeIds` is refused rather than honoured ("If you specify the ID of the
-//! root volume, the request fails. To exclude the root volume, use `ExcludeBootVolume`").
+//! instance's root device name is the one its launch put the root volume at
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::launched_root_device`], which reads
+//! `Image$RootDeviceName` for an AMI the account can see), so an attachment at that device
+//! is the boot volume and every other attachment is a data volume. That is what
+//! `ExcludeBootVolume` excludes, and why naming the root volume in `ExcludeDataVolumeIds` is
+//! refused rather than honoured ("If you specify the ID of the root volume, the request
+//! fails. To exclude the root volume, use `ExcludeBootVolume`").
 //!
 //! Each snapshot is stored as the modelled `Snapshot` shape
 //! ([`crate::state::SnapshotView`]) through
@@ -285,21 +287,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let instance = require_instance_with_volumes(&store, &specification.instance_id)?;
         let instance_id = instance.instance_id.clone();
         // "The device name of the root device volume" (`Image$RootDeviceName`): the device
-        // the instance's own AMI boots from, which is what makes one of the instance's
-        // attachments its boot volume. An instance whose AMI this store cannot see has no
-        // published root device, so none of its attachments is known to be the root one.
-        let root_device = instance
-            .image_id
-            .as_deref()
-            .and_then(|image_id| store.images.get(image_id))
-            .and_then(|image| image.root_device_name.clone());
+        // the instance's own launch put its root volume at, which is what makes one of the
+        // instance's attachments its boot volume. It is read through the crate's ONE
+        // resolution of that device
+        // ([`crate::state::ComAmazonawsEc2Amazonec2State::launched_root_device`]), the same
+        // one the launch minted the volume from, so this call and the launch cannot disagree
+        // about which attachment is the root one.
+        let root_device = store
+            .launched_root_device(instance.image_id.as_deref())
+            .map(|(device_name, _)| device_name);
 
         // "Each volume attached to the specified instance will produce one snapshot"
         // (`CreateSnapshots`), minus the exclusions the request asked for. The volumes are
         // walked in id order, which is the store's own order, so one request's snapshot set
-        // is reported in a stable order. An instance that holds no EBS volume therefore
-        // produces no snapshot: the set is the arithmetic consequence of the rule, read out
-        // of the store, and the corpus records no refusal of that case to word one from.
+        // is reported in a stable order. An instance left holding no EBS volume — every one
+        // of them detached, or dropped by the exclusions — therefore produces no snapshot:
+        // the set is the arithmetic consequence of the rule, read out of the store, and the
+        // corpus records no refusal of that case to word one from.
         let mut sources: Vec<SourceVolume> = Vec::new();
         for (volume_id, record) in &store.volumes {
             // The devices THIS instance holds this volume at: none means the volume is not
@@ -505,14 +509,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// [`crate::scaffolded::Scaffolded::instance_id_is_malformed`], which is the one place both
 /// wordings of this code live). A value that is not an instance id at all is refused one
 /// step earlier, by the id space itself, with the echoed-value message
-/// [`crate::scaffolded::Scaffolded::invalid_instance_id_malformed`] carries; the recorded
-/// units behind this operation's issue pin both halves.
+/// [`crate::scaffolded::Scaffolded::invalid_instance_id_malformed`] carries.
 ///
 /// So the choice belongs to the OPERATION rather than to the id, which is why this lives
 /// here and not in [`crate::state::require_known_instance`] — the shared helper the
 /// operations that DO draw the malformed/not-found distinction keep using. The resolved
 /// record is handed back, so the handler reads the instance ONCE rather than looking it up
 /// again behind an unreachable branch.
+///
+/// Neither of those two wordings is what AWS answered the one recorded refusal of THIS
+/// operation, whose text the corpus withholds: the refusal's status and error code are
+/// AWS's, its text is this service's, and the wordings here are the ones EC2's recordings
+/// carry for this code on the operations beside it.
 fn require_instance_with_volumes<'a, E>(
     store: &'a crate::state::ComAmazonawsEc2Amazonec2State,
     instance_id: &str,

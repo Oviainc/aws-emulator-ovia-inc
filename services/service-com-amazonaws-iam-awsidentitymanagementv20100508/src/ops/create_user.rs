@@ -168,7 +168,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // `ctx` carries request metadata only; what this operation reads out of it is the
+        // signing key id of the caller the request is authorized as. The user is named in
+        // the request — IAM is global, so no region is read.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateUserErrorModeled::ServiceFailureException(
                 ServiceFailureException {
@@ -178,6 +180,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let mut store = state.lock();
+
+        let path = input
+            .path
+            .clone()
+            .unwrap_or_else(|| crate::state::DEFAULT_PATH.to_string());
+        // IAM authorizes its own API: the caller's identity-based policies are evaluated
+        // before the user is created, and before the store is consulted for a name
+        // collision — so a caller that may not create users learns that it may not, never
+        // which names the account already holds. The decision is made on the ARN the user
+        // WOULD carry, which is the resource a statement about this call names, with the
+        // tags the request attaches handed to the gate: creating a tagged resource is the
+        // other call `aws:RequestTag/<key>` and `aws:TagKeys` are published for, so a
+        // grant conditioned on them admits exactly the tag sets it names. Nothing is
+        // created when it refuses.
+        crate::state::authorization::authorize_written(
+            &store,
+            ctx,
+            crate::state::authorization::CREATE_USER,
+            &crate::state::user_arn(&path, &input.user_name),
+            &format!("user {}", input.user_name),
+            crate::state::authorization::WrittenTags::Pairs(
+                input.tags.as_deref().unwrap_or_default(),
+            ),
+        )?;
 
         // IAM entity names are unique within the account and "are not
         // distinguished by case", so the case-folded name is the identity.
@@ -190,10 +216,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-
-        let path = input
-            .path
-            .unwrap_or_else(|| crate::state::DEFAULT_PATH.to_string());
 
         // An account holds a bounded number of users, so a caller cannot grow the
         // account without limit; past the quota IAM refuses the create.
