@@ -248,3 +248,5 @@ mod documentation_part_import_warnings;
 mod model_collection;
 #[path = "all/delete_domain_name_access_association.rs"]
 mod delete_domain_name_access_association;
+#[path = "all/base_path_mapping_collection.rs"]
+mod base_path_mapping_collection;

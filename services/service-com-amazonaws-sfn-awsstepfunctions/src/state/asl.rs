@@ -308,15 +308,25 @@ pub const MAX_CAUSE_BYTES: usize = 32_768;
 /// shortened to this.
 pub const MAX_WAIT_SECONDS: u64 = 31_622_400;
 
-/// The state types this emulator executes.
+/// Every state type the Amazon States Language DEFINES: the language's `Type` member
+/// selects one of these eight and nothing else, so a state declaring any other type
+/// is not a state the language describes and no state machine can be created with it
+/// ([`diagnose_state`] reports it).
+///
+/// The list is the union of the two groups the transition rule is keyed on —
+/// [`TERMINAL_STATE_TYPES`] and [`CONTINUING_STATE_TYPES`] — plus `Choice`, which
+/// transitions through its own `Choices`/`Default` members.
+pub const STATE_TYPES: &[&str] = &[
+    "Choice", "Fail", "Map", "Parallel", "Pass", "Succeed", "Task", "Wait",
+];
+
+/// The state types this emulator executes, which is every type the language defines.
 ///
 /// `Task` is one of them for both kinds of work a `Resource` can name: an activity
 /// task, which a worker polls for, and a service-integration call this emulator
 /// makes ([`super::integration`]). A `Resource` naming neither still ends the
 /// execution with [`RUNTIME_ERROR`].
-pub const EXECUTED_STATE_TYPES: &[&str] = &[
-    "Choice", "Fail", "Map", "Parallel", "Pass", "Succeed", "Task", "Wait",
-];
+pub const EXECUTED_STATE_TYPES: &[&str] = STATE_TYPES;
 
 /// The query language this interpreter evaluates. ASL's `QueryLanguage` member
 /// selects between it and JSONata; a JSONata definition is not run.
@@ -986,7 +996,7 @@ struct ParallelPlan<'a> {
 
 /// The diagnostic code `INVALID_JSON_DESCRIPTION`: "JSON syntax problem found".
 ///
-/// The four codes below are the ones this emulator's validation can reach, out of
+/// The codes below are the ones this emulator's validation can reach, out of
 /// the error-code list the model documents on
 /// `ValidateStateMachineDefinitionDiagnostic`
 /// (`smithy_query(query="doc",shape="ValidateStateMachineDefinitionDiagnostic")`).
@@ -1000,6 +1010,14 @@ pub const INVALID_JSON_DESCRIPTION: &str = "INVALID_JSON_DESCRIPTION";
 /// `SCHEMA_VALIDATION_FAILED`: "Schema validation reported errors" — the definition
 /// is JSON, but not the shape the Amazon States Language declares.
 pub const SCHEMA_VALIDATION_FAILED: &str = "SCHEMA_VALIDATION_FAILED";
+
+/// `UNSUPPORTED_JSONATA_EXPRESSION`: the definition is the shape the language
+/// declares, but one of its JSONata expressions is not one the service accepts —
+/// a reserved term read where the language does not bind it, which is a problem with
+/// the EXPRESSION rather than with the shape of the document around it. The model's
+/// own list of codes is not closed ("might add new diagnostics in the future"), so a
+/// code it does not list is still a code the service reports.
+pub const UNSUPPORTED_JSONATA_EXPRESSION: &str = "UNSUPPORTED_JSONATA_EXPRESSION";
 
 /// `MISSING_TRANSITION_TARGET`: "The value of \"Next\" field doesn't match a known
 /// state name" — reported for every transition target that names no declared state,
@@ -1462,6 +1480,24 @@ fn diagnose_state(
         ));
         return;
     };
+    // `Type` selects one of the state types the Amazon States Language DEFINES
+    // ([`STATE_TYPES`]), so a state naming any other one describes no state at all:
+    // nothing says what it reads, what it writes or where it goes next, which is why
+    // the walk stops here rather than judging the state's other members under rules
+    // that are keyed on its type.
+    if !STATE_TYPES.contains(&state_type) {
+        into.push(error(
+            SCHEMA_VALIDATION_FAILED,
+            at(&here, "/Type"),
+            format!(
+                "state '{name}' is of type '{}', which is not one of the state types the \
+                 Amazon States Language defines ({})",
+                echoed(state_type),
+                STATE_TYPES.join(", ")
+            ),
+        ));
+        return;
+    }
     // A `Fail` state's `Error` and `Cause` are reported verbatim by
     // `DescribeExecution`, through shapes with their own maxima, so a
     // definition carrying a longer one could never be reported.
@@ -1534,9 +1570,12 @@ fn diagnose_state(
     let language = match declared_language(state.get("QueryLanguage")) {
         Ok(Some(declared)) => {
             if declared == JSONPATH && inherited == JSONATA {
+                // The service blames the overriding STATE rather than the member it
+                // declares the override in: the state is the thing a state machine of
+                // this query language may not hold.
                 into.push(error(
                     SCHEMA_VALIDATION_FAILED,
-                    at(&here, "/QueryLanguage"),
+                    at(&here, ""),
                     format!(
                         "state '{name}' selects '{JSONPATH}', which a state of a '{JSONATA}' \
                          state machine must not do"
@@ -1640,15 +1679,56 @@ const JSONPATH_ONLY_MEMBERS: &[&str] = &[
 /// scanned as this state's data.
 const NESTED_MACHINE_MEMBERS: &[&str] = &["Branches", "ItemProcessor", "Iterator"];
 
+/// The member a state hands a failure to, whose own `Assign` and `Output` are the
+/// only ones the error output is in scope in.
+const CATCH_MEMBER: &str = "Catch";
+
 /// The reserved term a JSONata expression reads the error of a caught failure
 /// through, which the language scopes to a `Catch`: `$states.errorOutput` holds "the
 /// error output" of the state that failed, and only that `Catch`'s own `Assign` and
 /// `Output` are evaluated with it in scope.
 const ERROR_OUTPUT: &str = "$states.errorOutput";
 
+/// The reserved term a JSONata expression reads the state's own outcome through,
+/// which the language binds only where there IS one: `$states.result` holds what the
+/// state's work produced, so it is in scope in a state whose work produces a result
+/// ([`RESULT_STATE_TYPES`]) and on that state's success path — never in a `Catch`,
+/// which runs because the work produced no result at all.
+const RESULT: &str = "$states.result";
+
+/// The state types whose work produces a result, which is what binds [`RESULT`]: a
+/// `Task`'s own work, and the per-item and per-branch results a `Map` and a
+/// `Parallel` gather. Every other type carries its input through, so there is no
+/// result for an expression of it to read.
+const RESULT_STATE_TYPES: &[&str] = &["Map", "Parallel", "Task"];
+
+/// How the service states a field an expression reads that the expression's scope does
+/// not bind: the field is not there to read, so it is reported as the field it named.
+fn field_does_not_exist(term: &str) -> String {
+    format!("Field '{term}' does not exist.")
+}
+
+/// The reserved terms of the state's own outcome that a `member` of a state of this
+/// type must NOT read.
+///
+/// One rule, read off the member and the state's type: a term is reported wherever
+/// the language does not bind it, so an expression that could never resolve is
+/// refused at validation time rather than at run time.
+fn out_of_scope_terms(state_type: &str, member: &str) -> Vec<&'static str> {
+    let caught = member == CATCH_MEMBER;
+    let mut terms = Vec::new();
+    if !caught {
+        terms.push(ERROR_OUTPUT);
+    }
+    if caught || !RESULT_STATE_TYPES.contains(&state_type) {
+        terms.push(RESULT);
+    }
+    terms
+}
+
 /// The rules a state written in JSONata must satisfy: it carries none of the other
-/// language's data-flow members, and it reads [`ERROR_OUTPUT`] only where that term
-/// is in scope.
+/// language's data-flow members, and each reserved term of its own outcome is read
+/// only where the language binds it ([`out_of_scope_terms`]).
 fn diagnose_jsonata_state(
     name: &str,
     state: &Map<String, Value>,
@@ -1685,19 +1765,22 @@ fn diagnose_jsonata_state(
         }
     }
     for (member, value) in state {
-        if member == "Catch" || NESTED_MACHINE_MEMBERS.contains(&member.as_str()) {
+        if NESTED_MACHINE_MEMBERS.contains(&member.as_str()) {
             continue;
         }
-        if references_error_output(value) {
-            let member = echoed(member);
-            into.push(error(
-                SCHEMA_VALIDATION_FAILED,
-                at(here, &format!("/{member}")),
-                format!(
-                    "the '{member}' of state '{name}' reads '{ERROR_OUTPUT}', which is in scope \
-                     only in the 'Catch' that handles a failure"
-                ),
-            ));
+        let shown = echoed(member);
+        for term in out_of_scope_terms(state_type, member) {
+            // One diagnostic per FIELD that reads the term, which is the granularity
+            // `location` documents (`/States/<StateName>/<FieldName>`): a member
+            // carrying several such fields is several problems to fix, each at its own
+            // place in the caller's document.
+            for field in fields_reading(value, term) {
+                into.push(error(
+                    UNSUPPORTED_JSONATA_EXPRESSION,
+                    at(here, &format!("/{shown}{field}")),
+                    field_does_not_exist(term),
+                ));
+            }
         }
     }
 }
@@ -1752,28 +1835,42 @@ fn diagnose_jsonata_rule(
     }
 }
 
-/// Whether any JSONata expression inside `value` reads [`ERROR_OUTPUT`].
+/// Every FIELD inside `value` whose JSONata expression reads `term`, as the path
+/// from the member that carries `value` down to that field — the empty path for a
+/// member that is itself such an expression.
 ///
 /// The walk is ITERATIVE: `value` is a caller-shaped document, so it carries its own
-/// stack rather than the thread's.
-fn references_error_output(value: &Value) -> bool {
-    let mut pending = vec![value];
-    while let Some(value) = pending.pop() {
+/// stack rather than the thread's. Each path is built through [`nested_at`], so it is
+/// bounded as it grows, and the list is sorted lexicographically, which is what makes
+/// the per-field list of one member deterministic whatever shape the document has.
+fn fields_reading(value: &Value, term: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut pending = vec![(String::new(), value)];
+    while let Some((path, value)) = pending.pop() {
         match value {
             Value::String(text) => {
                 if jsonata_expressions(text)
                     .iter()
-                    .any(|expression| expression.contains(ERROR_OUTPUT))
+                    .any(|expression| expression.contains(term))
                 {
-                    return true;
+                    found.push(path);
                 }
             }
-            Value::Array(items) => pending.extend(items.iter()),
-            Value::Object(members) => pending.extend(members.values()),
+            Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    pending.push((nested_at(&path, format_args!("/{index}")), item));
+                }
+            }
+            Value::Object(members) => {
+                for (member, child) in members {
+                    pending.push((nested_at(&path, format_args!("/{}", echoed(member))), child));
+                }
+            }
             _ => {}
         }
     }
-    false
+    found.sort();
+    found
 }
 
 /// The payload templates a JSONPath state renders: every member of one is a LITERAL

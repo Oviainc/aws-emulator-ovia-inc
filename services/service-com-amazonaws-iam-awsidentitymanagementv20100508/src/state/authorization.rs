@@ -144,6 +144,9 @@ pub const GET_ACCOUNT_AUTHORIZATION_DETAILS: &str = "iam:GetAccountAuthorization
 /// `iam:GetDelegationRequest`.
 pub const GET_DELEGATION_REQUEST: &str = "iam:GetDelegationRequest";
 
+/// `iam:GenerateOrganizationsAccessReport`.
+pub const GENERATE_ORGANIZATIONS_ACCESS_REPORT: &str = "iam:GenerateOrganizationsAccessReport";
+
 /// `iam:ListDelegationRequests`.
 pub const LIST_DELEGATION_REQUESTS: &str = "iam:ListDelegationRequests";
 

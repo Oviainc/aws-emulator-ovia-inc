@@ -7,6 +7,12 @@
 //! value, and the only write it makes is materialising a deletion the clock has
 //! already made due.
 //!
+//! The `definition` it reports is encrypted under the state machine's own customer
+//! managed KMS key when it has one, so a read that reports it decides the caller's
+//! `kms:Decrypt` grant on that key first (`crate::state::encryption`, the modelled
+//! `KmsAccessDeniedException`); a metadata-only read reports no definition and so
+//! needs no grant.
+//!
 //! A request this operation cannot serve is refused with one of the operation's own
 //! modelled errors; it never answers 501.
 //!
@@ -248,6 +254,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.included_data.unwrap_or_default()
             )));
         };
+
+        // The definition of a state machine encrypted with a CUSTOMER MANAGED KMS key
+        // is handed out only to a caller that key permits ("callers must have
+        // kms:Decrypt permission to decrypt the definition"), so the caller's
+        // `kms:Decrypt` grant on it is decided before the definition is read. A
+        // metadata-only read reports no definition, so it decrypts nothing and needs
+        // no grant ("you can call DescribeStateMachine API with includedData =
+        // METADATA_ONLY to get a successful response without the encrypted
+        // definition"). The decision is made with no store of this service locked.
+        if !included_data.is_metadata_only() {
+            if let Some(why) = crate::state::encryption::state_machine_read_denied(
+                &*self.engine,
+                ctx,
+                &endpoint_region,
+                &input.state_machine_arn,
+            ) {
+                return Err(DescribeStateMachineErrorModeled::KmsAccessDeniedException(
+                    KmsAccessDeniedException { message: Some(why) },
+                )
+                .into());
+            }
+        }
 
         let mut store = state.lock();
         // Materialising a deletion the clock already owes is the one write a report

@@ -1085,6 +1085,41 @@ pub struct ServerCertificateRecord {
     pub tags: Option<Vec<Tag>>,
 }
 
+/// The organization the account belongs to, as IAM sees it: which organization it is,
+/// and which account manages it.
+///
+/// IAM reads this where an operation of its own is served only to an organization's
+/// management account — `GenerateOrganizationsAccessReport` ("to call this operation, you
+/// must be signed in using your Organizations management account credentials") — so the
+/// two facts such a decision needs are held in ONE place: the organization's id, which an
+/// Organizations entity path names, and the account that manages it.
+#[derive(Debug, Clone)]
+pub struct Organization {
+    /// "The unique identifier (ID) of an organization" (`OrganizationIdType`, pattern
+    /// `^o-[a-z0-9]{10,32}$`) — the value an entity path's first segment carries.
+    pub organization_id: String,
+    /// The account that manages the organization: the one whose credentials IAM serves
+    /// the organization-wide operations to, and the account every other member is
+    /// refused as.
+    pub management_account_id: String,
+}
+
+/// The organization an Organizations entity path names: the `o-…` segment it begins with.
+///
+/// "You can build an entity path using the known structure of your organization … your
+/// entity path is `o-a1b2c3d4e5/r-f6g7h8i9j0example/ou-rge0-awsabcde/123456789012`"
+/// (`GenerateOrganizationsAccessReport$EntityPath`), so the organization is the first
+/// segment and the root, the organizational units and the account follow it. `None` for a
+/// value that carries no such segment — which the member's own pattern
+/// (`^o-[0-9a-z]{10,32}\/r-…`) already refuses before a handler sees it.
+pub fn organizations_entity_path_organization(entity_path: &str) -> Option<&str> {
+    let organization = entity_path.split('/').next()?;
+    organization
+        .strip_prefix("o-")
+        .is_some_and(|id| !id.is_empty())
+        .then_some(organization)
+}
+
 /// Per-service state for com-amazonaws-iam-awsidentitymanagementv20100508. A handler reaches it through [`service_state`].
 ///
 /// Every map is a `BTreeMap` so enumeration order is total and stable, which is
@@ -1278,6 +1313,15 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// `^[\w-]+$` and the identifier is minted rather than named by a caller, so there
     /// is no case to fold and no [`name_key`] to build.
     pub delegation_requests: BTreeMap<String, DelegationRequest>,
+    /// The organization this account belongs to, or `None` while it belongs to none.
+    ///
+    /// `None` is the standalone account this emulator presents until something records
+    /// otherwise: an account is put in an organization by AWS Organizations, not by IAM,
+    /// so no operation of THIS service fills this field — the organization-wide operations
+    /// IAM serves only consult it ([`Self::manages_organization`]) and refuse a caller it
+    /// does not make the organization's management account. An `Option` rather than a
+    /// collection because an account belongs to at most one organization.
+    pub organization: Option<Organization>,
     /// The Organizations service-last-accessed report jobs the account has asked for,
     /// keyed by the `JobId` [`GenerateOrganizationsAccessReport`] answered with — "the job
     /// identifier … use this parameter in the GetOrganizationsAccessReport operation" —
@@ -1375,6 +1419,7 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
             account_alias: None,
             account_properties: BTreeMap::new(),
             delegation_requests: BTreeMap::new(),
+            organization: None,
             organizations_access_reports: BTreeMap::new(),
             organizations_access_report_seq: 0,
             saml_provider_uuid_seq: 0,
@@ -1533,6 +1578,20 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
             self.signing_certificate_id_seq,
             SIGNING_CERTIFICATE_ID_CHARACTERS,
         )
+    }
+
+    /// Whether `account_id` manages the organization `organization_id` — the question an
+    /// operation served only to an organization's management account is decided by.
+    ///
+    /// False for an account that belongs to no organization at all (a standalone account,
+    /// which is what [`Self::organization`] holds `None` for), for a member account of an
+    /// organization it does not manage, and for the management account of ANOTHER
+    /// organization than the one asked about.
+    pub fn manages_organization(&self, account_id: &str, organization_id: &str) -> bool {
+        self.organization.as_ref().is_some_and(|organization| {
+            organization.organization_id == organization_id
+                && organization.management_account_id == account_id
+        })
     }
 
     /// How many signing certificates the user keyed by `user_key` holds.
