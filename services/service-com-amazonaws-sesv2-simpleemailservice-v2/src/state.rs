@@ -410,17 +410,31 @@ pub fn ses_resource_of(resource_arn: &str) -> Option<(&str, &str)> {
 /// How the tagging surface words `NotFoundException` for a `ResourceArn` that names
 /// no resource the account holds in this Region.
 ///
-/// One wording for every operation that resolves a `ResourceArn` to a tag set, so a
-/// client sees the same sentence whichever of them first tells it the resource is
-/// gone. The ARN is the only variable part, taken from the request.
+/// One wording per resource KIND for every operation that resolves a `ResourceArn` to
+/// a tag set, so a client sees the same sentence whichever of them first tells it the
+/// resource is gone.
 ///
-/// Neither the model nor a recording of this surface states the sentence, so it is
-/// this service's own sentence for a named resource it does not hold — the form
-/// [`tenant_not_found`] states for the resource it names — with the resource written
-/// as the ARN the request addressed it by, which is the only name this operation is
-/// given.
+/// A tenant is addressed by an ARN carrying both its name and its id ([`tenant_arn`]),
+/// and this surface is RECORDED answering a tagging call whose tenant ARN resolves to no
+/// tenant with the fixed text `No Tenant present with name: ` and `with tenantId: ` run
+/// together without a separator, naming those two parts of the ARN the request
+/// addressed the tenant by — so a caller reads which tenant record was looked for.
+///
+/// For every other kind neither the model nor a recording of this surface states the
+/// sentence, so it is this service's own sentence for a named resource it does not hold
+/// — the form [`tenant_not_found`] states for the resource it names — with the resource
+/// written as the ARN the request addressed it by, which is the only name those
+/// operations are given.
 pub fn tagged_resource_not_found(resource_arn: &str) -> String {
-    format!("Resource {resource_arn} does not exist.")
+    let tenant = ses_resource_of(resource_arn)
+        .filter(|(resource_type, _)| *resource_type == "tenant")
+        .and_then(|(_, resource_id)| resource_id.split_once('/'));
+    match tenant {
+        Some((tenant_name, tenant_id)) => {
+            format!("No Tenant present with name: {tenant_name}with tenantId: {tenant_id}")
+        }
+        None => format!("Resource {resource_arn} does not exist."),
+    }
 }
 
 /// Tenants the account may hold.

@@ -107,6 +107,8 @@ mod reputation_entities;
 mod reputation_entity_policy;
 #[path = "all/request_claim.rs"]
 mod request_claim;
+#[path = "all/resource_tag_removal.rs"]
+mod resource_tag_removal;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/send_list_management_options.rs"]

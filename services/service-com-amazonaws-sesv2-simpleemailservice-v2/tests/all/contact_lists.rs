@@ -28,6 +28,7 @@
 //! topic.
 
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -242,21 +243,27 @@ fn next_token(reply: &Reply) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Percent-encode a `NextToken` for the query string.
+/// Percent-encode a caller-supplied value for the query string.
 ///
 /// `ListContactLists` binds `NextToken` to `@httpQuery`, and the token is base64, whose
 /// alphabet includes `+`, `/` and `=` — characters a query string gives its own meaning
 /// to, so the value is escaped the way an SDK escapes it. Shared with the other suites
-/// of this test binary that walk an `@httpQuery` token or put a filter in a query
-/// string.
+/// of this test binary that walk an `@httpQuery` token, put a filter in a query string
+/// or name an `@httpQuery` tag key, which the model's `Tag` documentation allows to be
+/// written in "Unicode letters" — so everything outside the unreserved set is escaped
+/// byte by byte over the value's UTF-8 encoding, and a value in any script survives the
+/// round trip.
 pub(crate) fn query_escaped(token: &str) -> String {
-    token
-        .chars()
-        .map(|character| match character {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => character.to_string(),
-            other => format!("%{:02X}", other as u32),
-        })
-        .collect()
+    let mut escaped = String::with_capacity(token.len());
+    for byte in token.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                escaped.push(char::from(*byte));
+            }
+            other => write!(escaped, "%{other:02X}").expect("writing to a String cannot fail"),
+        }
+    }
+    escaped
 }
 
 /// One row of the pagination table: how many items are stored and the `PageSize` the

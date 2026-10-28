@@ -692,7 +692,14 @@ async fn list_tags_for_resource_refuses_an_arn_it_cannot_resolve() {
             resource_arn: other_tenant_id_arn.clone(),
             status: 404,
             error_code: "NotFoundException",
-            message: format!("Resource {other_tenant_id_arn} does not exist."),
+            // A tenant ARN names the tenant and its id, and SES reports a tenant ARN
+            // resolving to no tenant by naming both of them rather than the whole ARN:
+            // the fixed text `No Tenant present with name: ` and `with tenantId: ` run
+            // together without a separator.
+            message: format!(
+                "No Tenant present with name: {}with tenantId: not-the-stored-id",
+                tenant.name
+            ),
         },
     ];
 

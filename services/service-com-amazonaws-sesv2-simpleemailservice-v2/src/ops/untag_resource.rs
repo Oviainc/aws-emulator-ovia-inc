@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the tag keys the request names from the resource its `ResourceArn` names,
+//! resolved against this account's records in the Region the call executes in: "when you
+//! specify a tag key, the action removes both that key and its associated tag value",
+//! every other tag stays on the resource in the order it was stored, and a key the
+//! resource does not carry is already absent, so naming it removes nothing and the call
+//! still succeeds. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +141,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The engine is not the shared in-memory engine, so this service has no
+            // store to write to. That is not a modelled SES state: answer the scaffold's
+            // 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UntagResource without the shared emulator state",
+            ));
+        };
+
+        let resource_arn = input.resource_arn;
+        // A value that is no resource ARN of this service, or one naming no resource
+        // within it, addresses nothing this API tags, so it is refused on the input,
+        // before any lookup and before any write, with the `BadRequestException` the
+        // model binds for "the input you provided is invalid", rather than reported as a
+        // resource that happens to be missing. The read side of this surface, and the
+        // write that adds tags, refuse the same values the same way.
+        if crate::state::ses_resource_of(&resource_arn).is_none() {
+            return Err(UntagResourceErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::UNSUPPORTED_RESOURCE_ARN.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The resource this call can reach is one of the account the request is
+        // authenticated for, in the Region its own credential scope names.
+        let scope = crate::state::CallerScope::of(ctx.parts());
+
+        let mut store = state.lock();
+        let Some(stored) = store.resource_tags_mut(&resource_arn, &scope) else {
+            // "The resource you attempted to access doesn't exist": the ARN is one this
+            // API addresses, so an ARN resolving to no record is reported as the missing
+            // resource it names, and nothing has been written, so the refused call
+            // leaves every later caller seeing what it saw.
+            return Err(UntagResourceErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::tagged_resource_not_found(&resource_arn)),
+                },
+            )
+            .into());
+        };
+
+        // A tag is identified by its key, which is unique on the resource, so each key
+        // the request names drops the one pair carrying it and every tag it does not name
+        // keeps its stored position. A key the resource does not carry (one never set,
+        // one an earlier removal already dropped, or one no caller could have defined)
+        // names no stored tag, so it removes nothing rather than failing the call: the
+        // state the caller asked for, those keys absent from the resource, is the state
+        // it is left in whether it asks once or twice.
+        stored.retain(|(stored_key, _)| !input.tag_keys.iter().any(|key| key == stored_key));
+
+        // `UntagResourceResponse` carries no members: what the resource is left carrying
+        // is read back with `ListTagsForResource` and by the read of the resource itself.
+        Ok(UntagResourceOutput {})
     }
 }
+
