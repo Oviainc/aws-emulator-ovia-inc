@@ -255,6 +255,30 @@ impl ComAmazonawsAiopsAiopsState {
         self.investigation_groups.get_mut(&id)
     }
 
+    /// The group `identifier` names in `request_region` for a POLICY operation that
+    /// needs a stored document, or the not-found answer the absent one of the two
+    /// resources is reported through — the two-step every policy operation shares,
+    /// through its one home ([`resolved_policy_group`]).
+    ///
+    /// For a reporting operation; the group it answers with carries a policy.
+    pub fn policy_group(
+        &self,
+        identifier: &str,
+        request_region: &str,
+    ) -> Result<&InvestigationGroup, ResourceNotFoundException> {
+        resolved_policy_group(self.group(identifier, request_region))
+    }
+
+    /// [`Self::policy_group`] for an operation the spec says mutates the stored policy:
+    /// the same two-step, through the same one home.
+    pub fn policy_group_mut(
+        &mut self,
+        identifier: &str,
+        request_region: &str,
+    ) -> Result<&mut InvestigationGroup, ResourceNotFoundException> {
+        resolved_policy_group(self.group_mut(identifier, request_region))
+    }
+
     /// Every group this account holds in `region`, in the store's stable id order.
     ///
     /// A group belongs to exactly one Region — the one its ARN names — so this is
@@ -388,6 +412,34 @@ pub fn investigation_group_not_found() -> ResourceNotFoundException {
 /// resource named, which is what lets a client tell the two apart.
 pub fn investigation_group_policy_not_found() -> ResourceNotFoundException {
     resource_not_found(INVESTIGATION_GROUP_POLICY_RESOURCE)
+}
+
+/// Which of the two 404s a policy operation answers for `resolved`, what resolving its
+/// `{identifier}` handed back — the WHOLE two-step a policy operation takes to reach a
+/// stored document, in one place.
+///
+/// The individual wordings are single-homed above; so is this composition, because the
+/// order is itself part of the contract. The identifier is resolved FIRST, and nothing
+/// resolving is the absent GROUP ([`investigation_group_not_found`]) — a policy
+/// operation reports the group it could not find, not a policy on a group that does not
+/// exist. Only then is the stored document looked at, and a group that exists while
+/// carrying none is the absent POLICY ([`investigation_group_policy_not_found`]), so a
+/// client can tell the two conditions apart. A change to which exception either step
+/// answers, or to their order, is therefore made once and every policy operation
+/// follows it.
+///
+/// Generic over how the caller holds the resolved record, so the reporting and the
+/// mutating resolver ([`ComAmazonawsAiopsAiopsState::policy_group`],
+/// [`ComAmazonawsAiopsAiopsState::policy_group_mut`]) share this one body. The group it
+/// answers with is guaranteed to carry a policy.
+fn resolved_policy_group<G: std::ops::Deref<Target = InvestigationGroup>>(
+    resolved: Option<G>,
+) -> Result<G, ResourceNotFoundException> {
+    let group = resolved.ok_or_else(investigation_group_not_found)?;
+    if group.policy.is_none() {
+        return Err(investigation_group_policy_not_found());
+    }
+    Ok(group)
 }
 
 /// The text separating a clause's subject from the requirement it states.

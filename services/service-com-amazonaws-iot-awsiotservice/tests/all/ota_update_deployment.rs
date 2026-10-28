@@ -22,7 +22,10 @@
 //! * a request it refuses (a target that names no device, a target ARN of another
 //!   resource type, a thing group, a file naming no location, an id already in use, or
 //!   a fan-out past a ceiling) writes nothing at all;
-//! * the creation the clock owes completes on its own, at the instant it was due.
+//! * the creation the clock owes completes on its own, at the instant it was due;
+//! * a `DeleteOTAUpdate` removes the update, the job it deployed and that job's
+//!   executions, and refuses while the job is still running unless the request forces
+//!   it.
 //!
 //! Each table spans the class the rule generalises over — how many targets and files
 //! one update carries and in what form, which optional members the request carries,
@@ -33,8 +36,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_iot_awsiotservice::state::{
-    CREATED_OTA_UPDATE_STATUS, MAX_JOB_TARGETS, MAX_OTA_UPDATE_FILES, MAX_OTA_UPDATE_ID_LEN,
-    NEW_OTA_UPDATE_STATUS, OTA_UPDATE_CREATION_SPAN, OTA_UPDATE_JOB_ID_PREFIX,
+    missing_ota_update_message, CREATED_OTA_UPDATE_STATUS, MAX_JOB_TARGETS, MAX_OTA_UPDATE_FILES,
+    MAX_OTA_UPDATE_ID_LEN, NEW_OTA_UPDATE_STATUS, OTA_UPDATE_CREATION_SPAN,
+    OTA_UPDATE_JOB_ID_PREFIX,
 };
 use service_com_amazonaws_iot_awsiotservice::EmulatedService;
 use service_common::iot_job_executions::{JobExecutionStore, MAX_THING_NAME_LEN, STATUS_QUEUED};
@@ -47,6 +51,10 @@ const REGION: &str = "us-east-1";
 /// An IAM role ARN of the shape `CreateOTAUpdate$roleArn` is modelled with (len
 /// 20..2048); the operation neither assumes nor resolves it.
 const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/ota-update-role";
+/// The terminal `JobExecutionStatus` a device reports when it finished the job it was
+/// handed (`smithy_query(query="shape",shape="JobExecutionStatus")`: QUEUED |
+/// IN_PROGRESS | SUCCEEDED | FAILED | TIMED_OUT | REJECTED | REMOVED | CANCELED).
+const STATUS_SUCCEEDED: &str = "SUCCEEDED";
 
 /// A SigV4 `Authorization` header whose credential scope names the `iot` signing name
 /// and `region`: the scope is how the router picks the claiming service, and how the
@@ -199,6 +207,61 @@ impl Emulator {
     async fn get_ota_update_in(&self, ota_update_id: &str, region: &str) -> Reply {
         self.call("GET", &format!("/otaUpdates/{ota_update_id}"), None, region)
             .await
+    }
+
+    /// The document of the AWS IoT job the update deploys through, read through the
+    /// job surface a device's `GetJobDocument` call uses.
+    async fn job_document(&self, job_id: &str, region: &str) -> Reply {
+        self.call(
+            "GET",
+            &format!("/jobs/{job_id}/job-document"),
+            None,
+            region,
+        )
+        .await
+    }
+
+    /// `DeleteOTAUpdate` with both flags left out (their modelled default, `false`) or
+    /// spelled out.
+    async fn delete_ota_update(
+        &self,
+        ota_update_id: &str,
+        force_delete_aws_job: Option<bool>,
+        delete_stream: Option<bool>,
+    ) -> Reply {
+        let mut query: Vec<String> = Vec::new();
+        if let Some(force) = force_delete_aws_job {
+            query.push(format!("forceDeleteAWSJob={force}"));
+        }
+        if let Some(delete_stream) = delete_stream {
+            query.push(format!("deleteStream={delete_stream}"));
+        }
+        let query = if query.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", query.join("&"))
+        };
+        self.call(
+            "DELETE",
+            &format!("/otaUpdates/{ota_update_id}{query}"),
+            None,
+            REGION,
+        )
+        .await
+    }
+
+    /// Finish `thing_name`'s execution of `job_id` in the SHARED store, which is what a
+    /// device reporting the job done through the Jobs data plane leaves behind.
+    fn finish_execution(&self, thing_name: &str, job_id: &str) {
+        let store = self.engine.state::<JobExecutionStore>();
+        let mut store = store.lock();
+        let index = store
+            .execution_index(thing_name, job_id, None)
+            .unwrap_or_else(|| panic!("{thing_name} must hold an execution of {job_id}"));
+        store
+            .record_mut(thing_name, index)
+            .expect("the index came from this store")
+            .status = STATUS_SUCCEEDED.to_string();
     }
 
     /// What the SHARED store holds for `thing_name`, in enqueue order.
@@ -565,8 +628,35 @@ async fn an_ota_update_is_recorded_and_deployed_to_every_targeted_thing() {
             read.body
         );
 
+        // The deployed job carries the document the OTA service generated for it, so
+        // the job's own reader reports one naming every file the request asked to be
+        // streamed; what it reports is what the executions below hand the device (the
+        // document's structure is `ota_update_job_document`'s own table).
+        let reported = emulator.job_document(&expected_job_id, case.region).await;
+        let document = reported.text("document");
+        assert!(
+            document.as_deref().is_some_and(|document| !document.is_empty()),
+            "case {:?}: expected the deployed job to carry a document, got {} {:?}",
+            case.case,
+            reported.status,
+            reported.body
+        );
+        let document_text = document.clone().unwrap_or_default();
+        for file in &case.files {
+            let file_name = file
+                .get("fileName")
+                .and_then(Value::as_str)
+                .expect("every file of a create case names itself");
+            assert!(
+                document_text.contains(file_name),
+                "case {:?}: expected the generated document to name the file {file_name:?} \
+                 the request asked to be streamed, got {document_text:?}",
+                case.case
+            );
+        }
+
         // The update's targets ARE its job's: one QUEUED execution per DISTINCT thing,
-        // carrying the per-device timeout the request named and no job document.
+        // carrying the per-device timeout the request named and the job's document.
         let mut distinct: Vec<&str> = case.targets.to_vec();
         distinct.sort_unstable();
         distinct.dedup();
@@ -578,7 +668,7 @@ async fn an_ota_update_is_recorded_and_deployed_to_every_targeted_thing() {
                     status: STATUS_QUEUED.to_string(),
                     version_number: 1,
                     execution_number: 1,
-                    document: None,
+                    document: document.clone(),
                     in_progress_timeout_minutes: case.in_progress_timeout_minutes,
                     started: false,
                 }],
@@ -902,4 +992,199 @@ async fn the_creation_the_clock_owes_completes_on_its_own() {
         "expected the completed status to stay, got {:?}",
         again.body
     );
+}
+
+/// One row of the deletion table.
+struct DeletionCase {
+    case: &'static str,
+    ota_update_id: &'static str,
+    /// The things the update targets.
+    targets: &'static [&'static str],
+    /// Whether every targeted device has finished its execution before the delete.
+    finished: bool,
+    /// `forceDeleteAWSJob`, when the row spells it out; left out is the modelled
+    /// default (`false`).
+    force_delete_aws_job: Option<bool>,
+    /// `deleteStream`, when the row spells it out.
+    delete_stream: Option<bool>,
+    /// The status the delete answers with.
+    status: u16,
+    /// The error code it answers with, for a refusal.
+    code: Option<&'static str>,
+}
+
+/// RULE: deleting an OTA update removes the three records its create wrote — the
+/// update, the AWS IoT job it deployed and that job's per-thing executions — and a job
+/// that is still running is deleted only when the request forces it; a refused delete
+/// removes nothing.
+#[tokio::test]
+async fn deleting_an_ota_update_removes_the_job_it_deployed_and_its_executions() {
+    let emulator = Emulator::new();
+
+    let cases: Vec<DeletionCase> = vec![
+        DeletionCase {
+            case: "every device finished, both flags left out",
+            ota_update_id: "ota-delete-finished",
+            targets: &["delete-sensor-a"],
+            finished: true,
+            force_delete_aws_job: None,
+            delete_stream: None,
+            status: 200,
+            code: None,
+        },
+        DeletionCase {
+            case: "two devices finished, the stream the request supplied is kept",
+            ota_update_id: "ota-delete-two-finished",
+            targets: &["delete-sensor-b", "delete-sensor-c"],
+            finished: true,
+            force_delete_aws_job: Some(false),
+            delete_stream: Some(true),
+            status: 200,
+            code: None,
+        },
+        DeletionCase {
+            case: "a device still has the job queued, and the delete does not force it",
+            ota_update_id: "ota-delete-running",
+            targets: &["delete-sensor-d"],
+            finished: false,
+            force_delete_aws_job: None,
+            delete_stream: None,
+            status: 400,
+            code: Some("InvalidRequestException"),
+        },
+        DeletionCase {
+            case: "a device still has the job queued, and the delete forces it",
+            ota_update_id: "ota-delete-forced",
+            targets: &["delete-sensor-e", "delete-sensor-f"],
+            finished: false,
+            force_delete_aws_job: Some(true),
+            delete_stream: Some(false),
+            status: 200,
+            code: None,
+        },
+    ];
+
+    for case in &cases {
+        let request = json!({
+            "targets": case.targets.iter().map(|name| thing_arn(name)).collect::<Vec<String>>(),
+            "files": [s3_file("firmware.bin", "1.0.0")],
+            "protocols": ["HTTP"],
+            "roleArn": ROLE_ARN,
+        });
+        assert_eq!(
+            emulator
+                .create_ota_update(case.ota_update_id, &request)
+                .await
+                .status,
+            200,
+            "case {:?}: the update must be creatable",
+            case.case
+        );
+        let job_id = format!("{OTA_UPDATE_JOB_ID_PREFIX}{}", case.ota_update_id);
+        if case.finished {
+            for thing_name in case.targets {
+                emulator.finish_execution(thing_name, &job_id);
+            }
+        }
+
+        let reply = emulator
+            .delete_ota_update(
+                case.ota_update_id,
+                case.force_delete_aws_job,
+                case.delete_stream,
+            )
+            .await;
+        assert_eq!(
+            reply.status, case.status,
+            "case {:?}: expected {}, got {} {:?}",
+            case.case, case.status, reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_code.as_deref(),
+            case.code,
+            "case {:?}: expected {:?}, got {:?} {:?}",
+            case.case,
+            case.code,
+            reply.error_code,
+            reply.body
+        );
+
+        if case.code.is_some() {
+            // A refused delete removes nothing: the update, its job's document and
+            // every execution are still there.
+            assert!(
+                reply.message().contains(&job_id),
+                "case {:?}: expected the refusal to name the job that is still running, \
+                 got {:?}",
+                case.case,
+                reply.body
+            );
+            assert_eq!(
+                emulator.get_ota_update(case.ota_update_id).await.status,
+                200,
+                "case {:?}: the refused delete must keep the update",
+                case.case
+            );
+            assert_eq!(
+                emulator.job_document(&job_id, REGION).await.status,
+                200,
+                "case {:?}: the refused delete must keep the deployed job",
+                case.case
+            );
+            for thing_name in case.targets {
+                assert_eq!(
+                    emulator.executions_for(thing_name).len(),
+                    1,
+                    "case {:?}: the refused delete must keep {thing_name}'s execution",
+                    case.case
+                );
+            }
+            continue;
+        }
+
+        let read = emulator.get_ota_update(case.ota_update_id).await;
+        assert_eq!(
+            read.status, 404,
+            "case {:?}: expected the deleted update to be gone, got {} {:?}",
+            case.case, read.status, read.body
+        );
+        let document = emulator.job_document(&job_id, REGION).await;
+        assert_eq!(
+            document.status, 404,
+            "case {:?}: expected the deployed job and its document to be gone, got {} {:?}",
+            case.case, document.status, document.body
+        );
+        for thing_name in case.targets {
+            assert_eq!(
+                emulator.executions_for(thing_name),
+                Vec::new(),
+                "case {:?}: expected {thing_name} to hold no execution of the deleted \
+                 job, got {:?}",
+                case.case,
+                emulator.executions_for(thing_name)
+            );
+        }
+    }
+
+    // An id the account holds no update under is the modelled 404, not an empty 200.
+    for ota_update_id in ["ota-delete-finished", "ota-never-existed"] {
+        let reply = emulator.delete_ota_update(ota_update_id, Some(true), None).await;
+        assert_eq!(
+            reply.status, 404,
+            "case {ota_update_id:?}: expected 404, got {} {:?}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_code.as_deref(),
+            Some("ResourceNotFoundException"),
+            "case {ota_update_id:?}: expected ResourceNotFoundException, got {:?}",
+            reply.error_code
+        );
+        assert_eq!(
+            reply.message(),
+            missing_ota_update_message(ota_update_id),
+            "case {ota_update_id:?}: expected the refusal to name the update, got {:?}",
+            reply.body
+        );
+    }
 }

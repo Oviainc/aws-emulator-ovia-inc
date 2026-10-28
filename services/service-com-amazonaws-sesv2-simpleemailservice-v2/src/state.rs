@@ -371,6 +371,67 @@ pub const REPUTATION_ENTITY_FILTER_KEYS: [&str; 4] = [
 /// `ReputationImpact` is one of.
 pub const RECOMMENDATION_IMPACTS: [&str; 2] = ["LOW", "HIGH"];
 
+/// `RecommendationStatus$OPEN`: the shortcoming the recommendation reports is still
+/// there, so the recommendation still asks for something.
+pub const RECOMMENDATION_STATUS_OPEN: &str = "OPEN";
+
+/// `RecommendationStatus$FIXED`: the configuration the recommendation asked for is in
+/// place, so the recommendation stands as a record of a shortcoming that was resolved.
+pub const RECOMMENDATION_STATUS_FIXED: &str = "FIXED";
+
+/// `RecommendationType$DKIM`: a domain's DKIM setup.
+pub const RECOMMENDATION_TYPE_DKIM: &str = "DKIM";
+
+/// `RecommendationType$SPF`: a domain's SPF setup, which for a sender of SES mail is
+/// its custom MAIL FROM domain — `PutEmailIdentityMailFromAttributes` is what makes the
+/// envelope sender a domain of the account's own, and so what lets that domain's SPF
+/// record speak for the mail SES sends for it.
+pub const RECOMMENDATION_TYPE_SPF: &str = "SPF";
+
+/// The `RecommendationImpact` every recommendation derived here carries.
+///
+/// The model states no impact per recommendation type ("the recommendation impact, with
+/// values like `HIGH` or `LOW`"), so the value is not read off a per-type table. Both
+/// findings derived here are that a domain's own mail authentication is not set up, which
+/// is what a receiving provider checks on every message it is offered and what it rejects
+/// or spam-folders a message for — the higher of the two modelled impacts.
+pub const RECOMMENDATION_IMPACT_HIGH: &str = "HIGH";
+
+/// The `Recommendation$Description` of the DKIM finding: what the recommendation asks the
+/// account to do, in SES's own terms for the mechanism (`CreateEmailIdentity` documents
+/// the identity's Easy DKIM tokens as "a set of unique strings that you use to create a
+/// set of CNAME records that you add to the DNS configuration for your domain").
+const DKIM_RECOMMENDATION_DESCRIPTION: &str =
+    "Add the DKIM records Amazon SES published for this domain to its DNS configuration, \
+     so that receiving mail providers can verify that messages signed for the domain were \
+     not altered in transit.";
+
+/// The `Recommendation$Description` of the SPF finding, in the same terms: a custom MAIL
+/// FROM domain is what `PutEmailIdentityMailFromAttributes` configures, and SES documents
+/// the MX record the caller publishes for it as the record it searches for.
+const SPF_RECOMMENDATION_DESCRIPTION: &str =
+    "Configure a custom MAIL FROM domain for this domain and publish the MX record Amazon \
+     SES asks for, so that the envelope sender of its messages is a domain whose SPF record \
+     authorizes Amazon SES to send for it.";
+
+/// What separates the two halves of [`recommendation_key`]: a unit separator, which no
+/// ARN and no modelled enum value carries, so the key of one recommendation can never
+/// read as the key of another.
+const RECOMMENDATION_KEY_SEPARATOR: char = '\u{1f}';
+
+/// The key one recommendation is ordered and paged by.
+///
+/// A recommendation is identified by the resource it is about and the type of finding it
+/// reports — a resource carries at most one finding of each type — so that pair orders the
+/// listing deterministically and names a position in it.
+pub fn recommendation_key(recommendation: &crate::ops::types::Recommendation) -> String {
+    format!(
+        "{}{RECOMMENDATION_KEY_SEPARATOR}{}",
+        recommendation.resource_arn.as_deref().unwrap_or_default(),
+        recommendation.r#type.as_deref().unwrap_or_default()
+    )
+}
+
 /// The `StatusRecord$Status` of every entity's Amazon-SES-managed status record.
 ///
 /// SES moves that status itself, on a reputation finding it raised against the
@@ -951,6 +1012,31 @@ impl ComAmazonawsSesv2SimpleemailserviceV2State {
                 .cmp(&right.reputation_entity_reference)
         });
         entities
+    }
+
+    /// Every recommendation the account's own records yield, reachable by the call
+    /// `scope` describes, ordered by [`recommendation_key`].
+    ///
+    /// No operation creates a recommendation: SES raises one for a resource whose mail
+    /// configuration it finds wanting, and marks it `FIXED` once the configuration it
+    /// asked for is in place. The table is therefore DERIVED from the resource records
+    /// on every read instead of being kept beside them, and each resource's own record
+    /// stays the single place its configuration lives — the same derivation
+    /// [`Self::reputation_entities`] makes for the entities of tracked resources.
+    ///
+    /// The resource a recommendation is about is an email identity
+    /// (`Recommendation$ResourceArn` is documented with an `identity/…` ARN), so the
+    /// identity table is what the findings are read off, and the ARN each carries is
+    /// minted in the Region the call executes in. Reporting only: the derivation reads
+    /// the records and writes nothing.
+    pub fn recommendations(&self, scope: &CallerScope) -> Vec<crate::ops::types::Recommendation> {
+        let mut recommendations: Vec<crate::ops::types::Recommendation> = self
+            .identities
+            .values()
+            .flat_map(|identity| identity.recommendations(&scope.region))
+            .collect();
+        recommendations.sort_by_cached_key(recommendation_key);
+        recommendations
     }
 
     /// The tenant a reputation entity reference names, for a write that has to
@@ -1776,6 +1862,62 @@ impl EmailIdentityRecord {
         }
     }
 
+    /// The recommendations this identity's record yields, with their ARNs minted in
+    /// `region`.
+    ///
+    /// Two of the model's `RecommendationType` values are decided by what this record
+    /// carries: `DKIM` by whether SES has found the DKIM records it told the caller to
+    /// publish for the domain, and `SPF` by whether a custom MAIL FROM domain is
+    /// configured and its MX record found — the two mechanisms this service's own
+    /// records say whether a domain has set up. Each is `OPEN` while the mechanism is
+    /// not in place and `FIXED` once it is, raised when the identity was created (the
+    /// first instant SES had this domain's setup to look at) and last updated when the
+    /// search that settled it fell due.
+    ///
+    /// The model's other six types are NOT derived: `DMARC` and `BIMI` are published
+    /// DNS policies for the domain, `COMPLAINT`, `BOUNCE` and `FEEDBACK_3P` are
+    /// recipient feedback on delivered mail, and `IP_LISTING` is a third party's
+    /// blocklist — none of which anything in this service observes or records, so there
+    /// is no finding of those kinds to report rather than one being made up.
+    ///
+    /// Both mechanisms authenticate a DOMAIN, so an email-address identity yields no
+    /// finding: it is the domain identity covering its address that carries the DKIM
+    /// and MAIL FROM configuration SES looks at.
+    pub fn recommendations(&self, region: &str) -> Vec<crate::ops::types::Recommendation> {
+        if self.identity_kind != IdentityKind::Domain {
+            return Vec::new();
+        }
+        let arn = identity_arn(region, &self.name);
+        // When the DKIM records were found, the identity's verification succeeded with
+        // them, so the instant that search last succeeded is when the finding was
+        // resolved; an identity whose DKIM was already in place when it was created (one
+        // inheriting a verified parent domain's) has no such instant, and its finding was
+        // resolved as it was raised.
+        let dkim_fixed_at = (self.dkim.status == SesStatus::Success)
+            .then(|| self.last_success_at.unwrap_or(self.created_at));
+        let spf_fixed_at = self
+            .mail_from
+            .as_ref()
+            .filter(|mail_from| mail_from.status == SesStatus::Success)
+            .map(|mail_from| mail_from.mx_lookup_due_at);
+        vec![
+            recommendation(
+                &arn,
+                RECOMMENDATION_TYPE_DKIM,
+                DKIM_RECOMMENDATION_DESCRIPTION,
+                self.created_at,
+                dkim_fixed_at,
+            ),
+            recommendation(
+                &arn,
+                RECOMMENDATION_TYPE_SPF,
+                SPF_RECOMMENDATION_DESCRIPTION,
+                self.created_at,
+                spf_fixed_at,
+            ),
+        ]
+    }
+
     /// Configure `domain` as this identity's custom MAIL FROM domain.
     ///
     /// Setting a domain starts the search for that domain's MX record, so the
@@ -1794,6 +1936,41 @@ impl EmailIdentityRecord {
                 self.mail_from = Some(MailFromState::new(domain, behavior_on_mx_failure, now));
             }
         }
+    }
+}
+
+/// One recommendation about the resource `arn` names.
+///
+/// `raised_at` is when the shortcoming the finding reports was first there and
+/// `fixed_at` when the configuration it asks for was in place, or `None` while it is
+/// not: that pair decides both the status and the instant the finding was last updated,
+/// so the two cannot disagree. Stated once here, so every derived finding reports its
+/// state the same way.
+fn recommendation(
+    arn: &str,
+    recommendation_type: &str,
+    description: &str,
+    raised_at: SystemTime,
+    fixed_at: Option<SystemTime>,
+) -> crate::ops::types::Recommendation {
+    crate::ops::types::Recommendation {
+        resource_arn: Some(arn.to_string()),
+        r#type: Some(recommendation_type.to_string()),
+        description: Some(description.to_string()),
+        status: Some(
+            match fixed_at {
+                Some(_) => RECOMMENDATION_STATUS_FIXED,
+                None => RECOMMENDATION_STATUS_OPEN,
+            }
+            .to_string(),
+        ),
+        created_timestamp: Some(::aws_smithy_types::DateTime::from(raised_at)),
+        // A finding cannot have been updated before it was raised, so the instant it was
+        // resolved is read as no earlier than that.
+        last_updated_timestamp: Some(::aws_smithy_types::DateTime::from(
+            fixed_at.map_or(raised_at, |at| at.max(raised_at)),
+        )),
+        impact: Some(RECOMMENDATION_IMPACT_HIGH.to_string()),
     }
 }
 
@@ -4079,6 +4256,9 @@ pub const DEDICATED_IPS_PAGE_TOKEN_TAG: &str = "sesv2:dedicated-ips:";
 
 /// The tag `ListExportJobs`'s own tokens carry.
 pub const EXPORT_JOBS_PAGE_TOKEN_TAG: &str = "sesv2:export-jobs:";
+
+/// The tag `ListRecommendations`'s own tokens carry.
+pub const RECOMMENDATIONS_PAGE_TOKEN_TAG: &str = "sesv2:recommendations:";
 
 /// Encode a `NextToken` that resumes the listing tagged `tag` after `last_returned`.
 ///

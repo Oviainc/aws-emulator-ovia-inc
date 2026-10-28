@@ -253,7 +253,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(name) => {
                 let not_found = || {
                     DescribeTagsErrorModeled::ResourceNotFoundFault(ResourceNotFoundFault {
-                        message: Some(format!("The resource could not be found: {name}")),
+                        message: Some(st::resource_not_found_message(name)),
                     })
                 };
                 let Some(entries) = store.tagged_resources_of(name, &filter, &region) else {

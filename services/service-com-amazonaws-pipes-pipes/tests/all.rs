@@ -27,6 +27,8 @@ mod pipe_execution_role;
 mod pipe_lifecycle;
 #[path = "all/pipe_lifecycle_conflicts.rs"]
 mod pipe_lifecycle_conflicts;
+#[path = "all/pipe_metric_attribution.rs"]
+mod pipe_metric_attribution;
 #[path = "all/pipe_metrics.rs"]
 mod pipe_metrics;
 #[path = "all/pipe_refusal_bodies.rs"]

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Detaches the resource policy of the resource the request's `ResourceArn`
+//! names, so the resource carries none from then on.
 //!
 //! ## Shape of an operation
 //!
@@ -94,9 +88,18 @@ impl ::aws_smithy_schema::serde::SerializableStruct for DeleteResourcePolicyOutp
 // here — hence the `DeleteResourcePolicyError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#DeleteResourcePolicy")]
+//
+// `DependentServiceUnavailableFault` — the fault this SERVICE models for "a
+// dependent internal service is temporarily unavailable", which every other
+// handler here answers an unreachable shared store with and which this
+// operation's own error list omits — is widened in through `extra_errors`.
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#DeleteResourcePolicy",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum DeleteResourcePolicyErrorModeled {
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
     ResourceNotFoundFault(ResourceNotFoundFault),
     UnsupportedOperationFault(UnsupportedOperationFault),
 }
@@ -147,23 +150,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = DELETE_RESOURCE_POLICY_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Detach one resource's policy.
+    ///
+    /// A resource carrying no policy has none to detach, which is the same
+    /// refusal the read answers it with: the call says the policy must be gone
+    /// from a resource that had one, so there is nothing to report success over.
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteResourcePolicy"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                DeleteResourcePolicyErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The same classification the write and the read use, so the three
+        // cannot disagree about which ARN names a policy holder.
+        if let Err(refusal) = st::check_policy_resource_arn(&input.resource_arn) {
+            return Err(match refusal {
+                st::PolicyResourceRefusal::NotAResource(message) => {
+                    DeleteResourcePolicyErrorModeled::ResourceNotFoundFault(
+                        ResourceNotFoundFault {
+                            message: Some(message),
+                        },
+                    )
+                }
+                st::PolicyResourceRefusal::UnsupportedResource(message) => {
+                    DeleteResourcePolicyErrorModeled::UnsupportedOperationFault(
+                        UnsupportedOperationFault {
+                            message: Some(message),
+                        },
+                    )
+                }
+            }
+            .into());
+        }
+
+        if !state.lock().remove_resource_policy(&input.resource_arn) {
+            return Err(DeleteResourcePolicyErrorModeled::ResourceNotFoundFault(
+                ResourceNotFoundFault {
+                    message: Some(st::RESOURCE_POLICY_NOT_FOUND.to_string()),
+                },
+            )
+            .into());
+        }
+
+        Ok(DeleteResourcePolicyOutput)
     }
 }

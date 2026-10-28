@@ -25,27 +25,11 @@
 //!   the documented form is refused;
 //! * a set takes no more destinations than Amazon SES allows one.
 
-use crate::harness::{call, element, elements, emulator, field, xml_text, Field};
+use crate::harness::{
+    account, call, create_event_destination, described_event_destinations, element, elements,
+    emulator, field, topic_arn, xml_text, Destination, REGION,
+};
 use smithy_server_runtime::MultiServiceRouter;
-
-/// The Region every request in this suite is scoped to, which is the Region of
-/// the harness's SigV4 credential scope and therefore the Region an ARN a
-/// request names has to be in.
-const REGION: &str = "us-east-1";
-
-/// The account this emulator serves, which is the account an ARN a request names
-/// has to belong to.
-fn account() -> String {
-    engine::EMULATOR_ACCOUNT_ID.to_string()
-}
-
-/// The ARN of the Amazon SNS topic `name` of this account in [`REGION`], which is
-/// the published form of a topic ARN
-/// (`arn:<partition>:sns:<region>:<account-id>:<topic-name>`) and so a `TopicARN`
-/// a destination could publish to.
-fn topic_arn(name: &str) -> String {
-    format!("arn:aws:sns:{REGION}:{}:{name}", account())
-}
 
 /// `CreateConfigurationSet`.
 async fn create_configuration_set(router: &MultiServiceRouter, name: &str) -> (u16, String) {
@@ -64,118 +48,6 @@ async fn given_configuration_set(router: &MultiServiceRouter, name: &str) {
         status, 200,
         "case create set {name}: expected 200, got {status} with {body}"
     );
-}
-
-/// The destination an event destination publishes to, as the form fields that
-/// name it on the wire.
-#[derive(Debug, Clone)]
-enum Destination {
-    /// `SNSDestination.TopicARN`.
-    Sns(String),
-    /// `KinesisFirehoseDestination`: `(IAMRoleARN, DeliveryStreamARN)`.
-    Firehose(String, String),
-    /// `CloudWatchDestination.DimensionConfigurations`: one entry per
-    /// `(DimensionName, DimensionValueSource, DefaultDimensionValue)`.
-    CloudWatch(Vec<(String, String, String)>),
-    /// No destination member at all.
-    None,
-    /// Both an SNS and a CloudWatch destination, which is more than one.
-    SnsAndCloudWatch(String),
-}
-
-impl Destination {
-    /// The form fields this destination contributes to a create.
-    fn fields(&self) -> Vec<Field> {
-        match self {
-            Self::Sns(topic_arn) => {
-                vec![field("EventDestination.SNSDestination.TopicARN", topic_arn)]
-            }
-            Self::Firehose(role_arn, stream_arn) => vec![
-                field(
-                    "EventDestination.KinesisFirehoseDestination.IAMRoleARN",
-                    role_arn,
-                ),
-                field(
-                    "EventDestination.KinesisFirehoseDestination.DeliveryStreamARN",
-                    stream_arn,
-                ),
-            ],
-            Self::CloudWatch(dimensions) => dimensions
-                .iter()
-                .enumerate()
-                .flat_map(|(index, (name, source, default))| {
-                    let at = format!(
-                        "EventDestination.CloudWatchDestination.DimensionConfigurations.member.{}",
-                        index + 1
-                    );
-                    [
-                        field(format!("{at}.DimensionName"), name),
-                        field(format!("{at}.DimensionValueSource"), source),
-                        field(format!("{at}.DefaultDimensionValue"), default),
-                    ]
-                })
-                .collect(),
-            Self::None => Vec::new(),
-            Self::SnsAndCloudWatch(topic_arn) => {
-                let mut fields = Self::Sns(topic_arn.clone()).fields();
-                fields.extend(Self::CloudWatch(vec![(
-                    "campaign".to_string(),
-                    "messageTag".to_string(),
-                    "none".to_string(),
-                )]).fields());
-                fields
-            }
-        }
-    }
-}
-
-/// `CreateConfigurationSetEventDestination`.
-async fn create_event_destination(
-    router: &MultiServiceRouter,
-    configuration_set: &str,
-    name: &str,
-    enabled: bool,
-    event_types: &[&str],
-    destination: &Destination,
-) -> (u16, String) {
-    let mut params = vec![
-        field("ConfigurationSetName", configuration_set),
-        field("EventDestination.Name", name),
-        field("EventDestination.Enabled", if enabled { "true" } else { "false" }),
-    ];
-    for (index, event_type) in event_types.iter().enumerate() {
-        params.push(field(
-            format!("EventDestination.MatchingEventTypes.member.{}", index + 1),
-            *event_type,
-        ));
-    }
-    params.extend(destination.fields());
-    call(
-        router,
-        "CreateConfigurationSetEventDestination",
-        &params,
-    )
-    .await
-}
-
-/// The `<EventDestinations>` element `DescribeConfigurationSet` reports for
-/// `name`, asked for by the attribute group the model's own
-/// `ConfigurationSetAttribute` enum names.
-async fn described_event_destinations(router: &MultiServiceRouter, name: &str) -> String {
-    let (status, body) = call(
-        router,
-        "DescribeConfigurationSet",
-        &[
-            field("ConfigurationSetName", name),
-            field("ConfigurationSetAttributeNames.member.1", "eventDestinations"),
-        ],
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "case describe {name}: expected 200, got {status} with {body}"
-    );
-    element(&body, "EventDestinations").unwrap_or_default()
 }
 
 /// The `(Code, Message)` of a refusal, with the XML entities the codec escapes a

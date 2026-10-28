@@ -951,9 +951,11 @@ async fn a_create_is_refused_when_its_peering_or_its_route_table_does_not_resolv
         "the route table over its own peering: expected 200, got {status} with {created}"
     );
 
-    // A peering whose core network has since been deleted carries no attachment either:
-    // the attachment hangs off that core network, so the create is refused on the member
-    // that carried the reference and stores nothing.
+    // A `PeeringId` naming no stored peering carries no attachment: the peering is what
+    // decides the core network the attachment hangs off, so the create is refused on the
+    // member that carried the reference and stores nothing. A core network holding a peering
+    // cannot be deleted under it (this service's dependency refusal), so the way a peering
+    // stops being resolvable is its own delete.
     let (_, orphan) = core_network_at(&emulator, "to be emptied", &["us-east-2"]).await;
     let orphan_case = RouteTableCase {
         name: "an orphaned peering",
@@ -971,6 +973,19 @@ async fn a_create_is_refused_when_its_peering_or_its_route_table_does_not_resolv
         routing_policy_label: None,
     };
     let (orphan_peering, _) = create_peering(&emulator, &orphan_case, &orphan).await;
+    let (status, refused) = emulator.delete(&format!("/core-networks/{orphan}")).await;
+    assert_eq!(
+        status, 400,
+        "DeleteCoreNetwork while the core network holds a peering: expected the dependency \
+         refusal, got {status} with {refused}"
+    );
+    let (status, gone) = emulator
+        .delete(&format!("/peerings/{orphan_peering}"))
+        .await;
+    assert_eq!(
+        status, 200,
+        "DeletePeering of the peering under test: expected 200, got {status} with {gone}"
+    );
     let (status, emptied) = emulator.delete(&format!("/core-networks/{orphan}")).await;
     assert_eq!(
         status, 200,
@@ -981,17 +996,17 @@ async fn a_create_is_refused_when_its_peering_or_its_route_table_does_not_resolv
         .await;
     assert_eq!(
         status, 400,
-        "case a peering whose core network is gone: expected 400, got {status} with {body}"
+        "case a peering that is no longer stored: expected 400, got {status} with {body}"
     );
     assert_eq!(
         error_code(&body),
         "ValidationException",
-        "case a peering whose core network is gone: wrong error code in {body}"
+        "case a peering that is no longer stored: wrong error code in {body}"
     );
     assert_eq!(
         body["Fields"][0]["Name"],
         json!("peeringId"),
-        "case a peering whose core network is gone: the refusal must name peeringId, got {body}"
+        "case a peering that is no longer stored: the refusal must name peeringId, got {body}"
     );
 }
 

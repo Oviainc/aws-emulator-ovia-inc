@@ -1831,61 +1831,18 @@ impl ComAmazonawsTranscribeTranscribeState {
     /// `None` when that ARN names no resource this call can reach.
     ///
     /// The read-only half of [`Self::tags_mut`], so a reporting operation
-    /// (`ListTagsForResource`) takes no mutable borrow for a read. The two must agree
-    /// about which ARN names which stored record, so both read the same ARN qualifiers
-    /// ([`ResourceRef::is_served_in`]) and match on the same resource types.
+    /// (`ListTagsForResource`) takes no mutable borrow for a read. The two cannot
+    /// disagree about which ARN names which stored record: they read the same ARN
+    /// qualifiers ([`ResourceRef::is_served_in`]), the same `<type>`-segment mapping
+    /// ([`ResourceFamily::from_resource_type`]) and the same per-family dispatch, whose
+    /// two borrow kinds ([`Self::tags_of`] and [`Self::tags_of_mut`]) are generated from
+    /// a single table of family-to-store pairs.
     pub fn tags(&self, resource: &ResourceRef, region: &str) -> Option<&Vec<Tag>> {
         if !resource.is_served_in(region) {
             return None;
         }
         let family = ResourceFamily::from_resource_type(&resource.resource_type)?;
         self.tags_of(family, region, &resource.name)
-    }
-
-    /// The tag set of the resource `family` names `name` in `region`, or `None` when
-    /// that Region holds no such resource.
-    ///
-    /// The lookup [`Self::tags`] and [`Self::holds`] both read, by family, Region and
-    /// borrowed name: one place decides which family's store answers for which resource.
-    pub fn tags_of(&self, family: ResourceFamily, region: &str, name: &str) -> Option<&Vec<Tag>> {
-        match family {
-            ResourceFamily::TranscriptionJob => self
-                .transcription_jobs
-                .get(region, name)
-                .map(|record| &record.tags),
-            ResourceFamily::MedicalTranscriptionJob => self
-                .medical_transcription_jobs
-                .get(region, name)
-                .map(|record| &record.tags),
-            ResourceFamily::Vocabulary => self
-                .vocabularies
-                .get(region, name)
-                .map(|record| &record.tags),
-            ResourceFamily::MedicalVocabulary => self
-                .medical_vocabularies
-                .get(region, name)
-                .map(|record| &record.tags),
-            ResourceFamily::VocabularyFilter => self
-                .vocabulary_filters
-                .get(region, name)
-                .map(|record| &record.tags),
-            ResourceFamily::LanguageModel => self
-                .language_models
-                .get(region, name)
-                .map(|record| &record.tags),
-            ResourceFamily::CallAnalyticsCategory => self
-                .call_analytics_categories
-                .get(region, name)
-                .map(|record| &record.tags),
-            ResourceFamily::MedicalScribeJob => self
-                .medical_scribe_jobs
-                .get(region, name)
-                .map(|record| &record.tags),
-            ResourceFamily::CallAnalyticsJob => self
-                .call_analytics_jobs
-                .get(region, name)
-                .map(|record| &record.tags),
-        }
     }
 
     /// The tag set of the resource `resource` names, for reading and writing, or
@@ -1902,49 +1859,90 @@ impl ComAmazonawsTranscribeTranscribeState {
     /// is served in ([`ResourceRef::is_served_in`]): the record a local ARN of the same
     /// `<type>/<name>` would reach is a DIFFERENT resource from the one that ARN names,
     /// so a write through it would mutate a resource the caller did not address.
+    ///
+    /// Which family's store answers for the ARN's `<type>` segment is decided by the
+    /// generated [`Self::tags_of_mut`], the write-borrow half of the very table the read
+    /// [`Self::tags`] dispatches through.
     pub fn tags_mut(&mut self, resource: &ResourceRef, region: &str) -> Option<&mut Vec<Tag>> {
         if !resource.is_served_in(region) {
             return None;
         }
-        match ResourceFamily::from_resource_type(&resource.resource_type)? {
-            ResourceFamily::TranscriptionJob => self
-                .transcription_jobs
-                .get_mut(region, &resource.name)
-                .map(|record| &mut record.tags),
-            ResourceFamily::MedicalTranscriptionJob => self
-                .medical_transcription_jobs
-                .get_mut(region, &resource.name)
-                .map(|record| &mut record.tags),
-            ResourceFamily::Vocabulary => self
-                .vocabularies
-                .get_mut(region, &resource.name)
-                .map(|record| &mut record.tags),
-            ResourceFamily::MedicalVocabulary => self
-                .medical_vocabularies
-                .get_mut(region, &resource.name)
-                .map(|record| &mut record.tags),
-            ResourceFamily::VocabularyFilter => self
-                .vocabulary_filters
-                .get_mut(region, &resource.name)
-                .map(|record| &mut record.tags),
-            ResourceFamily::LanguageModel => self
-                .language_models
-                .get_mut(region, &resource.name)
-                .map(|record| &mut record.tags),
-            ResourceFamily::CallAnalyticsCategory => self
-                .call_analytics_categories
-                .get_mut(region, &resource.name)
-                .map(|record| &mut record.tags),
-            ResourceFamily::MedicalScribeJob => self
-                .medical_scribe_jobs
-                .get_mut(region, &resource.name)
-                .map(|record| &mut record.tags),
-            ResourceFamily::CallAnalyticsJob => self
-                .call_analytics_jobs
-                .get_mut(region, &resource.name)
-                .map(|record| &mut record.tags),
-        }
+        let family = ResourceFamily::from_resource_type(&resource.resource_type)?;
+        self.tags_of_mut(family, region, &resource.name)
     }
+}
+
+/// Give the state BOTH borrow kinds of the per-family tag-set lookup from ONE table of
+/// `ResourceFamily => store` pairs.
+///
+/// Which family's store answers for an ARN's `<type>` segment is a single rule, and its
+/// read half (`tags_of`, which `ListTagsForResource` reads through
+/// [`ComAmazonawsTranscribeTranscribeState::tags`] and every job start through
+/// [`ComAmazonawsTranscribeTranscribeState::holds`]) and its write half (`tags_of_mut`,
+/// which `TagResource` and `UntagResource` write through
+/// [`ComAmazonawsTranscribeTranscribeState::tags_mut`]) differ in nothing but the borrow
+/// they take — so both are emitted from the one table below rather than written twice,
+/// as the `clocked_records!` and `listed_records!` tables of this module emit a family's
+/// per-record views. Neither generated match has a catch-all arm, so a family added to
+/// [`ResourceFamily`] and forgotten here fails to compile in both halves at once: a
+/// resource whose tags can be read but not written is no longer expressible.
+macro_rules! tag_sets {
+    ($($family:ident => $store:ident;)+) => {
+        impl ComAmazonawsTranscribeTranscribeState {
+            /// The tag set of the resource `family` names `name` in `region`, or `None`
+            /// when that Region holds no such resource.
+            ///
+            /// The lookup [`Self::tags`] and [`Self::holds`] both read, by family,
+            /// Region and borrowed name: one table decides which family's store answers
+            /// for which resource.
+            pub fn tags_of(
+                &self,
+                family: ResourceFamily,
+                region: &str,
+                name: &str,
+            ) -> Option<&Vec<Tag>> {
+                match family {
+                    $(
+                        ResourceFamily::$family => {
+                            self.$store.get(region, name).map(|record| &record.tags)
+                        }
+                    )+
+                }
+            }
+
+            /// The same lookup for writing, which [`Self::tags_mut`] reaches every
+            /// family's tag set through: the same family-to-store pairing, under a
+            /// mutable borrow.
+            pub fn tags_of_mut(
+                &mut self,
+                family: ResourceFamily,
+                region: &str,
+                name: &str,
+            ) -> Option<&mut Vec<Tag>> {
+                match family {
+                    $(
+                        ResourceFamily::$family => {
+                            self.$store.get_mut(region, name).map(|record| &mut record.tags)
+                        }
+                    )+
+                }
+            }
+        }
+    };
+}
+
+// Every family this emulator holds records of, paired with the store those records live
+// in — the one place that says which ARN `<type>` segment names which stored record.
+tag_sets! {
+    TranscriptionJob => transcription_jobs;
+    MedicalTranscriptionJob => medical_transcription_jobs;
+    Vocabulary => vocabularies;
+    MedicalVocabulary => medical_vocabularies;
+    VocabularyFilter => vocabulary_filters;
+    LanguageModel => language_models;
+    CallAnalyticsCategory => call_analytics_categories;
+    MedicalScribeJob => medical_scribe_jobs;
+    CallAnalyticsJob => call_analytics_jobs;
 }
 
 /// The resource an Amazon Transcribe ARN names: the partition, Region and account that
