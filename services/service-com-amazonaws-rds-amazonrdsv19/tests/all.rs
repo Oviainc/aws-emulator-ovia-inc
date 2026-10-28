@@ -59,6 +59,8 @@ mod db_parameters;
 mod db_security_group_deletion;
 #[path = "all/db_security_group_ingress.rs"]
 mod db_security_group_ingress;
+#[path = "all/db_security_group_ingress_concurrency.rs"]
+mod db_security_group_ingress_concurrency;
 #[path = "all/db_security_groups.rs"]
 mod db_security_groups;
 #[path = "all/db_shard_group_primary_cluster.rs"]
