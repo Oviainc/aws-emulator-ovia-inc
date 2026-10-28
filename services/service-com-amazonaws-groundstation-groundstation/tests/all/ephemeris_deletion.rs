@@ -54,7 +54,7 @@ use crate::scheduling_loop::{
 /// ones a request can reach today, because the rule is over the whole enum. Which of them
 /// are the ends of the lifecycle is `state::TERMINAL_CONTACT_STATUSES`, asserted here to be
 /// a subset of this list so the two cannot drift apart.
-const CONTACT_STATUSES: &[&str] = &[
+pub(crate) const CONTACT_STATUSES: &[&str] = &[
     "AVAILABLE",
     "AWS_CANCELLED",
     "AWS_FAILED",
@@ -153,7 +153,7 @@ async fn list_tags(router: &MultiServiceRouter, arn: &str) -> Reply {
 ///
 /// Satellites are not created through this API and `GetSatellite` is still a scaffolded
 /// 501, so the only reader of the ARN a contact names its satellite by is the store itself.
-fn satellite_arn(engine: &engine::InMemoryEngine, satellite_id: &str) -> String {
+pub(crate) fn satellite_arn(engine: &engine::InMemoryEngine, satellite_id: &str) -> String {
     service_state(engine)
         .expect("this service's state store")
         .lock()
@@ -169,7 +169,7 @@ fn satellite_arn(engine: &engine::InMemoryEngine, satellite_id: &str) -> String 
 /// Most `ContactStatus` values are reached by the scheduler and by the pass itself, which
 /// no request drives, so the stored contact's status is set directly — as
 /// `tests/all/contact_cancellation.rs` does for the same reason.
-fn put_in_status(engine: &engine::InMemoryEngine, contact_id: &str, status: &str) {
+pub(crate) fn put_in_status(engine: &engine::InMemoryEngine, contact_id: &str, status: &str) {
     service_state(engine)
         .expect("this service's state store")
         .lock()

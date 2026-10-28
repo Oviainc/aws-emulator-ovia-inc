@@ -4689,19 +4689,23 @@ impl ComAmazonawsGroundstationGroundstationState {
         Some(removed)
     }
 
-    /// The contacts that still depend on the ephemeris `ephemeris_id` names, as the
-    /// refusal of a delete lists them; empty when nothing depends on it.
+    /// The contacts the ephemeris `ephemeris_id` names POINTS, whatever status each of them
+    /// holds — what a listing filtering on an ephemeris selects; empty when it points
+    /// nothing.
     ///
     /// An ephemeris is what a contact's antenna is pointed by, in either of the two ways a
     /// contact names one: through the satellite the ephemeris applies to — a contact names
     /// its satellite by ARN ([`Contact::flies_satellite`]), and the ephemeris in force for
     /// that satellite is the trajectory its pass is flown on — or by naming the ephemeris
     /// itself in the program track of its tracking overrides
-    /// ([`Contact::program_tracks_ephemeris`]). So the ephemerides a contact depends on are
-    /// the ones that apply to its satellite plus the one its program track names, and a
-    /// contact depends on them for as long as it is not terminal
-    /// ([`Contact::is_non_terminal`]) — once its pass is over or its reservation released,
-    /// nothing of it is still to be flown.
+    /// ([`Contact::program_tracks_ephemeris`]). So the ephemerides that point a contact are
+    /// the ones that apply to its satellite plus the one its program track names.
+    ///
+    /// Which contacts an ephemeris points is a property of the POINTING, not of where each
+    /// contact sits in its own lifecycle: a contact whose pass is over or whose reservation
+    /// was released was still flown on the trajectory it names. The non-terminal
+    /// restriction belongs to the IN-USE question alone
+    /// ([`Self::contacts_using_ephemeris`]), which is a different question.
     ///
     /// For the SATELLITE coupling, only an ephemeris whose status is [`EPHEMERIS_ENABLED`]
     /// is in force: that status is what "whether or not the ephemeris is enabled"
@@ -4709,13 +4713,13 @@ impl ComAmazonawsGroundstationGroundstationState {
     /// still validating, disabled, invalid or expired is not the trajectory anything is
     /// flown on. A contact that names an ephemeris OUTRIGHT holds it whatever its status:
     /// the reference is the contact's own configuration, not a trajectory the service
-    /// chose. CHOSEN coupling: AWS documents only that such a resource "is in use by
-    /// non-terminal state contacts", so which contacts hold which ephemeris is this
-    /// emulator's rule, stated once here rather than per operation.
+    /// chose. CHOSEN coupling: AWS documents only which ephemeris a pass is flown on, so
+    /// which contacts an ephemeris points is this emulator's rule, stated once here rather
+    /// than per operation.
     ///
-    /// Sorted, so a refusal listing them reads the same on every call whatever order the
-    /// map iterates in.
-    pub fn contacts_using_ephemeris(&self, ephemeris_id: &str) -> Vec<String> {
+    /// Sorted, so every answer built from it reads the same on every call whatever order
+    /// the map iterates in.
+    pub fn contacts_pointed_by_ephemeris(&self, ephemeris_id: &str) -> Vec<String> {
         let Some(ephemeris) = self.ephemerides.get(ephemeris_id) else {
             return Vec::new();
         };
@@ -4731,20 +4735,42 @@ impl ComAmazonawsGroundstationGroundstationState {
         } else {
             None
         };
-        let mut holding: Vec<String> = self
+        let mut pointed: Vec<String> = self
             .contacts
             .values()
             .filter(|contact| {
-                contact.is_non_terminal()
-                    && (contact.program_tracks_ephemeris(ephemeris_id)
-                        || flown_satellite_arn
-                            .as_deref()
-                            .is_some_and(|arn| contact.flies_satellite(arn)))
+                contact.program_tracks_ephemeris(ephemeris_id)
+                    || flown_satellite_arn
+                        .as_deref()
+                        .is_some_and(|arn| contact.flies_satellite(arn))
             })
             .map(|contact| contact.contact_id.clone())
             .collect();
-        holding.sort();
-        holding
+        pointed.sort();
+        pointed
+    }
+
+    /// The contacts that still depend on the ephemeris `ephemeris_id` names, as the
+    /// refusal of a delete lists them; empty when nothing depends on it.
+    ///
+    /// The contacts it points ([`Self::contacts_pointed_by_ephemeris`]) that are still
+    /// going somewhere: a contact depends on what it is flown with for as long as it is not
+    /// terminal ([`Contact::is_non_terminal`]) — once its pass is over or its reservation
+    /// released, nothing of it is still to be flown, so a resource it names is no longer
+    /// held. AWS documents only that such a resource "is in use by non-terminal state
+    /// contacts", which is exactly that restriction.
+    ///
+    /// Sorted, like the pointing it narrows, so a refusal listing them reads the same on
+    /// every call.
+    pub fn contacts_using_ephemeris(&self, ephemeris_id: &str) -> Vec<String> {
+        self.contacts_pointed_by_ephemeris(ephemeris_id)
+            .into_iter()
+            .filter(|contact_id| {
+                self.contacts
+                    .get(contact_id)
+                    .is_some_and(Contact::is_non_terminal)
+            })
+            .collect()
     }
 
     /// Remove the ephemeris `ephemeris_id` addresses, along with the ARN index entry that

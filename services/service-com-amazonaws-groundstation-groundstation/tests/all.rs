@@ -37,6 +37,8 @@ mod contact_cancellation;
 mod contact_dataflows_and_pass_stages;
 #[path = "all/contact_endpoint_settle_consistency.rs"]
 mod contact_endpoint_settle_consistency;
+#[path = "all/contact_ephemeris_filter.rs"]
+mod contact_ephemeris_filter;
 #[path = "all/contact_version_description.rs"]
 mod contact_version_description;
 #[path = "all/contact_version_listing.rs"]

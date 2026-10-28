@@ -294,10 +294,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         guard.settle_due_ephemerides();
 
         // Which contacts the `ephemeris` filter admits: the ones the ephemeris it names
-        // points, by this service's one rule for that (`contacts_using_ephemeris`, the same
-        // rule that keeps such an ephemeris from being deleted).
+        // POINTS, by this service's one rule for that
+        // (`contacts_pointed_by_ephemeris`). A filter selects on the pointing alone, so
+        // every contact the ephemeris points stays selectable whatever status it holds —
+        // the narrower in-use rule, which drops the terminal ones because they hold nothing
+        // any longer, belongs to the delete that rule protects, not to a listing whose
+        // `statusList` is free to ask for exactly those statuses.
         let pointed_by_filter: Option<Vec<String>> =
-            filter_ephemeris_id.map(|id| guard.contacts_using_ephemeris(id));
+            filter_ephemeris_id.map(|id| guard.contacts_pointed_by_ephemeris(id));
 
         // The contacts the store holds, ordered by contact id: a page boundary is only
         // stable over a stable order. The windows an availability search computes are
