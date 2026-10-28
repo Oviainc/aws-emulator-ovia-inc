@@ -37,6 +37,8 @@ mod identity_key_separators;
 mod mutating_plan_admission;
 #[path = "all/plan_version_member_validation.rs"]
 mod plan_version_member_validation;
+#[path = "all/policy_name_identity.rs"]
+mod policy_name_identity;
 #[path = "all/predictive_scaling_predicate.rs"]
 mod predictive_scaling_predicate;
 #[path = "all/scaling_instruction_validation.rs"]

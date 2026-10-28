@@ -212,49 +212,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // Every resource the plan covers, ordered by the identity that
                     // addresses it, so that ordering is fixed by the resources themselves
                     // and a page boundary keeps its meaning across a rewrite of the
-                    // instruction list. Each instruction's POSITION in the plan's own
-                    // list travels along: that is what names its policies apart.
-                    let mut covered: Vec<(String, usize, &ScalingInstruction)> = plan
+                    // instruction list.
+                    let mut covered: Vec<(String, &ScalingInstruction)> = plan
                         .scaling_instructions
                         .iter()
-                        .enumerate()
-                        .map(|(resource, instruction)| {
+                        .map(|instruction| {
                             (
                                 crate::state::resource_identity_key(instruction),
-                                resource,
                                 instruction,
                             )
                         })
                         .collect();
-                    covered.sort_by(|(left, _, _), (right, _, _)| left.cmp(right));
+                    covered.sort_by(|(left, _), (right, _)| left.cmp(right));
 
                     // One resource more than the page is taken, so "is there another
                     // page?" is answered from state rather than guessed — the same way
                     // the sibling read over the plans themselves answers it.
-                    let mut page: Vec<(String, usize, &ScalingInstruction)> = covered
+                    let mut page: Vec<(String, &ScalingInstruction)> = covered
                         .into_iter()
-                        .filter(|(identity, _, _)| {
-                            after.as_ref().is_none_or(|last| identity > last)
-                        })
+                        .filter(|(identity, _)| after.as_ref().is_none_or(|last| identity > last))
                         .take(page_size + 1)
                         .collect();
                     let next_token = if page.len() > page_size {
                         page.truncate(page_size);
-                        page.last().map(|(identity, _, _)| {
-                            crate::state::encode_cursor(CURSOR_KIND, identity)
-                        })
+                        page.last()
+                            .map(|(identity, _)| crate::state::encode_cursor(CURSOR_KIND, identity))
                     } else {
                         None
                     };
 
                     let resources: Vec<ScalingPlanResource> = page
                         .into_iter()
-                        .map(|(_, resource, instruction)| {
+                        .map(|(_, instruction)| {
                             // "AWS Auto Scaling creates target tracking scaling policies
                             // based on the scaling instructions" — so the policies on a
                             // resource are those its own instruction calls for, reported
                             // once the plan's configuration has reached it.
-                            let policies = plan.applied_policies(resource, instruction);
+                            let policies = plan.applied_policies(instruction);
                             ScalingPlanResource {
                                 scaling_plan_name: plan.name.clone(),
                                 scaling_plan_version: plan.version,

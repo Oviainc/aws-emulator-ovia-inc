@@ -24,6 +24,10 @@ tracing = { workspace = true }
 # Opaque pagination tokens: the NextToken cursors are hex-encoded, so a token this
 # service did not mint fails to decode and is refused as InvalidNextTokenException.
 hex = { workspace = true }
+# Policy names: a scaling plan's policy is named after the identity of the resource and
+# the metric it was minted from, and both are unbounded caller text, so each enters the
+# bounded PolicyName as a fixed-width digest of itself.
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -32,7 +36,6 @@ emulator-core-build-support = { workspace = true }
 # `time` is a TEST-only feature: one integration test waits out the real lifecycle
 # settle span with `tokio::time::sleep`. The production build does not need it.
 tokio = { workspace = true, features = ["time"] }
-sha2 = { workspace = true }
 
 [lints]
 workspace = true

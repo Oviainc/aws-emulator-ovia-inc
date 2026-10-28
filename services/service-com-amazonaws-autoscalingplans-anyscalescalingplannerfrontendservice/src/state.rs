@@ -10,6 +10,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
+use sha2::{Digest, Sha256};
+
 use crate::ops::get_scaling_plan_resource_forecast_data::FORECAST_INTERVAL_SECONDS;
 use crate::ops::types::{
     ApplicationSource, PredefinedScalingMetricSpecification, ScalingInstruction, ScalingPolicy,
@@ -283,29 +285,37 @@ impl ScalingPlanRecord {
     /// Empty while the plan is still being created: no policy has reached the resource
     /// yet, which is exactly what its `Inactive` scaling status reports.
     ///
-    /// `resource` is the position of `instruction` in [`Self::scaling_instructions`],
-    /// which is what names the policies apart.
+    /// A policy is named after the IDENTITIES its state gives it — the resource
+    /// `instruction` applies to and the metric each configuration tracks — so a rewrite
+    /// of [`Self::scaling_instructions`] that leaves a resource's instruction alone
+    /// leaves the names that resource reports alone too. See [`policy_name`].
     ///
     /// The policies are PROJECTED per read rather than stored beside the instruction
     /// they come from, so one record cannot disagree with another about what a resource
     /// tracks; the configuration clone that costs is bounded by the documented
     /// [`MAX_TARGET_TRACKING_CONFIGURATIONS`] per resource, and the page by `MaxResults`.
-    pub fn applied_policies(
-        &self,
-        resource: usize,
-        instruction: &ScalingInstruction,
-    ) -> Vec<ScalingPolicy> {
+    pub fn applied_policies(&self, instruction: &ScalingInstruction) -> Vec<ScalingPolicy> {
         if self.scaling_status_code() == SCALING_STATUS_INACTIVE
             || !configures_dynamic_scaling(instruction)
         {
             return Vec::new();
         }
+        let resource = resource_identity_key(instruction);
         instruction
             .target_tracking_configurations
             .iter()
             .enumerate()
             .map(|(position, configuration)| ScalingPolicy {
-                policy_name: policy_name(&self.name, resource, position),
+                policy_name: policy_name(
+                    &self.name,
+                    &resource,
+                    // A configuration naming neither a predefined nor a customized
+                    // metric identifies no metric at all, and both write paths refuse
+                    // one before it can be stored, so this fallback only keeps the
+                    // names apart for state this service cannot hold.
+                    &target_metric_identity(configuration)
+                        .unwrap_or_else(|| position.to_string()),
+                ),
                 policy_type: POLICY_TYPE_TARGET_TRACKING.to_string(),
                 target_tracking_configuration: Some(configuration.clone()),
             })
@@ -360,8 +370,43 @@ pub enum PlanMutationRefusal {
 /// characters however long a resource id is, and the name a resource reports does not
 /// change between reads. A `ScalingPlanName` carries no `/`
 /// (`^[\p{Print}&&[^|:/]]+$`), so the segments cannot run together.
-fn policy_name(plan_name: &str, resource: usize, position: usize) -> String {
-    format!("{plan_name}/TargetTracking/{resource}/{position}")
+///
+/// `resource` is the [`resource_identity_key`] of the instruction the policy was minted
+/// from and `configuration` the [`target_metric_identity`] of the configuration inside
+/// it — the two IDENTITIES, never the positions those values happen to hold in a list,
+/// because an update rewrites the instruction list in the order the request carries it
+/// and so moves every position in it.
+///
+/// Both identities are built out of caller-supplied text the model lets run long — a
+/// `ResourceId` alone reaches 1600 characters and a customized metric's namespace, name
+/// and dimensions are plain strings — while a `PolicyName` has 256. Each therefore
+/// enters the name as a fixed-width [`identity_digest`] of itself: the name stays a
+/// function of the identity, and of nothing else, at a length the plan name bounds.
+fn policy_name(plan_name: &str, resource: &str, configuration: &str) -> String {
+    format!(
+        "{plan_name}/TargetTracking/{}/{}",
+        identity_digest(resource),
+        identity_digest(configuration)
+    )
+}
+
+/// How many BYTES of an identity's SHA-256 digest a policy name carries.
+///
+/// 16 bytes is 32 hex characters, so a `ScalingPlanName` at its modelled maximum of 128
+/// characters, plus the fixed `/TargetTracking/` segment, the separator and the two
+/// digests, occupies 209 of the 256 characters `ScalingPolicy$PolicyName` allows,
+/// whatever the identities are spelled with; 128 bits of digest per identity is why two
+/// identities of one plan do not render one name.
+const IDENTITY_DIGEST_BYTES: usize = 16;
+
+/// A fixed-width, printable rendering of one identity key.
+///
+/// The digest is what lets an UNBOUNDED identity name a policy inside the bounded
+/// `PolicyName`: equal identities render equal, different identities render different,
+/// and the rendering is the same on every read because it reads nothing but `identity`.
+fn identity_digest(identity: &str) -> String {
+    let digest = Sha256::digest(identity.as_bytes());
+    hex::encode(&digest[..IDENTITY_DIGEST_BYTES])
 }
 
 /// Per-service state for com-amazonaws-autoscalingplans-anyscalescalingplannerfrontendservice. A handler reaches it through [`service_state`].
