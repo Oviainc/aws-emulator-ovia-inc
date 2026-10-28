@@ -535,7 +535,7 @@ async fn a_lookup_that_resolved_nothing_names_the_account_and_never_the_probed_n
     let account = engine::emulator_account_id();
     // The control plane states the account the lookup was scoped to; the data plane
     // states the same fact in its own wording. Neither echoes the name it was given.
-    let control_plane = format!("Firehose under accountId {account} not found");
+    let control_plane = format!("Firehose under account {account} not found.");
     let data_plane = format!("Firehose not found under account {account}.");
 
     // One stream exists, so the refusals below are a failed lookup and not an empty

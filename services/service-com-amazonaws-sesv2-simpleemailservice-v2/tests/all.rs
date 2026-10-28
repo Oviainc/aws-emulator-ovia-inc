@@ -77,6 +77,8 @@ mod email_identity_listing_route;
 mod email_identity_mail_from_attributes;
 #[path = "all/email_identity_policies.rs"]
 mod email_identity_policies;
+#[path = "all/email_identity_policies_read.rs"]
+mod email_identity_policies_read;
 #[path = "all/email_identity_verification_info.rs"]
 mod email_identity_verification_info;
 #[path = "all/email_template_updates.rs"]

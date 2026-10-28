@@ -56,14 +56,14 @@ const OVERLAP_FLOOR: Duration = Duration::from_millis(500);
 
 /// One `StackEvent` as the wire reports it, reduced to what a timeline is read from.
 #[derive(Debug, Clone)]
-struct Event {
-    logical_id: String,
-    status: String,
-    timestamp: String,
+pub(crate) struct Event {
+    pub(crate) logical_id: String,
+    pub(crate) status: String,
+    pub(crate) timestamp: String,
 }
 
 /// Every event a stack has recorded, newest first as `DescribeStackEvents` answers them.
-async fn events_of(router: &MultiServiceRouter, name_or_id: &str) -> Vec<Event> {
+pub(crate) async fn events_of(router: &MultiServiceRouter, name_or_id: &str) -> Vec<Event> {
     let (status_code, body) = call(
         router,
         "DescribeStackEvents",
@@ -110,7 +110,12 @@ fn micros(case: &str, event: &Event) -> i128 {
 /// a wait condition is recorded `CREATE_IN_PROGRESS` when the walk schedules it and again
 /// when a signal it waited for arrives, and the instant it was SCHEDULED is the first of
 /// them.
-fn instant(case: &str, events: &[Event], logical_id: &str, status: &str) -> Option<i128> {
+pub(crate) fn instant(
+    case: &str,
+    events: &[Event],
+    logical_id: &str,
+    status: &str,
+) -> Option<i128> {
     events
         .iter()
         .filter(|event| event.logical_id == logical_id && event.status == status)
@@ -120,14 +125,19 @@ fn instant(case: &str, events: &[Event], logical_id: &str, status: &str) -> Opti
 
 /// The instant a resource's transition was SCHEDULED, which the case requires the log to
 /// carry.
-fn scheduled(case: &str, events: &[Event], logical_id: &str, in_progress: &str) -> i128 {
+pub(crate) fn scheduled(
+    case: &str,
+    events: &[Event],
+    logical_id: &str,
+    in_progress: &str,
+) -> i128 {
     instant(case, events, logical_id, in_progress).unwrap_or_else(|| {
         panic!("case {case:?}: {logical_id} must have a {in_progress} event, got {events:?}")
     })
 }
 
 /// The instant a resource's transition FINISHED, which the case requires the log to carry.
-fn finished(case: &str, events: &[Event], logical_id: &str, terminal: &str) -> i128 {
+pub(crate) fn finished(case: &str, events: &[Event], logical_id: &str, terminal: &str) -> i128 {
     instant(case, events, logical_id, terminal).unwrap_or_else(|| {
         panic!("case {case:?}: {logical_id} must have a {terminal} event, got {events:?}")
     })
@@ -414,7 +424,7 @@ async fn a_refused_deployments_events_keep_the_order_of_the_walk_that_was_cut_sh
 }
 
 /// `SignalResource` for one resource of one stack.
-async fn signal(
+pub(crate) async fn signal(
     router: &MultiServiceRouter,
     stack: &str,
     logical_id: &str,

@@ -216,40 +216,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // same request answers the record the first call minted instead of minting a second
         // peering; the same token asking for something else is a conflict. This is resolved
         // BEFORE the one-peering-per-gateway rule below, so a retry answers the peering it
-        // created rather than colliding with it.
-        if let Some(token) = input
-            .client_token
-            .as_deref()
-            .filter(|token| !token.is_empty())
-        {
-            if let Some(existing) = store
-                .peerings
-                .values()
-                .find(|record| record.client_token.as_deref() == Some(token))
-            {
-                let same_request = existing.core_network_id == input.core_network_id
+        // created rather than colliding with it. The walk itself — the token normalisation,
+        // the store lookup and the replay-or-refuse branch — is
+        // [`crate::state::replay_or_conflict`], the one every tokened operation of this
+        // service goes through, so what is left here is only what makes a stored peering
+        // THIS request.
+        let client_token = crate::state::normalized_client_token(input.client_token);
+        if let Some(existing) = crate::state::replay_or_conflict(
+            client_token.as_deref(),
+            store.peerings.values(),
+            |existing| {
+                existing.core_network_id == input.core_network_id
                     && existing.resource_arn == input.transit_gateway_arn
                     && crate::state::same_tags(
                         &existing.tags,
                         input.tags.as_deref().unwrap_or_default(),
-                    );
-                if same_request {
-                    return Ok(CreateTransitGatewayPeeringOutput {
-                        transit_gateway_peering: Some(existing.to_transit_gateway_peering(now)),
-                    });
-                }
-                return Err(CreateTransitGatewayPeeringErrorModeled::ConflictException(
-                    ConflictException {
-                        message: format!(
-                            "client token {token:?} already created peering {}, with a different request",
-                            existing.id
-                        ),
-                        resource_id: existing.id.clone(),
-                        resource_type: crate::state::PEERING_KIND.to_string(),
-                    },
-                )
-                .into());
-            }
+                    )
+            },
+            |existing| crate::state::ClientTokenConflict {
+                effect: format!("created peering {}", existing.id),
+                resource_id: existing.id.clone(),
+                resource_type: crate::state::PEERING_KIND.to_string(),
+            },
+        )
+        .map_err(CreateTransitGatewayPeeringErrorModeled::ConflictException)?
+        {
+            return Ok(CreateTransitGatewayPeeringOutput {
+                transit_gateway_peering: Some(existing.to_transit_gateway_peering(now)),
+            });
         }
 
         // A transit gateway is peered with one core network at a time, so a second peering
@@ -313,7 +307,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             transit_gateway_peering_attachment_id,
             created_at: now,
             available_at: now + crate::state::SETTLE_DELAY,
-            client_token: input.client_token.filter(|token| !token.is_empty()),
+            client_token,
             tags: input.tags.unwrap_or_default(),
         };
         // The peering is `CREATING` until the settle span the clock owes elapses, so the

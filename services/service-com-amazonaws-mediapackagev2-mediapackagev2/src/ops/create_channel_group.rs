@@ -234,9 +234,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(CreateChannelGroupErrorModeled::ValidationException(rejection).into());
         }
+        // The optional `Description` is rendered so that ABSENT and present-but-empty stay
+        // apart (`ResourceDescription` is `@length 0..1024`, so `""` is a value a request
+        // may carry, and the two store different groups), which is what makes a repeat
+        // under the same token that now sends it a changed request rather than a retry.
         let fingerprint = crate::state::request_fingerprint(&[
             input.channel_group_name.clone(),
-            input.description.clone().unwrap_or_default(),
+            format!("{:?}", input.description),
             crate::state::tag_fingerprint(&tags),
         ]);
 

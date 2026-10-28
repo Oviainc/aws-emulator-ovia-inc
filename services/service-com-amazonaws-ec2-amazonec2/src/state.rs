@@ -18078,12 +18078,14 @@ pub fn prepared_user_id_group_pair<E>(
     // "The ID of the VPC for the referenced security group, if applicable"
     // (`UserIdGroupPair$VpcId`) and "the ID of the VPC peering connection, if applicable"
     // (`$VpcPeeringConnectionId`): a value that is not an id of its kind names no resource
-    // at all, so it is refused rather than stored on the rule.
+    // at all, so it is refused rather than stored on the rule. The prefix each kind is
+    // asked about is the prefix ALONE — [`prefixed_id_is_well_formed`] reads the separator
+    // itself — so a well-formed id of either kind is stored rather than refused.
     for (member, prefix, value) in [
-        ("vpcId", "vpc-", pair.vpc_id.as_deref()),
+        ("vpcId", "vpc", pair.vpc_id.as_deref()),
         (
             "vpcPeeringConnectionId",
-            "pcx-",
+            "pcx",
             pair.vpc_peering_connection_id.as_deref(),
         ),
     ] {

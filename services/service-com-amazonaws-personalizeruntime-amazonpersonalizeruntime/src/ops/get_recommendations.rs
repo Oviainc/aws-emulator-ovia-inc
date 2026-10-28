@@ -353,7 +353,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     promotion_name: promoted
                         .then(|| promotion.as_ref().map(|promotion| promotion.name.clone()))
                         .flatten(),
-                    metadata: registry::metadata_for(item, metadata_columns.as_deref()),
+                    metadata: registry::metadata_for(&item.attributes, metadata_columns.as_deref()),
                     reason: promoted.then(|| vec![registry::REASON_PROMOTED_ITEM.to_string()]),
                 }
             })

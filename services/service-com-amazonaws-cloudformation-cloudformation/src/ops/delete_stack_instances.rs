@@ -125,6 +125,9 @@ struct Removal {
     stack_id: String,
     /// The resources that stack still holds, which the walk deletes.
     resources: Vec<crate::state::StoredResource>,
+    /// The logical ids of the records that stack HOLDS, which is what the walk reports a
+    /// deletion of ([`crate::state::provisioning::delete`]).
+    held: ::std::collections::BTreeSet<String>,
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -395,6 +398,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         region: target_region.clone(),
                         stack_id: stack_id.clone(),
                         resources: stack.current_resources().to_vec(),
+                        held: stack.held_resource_ids(),
                     });
                 }
             }
@@ -427,8 +431,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // another service's handler, which takes that service's lock.
         let mut failed_instances: Vec<(String, String, String)> = Vec::new();
         for removal in removals {
-            let deleted =
-                crate::state::provisioning::delete(ctx, &removal.region, &removal.resources).await;
+            let deleted = crate::state::provisioning::delete(
+                ctx,
+                &removal.region,
+                &removal.resources,
+                &removal.held,
+            )
+            .await;
             let failure = deleted.failure.clone();
             let mut store = state.lock();
             if let Some(stack) = store.resolve_mut(&removal.region, &removal.stack_id) {
