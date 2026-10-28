@@ -10,6 +10,14 @@
 //! is fabricated for it — and a `Code` that is not the outstanding one (including any code
 //! while none is outstanding) is the modelled `ValidationException` (HTTP 400).
 //!
+//! A submission of the outstanding code COMPLETES the validation, which is what a reader
+//! of the preference then reports: every plane whose portal connection was still waiting
+//! to be verified moves to the validated status
+//! ([`crate::state::apply_completed_verification`]), so the completed validation is
+//! observable through `GetProcurementPortalPreference` and the listing alike, and that
+//! write advances `Version` and `LastUpdateDate` the same way the other write that moves a
+//! plane's status does.
+//!
 //! A refused submission counts against the preference's failed-attempt budget
 //! ([`crate::state::StoredProcurementPortalPreference::failed_verification_attempts`]),
 //! which is what the refusal REPORTS: its message names the attempt that failed and the
@@ -305,6 +313,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(validation) = stored.validation.as_mut() {
                 validation.verified_at = Some(verified_at);
             }
+            // And the completed verification is what a READER of the preference reports:
+            // every plane still waiting for the portal connection to be verified now
+            // reports the validated status, the rule
+            // `crate::state::apply_completed_verification` holds for whichever call
+            // completes a validation.
+            crate::state::apply_completed_verification(&mut stored.preference);
         }
 
         store.record_result(

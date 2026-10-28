@@ -686,6 +686,67 @@ pub fn apply_plane_verification_statuses(preference: &mut ProcurementPortalPrefe
     }
 }
 
+/// `ProcurementPortalPreferenceStatus$VALIDATED` — the status a plane reports once the
+/// portal connection it describes HAS been verified. One of the values the modelled enum
+/// admits ([`crate::ops::types::PROCUREMENT_PORTAL_PREFERENCE_STATUS_VALUES`]), and the
+/// one a plane waiting at [`STATUS_PENDING_VERIFICATION`] reaches when a caller completes
+/// the validation of the preference.
+pub const STATUS_VALIDATED: &str = "VALIDATED";
+
+/// What a COMPLETED portal validation leaves on the preference it validated, in one place:
+/// every plane still waiting for the connection to be verified reports
+/// [`STATUS_VALIDATED`], and the write is dated. Answers whether anything moved.
+///
+/// A plane's status is "the current status of the e-invoice delivery preference" / of the
+/// purchase order retrieval preference (`smithy_query(query="shape",
+/// shape="ProcurementPortalPreference")`), so completing the verification of the portal
+/// connection is what carries a plane off the status it holds WHILE that connection is
+/// unverified — and only that plane: a plane the configuration leaves disabled has no
+/// status for the connection to be about ([`apply_plane_verification_statuses`]), and a
+/// plane an explicit status update already carried further along keeps the status it
+/// holds, because a completed verification does not undo a later state. The status reason
+/// is "the reason for the current" status, so a plane that moves reports no reason until
+/// one is stated for the status it now holds.
+///
+/// A plane that moved is a write of the resource, so it advances `Version` and stamps
+/// `LastUpdateDate` exactly as the other write that moves a status does
+/// (`crate::ops::update_procurement_portal_preference_status`) — the two paths to one
+/// status cannot leave a reader disagreeing. A validation that completes with no plane
+/// waiting changed no member a reader reports, so it is no version of the resource.
+///
+/// It lives beside the preference registry rather than in one operation's module for the
+/// reason [`PORTAL_COUPA`] states: it is one rule about the RESOURCE's verification state,
+/// the third face of the rule [`apply_plane_verification_statuses`] and
+/// [`check_plane_enabled_for_status`] hold between them.
+pub fn apply_completed_verification(preference: &mut ProcurementPortalPreference) -> bool {
+    // Each plane as the pair the rule acts on: the status it reports and the reason stated
+    // for that status. The fields are disjoint, so both planes are borrowed at once and the
+    // rule below is written once for the two of them.
+    let planes: [(&mut Option<String>, &mut Option<String>); 2] = [
+        (
+            &mut preference.einvoice_delivery_preference_status,
+            &mut preference.einvoice_delivery_preference_status_reason,
+        ),
+        (
+            &mut preference.purchase_order_retrieval_preference_status,
+            &mut preference.purchase_order_retrieval_preference_status_reason,
+        ),
+    ];
+    let mut moved = false;
+    for (status, reason) in planes {
+        if status.as_deref() == Some(STATUS_PENDING_VERIFICATION) {
+            *status = Some(STATUS_VALIDATED.to_string());
+            *reason = None;
+            moved = true;
+        }
+    }
+    if moved {
+        preference.version = preference.version.saturating_add(1);
+        preference.last_update_date = now();
+    }
+    moved
+}
+
 /// The plane a status update may move: the other face of the rule
 /// [`apply_plane_verification_statuses`] holds, for the write that states a status without
 /// stating a configuration.

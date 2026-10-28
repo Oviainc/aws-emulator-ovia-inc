@@ -24,7 +24,10 @@
 //!   issues no second code, while any other send issues a fresh one;
 //! * a completed validation can be started again: the next send issues a code of its own
 //!   and the consumed one completes nothing;
-//! * issuing a code writes no configuration, so no member a reader reports moves.
+//! * issuing a code writes no configuration, so no member a reader reports moves — and
+//!   neither does completing the validation, whose only reported effect is the
+//!   verification status of the planes it validated (the rule
+//!   `completed_validation_moves_the_plane_status` spans).
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -43,6 +46,11 @@ use crate::refused_procurement_portal_writes::{
 /// `ComAmazonawsInvoicingInvoicingState::issue_portal_validation_code` mints and the
 /// portal-validation flow's `Code` is quoted in.
 const CODE_DIGITS: usize = 6;
+
+/// The status a plane reports once its portal connection has been verified: one of the
+/// values `ProcurementPortalPreferenceStatus` admits (`smithy_query(query="shape",
+/// shape="ProcurementPortalPreferenceStatus")`).
+const VALIDATED: &str = "VALIDATED";
 
 /// Whether the validation of `arn` has been completed, per state — no modelled member
 /// reports it.
@@ -63,6 +71,27 @@ fn stored_preferences(engine: &Arc<engine::InMemoryEngine>) -> usize {
         .lock()
         .procurement_portal_preferences
         .len()
+}
+
+/// What a reader reports for a preference APART from the members a status write moves:
+/// each plane's verification status and status reason, and the `Version` and
+/// `LastUpdateDate` such a write advances. What is left is the preference's configuration,
+/// which a call of the validation flow never writes.
+fn configuration(preference: &Value) -> Value {
+    let mut configuration = preference.clone();
+    if let Some(members) = configuration.as_object_mut() {
+        for moved_by_a_status_write in [
+            "EinvoiceDeliveryPreferenceStatus",
+            "EinvoiceDeliveryPreferenceStatusReason",
+            "PurchaseOrderRetrievalPreferenceStatus",
+            "PurchaseOrderRetrievalPreferenceStatusReason",
+            "Version",
+            "LastUpdateDate",
+        ] {
+            members.remove(moved_by_a_status_write);
+        }
+    }
+    configuration
 }
 
 /// The `Version` a reader reports for a preference.
@@ -272,9 +301,39 @@ async fn every_send_issues_a_code_the_verify_then_accepts() {
         );
         let after_verify = get_preference(&router, &arn).await;
         assert_eq!(
-            after_verify, before,
+            configuration(&after_verify),
+            configuration(&before),
             "case {}: completing a validation writes no configuration either, got \
              {after_verify}",
+            row.label
+        );
+        // What it DOES write is the verification state: each plane that was waiting for
+        // the portal connection to be verified now reports it validated, and that status
+        // write is one version of the resource.
+        for (member, was) in [
+            (
+                "EinvoiceDeliveryPreferenceStatus",
+                before.get("EinvoiceDeliveryPreferenceStatus"),
+            ),
+            (
+                "PurchaseOrderRetrievalPreferenceStatus",
+                before.get("PurchaseOrderRetrievalPreferenceStatus"),
+            ),
+        ] {
+            let actual = after_verify.get(member).and_then(Value::as_str);
+            assert_eq!(
+                actual,
+                Some(VALIDATED),
+                "case {}: the {member} that was {was:?} reports {VALIDATED} once the \
+                 validation completed, got {actual:?}",
+                row.label
+            );
+        }
+        assert_eq!(
+            version(&after_verify),
+            expected_version + 1,
+            "case {}: the status write a completed validation performs is one version of \
+             the resource, got {after_verify}",
             row.label
         );
     }
