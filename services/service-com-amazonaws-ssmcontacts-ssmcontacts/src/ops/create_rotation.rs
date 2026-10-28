@@ -25,7 +25,11 @@
 //!    zone, so a name no zone database resolves is refused rather than stored.
 //! 5. `ContactIds` — "the Amazon Resource Names (ARNs) of the contacts to add to the
 //!    rotation" — must name stored contacts; the first that does not answers the modelled
-//!    `ResourceNotFoundException` (HTTP 404).
+//!    `ResourceNotFoundException` (HTTP 404). Each of those contacts must also be of the one
+//!    contact type the member admits
+//!    ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::check_rotation_team`]): a
+//!    shift hands off to a person, so an escalation plan or another on-call schedule is
+//!    refused with the modelled `ValidationException` (HTTP 400).
 //! 6. `Recurrence.NumberOfOnCalls` must be met by that team
 //!    ([`crate::state::check_number_of_on_calls`]): the members on call concurrently are
 //!    members of this rotation's team, so a rotation cannot put more of them on call at once
@@ -253,6 +257,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+
+        // And every one of them must be a contact a shift can hand off TO: the member admits
+        // only the PERSONAL contact type, so an escalation plan or another on-call schedule
+        // is refused with the modelled `ValidationException` rather than stored as a rotation
+        // team. The reading is `UpdateRotation`'s too.
+        state
+            .check_rotation_team(&input.contact_ids)
+            .map_err(validation)?;
 
         // How many of that team can be on call at once is bounded by the team itself.
         check_number_of_on_calls(&input.recurrence, input.contact_ids.len()).map_err(validation)?;

@@ -130,6 +130,11 @@ const SMS: ChannelFixture = ChannelFixture {
 /// `RotationIds` entry has to name a rotation the store holds.
 const ROTATION: &str = "weekend";
 
+/// The alias of the contact the fixture puts on that rotation's shift team: a rotation's
+/// `ContactIds` admits only the `PERSONAL` contact type, so the team is a person rather than
+/// whichever contact the row happens to list first.
+const ROTATION_MEMBER: &str = "rotation-member";
+
 const PLAN_ROWS: &[PlanRow] = &[
     PlanRow {
         case: "one stage naming two channel targets pages both, in plan order",
@@ -373,7 +378,28 @@ async fn seed(emulator: &Emulator, contacts: &[ContactFixture], case: &str) -> S
         .iter()
         .any(|fixture| fixture.plan.contains("{rotation:"))
     {
-        let team = seeded.contact(contacts[0].alias).to_string();
+        // Its shift team is a personal contact, which is the only contact type a rotation's
+        // team admits: the row's own first contact may be an on-call schedule.
+        let team = match contacts
+            .iter()
+            .find(|fixture| fixture.contact_type == "PERSONAL")
+        {
+            Some(fixture) => seeded.contact(fixture.alias).to_string(),
+            None => {
+                let arn = emulator
+                    .create_contact(
+                        json!({
+                            "Alias": ROTATION_MEMBER,
+                            "Type": "PERSONAL",
+                            "Plan": {"Stages": []},
+                        }),
+                        case,
+                    )
+                    .await;
+                seeded.contacts.insert(ROTATION_MEMBER.to_string(), arn);
+                seeded.contact(ROTATION_MEMBER).to_string()
+            }
+        };
         let arn = emulator.create_rotation(&team, ROTATION, case).await;
         seeded.rotations.insert(ROTATION.to_string(), arn);
     }

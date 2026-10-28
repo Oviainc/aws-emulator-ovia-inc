@@ -11,7 +11,8 @@
 //!
 //! The request is checked WHOLE before any of it is applied, by the same rules
 //! `CreateRotation` admits its own rotation by — the recurrence describes a schedule, the
-//! time zone resolves against the IANA zone database, and the recurrence's `NumberOfOnCalls`
+//! time zone resolves against the IANA zone database, every named team member is a stored
+//! contact of the one contact type the member admits, and the recurrence's `NumberOfOnCalls`
 //! is met by the shift team the update leaves the rotation with — so a refused update leaves
 //! the stored rotation exactly as it was and cannot leave it in a state the create would have
 //! refused.
@@ -227,6 +228,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 missing,
                 CONTACT_RESOURCE_TYPE,
             ));
+        }
+
+        // And each of them must be of the one contact type the member admits — the SAME
+        // reading `CreateRotation` admits its own team by, so an update cannot put an
+        // escalation plan or another on-call schedule on a team the create would have
+        // refused.
+        if let Some(contact_ids) = &input.contact_ids {
+            state.check_rotation_team(contact_ids).map_err(validation)?;
         }
 
         let Some(rotation) = state.rotations.get_mut(&input.rotation_id) else {

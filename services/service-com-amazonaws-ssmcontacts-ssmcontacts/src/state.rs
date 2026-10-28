@@ -868,6 +868,37 @@ impl ComAmazonawsSsmcontactsSsmcontactsState {
         }
     }
 
+    /// `Ok` when every entry of `contact_ids` that this store RESOLVES names a contact of the
+    /// one type a rotation's shift team may carry, else the `ValidationException` message
+    /// naming the first entry that does not
+    /// ([`contact_type_not_a_rotation_member_message`]).
+    ///
+    /// Both operations that write a rotation's team document the member that carries it as
+    /// admitting only the `PERSONAL` contact type, the types `ESCALATION` and
+    /// `ONCALL_SCHEDULE` being "not supported for this operation"
+    /// (`smithy_query(query="doc",shape="CreateRotationRequest",member="ContactIds")`, and
+    /// the same for `UpdateRotationRequest`): an escalation plan and an on-call schedule are
+    /// not people a shift hands off to, so the write is refused rather than leaving a rotation
+    /// whose team every reader then reports. The rule is written once, so the two operations
+    /// cannot admit different teams.
+    ///
+    /// An entry the store does NOT resolve is passed over here: that an ARN names no contact
+    /// at all is the caller's own modelled `ResourceNotFoundException`, checked before this.
+    pub fn check_rotation_team(&self, contact_ids: &[String]) -> Result<(), String> {
+        for contact_id in contact_ids {
+            let Some(contact) = self.contacts.get(contact_id) else {
+                continue;
+            };
+            if contact.contact_type != ROTATION_MEMBER_CONTACT_TYPE {
+                return Err(contact_type_not_a_rotation_member_message(
+                    contact_id,
+                    &contact.contact_type,
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Resolve every resource the `Plan` a request carries NAMES, against this store.
     ///
     /// A plan is a graph of references: each `Stage`'s `Target` names either a contact
@@ -1719,6 +1750,28 @@ const TIME_ZONE_ID_MEMBER: &str = "timeZoneId";
 
 /// The member path a `NumberOfOnCalls` refusal names.
 const NUMBER_OF_ON_CALLS_MEMBER: &str = "recurrence.numberOfOnCalls";
+
+/// The member path a rotation-team refusal names, spelled the way the other member paths of
+/// this service's constraint messages are.
+const CONTACT_IDS_MEMBER: &str = "contactIds";
+
+/// The one `ContactType` ([`crate::ops::types::CONTACT_TYPE_VALUES`]) a rotation's shift team
+/// may name.
+const ROTATION_MEMBER_CONTACT_TYPE: &str = "PERSONAL";
+
+/// The message a rotation write refuses a team member of the wrong contact type with: the
+/// member path, the ARN the request carried, the type the stored contact has and the one type
+/// a shift team admits.
+///
+/// Built from the request and the store, so it carries no value of any one run.
+#[must_use]
+pub fn contact_type_not_a_rotation_member_message(arn: &str, contact_type: &str) -> String {
+    format!(
+        "Value '{arn}' at '{CONTACT_IDS_MEMBER}' failed to satisfy constraint: Member must be \
+         a contact of type {ROTATION_MEMBER_CONTACT_TYPE}, and names a contact of type \
+         {contact_type}"
+    )
+}
 
 /// `Ok` when `time_zone_id` names a zone of the IANA time zone database, else the
 /// `ValidationException` message naming the member and the value it could not resolve.
