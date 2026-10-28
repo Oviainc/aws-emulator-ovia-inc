@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/accept_connection_proposal.rs"]
 mod accept_connection_proposal;
+#[path = "all/acceptance_attach_point_arn_resolves_in_full.rs"]
+mod acceptance_attach_point_arn_resolves_in_full;
 #[path = "all/arn_scope_refusals.rs"]
 mod arn_scope_refusals;
 #[path = "all/arn_scope_is_relative_to_the_request.rs"]
