@@ -833,11 +833,16 @@ async fn an_update_may_only_name_a_version_the_catalogue_holds() {
             ("minimum length 5", "ab-cd".to_string()),
             ("maximum length 30", format!("v{}", "9".repeat(29))),
         ];
+        // Each refusal carries the message of the KIND of resource that is missing: a
+        // deployment pattern VERSION is its own resource (its own read operations), so
+        // it has its own message, while the model publishes no workload-version
+        // resource. See `tests/all/not_found_resource_kind.rs` for the suite that drives
+        // that rule across the operations which resolve the same names.
         for (member, fixed) in [
             ("workloadVersionName", "The specified workload does not exist or insufficient permissions."),
             (
                 "deploymentPatternVersionName",
-                "The specified deployment pattern does not exist or insufficient permissions.",
+                "The specified deployment pattern version does not exist or insufficient permissions.",
             ),
         ] {
             for (label, version) in &absent {
@@ -854,8 +859,8 @@ async fn an_update_may_only_name_a_version_the_catalogue_holds() {
                 let message = error_message(&body);
                 assert_eq!(
                     message, fixed,
-                    "case {case:?}: a catalogue lookup carries its fixed message, got \
-                     {message:?}"
+                    "case {case:?}: a lookup that finds nothing carries the fixed message of \
+                     the kind of resource that is missing, got {message:?}"
                 );
                 assert!(
                     !message.contains(version.as_str()),

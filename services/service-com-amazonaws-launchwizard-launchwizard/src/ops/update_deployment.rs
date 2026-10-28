@@ -246,9 +246,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // cannot be found rather than a setting that is merely odd. A pattern publishes
         // several versions, so ANY of them is a version this deployment can be moved
         // onto — the same published list `GetDeploymentPatternVersion` reports from, so
-        // a version a caller can read is a version it can ask for. Both messages are
-        // the fixed, identifier-free ones a catalogue lookup carries, so the version
-        // asked about is not reflected back.
+        // a version a caller can read is a version it can ask for. Each refusal carries
+        // the message of the KIND of resource that is missing, which for a name below
+        // the pattern (resolved one statement above) is the kind that name identifies
+        // and never the enclosing pattern's: a deployment pattern VERSION is its own
+        // resource, with its own read operations, so it has its own message, while the
+        // model publishes no workload-version resource and a workload version that is
+        // not published is a workload the catalogue does not hold at that version. Both
+        // messages are the fixed, identifier-free ones a catalogue lookup carries, so
+        // the version asked about is not reflected back.
         if input
             .workload_version_name
             .as_ref()
@@ -268,7 +274,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(UpdateDeploymentErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::DEPLOYMENT_PATTERN_NOT_FOUND_MESSAGE.to_string()),
+                    message: Some(
+                        crate::state::DEPLOYMENT_PATTERN_VERSION_NOT_FOUND_MESSAGE.to_string(),
+                    ),
                 },
             )
             .into());
