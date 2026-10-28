@@ -145,6 +145,16 @@
 //! `DeleteCapacityProvider` moves it into the enum's `Deleting` value with the instant
 //! its removal becomes due ([`CapacityProviderRecord::begin_delete`]), which the clock
 //! then owes exactly as it owes the activation.
+//!
+//! The event-source-mapping slice is
+//! [`ComAmazonawsLambdaAwsgirapiserviceState::event_source_mappings`]: one
+//! [`EventSourceMappingRecord`] per mapping, keyed by its UUID, with the same clock-owed
+//! lifetime (`Creating` and `Updating` settle into the state the mapping's `Enabled`
+//! setting asks for, and a deletion's removal falls due). A mapping that reports `Enabled`
+//! also POLLS its event source, because "Lambda reads items from the event source and
+//! invokes the function": for an Amazon SQS queue that reading is [`sqs_poller`], which
+//! takes a batch out of the queue through the queue's own delivery bookkeeping and records
+//! what became of it on [`EventSourceMappingRecord::last_processing_result`].
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, SystemTime};
@@ -189,6 +199,14 @@ pub use capacity_provider::{
     capacity_provider_arn, capacity_provider_name_message, parse_capacity_provider_name,
     CAPACITY_PROVIDER_RESOURCE_TYPE,
 };
+
+/// The poller an event source mapping on an Amazon SQS queue runs — the component that
+/// reads from the queue and hands a batch to the mapping's function — lives in
+/// [`sqs_poller`] and is re-exported here, for the same reason as [`capacity_provider`]:
+/// the mapping record, its clock-owed transitions and the store that holds it stay in this
+/// module, and a handler still names the poller as `crate::state::…`.
+pub mod sqs_poller;
+pub use sqs_poller::{drive_sqs_pollers, poll_due, BATCH_NOT_PROCESSED_RESULT, POLL_INTERVAL};
 
 /// The region an ARN carries when the request is unsigned and therefore names no
 /// SigV4 credential scope to read a region from.
@@ -3738,9 +3756,9 @@ pub fn queue_visibility_refusal(
 /// record (see [`EventSourceMappingRecord::reported`]), so nothing of a request is
 /// echoed straight back to its caller.
 ///
-/// No poller runs in this emulator, so the record carries no `LastProcessingResult`:
-/// that member is "The result of the event source mapping's last processing attempt",
-/// and no attempt has been made.
+/// A mapping on an Amazon SQS queue also POLLS that queue once it is enabled, which is
+/// what [`sqs_poller`] does, so the record carries the result of the last attempt that
+/// poller made ([`Self::last_processing_result`]).
 #[derive(Debug, Clone)]
 pub struct EventSourceMappingRecord {
     /// `UUID`: "The identifier of the event source mapping", which is also the key it is
@@ -3844,6 +3862,11 @@ pub struct EventSourceMappingRecord {
     /// `LastModified`: "The date that the event source mapping was last updated or that
     /// its state changed."
     pub last_modified: SystemTime,
+    /// `LastProcessingResult`: "The result of the event source mapping's last processing
+    /// attempt" — `None` for a mapping whose poller has not had a batch to attempt yet,
+    /// which is every mapping at the instant it is created. Written only by the poller that
+    /// made the attempt; see [`sqs_poller::poll_due`].
+    pub last_processing_result: Option<String>,
 }
 
 impl EventSourceMappingRecord {
@@ -3974,9 +3997,9 @@ impl EventSourceMappingRecord {
             logging_config: self.logging_config.clone(),
             scaling_config: self.scaling_config.clone(),
             last_modified: Some(::aws_smithy_types::DateTime::from(self.last_modified)),
-            // "The result of the event source mapping's last processing attempt" — no
-            // poller runs here, so there has been no attempt to report the result of.
-            last_processing_result: None,
+            // "The result of the event source mapping's last processing attempt": what
+            // the mapping's poller recorded, and nothing at all until it has made one.
+            last_processing_result: self.last_processing_result.clone(),
             state: Some(self.state.clone()),
             state_transition_reason: Some(self.state_transition_reason.clone()),
             destination_config: self.destination_config.clone(),
@@ -4053,6 +4076,15 @@ pub struct ComAmazonawsLambdaAwsgirapiserviceState {
     /// Every event source mapping this emulator holds, keyed by its UUID so
     /// `ListEventSourceMappings` pages through them in a stable order.
     pub event_source_mappings: BTreeMap<String, EventSourceMappingRecord>,
+    /// Whether a poll loop is already running over this store's queue mappings; see
+    /// [`sqs_poller::drive_sqs_pollers`], which is the only thing that sets it.
+    pub sqs_poller_running: bool,
+    /// Which claim on that loop is the current one, so a loop standing down because nothing
+    /// polls any more releases only its OWN claim and never one a later call is holding.
+    pub sqs_poller_generation: u64,
+    /// The running poll loop's task handle, kept so the loop it replaces is aborted rather
+    /// than merely forgotten.
+    pub sqs_poller: Option<::tokio::task::JoinHandle<()>>,
 }
 
 /// One code-signing configuration.

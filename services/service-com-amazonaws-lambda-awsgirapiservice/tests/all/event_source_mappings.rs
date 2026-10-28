@@ -309,6 +309,132 @@ pub(crate) async fn create_function(router: &MultiServiceRouter, name: &str) {
     create_function_publishing(router, name, false).await;
 }
 
+/// Create a function for a mapping to invoke whose `Timeout` is `timeout` seconds — the
+/// member a queue's own `VisibilityTimeout` is compared against when a mapping between the
+/// two is made.
+pub(crate) async fn create_timed_function(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+    timeout: i64,
+) {
+    let package: Vec<u8> = (0..64u16)
+        .map(|byte| u8::try_from(byte % 251).unwrap_or(0))
+        .collect();
+    let answer = call(
+        router,
+        "POST",
+        FUNCTIONS_URI,
+        &json!({
+            "FunctionName": name,
+            "Role": ROLE,
+            "Runtime": "python3.12",
+            "Handler": "index.handler",
+            "Timeout": timeout,
+            "Code": { "ZipFile": base64::engine::general_purpose::STANDARD.encode(&package) },
+        }),
+    )
+    .await;
+    assert_eq!(
+        answer.status,
+        201,
+        "case {case:?}: expected CreateFunction {name:?} to answer 201, got {} {}",
+        answer.status,
+        answer.text()
+    );
+}
+
+/// Lambda over the SAME engine as Amazon SQS, so a mapping resolves and polls the queue in
+/// the service that owns it — exactly what `core/router` assembles. The harness every suite
+/// that spans the two services uses.
+pub(crate) fn router_with_queues() -> MultiServiceRouter {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = router_on(&engine);
+    router.register_service(service_com_amazonaws_sqs_amazonsqs::EmulatedService::new(
+        Arc::clone(&engine),
+    ));
+    router
+}
+
+/// Call one Amazon SQS operation (`POST /` with `X-Amz-Target: AmazonSQS.<Operation>`), the
+/// way a client calls it.
+pub(crate) async fn call_sqs(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("host", "sqs.us-east-1.amazonaws.com")
+        .header("content-type", "application/x-amz-json-1.0")
+        .header("x-amz-target", format!("AmazonSQS.{operation}"))
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{REGION}/sqs/aws4_request, \
+                 SignedHeaders=host;x-amz-target, Signature=0000"
+            ),
+        )
+        .body(bytes::Bytes::from(
+            serde_json::to_vec(body).expect("the request body serializes"),
+        ))
+        .expect("a well-formed request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let parsed = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
+    (status, parsed)
+}
+
+/// A queue created with the attributes `attributes` names: its url and its ARN, both read
+/// back out of Amazon SQS rather than spelled here, so a mapping is made on the ARN the
+/// queue itself reports.
+pub(crate) async fn create_queue(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+    attributes: &Value,
+) -> (String, String) {
+    let (status, created) = call_sqs(
+        router,
+        "CreateQueue",
+        &json!({ "QueueName": name, "Attributes": attributes }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected CreateQueue {name:?} to answer 200, got {status} {created}"
+    );
+    let url = created["QueueUrl"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: no QueueUrl in {created}"))
+        .to_string();
+    let arn = queue_attribute(router, case, &url, "QueueArn")
+        .await
+        .unwrap_or_else(|| panic!("case {case:?}: the queue {name:?} reports no QueueArn"));
+    (url, arn)
+}
+
+/// One attribute of the queue `url` addresses, as `GetQueueAttributes` reports it.
+pub(crate) async fn queue_attribute(
+    router: &MultiServiceRouter,
+    case: &str,
+    url: &str,
+    name: &str,
+) -> Option<String> {
+    let (status, answered) = call_sqs(
+        router,
+        "GetQueueAttributes",
+        &json!({ "QueueUrl": url, "AttributeNames": [name] }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected GetQueueAttributes to answer 200, got {status} {answered}"
+    );
+    answered["Attributes"][name].as_str().map(str::to_string)
+}
+
 /// The `CreateEventSourceMapping` body for `function` and `event_source`, plus whatever
 /// `extras` states.
 pub(crate) fn create_request(function: &str, event_source: Option<&str>, extras: &Value) -> Value {

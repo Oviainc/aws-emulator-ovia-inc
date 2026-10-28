@@ -25,27 +25,16 @@
 //! visibility timeout at all or carries the documented default, and which call states the
 //! pair.
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use base64::Engine as _;
 use serde_json::{json, Value};
 use service_com_amazonaws_lambda_awsgirapiservice::state::EVENT_SOURCE_MAPPING_SETTLE_DELAY;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::event_source_mappings::{
-    call, create_mapping, get_mapping, list_mappings, Answer, KINESIS_SOURCE, MAPPINGS_URI,
+    call, create_mapping, create_queue, create_timed_function, get_mapping, list_mappings,
+    router_with_queues, Answer, KINESIS_SOURCE, MAPPINGS_URI,
 };
-
-/// Where `CreateFunction` is bound (`POST /2015-03-31/functions`).
-const FUNCTIONS_URI: &str = "/2015-03-31/functions";
-
-/// The region every request's credential scope names, and the region each minted ARN
-/// carries.
-const REGION: &str = "us-east-1";
-
-/// A well-formed execution role ARN, satisfying the model's `RoleArn` pattern.
-const ROLE: &str = "arn:aws:iam::000000000000:role/service-role/lambda-exec";
 
 /// The `State` a freshly created mapping carries.
 const STATE_CREATING: &str = "Creating";
@@ -75,112 +64,23 @@ const MIN_FUNCTION_TIMEOUT: i64 = 1;
 /// seconds (15 minutes)", which is what this emulator refuses a larger value against.
 const MAX_FUNCTION_TIMEOUT: i64 = 900;
 
-/// Lambda, over the same engine as Amazon SQS, so a mapping resolves the queue it polls in
-/// the service that owns it — exactly what `core/router` assembles.
-fn emulator() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(
-        service_com_amazonaws_lambda_awsgirapiservice::EmulatedService::new(Arc::clone(&engine)),
-    );
-    router.register_service(service_com_amazonaws_sqs_amazonsqs::EmulatedService::new(
-        Arc::clone(&engine),
-    ));
-    router
-}
-
-/// Call one Amazon SQS operation (`POST /` with `X-Amz-Target: AmazonSQS.<Operation>`).
-async fn call_sqs(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
-    let request = http::Request::builder()
-        .method("POST")
-        .uri("/")
-        .header("host", "sqs.us-east-1.amazonaws.com")
-        .header("content-type", "application/x-amz-json-1.0")
-        .header("x-amz-target", format!("AmazonSQS.{operation}"))
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{REGION}/sqs/aws4_request, \
-                 SignedHeaders=host;x-amz-target, Signature=0000"
-            ),
-        )
-        .body(bytes::Bytes::from(
-            serde_json::to_vec(body).expect("the request body serializes"),
-        ))
-        .expect("a well-formed request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let parsed = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
-    (status, parsed)
-}
-
 /// Create a queue called `name`, stating `VisibilityTimeout` when `visibility_timeout`
 /// names one and leaving the queue at the documented default otherwise, and answer the
 /// ARN it reports.
-async fn create_queue(
+///
+/// The queue is created, and its ARN read back, through the shared harness every suite
+/// spanning Lambda and Amazon SQS uses; only which attributes this suite states is its own.
+async fn create_timed_queue(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
     visibility_timeout: Option<i64>,
 ) -> String {
-    let mut body = json!({ "QueueName": name });
-    if let Some(seconds) = visibility_timeout {
-        body["Attributes"] = json!({ "VisibilityTimeout": seconds.to_string() });
-    }
-    let (status, created) = call_sqs(router, "CreateQueue", &body).await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: expected CreateQueue to answer 200, got {status} {created}"
+    let attributes = visibility_timeout.map_or_else(
+        || json!({}),
+        |seconds| json!({ "VisibilityTimeout": seconds.to_string() }),
     );
-    let url = created["QueueUrl"]
-        .as_str()
-        .unwrap_or_else(|| panic!("case {case:?}: no QueueUrl in {created}"))
-        .to_string();
-    // The ARN comes back out of the queue itself rather than being spelled here, so the
-    // mapping is made on the ARN Amazon SQS reports for the queue it created.
-    let (status, attributes) = call_sqs(
-        router,
-        "GetQueueAttributes",
-        &json!({ "QueueUrl": url, "AttributeNames": ["QueueArn"] }),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: expected GetQueueAttributes to answer 200, got {status} {attributes}"
-    );
-    attributes["Attributes"]["QueueArn"]
-        .as_str()
-        .unwrap_or_else(|| panic!("case {case:?}: no QueueArn in {attributes}"))
-        .to_string()
-}
-
-/// Create a function called `name` whose `Timeout` is `timeout` seconds.
-async fn create_function(router: &MultiServiceRouter, case: &str, name: &str, timeout: i64) {
-    let package: Vec<u8> = (0..64u16)
-        .map(|byte| u8::try_from(byte % 251).unwrap_or(0))
-        .collect();
-    let answer = call(
-        router,
-        "POST",
-        FUNCTIONS_URI,
-        &json!({
-            "FunctionName": name,
-            "Role": ROLE,
-            "Runtime": "python3.12",
-            "Handler": "index.handler",
-            "Timeout": timeout,
-            "Code": { "ZipFile": base64::engine::general_purpose::STANDARD.encode(&package) },
-        }),
-    )
-    .await;
-    assert_eq!(
-        answer.status,
-        201,
-        "case {case:?}: expected CreateFunction {name:?} to answer 201, got {} {}",
-        answer.status,
-        answer.text()
-    );
+    create_queue(router, case, name, &attributes).await.1
 }
 
 /// `UpdateEventSourceMapping` on the mapping `uuid` names.
@@ -317,11 +217,11 @@ fn rows() -> Vec<Row> {
 async fn a_queue_mapping_is_accepted_only_where_the_queue_outlasts_the_function() {
     for (index, row) in rows().iter().enumerate() {
         let case = row.case;
-        let router = emulator();
+        let router = router_with_queues();
         let function = format!("esm-visibility-{index}");
         let queue = format!("esm-visibility-queue-{index}");
-        create_function(&router, case, &function, row.function_timeout).await;
-        let queue_arn = create_queue(&router, case, &queue, row.visibility_timeout).await;
+        create_timed_function(&router, case, &function, row.function_timeout).await;
+        let queue_arn = create_timed_queue(&router, case, &queue, row.visibility_timeout).await;
 
         let answer = create_mapping(
             &router,
@@ -386,9 +286,9 @@ async fn an_event_source_without_a_visibility_timeout_is_not_held_to_one() {
     // A Kinesis data stream has no visibility timeout at all, so the longest function
     // this emulator admits still maps onto it.
     let case = "a kinesis stream and the longest function";
-    let router = emulator();
+    let router = router_with_queues();
     let function = "esm-visibility-stream";
-    create_function(&router, case, function, MAX_FUNCTION_TIMEOUT).await;
+    create_timed_function(&router, case, function, MAX_FUNCTION_TIMEOUT).await;
 
     let answer = create_mapping(
         &router,
@@ -411,15 +311,20 @@ async fn an_event_source_without_a_visibility_timeout_is_not_held_to_one() {
 #[tokio::test]
 async fn re_targeting_a_queue_mapping_is_held_to_the_same_comparison() {
     let case = "a re-target onto a longer function";
-    let router = emulator();
+    let router = router_with_queues();
     // One queue, and three functions: the one the mapping is created on, one that outruns
     // the queue, and one that does not.
     let visibility_timeout = 5;
-    let queue_arn =
-        create_queue(&router, case, "esm-visibility-retarget", Some(visibility_timeout)).await;
-    create_function(&router, case, "esm-retarget-fits", visibility_timeout).await;
-    create_function(&router, case, "esm-retarget-too-long", 300).await;
-    create_function(&router, case, "esm-retarget-also-fits", MIN_FUNCTION_TIMEOUT).await;
+    let queue_arn = create_timed_queue(
+        &router,
+        case,
+        "esm-visibility-retarget",
+        Some(visibility_timeout),
+    )
+    .await;
+    create_timed_function(&router, case, "esm-retarget-fits", visibility_timeout).await;
+    create_timed_function(&router, case, "esm-retarget-too-long", 300).await;
+    create_timed_function(&router, case, "esm-retarget-also-fits", MIN_FUNCTION_TIMEOUT).await;
 
     let created = create_mapping(
         &router,

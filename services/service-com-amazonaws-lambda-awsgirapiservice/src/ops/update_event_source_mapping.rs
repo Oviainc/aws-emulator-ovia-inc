@@ -33,6 +33,11 @@
 //! error rather than applied on top. Two concurrent updates of one mapping therefore have
 //! exactly one winner, and the loser is told to retry.
 //!
+//! An update is also what RESUMES polling, or re-targets it onto another queue, so it arms
+//! the poll loop exactly as the create does ([`crate::state::drive_sqs_pollers`]); the loop
+//! polls only the mappings that report `Enabled` at the instant of each poll, so a mapping
+//! this call paused stops being polled when the clock settles it into `Disabled`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -551,7 +556,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Answered by reading the stored record back, so `GetEventSourceMapping` reports
         // exactly what this call persisted.
-        Ok(event_source_mapping_configuration(record.reported()))
+        let reported = event_source_mapping_configuration(record.reported());
+        // An update may be what ENABLES a mapping, or what re-targets it onto another queue
+        // or function, so it arms the poll loop exactly as the create does — the store's
+        // lock is released first, because the loop takes it itself.
+        drop(store);
+        crate::state::drive_sqs_pollers(&self.engine);
+        Ok(reported)
     }
 }
 

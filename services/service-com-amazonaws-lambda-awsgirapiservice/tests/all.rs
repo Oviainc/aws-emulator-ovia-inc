@@ -73,6 +73,8 @@ mod event_source_mapping_delete_in_use;
 mod event_source_mapping_deletion;
 #[path = "all/event_source_mapping_queue_visibility.rs"]
 mod event_source_mapping_queue_visibility;
+#[path = "all/event_source_mapping_sqs_delivery.rs"]
+mod event_source_mapping_sqs_delivery;
 #[path = "all/event_source_mapping_update.rs"]
 mod event_source_mapping_update;
 #[path = "all/event_source_mapping_update_omitted_members.rs"]

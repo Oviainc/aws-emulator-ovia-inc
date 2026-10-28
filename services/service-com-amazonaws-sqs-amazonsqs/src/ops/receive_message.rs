@@ -581,66 +581,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     });
                 }
 
-                let taking: Vec<usize> = if delivering {
-                    queue.delivery_order(now, usize::try_from(max_messages).unwrap_or(1))
+                // The delivery itself — which messages are handed over, how each one's
+                // delivery counts and visibility move, and the receipt handle minted for
+                // it — is the queue's own bookkeeping, shared with every other consumer of
+                // it. Nothing was waiting when the queue's key was decided, so an
+                // iteration that found nothing hands nothing over here either (see the
+                // attempt token above).
+                let minted = if delivering {
+                    queue.hand_over(
+                        now,
+                        usize::try_from(max_messages).unwrap_or(1),
+                        invisible_until,
+                    )
                 } else {
-                    // Nothing was waiting when the queue's key was decided, so nothing is
-                    // handed over here either (see the attempt token above).
                     Vec::new()
                 };
 
-                let mut delivered = Vec::with_capacity(taking.len());
-                let mut minted = Vec::with_capacity(taking.len());
-                // The message group the last of these deliveries came from, which is where
-                // the next FIFO receive's walk over the groups starts.
-                let mut served_group: Option<String> = None;
-                for index in taking {
-                    let receipt_handle = queue.mint_receipt_handle();
-                    let message = &mut queue.messages[index];
-                    message.receive_count = message.receive_count.saturating_add(1);
-                    // This queue's own count of the deliveries it has made, which is what
-                    // its `RedrivePolicy` bounds: the delivery below is one of them.
-                    message.queue_receive_count = message.queue_receive_count.saturating_add(1);
-                    if message.first_received_at.is_none() {
-                        message.first_received_at = Some(now);
-                    }
-                    // The instant this handle was minted at, which is where the span a
-                    // later visibility change may still ask for is counted from.
-                    message.last_received_at = Some(now);
-                    message.invisible_until = Some(invisible_until);
-                    served_group = Some(message.group().to_string());
-                    minted.push((receipt_handle.clone(), message.message_id.clone()));
+                let mut delivered = Vec::with_capacity(minted.len());
+                for (index, handed) in &minted {
+                    // The position the message was handed over from, so the wire message is
+                    // projected from the stored one without searching the queue for it.
+                    let Some(message) = queue.messages.get(*index) else {
+                        continue;
+                    };
                     delivered.push(wire_message(
                         message,
-                        receipt_handle,
+                        handed.receipt_handle.clone(),
                         &system_requested,
                         &attribute_requested,
                     ));
                 }
-                if let Some(group) = served_group {
-                    queue.record_delivered_group(&group);
-                }
-                for (receipt_handle, message_id) in &minted {
-                    // Replaces the handle an earlier receive minted for this message, so
-                    // re-receiving cannot accumulate handles.
-                    queue.record_receipt_handle(receipt_handle.clone(), message_id);
-                }
                 // The batch this attempt token handed over, so the retry the token exists
                 // for finds it. A receive that handed nothing over names no batch, so it
                 // remembers nothing and a retry polls the queue afresh.
-                if let Some(attempt_id) =
-                    attempt_id.filter(|_| !minted.is_empty()).cloned()
-                {
+                if let Some(attempt_id) = attempt_id.filter(|_| !minted.is_empty()).cloned() {
                     queue.record_receive_attempt(
                         attempt_id,
                         sqs::ReceiveAttempt {
                             delivered: minted
                                 .into_iter()
-                                .map(|(receipt_handle, message_id)| sqs::DeliveredMessage {
-                                    message_id,
-                                    receipt_handle,
-                                    invisible_until,
-                                })
+                                .map(|(_, handed)| handed)
                                 .collect(),
                             served_at: now,
                         },

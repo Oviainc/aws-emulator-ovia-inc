@@ -38,7 +38,11 @@
 //! maps the receipt handle a receive minted to the message it names, which is what
 //! `DeleteMessage` resolves — and [`Queue::deleted_handles`] remembers the handles a
 //! delete has already consumed, so repeating a delete that succeeded is idempotent
-//! rather than refused. A handle is not an opaque value with no provenance: it carries
+//! rather than refused. HANDING a message over is [`Queue::hand_over`], the one path
+//! every consumer of a queue takes — this service's own `ReceiveMessage` and a poller
+//! another service runs over the same queue — so what one delivery does to a message's
+//! counts, its visibility and its receipt handle is stated once. A handle is not an opaque
+//! value with no provenance: it carries
 //! the queue incarnation that minted it ([`Queue::mint_receipt_handle`]), so
 //! [`ComAmazonawsSqsAmazonsqsState::receipt_handle_origin`] can tell this queue's own
 //! handle from one another queue issued and from one a deleted incarnation issued, which
@@ -1447,6 +1451,83 @@ impl Queue {
         if self.is_fifo() {
             self.group_cursor = Some(group.to_string());
         }
+    }
+
+    /// Hand the next batch this queue may deliver at `now` — at most `max` messages, in
+    /// [`delivery_order`](Self::delivery_order) — to a consumer, and answer what was handed
+    /// over.
+    ///
+    /// This is the ONE place a delivery is recorded, for every consumer of a queue: the
+    /// caller's own `ReceiveMessage` and a poller another service runs over the same queue
+    /// both count a delivery the same way, because `maxReceiveCount` is "the number of
+    /// times a message is delivered to the source queue before being moved to the
+    /// dead-letter queue" whoever the consumer was. Each message handed over has both its
+    /// delivery counts raised, is hidden until `invisible_until` ("The parameter is applied
+    /// to the messages that Amazon SQS returns in the response"), carries the instant it
+    /// was handed over, and gets a freshly minted receipt handle — "if you receive a
+    /// message more than once, each time you receive it, you get a different receipt
+    /// handle" — which supersedes the handle an earlier delivery of it minted. On a FIFO
+    /// queue the group this batch came from is remembered, so the next delivery starts at
+    /// the group after it.
+    ///
+    /// The messages are left IN the queue: only a delete removes one, and a delivery whose
+    /// consumer never deletes it is exactly the case the queue's `RedrivePolicy` bounds. Each
+    /// entry answered therefore carries the POSITION in [`messages`](Self::messages) the
+    /// message was handed over from, so a caller that has to read the stored message again —
+    /// to project the wire message a receive answers with — walks to it instead of searching
+    /// the queue for it. The position is this hand-over's: nothing here removes or reorders a
+    /// message, so it holds until something else does.
+    pub fn hand_over(
+        &mut self,
+        now: SystemTime,
+        max: usize,
+        invisible_until: SystemTime,
+    ) -> Vec<(usize, DeliveredMessage)> {
+        let taking = self.delivery_order(now, max);
+        let mut handed: Vec<(usize, DeliveredMessage)> = Vec::with_capacity(taking.len());
+        // The message group the last of these deliveries came from, which is where the next
+        // delivery's walk over the groups starts.
+        let mut served_group: Option<String> = None;
+        for index in taking {
+            // The handle is minted for a message this queue really holds, so an index it does
+            // not hold costs nothing.
+            if self.messages.get(index).is_none() {
+                continue;
+            }
+            let receipt_handle = self.mint_receipt_handle();
+            let Some(message) = self.messages.get_mut(index) else {
+                continue;
+            };
+            message.receive_count = message.receive_count.saturating_add(1);
+            // This queue's own count of the deliveries it has made, which is what its
+            // `RedrivePolicy` bounds: this delivery is one of them.
+            message.queue_receive_count = message.queue_receive_count.saturating_add(1);
+            if message.first_received_at.is_none() {
+                message.first_received_at = Some(now);
+            }
+            // The instant this handle was minted at, which is where the span a later
+            // visibility change may still ask for is counted from.
+            message.last_received_at = Some(now);
+            message.invisible_until = Some(invisible_until);
+            served_group = Some(message.group().to_string());
+            handed.push((
+                index,
+                DeliveredMessage {
+                    message_id: message.message_id.clone(),
+                    receipt_handle,
+                    invisible_until,
+                },
+            ));
+        }
+        if let Some(group) = served_group {
+            self.record_delivered_group(&group);
+        }
+        for (_, delivered) in &handed {
+            // Replaces the handle an earlier delivery minted for this message, so
+            // re-receiving cannot accumulate handles.
+            self.record_receipt_handle(delivered.receipt_handle.clone(), &delivered.message_id);
+        }
+        handed
     }
 
     /// Count, against the messages this queue was about to hand over at `now`, a delivery

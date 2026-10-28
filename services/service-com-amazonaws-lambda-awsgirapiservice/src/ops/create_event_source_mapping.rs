@@ -21,6 +21,13 @@
 //! refused with the same modelled 400 (see [`crate::state::queue_visibility_refusal`]),
 //! which is why the queue's timeout is read out of its own store here.
 //!
+//! An accepted mapping on a queue also STARTS POLLING it: "Lambda reads items from the
+//! event source and invokes the function", so this call arms the poll loop
+//! ([`crate::state::drive_sqs_pollers`]) that takes each batch out of the queue and hands
+//! it to the mapping's function. Nothing waits for a poll here — the loop runs on its own
+//! clock — and what one poll does, including why an unprocessed batch is left on the queue,
+//! is documented in [`crate::state::sqs_poller`].
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -648,6 +655,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Nobody has deleted this mapping, so no removal is owed.
             removal_due: None,
             last_modified: now,
+            // "The result of the event source mapping's last processing attempt": this
+            // mapping's poller has not had a batch to attempt yet.
+            last_processing_result: None,
         };
         store.event_source_mappings.insert(uuid.clone(), record);
 
@@ -664,7 +674,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        Ok(stored.reported())
+        let reported = stored.reported();
+        // Standing the mapping's poller up is what this call started: "Lambda reads items
+        // from the event source and invokes the function", and the reading is the poller's.
+        // The store's lock is released first — the poll loop takes it itself — and nothing
+        // here waits for a poll: the loop runs on its own clock (`crate::state::poll_due`).
+        drop(store);
+        crate::state::drive_sqs_pollers(&self.engine);
+        Ok(reported)
     }
 }
 
