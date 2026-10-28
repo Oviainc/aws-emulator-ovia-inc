@@ -7,6 +7,12 @@
 //! the `running` transition the clock owes it recorded, so a caller that describes it
 //! immediately still sees `pending`.
 //!
+//! A launch that names an `IamInstanceProfile` gives every instance it mints that
+//! profile: an association is recorded over each one through the store's single writer
+//! seam ([`crate::state::ComAmazonawsEc2Amazonec2State::insert_iam_instance_profile_association`]),
+//! so the instance reports it as `Instance$IamInstanceProfile` and
+//! `DescribeIamInstanceProfileAssociations` reports the same record.
+//!
 //! A repeat of the same request under one `ClientToken` returns the reservation that
 //! token already minted instead of launching again. A `LaunchTemplate` is answered
 //! with a 501: it names a resource no implemented operation creates, so there is
@@ -317,14 +323,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            architecture_for, availability_zones_in_region, private_dns_name, request_region,
-            require_service_state, validate_kernel_or_ramdisk_id, validate_tag_size,
-            InstanceRecord, InstanceStateName,
+            architecture_for, availability_zones_in_region,
+            iam_instance_profile_association_payload_bytes, private_dns_name, request_region,
+            require_service_state, resolve_iam_instance_profile, validate_kernel_or_ramdisk_id,
+            validate_tag_size,
+            IamInstanceProfileAssociationSpec, InstanceRecord, InstanceStateName,
             MONITORING_STATE_DISABLED, MONITORING_STATE_ENABLED,
             PendingTransition, ReservationRecord, DEFAULT_INSTANCE_TYPE,
-            DEFAULT_SOURCE_DEST_CHECK, MAX_INSTANCES_PER_RUN,
+            DEFAULT_SOURCE_DEST_CHECK, MAX_IAM_INSTANCE_PROFILE_ASSOCIATIONS,
+            MAX_INSTANCES_PER_RUN,
             MAX_SECURITY_GROUPS_PER_INSTANCE, MAX_STORED_BYTES, MAX_STORED_INSTANCES,
             MAX_USER_DATA_BYTES, RUN_INSTANCES_TAGGABLE_RESOURCES,
+            STORED_RECORD_OVERHEAD_BYTES,
         };
 
         // A launch template carries the launch parameters this handler would have to
@@ -454,6 +464,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // "The name or Amazon Resource Name (ARN) of an IAM instance profile"
+        // (`RunInstancesRequest$IamInstanceProfile`): a launch that names one gives every
+        // instance it mints that profile, so the reference is read through the ONE reading
+        // of that member this crate has — the same one `AssociateIamInstanceProfile` uses,
+        // so a profile cannot be spelled one way here and another there — BEFORE the store
+        // is touched. A reference this service cannot act on refuses the whole launch
+        // rather than being accepted and dropped.
+        let iam_instance_profile = match input.iam_instance_profile.as_ref() {
+            Some(specification) => Some(resolve_iam_instance_profile(specification)?),
+            None => None,
+        };
+
         let region = request_region(ctx.parts());
         // The zone an instance launches into must be one the Region has, and the
         // naming rule for those zones lives in one place: `availability_zones_in_region`.
@@ -557,6 +579,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             + input.kernel_id.as_ref().map_or(0, String::len)
             + input.ramdisk_id.as_ref().map_or(0, String::len)
             + availability_zone.len()
+            // The association each instance of the launch is given retains the profile
+            // reference the request named, charged by the one definition of that charge
+            // beside the per-record overhead the store's writer seam adds to it — so the
+            // batch ceiling below covers every record the launch stores, not only the
+            // instances.
+            + iam_instance_profile.as_ref().map_or(0, |profile| {
+                iam_instance_profile_association_payload_bytes(profile)
+                    .saturating_add(STORED_RECORD_OVERHEAD_BYTES)
+            })
             + crate::state::tag_bytes(&tags)
             + security_groups
                 .iter()
@@ -578,6 +609,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     "This emulator holds {} of at most {MAX_STORED_INSTANCES} instances, \
                      so it cannot launch {requested} more",
                     store.instances.len()
+                )));
+            }
+            // One association per instance the launch mints, so the association store's
+            // own ceiling bounds a launch that names a profile the way the instance
+            // store's bounds every launch — asked here, before the first write, so a
+            // launch that cannot be given them all leaves nothing behind.
+            if iam_instance_profile.is_some()
+                && store
+                    .iam_instance_profile_associations
+                    .len()
+                    .saturating_add(requested)
+                    > MAX_IAM_INSTANCE_PROFILE_ASSOCIATIONS
+            {
+                return Err(Scaffolded::request_limit_exceeded(format!(
+                    "This emulator holds {} of at most \
+                     {MAX_IAM_INSTANCE_PROFILE_ASSOCIATIONS} IAM instance profile \
+                     associations, so it cannot associate {requested} more",
+                    store.iam_instance_profile_associations.len()
                 )));
             }
             if store.would_exceed_stored_bytes(batch_bytes) {
@@ -652,7 +701,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for (launch_index, private_ip) in addresses.into_iter().enumerate() {
             let instance_id = store.mint_instance_id();
             store.insert_instance(InstanceRecord {
-                instance_id,
+                instance_id: instance_id.clone(),
                 reservation_id: reservation_id.clone(),
                 image_id: Some(image_id.clone()),
                 instance_type: instance_type.clone(),
@@ -706,6 +755,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // carries neither a request id nor the `spot` lifecycle.
                 spot_instance_request_id: None,
             });
+            // The profile the launch named is recorded over the instance as an association
+            // of its own, in the non-terminal `associating` state the clock then moves to
+            // `associated` — so a caller that reads straight after the launch still sees
+            // the transient state — and the instance reports the profile off that same
+            // record, so the launch, the instance report and the association report cannot
+            // disagree about one instance's profile. Both of the store's ceilings were
+            // asked above, so the seam has room; a store that answers otherwise has not
+            // stored what this launch reports, and says so rather than reporting a profile
+            // no association holds.
+            if let Some(profile) = iam_instance_profile.clone() {
+                if store
+                    .insert_iam_instance_profile_association(IamInstanceProfileAssociationSpec {
+                        instance_id: instance_id.clone(),
+                        iam_instance_profile: profile,
+                    })
+                    .is_none()
+                {
+                    return Err(Scaffolded::internal_error(format!(
+                        "the IAM instance profile association for instance \
+                         '{instance_id}' was not stored"
+                    )));
+                }
+            }
         }
 
         if let Some(token) = input.client_token.clone() {
