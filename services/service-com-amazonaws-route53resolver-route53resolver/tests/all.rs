@@ -59,6 +59,8 @@ mod resolver_query_log_config_listing;
 mod resolver_query_log_configs;
 #[path = "all/resolver_rule_association_listing.rs"]
 mod resolver_rule_association_listing;
+#[path = "all/resolver_rule_association_ordering.rs"]
+mod resolver_rule_association_ordering;
 #[path = "all/resolver_rule_delete_identity.rs"]
 mod resolver_rule_delete_identity;
 #[path = "all/resolver_rule_deletion.rs"]
