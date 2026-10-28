@@ -31,6 +31,8 @@ mod enum_value_set_order;
 mod error_classification;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
+#[path = "all/geo_locations.rs"]
+mod geo_locations;
 #[path = "all/geolocation_routing.rs"]
 mod geolocation_routing;
 #[path = "all/health_check_creation.rs"]

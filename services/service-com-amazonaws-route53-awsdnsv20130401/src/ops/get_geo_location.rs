@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetGeoLocation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetGeoLocation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetGeoLocation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -91,6 +82,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::geo_location::{self, Location};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -122,6 +115,79 @@ impl From<GetGeoLocationErrorModeled> for GetGeoLocationError {
     fn from(modeled: GetGeoLocationErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// A value a request carried, or `None` when it carried none: an absent query
+/// parameter and an empty one both name nothing.
+fn given(value: &Option<String>) -> Option<&str> {
+    value.as_deref().filter(|value| !value.is_empty())
+}
+
+/// The location the request asks about.
+///
+/// The operation's own documented syntax admits exactly three forms — "whether a
+/// continent is supported … `?continentcode=`", "whether a country is supported …
+/// `?countrycode=`" and "whether a subdivision of a country is supported …
+/// `?countrycode=…&subdivisioncode=`" — so a request naming a continent together
+/// with a country, a subdivision with no country, or nothing at all asks about no
+/// location and is refused as the invalid input it is, never answered with a
+/// location it did not name.
+fn requested_location(
+    input: &GetGeoLocationInput,
+) -> Result<Location<'_>, GetGeoLocationError> {
+    let continent_code = given(&input.continent_code);
+    let country_code = given(&input.country_code);
+    let subdivision_code = given(&input.subdivision_code);
+
+    let problem = match (continent_code, country_code, subdivision_code) {
+        (Some(continent_code), None, None) => return Ok(Location::Continent(continent_code)),
+        (None, Some(country_code), None) => return Ok(Location::Country(country_code)),
+        (None, Some(country_code), Some(subdivision_code)) => {
+            return Ok(Location::Subdivision {
+                country_code,
+                subdivision_code,
+            })
+        }
+        (Some(_), _, _) => {
+            "continentcode names a continent on its own, so it cannot be combined with \
+             countrycode or subdivisioncode"
+        }
+        (None, None, Some(_)) => {
+            "subdivisioncode names a subdivision of no country; a subdivision is asked about \
+             with both countrycode and subdivisioncode"
+        }
+        (None, None, None) => {
+            "a geolocation is asked about by continentcode, by countrycode, or by countrycode \
+             and subdivisioncode together; this request names none of them"
+        }
+    };
+    Err(GetGeoLocationErrorModeled::InvalidInput(InvalidInput {
+        message: Some(problem.to_string()),
+    })
+    .into())
+}
+
+/// How a location the service does not support is refused.
+///
+/// `NoSuchGeoLocation`'s own documentation: "Amazon Route 53 doesn't support the
+/// specified geographic location." The service states which location that was by
+/// naming the codes the request asked about, as a bracketed list of the code
+/// members the request filled — a country on its own, a continent on its own, or
+/// a country together with the subdivision inside it — so one such refusal is
+/// told apart from the next by the location it is about.
+fn no_such_geo_location(wanted: Location<'_>) -> GetGeoLocationError {
+    let asked = match wanted {
+        Location::Continent(code) => format!("continent = {code}"),
+        Location::Country(code) => format!("country = {code}"),
+        Location::Subdivision {
+            country_code,
+            subdivision_code,
+        } => format!("country = {country_code}, subdivision = {subdivision_code}"),
+    };
+    GetGeoLocationErrorModeled::NoSuchGeoLocation(NoSuchGeoLocation {
+        message: Some(format!("No geo location for location: [{asked}]")),
+    })
+    .into()
 }
 
 /// The `GetGeoLocation` operation.
@@ -158,20 +224,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetGeoLocation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetGeoLocationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetGeoLocation"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable under the router, which always mounts this service on
+            // the shared `InMemoryEngine`.
+            GetGeoLocationErrorModeled::InvalidInput(InvalidInput {
+                message: Some("the Route 53 emulator's state store is unavailable".to_string()),
+            })
+        })?;
+        let wanted = requested_location(&input)?;
+
+        // A pure read of the SAME catalog `ListGeoLocations` reports ("For a list of
+        // all supported subdivision codes, use the ListGeoLocations API"), so a
+        // location the listing carries is one this operation resolves and a location
+        // neither holds is one the service does not support.
+        let store = state.lock();
+        let catalog = store.geo_locations();
+        let found = geo_location::find(catalog, wanted)
+            .ok_or_else(|| no_such_geo_location(wanted))?;
+
+        Ok(GetGeoLocationOutput {
+            geo_location_details: found.clone(),
+        })
     }
 }

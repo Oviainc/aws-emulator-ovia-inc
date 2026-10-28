@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListGeoLocations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListGeoLocations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListGeoLocations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -113,6 +104,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::geo_location::{self, Location};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -143,6 +136,94 @@ impl From<ListGeoLocationsErrorModeled> for ListGeoLocationsError {
     fn from(modeled: ListGeoLocationsErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// The most locations one response carries, and the bound a request's `maxitems`
+/// is read within.
+///
+/// Route 53 states that bound on the `MaxItems` of its listings — `ListHostedZones`'s
+/// own documentation: "If you don't specify a value for maxitems, Route 53 returns up
+/// to 100 … If you specify a value greater than 100, Route 53 returns only the first
+/// 100" — and this service's other listings already read it that way
+/// (`list_hosted_zones`, `list_reusable_delegation_sets`). The catalog is longer than
+/// one page, so paging through it is the only way to see all of it, exactly as it is
+/// against Route 53.
+const MAX_PAGE_SIZE: i32 = 100;
+
+/// A value a request carried, or `None` when it carried none: an absent query
+/// parameter and an empty one both name nothing.
+fn given(value: &Option<String>) -> Option<&str> {
+    value.as_deref().filter(|value| !value.is_empty())
+}
+
+/// This operation's one modelled input refusal, worded with `message`.
+fn invalid_input(message: String) -> ListGeoLocationsError {
+    ListGeoLocationsErrorModeled::InvalidInput(InvalidInput {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The location the request's start codes position the listing AT, or `None` when
+/// it carries none and the listing starts at the beginning.
+///
+/// The three start codes are the three `Next*Code`s of a previous response, so
+/// they name one location between them, in one of the forms the operation
+/// documents: a continent on its own ("Include startcontinentcode only if you want
+/// to list continents. Don't include startcontinentcode when you're listing
+/// countries or countries with their subdivisions"), a country on its own, or a
+/// subdivision, which takes both codes ("To list subdivisions (U.S. states), you
+/// must include both startcountrycode and startsubdivisioncode"). Any other
+/// combination names no location, so it is refused rather than silently read as
+/// one of them.
+fn requested_start(
+    input: &ListGeoLocationsInput,
+) -> Result<Option<Location<'_>>, ListGeoLocationsError> {
+    let continent_code = given(&input.start_continent_code);
+    let country_code = given(&input.start_country_code);
+    let subdivision_code = given(&input.start_subdivision_code);
+
+    match (continent_code, country_code, subdivision_code) {
+        (Some(continent_code), None, None) => Ok(Some(Location::Continent(continent_code))),
+        (None, Some(country_code), None) => Ok(Some(Location::Country(country_code))),
+        (None, Some(country_code), Some(subdivision_code)) => Ok(Some(Location::Subdivision {
+            country_code,
+            subdivision_code,
+        })),
+        (None, None, None) => Ok(None),
+        (Some(_), _, _) => Err(invalid_input(
+            "startcontinentcode is only for listing continents, so it cannot be combined with \
+             startcountrycode or startsubdivisioncode"
+                .to_string(),
+        )),
+        (None, None, Some(subdivision_code)) => Err(invalid_input(format!(
+            "startsubdivisioncode {subdivision_code:?} names a subdivision of no country; to list \
+             subdivisions you must include both startcountrycode and startsubdivisioncode"
+        ))),
+    }
+}
+
+/// How a start code that names no supported location is refused.
+///
+/// The start codes position the listing at a location, so a code naming none
+/// positions nothing: the caller is told so rather than handed a page starting
+/// somewhere else.
+fn unsupported_start(wanted: Location<'_>) -> ListGeoLocationsError {
+    let named = match wanted {
+        Location::Continent(code) => format!("startcontinentcode {code:?}"),
+        Location::Country(code) => format!("startcountrycode {code:?}"),
+        Location::Subdivision {
+            country_code,
+            subdivision_code,
+        } => {
+            format!("startcountrycode {country_code:?} and startsubdivisioncode {subdivision_code:?}")
+        }
+    };
+    invalid_input(format!(
+        "{named} names no geographic location Route 53 supports for geolocation; the start codes \
+         position the listing at a location, so they have to be the NextContinentCode, \
+         NextCountryCode and NextSubdivisionCode a previous ListGeoLocations response returned"
+    ))
 }
 
 /// The `ListGeoLocations` operation.
@@ -179,20 +260,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListGeoLocations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListGeoLocationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListGeoLocations"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable under the router, which always mounts this service on
+            // the shared `InMemoryEngine`.
+            invalid_input("the Route 53 emulator's state store is unavailable".to_string())
+        })?;
+
+        let page_size = input
+            .max_items
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+        // Route 53 echoes the `maxitems` the caller asked for ("The value that you
+        // specified for MaxItems in the request"); the clamped `page_size` above only
+        // bounds the work and the response size.
+        let reported_max_items = input.max_items.unwrap_or(MAX_PAGE_SIZE);
+        let start = requested_start(&input)?;
+
+        // A pure read: the catalog belongs to the service, so reporting it leaves
+        // the store exactly as it was.
+        let store = state.lock();
+        let catalog = store.geo_locations();
+        let start = match start {
+            None => 0,
+            Some(wanted) => {
+                geo_location::position(catalog, wanted).ok_or_else(|| unsupported_start(wanted))?
+            }
+        };
+
+        // `skip` rather than a slice index: `start` came from the request, and a
+        // walk that skips can never index past the end of the catalog.
+        let mut remaining = catalog.iter().skip(start);
+        let geo_location_details_list: Vec<GeoLocationDetails> =
+            remaining.by_ref().take(page_size as usize).cloned().collect();
+        // "A value that indicates whether more locations remain to be listed after
+        // the last location in this response" — so what is truncated is decided by
+        // whether the catalog holds a location after this page, and the `Next*Code`s
+        // are that location's own codes, which a caller hands straight back as the
+        // `start*code`s to resume at it.
+        let next = remaining.next();
+
+        Ok(ListGeoLocationsOutput {
+            geo_location_details_list,
+            is_truncated: next.is_some(),
+            next_continent_code: next.and_then(|next| next.continent_code.clone()),
+            next_country_code: next.and_then(|next| next.country_code.clone()),
+            next_subdivision_code: next.and_then(|next| next.subdivision_code.clone()),
+            // The echoed `maxitems`, so a request outside the page bound reads its
+            // own value back while the page itself stays clamped.
+            max_items: reported_max_items,
+        })
     }
 }

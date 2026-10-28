@@ -13,15 +13,16 @@
 //! `/hostedzone/`, `/change/` and `/delegationset/` id prefixes the API wraps
 //! ids in, and the id minting every create needs.
 //!
-//! Beside those caller-owned resources this store also holds the one
-//! SERVICE-owned record the API reports: the CIDR blocks Route 53's health
-//! checkers send their checks from ([`CHECKER_IP_RANGES`]). No operation
-//! creates, changes or deletes one — the set belongs to the service, not to the
-//! account — so it is built into this struct's [`Default`], which the engine
-//! constructs the first time a handler reaches the store. Seeding it there,
-//! rather than on the first read, is what keeps `GetCheckerIpRanges` a pure
-//! reporting operation: it reads the record and writes nothing, so a read can
-//! never change what a later caller sees.
+//! Beside those caller-owned resources this store also holds the SERVICE-owned
+//! records the API reports: the CIDR blocks Route 53's health checkers send
+//! their checks from ([`CHECKER_IP_RANGES`]), and the geographic locations it
+//! supports for geolocation routing ([`geo_location`]). No operation creates,
+//! changes or deletes one — they belong to the service, not to the account — so
+//! they are built into this struct's [`Default`], which the engine constructs
+//! the first time a handler reaches the store. Seeding them there, rather than
+//! on the first read, is what keeps `GetCheckerIpRanges`, `ListGeoLocations`
+//! and `GetGeoLocation` pure reporting operations: they read the records and
+//! write nothing, so a read can never change what a later caller sees.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt::Write as _;
@@ -37,6 +38,10 @@ pub mod health_check_status;
 /// record set is selected by.
 pub mod client_location;
 
+/// The geographic locations the service supports for geolocation routing, which
+/// is what `ListGeoLocations` reports and `GetGeoLocation` resolves.
+pub mod geo_location;
+
 /// The CloudWatch alarm an alarm-reading health check monitors, as the reported
 /// health check carries it.
 pub mod monitored_alarm;
@@ -50,6 +55,7 @@ use crate::ops::types::shared_types::{
     HealthCheckObservation, HostedZone, HostedZoneConfig, HostedZoneFeatures,
     InvalidPaginationToken, InvalidTrafficPolicyDocument, KeySigningKey, NoSuchDelegationSet,
     NoSuchHealthCheck, NoSuchHostedZone, NoSuchTrafficPolicy, NoSuchTrafficPolicyInstance,
+    GeoLocationDetails,
     ResourceRecordSet, ResourceTagSet, StatusReport, Tag, TrafficPolicy, TrafficPolicyInstance, VPC,
     HEALTH_CHECK_REGION_VALUES, R_R_TYPE_VALUES, V_P_C_REGION_VALUES,
 };
@@ -1606,6 +1612,13 @@ pub struct ComAmazonawsRoute53Awsdnsv20130401State {
     /// this store is created and only ever read afterwards, so every call
     /// answers the same list.
     checker_ip_ranges: Vec<String>,
+    /// The geographic locations `ListGeoLocations` reports and `GetGeoLocation`
+    /// resolves, in the order the API reports them. SERVICE-owned in exactly the
+    /// way the checker ranges above are: seeded from
+    /// [`geo_location::catalog`] when this store is created and only ever read
+    /// afterwards, so every call answers the same catalog and a read of it can
+    /// never change what a later caller sees.
+    geo_locations: Vec<GeoLocationDetails>,
     /// Whether the one checker clock that publishes the health checks' status
     /// series ([`health_check_status::drive_health_check_metrics`]) is running, so
     /// a second write does not start a second one.
@@ -1636,6 +1649,7 @@ impl Default for ComAmazonawsRoute53Awsdnsv20130401State {
             delegation_set_by_caller_reference: HashMap::new(),
             ids: IdMinter::default(),
             checker_ip_ranges: checker_ip_ranges(),
+            geo_locations: geo_location::catalog(),
             checker_clock_running: false,
             checker_clock_generation: 0,
             checker_clock: None,
@@ -2001,6 +2015,15 @@ impl ComAmazonawsRoute53Awsdnsv20130401State {
     /// leaves the store exactly as it was.
     pub fn checker_ip_ranges(&self) -> &[String] {
         &self.checker_ip_ranges
+    }
+
+    /// The supported geographic locations this store holds, in the order
+    /// `ListGeoLocations` reports them.
+    ///
+    /// A borrow, not a mutation: the catalog is service-owned, so reporting it
+    /// or resolving one entry of it leaves the store exactly as it was.
+    pub fn geo_locations(&self) -> &[GeoLocationDetails] {
+        &self.geo_locations
     }
 
     /// Mint the four authoritative name servers for a new hosted zone.
