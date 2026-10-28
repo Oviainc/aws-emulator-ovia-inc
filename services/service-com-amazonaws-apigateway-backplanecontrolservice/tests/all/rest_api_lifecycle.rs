@@ -185,6 +185,46 @@ pub(crate) async fn resource_under(
     string_member(&created, "id", &format!("CreateResource({path_part})"))
 }
 
+/// Put one method on `api`'s ROOT resource, which is what makes the API DEPLOYABLE:
+/// `CreateDeployment` refuses an API that carries no method, since a deployment is the
+/// snapshot of the API's methods a stage serves.
+///
+/// The method goes on the root resource, which every API is created with, so nothing is
+/// added to the API's resource TREE and a suite that asserts the tree is unaffected. This
+/// crate's one copy of that step, shared by every suite that deploys an API only to have
+/// a deployment or a stage to address.
+pub(crate) async fn make_deployable(gateway: &Gateway, api: &str) {
+    // Idempotent, so a suite may call it beside a helper that already does: a method is
+    // only put when the API carries none at all, which is what `embed=methods` reports.
+    let listed = gateway
+        .call("GET", &format!("/restapis/{api}/resources?embed=methods"), None)
+        .await;
+    let carries_a_method = page_items(&listed.body, &format!("GetResources({api})"))
+        .iter()
+        .any(|resource| {
+            resource["resourceMethods"]
+                .as_object()
+                .is_some_and(|methods| !methods.is_empty())
+        });
+    if carries_a_method {
+        return;
+    }
+    let read = gateway.call("GET", &format!("/restapis/{api}"), None).await;
+    let root = string_member(&read.body, "rootResourceId", &format!("GetRestApi({api})"));
+    let answer = gateway
+        .call(
+            "PUT",
+            &format!("/restapis/{api}/resources/{root}/methods/GET"),
+            Some(json!({ "authorizationType": "NONE" })),
+        )
+        .await;
+    assert_eq!(
+        answer.status, 201,
+        "case PutMethod on the root of {api}: expected 201, got {} with {:?}",
+        answer.status, answer.body
+    );
+}
+
 /// A required string member of a response body, with the case named on failure.
 pub(crate) fn string_member(body: &Value, member: &str, case: &str) -> String {
     body[member]

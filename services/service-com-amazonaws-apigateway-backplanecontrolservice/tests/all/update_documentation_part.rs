@@ -373,9 +373,10 @@ async fn an_op_the_content_map_does_not_support_is_refused() {
         );
     }
 
-    // An op OUTSIDE the modelled `Op` value set is refused with the same 400
-    // `BadRequestException` this operation's own refusals carry — the rule the sibling
-    // `patch_updates` suite asserts for every `Update*` operation of this service.
+    // An op OUTSIDE the modelled `Op` value set is refused by the CONSTRAINT layer in
+    // front of the handler, whose error class is `ValidationException` and not this
+    // operation's own `BadRequestException` — the rule the sibling `patch_updates` suite
+    // asserts for every `Update*` operation of this service.
     for op in ["delete", "upsert", ""] {
         let case = format!("an off-model op {op:?}");
         let answer = update_part(
@@ -385,7 +386,7 @@ async fn an_op_the_content_map_does_not_support_is_refused() {
             json!([patch(op, "/properties", Some("{}"))]),
         )
         .await;
-        assert_failure(&answer, 400, BAD_REQUEST, &case);
+        assert_failure(&answer, 400, "ValidationException", &case);
         let read = read_properties(&gateway, &api, &part, &case).await;
         assert_eq!(
             read, ORIGINAL_PROPERTIES,

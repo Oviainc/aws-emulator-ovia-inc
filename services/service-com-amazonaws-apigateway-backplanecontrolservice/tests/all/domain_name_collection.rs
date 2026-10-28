@@ -647,14 +647,14 @@ async fn the_resource_owner_filter_selects_whose_domain_names_a_page_reports() {
     }
 
     // A value outside the enum is refused by the modelled constraint, not served as if it
-    // had named an owner: the boundary validator answers this service's own
-    // `BadRequestException` (see `src/service/validation.rs`), the code AWS names a
-    // refused control-plane request by.
+    // had named an owner: the layer in front of the handler answers under its OWN error
+    // class (see `src/service/validation.rs`), which is not the operation's
+    // `BadRequestException`.
     let answer = list_domains(&gateway, "resourceOwner=NOBODY").await;
     assert_failure(
         &answer,
         400,
-        "BadRequestException",
+        "ValidationException",
         "GetDomainNames(resourceOwner=NOBODY)",
     );
 }

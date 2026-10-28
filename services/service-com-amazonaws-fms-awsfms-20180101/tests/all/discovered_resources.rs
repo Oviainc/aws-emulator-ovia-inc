@@ -237,6 +237,34 @@ pub(crate) async fn api_gateway_created(
     parsed
 }
 
+/// Put one method on the API's ROOT resource, which is what makes the API
+/// DEPLOYABLE: a deployment is the snapshot of the API's methods a stage serves,
+/// so API Gateway refuses to deploy an API that carries none.
+///
+/// `created` is the `CreateRestApi` body, which reports the root resource the API
+/// was created with.
+pub(crate) async fn api_gateway_method_on_root(
+    router: &MultiServiceRouter,
+    api: &str,
+    created: &Value,
+) {
+    let root = created["rootResourceId"]
+        .as_str()
+        .expect("a minted root resource id");
+    let uri = format!("/restapis/{api}/resources/{root}/methods/GET");
+    let (status, parsed) = api_gateway_call(
+        router,
+        "PUT",
+        &uri,
+        Some(json!({ "authorizationType": "NONE" })),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "case \"method\": expected HTTP 201 from PUT {uri}, got {status} with {parsed}"
+    );
+}
+
 /// An EC2 call that must succeed, and the XML it answered.
 pub(crate) async fn ec2_ok(
     case: &str,
@@ -558,16 +586,19 @@ async fn discovers_what_the_owning_services_hold() {
     let load_balancer_arn = element("load balancer", &created, "LoadBalancerArn");
 
     // --- API Gateway, over restJson1 ---------------------------------------
-    let api = api_gateway_created(
+    let created_api = api_gateway_created(
         "rest api",
         &router,
         "/restapis",
         json!({ "name": "fms-discovered-api" }),
     )
-    .await["id"]
+    .await;
+    let api = created_api["id"]
         .as_str()
         .expect("a minted REST API id")
         .to_string();
+    // A deployment is the snapshot of the API's methods, so the API must carry one.
+    api_gateway_method_on_root(&router, &api, &created_api).await;
     let stage_name = "prod";
     api_gateway_created(
         "stage",

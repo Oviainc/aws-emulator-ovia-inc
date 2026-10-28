@@ -330,16 +330,18 @@ async fn the_status_codes_an_integration_response_takes_are_the_ones_the_pattern
     }
 
     for status in refused {
+        // Refused by the CONSTRAINT layer in front of the handler, whose error class is
+        // `ValidationException` rather than the operation's own `BadRequestException`.
         assert_failure(
             &put_integration_response(&gateway, &api, &resource, "GET", status, json!({})).await,
             400,
-            "BadRequestException",
+            "ValidationException",
             &format!("PutIntegrationResponse({status})"),
         );
         assert_failure(
             &get_integration_response(&gateway, &api, &resource, "GET", status).await,
             400,
-            "BadRequestException",
+            "ValidationException",
             &format!("GetIntegrationResponse({status})"),
         );
     }

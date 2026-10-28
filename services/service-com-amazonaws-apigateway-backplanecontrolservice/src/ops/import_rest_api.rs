@@ -558,10 +558,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // API created from a request.
             stages: BTreeMap::new(),
             deployments: BTreeMap::new(),
-            // Nor with a customized gateway response, a documentation part, a
-            // documentation version, an authorizer, a request validator or a model: each
-            // is written by the operation that owns it. An imported definition's schemas
-            // are left to the issue that owns importing them.
+            // Nor with a documentation part, a documentation version, an authorizer, a
+            // request validator or a model: each is written by the operation that owns
+            // it. An imported definition's schemas are left to the issue that owns
+            // importing them. The gateway responses the definition customizes ARE
+            // imported, by `materialise_definition` below.
             gateway_responses: BTreeMap::new(),
             documentation_parts: BTreeMap::new(),
             documentation_versions: BTreeMap::new(),

@@ -4,8 +4,9 @@
 //! IMPLEMENTED: reads the API key file the request carries, writes one `ApiKey` record
 //! into [`crate::state`] per row it can carry over — metered by each stored usage plan
 //! that row's `usageplanIds` cell names — and answers with those ids beside one warning
-//! per row it could not fully carry over; the whole import is refused instead when
-//! `failOnWarnings` is set. This is the ONLY file to touch for this operation.
+//! per row it could not fully carry over; a warning plus `failOnWarnings` turns that
+//! answer into the modelled 400, leaving the records the other rows committed in place.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -133,6 +134,46 @@ const COLUMN_USAGE_PLAN_IDS: &str = "usageplanids";
 /// bounds the work the reader does.
 const MAX_IMPORT_BYTES: usize = 1024 * 1024;
 
+/// The warning for a record the import SKIPPED: it names the record by its 1-based row
+/// and states why that record could not be created.
+///
+/// A record this operation cannot create is a WARNING and not an error — the rows around
+/// it are still committed — and API Gateway words such a warning exactly this way (a
+/// recorded refusal under `failOnWarnings` carries `Skipped invalid record: 2. API Key
+/// value should be at least 20 characters`). The variable parts are the row the caller
+/// has to fix and the reason, both taken from the payload.
+fn skipped_record(row: usize, reason: &str) -> String {
+    format!("Skipped invalid record: {row}. {reason}")
+}
+
+/// The warning for a record the import DID create while leaving part of the row behind.
+///
+/// AWS publishes no wording for this second kind of warning — the record exists, so it is
+/// not a skipped one — so the sentence is this emulator's own, naming the row and what it
+/// could not carry over.
+fn partial_record(row: usize, note: &str) -> String {
+    format!("row {row}: {note}")
+}
+
+/// The reason a record whose `key` cell is empty is skipped: the value is what a client
+/// presents in `x-api-key`, so a record without one creates nothing.
+const VALUE_REQUIRED: &str = "API Key value is required";
+
+/// The reason a record whose `name` cell is empty is skipped; `name` is a required column
+/// of the API key file format.
+const NAME_REQUIRED: &str = "API Key name is required";
+
+/// The reason a record is skipped for a key value shorter than the published minimum,
+/// which is the recorded wording of this warning.
+fn value_too_short() -> String {
+    format!("API Key value should be at least {MIN_VALUE_CHARS} characters")
+}
+
+/// The same reason at the other end of the published range; see [`value_too_short`].
+fn value_too_long() -> String {
+    format!("API Key value should be at most {MAX_VALUE_CHARS} characters")
+}
+
 /// One row of an API key file, as it will be stored.
 #[derive(Debug, Clone)]
 struct ImportedKey {
@@ -220,21 +261,21 @@ fn imported_key(
 
     let value = cell(record, indices, COLUMN_KEY);
     if value.is_empty() {
-        return Err(format!("{COLUMN_KEY} is required"));
+        return Err(VALUE_REQUIRED.to_string());
     }
     // The value is what a client will present in `x-api-key`, so it must be long enough
     // to be a key at all: the SAME published range `CreateApiKey` holds a supplied value
-    // to. The refusal names the bound and the length, never the value, which is a secret.
+    // to. The refusal names the bound, never the value, which is a secret.
     let length = value.chars().count();
-    if !(MIN_VALUE_CHARS..=MAX_VALUE_CHARS).contains(&length) {
-        return Err(format!(
-            "{COLUMN_KEY} must be between {MIN_VALUE_CHARS} and {MAX_VALUE_CHARS} characters, \
-             got {length}"
-        ));
+    if length < MIN_VALUE_CHARS {
+        return Err(value_too_short());
+    }
+    if length > MAX_VALUE_CHARS {
+        return Err(value_too_long());
     }
     let name = cell(record, indices, COLUMN_NAME);
     if name.is_empty() {
-        return Err(format!("{COLUMN_NAME} is required"));
+        return Err(NAME_REQUIRED.to_string());
     }
     bound_chars(COLUMN_NAME, name, MAX_STRING_CHARS)?;
     let description = cell(record, indices, COLUMN_DESCRIPTION);
@@ -358,7 +399,8 @@ fn parse_import(body: &[u8]) -> Result<ImportedKeys, String> {
         let record = match record {
             Ok(record) => record,
             Err(_) => {
-                read.warnings.push((row, "the row is malformed".to_string()));
+                read.warnings
+                    .push((row, skipped_record(row, "the row is malformed")));
                 continue;
             }
         };
@@ -367,11 +409,11 @@ fn parse_import(body: &[u8]) -> Result<ImportedKeys, String> {
                 // The key itself is still imported: every note is one thing about this
                 // row the import could not carry over, reported as that row's warning.
                 for note in ::std::mem::take(&mut key.notes) {
-                    read.warnings.push((row, note));
+                    read.warnings.push((row, partial_record(row, &note)));
                 }
                 read.keys.push(key);
             }
-            Err(message) => read.warnings.push((row, message)),
+            Err(reason) => read.warnings.push((row, skipped_record(row, &reason))),
         }
     }
     Ok(read)
@@ -476,24 +518,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = crate::state::now();
         let mut store = state.lock();
 
-        // A key value identifies the caller presenting it, so two keys cannot share one.
-        // A row whose value is already taken — by a stored key, or by an earlier row of
-        // this same import — creates nothing and is reported as a warning, which is how
-        // this operation reports a row it could not carry over while importing the rest.
-        let mut taken: BTreeSet<String> = store
-            .api_keys
-            .values()
-            .map(|key| key.value.clone())
-            .collect();
+        // A key value identifies the caller presenting it, so one payload declares each
+        // value once: colliding rows COLLAPSE to a single API key in which the LAST
+        // colliding row's columns win, which is what a repeated value in a CSV export
+        // means. The uniqueness is in-payload only — no row is checked against the keys
+        // the account already holds — so a collapse creates a key rather than warning
+        // about one.
+        //
+        // The surviving row keeps the POSITION of the value's first occurrence, because
+        // that is where the import created the key before a later row updated it, so the
+        // ids are answered in the payload's own row order.
         let mut creatable: Vec<ImportedKey> = Vec::with_capacity(keys.len());
+        let mut position: BTreeMap<String, usize> = BTreeMap::new();
         for key in keys {
-            if taken.insert(key.value.clone()) {
-                creatable.push(key);
-            } else {
-                warnings.push((
-                    key.row,
-                    "an API Key already exists for the given value".to_string(),
-                ));
+            match position.get(&key.value).copied() {
+                Some(index) => {
+                    if let Some(slot) = creatable.get_mut(index) {
+                        *slot = key;
+                    }
+                }
+                None => {
+                    position.insert(key.value.clone(), creatable.len());
+                    creatable.push(key);
+                }
             }
         }
 
@@ -516,9 +563,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let Some(plan) = store.usage_plans.get(plan_id) else {
                     warnings.push((
                         key.row,
-                        format!(
-                            "no usage plan {plan_id} exists, so the imported API Key was \
-                             not associated with it"
+                        partial_record(
+                            key.row,
+                            &format!(
+                                "no usage plan {plan_id} exists, so the imported API Key was \
+                                 not associated with it"
+                            ),
                         ),
                     ));
                     continue;
@@ -527,10 +577,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if metered >= crate::state::MAX_USAGE_PLAN_KEYS_PER_PLAN {
                     warnings.push((
                         key.row,
-                        format!(
-                            "usage plan {plan_id} already meters {} API Keys, so the \
-                             imported API Key was not associated with it",
-                            crate::state::MAX_USAGE_PLAN_KEYS_PER_PLAN
+                        partial_record(
+                            key.row,
+                            &format!(
+                                "usage plan {plan_id} already meters {} API Keys, so the \
+                                 imported API Key was not associated with it",
+                                crate::state::MAX_USAGE_PLAN_KEYS_PER_PLAN
+                            ),
                         ),
                     ));
                     continue;
@@ -540,15 +593,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // One warning per row the import could not carry over, in row order whichever
-        // check earned it, and at most as many as this service reports for a
+        // One warning per row the import could not fully carry over, in row order
+        // whichever check earned it, and at most as many as this service reports for a
         // caller-sized list: what the response carries stays bounded however many rows
         // the payload declares. A cut list says so in a last entry, so a caller can tell
         // a truncated report from a complete one.
         warnings.sort_by_key(|(row, _)| *row);
         let mut warnings: Vec<String> = warnings
             .into_iter()
-            .map(|(row, message)| format!("row {row}: {message}"))
+            .map(|(_, message)| message)
             .collect();
         if warnings.len() > crate::state::MAX_COLLECTION_ENTRIES {
             // The cut keeps one entry fewer than the bound and spends the last on how
@@ -558,17 +611,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let omitted = warnings.len() - kept;
             warnings.truncate(kept);
             warnings.push(format!("{omitted} further row(s) warned"));
-        }
-
-        // `failOnWarnings` is "a query parameter to indicate whether to rollback ApiKey
-        // importation (true) or not (false) when error is encountered": every warning is
-        // known before anything is written, so the rollback is that no record changes at
-        // all.
-        if input.fail_on_warnings && !warnings.is_empty() {
-            return Err(bad_request(format!(
-                "Errors found during import: {}",
-                warnings.join("; ")
-            )));
         }
 
         // Bound the growth a caller drives, at API Gateway's published quota: an import
@@ -651,11 +693,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             outcome = "imported",
             "api keys imported",
         );
+        // `failOnWarnings` is "a query parameter to indicate whether to rollback ApiKey
+        // importation (true) or not (false) when error is encountered". What it gates is
+        // the WARNING channel above, and it gates only the ANSWER: this import is not
+        // transactional, so the records the rows above committed stay committed and the
+        // caller is told which records were skipped. The message is the fixed lead the
+        // sibling definition imports answer a refused-on-warnings call with
+        // (`super::put_rest_api::warnings_refusal`), one warning per tab-indented line,
+        // so one wording serves every import of this service.
+        if input.fail_on_warnings && !warnings.is_empty() {
+            return Err(bad_request(super::put_rest_api::warnings_refusal(
+                &warnings,
+            )));
+        }
         Ok(ImportApiKeysOutput {
             ids: Some(ids),
             // What THIS import could not carry over; an import that warned about nothing
-            // reports no warnings, never a value some other call left behind.
-            warnings: (!warnings.is_empty()).then_some(warnings),
+            // reports an EMPTY list, never a value some other call left behind.
+            warnings: Some(warnings),
         })
     }
 }
