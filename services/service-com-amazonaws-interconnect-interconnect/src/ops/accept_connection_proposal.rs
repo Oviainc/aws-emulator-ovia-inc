@@ -248,12 +248,14 @@ fn judge_against_store(
     // that member carries is an Interconnect CONNECTION ARN: the attach point is a
     // connection of the account, resolved against the store the way every
     // ARN-addressed operation here resolves one — in full, so an ARN whose Region or
-    // account is not the stored one names no resource this account holds. An ARN that
-    // resolves to nothing has no attach point behind it, so there is nothing to make
+    // account is not the stored one names no resource this account holds, and inside
+    // the scope the request addressed, so a connection created through another
+    // Region's endpoint is one this endpoint holds nothing for. An ARN that resolves
+    // to nothing has no attach point behind it, so there is nothing to make
     // the connection onto. The same rule the create path applies, so what a
     // Connection may be attached to does not depend on how it came to exist.
     if let AttachPoint::Arn(arn) = &input.attach_point {
-        if store.connection_by_arn(arn).is_none() {
+        if store.connection_in_by_arn(region, arn).is_none() {
             return Err(
                 AcceptConnectionProposalErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
