@@ -428,6 +428,9 @@ async fn a_request_at_the_edge_of_every_constraint_is_accepted() {
             "Description": "d".repeat(MAX_DESCRIPTION),
             "KmsKeyIdentifier": "k".repeat(MAX_KMS_KEY),
             "Tags": generated_tags(MAX_TAGS),
+            // A self-managed Kafka source reads one topic, which is the member its
+            // parameters shape requires, so the request that must be accepted carries it.
+            "SourceParameters": {"SelfManagedKafkaParameters": {"TopicName": "orders"}},
         }),
     );
     let created = create(&router, &name, body).await;

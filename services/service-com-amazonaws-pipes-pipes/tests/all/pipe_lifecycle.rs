@@ -158,6 +158,29 @@ pub(crate) async fn create(router: &MultiServiceRouter, name: &str, body: Value)
     call(router, "POST", &format!("/v1/pipes/{name}"), Some(body), REGION).await
 }
 
+/// The `SourceParameters` a `Source` of this kind cannot be created without, or `None`
+/// for one that needs none.
+///
+/// A source type whose parameters shape declares a required member — a stream's starting
+/// position, a Kafka topic name — has no legal configuration with the member absent, so a
+/// fixture naming such a source carries the minimum that makes it legal. An Amazon SQS
+/// source needs none.
+pub(crate) fn required_source_parameters(source: &str) -> Option<Value> {
+    if source.starts_with("smk://") {
+        return Some(json!({"SelfManagedKafkaParameters": {"TopicName": "orders"}}));
+    }
+    if source.starts_with("arn:aws:kinesis:") {
+        return Some(json!({"KinesisStreamParameters": {"StartingPosition": "LATEST"}}));
+    }
+    if source.starts_with("arn:aws:dynamodb:") {
+        return Some(json!({"DynamoDBStreamParameters": {"StartingPosition": "LATEST"}}));
+    }
+    if source.starts_with("arn:aws:kafka:") {
+        return Some(json!({"ManagedStreamingKafkaParameters": {"TopicName": "orders"}}));
+    }
+    None
+}
+
 pub(crate) async fn describe(router: &MultiServiceRouter, name: &str) -> Reply {
     call(router, "GET", &format!("/v1/pipes/{name}"), None, REGION).await
 }
@@ -210,6 +233,9 @@ async fn describe_pipe_reports_every_member_create_pipe_stored() {
                 "Source": "smk://b-1.broker.kafka.us-west-2.amazonaws.com:9092",
                 "Target": "arn:aws:sqs:us-west-2:000000000000:results",
                 "RoleArn": "arn:aws:iam::000000000000:role/pipes-role",
+                // A self-managed Kafka source reads one topic, which is the member its
+                // parameters shape requires, so a pipe of this source type carries them.
+                "SourceParameters": {"SelfManagedKafkaParameters": {"TopicName": "orders"}},
                 "Description": "demo",
                 "Tags": {"env": "test", "team": "platform"},
             }),
@@ -221,6 +247,9 @@ async fn describe_pipe_reports_every_member_create_pipe_stored() {
                 "Target": "arn:aws:lambda:us-west-2:000000000000:function:handler",
                 "RoleArn": "arn:aws:iam::000000000000:role/pipes-role",
                 "DesiredState": "STOPPED",
+                // A stream source reads from a position, which is the member its
+                // parameters shape requires.
+                "SourceParameters": {"KinesisStreamParameters": {"StartingPosition": "LATEST"}},
                 "Enrichment": "arn:aws:lambda:us-west-2:000000000000:function:enrich",
                 "EnrichmentParameters": {"InputTemplate": "$.detail"},
                 "TargetParameters": {
@@ -532,6 +561,11 @@ async fn list_pipes_honours_every_modelled_filter() {
     for (name, source, target, desired) in &fixture {
         let mut body = minimal_body(source, target);
         body["DesiredState"] = json!(desired);
+        // A source whose own parameters shape requires a member cannot be created without
+        // it, so each fixture carries the one its source type needs.
+        if let Some(parameters) = required_source_parameters(source) {
+            body["SourceParameters"] = parameters;
+        }
         let created = create(&router, name, body).await;
         assert_eq!(
             created.status, 200,

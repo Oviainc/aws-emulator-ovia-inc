@@ -930,6 +930,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-dynamodbstreams"
+version = "1.120.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8288abfaafe8e4909682aebd7c17cd5e3d1ab7e0022b4c6c2137d0ca729f8068"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json 0.65.0",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema 1.1.0",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-ec2"
 version = "1.271.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7416,6 +7441,7 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-common",
  "sha2 0.10.9",
  "tokio",
  "tracing",
@@ -13049,6 +13075,7 @@ dependencies = [
  "aws-emulator-smithy-macros",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
+ "aws-sdk-dynamodbstreams",
  "aws-sdk-lambda",
  "aws-sdk-sfn",
  "aws-sdk-sqs",
@@ -13061,6 +13088,8 @@ dependencies = [
  "http",
  "serde_json",
  "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",
+ "service-com-amazonaws-dynamodb-dynamodb-20120810",
+ "service-com-amazonaws-dynamodbstreams-dynamodbstreams-20120810",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-com-amazonaws-sfn-awsstepfunctions",
  "service-com-amazonaws-sqs-amazonsqs",

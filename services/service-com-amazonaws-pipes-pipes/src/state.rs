@@ -576,27 +576,191 @@ const NOT_AN_OBJECT_REASON: &str = "Filter is not an object";
 const BATCH_SIZE_FIELD: &str = "BatchSize";
 const MESSAGE_GROUP_ID_FIELD: &str = "MessageGroupId";
 
+/// The request member that carries a pipe's source configuration, which a member nested
+/// inside it is reported under (`SourceParameters.<Member>`).
+const SOURCE_PARAMETERS_MEMBER: &str = "SourceParameters";
+
+/// What this service reports for a member the request had to carry and did not.
+const MISSING_PARAMETER_MESSAGE: &str = "Missing required parameter.";
+
+/// One `SourceParameters` member that belongs to a source TYPE.
+pub struct SourceTypeMember {
+    /// The member, as the model names it.
+    pub member: &'static str,
+    /// The source type it belongs to, as [`source_type_of`] reports one.
+    pub source_type: &'static str,
+    /// Whether a source of that type has a legal configuration that OMITS this member.
+    /// `false` where the member's own shape declares a `@required` member, so no
+    /// configuration of such a source can leave the member out.
+    pub omittable: bool,
+    /// Whether a source configuration carries this member. The ONE place the member's
+    /// name and the field that holds it are paired, so a rule about the member reads it
+    /// off the table rather than naming the field again.
+    pub carried: fn(&PipeSourceParameters) -> bool,
+}
+
+/// Every `SourceParameters` member that belongs to a source type.
+///
+/// Source: the members of `PipeSourceParameters` in
+/// `smithy-model/com-amazonaws-pipes-pipes.json` (`UpdatePipeSourceParameters` names them
+/// identically) — each is the parameters of exactly ONE source type — paired with the
+/// service namespace of that type's resource ARN and with whether that type can be
+/// configured without the member. `FilterCriteria`, the one member that belongs to no
+/// source type, is deliberately absent: it applies to a pipe whatever its source is.
+///
+/// `omittable` is read off the member's own shape in that model:
+/// `PipeSourceSqsQueueParameters` declares no `@required` member, so an Amazon SQS source
+/// needs no parameters at all; the two stream shapes declare `StartingPosition`, the two
+/// Kafka shapes `TopicName` and the two broker shapes `QueueName` and `Credentials`, so a
+/// source of one of those types has no legal configuration with the member absent.
+///
+/// One source type — an Amazon MQ broker, which is `arn:…:mq:…` whichever engine it runs
+/// — has TWO members that configure it, and the `Source` does not say which engine the
+/// broker runs. A configuration carrying neither is still illegal, so the refusal names
+/// both candidates rather than guessing one ([`missing_source_parameters_fields`]).
+pub const SOURCE_TYPE_MEMBERS: &[SourceTypeMember] = &[
+    SourceTypeMember {
+        member: "KinesisStreamParameters",
+        source_type: "kinesis",
+        omittable: false,
+        carried: |parameters| parameters.kinesis_stream_parameters.is_some(),
+    },
+    SourceTypeMember {
+        member: "DynamoDBStreamParameters",
+        source_type: "dynamodb",
+        omittable: false,
+        carried: |parameters| parameters.dynamo_db_stream_parameters.is_some(),
+    },
+    SourceTypeMember {
+        member: "SqsQueueParameters",
+        source_type: PIPES_SERVICE_SQS,
+        omittable: true,
+        carried: |parameters| parameters.sqs_queue_parameters.is_some(),
+    },
+    SourceTypeMember {
+        member: "ActiveMQBrokerParameters",
+        source_type: "mq",
+        omittable: false,
+        carried: |parameters| parameters.active_mq_broker_parameters.is_some(),
+    },
+    SourceTypeMember {
+        member: "RabbitMQBrokerParameters",
+        source_type: "mq",
+        omittable: false,
+        carried: |parameters| parameters.rabbit_mq_broker_parameters.is_some(),
+    },
+    SourceTypeMember {
+        member: "ManagedStreamingKafkaParameters",
+        source_type: "kafka",
+        omittable: false,
+        carried: |parameters| parameters.managed_streaming_kafka_parameters.is_some(),
+    },
+    SourceTypeMember {
+        member: "SelfManagedKafkaParameters",
+        source_type: SELF_MANAGED_KAFKA,
+        omittable: false,
+        carried: |parameters| parameters.self_managed_kafka_parameters.is_some(),
+    },
+];
+
+/// The source type `member` belongs to, per [`SOURCE_TYPE_MEMBERS`], or the empty string
+/// for a member that belongs to none.
+pub fn member_source_type(member: &str) -> &'static str {
+    SOURCE_TYPE_MEMBERS
+        .iter()
+        .find(|entry| entry.member == member)
+        .map_or("", |entry| entry.source_type)
+}
+
+/// The source type a `Source` names, as the token this service names a source by: the
+/// vendor of its ARN as `service_common::arn` reads one — the one parse of an ARN's fields
+/// in this tree — or [`SELF_MANAGED_KAFKA`] for the one non-ARN form `ArnOrUrl` admits.
+///
+/// Read off the `Source` rather than off a record, because both the write that creates a
+/// pipe (which has no record yet) and the reads of a stored one resolve the same token.
+pub fn source_type_of(source: &str) -> String {
+    if source
+        .get(..SELF_MANAGED_KAFKA_SCHEME.len())
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case(SELF_MANAGED_KAFKA_SCHEME))
+    {
+        return SELF_MANAGED_KAFKA.to_string();
+    }
+    ::service_common::arn::vendor(source)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The fields a configuration whose `Source` names a kind of resource that cannot be
+/// configured without its own `SourceParameters` member is refused at — empty when the
+/// configuration carries one of them, or when the source's type needs none.
+///
+/// This is the requirement the SERVICE derives from the resource the `Source` ARN names:
+/// the model makes every member of `PipeSourceParameters` optional, so no boundary
+/// constraint can express it, but the parameters shape of a source type may itself declare
+/// a `@required` member ([`SOURCE_TYPE_MEMBERS`]), and then no legal configuration of such
+/// a source leaves that member out.
+///
+/// A source type configured by SEVERAL such members — an Amazon MQ broker, whose ARN does
+/// not say which engine it runs — needs one of them, so carrying any one satisfies the
+/// rule and carrying none is refused naming every candidate: which member the request had
+/// to carry is the caller's to choose, and the refusal states the choice rather than
+/// inventing it.
+fn missing_source_parameters_fields(
+    source: &str,
+    source_parameters: Option<&PipeSourceParameters>,
+) -> Vec<ValidationExceptionField> {
+    let source_type = source_type_of(source);
+    let required: Vec<&SourceTypeMember> = SOURCE_TYPE_MEMBERS
+        .iter()
+        .filter(|entry| !entry.omittable && entry.source_type == source_type)
+        .collect();
+    let carried = required.iter().any(|entry| {
+        source_parameters.is_some_and(|parameters| (entry.carried)(parameters))
+    });
+    if carried {
+        return Vec::new();
+    }
+    required
+        .into_iter()
+        .map(|entry| {
+            validation_field(
+                format!("{SOURCE_PARAMETERS_MEMBER}.{}", entry.member),
+                MISSING_PARAMETER_MESSAGE,
+            )
+        })
+        .collect()
+}
+
 /// The `ValidationException` a pipe configuration is refused with when it breaks a rule
 /// about the RESOURCES the pipe names rather than about the shape of the request, or `None`
 /// when it breaks none.
 ///
 /// These are the rules no modelled constraint can express, because each spans two members:
-/// the batch size the source reads is bounded by what the TARGET accepts per delivery
-/// ([`target_batch_size_cap`]), a FIFO queue target needs the message group id its sends
-/// are ordered by, and a filter pattern has to be an event pattern
-/// ([`filter_criteria_field`]). Checked by both writes that can configure a pipe, against
-/// the configuration the pipe would END UP with, so neither a create nor an update can
-/// leave a pipe AWS would never have accepted.
+/// the `SourceParameters` member a source needs is the one for the kind of resource its
+/// `Source` names ([`missing_source_parameters_fields`]), the batch size the source reads is
+/// bounded by what the TARGET accepts per delivery ([`target_batch_size_cap`]), a FIFO
+/// queue target needs the message group id its sends are ordered by, and a filter pattern
+/// has to be an event pattern ([`filter_criteria_field`]). Checked by both writes that can
+/// configure a pipe, against the configuration the pipe would END UP with, so neither a
+/// create nor an update can leave a pipe AWS would never have accepted.
 pub fn cross_resource_violation(
+    source: &str,
     source_parameters: Option<&PipeSourceParameters>,
     target: &str,
     target_parameters: Option<&PipeTargetParameters>,
 ) -> Option<ValidationException> {
+    // First, because a source configuration that is not there at all can carry no batch
+    // size and no filter either.
+    let missing = missing_source_parameters_fields(source, source_parameters);
+    if !missing.is_empty() {
+        return Some(validation_error(missing));
+    }
     let field = cross_resource_field(source_parameters, target, target_parameters)?;
     Some(validation_error(vec![field]))
 }
 
-/// The one field [`cross_resource_violation`] reports, in the order the rules are stated.
+/// The one field [`cross_resource_violation`] reports for the rules that name exactly one,
+/// in the order they are stated.
 fn cross_resource_field(
     source_parameters: Option<&PipeSourceParameters>,
     target: &str,
@@ -736,20 +900,10 @@ impl PipeRecord {
     /// The source type this pipe reads from, as the token this service names a source by.
     ///
     /// It is resolved from the pipe's `Source`, which is fixed when the pipe is created
-    /// (no update shape carries a `Source`): the vendor of its ARN as
-    /// `service_common::arn` reads one — the one parse of an ARN's fields in this tree —
-    /// or [`SELF_MANAGED_KAFKA`] for the one non-ARN form `ArnOrUrl` admits.
+    /// (no update shape carries a `Source`), through the one reading of that token
+    /// ([`source_type_of`]).
     pub fn source_type(&self) -> String {
-        if self
-            .source
-            .get(..SELF_MANAGED_KAFKA_SCHEME.len())
-            .is_some_and(|scheme| scheme.eq_ignore_ascii_case(SELF_MANAGED_KAFKA_SCHEME))
-        {
-            return SELF_MANAGED_KAFKA.to_string();
-        }
-        ::service_common::arn::vendor(&self.source)
-            .unwrap_or_default()
-            .to_string()
+        source_type_of(&self.source)
     }
 
     /// This record as the `Pipe` summary `ListPipes` returns.

@@ -199,16 +199,29 @@ async fn source_parameters_of_another_source_type_are_refused_naming_the_member_
             source_type: "selfmanagedkafka",
         },
         Mismatch {
-            // The member DOES belong to this pipe's source type, but the pipe was created
-            // with no parameters for it, so the members only `CreatePipe` can state (the
-            // starting position) have nothing to be carried over from: the source cannot
-            // hold the parameters as sent either.
-            case: "kinesis-without-created-parameters",
-            source: "arn:aws:kinesis:us-west-2:000000000000:stream/events",
-            created: Value::Null,
-            member: "KinesisStreamParameters",
-            supplied: json!({"BatchSize": 10}),
-            source_type: "kinesis",
+            // The member DOES belong to this pipe's source type, but the pipe holds no
+            // parameters for THAT member: an Amazon MQ broker's ARN does not say which
+            // engine it runs, so a pipe of this source type carries one of the two broker
+            // members, and the members only `CreatePipe` can state (the broker's queue
+            // name) have nothing to be carried over from for the other one.
+            case: "mq-given-the-other-broker-engine",
+            source: "arn:aws:mq:us-west-2:000000000000:broker:orders:b-1234",
+            created: json!({
+                "RabbitMQBrokerParameters": {
+                    "Credentials": {
+                        "BasicAuth":
+                            "arn:aws:secretsmanager:us-west-2:000000000000:secret:mq-abc",
+                    },
+                    "QueueName": "orders",
+                },
+            }),
+            member: "ActiveMQBrokerParameters",
+            supplied: json!({
+                "Credentials": {
+                    "BasicAuth": "arn:aws:secretsmanager:us-west-2:000000000000:secret:mq-abc",
+                },
+            }),
+            source_type: "mq",
         },
     ];
 

@@ -232,6 +232,11 @@ pub mod data_plane_addressing;
 /// documents a member as one and targets it at a bare string — so two services asked
 /// whether a value is an address cannot answer differently.
 pub mod email_address;
+/// The ONE reading and matching of an EventBridge EVENT PATTERN, for every service
+/// whose API accepts one — a rule's `EventPattern`, a pipe's `FilterCriteria` filter —
+/// so two services handed the same pattern and event cannot disagree about whether it
+/// matches, or about whether the pattern is one at all.
+pub mod event_pattern;
 /// The `vnd.amazon.eventstream` framing and routing seam a service with a
 /// `@streaming` output member needs, which the scaffold does not generate.
 pub mod event_stream;

@@ -268,6 +268,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_ref()
             .or(pipe.source_parameters.as_ref());
         if let Some(violation) = crate::state::cross_resource_violation(
+            &pipe.source,
             effective_source_parameters,
             target,
             target_parameters,
@@ -380,7 +381,7 @@ fn updated_source_parameters(
     source_type: &str,
 ) -> Result<PipeSourceParameters, UpdatePipeError> {
     for member in supplied_source_type_members(update) {
-        if member_source_type(member) != source_type {
+        if crate::state::member_source_type(member) != source_type {
             return Err(invalid_source_parameter(member, source_type));
         }
     }
@@ -520,35 +521,6 @@ fn updated_source_parameters(
         managed_streaming_kafka_parameters: msk,
         self_managed_kafka_parameters: self_managed,
     })
-}
-
-/// Every `UpdatePipeSourceParameters` member that belongs to a source type, with the
-/// source type it belongs to as [`crate::state::PipeRecord::source_type`] reports one.
-///
-/// Source: the members of `UpdatePipeSourceParameters` in the model — each is the
-/// parameters of exactly ONE source type — paired with the service namespace of that
-/// type's resource ARN. `FilterCriteria`, the one member that belongs to no source type,
-/// is deliberately absent: it applies to a pipe whatever its source is.
-const SOURCE_TYPE_MEMBERS: &[(&str, &str)] = &[
-    ("KinesisStreamParameters", "kinesis"),
-    ("DynamoDBStreamParameters", "dynamodb"),
-    ("SqsQueueParameters", "sqs"),
-    // An Amazon MQ broker is `arn:…:mq:…` whichever engine it runs.
-    ("ActiveMQBrokerParameters", "mq"),
-    ("RabbitMQBrokerParameters", "mq"),
-    ("ManagedStreamingKafkaParameters", "kafka"),
-    (
-        "SelfManagedKafkaParameters",
-        crate::state::SELF_MANAGED_KAFKA,
-    ),
-];
-
-/// The source type `member` belongs to, per [`SOURCE_TYPE_MEMBERS`].
-fn member_source_type(member: &str) -> &str {
-    SOURCE_TYPE_MEMBERS
-        .iter()
-        .find(|(name, _)| *name == member)
-        .map_or("", |(_, source_type)| *source_type)
 }
 
 /// The source-type members this request carries, in the order the model declares them.

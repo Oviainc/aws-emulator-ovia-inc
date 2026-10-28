@@ -8,11 +8,23 @@
 //! enrichment, and invokes the target — no caller asks it to. The three stages and the
 //! rules they follow:
 //!
-//! * SOURCE. The queue is polled for up to `BatchSize` records, and a poll that has not
+//! * SOURCE. The source is polled for up to `BatchSize` records, and a poll that has not
 //!   filled a batch keeps collecting for up to `MaximumBatchingWindowInSeconds` —
 //!   "the maximum number of records to include in each batch" and "the maximum length of
-//!   a time to wait for events" (`PipeSourceSqsQueueParameters`). Those two bound the
-//!   POLL; they say nothing about how many calls the target stage makes.
+//!   a time to wait for events" (every `PipeSource*Parameters` shape that batches carries
+//!   both). Those two bound the POLL; they say nothing about how many calls the target
+//!   stage makes. WHICH source is polled is the kind of resource the pipe's `Source`
+//!   names: an Amazon SQS queue is received from, and a DynamoDB stream is read shard by
+//!   shard from the position `StartingPosition` names, so the changes made to one
+//!   partition key reach the target in the order they were applied — the records of a
+//!   shard are ordered, and the batches of one shard are moved one after another.
+//! * FILTER. A pipe carrying `FilterCriteria` admits only the records that match one of
+//!   its patterns — "the collection of event patterns used to filter events" — and it
+//!   does so BEFORE the enrichment, so a record the filter drops reaches neither the
+//!   enrichment nor the target. The patterns are EventBridge event patterns, read and
+//!   matched by the one reading of that language in this tree
+//!   (`service_common::event_pattern`). A dropped record is still consumed: it entered
+//!   the pipe and the pipe decided about it.
 //! * ENRICHMENT. The records polled together are handed to the enrichment as ONE JSON
 //!   array of record envelopes, and what the enrichment RETURNS — not the source batch —
 //!   is what the target stage delivers. So an enrichment that collapses a batch into one
@@ -32,20 +44,27 @@
 //! receives the payload the template spells out rather than the record envelope
 //! ([`render_template`]).
 //!
-//! A source record is deleted only once every event derived from it has been delivered,
-//! so a target the pipe could not reach leaves the record on the queue to reappear when
-//! its visibility timeout lapses.
+//! A batch is finished with its source only once every event derived from it has been
+//! delivered: a queue's records are deleted then and not before, so a target the pipe
+//! could not reach leaves them on the queue to reappear when their visibility timeout
+//! lapses, and a stream's read position moves on then and not before, so the same
+//! records are read again. Either way delivery is at-least-once, which is what the
+//! service promises for a stream source.
 //!
 //! The poller is started by the operations that make a pipe RUNNING (`CreatePipe`,
 //! `StartPipe`, `UpdatePipe`) and ends itself as soon as the pipe's `CurrentState` is no
 //! longer one a running pipe rests in — so a `STOPPED` pipe consumes nothing, its
 //! backlog stays visible and undeleted, and `StartPipe` resumes consumption of
 //! everything that accumulated while it was stopped. At most one poller runs per pipe
-//! ([`ComAmazonawsPipesPipesState::claim_poller`]).
+//! ([`ComAmazonawsPipesPipesState::claim_poller`]). While the pipe is still reaching
+//! RUNNING the poller consumes nothing, but it does take up its position in a stream
+//! source ([`establish_cursors`]), so a change made to the table between the call that
+//! started the pipe and the moment it is running is not one the pipe silently skipped.
 //!
 //! Every call this module makes goes to the emulator it is running inside, over the
 //! in-process callback ([`smithy_server_runtime::EmbeddedEmulator`]): the pipe reaches
-//! the sqs, lambda and states surfaces of this same emulator and nothing else.
+//! the sqs, dynamodbstreams, lambda and states surfaces of this same emulator and
+//! nothing else.
 //!
 //! Every one of those calls is made AS THE PIPE'S EXECUTION ROLE, so each stage asks
 //! first whether the policies in force on that role let it make the call it is about to
@@ -64,7 +83,7 @@
 //! thing that tells a pipe whose stage was refused from a pipe that never ran, because
 //! both leave the target holding nothing.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use ::serde_json::{json, Value};
@@ -114,6 +133,13 @@ const MAX_RECORDS_PER_BATCH: usize = 1_000;
 /// that wants one record per batch says `BatchSize: 1`.
 const DEFAULT_BATCH_SIZE: usize = 10;
 
+/// The `BatchSize` a DynamoDB-stream source polls with when its parameters name none.
+///
+/// The model declares no `@default` here either, so this is the default EventBridge Pipes
+/// documents for a stream source — 100 records per batch, the same default the DynamoDB
+/// Streams event-source polling of a Lambda function has.
+const DEFAULT_STREAM_BATCH_SIZE: usize = 100;
+
 /// `BatchSize`'s own `@range`, from `PipeSourceSqsQueueParameters` in
 /// `smithy-model/com-amazonaws-pipes-pipes.json`.
 const BATCH_SIZE_RANGE: std::ops::RangeInclusive<usize> = 1..=10_000;
@@ -121,19 +147,63 @@ const BATCH_SIZE_RANGE: std::ops::RangeInclusive<usize> = 1..=10_000;
 /// `MaximumBatchingWindowInSeconds`' own `@range`, from the same shape.
 const BATCHING_WINDOW_RANGE: std::ops::RangeInclusive<i32> = 0..=300;
 
+/// How much work matching ONE polled batch against the pipe's filters may spend, in
+/// steps.
+///
+/// `FilterCriteria` holds at most five patterns and each is `@length(max: 4096)`, but a
+/// batch holds up to [`MAX_RECORDS_PER_BATCH`] records whose own values are the other side
+/// of every compare, so the PRODUCT is not bounded by those lengths alone. This is the one
+/// cap on the total for a batch, spent down across its records and patterns by the
+/// matcher's own budget: the matcher's per-request figure, which is orders of magnitude
+/// above what a real pattern set costs.
+const MAX_FILTER_STEPS_PER_BATCH: u64 =
+    ::service_common::event_pattern::MAX_MATCH_STEPS_PER_REQUEST;
+
 /// The `eventSource` an Amazon SQS record envelope reports.
 const SQS_EVENT_SOURCE: &str = "aws:sqs";
 
-/// The ARN service namespaces the stages below address: an SQS queue, a Lambda function
-/// and a Step Functions state machine (`states`, the namespace Step Functions signs and
-/// publishes its endpoint under).
+/// The `eventSource` a DynamoDB stream record envelope reports, and the `eventVersion` of
+/// the envelope this emulator builds — the version of the record FORMAT, which is what a
+/// consumer branches on.
+const DYNAMODB_EVENT_SOURCE: &str = "aws:dynamodb";
+const DYNAMODB_EVENT_VERSION: &str = "1.1";
+
+/// The ARN service namespaces the stages below address: an SQS queue, a DynamoDB table's
+/// stream, a Lambda function and a Step Functions state machine (`states`, the namespace
+/// Step Functions signs and publishes its endpoint under).
 const SQS_NAMESPACE: &str = "sqs";
+const DYNAMODB_NAMESPACE: &str = "dynamodb";
 const LAMBDA_NAMESPACE: &str = "lambda";
 const STATES_NAMESPACE: &str = "states";
 
 /// The resource types the enrichment ARNs name within those namespaces.
 const FUNCTION_RESOURCE: &str = "function";
 const STATE_MACHINE_RESOURCE: &str = "stateMachine";
+
+/// The resource type a DynamoDB stream ARN names, and the segment that makes it a
+/// STREAM of that table rather than the table itself:
+/// `arn:…:dynamodb:…:table/<name>/stream/<label>`.
+const TABLE_RESOURCE: &str = "table";
+const STREAM_SEGMENT: &str = "/stream/";
+
+/// The `StartingPosition` values a DynamoDB stream source may name, as the shard
+/// iterator type each one reads from. Source: `DynamoDBStreamStartPosition` in
+/// `smithy-model/com-amazonaws-pipes-pipes.json` (`TRIM_HORIZON`, `LATEST`), which are
+/// also two of DynamoDB Streams' own `ShardIteratorType` values.
+const TRIM_HORIZON_POSITION: &str = "TRIM_HORIZON";
+const LATEST_POSITION: &str = "LATEST";
+
+/// The most shards of one stream a pass reads, and the most `DescribeStream` pages it
+/// walks to list them.
+///
+/// Both are the EMULATOR's bounds: a stream's shard count is the table's, which this
+/// emulator does not cap, so a pass is bounded by work of its own rather than by what the
+/// store happens to hold. A pass lists the shards AFTER the one the previous pass served
+/// ([`StreamCursors::last_served`]) and wraps round at the end of the stream, so every
+/// shard is reached in turn — a stream with more shards than one pass lists is read pass
+/// by pass, and a continuously written shard cannot starve the ones behind it.
+const MAX_SHARDS_PER_PASS: usize = 100;
+const MAX_DESCRIBE_STREAM_PAGES: usize = 10;
 
 /// The IAM action each stage's call is authorized under — the action name of the API call
 /// the stage makes, in the namespace of the service it makes it to, which is what the
@@ -144,6 +214,9 @@ const DELETE_MESSAGE_ACTION: &str = "sqs:DeleteMessage";
 const SEND_MESSAGE_ACTION: &str = "sqs:SendMessage";
 const INVOKE_FUNCTION_ACTION: &str = "lambda:InvokeFunction";
 const START_SYNC_EXECUTION_ACTION: &str = "states:StartSyncExecution";
+const DESCRIBE_STREAM_ACTION: &str = "dynamodb:DescribeStream";
+const GET_SHARD_ITERATOR_ACTION: &str = "dynamodb:GetShardIterator";
+const GET_RECORDS_ACTION: &str = "dynamodb:GetRecords";
 
 /// `ReceiveMessage`'s selector for every attribute: "All".
 const ALL_ATTRIBUTES: &str = "All";
@@ -288,9 +361,13 @@ impl Drop for PollerClaim {
 enum Pass {
     /// The pipe is RUNNING: move one batch under this configuration. Boxed because it is
     /// far larger than the other answers, which are what most passes are.
-    Run(Box<SqsSourcedPipe>),
+    Run(Box<RunningPipe>),
     /// The pipe is mid-transition (`CREATING`, `STARTING`, `UPDATING`): nothing is
-    /// consumed until it rests in `RUNNING`.
+    /// consumed until it rests in `RUNNING`, but the position a stream source is read
+    /// from is taken up now, so a change made while the pipe was settling is not skipped.
+    Settling(Box<RunningPipe>),
+    /// The pipe is mid-transition and this data plane cannot resolve its configuration
+    /// yet: nothing is consumed and nothing is taken up.
     Wait,
     /// The pipe is RUNNING but its configuration is not one this data plane serves, and
     /// why. Nothing is polled and the poller ends, so no record is consumed by a stage
@@ -324,6 +401,8 @@ async fn poll_pipe(
         pipe: &pipe_name,
     };
     let mut clients = Clients::default();
+    // Where a DynamoDB-stream source has been read up to, for the length of this poller.
+    let mut cursors = StreamCursors::default();
     let mut failures = 0u32;
     loop {
         let pass = {
@@ -336,6 +415,23 @@ async fn poll_pipe(
         match pass {
             Pass::Stop => return,
             Pass::Wait => ::tokio::time::sleep(POLL_INTERVAL).await,
+            Pass::Settling(run) => {
+                // Not a poll: the pipe is still reaching RUNNING, so nothing is read and
+                // nothing is delivered. All this takes up is the position the source will
+                // be read FROM, which is what keeps a change made while the pipe was
+                // settling from falling outside a `LATEST` read.
+                if let Err(detail) =
+                    establish_cursors(callback, &mut clients, &record, &run, &mut cursors).await
+                {
+                    ::tracing::debug!(
+                        pipe = %pipe_name,
+                        detail = %detail,
+                        "a pipe that is still settling could not take up its source \
+                         position yet; it tries again"
+                    );
+                }
+                ::tokio::time::sleep(POLL_INTERVAL).await;
+            }
             Pass::Unserved(detail) => {
                 ::tracing::warn!(
                     pipe = %pipe_name,
@@ -351,7 +447,7 @@ async fn poll_pipe(
                 // A RUNNING pipe publishes for every minute it runs, so its counters
                 // exist and read 0 for a minute in which nothing of their kind happened.
                 metrics.open_window();
-                match move_one_batch(callback, &mut clients, &record, &run).await {
+                match move_one_batch(callback, &mut clients, &mut cursors, &record, &run).await {
                     Batch::Moved { events } => {
                         metrics.count(super::metrics::EVENT_COUNT_METRIC, events);
                         failures = 0;
@@ -438,7 +534,12 @@ fn next_pass(store: &mut ComAmazonawsPipesPipesState, claim: &mut PollerClaim) -
         pipe_state::CREATING | pipe_state::STARTING | pipe_state::UPDATING
     ) && pipe.desired_state == super::requested_state::RUNNING;
     if towards_running {
-        return Pass::Wait;
+        return match resolve_run(pipe) {
+            Ok(run) => Pass::Settling(Box::new(run)),
+            // A configuration that cannot be resolved has no source position to take up
+            // either; the pass that finds the pipe RUNNING is the one that reports it.
+            Err(_) => Pass::Wait,
+        };
     }
     claim.release(store);
     Pass::Stop
@@ -491,8 +592,9 @@ enum Batch {
     /// when their visibility timeout lapses, for a later pass to move under the record as
     /// it then reads.
     Superseded,
-    /// A stage failed; the source records are left for the next pass (and reappear on
-    /// the queue when their visibility timeout lapses). `events` is how many events the
+    /// A stage failed; the batch is not finished with its source, so a later pass reads
+    /// the same records again (a queue's reappear when their visibility timeout lapses,
+    /// and a stream's position has not moved past them). `events` is how many events the
     /// failed execution had taken from its source, which entered the pipe whether or not
     /// the execution finished.
     Failed {
@@ -502,8 +604,9 @@ enum Batch {
     },
 }
 
-/// Move one batch: poll the source, hand it to the enrichment, deliver what came back to
-/// the target, and delete the source records that were delivered.
+/// Move one batch: poll the source, drop the records the pipe's filters do not admit,
+/// hand the rest to the enrichment, deliver what came back to the target, and finish the
+/// batch with its source.
 ///
 /// Every one of those calls is made AS THE PIPE'S EXECUTION ROLE, so each is preceded by
 /// the one question [`LiveRecord::refusal`] answers: may the role the pipe carries AT THAT
@@ -512,17 +615,11 @@ enum Batch {
 async fn move_one_batch(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     clients: &mut Clients,
+    cursors: &mut StreamCursors,
     record: &LiveRecord<'_>,
-    run: &SqsSourcedPipe,
+    run: &RunningPipe,
 ) -> Batch {
-    if let Some(detail) = record.refusal(RECEIVE_MESSAGE_ACTION, &run.source_arn) {
-        return Batch::Failed {
-            stage: Stage::Source,
-            events: 0,
-            detail,
-        };
-    }
-    let polled = match collect_batch(callback, clients, run).await {
+    let polled = match collect_batch(callback, clients, record, run, cursors).await {
         Ok(polled) => polled,
         Err(detail) => {
             return Batch::Failed {
@@ -545,10 +642,25 @@ async fn move_one_batch(
     let taken = polled.len();
 
     // The WHOLE polled batch, as one JSON array of record envelopes.
-    let batch: Vec<Value> = polled
-        .iter()
-        .map(|message| record_envelope(message, &run.source_arn, &run.source_region))
-        .collect();
+    let batch = match polled.envelopes(run) {
+        Ok(batch) => batch,
+        Err(detail) => {
+            return Batch::Failed {
+                stage: Stage::Source,
+                events: taken,
+                detail,
+            }
+        }
+    };
+
+    // The filter decides which of the polled records enter the pipe, BEFORE the
+    // enrichment: one the pipe's patterns do not admit reaches neither stage. It is still
+    // consumed, so the source moves on from it rather than offering it again.
+    let batch = admitted(&run.filters, batch);
+    if batch.is_empty() {
+        finish_batch(callback, clients, cursors, record, run, &polled).await;
+        return Batch::Moved { events: taken };
+    }
 
     // What the TARGET stage delivers: the enrichment's answer when the pipe has one,
     // the polled batch itself when it has none. An enrichment is handed the records
@@ -630,38 +742,64 @@ async fn move_one_batch(
         }
     }
 
-    // Delivered: the source records may go. A delete the role may not make, or that
-    // fails, only means the record reappears and is delivered again, which is the
-    // at-least-once the service promises.
-    let queue = run.source_queue.clone();
-    if let Some(detail) = record.refusal(DELETE_MESSAGE_ACTION, &run.source_arn) {
-        ::tracing::warn!(
-            queue = %queue,
-            detail = %detail,
-            "a delivered pipe source record could not be deleted"
-        );
-        return Batch::Moved { events: taken };
-    }
-    for message in &polled {
-        let Some(handle) = message.receipt_handle.as_deref() else {
-            continue;
-        };
-        if let Err(error) = clients
-            .sqs(callback, &run.source_region)
-            .delete_message()
-            .queue_url(&queue)
-            .receipt_handle(handle)
-            .send()
-            .await
-        {
-            ::tracing::warn!(
-                queue = %queue,
-                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
-                "a delivered pipe source record could not be deleted"
-            );
-        }
-    }
+    // Delivered: the batch may be finished with its source.
+    finish_batch(callback, clients, cursors, record, run, &polled).await;
     Batch::Moved { events: taken }
+}
+
+/// Finish a batch with its SOURCE, now that every event derived from it has been
+/// delivered: a queue's records are deleted, and a stream's read position moves past
+/// them.
+///
+/// Neither can fail the batch. A delete the role may not make, or that fails, only means
+/// the record reappears and is delivered again, which is the at-least-once the service
+/// promises; a stream's position is this poller's own, so moving it on cannot fail at all.
+async fn finish_batch(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    clients: &mut Clients,
+    cursors: &mut StreamCursors,
+    record: &LiveRecord<'_>,
+    run: &RunningPipe,
+    polled: &Polled,
+) {
+    match polled {
+        Polled::Messages(messages) => {
+            let Source::Queue { url } = &run.source else {
+                return;
+            };
+            if let Some(detail) = record.refusal(DELETE_MESSAGE_ACTION, &run.source_arn) {
+                ::tracing::warn!(
+                    queue = %url,
+                    detail = %detail,
+                    "a delivered pipe source record could not be deleted"
+                );
+                return;
+            }
+            for message in messages {
+                let Some(handle) = message.receipt_handle.as_deref() else {
+                    continue;
+                };
+                if let Err(error) = clients
+                    .sqs(callback, &run.source_region)
+                    .delete_message()
+                    .queue_url(url)
+                    .receipt_handle(handle)
+                    .send()
+                    .await
+                {
+                    ::tracing::warn!(
+                        queue = %url,
+                        error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                        "a delivered pipe source record could not be deleted"
+                    );
+                }
+            }
+        }
+        // The shard is read from the position AFTER the delivered records from now on. A
+        // shard whose answer carried no next position is closed and drained, so it is
+        // taken off the walk rather than read from its start again.
+        Polled::Records(batch) => cursors.advance(&batch.shard, batch.next_iterator.clone()),
+    }
 }
 
 /// The one question each stage asks before it makes its call: may this pipe's execution
@@ -696,7 +834,7 @@ impl LiveRecord<'_> {
 
     /// Whether the pipe's record still asks for exactly what `run` was resolved from —
     /// `false` once a call has reconfigured it, and for a pipe the store no longer holds.
-    fn still_configured_as(&self, run: &SqsSourcedPipe) -> bool {
+    fn still_configured_as(&self, run: &RunningPipe) -> bool {
         let store = self.pipes.lock();
         store
             .pipes
@@ -719,33 +857,156 @@ impl LiveRecord<'_> {
     }
 }
 
+/// What one poll of a source came back with, by the kind of source it was polled from.
+///
+/// It carries what the SOURCE needs to be finished with ([`finish_batch`]) as well as the
+/// records themselves: an Amazon SQS message holds the receipt handle its delete needs,
+/// and a stream batch holds the shard it came from and the position after it.
+enum Polled {
+    /// Amazon SQS messages, in the order they were received.
+    Messages(Vec<::aws_sdk_sqs::types::Message>),
+    /// One shard's stream records, in the order the changes were applied.
+    Records(StreamBatch),
+}
+
+impl Polled {
+    /// How many source records this poll took.
+    fn len(&self) -> usize {
+        match self {
+            Self::Messages(messages) => messages.len(),
+            Self::Records(batch) => batch.records.len(),
+        }
+    }
+
+    /// Whether the source held nothing.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The WHOLE poll as the record envelopes a pipe hands to its stages, in the order
+    /// the records were polled in.
+    fn envelopes(&self, run: &RunningPipe) -> Result<Vec<Value>, String> {
+        match self {
+            Self::Messages(messages) => Ok(messages
+                .iter()
+                .map(|message| queue_record_envelope(message, &run.source_arn, &run.source_region))
+                .collect()),
+            Self::Records(batch) => batch
+                .records
+                .iter()
+                .map(|record| stream_record_envelope(record, &run.source_arn, &run.source_region))
+                .collect(),
+        }
+    }
+}
+
+/// One shard's worth of stream records, with where they were read from and where the
+/// shard is read from NEXT once they have been delivered.
+struct StreamBatch {
+    /// The shard they came from: one partition key's changes are all in one shard, which
+    /// is why reading a shard in order preserves the order they were applied in.
+    shard: String,
+    /// The position after the last record read, or `None` for a shard that is closed and
+    /// drained. Taken up only once the batch has been delivered.
+    next_iterator: Option<String>,
+    records: Vec<::aws_sdk_dynamodbstreams::types::Record>,
+}
+
+/// Where a DynamoDB-stream source has been read up to, for the length of one poller.
+///
+/// A shard iterator names an immutable position and is not consumed by the read it
+/// serves, so the position a shard is read FROM is kept here until the batch read from it
+/// has been delivered: a failed delivery re-reads the same records rather than skipping
+/// them, which is the at-least-once a stream source promises.
+///
+/// Both maps are bounded by the stream's own shard count: a shard the stream no longer
+/// lists is forgotten, and a drained closed shard is remembered only by its id.
+#[derive(Default)]
+struct StreamCursors {
+    /// The position each live shard is read from next, by shard id.
+    shards: BTreeMap<String, String>,
+    /// The shards that are closed and read to their end, which are not read again.
+    drained: BTreeSet<String>,
+    /// The shard the last pass moved a batch from. The next pass lists the shards AFTER
+    /// it and wraps round at the end of the stream, so each shard is served in turn
+    /// rather than one busy shard starving the rest.
+    last_served: Option<String>,
+    /// Whether this poller has taken up its position in the stream at all. The
+    /// configured `StartingPosition` applies to the shards the stream had THEN; a shard
+    /// the stream gains afterwards is read from its own beginning, so no change made to
+    /// it is skipped.
+    started: bool,
+}
+
+impl StreamCursors {
+    /// Take up the position after a delivered batch, or retire a shard that is closed and
+    /// drained.
+    fn advance(&mut self, shard: &str, next_iterator: Option<String>) {
+        match next_iterator {
+            Some(iterator) => {
+                self.shards.insert(shard.to_string(), iterator);
+            }
+            None => {
+                self.shards.remove(shard);
+                self.drained.insert(shard.to_string());
+            }
+        }
+    }
+
+    /// Forget every shard the stream no longer lists, so what this holds is bounded by
+    /// the stream as it is now.
+    fn retain_listed(&mut self, listed: &BTreeSet<String>) {
+        self.shards.retain(|shard, _| listed.contains(shard));
+        self.drained.retain(|shard| listed.contains(shard));
+    }
+}
+
 /// Poll the source for up to `BatchSize` records, collecting for up to the batching
 /// window once the first record has arrived.
 ///
-/// The window is what lets a batch span several receives: "the maximum length of a time
+/// The window is what lets a batch span several reads: "the maximum length of a time
 /// to wait for events". It starts when the poll finds its first record, so an idle
 /// source is not waited on — this pass simply reports nothing and the next one looks
 /// again.
+///
+/// WHICH source is polled is the pipe's own ([`Source`]), and the one question every
+/// stage asks is asked here too: may the pipe's execution role make the call this poll is
+/// about to make?
 async fn collect_batch(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     clients: &mut Clients,
-    run: &SqsSourcedPipe,
-) -> Result<Vec<::aws_sdk_sqs::types::Message>, String> {
-    let mut collected = receive(callback, clients, run, run.batch_size).await?;
-    if collected.is_empty() {
-        return Ok(collected);
-    }
-    let deadline = Instant::now() + run.batching_window;
-    while collected.len() < run.batch_size && Instant::now() < deadline {
-        let wanted = run.batch_size - collected.len();
-        let more = receive(callback, clients, run, wanted).await?;
-        if more.is_empty() {
-            ::tokio::time::sleep(POLL_INTERVAL).await;
-        } else {
-            collected.extend(more);
+    record: &LiveRecord<'_>,
+    run: &RunningPipe,
+    cursors: &mut StreamCursors,
+) -> Result<Polled, String> {
+    match &run.source {
+        Source::Queue { url } => {
+            if let Some(detail) = record.refusal(RECEIVE_MESSAGE_ACTION, &run.source_arn) {
+                return Err(detail);
+            }
+            let mut collected = receive(callback, clients, run, url, run.batch_size).await?;
+            if collected.is_empty() {
+                return Ok(Polled::Messages(collected));
+            }
+            let deadline = Instant::now() + run.batching_window;
+            while collected.len() < run.batch_size && Instant::now() < deadline {
+                let wanted = run.batch_size - collected.len();
+                let more = receive(callback, clients, run, url, wanted).await?;
+                if more.is_empty() {
+                    ::tokio::time::sleep(POLL_INTERVAL).await;
+                } else {
+                    collected.extend(more);
+                }
+            }
+            Ok(Polled::Messages(collected))
+        }
+        Source::Stream { starting_position } => {
+            let batch =
+                collect_stream_batch(callback, clients, record, run, starting_position, cursors)
+                    .await?;
+            Ok(Polled::Records(batch))
         }
     }
-    Ok(collected)
 }
 
 /// One `ReceiveMessage` for up to `wanted` records, with every attribute a record
@@ -753,7 +1014,8 @@ async fn collect_batch(
 async fn receive(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     clients: &mut Clients,
-    run: &SqsSourcedPipe,
+    run: &RunningPipe,
+    url: &str,
     wanted: usize,
 ) -> Result<Vec<::aws_sdk_sqs::types::Message>, String> {
     let asked = i32::try_from(wanted)
@@ -762,7 +1024,7 @@ async fn receive(
     let answer = clients
         .sqs(callback, &run.source_region)
         .receive_message()
-        .queue_url(&run.source_queue)
+        .queue_url(url)
         .max_number_of_messages(asked)
         .message_system_attribute_names(::aws_sdk_sqs::types::MessageSystemAttributeName::All)
         .message_attribute_names(ALL_ATTRIBUTES)
@@ -770,18 +1032,363 @@ async fn receive(
         .await
         .map_err(|error| {
             format!(
-                "the source queue {} could not be received from ({})",
-                run.source_queue,
+                "the source queue {url} could not be received from ({})",
                 ::aws_smithy_types::error::display::DisplayErrorContext(&error)
             )
         })?;
     Ok(answer.messages.unwrap_or_default())
 }
 
+/// Take up the position a stream source is read FROM, without reading anything.
+///
+/// This is what a pipe that is still reaching RUNNING does: it mints the shard iterators
+/// its configured `StartingPosition` names, so a change applied between the call that
+/// started the pipe and the moment it runs is inside the span the pipe then reads. For a
+/// queue source there is no position to take up and this does nothing.
+async fn establish_cursors(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    clients: &mut Clients,
+    record: &LiveRecord<'_>,
+    run: &RunningPipe,
+    cursors: &mut StreamCursors,
+) -> Result<(), String> {
+    let Source::Stream { starting_position } = &run.source else {
+        return Ok(());
+    };
+    open_shards(callback, clients, record, run, starting_position, cursors).await?;
+    Ok(())
+}
+
+/// Take up the position every shard the stream lists NOW is read from — minting the
+/// iterators this poller does not hold yet — and answer those shards with the position
+/// each is read from, `None` for one this poller is finished with.
+///
+/// Every listed shard is opened before any of them is read, so the configured
+/// `StartingPosition` is applied to the stream as it is at that moment and not shard by
+/// shard as the reads reach them: a `LATEST` pipe would otherwise read a shard it had not
+/// opened yet from a tail that had moved on, which is a skipped change.
+async fn open_shards(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    clients: &mut Clients,
+    record: &LiveRecord<'_>,
+    run: &RunningPipe,
+    starting_position: &str,
+    cursors: &mut StreamCursors,
+) -> Result<Vec<(String, Option<String>)>, String> {
+    let shards = list_shards(callback, clients, record, run, cursors).await?;
+    let mut opened = Vec::with_capacity(shards.len());
+    for shard in shards {
+        let iterator =
+            shard_iterator(callback, clients, record, run, &shard, starting_position, cursors)
+                .await?;
+        opened.push((shard, iterator));
+    }
+    // Every shard of the stream as it is now holds a position of its own, so the
+    // configured starting position has been applied; a shard the stream gains after this
+    // is read from its own beginning.
+    cursors.started = true;
+    Ok(opened)
+}
+
+/// Read up to `BatchSize` records from ONE shard of the stream, collecting for up to the
+/// batching window once the first record has been read.
+///
+/// The shards are walked in the order the pass listed them — which starts after the shard
+/// the previous pass served — and the FIRST one holding records is the batch: a pipe moves
+/// one batch at a time, so the records of one shard, and therefore the changes to one
+/// partition key, which all land in one shard, reach the target in the order they were
+/// applied.
+///
+/// Each read asks only for the records the batch still has room for, so the batch never
+/// holds more than `BatchSize` and no record this pass read is left out of it: the
+/// position the batch is finished at is the position after the records it carries.
+async fn collect_stream_batch(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    clients: &mut Clients,
+    record: &LiveRecord<'_>,
+    run: &RunningPipe,
+    starting_position: &str,
+    cursors: &mut StreamCursors,
+) -> Result<StreamBatch, String> {
+    let opened = open_shards(callback, clients, record, run, starting_position, cursors).await?;
+    for (shard, iterator) in opened {
+        let Some(iterator) = iterator else {
+            continue;
+        };
+        let (mut records, mut next) =
+            get_records(callback, clients, record, run, &iterator, run.batch_size).await?;
+        if records.is_empty() {
+            // A closed shard that answered nothing more is drained: it is retired here
+            // rather than read again, because its position cannot move any further.
+            if next.is_none() {
+                cursors.advance(&shard, None);
+            }
+            continue;
+        }
+        let deadline = Instant::now() + run.batching_window;
+        while records.len() < run.batch_size && Instant::now() < deadline {
+            let Some(iterator) = next.clone() else {
+                break;
+            };
+            let wanted = run.batch_size - records.len();
+            let (more, after) =
+                get_records(callback, clients, record, run, &iterator, wanted).await?;
+            if more.is_empty() {
+                ::tokio::time::sleep(POLL_INTERVAL).await;
+            } else {
+                records.extend(more);
+                next = after;
+            }
+        }
+        cursors.last_served = Some(shard.clone());
+        return Ok(StreamBatch {
+            shard,
+            next_iterator: next,
+            records,
+        });
+    }
+    Ok(StreamBatch {
+        shard: String::new(),
+        next_iterator: None,
+        records: Vec::new(),
+    })
+}
+
+/// The shards of the source stream this pass may read, in the order `DescribeStream`
+/// lists them.
+///
+/// The listing WINDOW starts after the shard the previous pass served
+/// ([`StreamCursors::last_served`]) and wraps round when it runs past the last shard, so
+/// each shard of the stream is served in turn — an earlier shard that is written
+/// continuously cannot starve the ones behind it, and a stream with more shards than one
+/// pass lists is covered pass by pass.
+///
+/// `DescribeStream` pages its shards, so the pages are followed — bounded by
+/// [`MAX_DESCRIBE_STREAM_PAGES`] and [`MAX_SHARDS_PER_PASS`], because the count is the
+/// table's and not this pass's. What this poller remembers about OTHER shards is pruned
+/// only when the window covered the whole stream, so a shard outside this window keeps
+/// the position it was read up to.
+async fn list_shards(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    clients: &mut Clients,
+    record: &LiveRecord<'_>,
+    run: &RunningPipe,
+    cursors: &mut StreamCursors,
+) -> Result<Vec<String>, String> {
+    if let Some(detail) = record.refusal(DESCRIBE_STREAM_ACTION, &run.source_arn) {
+        return Err(detail);
+    }
+    let from = cursors.last_served.clone();
+    let mut listed = describe_shards(callback, clients, run, from.clone()).await?;
+    if listed.shards.is_empty() && from.is_some() {
+        // The window ran past the stream's last shard: the next one is its beginning.
+        cursors.last_served = None;
+        listed = describe_shards(callback, clients, run, None).await?;
+    }
+    if listed.complete {
+        cursors.retain_listed(&listed.shards.iter().cloned().collect());
+    }
+    Ok(listed.shards)
+}
+
+/// The shards one run of `DescribeStream` pages lists, starting after `after`.
+struct ListedShards {
+    shards: Vec<String>,
+    /// Whether the run covered the WHOLE stream: it started at the beginning and the
+    /// service reported no shard beyond the ones it listed. Only then is what this poller
+    /// remembers about shards outside the run safe to prune.
+    complete: bool,
+}
+
+/// One run of `DescribeStream` pages, from the shard after `after` (or from the stream's
+/// first shard when there is none).
+async fn describe_shards(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    clients: &mut Clients,
+    run: &RunningPipe,
+    after: Option<String>,
+) -> Result<ListedShards, String> {
+    let from_the_beginning = after.is_none();
+    let mut shards: Vec<String> = Vec::new();
+    let mut after = after;
+    let mut whole_stream = false;
+    for _ in 0..MAX_DESCRIBE_STREAM_PAGES {
+        let mut request = clients
+            .dynamodbstreams(callback, &run.source_region)
+            .describe_stream()
+            .stream_arn(&run.source_arn);
+        if let Some(after) = after.as_deref() {
+            request = request.exclusive_start_shard_id(after);
+        }
+        let answer = request.send().await.map_err(|error| {
+            format!(
+                "the source stream {} could not be described ({})",
+                run.source_arn,
+                ::aws_smithy_types::error::display::DisplayErrorContext(&error)
+            )
+        })?;
+        let Some(description) = answer.stream_description else {
+            break;
+        };
+        for shard in description.shards.unwrap_or_default() {
+            if let Some(id) = shard.shard_id {
+                shards.push(id);
+            }
+        }
+        after = description.last_evaluated_shard_id;
+        if after.is_none() {
+            whole_stream = true;
+            break;
+        }
+        if shards.len() >= MAX_SHARDS_PER_PASS {
+            break;
+        }
+    }
+    let within_the_bound = shards.len() <= MAX_SHARDS_PER_PASS;
+    shards.truncate(MAX_SHARDS_PER_PASS);
+    Ok(ListedShards {
+        shards,
+        complete: from_the_beginning && whole_stream && within_the_bound,
+    })
+}
+
+/// The position a shard is read from on this pass, minting one when this poller holds
+/// none, or `None` for a shard it is finished with.
+///
+/// The configured `StartingPosition` is where the shards the stream had when the poller
+/// took up its position are read from; a shard it gains afterwards is read from its own
+/// beginning, so nothing appended to a new shard is skipped.
+async fn shard_iterator(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    clients: &mut Clients,
+    record: &LiveRecord<'_>,
+    run: &RunningPipe,
+    shard: &str,
+    starting_position: &str,
+    cursors: &mut StreamCursors,
+) -> Result<Option<String>, String> {
+    if cursors.drained.contains(shard) {
+        return Ok(None);
+    }
+    if let Some(held) = cursors.shards.get(shard) {
+        return Ok(Some(held.clone()));
+    }
+    if let Some(detail) = record.refusal(GET_SHARD_ITERATOR_ACTION, &run.source_arn) {
+        return Err(detail);
+    }
+    let from = if cursors.started {
+        ::aws_sdk_dynamodbstreams::types::ShardIteratorType::TrimHorizon
+    } else {
+        iterator_type(starting_position)
+    };
+    let answer = clients
+        .dynamodbstreams(callback, &run.source_region)
+        .get_shard_iterator()
+        .stream_arn(&run.source_arn)
+        .shard_id(shard)
+        .shard_iterator_type(from)
+        .send()
+        .await
+        .map_err(|error| {
+            format!(
+                "the shard {shard} of the source stream {} could not be opened ({})",
+                run.source_arn,
+                ::aws_smithy_types::error::display::DisplayErrorContext(&error)
+            )
+        })?;
+    // A shard that is closed and already past its end has no iterator to read from.
+    let Some(iterator) = answer.shard_iterator else {
+        cursors.drained.insert(shard.to_string());
+        return Ok(None);
+    };
+    cursors.shards.insert(shard.to_string(), iterator.clone());
+    Ok(Some(iterator))
+}
+
+/// The shard iterator type the configured `StartingPosition` reads from. Both values
+/// `DynamoDBStreamStartPosition` admits are DynamoDB Streams' own iterator types.
+fn iterator_type(starting_position: &str) -> ::aws_sdk_dynamodbstreams::types::ShardIteratorType {
+    match starting_position {
+        LATEST_POSITION => ::aws_sdk_dynamodbstreams::types::ShardIteratorType::Latest,
+        TRIM_HORIZON_POSITION => ::aws_sdk_dynamodbstreams::types::ShardIteratorType::TrimHorizon,
+        // A value outside the enum never reaches here — the boundary validator refuses one
+        // — and is read as the stream's oldest retained record rather than as a position
+        // that would silently skip records.
+        _ => ::aws_sdk_dynamodbstreams::types::ShardIteratorType::TrimHorizon,
+    }
+}
+
+/// One `GetRecords` from `iterator` for at most `wanted` records: the records it answered
+/// and the position after them.
+///
+/// `wanted` is what the batch still has room for, so a read never answers records the
+/// batch cannot carry — the position this answers is the position after the records the
+/// batch takes.
+async fn get_records(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    clients: &mut Clients,
+    record: &LiveRecord<'_>,
+    run: &RunningPipe,
+    iterator: &str,
+    wanted: usize,
+) -> Result<
+    (
+        Vec<::aws_sdk_dynamodbstreams::types::Record>,
+        Option<String>,
+    ),
+    String,
+> {
+    if let Some(detail) = record.refusal(GET_RECORDS_ACTION, &run.source_arn) {
+        return Err(detail);
+    }
+    let limit = i32::try_from(wanted).unwrap_or(i32::MAX).max(1);
+    let answer = clients
+        .dynamodbstreams(callback, &run.source_region)
+        .get_records()
+        .shard_iterator(iterator)
+        .limit(limit)
+        .send()
+        .await
+        .map_err(|error| {
+            format!(
+                "the source stream {} could not be read ({})",
+                run.source_arn,
+                ::aws_smithy_types::error::display::DisplayErrorContext(&error)
+            )
+        })?;
+    Ok((
+        answer.records.unwrap_or_default(),
+        answer.next_shard_iterator,
+    ))
+}
+
+/// The events of `batch` the pipe's filters admit, in the order they were polled.
+///
+/// "The collection of event patterns used to filter events": a record that matches ANY of
+/// the patterns enters the pipe, and a pipe carrying no filter admits every record. The
+/// patterns are matched by the one reading of the event-pattern language in this tree,
+/// under one work budget for the whole batch, so a batch can never buy more matching work
+/// than the budget sold it.
+fn admitted(filters: &[Value], batch: Vec<Value>) -> Vec<Value> {
+    if filters.is_empty() {
+        return batch;
+    }
+    let mut budget =
+        ::service_common::event_pattern::MatchBudget::new(MAX_FILTER_STEPS_PER_BATCH);
+    batch
+        .into_iter()
+        .filter(|event| {
+            filters.iter().any(|pattern| {
+                ::service_common::event_pattern::matches_within(pattern, event, &mut budget)
+            })
+        })
+        .collect()
+}
+
 /// One polled Amazon SQS message as the record envelope a pipe hands to its enrichment
 /// and its target: the message's own id, receipt handle, body and MD5, its system and
 /// message attributes, and which source it came from.
-fn record_envelope(
+fn queue_record_envelope(
     message: &::aws_sdk_sqs::types::Message,
     source_arn: &str,
     region: &str,
@@ -816,6 +1423,223 @@ fn record_envelope(
         "eventSourceARN": source_arn,
         "awsRegion": region,
     })
+}
+
+/// One read DynamoDB stream record as the record envelope a pipe hands to its enrichment
+/// and its target: which change it was, where it came from, and the record's own
+/// `dynamodb` body — the item's keys and the images the stream's view type captures.
+///
+/// The member names are the stream record's own (`eventID`, `eventName`,
+/// `eventVersion`, `eventSource`, `awsRegion`, `dynamodb`, `eventSourceARN`), and the
+/// `dynamodb` body's are `StreamRecord`'s (`ApproximateCreationDateTime`, `Keys`,
+/// `NewImage`, `OldImage`, `SequenceNumber`, `SizeBytes`, `StreamViewType`), so a
+/// consumer written against a DynamoDB stream event reads what it expects. A member the
+/// record does not carry is absent rather than reported empty: `OldImage` is not there
+/// for an `INSERT`, and neither image is there for a `KEYS_ONLY` stream.
+fn stream_record_envelope(
+    record: &::aws_sdk_dynamodbstreams::types::Record,
+    source_arn: &str,
+    region: &str,
+) -> Result<Value, String> {
+    let mut envelope = ::serde_json::Map::new();
+    if let Some(id) = record.event_id.clone() {
+        envelope.insert("eventID".to_string(), Value::String(id));
+    }
+    if let Some(name) = record.event_name.as_ref() {
+        envelope.insert(
+            "eventName".to_string(),
+            Value::String(name.as_str().to_string()),
+        );
+    }
+    envelope.insert(
+        "eventVersion".to_string(),
+        Value::String(
+            record
+                .event_version
+                .clone()
+                .unwrap_or_else(|| DYNAMODB_EVENT_VERSION.to_string()),
+        ),
+    );
+    envelope.insert(
+        "eventSource".to_string(),
+        Value::String(
+            record
+                .event_source
+                .clone()
+                .unwrap_or_else(|| DYNAMODB_EVENT_SOURCE.to_string()),
+        ),
+    );
+    // The Region the record reports is the stream's own; the source ARN's is the fallback
+    // for a record that carries none.
+    envelope.insert(
+        "awsRegion".to_string(),
+        Value::String(
+            record
+                .aws_region
+                .clone()
+                .unwrap_or_else(|| region.to_string()),
+        ),
+    );
+    if let Some(body) = record.dynamodb.as_ref() {
+        let mut stream_record = ::serde_json::Map::new();
+        if let Some(at) = body.approximate_creation_date_time.as_ref() {
+            // "in Unix time seconds", as a stream record reports the instant a change was
+            // made.
+            stream_record.insert(
+                "ApproximateCreationDateTime".to_string(),
+                Value::from(at.secs()),
+            );
+        }
+        if let Some(keys) = body.keys.as_ref() {
+            stream_record.insert("Keys".to_string(), attribute_map_json(keys)?);
+        }
+        if let Some(image) = body.new_image.as_ref() {
+            stream_record.insert("NewImage".to_string(), attribute_map_json(image)?);
+        }
+        if let Some(image) = body.old_image.as_ref() {
+            stream_record.insert("OldImage".to_string(), attribute_map_json(image)?);
+        }
+        if let Some(sequence) = body.sequence_number.clone() {
+            stream_record.insert("SequenceNumber".to_string(), Value::String(sequence));
+        }
+        if let Some(size) = body.size_bytes {
+            stream_record.insert("SizeBytes".to_string(), Value::from(size));
+        }
+        if let Some(view) = body.stream_view_type.as_ref() {
+            stream_record.insert(
+                "StreamViewType".to_string(),
+                Value::String(view.as_str().to_string()),
+            );
+        }
+        envelope.insert("dynamodb".to_string(), Value::Object(stream_record));
+    }
+    envelope.insert(
+        "eventSourceARN".to_string(),
+        Value::String(source_arn.to_string()),
+    );
+    Ok(Value::Object(envelope))
+}
+
+/// One item image as the JSON a stream record carries it in: each attribute under its
+/// name, as [`attribute_json`] renders it.
+fn attribute_map_json(
+    image: &::std::collections::HashMap<String, ::aws_sdk_dynamodbstreams::types::AttributeValue>,
+) -> Result<Value, String> {
+    // Collected into an ordered map so one image always renders the same way, whatever
+    // order the hash map happens to iterate in.
+    let mut rendered: BTreeMap<String, Value> = BTreeMap::new();
+    for (name, value) in image {
+        rendered.insert(name.clone(), attribute_json(value)?);
+    }
+    Ok(::serde_json::json!(rendered))
+}
+
+/// One attribute value as the JSON DynamoDB carries one in: a single-member object whose
+/// name is the attribute's TYPE (`S`, `N`, `B`, `SS`, `NS`, `BS`, `M`, `L`, `NULL`,
+/// `BOOL`) — the same form a `PutItem` request writes it in, so a consumer reads the item
+/// back in the shape it wrote it.
+///
+/// ITERATIVE, over an explicit worklist, for the reason the DynamoDB-to-streams seam gives
+/// for its own walk over an image: `M` and `L` nest to a depth the client chose, and a
+/// recursive walk over it would overflow the thread stack, which in Rust aborts the
+/// process instead of unwinding.
+///
+/// A nesting value is met twice: once to put its members on the worklist, and once to
+/// rebuild it from the members converted since. A map's names are CARRIED from the pass
+/// that pushed its members rather than read off the map a second time, so the pairing does
+/// not depend on two iterations of one map agreeing.
+fn attribute_json(
+    root: &::aws_sdk_dynamodbstreams::types::AttributeValue,
+) -> Result<Value, String> {
+    use ::aws_sdk_dynamodbstreams::types::AttributeValue as Attribute;
+
+    /// What the walk still owes: a value to render, or a container to rebuild from the
+    /// members already rendered.
+    enum Step<'a> {
+        Render(&'a Attribute),
+        RebuildMap(Vec<&'a String>),
+        RebuildList(usize),
+    }
+
+    /// The base64 of one binary attribute, which is how JSON carries bytes.
+    fn encoded(bytes: &::aws_smithy_types::Blob) -> Value {
+        Value::String(::base64::Engine::encode(
+            &::base64::engine::general_purpose::STANDARD,
+            bytes.as_ref(),
+        ))
+    }
+
+    let mut worklist = vec![Step::Render(root)];
+    let mut rendered: Vec<Value> = Vec::new();
+    while let Some(step) = worklist.pop() {
+        match step {
+            Step::Render(Attribute::M(members)) => {
+                let mut names = Vec::with_capacity(members.len());
+                let mut values = Vec::with_capacity(members.len());
+                for (name, nested) in members {
+                    names.push(name);
+                    values.push(nested);
+                }
+                worklist.push(Step::RebuildMap(names));
+                worklist.extend(values.into_iter().map(Step::Render));
+            }
+            Step::Render(Attribute::L(members)) => {
+                worklist.push(Step::RebuildList(members.len()));
+                worklist.extend(members.iter().map(Step::Render));
+            }
+            Step::Render(Attribute::S(text)) => rendered.push(json!({ "S": text })),
+            Step::Render(Attribute::N(number)) => rendered.push(json!({ "N": number })),
+            Step::Render(Attribute::B(bytes)) => rendered.push(json!({ "B": encoded(bytes) })),
+            Step::Render(Attribute::Ss(members)) => rendered.push(json!({ "SS": members })),
+            Step::Render(Attribute::Ns(members)) => rendered.push(json!({ "NS": members })),
+            Step::Render(Attribute::Bs(members)) => rendered.push(json!({
+                "BS": members.iter().map(encoded).collect::<Vec<Value>>(),
+            })),
+            Step::Render(Attribute::Null(is_null)) => rendered.push(json!({ "NULL": is_null })),
+            Step::Render(Attribute::Bool(flag)) => rendered.push(json!({ "BOOL": flag })),
+            // The union is `#[non_exhaustive]`: a member this build of the SDK does not
+            // know is a record this emulator cannot render faithfully, so the batch fails
+            // and the records stay for a later pass rather than a record reaching a stage
+            // with an attribute missing.
+            Step::Render(_) => {
+                return Err("a stream record carries an attribute type this emulator does \
+                            not render"
+                    .to_string())
+            }
+            Step::RebuildMap(names) => {
+                let nested = take_rendered(&mut rendered, names.len())?;
+                rendered.push(json!({
+                    "M": names
+                        .into_iter()
+                        .cloned()
+                        .zip(nested.into_iter().rev())
+                        .collect::<BTreeMap<String, Value>>(),
+                }));
+            }
+            Step::RebuildList(count) => {
+                let mut nested = take_rendered(&mut rendered, count)?;
+                nested.reverse();
+                rendered.push(json!({ "L": nested }));
+            }
+        }
+    }
+    // The walk pushes exactly one value for the root, so this is it.
+    rendered
+        .pop()
+        .ok_or_else(|| "an attribute value rendered to no value".to_string())
+}
+
+/// The `count` values a container's members rendered to, taken off the top of the walk's
+/// stack. Every `Step::Render` pushes exactly one value, so the top `count` are this
+/// container's; a shorter stack would be a defect in that invariant, and the batch fails
+/// rather than a truncated container reaching a stage.
+fn take_rendered(rendered: &mut Vec<Value>, count: usize) -> Result<Vec<Value>, String> {
+    if rendered.len() < count {
+        return Err("a nested attribute value rendered to fewer values than it has members"
+            .to_string());
+    }
+    let from = rendered.len() - count;
+    Ok(rendered.split_off(from))
 }
 
 /// Hand the whole polled batch to the enrichment as ONE array, and read the events it
@@ -1209,7 +2033,7 @@ fn json_string_body(text: &str) -> String {
         .to_string()
 }
 
-/// An Amazon SQS-sourced pipe, as the stages above read it: what the poller moves for
+/// A pipe this data plane serves, as the stages above read it: what the poller moves for
 /// one pipe, resolved from the stored record.
 ///
 /// It carries no `RoleArn`: the identity each stage's call is made as is read from the
@@ -1220,9 +2044,10 @@ fn json_string_body(text: &str) -> String {
 /// to now is compared with what the batch was polled under
 /// ([`LiveRecord::still_configured_as`]).
 #[derive(PartialEq, Eq)]
-struct SqsSourcedPipe {
-    /// The queue url the source ARN addresses.
-    source_queue: String,
+struct RunningPipe {
+    /// The source the records are polled from, by the kind of resource the `Source`
+    /// names.
+    source: Source,
     /// The `Source` itself, which every record envelope reports as its event source.
     source_arn: String,
     /// The Region the source ARN names — the one its records are polled in and report.
@@ -1231,6 +2056,9 @@ struct SqsSourcedPipe {
     batch_size: usize,
     /// `MaximumBatchingWindowInSeconds`, as a span.
     batching_window: Duration,
+    /// `FilterCriteria`'s patterns, parsed: a record matching any of them enters the
+    /// pipe, and an empty list admits every record.
+    filters: Vec<Value>,
     /// The enrichment the batch is handed to, when the pipe has one.
     enrichment: Option<Enrichment>,
     /// `EnrichmentParameters.InputTemplate`: what the ENRICHMENT is handed instead of the
@@ -1242,6 +2070,16 @@ struct SqsSourcedPipe {
     target: Target,
     /// The `Target` itself: the resource the delivery is authorized on.
     target_arn: String,
+}
+
+/// The source a pipe's records are polled from, by the resource its `Source` names.
+#[derive(PartialEq, Eq)]
+enum Source {
+    /// An Amazon SQS queue, received from at the url its ARN addresses.
+    Queue { url: String },
+    /// A DynamoDB stream, read shard by shard from the position `StartingPosition`
+    /// names.
+    Stream { starting_position: String },
 }
 
 /// The enrichment a batch is handed to, by the resource its ARN names.
@@ -1301,44 +2139,98 @@ impl Target {
 /// What this record asks the stages to do, or why this data plane does not serve it.
 ///
 /// A configuration it cannot serve FAITHFULLY leaves the source untouched rather than
-/// delivering something the pipe did not ask for: a filter that would drop records, or a
-/// source or target of a kind no stage here addresses.
-fn resolve_run(pipe: &PipeRecord) -> Result<SqsSourcedPipe, String> {
-    let source = ::service_common::arn::parse(&pipe.source)
+/// delivering something the pipe did not ask for: a source or target of a kind no stage
+/// here addresses, or a filter pattern the event-pattern language does not admit.
+fn resolve_run(pipe: &PipeRecord) -> Result<RunningPipe, String> {
+    let parsed = ::service_common::arn::parse(&pipe.source)
         .ok_or_else(|| format!("its Source {} is not a resource ARN", pipe.source))?;
-    if source.vendor != SQS_NAMESPACE {
-        return Err(format!(
-            "its Source names a {} resource, and only an Amazon SQS queue source is \
-             polled by this emulator",
-            source.vendor
-        ));
-    }
-    let queue_name = source.resource;
-    if queue_name.contains('/') || queue_name.contains(':') {
-        return Err(format!("its Source {} names no queue", pipe.source));
-    }
-    let source_region = source.region.to_string();
-    let source_queue = queue_url(&source_region, source.account, queue_name);
-
+    let source_region = parsed.region.to_string();
     let parameters = pipe.source_parameters.as_ref();
-    if parameters.and_then(|p| p.filter_criteria.as_ref()).is_some() {
-        return Err("it carries FilterCriteria, which this emulator does not evaluate yet"
-            .to_string());
-    }
-    let sqs_parameters = parameters.and_then(|p| p.sqs_queue_parameters.as_ref());
-    let batch_size = sqs_parameters
-        .and_then(|p| p.batch_size)
+
+    // WHICH source is polled, and the parameters that source's own shape carries: a pipe
+    // reads from exactly one source, which is the kind of resource its `Source` names.
+    let (source, batch_size, window_seconds, default_batch_size) = match parsed.vendor {
+        SQS_NAMESPACE => {
+            let queue_name = parsed.resource;
+            if queue_name.contains('/') || queue_name.contains(':') {
+                return Err(format!("its Source {} names no queue", pipe.source));
+            }
+            let queue = parameters.and_then(|p| p.sqs_queue_parameters.as_ref());
+            (
+                Source::Queue {
+                    url: queue_url(&source_region, parsed.account, queue_name),
+                },
+                queue.and_then(|p| p.batch_size),
+                queue.and_then(|p| p.maximum_batching_window_in_seconds),
+                DEFAULT_BATCH_SIZE,
+            )
+        }
+        DYNAMODB_NAMESPACE => {
+            // A DynamoDB source is the table's STREAM, which is the resource the ARN has
+            // to name: `table/<name>/stream/<label>`.
+            if parsed.resource_type() != TABLE_RESOURCE
+                || !parsed.resource.contains(STREAM_SEGMENT)
+            {
+                return Err(format!(
+                    "its Source {} names no DynamoDB stream",
+                    pipe.source
+                ));
+            }
+            let stream = parameters
+                .and_then(|p| p.dynamo_db_stream_parameters.as_ref())
+                .ok_or_else(|| {
+                    "it carries no DynamoDBStreamParameters, so there is no position to \
+                     read its stream from"
+                        .to_string()
+                })?;
+            (
+                Source::Stream {
+                    starting_position: stream.starting_position.clone(),
+                },
+                stream.batch_size,
+                stream.maximum_batching_window_in_seconds,
+                DEFAULT_STREAM_BATCH_SIZE,
+            )
+        }
+        other => {
+            return Err(format!(
+                "its Source names a {other} resource, and only an Amazon SQS queue or a \
+                 DynamoDB stream source is polled by this emulator"
+            ))
+        }
+    };
+    let batch_size = batch_size
         .and_then(|size| usize::try_from(size).ok())
-        .unwrap_or(DEFAULT_BATCH_SIZE)
+        .unwrap_or(default_batch_size)
         .clamp(*BATCH_SIZE_RANGE.start(), *BATCH_SIZE_RANGE.end())
         // Clamped BEFORE anything is collected, so the records one batch holds in
         // memory are bounded by this emulator rather than by the request.
         .min(MAX_RECORDS_PER_BATCH);
-    let window_seconds = sqs_parameters
-        .and_then(|p| p.maximum_batching_window_in_seconds)
+    let window_seconds = window_seconds
         .unwrap_or(0)
         .clamp(*BATCHING_WINDOW_RANGE.start(), *BATCHING_WINDOW_RANGE.end());
     let batching_window = Duration::from_secs(u64::try_from(window_seconds).unwrap_or_default());
+
+    // The filters the pipe admits records by, read through the one reading of the
+    // event-pattern language in this tree. An absent or empty pattern carries no pattern
+    // at all, and `FilterCriteria` with an empty `Filters` array is how a caller REMOVES
+    // filtering.
+    let mut filters = Vec::new();
+    for filter in parameters
+        .and_then(|p| p.filter_criteria.as_ref())
+        .and_then(|criteria| criteria.filters.as_ref())
+        .into_iter()
+        .flatten()
+    {
+        let pattern = match filter.pattern.as_deref() {
+            None | Some("") => continue,
+            Some(pattern) => pattern,
+        };
+        filters.push(
+            ::service_common::event_pattern::parse(pattern)
+                .map_err(|reason| format!("it carries a filter pattern this emulator cannot match ({reason})"))?,
+        );
+    }
 
     let enrichment = match pipe
         .enrichment
@@ -1365,12 +2257,13 @@ fn resolve_run(pipe: &PipeRecord) -> Result<SqsSourcedPipe, String> {
         target_parameters.and_then(|parameters| parameters.sqs_queue_parameters.as_ref()),
     )?;
 
-    Ok(SqsSourcedPipe {
-        source_queue,
+    Ok(RunningPipe {
+        source,
         source_arn: pipe.source.clone(),
         source_region,
         batch_size,
         batching_window,
+        filters,
         enrichment,
         enrichment_template,
         target_template,
@@ -1453,6 +2346,7 @@ struct Clients {
     sqs: Option<(String, ::aws_sdk_sqs::Client)>,
     lambda: Option<(String, ::aws_sdk_lambda::Client)>,
     sfn: Option<(String, ::aws_sdk_sfn::Client)>,
+    dynamodbstreams: Option<(String, ::aws_sdk_dynamodbstreams::Client)>,
 }
 
 /// Build each client the same way: over the in-process callback into this same
@@ -1508,6 +2402,9 @@ impl Clients {
     callback_client!(lambda, aws_sdk_lambda, "lambda");
     // Step Functions publishes its endpoint and signs under `states`.
     callback_client!(sfn, aws_sdk_sfn, "states");
+    // DynamoDB Streams publishes its own endpoint under the DynamoDB one
+    // (`streams.dynamodb.<region>.amazonaws.com`) and signs as `dynamodb`.
+    callback_client!(dynamodbstreams, aws_sdk_dynamodbstreams, "streams.dynamodb");
 }
 
 #[cfg(test)]

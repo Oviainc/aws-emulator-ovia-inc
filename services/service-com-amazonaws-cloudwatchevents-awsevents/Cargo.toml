@@ -25,6 +25,10 @@ tracing = { workspace = true }
 # counter through SHA-256 and laid out as a UUID; these two do that.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# `event_pattern`: the ONE reading and matching of the EventBridge event-pattern
+# language, shared with every other service whose API accepts one, so a pattern this
+# service stores and a pattern another service filters with are read the same way.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

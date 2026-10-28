@@ -4,7 +4,8 @@
 //! IMPLEMENTED: persists the whole pipe record in [`crate::state`], mints its ARN, and
 //! answers from the record it just stored. A name that already exists is refused with
 //! `ConflictException` (409); a configuration the resources the pipe names cannot hold —
-//! a batch size past what the target takes per delivery, a FIFO queue target with no
+//! a source with no `SourceParameters` for the kind of resource its `Source` names, a
+//! batch size past what the target takes per delivery, a FIFO queue target with no
 //! message group id, a filter that is not an event pattern — is refused with the modelled
 //! `ValidationException` (400); a `Tags` entry breaking a published tag rule is refused
 //! with the `BadRequestException` (400) the tagging layer answers a broken tag rule with,
@@ -225,6 +226,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Stated once in `crate::state` and enforced by `UpdatePipe` too, so a pipe cannot
         // be created in a configuration an update could not have reached either.
         if let Some(violation) = crate::state::cross_resource_violation(
+            &input.source,
             input.source_parameters.as_ref(),
             &input.target,
             input.target_parameters.as_ref(),
