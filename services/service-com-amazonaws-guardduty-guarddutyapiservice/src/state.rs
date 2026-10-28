@@ -448,6 +448,41 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
         Ok(())
     }
 
+    /// Record the feedback a caller submitted on the named findings of the detector
+    /// `region`'s endpoint serves for `detector_id`, recording the instant of the
+    /// write as the `UpdatedAt` of each finding it changes.
+    ///
+    /// This is the WHOLE rule the feedback write follows — resolve the detector,
+    /// then write — and it is the same shape the archive write takes
+    /// ([`Self::set_findings_archived_in`]), so neither metadata write can drift
+    /// from the other on which clock a record-metadata change moves. Unlike the
+    /// archive write, an id this detector does not hold is NOT a refusal here: the
+    /// feedback write takes the reading a findings read takes, where such an id is
+    /// simply absent.
+    ///
+    /// `Err` carries the message the request is refused with, already classified by
+    /// [`detector_id_rejection`]: an endpoint that holds no such detector. The
+    /// detector is resolved before [`Self::tick_millis`] runs, so a refused request
+    /// moves nothing and advances nothing.
+    pub fn set_findings_feedback_in(
+        &mut self,
+        region: &str,
+        detector_id: &str,
+        finding_ids: &[String],
+        feedback: &str,
+        comments: Option<&str>,
+    ) -> Result<(), String> {
+        if self.detector_in(region, detector_id).is_none() {
+            return Err(detector_id_rejection(detector_id));
+        }
+        let now = self.tick_millis();
+        let Some(detector) = self.detector_in_mut(region, detector_id) else {
+            return Err(detector_id_rejection(detector_id));
+        };
+        detector.set_findings_feedback(finding_ids, feedback, comments, now);
+        Ok(())
+    }
+
     /// The ids of the detectors `region`'s endpoint serves, in a total order.
     pub fn detector_ids_in(&self, region: &str) -> Vec<String> {
         let mut ids: Vec<String> = self
@@ -2663,6 +2698,42 @@ impl Detector {
             if let Some(finding) = self.findings.get_mut(id) {
                 if finding.archived != archived {
                     finding.archived = archived;
+                    finding.updated_at_millis = now;
+                }
+            }
+        }
+    }
+
+    /// Record `feedback` (and the `comments` it came with) on every named finding
+    /// this detector holds, recording `now` as the `UpdatedAt` of each finding the
+    /// call actually changes.
+    ///
+    /// The submission REPLACES whatever was recorded before: the feedback is one
+    /// value per finding, not a log. An id this detector does not hold writes
+    /// nothing and is not an error, the same way a findings read reports only the
+    /// ids it holds.
+    ///
+    /// The feedback is a property of the RECORD, not an observation of the
+    /// activity, so — exactly as for [`Self::set_findings_archived`] — only
+    /// [`FindingRecord::updated_at_millis`] moves and
+    /// [`FindingRecord::event_last_seen_millis`] stays where the last observation
+    /// left it. A submission that leaves every stored value where it was moves
+    /// nothing at all, which is what makes a re-submission of the same feedback a
+    /// true no-op.
+    pub fn set_findings_feedback(
+        &mut self,
+        finding_ids: &[String],
+        feedback: &str,
+        comments: Option<&str>,
+        now: i64,
+    ) {
+        for id in finding_ids {
+            if let Some(finding) = self.findings.get_mut(id) {
+                let changed = finding.user_feedback.as_deref() != Some(feedback)
+                    || finding.feedback_comments.as_deref() != comments;
+                if changed {
+                    finding.user_feedback = Some(feedback.to_string());
+                    finding.feedback_comments = comments.map(str::to_string);
                     finding.updated_at_millis = now;
                 }
             }
