@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDataset
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDataset`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDataset::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: the handler below removes the dataset its request addresses from
+//! this service's store together with the data segments that dataset held — and,
+//! for each segment holding the dataset's OWN data, the underlying time series
+//! samples that segment's span covered — refusing while another dataset's segments
+//! still reference its data, so no later read can still see what this call
+//! deleted.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +160,144 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDataset` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDatasetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDataset"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteDatasetError::Modeled(DeleteDatasetErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: "the IoT SiteWise store is unavailable".to_string(),
+                },
+            ))
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // `clientToken` makes this delete idempotent, as the member documents: "A
+        // unique case-sensitive identifier that you can provide to ensure the
+        // idempotency of the request." A retry carries the token of the call it
+        // repeats, so it replays that call's answer — the dataset it removed, reported
+        // DELETING — rather than the not-found refusal the removal itself would now
+        // produce, and removes nothing further; a token already spent on a DIFFERENT
+        // request belongs to another call, which is the modelled conflict. It is the
+        // FIRST thing decided, because the call it repeats was already served.
+        let fingerprint =
+            crate::state::request_fingerprint(&[&input.dataset_id, &input.workspace_name], None);
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(_) => {
+                // The answer the first call gave: the dataset it removed is gone by the
+                // time its retry lands, which is exactly why that answer is replayed
+                // from the record of the call rather than re-derived from the store.
+                return Ok(DeleteDatasetOutput {
+                    dataset_status: deleting(),
+                });
+            }
+            crate::state::TokenVerdict::Spent(spent_on) => {
+                // The ARN the conflict reports is the one the stored dataset CARRIES,
+                // read back from the record rather than rebuilt, so the refusal cannot
+                // name an ARN no dataset of this store has. A dataset removed since the
+                // token was spent — which is what the delete it was spent on left
+                // behind — has only its id left to build one from.
+                let conflicting_arn = store
+                    .datasets
+                    .get(&spent_on)
+                    .map(|dataset| dataset.arn.clone())
+                    .unwrap_or_else(|| crate::state::dataset_arn(&region, &spent_on));
+                return Err(token_spent(&spent_on, conflicting_arn));
+            }
+            crate::state::TokenVerdict::Serve => {}
+        }
+
+        // `workspaceName` names "the name of the workspace that contains the dataset",
+        // so a request that names one SCOPES the lookup: a dataset held by another
+        // workspace, or by none at all, is not the dataset this request addresses —
+        // the same narrowing `DescribeDataset` and `UpdateDataset` apply. An id that
+        // resolves to no dataset is the modelled 404 rather than a silent success.
+        if !store.datasets.get(&input.dataset_id).is_some_and(|dataset| {
+            input.workspace_name.is_none() || input.workspace_name == dataset.workspace_name
+        }) {
+            return Err(not_found(&input.dataset_id));
+        }
+
+        // "You can't delete a session dataset while a curated dataset references its
+        // data segments. First delete the curated dataset or disassociate the data
+        // segments." A segment another dataset holds names this dataset as the source
+        // its data came from, so deleting this dataset — which deletes that data —
+        // would leave that segment covering data nothing holds. This is a TERMINAL
+        // request error — the caller has to delete the referencing dataset or
+        // disassociate the segments first, and no retry of this call can succeed — so
+        // it is `InvalidRequestException` (400) and not the retryable
+        // `ConflictingOperationException` (409), which states a transient conflict
+        // between two operations on one resource; the same rule, and the same mapping,
+        // as `DeleteAsset` and `DeleteWorkspace` give a delete whose resource is still
+        // depended on. Evaluated BEFORE anything is removed, so a refused delete leaves
+        // the dataset and its data exactly as they were.
+        let referenced_by = store
+            .dataset_data_reference(&input.dataset_id)
+            .map(|(holder, _)| holder.to_string());
+        if let Some(holder) = referenced_by {
+            return Err(DeleteDatasetError::Modeled(
+                DeleteDatasetErrorModeled::InvalidRequestException(InvalidRequestException {
+                    message: format!(
+                        "The data segments of the dataset {} are referenced by the dataset \
+                         {holder}. Delete that dataset or disassociate the data segments \
+                         before deleting it.",
+                        input.dataset_id
+                    ),
+                }),
+            ));
+        }
+
+        // The dataset and the segments it held go away, so no later read can still see
+        // it: a describe of the dataset, a listing of its data segments and a lookup of
+        // its tags by ARN all resolve to nothing. The data those segments covered goes
+        // with them only where the dataset OWNED it — see
+        // `ComAmazonawsIotsitewiseAwsiotsitewiseState::forget_dataset`, which states
+        // that split once for every caller.
+        store.forget_dataset(&input.dataset_id);
+
+        // The token is spent only now that the delete has succeeded: a refused
+        // request removed nothing, so the caller may send its token again.
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &input.dataset_id,
+            now,
+        );
+
+        Ok(DeleteDatasetOutput {
+            dataset_status: deleting(),
+        })
     }
+}
+
+/// The status an accepted delete reports: "State is DELETING after a successfull
+/// call to this API", the lifecycle state this service's other deletes report for
+/// a resource the accepted call removed.
+fn deleting() -> DatasetStatus {
+    DatasetStatus {
+        state: crate::state::STATE_DELETING.to_string(),
+        error: None,
+    }
+}
+
+/// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
+/// request already spent: the conflict is with the dataset that request removed,
+/// so `resourceId`/`resourceArn` name it.
+fn token_spent(dataset_id: &str, resource_arn: String) -> DeleteDatasetError {
+    DeleteDatasetError::Modeled(DeleteDatasetErrorModeled::ConflictingOperationException(
+        ConflictingOperationException {
+            message: crate::state::already_using_message("dataset", "clientToken"),
+            resource_id: dataset_id.to_string(),
+            resource_arn,
+        },
+    ))
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the id that resolved to nothing.
+fn not_found(dataset_id: &str) -> DeleteDatasetError {
+    DeleteDatasetError::Modeled(DeleteDatasetErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: crate::state::not_found_message(crate::state::RESOURCE_DATASET, dataset_id),
+        },
+    ))
 }

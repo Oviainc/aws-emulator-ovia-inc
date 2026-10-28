@@ -198,12 +198,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // has nothing publishable to prepare a template from. That is a
                     // parameter the service cannot act on — HTTP 400 — which is also what
                     // AWS answers when the same versionless application is asked for a
-                    // change set.
-                    return Err(bad_request(format!(
-                        "Application {} does not have any versions. Publish a version \
-                         before preparing a template from it.",
-                        input.application_id
-                    )))
+                    // change set, in that path's own words.
+                    return Err(bad_request(NO_VERSION_TO_PREPARE_FROM))
                 }
             },
         };
@@ -276,9 +272,20 @@ fn not_found(
     .into()
 }
 
+/// The 400 this operation answers for an application that has published no version at
+/// all, so there is nothing to prepare a template from.
+///
+/// The sentence is FIXED: it names neither the application nor a version, because there
+/// is no version to name and this condition is about the operation that cannot be served,
+/// not about a value in the request. It belongs to THIS deploy path alone — the sibling
+/// `CreateCloudFormationChangeSet` states the same precondition in its own words — so it
+/// is stated here rather than in a helper the two would share.
+const NO_VERSION_TO_PREPARE_FROM: &str =
+    "CloudFormation template can't be created from application with no version.";
+
 /// The 400 this operation answers for a request it cannot act on: an application with no
 /// version to prepare a template from.
-fn bad_request(message: String) -> CreateCloudFormationTemplateError {
+fn bad_request(message: impl Into<String>) -> CreateCloudFormationTemplateError {
     CreateCloudFormationTemplateErrorModeled::BadRequestException(crate::state::bad_request(
         message,
     ))

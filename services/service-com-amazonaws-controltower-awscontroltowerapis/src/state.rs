@@ -65,6 +65,13 @@
 //! operation of this crate reaches the rule through these, so narrowing by a filter
 //! member cannot drift between them.
 //!
+//! They all PAGINATE the listing they narrowed the same way as well, so that rule lives
+//! here once for the same reason: [`page`] cuts out the page a `nextToken`/`maxResults`
+//! pair asks for and hands back the token that resumes the listing after it, and
+//! [`TokenScope`] says how far a token one listing handed out reaches. Every list
+//! operation of this crate reaches the rule through [`page`], so a page boundary — and
+//! the refusal of a token no page handed out — cannot drift between them either.
+//!
 //! [`merge_tags`]: ComAmazonawsControltowerAwscontroltowerapisState::merge_tags
 //! [`remove_tags`]: ComAmazonawsControltowerAwscontroltowerapisState::remove_tags
 //!
@@ -3453,6 +3460,73 @@ pub fn selected_resolved<Entry: PartialEq>(
     values
         .iter()
         .any(|value| resolve(value).as_ref() == Some(&actual))
+}
+
+/// How far a `nextToken` one list operation handed out reaches, which is what its refusal
+/// tells a caller that sent a token it cannot resume.
+///
+/// A token is an index into the listing the call that handed it out was looking at, so a
+/// listing the request narrows (by a `filter` member, by a target) only resumes for a call
+/// that repeats those members — which is what `nextToken` is documented to require.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenScope {
+    /// The operation lists ONE whole collection, so its token means the same to every call.
+    WholeListing,
+    /// The operation narrows its listing from the request, so its token is only meaningful
+    /// to a call that sent the same parameters.
+    SameParameters,
+}
+
+/// The page of `listing` a list call asks for and the `nextToken` to report with it, or
+/// the message refusing the `nextToken` the call sent.
+///
+/// The ONE place every list operation of this service cuts a page out of its listing, so a
+/// page boundary cannot drift between them. The rule: an absent or empty token starts at
+/// the beginning, any other token is the index of the first entry the previous page did
+/// not return and resumes there — and is refused when it is not an index into this
+/// listing; `maxResults` is how many entries the page holds, every remaining entry when
+/// the caller sent none; and the response carries a token exactly while entries remain
+/// after the page. `operation` and `scope` are what the refusal names (see [`TokenScope`]).
+///
+/// The floor of 1 on `maxResults` keeps a page from being empty-but-tokened should a
+/// model's range ever admit a smaller value than the front door refuses today, and the
+/// saturating addition keeps a page size near the integer's maximum from wrapping.
+pub fn page<'entries, Entry>(
+    operation: &str,
+    scope: TokenScope,
+    next_token: Option<&str>,
+    max_results: Option<i32>,
+    listing: &'entries [Entry],
+) -> Result<(&'entries [Entry], Option<String>), String> {
+    let len = listing.len();
+    let start = match next_token {
+        None | Some("") => 0usize,
+        Some(token) => match token.parse::<usize>() {
+            Ok(index) if index <= len => index,
+            _ => return Err(unhandled_next_token_message(operation, scope, token)),
+        },
+    };
+    let limit = max_results.map_or(len, |max| max.max(1) as usize);
+    let end = start.saturating_add(limit).min(len);
+    Ok((&listing[start..end], (end < len).then(|| end.to_string())))
+}
+
+/// Why `token` resumes no page of `operation`'s listing.
+///
+/// The one place this refusal's wording is built, so every list operation refuses a token
+/// no page handed out in the same words, and the message is built from the request and the
+/// operation's own [`TokenScope`] so it tells the caller what a token it may send came
+/// from.
+fn unhandled_next_token_message(operation: &str, scope: TokenScope, token: &str) -> String {
+    match scope {
+        TokenScope::WholeListing => {
+            format!("nextToken {token} was not returned by a previous {operation} call")
+        }
+        TokenScope::SameParameters => format!(
+            "nextToken {token} was not returned by a previous {operation} call with these \
+             parameters"
+        ),
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
