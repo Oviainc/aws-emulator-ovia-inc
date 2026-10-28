@@ -27,8 +27,10 @@
 //!   that names no domain are each refused with the modelled error;
 //! * the read changes nothing a later caller sees;
 //! * and the published range is the range the service ENFORCES: `CreateDomain` and
-//!   `UpdateDomainConfig` refuse a volume sized outside it, at either end, and store
-//!   nothing when they do.
+//!   `UpdateDomainConfig` refuse a volume sized outside it, at either end, with the
+//!   modelled service-limit refusal, and store nothing when they do — which
+//!   [`super::ebs_volume_size_limit`] holds to the class, status and wording of that
+//!   refusal.
 
 use std::collections::BTreeSet;
 
@@ -690,15 +692,19 @@ async fn reading_the_limits_changes_nothing() {
     );
 }
 
-/// The published maximum volume size of one instance type and sub-type, read through
-/// `DescribeInstanceTypeLimits` itself — so the enforcement cases below are bounded by
+/// The published volume-size range of one instance type and sub-type — its
+/// `MinimumVolumeSize` and `MaximumVolumeSize` — read through
+/// `DescribeInstanceTypeLimits` itself, so the enforcement cases below are bounded by
 /// what the service publishes rather than by a second copy of the scale.
-async fn published_maximum(
+///
+/// Shared with [`super::ebs_volume_size_limit`], which holds the refusals to these same
+/// published bounds.
+pub(crate) async fn published_volume_size_range(
     emulator: &Emulator,
     engine_version: &str,
     instance_type: &str,
     sub_type: &str,
-) -> i64 {
+) -> (i64, i64) {
     let case = format!("{engine_version} {instance_type} {sub_type}");
     let map = limits_by_role(
         &describe_limits(emulator, engine_version, instance_type, "").await,
@@ -714,8 +720,11 @@ async fn published_maximum(
         .unwrap_or_else(|| {
             panic!("case {case}: expected a {sub_type} storage type, got {storage:?}")
         });
-    storage_limit(entry, "MaximumVolumeSize")
-        .unwrap_or_else(|| panic!("case {case}: expected a MaximumVolumeSize, got {entry:?}"))
+    let minimum = storage_limit(entry, "MinimumVolumeSize")
+        .unwrap_or_else(|| panic!("case {case}: expected a MinimumVolumeSize, got {entry:?}"));
+    let maximum = storage_limit(entry, "MaximumVolumeSize")
+        .unwrap_or_else(|| panic!("case {case}: expected a MaximumVolumeSize, got {entry:?}"));
+    (minimum, maximum)
 }
 
 #[tokio::test]
@@ -735,7 +744,8 @@ async fn a_volume_outside_the_published_range_is_refused_on_create() {
     ]    .into_iter()
     .enumerate()
     {
-        let maximum = published_maximum(&emulator, version, instance_type, sub_type).await;
+        let (_, maximum) =
+            published_volume_size_range(&emulator, version, instance_type, sub_type).await;
         let rows: [(i64, bool); 5] = [
             (MINIMUM_VOLUME_SIZE - 1, false),
             (1, false),
@@ -775,15 +785,18 @@ async fn a_volume_outside_the_published_range_is_refused_on_create() {
                     stored.body["DomainStatus"]["EBSOptions"]
                 );
             } else {
+                // A size outside the published range asks for storage the service does
+                // not offer for that instance type: the modelled service-limit refusal,
+                // not a request-shape one.
                 assert_eq!(
-                    answer.status, 400,
-                    "case {case}: expected HTTP 400, got {} {:?}",
+                    answer.status, 409,
+                    "case {case}: expected HTTP 409, got {} {:?}",
                     answer.status, answer.body
                 );
                 assert_eq!(
                     error_code(&answer),
-                    "ValidationException",
-                    "case {case}: expected the modelled validation refusal, got {:?}",
+                    "LimitExceededException",
+                    "case {case}: expected the modelled service-limit refusal, got {:?}",
                     answer.body
                 );
                 // A refused create stores nothing.
@@ -819,7 +832,8 @@ async fn a_volume_outside_the_published_range_is_refused_on_update() {
     let version = "OpenSearch_2.11";
     let instance_type = "m5.large.search";
     let name = "ebs-resize";
-    let maximum = published_maximum(&emulator, version, instance_type, "gp3").await;
+    let (_, maximum) =
+        published_volume_size_range(&emulator, version, instance_type, "gp3").await;
 
     let created = emulator
         .create(json!({
@@ -875,14 +889,14 @@ async fn a_volume_outside_the_published_range_is_refused_on_update() {
     for (case, body) in refused {
         let answer = emulator.update_config(name, body.clone()).await;
         assert_eq!(
-            answer.status, 400,
-            "case {case}: expected HTTP 400, got {} {:?}",
+            answer.status, 409,
+            "case {case}: expected HTTP 409, got {} {:?}",
             answer.status, answer.body
         );
         assert_eq!(
             error_code(&answer),
-            "ValidationException",
-            "case {case}: expected the modelled validation refusal, got {:?}",
+            "LimitExceededException",
+            "case {case}: expected the modelled service-limit refusal, got {:?}",
             answer.body
         );
         // A refused update stores nothing: the domain keeps the volume it had.
@@ -899,8 +913,8 @@ async fn a_volume_outside_the_published_range_is_refused_on_update() {
         dry["DryRun"] = json!(true);
         let answer = emulator.update_config(name, dry).await;
         assert_eq!(
-            answer.status, 400,
-            "case {case} dry run: expected HTTP 400, got {} {:?}",
+            answer.status, 409,
+            "case {case} dry run: expected HTTP 409, got {} {:?}",
             answer.status, answer.body
         );
     }
@@ -954,8 +968,8 @@ async fn a_volume_outside_the_published_range_is_refused_on_update() {
         )
         .await;
     assert_eq!(
-        shrunk.status, 400,
-        "case shrink the instance under its volume: expected HTTP 400, got {} {:?}",
+        shrunk.status, 409,
+        "case shrink the instance under its volume: expected HTTP 409, got {} {:?}",
         shrunk.status, shrunk.body
     );
     let grown = emulator

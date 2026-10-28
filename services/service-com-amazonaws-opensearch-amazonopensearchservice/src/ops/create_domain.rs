@@ -268,16 +268,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The storage a domain is created with has to be storage the service publishes
         // for the instance type the domain runs on: a volume sized outside that
-        // published range describes a cluster the service cannot provision, so it is
-        // refused rather than stored.
+        // published range asks for storage the service does not offer for that instance
+        // type, which is a storage LIMIT of the instance type rather than a malformed
+        // request, so it is refused with the modelled `LimitExceededException` and no
+        // domain is created.
         if let Some(refusal) = crate::state::ebs_volume_size_refusal(
             input.ebs_options.as_ref(),
             input
                 .cluster_config
                 .as_ref()
                 .and_then(|cluster| cluster.instance_type.as_deref()),
+            &engine_version,
         ) {
-            return Err(CreateDomainErrorModeled::ValidationException(refusal).into());
+            return Err(CreateDomainErrorModeled::LimitExceededException(refusal).into());
         }
 
         // The rest of the configuration is checked the same way, and against the same
