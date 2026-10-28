@@ -1,0 +1,55 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-ga-prod-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: route53.deploy-health-check-cfn-status-behavior
+Issue-Shape-Id: com.amazonaws.route53#AWSDnsV20130401
+Issue-Key: route53.deploy-health-check-cfn-status-behavior|_poll_health_status#13|Timeout|time.sleep(interval_s)
+Issue-Commit: f9d8ea6e8a952f12735f5ffe0890d0f58cbc4f2e
+
+# Route 53 endpoint health checks report a frozen Success from every checker, so a CFN stack update that breaks the monitored ResourcePath never turns GetHealthCheckStatus to failure
+
+> _Note: this issue was identified against the code base at commit `f9d8ea6e8a952f12735f5ffe0890d0f58cbc4f2e`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+GetHealthCheckStatus
+
+## Description
+One net-new root cause (Cause 1 of 1), grounded in failing check route53.deploy-health-check-cfn-status-behavior (verdict mismatch, "Check timed out after 60.0s").
+
+Cause 1 of 1: the status a Route 53 health checker reports about an endpoint-type health check is a CONSTANT derived only from the check's Type, not an assessment of the endpoint named by FullyQualifiedDomainName/Port/ResourcePath. A reconfiguration that repoints the check at a path the monitored endpoint answers with a non-2xx/3xx status therefore produces no observable change: every checker keeps reporting a Success status forever, so the "this health check has gone unhealthy" transition is unreachable by any input.
+
+AWS: Smithy HealthCheckConfig$ResourcePath — "The path, if any, that you want Amazon Route 53 to request when performing health checks. The path can be any value for which your endpoint will return an HTTP status code of 2xx or 3xx when the endpoint is healthy". Smithy StatusReport$Status — "A description of the status of the health check endpoint as reported by one of the Amazon Route 53 health checkers" (free text; the model constrains no value). GetHealthCheckStatus returns the required HealthCheckObservations list, "one HealthCheckObservation element for each Amazon Route 53 health checker that is reporting a status about the health check endpoint". UpdateHealthCheck accepts ResourcePath on a live check (and is what CloudFormation applies an AWS::Route53::HealthCheck property change through), and the check's HealthCheckVersion advances. So ResourcePath is a PROBE TARGET re-evaluated every RequestInterval: while the probed path answers 2xx/3xx every checker reports a status whose fixed leading text is "Success: " (recorded behavior for an HTTPS check answering 200: "Success: HTTP Status Code 200, OK" — "Success: HTTP Status Code " is fixed text and the numeric code and reason phrase come from the probed response); once the path answers a non-2xx/3xx — nothing about the health check itself other than the path having changed — every checker reports a status whose fixed leading text is "Failure: " and whose reason names what the probe observed rather than a success. The exact trailing wording for that failure class is recorded behavior only (the model documents no wording); what is a requirement is the "Failure: " opening and that the observed non-success status is what is reported, since a frozen Success is a different fact about the endpoint.
+
+Emulator: StoredHealthCheck::reported_status() returns STATUS_TCP_CONNECTION_ESTABLISHED ("Success: TCP connection established") when Type is TCP and otherwise always STATUS_HTTP_OK ("Success: HTTP Status Code 200, OK"), and to_health_check_observations() stamps that single StatusReport onto every checker Region. ResourcePath, Port, FullyQualifiedDomainName and the response of the monitored endpoint are not read anywhere on this path — the stored config only decides WHICH Regions report, WHETHER any report at all (endpoint_is_being_checked) and WHEN they last did (last_checked_at_millis). The replayed check deploys a CloudFormation stack that creates an API behind an AWS::Route53::HealthCheck (Type HTTPS, ResourcePath /prod/healthy, RequestInterval 10, FailureThreshold 1), polls until a checker reports Success (satisfied immediately by the constant), then updates the stack so ResourcePath becomes a path the API does not define (which real API Gateway answers 403 "Missing Authentication Token", scored as failure), and polls for any checker to stop reporting Success. Because reported_status() can only ever yield a "Success: "-prefixed string for every endpoint type, that predicate is unsatisfiable, and the check was killed by the 60 s harness limit while still polling (its own poll budget is 240 s).
+
+Why: a client gets the one fact a health check exists to supply frozen at healthy. Configuration round-trips perfectly — GetHealthCheck reports the new ResourcePath and an advanced HealthCheckVersion — while the monitoring behind it is inert, so a DNS-failover drill, a deployment gate or a test that waits for a health check to go unhealthy after its monitored path breaks hangs instead of observing the transition, and GetHealthCheckLastFailureReason/StatusReport never produce a failure report a client branches on. Any target that merely stores ResourcePath is indistinguishable from Route 53 today.
+
+Fix: the route53 health-check state/evaluator, not the GetHealthCheckStatus serializer. reported_status() must stop returning a Type-keyed constant and derive each probe's report from an actual assessment of the endpoint the stored config names (the endpoints these checks monitor are served by this same emulator in-process), reporting a "Success: "-prefixed status when the probed path answers 2xx/3xx and a "Failure: "-prefixed status naming the observed non-success otherwise, re-evaluated per probe so a later ResourcePath/endpoint change flips the report. The same assessment must feed the CloudWatch AWS/Route53 HealthCheckStatus publisher so one health check has one status.
+
+Relation to an already-open issue: 20261027T013849Z-route53-route-53-http-str-match-searchstring-is-never.md describes the same constant in reported_status() reached through SearchString, and carries only the replay key of route53.health-check-str-match-searchstring-governs-the-reported-health. It does not carry this check, and this check exercises a different input axis (ResourcePath/HTTP status, applied through a CloudFormation stack update, Type=HTTPS with no SearchString at all), so a fix narrowed to string matching leaves this one failing. If reported_status() is generalised to a real per-probe assessment, both close together — re-replay route53.deploy-health-check-cfn-status-behavior to confirm this one.
+
+Traces: route53.deploy-health-check-cfn-status-behavior.
+
+## Evidence
+Failing check: route53.deploy-health-check-cfn-status-behavior — verdict mismatch, "Check timed out after 60.0s" (killed inside a poll loop; the check's own Failure-phase poll budget is 240 s).
+
+Expected (AWS), for an HTTPS health check on an endpoint the deployer owns:
+  Phase 1, ResourcePath = a path the endpoint answers 2xx -> every HealthCheckObservations[].StatusReport.Status begins with the fixed text "Success: " (recorded: "Success: HTTP Status Code 200, OK"; the code and reason phrase come from the probed response).
+  Phase 2, the stack is updated so ResourcePath = a path the endpoint does NOT define -> GetHealthCheck reports the new ResourcePath and a HealthCheckVersion greater than before (UpdateHealthCheck semantics), and within a few RequestIntervals every checker reports a status beginning with the fixed text "Failure: " whose reason names the observed non-success response rather than a success.
+
+Actual (emulator): both phases report the identical constant from every checker Region — "Success: HTTP Status Code 200, OK" for every non-TCP type, "Success: TCP connection established" for TCP. No status not beginning with "Success" is producible by any ResourcePath, Port, FullyQualifiedDomainName or endpoint behavior, so Phase 2 never arrives and the check is cut off by the harness limit.
+
+Source of the constant (citations, not a patch):
+  services/service-com-amazonaws-route53-awsdnsv20130401/src/state.rs:1145-1162 — reported_status(): `if self.config.r#type == HEALTH_CHECK_TYPE_TCP { return STATUS_TCP_CONNECTION_ESTABLISHED; } STATUS_HTTP_OK`. Neither ResourcePath nor the endpoint's response is consulted.
+  services/service-com-amazonaws-route53-awsdnsv20130401/src/state.rs:1168-1180 — to_health_check_observations(): one cloned StatusReport applied to every checker Region.
+  services/service-com-amazonaws-route53-awsdnsv20130401/src/state.rs:1145-1156 — the doc comment conceding "a checker of an endpoint this service is checking has no failure to report".
+
+Controls that do hold, so the divergence is isolated to the probe assessment: CloudFormation really provisions this type — services/service-com-amazonaws-cloudformation-cloudformation/src/state/provisioner.rs:666 maps ROUTE53_HEALTH_CHECK to Provisioner::Route53HealthCheck, :899-901 creates it via CreateHealthCheck, :1272-1276 applies a changed declaration through UpdateHealthCheck ("Every member of a health check's configuration that can change on a live one is a member of UpdateHealthCheck"), :1762 reads it back — so the health check exists, is readable and its configuration change is applied; what never changes is the reported status.
+
+## Steps to Reproduce
+1. route53 CreateHealthCheck with HealthCheckConfig {Type: HTTPS, FullyQualifiedDomainName: <an HTTPS endpoint this emulator serves>, Port: 443, ResourcePath: "/prod/healthy" (a path that endpoint answers 200), RequestInterval: 10, FailureThreshold: 1}. (The replayed check creates it through CloudFormation: create_stack with an AWS::Route53::HealthCheck whose ResourcePath is a template parameter, beside an AWS::ApiGateway::RestApi/Resource/Method/Deployment/Stage that serves /prod/healthy, and takes the id from the stack output Ref'ing the health check.)
+2. Poll route53 GetHealthCheckStatus(HealthCheckId) until every HealthCheckObservations[].StatusReport.Status starts with "Success" — answered immediately with "Success: HTTP Status Code 200, OK".
+3. Repoint the check at a path the endpoint does not define: UpdateHealthCheck(HealthCheckId, ResourcePath="/prod/sim2real-404-nonexistent") — or, as the check does, update_stack with ResourcePath set to that value and wait for UPDATE_COMPLETE.
+4. GetHealthCheck(HealthCheckId): HealthCheckConfig.ResourcePath is the new path and HealthCheckVersion has advanced, confirming the reconfiguration landed.
+5. Poll GetHealthCheckStatus again. AWS: within a few RequestIntervals every checker reports a "Failure: "-prefixed status naming the non-success response the probe observed. Emulator: every checker keeps reporting "Success: HTTP Status Code 200, OK" indefinitely, so the poll never terminates and the check is killed at the harness limit.
+6. For contrast, create the same check with Type: TCP — the status is the other constant, "Success: TCP connection established", again regardless of whether anything listens on the port.
