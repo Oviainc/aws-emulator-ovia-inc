@@ -200,7 +200,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "An idempotent operation completes no more than once" (`ClientRequestToken`):
         // a token already used answers from the accessor its first call created, so a
-        // retry — or a second call with the same token — mints nothing new.
+        // retry — or a second call with the same token — mints nothing new, for as long as
+        // that accessor is one a caller can still use: `replay_idempotent` holds that
+        // liveness test, so a token whose accessor has begun being deleted mints a fresh
+        // accessor below.
         let token = crate::state::idempotency_key(&region, Self::NAME, &input.client_request_token);
         let replayed = guard
             .replay_idempotent(&token)
@@ -209,8 +212,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(accessor) = replayed {
             // Answered from the STORED record, so a replay carries the very id, billing
             // token and network type the first call returned. A ledger record whose
-            // accessor is no longer stored is NOT replayed: it could only hand back a
-            // token nothing holds, so such a token creates a new accessor below.
+            // accessor this Region no longer reaches is NOT replayed either: it could only
+            // hand back a token nothing holds, so such a token creates a new accessor
+            // below.
             return Ok(CreateAccessorOutput {
                 accessor_id: Some(accessor.id.clone()),
                 billing_token: Some(accessor.billing_token.clone()),
@@ -259,16 +263,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         guard.accessors.insert(accessor_id.clone(), accessor);
-        guard.remember_idempotent(
-            token,
-            crate::state::CreatedIds {
-                network_id: None,
-                member_id: None,
-                node_id: None,
-                proposal_id: None,
-                accessor_id: Some(accessor_id.clone()),
-            },
-        );
+        guard.remember_idempotent(token, crate::state::CreatedIds::accessor(&accessor_id));
 
         // Answer from the STORED record, so this is the id, token and network type every
         // later read of the accessor answers with — read back through the same
