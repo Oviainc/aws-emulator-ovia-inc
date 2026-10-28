@@ -7,10 +7,10 @@
 //! Every call here goes through the same `MultiServiceRouter` the production router
 //! uses: `POST /` with `X-Amz-Target: Invoicing.<OperationName>` and an awsJson1_0
 //! body, so what these tests see is what an SDK client sees. The one exception is the
-//! portal-validation code, which the real service delivers OUT OF BAND inside the test
-//! e-invoice it posts to the portal and the modelled responses never carry: the tests
-//! below issue it into, and read it out of, this service's state, because there is no
-//! wire to carry it.
+//! portal-validation code, which the real service delivers OUT OF BAND through the portal
+//! the preference configures and the modelled responses never carry: the tests below have
+//! `SendProcurementPortalValidation` issue it and then read it out of this service's
+//! state, because there is no wire to carry it.
 //!
 //! The tables span the class each rule generalises over rather than one recorded
 //! request: a unit's whole lifetime at several version counts, tagged and untagged; the
@@ -26,8 +26,7 @@ use smithy_server_runtime::multi_service_router::MultiServiceRouter;
 
 use service_com_amazonaws_invoicing_invoicing::ops::types::ProcurementPortalPreference;
 use service_com_amazonaws_invoicing_invoicing::state::{
-    self, ComAmazonawsInvoicingInvoicingState, IssuedPortalValidation,
-    StoredProcurementPortalPreference,
+    self, ComAmazonawsInvoicingInvoicingState, StoredProcurementPortalPreference,
 };
 
 /// The per-RESOURCE tag quota this service enforces: the AWS-wide tagging quota,
@@ -727,30 +726,26 @@ fn seed_preference(engine: &Arc<engine::InMemoryEngine>, arn: &str, portal: &str
         .insert(arn.to_string(), stored);
 }
 
-/// Make a validation code outstanding for `arn`, as a CONFIRMED delivery of the test
-/// e-invoice would.
+/// Make a validation code outstanding for `arn`, through the call that ISSUES one.
 ///
-/// `SendProcurementPortalValidation` cannot confirm that delivery in this emulator — it
-/// performs no outbound delivery and hosts no procurement portal, so the send answers the
-/// modelled 400 (see `procurement_portal_preference_lifecycle.rs`, which pins that
-/// refusal). The rules of `VerifyProcurementPortalValidation` are about an OUTSTANDING
-/// code, so the code is issued through the state the verify reads, from the same
-/// generator the service mints one with.
-fn issue_code(engine: &Arc<engine::InMemoryEngine>, arn: &str) -> String {
-    let handle = engine.state::<ComAmazonawsInvoicingInvoicingState>();
-    let mut store = handle.lock();
-    let code = store.issue_portal_validation_code();
-    let issued_at = state::now();
-    store
-        .procurement_portal_preferences
-        .get_mut(arn)
-        .unwrap_or_else(|| panic!("case issue a code: {arn} must name a seeded preference"))
-        .validation = Some(IssuedPortalValidation {
-        code: code.clone(),
-        issued_at,
-        verified_at: None,
-    });
-    code
+/// `SendProcurementPortalValidation` is that call — the model documents it as initiating
+/// the validation by issuing a validation code — so the code is issued over the wire and
+/// then READ from state: the modelled response carries only the ARN, because the real
+/// service delivers the code through the configured procurement portal.
+async fn issue_code(
+    router: &MultiServiceRouter,
+    engine: &Arc<engine::InMemoryEngine>,
+    arn: &str,
+) -> String {
+    ok(
+        router,
+        "SendProcurementPortalValidation",
+        &json!({"ProcurementPortalPreferenceArn": arn}),
+    )
+    .await;
+    outstanding_code(engine, arn).unwrap_or_else(|| {
+        panic!("case issue a code: the send must leave a code outstanding for {arn}")
+    })
 }
 
 /// The validation code this service issued for `arn` and has not seen back yet, read
@@ -860,30 +855,31 @@ async fn portal_validation_accepts_only_the_code_it_issued() {
         "case verify before any send: expected the modelled validation error, got {body}"
     );
 
+    // The send is the call that ISSUES a code: it answers 200 with the ARN it was asked
+    // about and leaves that preference's own code outstanding.
     for arn in [&first, &second] {
-        let (status, body) = call(
+        let answered = ok(
             &router,
             "SendProcurementPortalValidation",
             &json!({"ProcurementPortalPreferenceArn": arn}),
         )
         .await;
         assert_eq!(
-            status, 400,
-            "case send {arn}: the send cannot confirm delivery, so it refuses: got {status} {body}"
+            answered
+                .get("ProcurementPortalPreferenceArn")
+                .and_then(Value::as_str),
+            Some(arn.as_str()),
+            "case send {arn}: the send answers with the ARN it was asked about, got {answered}"
         );
     }
 
-    let issued = issue_code(&engine, &first);
-    let other = issue_code(&engine, &second);
-    assert_eq!(
-        outstanding_code(&engine, &first).as_deref(),
-        Some(issued.as_str()),
-        "case issue a code: the code is outstanding for {first}"
-    );
-    assert_eq!(
-        outstanding_code(&engine, &second).as_deref(),
-        Some(other.as_str()),
-        "case issue a code: the code is outstanding for {second}"
+    let issued = outstanding_code(&engine, &first)
+        .unwrap_or_else(|| panic!("case send {first}: the send leaves a code outstanding"));
+    let other = outstanding_code(&engine, &second)
+        .unwrap_or_else(|| panic!("case send {second}: the send leaves a code outstanding"));
+    assert_ne!(
+        issued, other,
+        "case send: each preference gets its own code, got {issued:?} for both"
     );
     assert_eq!(
         issued.len(),
@@ -977,7 +973,7 @@ async fn portal_validation_accepts_only_the_code_it_issued() {
         !is_verified(&engine, &second),
         "case verify: one preference's validation must not complete another's"
     );
-    let reissued = issue_code(&engine, &second);
+    let reissued = issue_code(&router, &engine, &second).await;
     ok(
         &router,
         "VerifyProcurementPortalValidation",

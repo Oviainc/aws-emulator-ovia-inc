@@ -46,9 +46,12 @@
 //! update — and by nothing else: `Version` is "the version number of the procurement
 //! portal preference configuration", so a call that answered an error wrote no
 //! configuration and leaves both exactly as the last successful write left them. The
-//! validation calls keep their own record of what the flow tried
-//! ([`StoredProcurementPortalPreference::failed_verification_attempts`]), which no
-//! modelled member reports, so a refused validation changes nothing a reader observes.
+//! validation calls keep their own record of what the flow tried: the code
+//! `SendProcurementPortalValidation` issued ([`IssuedPortalValidation`]) and how many
+//! submissions of one were refused
+//! ([`StoredProcurementPortalPreference::failed_verification_attempts`]). Neither is a
+//! modelled member, so starting or refusing a validation changes nothing a reader
+//! observes.
 //!
 //! The PORTALS themselves are not stored beside the preferences, because no operation of
 //! this service creates one: they are the catalog [`procurement_portals`] derives from
@@ -426,10 +429,9 @@ impl ComAmazonawsInvoicingInvoicingState {
     /// here (see [`IssuedPortalValidation`]) for `VerifyProcurementPortalValidation` to
     /// check a submitted code against.
     ///
-    /// No operation of this emulator issues one today:
-    /// `SendProcurementPortalValidation` cannot confirm that delivery (see that
-    /// operation's module docs) and so answers the modelled 400 instead of minting a
-    /// code. This is where a code comes from for whatever can confirm it.
+    /// `SendProcurementPortalValidation` is the operation that issues one: the model
+    /// documents it as initiating the validation by issuing a validation code, so this is
+    /// where the code it records against a preference comes from.
     pub fn issue_portal_validation_code(&mut self) -> String {
         self.next_portal_validation_code = self.next_portal_validation_code.wrapping_add(1);
         let mixed = u64::from(now().subsec_nanos())
