@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the properties of ONE rule a caller added to a listener: a list the request
+//! names replaces the stored one outright and every member it leaves out keeps the value
+//! the stored rule holds. The rule is read from and written back to its listener's own
+//! record — the one rule store `DescribeRules` walks — so what this operation persists is
+//! what that read answers.
+//!
+//! A listener's DEFAULT rule is not modified here: it has no record of its own, being
+//! derived from the listener's default actions, so this operation refuses it and
+//! `ModifyListener` is what changes those actions.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +173,170 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyRule"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Only reachable on an engine that is not the shared `InMemoryEngine`,
+            // which this service has no store on — so nothing is implemented for it.
+            crate::scaffolded::Scaffolded::not_implemented("ModifyRule")
+        })?;
+
+        // Everything read off the REQUEST alone is checked before the store is reached:
+        // whether the rule this call leaves behind holds together does not depend on
+        // what the store holds.
+        if let Some(conditions) = input.conditions.as_deref() {
+            crate::state::check_rule_conditions(conditions)
+                .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        }
+        let transforms = transform_update(input.transforms.as_deref(), input.reset_transforms)?;
+
+        let mut guard = state.lock();
+
+        // The rule is resolved through the very read that REPORTS it, so a listener's
+        // default rule resolves here too: it is a rule `DescribeRules` answers with, and
+        // the one rule this operation refuses to replace the properties of.
+        let Some(reported) = guard.rule_by_arn(&input.rule_arn) else {
+            return Err(rule_not_found(&input.rule_arn));
+        };
+        if reported.is_default.unwrap_or(false) {
+            return Err(ModifyRuleErrorModeled::OperationNotPermittedException(
+                OperationNotPermittedException {
+                    message: Some(format!(
+                        "Rule '{}' is the default rule of its listener and cannot be \
+                         modified; its actions are the listener's default actions",
+                        input.rule_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A rule belongs to exactly one listener and its ARN is that listener's with the
+        // rule's own id appended, so the listener a rule hangs on is a pure transform of
+        // the identifier the request named rather than a scan over the store.
+        let listener = crate::state::rule_listener_arn(&input.rule_arn)
+            .and_then(|arn| guard.listeners.get(&arn))
+            .cloned();
+        let (Some(listener), Some(stored)) = (listener, guard.rule_record(&input.rule_arn).cloned())
+        else {
+            // The rule resolved above, so its listener and its record are both there;
+            // were either ever gone, that is the modelled refusal for the rule.
+            return Err(rule_not_found(&input.rule_arn));
+        };
+
+        // "Any properties that you do not specify are unchanged. To add an item to a
+        // list, remove an item from a list, or update an item in a list, you must provide
+        // the entire list" — so a list the request carries replaces the stored one
+        // outright, and one it leaves out is kept.
+        let mut updated = stored;
+        if let Some(conditions) = input.conditions.clone() {
+            updated.conditions = conditions;
+        }
+        if let Some(actions) = input.actions.clone() {
+            updated.actions = actions;
+        }
+        match transforms {
+            TransformUpdate::Unchanged => {}
+            TransformUpdate::Replace(replacement) => updated.transforms = replacement,
+            TransformUpdate::Clear => updated.transforms.clear(),
+        }
+
+        // A redirect action is judged against the protocol of the LISTENER it is attached
+        // to, so a rule of a listener that terminates TLS cannot be left redirecting to
+        // cleartext; the same action on a listener that does not is admitted.
+        if crate::state::downgrades_to_http(listener.protocol.as_deref(), &updated.actions) {
+            return Err(
+                ModifyRuleErrorModeled::InvalidLoadBalancerActionException(
+                    InvalidLoadBalancerActionException {
+                        message: Some(crate::state::HTTPS_TO_HTTP_REDIRECT_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // An action may forward only to a target group that exists, exactly as the
+        // actions a rule is created with may.
+        let forwarded = crate::state::action_target_group_arns(&updated.actions);
+        for target_group_arn in &forwarded {
+            if !guard.target_groups.contains_key(target_group_arn) {
+                return Err(ModifyRuleErrorModeled::TargetGroupNotFoundException(
+                    TargetGroupNotFoundException {
+                        message: Some(crate::state::target_groups_not_found_message([
+                            target_group_arn.as_str(),
+                        ])),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let Some(record) = guard.rule_record_mut(&input.rule_arn) else {
+            // Resolved above under this same lock, so nothing can have released it.
+            return Err(rule_not_found(&input.rule_arn));
+        };
+        *record = updated;
+        let modified = record.to_shape();
+        // A load balancer routes to every target group an action of one of its rules
+        // forwards to, so a modification that stopped forwarding to one drops that
+        // association and one that started forwarding adds it.
+        guard.refresh_target_group_associations(&listener.load_balancer_arn);
+
+        Ok(ModifyRuleOutput {
+            rules: Some(vec![modified]),
+        })
     }
+}
+
+/// What one call does to the transforms the stored rule holds.
+enum TransformUpdate {
+    /// The request named neither member, so the rule keeps the transforms it holds.
+    Unchanged,
+    /// The request carried `Transforms`, which replaces the stored list outright.
+    Replace(Vec<RuleTransform>),
+    /// The request asked for every transform to be removed from the rule.
+    Clear,
+}
+
+/// Read the two members that decide a rule's transforms, and refuse a request whose two
+/// answers disagree.
+///
+/// `ResetTransforms` "[i]ndicates whether to remove all transforms from the rule. If you
+/// specify ResetTransforms, you can't specify Transforms" — so asking for every transform
+/// to be removed and naming the transforms to apply in one request is refused rather than
+/// one of the two silently winning. The model declares no error shape for it, so the
+/// refusal is this service's own input validation (`400` `ValidationError`) naming both
+/// members. A request that asks for no reset may name `Transforms`: it then states only
+/// what the list it carries already says.
+fn transform_update(
+    transforms: Option<&[RuleTransform]>,
+    reset: Option<bool>,
+) -> Result<TransformUpdate, ModifyRuleError> {
+    let resetting = reset.unwrap_or(false);
+    if resetting && transforms.is_some() {
+        return Err(crate::scaffolded::Scaffolded::validation_error(
+            "Transforms cannot be specified together with ResetTransforms",
+        ));
+    }
+    if let Some(transforms) = transforms {
+        // The clause the model states about a rule's transforms, read once for every
+        // operation that SETS them.
+        crate::state::check_rule_transforms(transforms)
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        return Ok(TransformUpdate::Replace(transforms.to_vec()));
+    }
+    Ok(if resetting {
+        TransformUpdate::Clear
+    } else {
+        TransformUpdate::Unchanged
+    })
+}
+
+/// The refusal for a `RuleArn` this store holds no rule for. The identifier the request
+/// carried is the only thing the caller can act on, so the message names it
+/// ([`crate::state::rule_not_found_message`]).
+fn rule_not_found(arn: &str) -> ModifyRuleError {
+    ModifyRuleErrorModeled::RuleNotFoundException(RuleNotFoundException {
+        message: Some(crate::state::rule_not_found_message(arn)),
+    })
+    .into()
 }

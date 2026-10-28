@@ -112,29 +112,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The condition fields a rule may match on, from `RuleCondition$Field`'s documented
-/// list: `http-header`, `http-request-method`, `host-header`, `path-pattern`,
-/// `query-string` and `source-ip`. The model types that member as a plain string, so a
-/// value outside the list is refused here rather than by the boundary validator.
-const CONDITION_FIELDS: &[&str] = &[
-    "host-header",
-    "http-header",
-    "http-request-method",
-    "path-pattern",
-    "query-string",
-    "source-ip",
-];
-
-/// The condition fields a rule carries AT MOST ONE of: "each rule can optionally include
-/// up to one of each of the following conditions: `http-request-method`, `host-header`,
-/// `path-pattern`, and `source-ip`" — while `http-header` and `query-string` may repeat.
-const SINGLE_USE_CONDITION_FIELDS: &[&str] = &[
-    "host-header",
-    "http-request-method",
-    "path-pattern",
-    "source-ip",
-];
-
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -229,7 +206,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and whether a rule's own shape holds together does not depend on the store.
         crate::state::check_listener_arn(&input.listener_arn)
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
-        check_conditions(&input.conditions)?;
+        // The clauses the model states about a rule's conditions and transforms, read
+        // once for every operation that SETS them ([`crate::state`]).
+        crate::state::check_rule_conditions(&input.conditions)
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        crate::state::check_rule_transforms(input.transforms.as_deref().unwrap_or_default())
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
 
         let mut guard = state.lock();
 
@@ -347,70 +329,4 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             rules: Some(vec![stored]),
         })
     }
-}
-
-/// Enforce what the model states about a rule's CONDITIONS in prose and declares no
-/// error shape for: every condition names a field this service matches on, a field that
-/// may appear only once appears at most once, and the values the whole rule carries stay
-/// inside the published bound ([`crate::state::CONDITION_VALUES_PER_RULE`]). Each
-/// refusal names the member, the value and the rule it broke, because that text is all
-/// the caller has to fix the request from.
-///
-/// That a rule carries conditions and actions at all is the model's own requirement on
-/// both members, so the boundary validator refuses a request naming neither before this
-/// runs.
-fn check_conditions(conditions: &[RuleCondition]) -> Result<(), CreateRuleError> {
-    let mut values = 0usize;
-    let mut single_use_seen: Vec<&str> = Vec::new();
-    for condition in conditions {
-        let field = condition.field.as_deref().unwrap_or_default();
-        if !CONDITION_FIELDS.contains(&field) {
-            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                "Condition field '{field}' is not valid; it must be one of {}",
-                CONDITION_FIELDS.join(", ")
-            )));
-        }
-        if SINGLE_USE_CONDITION_FIELDS.contains(&field) {
-            if single_use_seen.contains(&field) {
-                return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                    "A rule carries at most one '{field}' condition"
-                )));
-            }
-            single_use_seen.push(field);
-        }
-        values += condition_values(condition);
-    }
-    if values > crate::state::CONDITION_VALUES_PER_RULE {
-        return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-            "A rule's conditions carry at most {} values in total, got {values}",
-            crate::state::CONDITION_VALUES_PER_RULE
-        )));
-    }
-    Ok(())
-}
-
-/// How many values one condition matches on, whether they were given directly in
-/// `Values` or through the field's own configuration shape.
-fn condition_values(condition: &RuleCondition) -> usize {
-    let listed = |values: Option<&Vec<String>>| values.map_or(0, Vec::len);
-    let direct = listed(condition.values.as_ref()) + listed(condition.regex_values.as_ref());
-    let configured = condition.host_header_config.as_ref().map_or(0, |config| {
-        listed(config.values.as_ref()) + listed(config.regex_values.as_ref())
-    }) + condition.path_pattern_config.as_ref().map_or(0, |config| {
-        listed(config.values.as_ref()) + listed(config.regex_values.as_ref())
-    }) + condition.http_header_config.as_ref().map_or(0, |config| {
-        listed(config.values.as_ref()) + listed(config.regex_values.as_ref())
-    }) + condition
-        .query_string_config
-        .as_ref()
-        .map_or(0, |config| config.values.as_ref().map_or(0, Vec::len))
-        + condition
-            .http_request_method_config
-            .as_ref()
-            .map_or(0, |config| listed(config.values.as_ref()))
-        + condition
-            .source_ip_config
-            .as_ref()
-            .map_or(0, |config| listed(config.values.as_ref()));
-    direct + configured
 }

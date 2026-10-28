@@ -100,14 +100,21 @@ async fn delete_target_group(router: &MultiServiceRouter, arn: &str) -> Reply {
 }
 
 /// Read ONE rule back by its ARN.
-async fn describe_rule(router: &MultiServiceRouter, arn: &str) -> Reply {
+///
+/// `pub(crate)` because the modification suite (`all/rule_modification.rs`) reads a rule
+/// back the same way: one reader for the crate, so the two suites cannot drift on how a
+/// single rule is addressed.
+pub(crate) async fn describe_rule(router: &MultiServiceRouter, arn: &str) -> Reply {
     let mut form = action("DescribeRules");
     form.push(p("RuleArns.member.1", arn));
     call(router, &form).await
 }
 
 /// The ARN of the rule a listener mints with itself, as `DescribeRules` reports it.
-async fn default_rule_arn(router: &MultiServiceRouter, listener_arn: &str) -> String {
+///
+/// `pub(crate)` for the same reason as [`describe_rule`]: the modification suite refuses
+/// the same rule through it.
+pub(crate) async fn default_rule_arn(router: &MultiServiceRouter, listener_arn: &str) -> String {
     let mut form = action("DescribeRules");
     form.push(p("ListenerArn", listener_arn));
     let reply = call(router, &form).await;

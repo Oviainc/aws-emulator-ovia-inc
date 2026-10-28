@@ -293,14 +293,14 @@ async fn a_declared_but_unimplemented_elbv2_action_is_reached_not_refused_as_unk
             )],
         ),
         (
-            // `AddTags` was this row until it was implemented, and `RemoveTags` stood in
-            // for it until it was implemented too (both stub issues are closed);
-            // `ModifyRule`, a write addressing one named resource, is the stub that
-            // stands in for the same shape of answer.
-            "ModifyRule",
+            // `AddTags` was this row until it was implemented, `RemoveTags` stood in for
+            // it until it was implemented too, and `ModifyRule` stood in for them until
+            // its own stub issue was closed; `DeleteTrustStore`, a write addressing one
+            // named resource, is the stub that stands in for the same shape of answer.
+            "DeleteTrustStore",
             &[(
-                "RuleArn",
-                "arn:aws:elasticloadbalancing:us-west-2:000000000000:listener-rule/app/l/0/1/2",
+                "TrustStoreArn",
+                "arn:aws:elasticloadbalancing:us-west-2:000000000000:truststore/t/0",
             )],
         ),
     ];

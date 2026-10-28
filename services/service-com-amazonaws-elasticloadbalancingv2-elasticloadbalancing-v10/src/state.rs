@@ -2716,6 +2716,115 @@ fn mirror_condition_values(direct: &mut Option<Vec<String>>, configured: &mut Op
     }
 }
 
+/// The condition fields a rule may match on, from `RuleCondition$Field`'s documented
+/// list: `http-header`, `http-request-method`, `host-header`, `path-pattern`,
+/// `query-string` and `source-ip`. The model types that member as a plain string, so a
+/// value outside the list is refused by [`check_rule_conditions`] rather than by the
+/// boundary validator.
+pub const CONDITION_FIELDS: &[&str] = &[
+    "host-header",
+    "http-header",
+    "http-request-method",
+    "path-pattern",
+    "query-string",
+    "source-ip",
+];
+
+/// The condition fields a rule carries AT MOST ONE of: "each rule can optionally include
+/// up to one of each of the following conditions: `http-request-method`, `host-header`,
+/// `path-pattern`, and `source-ip`" — while `http-header` and `query-string` may repeat.
+pub const SINGLE_USE_CONDITION_FIELDS: &[&str] = &[
+    "host-header",
+    "http-request-method",
+    "path-pattern",
+    "source-ip",
+];
+
+/// Enforce what the model states about a rule's CONDITIONS in prose and declares no
+/// error shape for: every condition names a field this service matches on, a field that
+/// may appear only once appears at most once, and the values the whole rule carries stay
+/// inside the published bound ([`CONDITION_VALUES_PER_RULE`]). Each refusal names the
+/// value and the rule it broke, because that text is all the caller has to fix the
+/// request from.
+///
+/// A rule's conditions are judged by the same clauses wherever they are SET — on the
+/// create that first stores them and on the modification that replaces them — so one
+/// reading of those clauses serves both.
+pub fn check_rule_conditions(conditions: &[RuleCondition]) -> Result<(), String> {
+    let mut values = 0usize;
+    let mut single_use_seen: Vec<&str> = Vec::new();
+    for condition in conditions {
+        let field = condition.field.as_deref().unwrap_or_default();
+        if !CONDITION_FIELDS.contains(&field) {
+            return Err(format!(
+                "Condition field '{field}' is not valid; it must be one of {}",
+                CONDITION_FIELDS.join(", ")
+            ));
+        }
+        if SINGLE_USE_CONDITION_FIELDS.contains(&field) {
+            if single_use_seen.contains(&field) {
+                return Err(format!(
+                    "A rule carries at most one '{field}' condition"
+                ));
+            }
+            single_use_seen.push(field);
+        }
+        values += condition_values(condition);
+    }
+    if values > CONDITION_VALUES_PER_RULE {
+        return Err(format!(
+            "A rule's conditions carry at most {CONDITION_VALUES_PER_RULE} values in \
+             total, got {values}"
+        ));
+    }
+    Ok(())
+}
+
+/// How many values one condition matches on, whether they were given directly in
+/// `Values` or through the field's own configuration shape.
+fn condition_values(condition: &RuleCondition) -> usize {
+    let listed = |values: Option<&Vec<String>>| values.map_or(0, Vec::len);
+    let direct = listed(condition.values.as_ref()) + listed(condition.regex_values.as_ref());
+    let configured = condition.host_header_config.as_ref().map_or(0, |config| {
+        listed(config.values.as_ref()) + listed(config.regex_values.as_ref())
+    }) + condition.path_pattern_config.as_ref().map_or(0, |config| {
+        listed(config.values.as_ref()) + listed(config.regex_values.as_ref())
+    }) + condition.http_header_config.as_ref().map_or(0, |config| {
+        listed(config.values.as_ref()) + listed(config.regex_values.as_ref())
+    }) + condition
+        .query_string_config
+        .as_ref()
+        .map_or(0, |config| config.values.as_ref().map_or(0, Vec::len))
+        + condition
+            .http_request_method_config
+            .as_ref()
+            .map_or(0, |config| listed(config.values.as_ref()))
+        + condition
+            .source_ip_config
+            .as_ref()
+            .map_or(0, |config| listed(config.values.as_ref()));
+    direct + configured
+}
+
+/// Enforce what the model states about a rule's TRANSFORMS and declares no error shape
+/// for: "You can add one host header rewrite transform and one URL rewrite transform" —
+/// so a rule carries at most one transform of each type `TransformTypeEnum` declares.
+///
+/// Judged wherever a rule's transforms are SET, by the create that first stores them and
+/// by the modification that replaces them, exactly as its conditions are
+/// ([`check_rule_conditions`]).
+pub fn check_rule_transforms(transforms: &[RuleTransform]) -> Result<(), String> {
+    let mut seen: Vec<&str> = Vec::new();
+    for transform in transforms {
+        let kind = transform.r#type.as_str();
+        if seen.contains(&kind) {
+            return Err(format!("A rule carries at most one '{kind}' transform"));
+        }
+        seen.push(kind);
+    }
+    Ok(())
+}
+
 /// A persisted listener.
 #[derive(Debug, Clone, Default)]
 pub struct ListenerRecord {
