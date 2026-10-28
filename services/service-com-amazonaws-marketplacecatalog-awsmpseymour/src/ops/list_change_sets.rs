@@ -254,33 +254,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // `MaxResults` is modelled `@range(min: 1, max: 20)`. The range is
-        // CHECKED here rather than assumed: a page size outside it is refused
-        // with the modelled `ValidationException`, so no request can reach the
-        // paging arithmetic with a size the model does not allow — and an
-        // absent value serves the largest page the model allows.
-        let page_size = match input.max_results {
-            None => crate::state::LIST_CHANGE_SETS_PAGE_LIMIT,
-            Some(requested)
-                if (1..=crate::state::LIST_CHANGE_SETS_PAGE_LIMIT).contains(&requested) =>
-            {
-                requested
-            }
-            Some(requested) => {
-                return Err(ListChangeSetsErrorModeled::ValidationException(
-                    crate::state::validation(
-                        "MaxResults",
-                        format!(
-                            "ListChangeSets serves between 1 and {} change sets a page, \
-                             not {requested}",
-                            crate::state::LIST_CHANGE_SETS_PAGE_LIMIT
-                        ),
-                    ),
-                )
-                .into())
+        // `MaxResults` is modelled `@range(min: 1, max: 20)`, and the page-size
+        // rule — serve a size inside that range, refuse one outside it, serve
+        // the largest page the range allows when the member is absent — is
+        // `crate::state::page_size`, so no request can reach the paging
+        // arithmetic with a size the model does not allow.
+        let page_size = match crate::state::page_size(
+            "ListChangeSets",
+            "change sets",
+            crate::state::LIST_CHANGE_SETS_PAGE_LIMIT,
+            input.max_results,
+        ) {
+            Ok(page_size) => page_size,
+            Err(fault) => {
+                return Err(ListChangeSetsErrorModeled::ValidationException(fault).into())
             }
         };
-        let page_size = usize::try_from(page_size).expect("a page size in 1..=20 fits in usize");
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
