@@ -317,7 +317,7 @@ async fn a_topic_the_list_does_not_publish_is_refused() {
         );
         assert_eq!(
             reply.message(),
-            format!("Topic with name: {topic} doesn't exist in list: {LIST}."),
+            format!("List: {LIST} doesn't contain Topic: {topic}"),
             "case {topic:?}: expected the refusal to name the topic and the list, got {:?}",
             reply.message()
         );

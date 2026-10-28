@@ -249,6 +249,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
         let mut reported: Vec<VpnConnection> = Vec::new();
+        // `bgp-asn` is a fact of the CUSTOMER GATEWAY rather than of the connection, so the
+        // gateway store is bound beside the connection store and each candidate's
+        // `CustomerGatewayId` is resolved against it below.
+        let customer_gateways = &store.customer_gateways;
         for record in store.vpn_connections.values() {
             if budget.exhausted() {
                 break;
@@ -256,7 +260,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let named = named_ids.is_empty() || named_ids.contains(record.vpn_connection_id());
             if named
                 && state::matches_every_filter(&compiled, &mut budget, &|name| {
-                    filter_values(&record.view, name)
+                    filter_values(&record.view, customer_gateways, name)
                 })
             {
                 reported.push(reported_connection(&record.view));
@@ -348,22 +352,18 @@ fn documented_filter_name(name: &str) -> Option<&str> {
 /// connection attached to a virtual private gateway. `name` is a name
 /// [`documented_filter_name`] resolved.
 ///
-/// `bgp-asn` compares against no value on ANY connection: it is "the BGP Autonomous System
-/// Number (ASN) associated with a BGP device", a fact of the CUSTOMER GATEWAY, and the
-/// modelled `VpnConnection` shape carries no member for it
-/// (`smithy_query(query="shape",shape="VpnConnection")`) while this crate has no customer
-/// gateway store to resolve `CustomerGatewayId` against yet. So the documented name is
-/// accepted and selects nothing rather than being refused as unknown; it selects the
-/// connections AWS would once `CreateCustomerGateway` and its store are implemented under
-/// their own issue, which is where the ASN a connection's gateway carries will come from.
-///
-/// KNOWN GAP, keyed to that operation: until it lands, no stored connection can carry an
-/// ASN at all, so "selects nothing" is the same answer any absent attribute gives; when it
-/// lands, this arm must resolve `CustomerGatewayId` and compare the gateway's ASN instead.
-/// The `bgp-asn` row of `tests/all/vpn_connection_routes.rs::
-/// describe_answers_every_documented_filter_name` pins today's answer, so that change
-/// cannot be made without updating the row that states it.
-fn filter_values<'a>(connection: &'a VpnConnection, name: &str) -> Vec<::std::borrow::Cow<'a, str>> {
+/// `bgp-asn` is "the BGP Autonomous System Number (ASN) associated with a BGP device", a
+/// fact of the CUSTOMER GATEWAY: the modelled `VpnConnection` shape carries no member for it
+/// (`smithy_query(query="shape",shape="VpnConnection")`), so the connection's
+/// `CustomerGatewayId` is resolved in `customer_gateways` and the ASN that gateway carries is
+/// what the filter compares against. A connection naming a gateway this account does not hold
+/// compares against no value, like any other absent attribute, which is also the answer while
+/// `CreateCustomerGateway` is still a scaffold and nothing mints one.
+fn filter_values<'a>(
+    connection: &'a VpnConnection,
+    customer_gateways: &'a ::std::collections::BTreeMap<String, crate::state::CustomerGatewayRecord>,
+    name: &str,
+) -> Vec<::std::borrow::Cow<'a, str>> {
     use ::std::borrow::Cow;
 
     if let Some(key) = name.strip_prefix(crate::state::TAG_FILTER_PREFIX) {
@@ -411,9 +411,27 @@ fn filter_values<'a>(connection: &'a VpnConnection, name: &str) -> Vec<::std::bo
         "type" => text(connection.r#type.as_deref()),
         "vpn-connection-id" => text(connection.vpn_connection_id.as_deref()),
         "vpn-gateway-id" => text(connection.vpn_gateway_id.as_deref()),
-        // `bgp-asn` (see above) and, unreachably, every name `documented_filter_name` has
-        // already refused: an attribute nothing is stored for compares against nothing, so
-        // it could never widen a result even if that check were bypassed.
+        // The ASN of the customer gateway this connection names (see above), reported in
+        // `BgpAsn` up to 2,147,483,647 and in `BgpAsnExtended` above it, so whichever member
+        // carries it is what this filter compares against.
+        "bgp-asn" => connection
+            .customer_gateway_id
+            .as_deref()
+            .and_then(|customer_gateway_id| customer_gateways.get(customer_gateway_id))
+            .into_iter()
+            .flat_map(|gateway| {
+                gateway
+                    .view
+                    .bgp_asn
+                    .as_deref()
+                    .into_iter()
+                    .chain(gateway.view.bgp_asn_extended.as_deref())
+            })
+            .map(Cow::Borrowed)
+            .collect(),
+        // Unreachably, every name `documented_filter_name` has already refused: an attribute
+        // nothing is stored for compares against nothing, so it could never widen a result
+        // even if that check were bypassed.
         _ => Vec::new(),
     }
 }

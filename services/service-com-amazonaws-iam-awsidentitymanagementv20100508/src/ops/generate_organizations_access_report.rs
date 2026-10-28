@@ -2,12 +2,38 @@
 
 //! @op GenerateOrganizationsAccessReport
 //!
-//! Starts a service-last-accessed report for the Organizations entity the request's
-//! `EntityPath` names and answers the `JobId` that report is read back by
-//! (`GetOrganizationsAccessReport`). The job is a record of the account: its generation is
-//! DUE a short span after this call ([`crate::state::ACCESS_REPORT_GENERATION_SECONDS`]),
-//! so a caller polling straight afterwards sees it `IN_PROGRESS`, and from the due instant
-//! the read reports it `COMPLETED`.
+//! ## What this operation answers on the wire
+//!
+//! The start of a report generation, addressed by the path of an Organizations entity: it
+//! records a report-generation job for that entity (narrowed to one service control policy
+//! when the request names an `OrganizationsPolicyId`) and answers the `JobId` that report
+//! is read back by (`GetOrganizationsAccessReport`). The generation is DUE a short span
+//! after this call ([`crate::state::ACCESS_REPORT_GENERATION_SECONDS`]), so a caller
+//! polling straight afterwards sees it `IN_PROGRESS`, and from the due instant the read
+//! reports it `COMPLETED`.
+//!
+//! Who it is served to is stated in the operation's own documentation: "to call this
+//! operation, you must be signed in using your Organizations management account
+//! credentials". So the report is generated only for a caller whose account MANAGES the
+//! organization the entity path names
+//! ([`crate::state::ComAmazonawsIamAwsidentitymanagementv20100508State::manages_organization`]);
+//! every other caller — one whose account belongs to no organization at all, a member
+//! account, or the management account of another organization than the one the path names
+//! — is refused `403` `<Code>AccessDenied</Code>` with no job recorded, which is the code
+//! AWS answers a caller that is not permitted a call with and the only refusal this
+//! operation has for the requirement: its model declares no error shape for it.
+//!
+//! The model names one error SHAPE but neither its wording nor the status of the refusals
+//! above:
+//!
+//! * a request past the account's concurrency limit
+//!   ([`crate::state::MAX_CONCURRENT_ACCESS_REPORT_JOBS`]) "failed because the maximum
+//!   number of concurrent requests for this account are already running", so it is `409`
+//!   `<Code>ReportGenerationLimitExceeded</Code>` and nothing is stored;
+//! * a caller whose identity-based policies do not permit the call is refused before
+//!   anything is read or recorded, `403` `<Code>AccessDenied</Code>`
+//!   ([`crate::state::authorization::authorize_named`]) — IAM authorizes its own API, and
+//!   this operation also requires "the required IAM and Organizations permissions".
 //!
 //! ## Shape of an operation
 //!
@@ -117,20 +143,25 @@ use super::types::*;
 // `GenerateOrganizationsAccessReportError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-iam-awsidentitymanagementv20100508.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `GenerateOrganizationsAccessReportError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.iam#GenerateOrganizationsAccessReport")]
+// The operation's MODELED errors. `ServiceFailureException` is widened in through
+// `extra_errors`: this SERVICE models it ("the request processing has failed because of an
+// unknown error, exception or failure") and every other operation of this crate answers an
+// unreachable store with it, so this handler has the same modelled server failure to
+// answer with rather than a status of its own.
+#[smithy_macros::operation_error(
+    "com.amazonaws.iam#GenerateOrganizationsAccessReport",
+    extra_errors = ["ServiceFailureException"]
+)]
 #[derive(Debug)]
 pub enum GenerateOrganizationsAccessReportErrorModeled {
     ReportGenerationLimitExceededException(ReportGenerationLimitExceededException),
+    ServiceFailureException(ServiceFailureException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
 /// (`crate::ops::generate_organizations_access_report::GenerateOrganizationsAccessReportError`). Wrapping the modeled enum is what
-/// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
+/// lets this operation answer the refusals its model declares no shape for: the `403`
+/// `AccessDenied` of a caller the report is not served to.
 pub type GenerateOrganizationsAccessReportError = crate::scaffolded::Scaffolded<GenerateOrganizationsAccessReportErrorModeled>;
 
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
@@ -179,18 +210,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; nothing about the report depends on it —
-        // IAM is global, and the entity the report is about is named by the request.
-        let _ = ctx;
+        // `ctx` carries request metadata only; what this operation reads out of it is the
+        // signing key id of the caller the request is authorized as. IAM is global, so no
+        // region is read.
         let Some(state) = crate::state::service_state(&*self.engine) else {
-            // This operation models no server error, so an unreachable store is reported
-            // through the crate's generic refusal channel rather than as a report job
-            // nothing recorded.
-            return Err(crate::scaffolded::Scaffolded::validation(
-                "the IAM store is unavailable",
-            ));
+            return Err(
+                GenerateOrganizationsAccessReportErrorModeled::ServiceFailureException(
+                    ServiceFailureException {
+                        message: Some("the IAM store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
         };
+
+        // The organization the report was asked about: the first segment of the entity
+        // path, read through the one definition of that path's grammar this crate holds.
+        // Owned, because the path itself is recorded with the job below. The member's
+        // modelled pattern already refuses a value carrying no such segment before this
+        // handler runs, so what is left here is a value whose length the model admits but
+        // whose organization segment cannot be read.
+        let Some(organization_id) =
+            crate::state::organizations_entity_path_organization(&input.entity_path)
+                .map(ToString::to_string)
+        else {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "The entity path {} does not name an organization.",
+                input.entity_path
+            )));
+        };
+
         let mut store = state.lock();
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before the organization is consulted and before any job is recorded.
+        // The Service Authorization Reference lists no resource type for this action, so
+        // the decision is made against every resource
+        // ([`crate::state::authorization::ACCOUNT_WIDE_RESOURCE`]) while the refusal NAMES
+        // the Organizations entity the request addresses, which is what the caller asked
+        // about.
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::GENERATE_ORGANIZATIONS_ACCESS_REPORT,
+            crate::state::authorization::ACCOUNT_WIDE_RESOURCE,
+            &input.entity_path,
+        )?;
+
+        // "To call this operation, you must be signed in using your Organizations
+        // management account credentials": a caller whose account does not manage the
+        // organization the entity path names is refused, worded from that documented
+        // requirement and the organization the request named, and no job is recorded. The
+        // account a request speaks for is this emulator's
+        // (`engine::emulator_account_id`), and whether it manages that organization is the
+        // one question the store answers.
+        if !store.manages_organization(::engine::emulator_account_id(), &organization_id) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(format!(
+                "To call this operation, you must be signed in using the Organizations \
+                 management account credentials of organization {organization_id}."
+            )));
+        }
 
         // "The maximum number of concurrent requests for this account are already
         // running" (`ReportGenerationLimitExceededException`): a caller cannot start
@@ -254,6 +333,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             store.organizations_access_reports.remove(&oldest);
         }
 
+        // Audit record for the change: the acting principal, the operation and what was
+        // started for which organization, so a state-changing call leaves a local record —
+        // the same shape the other writes in this crate emit.
+        ::tracing::info!(
+            audit = true,
+            operation = "GenerateOrganizationsAccessReport",
+            outcome = "report_generation_started",
+            caller_akid = %::engine::extract_akid(&ctx.parts().headers),
+            organization_id = %organization_id,
+            job_id = %job_id,
+            "a report generation for Organizations service last accessed data was started"
+        );
         Ok(GenerateOrganizationsAccessReportOutput {
             job_id: Some(job_id),
         })

@@ -225,13 +225,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The keys whose automatic rotation a caller may turn OFF are exactly those it
         // may turn on, so both operations read the same gate.
-        crate::state::check_rotation_configurable(key).map_err(refuse)?;
+        crate::state::check_rotation_configurable(key, Self::NAME).map_err(refuse)?;
+        let key_id = key.key_id.clone();
 
         // "Disables automatic rotation of the key material": the schedule goes, and
         // the key material and the rotations the key has already had stay. Disabling
         // rotation on a key that has no schedule reaches the same end state, which is
-        // what the request asks for.
-        key.unschedule_rotation();
+        // what the request asks for. The setting is one the keys of a multi-Region set
+        // share, so it is cleared through every member of this key's set — which for a
+        // key belonging to no set is that key alone.
+        state.unschedule_rotation_across_set(&key_id);
 
         Ok(DisableKeyRotationOutput)
     }
@@ -243,11 +246,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// model the same errors and accept the same keys.
 fn refuse(refusal: crate::state::RotationConfigRefusal) -> DisableKeyRotationError {
     match refusal {
-        crate::state::RotationConfigRefusal::Unsupported => {
+        crate::state::RotationConfigRefusal::Unsupported(message) => {
             DisableKeyRotationErrorModeled::UnsupportedOperationException(
-                UnsupportedOperationException {
-                    message: crate::state::unsupported_rotation_message(),
-                },
+                UnsupportedOperationException { message },
             )
         }
         crate::state::RotationConfigRefusal::Disabled(message) => {

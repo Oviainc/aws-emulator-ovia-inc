@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListLensShares
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListLensShares`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the shares recorded against the lens the request names, in
+//! `ShareId` order, narrowed by `SharedWithPrefix` and `Status` and paged by `MaxResults`
+//! / `NextToken` — written exactly as `ListProfileShares`, `ListTemplateShares` and
+//! `ListWorkloadShares` are, because one rule covers every one of them. A reporting
+//! operation: it writes nothing.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListLensShares::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The path `LensAlias` is resolved by lookup, so an alias that names no lens at all is
+//! `ResourceNotFoundException` (404) rather than an empty page. A lens Amazon Web Services
+//! publishes EXISTS and holds no shares — "Lenses provided by Amazon Web Services (Amazon
+//! Web Services Official Content) cannot be shared" (`CreateLensShare` doc) — so it
+//! enumerates the shares held against its alias, of which there are none, the same reading
+//! `DeleteLensShare` makes of one. A `NextToken` this service did not issue is
+//! `ValidationException` (400).
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +163,128 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListLensShares` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListLensSharesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListLensShares"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListLensSharesErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool lens store is unavailable".to_string(),
+            })
+        })?;
+
+        // `Status` is a modelled enum, so the boundary validator normally refuses an
+        // out-of-set value before this handler runs; checking it here keeps the refusal
+        // correct for any path that does not.
+        if let Some(status) = input
+            .status
+            .as_deref()
+            .filter(|status| !SHARE_STATUS_VALUES.contains(status))
+        {
+            return Err(field_validation(
+                "Status",
+                &format!(
+                    "Member must satisfy enum value set: [{}], got {status}",
+                    SHARE_STATUS_VALUES.join(", ")
+                ),
+            ));
+        }
+
+        // `MaxResults` is modelled `@range(min: 1, max: 50)`, this service's common bound,
+        // and a request that omits it asks for a full page — so the modelled maximum is
+        // both the ceiling and the default (`crate::state::page_size`).
+        let page_size = crate::state::page_size(input.max_results);
+
+        // An opaque token this service did not issue is a bad request, not an empty page.
+        // A token is this service's own cursor, not a value a caller composes: it cannot
+        // be corrected, only obtained again, so the refusal is classified `CANNOT_PARSE`
+        // rather than as a field rule to fix — exactly as the other paged reads word it.
+        let cursor = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_share_next_token(token) {
+                Some(cursor) => Some(cursor),
+                None => {
+                    return Err(ListLensSharesErrorModeled::ValidationException(
+                        crate::state::cannot_parse_exception(
+                            crate::state::NEXT_TOKEN_MEMBER,
+                            crate::state::INVALID_NEXT_TOKEN_MESSAGE,
+                        ),
+                    )
+                    .into());
+                }
+            },
+        };
+
+        let store = state.lock();
+
+        // "List the lens shares associated with the lens" (this operation's doc): the lens
+        // is resolved by this lookup, and its own `lens_id` is what the share store is
+        // keyed by (`CreateLensShare` records a share under it), so the key is read off the
+        // resolved record rather than derived from the alias a second time.
+        let lens_id = match store
+            .lens_by_alias(&input.lens_alias)
+            .map(|record| record.lens_id.clone())
+        {
+            Some(lens_id) => lens_id,
+            // A lens Amazon Web Services publishes is not a stored lens — it is published
+            // content named by its own alias ([`crate::state::lens_alias`]) — and it EXISTS,
+            // the same reading `DeleteLensShare` makes of one, so it enumerates through the
+            // path below under that alias and reports the shares held against it: none,
+            // because `CreateLensShare` refuses to share one.
+            None if crate::state::is_published_official_lens(&input.lens_alias) => {
+                crate::state::lens_alias(&input.lens_alias).to_string()
+            }
+            // A name that resolves to no lens at all is the missing resource.
+            None => {
+                return Err(ListLensSharesErrorModeled::ResourceNotFoundException(
+                    crate::state::unknown_lens_not_found(&input.lens_alias),
+                )
+                .into())
+            }
+        };
+
+        let matching: Vec<&crate::state::LensShareRecord> = store
+            .lens_shares_of(&lens_id)
+            .into_iter()
+            // The cursor is start-EXCLUSIVE: the page resumes just past the last share
+            // already returned, so every share is enumerated exactly once across pages.
+            .filter(|share| {
+                cursor
+                    .as_deref()
+                    .is_none_or(|resume_after| share.share_id.as_str() > resume_after)
+            })
+            .filter(|share| {
+                input
+                    .shared_with_prefix
+                    .as_deref()
+                    .is_none_or(|prefix| share.shared_with.starts_with(prefix))
+            })
+            .filter(|share| {
+                input
+                    .status
+                    .as_deref()
+                    .is_none_or(|status| share.status == status)
+            })
+            .collect();
+
+        let page = &matching[..matching.len().min(page_size)];
+        let next_token = match page.last() {
+            Some(last) if matching.len() > page.len() => {
+                Some(crate::state::encode_share_next_token(&last.share_id))
+            }
+            _ => None,
+        };
+
+        Ok(ListLensSharesOutput {
+            lens_share_summaries: Some(page.iter().map(|share| share.to_summary()).collect()),
+            next_token,
+        })
     }
+}
+
+/// The service's own modelled `ValidationException` (HTTP 400) naming the member that
+/// failed and the constraint it violated — preferred over the scaffold's synthetic one
+/// because the modelled shape carries `Reason` and `Fields`, which a client reads.
+fn field_validation(member: &str, constraint: &str) -> ListLensSharesError {
+    ListLensSharesErrorModeled::ValidationException(
+        crate::state::member_constraint_exception(member, constraint),
+    )
+    .into()
 }

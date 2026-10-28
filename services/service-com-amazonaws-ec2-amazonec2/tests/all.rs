@@ -725,3 +725,8 @@ mod move_capacity_reservation_instances;
 // `DescribeSecurityGroupVpcAssociations` reports out of that store.
 #[path = "all/security_group_vpc_associations.rs"]
 mod security_group_vpc_associations;
+// Appended at the END of this file, for the reason the header gives. What
+// `DescribeCustomerGateways` reports out of the customer gateway store, and how the id list,
+// the documented filters and the clock narrow it.
+#[path = "all/customer_gateways.rs"]
+mod customer_gateways;

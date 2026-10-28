@@ -277,13 +277,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "To perform on-demand rotation of a set of related multi-Region keys, ...
         // invoke the on-demand rotation on the primary Region key" — so a replica key
-        // of a multi-Region set does not rotate; the primary key of its set does.
-        if key
-            .multi_region_topology
-            .as_ref()
-            .is_some_and(|topology| topology.primary_region != key.region)
-        {
-            return Err(unsupported());
+        // of a multi-Region set does not rotate; the primary key of its set does. The
+        // refusal names the replica and this operation, so the caller knows which key
+        // to call instead.
+        if key.is_multi_region_replica() {
+            return Err(RotateKeyOnDemandErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: Some(crate::state::multi_region_replica_message(
+                        &key.arn,
+                        Self::NAME,
+                    )),
+                },
+            )
+            .into());
         }
 
         // KMS generates the replacement material only for a key whose material KMS

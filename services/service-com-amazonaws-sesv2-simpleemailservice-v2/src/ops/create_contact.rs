@@ -206,6 +206,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         }
+        // Attribute data is a JSON document within a character bound, on whichever
+        // operation it arrives; nothing is written when it is neither.
+        if input
+            .attributes_data
+            .as_deref()
+            .is_some_and(|data| !crate::state::attributes_data_is_acceptable(data))
+        {
+            return Err(CreateContactErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::invalid_attributes_data()),
+            })
+            .into());
+        }
 
         let mut record = ContactRecord::new(&address, now);
         record.topic_preferences = preferences;

@@ -36,10 +36,10 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// One answered request: the status, the error shape when there was one, and the parsed
 /// body.
-struct Reply {
-    status: u16,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
     error_type: Option<String>,
-    body: Value,
+    pub(crate) body: Value,
 }
 
 impl Reply {
@@ -47,7 +47,7 @@ impl Reply {
     ///
     /// restJson1 resolves the error shape from `x-amzn-errortype`; the JSON body's
     /// `__type` carries the same name, so either is read.
-    fn error_code(&self) -> String {
+    pub(crate) fn error_code(&self) -> String {
         let raw = self
             .error_type
             .as_deref()
@@ -58,7 +58,7 @@ impl Reply {
     }
 
     /// The message the error carried, for an assertion that wants to show it.
-    fn message(&self) -> String {
+    pub(crate) fn message(&self) -> String {
         self.body
             .get("message")
             .or_else(|| self.body.get("Message"))
@@ -68,7 +68,7 @@ impl Reply {
     }
 
     /// A string member of the body, or `""` when absent.
-    fn text(&self, member: &str) -> String {
+    pub(crate) fn text(&self, member: &str) -> String {
         self.body
             .get(member)
             .and_then(Value::as_str)
@@ -78,12 +78,12 @@ impl Reply {
 }
 
 /// The emulated service behind its router.
-struct Ses {
+pub(crate) struct Ses {
     router: MultiServiceRouter,
 }
 
 impl Ses {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // These cases exercise handler behaviour, not SigV4.
@@ -92,7 +92,7 @@ impl Ses {
         Self { router }
     }
 
-    async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Reply {
+    pub(crate) async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Reply {
         let payload = match &body {
             Some(value) => bytes::Bytes::from(serde_json::to_vec(value).expect("serialize body")),
             None => bytes::Bytes::new(),
@@ -130,7 +130,7 @@ impl Ses {
         }
     }
 
-    async fn create_list(&self, body: Value) -> Reply {
+    pub(crate) async fn create_list(&self, body: Value) -> Reply {
         self.call("POST", "/v2/email/contact-lists", Some(body)).await
     }
 
@@ -158,7 +158,7 @@ impl Ses {
             .await
     }
 
-    async fn create_contact(&self, list: &str, body: Value) -> Reply {
+    pub(crate) async fn create_contact(&self, list: &str, body: Value) -> Reply {
         self.call(
             "POST",
             &format!("/v2/email/contact-lists/{list}/contacts"),
@@ -167,7 +167,7 @@ impl Ses {
         .await
     }
 
-    async fn get_contact(&self, list: &str, address: &str) -> Reply {
+    pub(crate) async fn get_contact(&self, list: &str, address: &str) -> Reply {
         self.call(
             "GET",
             &format!("/v2/email/contact-lists/{list}/contacts/{address}"),
@@ -185,7 +185,7 @@ impl Ses {
         .await
     }
 
-    async fn list_contacts(&self, list: &str, body: Value) -> Reply {
+    pub(crate) async fn list_contacts(&self, list: &str, body: Value) -> Reply {
         self.call(
             "POST",
             &format!("/v2/email/contact-lists/{list}/contacts/list"),
@@ -215,7 +215,7 @@ fn listed_lists(reply: &Reply) -> Vec<String> {
 }
 
 /// The addresses a `ListContacts` page reports, in the order it reported them.
-fn listed_contacts(reply: &Reply) -> Vec<String> {
+pub(crate) fn listed_contacts(reply: &Reply) -> Vec<String> {
     reply
         .body
         .get("Contacts")

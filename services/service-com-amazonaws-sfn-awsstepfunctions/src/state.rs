@@ -6922,6 +6922,7 @@ fn round_up_to(value: i64, increment: i64) -> i64 {
 }
 
 pub mod asl;
+pub mod encryption;
 pub mod integration;
 mod json_diagnostic;
 pub mod run_a_job;

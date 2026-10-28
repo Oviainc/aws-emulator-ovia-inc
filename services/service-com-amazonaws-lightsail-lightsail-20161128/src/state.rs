@@ -10842,6 +10842,16 @@ pub struct StoredLoadBalancerCertificate {
     pub support_code: String,
     /// The instant the request that asked for this certificate was served.
     pub created_at_ms: i64,
+    /// Where the certificate is: the location of the load balancer that holds
+    /// it, which is the Region that load balancer — and so this certificate —
+    /// belongs to.
+    ///
+    /// Kept on the record, exactly as a certificate of the account keeps one
+    /// ([`StoredCertificate::location`]): it is what the modelled `location`
+    /// member reports and what locates the operation-log entry a change to this
+    /// certificate writes. A load balancer's Region is half its store key, so
+    /// this can never drift from the holder's own location.
+    pub location: StoredLocation,
     /// The domain the certificate is associated with.
     pub domain_name: String,
     /// The alternative domains and subdomains the certificate also covers, as
@@ -10904,14 +10914,12 @@ impl StoredLoadBalancerCertificate {
     }
 
     /// This record as the modelled `LoadBalancerTlsCertificate`, on the load
-    /// balancer `load_balancer_name` at `location` — the load balancer that
-    /// holds it, which is what `loadBalancerName` and `location` report and
-    /// which the certificate is reached through.
-    pub fn view(
-        &self,
-        load_balancer_name: &str,
-        location: &StoredLocation,
-    ) -> LoadBalancerTlsCertificate {
+    /// balancer `load_balancer_name` — the load balancer that holds it, which is
+    /// what `loadBalancerName` reports and which the certificate is reached
+    /// through. `location` comes from this record: it is the location of that
+    /// same load balancer, kept here because a change to this certificate has
+    /// to locate its own log entry.
+    pub fn view(&self, load_balancer_name: &str) -> LoadBalancerTlsCertificate {
         let issued = self.is_issued();
         let validation_status = self.domain_validation_status();
         let domain_names = self.domain_names();
@@ -10920,7 +10928,7 @@ impl StoredLoadBalancerCertificate {
             arn: Some(self.arn.clone()),
             support_code: Some(self.support_code.clone()),
             created_at: Some(timestamp(self.created_at_ms)),
-            location: Some(location.view()),
+            location: Some(self.location.view()),
             resource_type: Some(RESOURCE_TYPE_LOAD_BALANCER_TLS_CERTIFICATE.to_string()),
             tags: Some(self.tags.clone()),
             load_balancer_name: Some(load_balancer_name.to_string()),
@@ -11249,12 +11257,13 @@ impl StoredLoadBalancer {
     /// `GetLoadBalancerTlsCertificates` reports.
     ///
     /// A certificate is reported on the load balancer that holds it, so each
-    /// view carries this load balancer's name and location; the walk is bounded
-    /// by [`MAX_CERTIFICATES_PER_LOAD_BALANCER`].
+    /// view carries this load balancer's name, and the location each record
+    /// keeps is this load balancer's own; the walk is bounded by
+    /// [`MAX_CERTIFICATES_PER_LOAD_BALANCER`].
     pub fn certificate_views(&self) -> Vec<LoadBalancerTlsCertificate> {
         self.certificates
             .iter()
-            .map(|certificate| certificate.view(&self.name, &self.location))
+            .map(|certificate| certificate.view(&self.name))
             .collect()
     }
 
@@ -14999,10 +15008,9 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// resources whose identity includes a Region, of which only `region`'s own
     /// are addressable there. Beside them are the kinds whose modelled shape
     /// carries no `tags` member, so no tag operation resolves them — the static
-    /// IP, the export snapshot record, the CloudFormation stack record, and the
-    /// SSL/TLS certificate a load balancer holds. A resource a delete removed is
-    /// held by no map, so its name is gone from here with it, which is what
-    /// makes these the ACTIVE names.
+    /// IP, the export snapshot record and the CloudFormation stack record. A
+    /// resource a delete removed is held by no map, so its name is gone from
+    /// here with it, which is what makes these the ACTIVE names.
     ///
     /// Every walk is bounded by the `MAX_` of the map it walks.
     pub fn active_names(&self, region: &str) -> BTreeSet<String> {
@@ -15069,7 +15077,9 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// a resource their own readers serve. A contact method is the one resource
     /// whose store key is neither: it is held under its Region and its PROTOCOL,
     /// so the map is resolved by scanning that Region's few entries for the name
-    /// the store minted.
+    /// the store minted. A load balancer's SSL/TLS certificate is held on the
+    /// record of the load balancer that holds it, which is a record of its
+    /// Region, so it is scanned for there the same way.
     ///
     /// The one place a tag change resolves a resource, so every operation that
     /// edits tags admits exactly the same set of resources — the ones whose
@@ -15130,6 +15140,34 @@ impl ComAmazonawsLightsailLightsail20161128State {
         }
         if let Some(record) = self.load_balancers.get_mut(&regional) {
             return Some(body(record, RESOURCE_TYPE_LOAD_BALANCER));
+        }
+        // An SSL/TLS certificate of a load balancer is a tag-carrying resource
+        // of its own: the modelled `LoadBalancerTlsCertificate` carries a `tags`
+        // member, the call that asks for one stores the tags its request named,
+        // and `GetActiveNames` reports the certificate's name among the
+        // account's. Its record lives ON the load balancer that holds it, which
+        // is held under the Region, so it is resolved in `region` too — by its
+        // own name among that Region's load balancers' certificates, which is
+        // how every certificate operation addresses one. The walk is bounded by
+        // [`MAX_LOAD_BALANCERS_PER_REGION`] records of at most
+        // [`MAX_CERTIFICATES_PER_LOAD_BALANCER`] certificates each.
+        //
+        // A certificate name is scoped to the load balancer that holds it —
+        // "the same name may name a certificate of another load balancer, and
+        // the two are different records"
+        // ([`StoredLoadBalancer::certificate`]) — so where two load balancers
+        // of one Region each hold a certificate of some name, that name
+        // addresses the certificate of the first of them in the store's own
+        // order: the one record the Region's flat set of active names reports
+        // that name for.
+        if let Some(record) = self
+            .load_balancers
+            .iter_mut()
+            .filter(|((balancer_region, _), _)| balancer_region == region)
+            .flat_map(|(_, balancer)| balancer.certificates.iter_mut())
+            .find(|certificate| certificate.name == name)
+        {
+            return Some(body(record, RESOURCE_TYPE_LOAD_BALANCER_TLS_CERTIFICATE));
         }
         // A contact method is held under its Region and its protocol, so the
         // name it is tagged by — the one this store minted for it, which
@@ -15340,6 +15378,7 @@ tagged_records!(
     StoredBucket,
     StoredContainerService,
     StoredLoadBalancer,
+    StoredLoadBalancerCertificate,
 );
 
 /// The tags of `record` with every tag whose key is in `keys` removed.

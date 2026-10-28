@@ -247,9 +247,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let Some(monitor) = store.monitors.get_mut(&input.monitor_name) else {
+            // The message is built from the request and the caller's account, by the one
+            // helper `GetMonitor`'s not-found path uses, so the two cannot drift.
             return Err(UpdateMonitorErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("The monitor {} does not exist.", input.monitor_name)),
+                    message: Some(crate::state::monitor_not_found_message(
+                        &input.monitor_name,
+                    )),
                 },
             )
             .into());

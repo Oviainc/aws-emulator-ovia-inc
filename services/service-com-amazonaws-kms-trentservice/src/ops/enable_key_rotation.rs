@@ -249,7 +249,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // same schedule from the other end: the two operations accept exactly the set
         // of keys whose automatic rotation is configurable, so a key one of them
         // refuses the other refuses the same way.
-        crate::state::check_rotation_configurable(key).map_err(refuse)?;
+        crate::state::check_rotation_configurable(key, Self::NAME).map_err(refuse)?;
+        let key_id = key.key_id.clone();
 
         // "KMS rotates the key material of the KMS key one year (approximately 365
         // days) from the enable date and every year thereafter. You can use the
@@ -261,7 +262,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // The period itself is already within its modelled 90..2560 bound by the time
         // this handler runs, so there is nothing further to validate here.
-        key.schedule_rotation(input.rotation_period_in_days);
+        //
+        // The setting is one the keys of a multi-Region set SHARE, and KMS
+        // synchronizes it among them, so the schedule is written through every member
+        // of this key's set — which for a key belonging to no set is that key alone.
+        state.schedule_rotation_across_set(&key_id, input.rotation_period_in_days);
 
         Ok(EnableKeyRotationOutput)
     }
@@ -273,11 +278,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// model the same set.
 fn refuse(refusal: crate::state::RotationConfigRefusal) -> EnableKeyRotationError {
     match refusal {
-        crate::state::RotationConfigRefusal::Unsupported => {
+        crate::state::RotationConfigRefusal::Unsupported(message) => {
             EnableKeyRotationErrorModeled::UnsupportedOperationException(
-                UnsupportedOperationException {
-                    message: crate::state::unsupported_rotation_message(),
-                },
+                UnsupportedOperationException { message },
             )
         }
         crate::state::RotationConfigRefusal::Disabled(message) => {

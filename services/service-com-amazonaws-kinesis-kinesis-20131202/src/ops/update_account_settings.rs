@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAccountSettings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAccountSettings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAccountSettings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Takes this account's MINIMUM THROUGHPUT BILLING COMMITMENT to the status the request asks
+//! for, and answers the commitment the store holds once that change is stored — so every later
+//! read of the account's settings reports it.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -92,12 +88,21 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-kinesis-kinesis-2013120
 // here — hence the `UpdateAccountSettingsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.kinesis#UpdateAccountSettings")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.kinesis#UpdateAccountSettings",
+    // `InternalFailureException` is widened in with `extra_errors`, exactly as `CreateStream`
+    // and `UpdateMaxRecordSize` widen it: this SERVICE models it ("The processing of the
+    // request failed because of an unknown error, exception, or failure"), the operation shape
+    // does not list it, and it is the only honest answer for a service mounted on an engine
+    // that holds no state for it.
+    extra_errors = ["InternalFailureException"]
+)]
 #[derive(Debug)]
 pub enum UpdateAccountSettingsErrorModeled {
     InvalidArgumentException(InvalidArgumentException),
     LimitExceededException(LimitExceededException),
     ValidationException(ValidationException),
+    InternalFailureException(InternalFailureException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -123,6 +128,67 @@ impl From<UpdateAccountSettingsErrorModeled> for UpdateAccountSettingsError {
 /// concrete engine where it mounts the service, not here.
 pub struct UpdateAccountSettings<Eng> {
     engine: ::std::sync::Arc<Eng>,
+}
+
+/// Record this state-changing call for attribution: the access key id the caller presented
+/// (a public identifier, never a secret), the region the request was signed for, and how the
+/// call ended.
+fn audit(akid: &str, region: &str, outcome: &str) {
+    ::tracing::info!(
+        target: "emulator::audit",
+        operation = "UpdateAccountSettings",
+        akid = %akid,
+        region = %region,
+        outcome = %outcome,
+        "state-changing operation"
+    );
+}
+
+/// Whether the request asks for a commitment to be held, or for it to end.
+///
+/// `MinimumThroughputBillingCommitmentInput$Status` is a modelled enum, so a value outside
+/// `MINIMUM_THROUGHPUT_BILLING_COMMITMENT_INPUT_STATUS_VALUES` is a client error rather than a
+/// stored status. The model's own constraint walk refuses one before this handler runs \u2014 so
+/// the `ValidationException` it answers is the only refusal a client observes over the wire \u2014
+/// and this function states that same refusal, one error code and one wording, through
+/// [`off_catalog_status`].
+fn requested_commitment(
+    input: &UpdateAccountSettingsInput,
+) -> Result<bool, UpdateAccountSettingsError> {
+    let status = input.minimum_throughput_billing_commitment.status.as_str();
+    if status == crate::state::COMMITMENT_ENABLED {
+        return Ok(true);
+    }
+    if status == crate::state::COMMITMENT_DISABLED {
+        return Ok(false);
+    }
+    Err(off_catalog_status(status))
+}
+
+/// The refusal for a `Status` outside the published catalog: this service's own
+/// `ValidationException` carrying the clause the constraint walk renders for an enum member,
+/// the member's path, the value at fault and the value set it has to be in, built through that
+/// walk's public violation rendering rather than re-worded here.
+fn off_catalog_status(status: &str) -> UpdateAccountSettingsError {
+    use ::aws_smithy_schema_server::constraints::{envelope, path, Violation, ViolationKind};
+
+    let violation = Violation {
+        path: path::join(&[
+            path::member("MinimumThroughputBillingCommitment"),
+            path::member("Status"),
+        ]),
+        kind: ViolationKind::EnumValue(
+            MINIMUM_THROUGHPUT_BILLING_COMMITMENT_INPUT_STATUS_VALUES
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+        ),
+        value: Some(status.to_string()),
+    };
+    UpdateAccountSettingsErrorModeled::ValidationException(ValidationException {
+        message: envelope(&[violation]),
+    })
+    .into()
 }
 
 impl<Eng> UpdateAccountSettings<Eng> {
@@ -151,18 +217,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAccountSettings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAccountSettingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAccountSettings"))
+        // The credential scope's access key id and region are read only to ATTRIBUTE the
+        // change ([`audit`]): the commitment itself is the ACCOUNT's, as
+        // `UpdateAccountSettings` words it ("your account's updated settings"), so no
+        // endpoint holds one of its own.
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+        let region = crate::state::request_region(ctx);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            audit(&akid, &region, "unavailable");
+            UpdateAccountSettingsError::from(
+                UpdateAccountSettingsErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: Some("the stream store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+
+        let enabled = requested_commitment(&input).inspect_err(|_| {
+            audit(&akid, &region, "refused");
+        })?;
+
+        // "Updating account settings is a synchronous operation. Upon receiving the request,
+        // Kinesis Data Streams will return immediately with your account's updated settings":
+        // the stored commitment is taken to the requested status and the answer is what it
+        // carries from this instant, with no transition left owed except the end a disable
+        // inside the minimum commitment window schedules.
+        let now = ::std::time::SystemTime::now();
+        let commitment = state.lock().set_commitment(now, enabled);
+
+        audit(&akid, &region, "updated");
+        Ok(UpdateAccountSettingsOutput {
+            minimum_throughput_billing_commitment: Some(commitment),
+        })
     }
 }
