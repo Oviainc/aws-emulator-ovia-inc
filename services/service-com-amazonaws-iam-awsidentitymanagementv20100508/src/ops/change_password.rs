@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ChangePassword
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ChangePassword`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ChangePassword::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -91,6 +82,14 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// Why the change was refused, as the reason clause closing this operation's
+/// `AccessDenied` text: the request did not present the password in force for the
+/// calling user, which is what `OldPassword` is for ("the IAM user's current
+/// password"). Stated once, so the refusal and the test that pins it read the same
+/// clause.
+pub const OLD_PASSWORD_NOT_IN_FORCE: &str =
+    "because the old password supplied is not the user's current password";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -184,18 +183,187 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ChangePassword` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ChangePasswordErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ChangePasswordErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        // A mutation: the operation "changes the password of the IAM user who is
+        // calling this operation", so the lock is held for write across the check of
+        // the current password and the replacement of the held one.
+        let mut store = state.lock();
+
+        // The request names no user, so the one whose password changes is whoever
+        // SIGNED it: the access key id the request carries, resolved to its IAM user
+        // exactly as `GetUser` and `CreateLoginProfile` resolve a nameless caller.
+        let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
+        let Some(user_key) = store
+            .access_keys
+            .get(&caller_akid)
+            .map(|record| record.user_key.clone())
+        else {
+            ::tracing::info!(
+                audit = true,
+                operation = "ChangePassword",
+                outcome = "refused_invalid_user_type",
+                caller_akid = %caller_akid,
+                "no password was changed"
+            );
+            // A credential no IAM user owns is the account's own long-term credential
+            // or a session another service minted — the position account root
+            // credentials and an assumed role are in. "The Amazon Web Services account
+            // root user password is not affected by this operation", and a role session
+            // has no console password of its own, so such a caller is the wrong TYPE of
+            // user for this transaction rather than a user that cannot be found.
+            return Err(ChangePasswordErrorModeled::InvalidUserTypeException(
+                InvalidUserTypeException {
+                    message: Some(
+                        // The sentence the model states for this error, as its fixed
+                        // text: "the request was rejected because the type of user for
+                        // the transaction was incorrect".
+                        "The request was rejected because the type of user for the \
+                         transaction was incorrect."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // The key's user, as the account holds it: the name and the ARN every refusal
+        // below is worded from, in the case the account stores rather than any a
+        // request spelled.
+        let Some((user_name, user_arn)) = store
+            .users
+            .get(&user_key)
+            .map(|user| (user.user_name.clone(), user.arn.clone()))
+        else {
+            ::tracing::info!(
+                audit = true,
+                operation = "ChangePassword",
+                outcome = "refused_no_such_user",
+                caller_akid = %caller_akid,
+                user_key = %user_key,
+                "no password was changed"
+            );
+            return Err(ChangePasswordErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!("The user with name {user_key} cannot be found.")),
+                },
+            )
+            .into());
+        };
+
+        // This operation CHANGES a password, so there has to be one to change: a
+        // caller with no login profile ("a login profile is created when you create a
+        // password for the user", `GetLoginProfile`) has no console password at all,
+        // and creating the first one is `CreateLoginProfile`'s job. The refusal is the
+        // one `GetLoginProfile` and `UpdateLoginProfile` answer with for the same
+        // missing entity.
+        let Some(held) = store.login_profiles.get(&user_key) else {
+            ::tracing::info!(
+                audit = true,
+                operation = "ChangePassword",
+                outcome = "refused_no_login_profile",
+                caller_akid = %caller_akid,
+                user_key = %user_key,
+                "no password was changed"
+            );
+            return Err(ChangePasswordErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "Login Profile for User {user_name} cannot be found."
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "The IAM user's current password" (`ChangePassword$OldPassword`): the change
+        // applies only to a caller that presents the password the account already
+        // accepted, which is what the held verifier answers. A caller that does not
+        // present it is refused the change and the held password stays in force, with
+        // the status and error code measured responses carry for this refusal: HTTP 403
+        // `AccessDenied`, because presenting the current password is what entitles a
+        // caller to replace it. It is NOT one of the operation's modelled errors —
+        // `InvalidUserTypeException` is about the TYPE of the calling user, not about
+        // what that user supplied — so it goes through the crate's authorization
+        // channel, where every other IAM refusal under that code is answered.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ChangePassword"))
+        // The text is that channel's single wording for the code
+        // ([`crate::state::authorization::not_authorized`]): the principal, the action
+        // and the resource the refusal is about, closed by the reason it went that way.
+        // The principal and the resource are read from the user the ACCOUNT holds — so
+        // the ARN carries the account id and the user's path, and the name is in the
+        // case the account stores rather than any a request spelled — and the reason
+        // names what the request did not present. No value of any one request or run
+        // appears in it, and neither password is echoed.
+        if !held.password.verifies(&input.old_password) {
+            ::tracing::info!(
+                audit = true,
+                operation = "ChangePassword",
+                outcome = "refused_invalid_old_password",
+                caller_akid = %caller_akid,
+                user_key = %user_key,
+                "no password was changed"
+            );
+            return Err(crate::state::authorization::not_authorized(
+                &user_arn,
+                crate::state::authorization::CHANGE_PASSWORD,
+                &format!("user {user_name}"),
+                OLD_PASSWORD_NOT_IN_FORCE,
+            )
+            .into());
+        }
+
+        // The new password replaces the one in force. The account keeps only the
+        // VERIFIER of it (`crate::state::hold_password`), exactly as the create and
+        // the administrative update do: nothing reports a password back, the model
+        // marks both members sensitive, and neither password is logged or echoed.
+        //
+        // `PasswordPolicyViolationException` is DECLINED for the reason it cannot
+        // arise: it refuses a password that "did not meet the requirements imposed by
+        // the account password policy", and no account password policy can exist while
+        // `UpdateAccountPasswordPolicy` is unimplemented; `passwordType`'s own length
+        // and alphabet constraints are enforced before this handler runs.
+        // `LimitExceededException` is declined too — a change creates no entity, so it
+        // reaches no quota — and so is `EntityTemporarilyUnmodifiableException`, which
+        // reports "a user name that was deleted and then recreated": every delete and
+        // create in this emulator takes effect at once, so no entity is ever
+        // temporarily unmodifiable.
+        let held_password = store.hold_password(&input.new_password);
+        let Some(held) = store.login_profiles.get_mut(&user_key) else {
+            return Err(ChangePasswordErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the password could not be changed".to_string()),
+                },
+            )
+            .into());
+        };
+        held.password = held_password;
+        // The caller has just chosen a password of its own, so the demand that the
+        // user "set a new password on next sign-in"
+        // (`CreateLoginProfile$PasswordResetRequired`) has been met and no longer
+        // stands: this operation is how a user resolves it. `CreateDate` is NOT moved —
+        // "the CreateDate reflects the initial password creation date"
+        // (`GetLoginProfile`), so it belongs to the create — which is also the choice
+        // `UpdateLoginProfile` makes.
+        held.password_reset_required = false;
+
+        ::tracing::info!(
+            audit = true,
+            operation = "ChangePassword",
+            outcome = "changed",
+            caller_akid = %caller_akid,
+            user_key = %user_key,
+            "console password changed"
+        );
+
+        // The output shape is `Unit`: the operation reports nothing, and the profile it
+        // left behind is read back through `GetLoginProfile`.
+        Ok(ChangePasswordOutput)
     }
 }

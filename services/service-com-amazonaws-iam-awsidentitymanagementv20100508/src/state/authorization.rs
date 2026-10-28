@@ -100,6 +100,9 @@ pub const GET_SERVICE_LAST_ACCESSED_DETAILS_WITH_ENTITIES: &str =
 /// `iam:ListOpenIDConnectProviders`.
 pub const LIST_OPEN_ID_CONNECT_PROVIDERS: &str = "iam:ListOpenIDConnectProviders";
 
+/// `iam:ChangePassword`.
+pub const CHANGE_PASSWORD: &str = "iam:ChangePassword";
+
 /// `iam:CreateGroup`.
 pub const CREATE_GROUP: &str = "iam:CreateGroup";
 
@@ -376,14 +379,23 @@ pub fn authorize_named(
         explicit_deny = decided == Decision::Denied || capped == Decision::Denied,
         "the policies in force on the caller do not permit this call"
     );
-    // What the decision was about, then why it went that way: the whole of AWS's
-    // `AccessDenied` text. The sentence ENDS at the reason — every part of it is a
-    // fact of the request and the documents in force, so the same refused call is
-    // worded the same on every run and in every Region.
-    Err(AccessDenied::new(format!(
+    Err(not_authorized(&principal, action, named_as, &reason))
+}
+
+/// The `AccessDenied` text AWS words a call it will not perform for its caller with:
+/// what the refusal is about — the principal that signed the request, the action it
+/// asked for and the resource it asked for it on — closed by `reason`, which says why,
+/// and nothing further.
+///
+/// ONE wording for the code, so a refusal an operation reaches for a reason of its own
+/// is worded exactly as the policy decision above is, differing only in that reason.
+/// Every part of it is a fact of the request and of the account's state, so the same
+/// refused call is worded the same on every run and in every Region.
+pub fn not_authorized(principal: &str, action: &str, named_as: &str, reason: &str) -> AccessDenied {
+    AccessDenied::new(format!(
         "User: {principal} is not authorized to perform: {action} on resource: {named_as} \
          {reason}"
-    )))
+    ))
 }
 
 /// Whether the caller has sufficient permissions to cover the asks of the delegation
