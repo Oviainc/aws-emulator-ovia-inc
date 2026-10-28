@@ -531,6 +531,10 @@ pub const TRIGGER_STATE_CREATED: &str = "CREATED";
 /// The `TriggerState` of a trigger that is started and waiting to fire: what
 /// `CreateTrigger` leaves a trigger in when the request set `StartOnCreation` ("Set to
 /// true to start SCHEDULED and CONDITIONAL triggers when created").
+///
+/// A trigger that waits on nothing but a caller is never in this state: it has no armed
+/// state to be put into, so a start of one is a firing and leaves it in
+/// [`TRIGGER_STATE_CREATED`]. See [`TriggerEntry::start`].
 pub const TRIGGER_STATE_ACTIVATED: &str = "ACTIVATED";
 
 /// The `TriggerState` of a trigger that has been stopped: the one modelled state of a
@@ -1727,6 +1731,66 @@ impl ComAmazonawsGlueAwsglueState {
             .entry(region.to_string())
             .or_default()
             .insert(entry.name.clone(), entry);
+    }
+
+    /// Initiate `actions` — the actions of the trigger `trigger_name`, which has just FIRED
+    /// in the Region `region` — and answer the id of every job run they began, in action
+    /// order.
+    ///
+    /// "Defines an action to be initiated by a trigger" (`Action`): an action naming a job
+    /// begins a RUN of that job, carrying the overrides the action names over the job's own
+    /// definition — "The job arguments used when this trigger fires. For this job run, they
+    /// replace the default arguments set in the job definition itself" (`Action$Arguments`),
+    /// and the same for its `Timeout`, `SecurityConfiguration` and `NotificationProperty` —
+    /// so what a firing begins is the record [`JobRunEntry::start`] builds for a direct
+    /// start of that job, named as the run of a trigger (`JobRun$TriggerName`), and a later
+    /// read of the job's runs reports it.
+    ///
+    /// The ceiling a direct start respects bounds a firing too: a job already at its
+    /// `ExecutionProperty$MaxConcurrentRuns` takes no further run, and because the firing is
+    /// not the caller's own start of that job, the firing begins the runs it can rather than
+    /// being refused. An action naming a job this Region no longer holds begins no run for
+    /// the same reason.
+    ///
+    /// An action's `CrawlerName` initiates a CRAWL, which is the crawl lifecycle
+    /// `StartCrawler` owns and which this crate does not hold yet ([`CrawlerEntry`] records
+    /// no crawl), so such an action begins nothing here.
+    pub fn initiate_trigger_actions(
+        &mut self,
+        region: &str,
+        trigger_name: &str,
+        actions: &[Action],
+        now: SystemTime,
+    ) -> Vec<String> {
+        let mut begun = Vec::new();
+        for action in actions {
+            let Some(job_name) = action.job_name.as_deref() else {
+                continue;
+            };
+            let request = job_run_request_for_action(action, job_name);
+            let Some(job) = self.job_mut(region, job_name) else {
+                continue;
+            };
+            // Everything the clock already owed this job's runs is materialised before they
+            // are counted, so a run it has already finished does not hold a slot.
+            job.settle_due_runs(now);
+            let allowed = usize::try_from(job.max_concurrent_runs()).unwrap_or(usize::MAX);
+            if job.runs_in_flight() >= allowed {
+                continue;
+            }
+            let run_id = new_job_run_id();
+            let run = JobRunEntry::start(
+                job,
+                &request,
+                run_id.clone(),
+                now,
+                None,
+                Some(trigger_name),
+            );
+            job.record_run(run);
+            begun.push(run_id);
+        }
+        begun
     }
 
     /// Whether the store can hold another schema registry, i.e. is below
@@ -3711,6 +3775,27 @@ impl TriggerEntry {
             event_batching_condition: input.event_batching_condition.clone(),
             tags: input.tags.clone().unwrap_or_default(),
         }
+    }
+
+    /// Move this trigger into the state a start leaves it in.
+    ///
+    /// "Starts an existing trigger" (`StartTrigger`) ARMS a trigger that waits on something
+    /// outside the caller — its schedule, its predicate or the events it batches — so such a
+    /// trigger is left in [`TRIGGER_STATE_ACTIVATED`], which every later read reports until
+    /// a stop moves it.
+    ///
+    /// A trigger that waits on nothing but a caller has no armed state to be put into: it is
+    /// the one type a create cannot start, "Set to true to start SCHEDULED and CONDITIONAL
+    /// triggers when created. True is not supported for ON_DEMAND triggers"
+    /// (`CreateTriggerRequest$StartOnCreation`), because there is nothing for it to wait for
+    /// once armed. Starting one FIRES it, and what the start leaves it in is the state it
+    /// waits in ([`TRIGGER_STATE_CREATED`]), ready for the next caller.
+    pub fn start(&mut self) {
+        self.state = if self.trigger_type == TRIGGER_TYPE_ON_DEMAND {
+            TRIGGER_STATE_CREATED.to_string()
+        } else {
+            TRIGGER_STATE_ACTIVATED.to_string()
+        };
     }
 
     /// Replace the stored DEFINITION with the one a `TriggerUpdate` carries: "this object
@@ -6373,7 +6458,25 @@ pub fn new_job_run_id() -> String {
 /// lowercase hexadecimal characters.
 const JOB_RUN_ID_WORDS: usize = 4;
 
-/// One run of a job definition, as `StartJobRun` recorded it.
+/// The job-run request an `Action` of a fired trigger amounts to: the run of `job_name`
+/// that action initiates, carrying every override the two shapes share — `Arguments`,
+/// `Timeout`, `SecurityConfiguration` and `NotificationProperty`, each documented on the
+/// action in the words `StartJobRunRequest` documents it in — and nothing else, because an
+/// action names no capacity, no execution class and no previous run to retry. Reading the
+/// run off this is what makes a run a firing began the same record a direct start records
+/// ([`JobRunEntry::start`]).
+fn job_run_request_for_action(action: &Action, job_name: &str) -> StartJobRunInput {
+    StartJobRunInput {
+        job_name: job_name.to_string(),
+        arguments: action.arguments.clone(),
+        timeout: action.timeout,
+        security_configuration: action.security_configuration.clone(),
+        notification_property: action.notification_property.clone(),
+        ..StartJobRunInput::default()
+    }
+}
+
+/// One run of a job definition, as a start of that job or a trigger's firing recorded it.
 ///
 /// A run carries the job's own configuration with the members the `StartJobRun` request
 /// overrode applied on top — "This value overrides the timeout value set in the parent
@@ -6385,6 +6488,9 @@ pub struct JobRunEntry {
     pub id: String,
     /// The name of the job definition this is a run of.
     pub job_name: String,
+    /// `JobRun$TriggerName`: "The name of the trigger that started this job run", and
+    /// `None` for a run a caller started directly, which no trigger started.
+    pub trigger_name: Option<String>,
     /// `JobRun$Attempt`; one past the retried run's attempt when this run retries one.
     pub attempt: i32,
     /// `JobRun$PreviousRunId`: "the `JobRunId` specified in the `StartJobRun` action",
@@ -6431,12 +6537,17 @@ impl JobRunEntry {
     ///
     /// `retries` is the `(id, attempt)` of the run this one retries, when the request's
     /// `JobRunId` ("The ID of a previous JobRun to retry") named one.
+    ///
+    /// `triggered_by` is the trigger whose firing initiated this run (`JobRun$TriggerName`,
+    /// "The name of the trigger that started this job run"), and `None` for a run a caller
+    /// started directly.
     pub fn start(
         job: &JobEntry,
         input: &StartJobRunInput,
         id: String,
         now: SystemTime,
         retries: Option<(String, i32)>,
+        triggered_by: Option<&str>,
     ) -> Self {
         let (previous_run_id, attempt) = match retries {
             Some((previous_id, previous_attempt)) => {
@@ -6475,6 +6586,7 @@ impl JobRunEntry {
         Self {
             id,
             job_name: job.name.clone(),
+            trigger_name: triggered_by.map(str::to_string),
             attempt,
             previous_run_id,
             job_mode: job.job_mode.clone(),
@@ -6590,9 +6702,9 @@ impl JobRunEntry {
             id: Some(self.id.clone()),
             attempt: self.attempt,
             previous_run_id: self.previous_run_id.clone(),
-            // "The name of the trigger that started this job run": this run was started
-            // through `StartJobRun`, so no trigger started it.
-            trigger_name: None,
+            // "The name of the trigger that started this job run": the trigger whose
+            // firing initiated this run, and nothing for a run a caller started directly.
+            trigger_name: self.trigger_name.clone(),
             job_name: Some(self.job_name.clone()),
             job_mode: Some(self.job_mode.clone()),
             job_run_queuing_enabled: self.job_run_queuing_enabled,

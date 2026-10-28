@@ -462,7 +462,9 @@ async fn an_update_does_not_move_the_triggers_state() {
         );
     }
 
-    // A trigger started by its own call keeps the state that start left it in.
+    // A trigger started by its own call keeps the state that start left it in: an
+    // on-demand trigger has no armed state, so its start leaves it in the state it waits
+    // in, and the update must not move that either.
     let name = format!("state-started-{TRIGGER_TYPE_ON_DEMAND}");
     create_trigger(&router, &name, TRIGGER_TYPE_ON_DEMAND, false).await;
     ok(&router, "StartTrigger", &json!({ "Name": name })).await;
@@ -474,8 +476,8 @@ async fn an_update_does_not_move_the_triggers_state() {
     .await;
     assert_eq!(
         answered.get("State").and_then(Value::as_str),
-        Some(TRIGGER_STATE_ACTIVATED),
-        "case a started on-demand trigger: expected State {TRIGGER_STATE_ACTIVATED}, got \
+        Some(TRIGGER_STATE_CREATED),
+        "case a started on-demand trigger: expected State {TRIGGER_STATE_CREATED}, got \
          {answered}"
     );
 }

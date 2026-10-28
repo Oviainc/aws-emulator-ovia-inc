@@ -10,9 +10,10 @@
 //! and leaves it in the one modelled `TriggerState` of a stopped trigger (`DEACTIVATED`),
 //! which every later read of that trigger reports, whatever state it was in before and
 //! however often the stop is repeated; the rest of the stored definition — type, schedule,
-//! predicate, actions — is untouched, so a later start activates the same trigger again,
-//! and a run a firing already began is left to its own lifecycle. A stop for a name the
-//! request's Region holds no trigger under is refused with `EntityNotFoundException`.
+//! predicate, actions — is untouched, so a later start takes the same trigger out of the
+//! stopped state again, and a run a firing already began is left to its own lifecycle. A
+//! stop for a name the request's Region holds no trigger under is refused with
+//! `EntityNotFoundException`.
 //!
 //! The tables are rows along what the rule generalises over: the trigger's type (each of
 //! the four modelled `TriggerType` values), the state the trigger was in when the stop
@@ -48,6 +49,9 @@ struct StopCase {
     start_first: bool,
     /// The `TriggerState` a read reports for this row before the stop.
     state_before: &'static str,
+    /// The `TriggerState` a read reports after the stop is undone by a later start: the
+    /// state a start leaves a trigger of this type in.
+    state_after_restart: &'static str,
 }
 
 /// The rows: each modelled `TriggerType`, a trigger that was never started, one started by
@@ -63,6 +67,7 @@ fn stop_cases() -> Vec<StopCase> {
             }),
             start_first: false,
             state_before: TRIGGER_STATE_CREATED,
+            state_after_restart: TRIGGER_STATE_CREATED,
         },
         StopCase {
             case: "on-demand, started by a call",
@@ -71,7 +76,10 @@ fn stop_cases() -> Vec<StopCase> {
                 "Actions": [{ "JobName": JOB }, { "CrawlerName": CRAWLER }],
             }),
             start_first: true,
-            state_before: TRIGGER_STATE_ACTIVATED,
+            // An on-demand trigger has no armed state: the start FIRED it and left it in
+            // the state it waits in.
+            state_before: TRIGGER_STATE_CREATED,
+            state_after_restart: TRIGGER_STATE_CREATED,
         },
         StopCase {
             // "This field is required when the trigger type is SCHEDULED."
@@ -83,6 +91,7 @@ fn stop_cases() -> Vec<StopCase> {
             }),
             start_first: false,
             state_before: TRIGGER_STATE_CREATED,
+            state_after_restart: TRIGGER_STATE_ACTIVATED,
         },
         StopCase {
             // "Set to true to start SCHEDULED and CONDITIONAL triggers when created."
@@ -95,6 +104,7 @@ fn stop_cases() -> Vec<StopCase> {
             }),
             start_first: false,
             state_before: TRIGGER_STATE_ACTIVATED,
+            state_after_restart: TRIGGER_STATE_ACTIVATED,
         },
         StopCase {
             // "This field is required when the trigger type is CONDITIONAL."
@@ -112,6 +122,7 @@ fn stop_cases() -> Vec<StopCase> {
             }),
             start_first: true,
             state_before: TRIGGER_STATE_ACTIVATED,
+            state_after_restart: TRIGGER_STATE_ACTIVATED,
         },
         StopCase {
             case: "conditional, started on creation",
@@ -129,6 +140,7 @@ fn stop_cases() -> Vec<StopCase> {
             }),
             start_first: false,
             state_before: TRIGGER_STATE_ACTIVATED,
+            state_after_restart: TRIGGER_STATE_ACTIVATED,
         },
         StopCase {
             // "Batch condition that must be met … before EventBridge event trigger fires."
@@ -140,6 +152,7 @@ fn stop_cases() -> Vec<StopCase> {
             }),
             start_first: false,
             state_before: TRIGGER_STATE_CREATED,
+            state_after_restart: TRIGGER_STATE_ACTIVATED,
         },
         StopCase {
             case: "event, started by a call",
@@ -150,6 +163,7 @@ fn stop_cases() -> Vec<StopCase> {
             }),
             start_first: true,
             state_before: TRIGGER_STATE_ACTIVATED,
+            state_after_restart: TRIGGER_STATE_ACTIVATED,
         },
     ]
 }
@@ -244,10 +258,11 @@ async fn a_stop_deactivates_the_trigger_whatever_state_it_was_in() {
 }
 
 /// Stopping is idempotent — a second stop answers 200 and reports the same state — and the
-/// stop is not a one-way door: a later start activates the same trigger again, and
-/// stopping it once more deactivates it again.
+/// stop is not a one-way door: a later start takes the trigger out of the stopped state and
+/// into the state a start leaves a trigger of its type in, and stopping it once more
+/// deactivates it again.
 #[tokio::test]
-async fn stopping_is_idempotent_and_a_later_start_activates_again() {
+async fn stopping_is_idempotent_and_a_later_start_undoes_it() {
     let (router, _engine) = emulator_with_engine();
     register_targets(&router).await;
 
@@ -274,9 +289,9 @@ async fn stopping_is_idempotent_and_a_later_start_activates_again() {
         ok(&router, "StartTrigger", &json!({ "Name": trigger })).await;
         let restarted = trigger_state(&router, &trigger).await;
         assert_eq!(
-            restarted, TRIGGER_STATE_ACTIVATED,
-            "case {case:?}: a stopped trigger starts again into {TRIGGER_STATE_ACTIVATED}, \
-             got {restarted:?}"
+            restarted, row.state_after_restart,
+            "case {case:?}: a stopped trigger starts again into {:?}, got {restarted:?}",
+            row.state_after_restart
         );
 
         let (status, body) = stop_trigger(&router, &trigger).await;

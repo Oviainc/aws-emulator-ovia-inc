@@ -7,11 +7,13 @@
 //! Every call goes over the wire through the shared [`crate::wire`] harness, so what is
 //! asserted is HTTP behaviour and not a direct call into a handler.
 //!
-//! The rule under test: a start addresses a trigger by name in the Region that holds it
-//! and leaves it in the one `TriggerState` of a started trigger (`ACTIVATED`); a started
-//! trigger that waits on nothing outside the caller — an `ON_DEMAND` one — fires there and
-//! then, beginning a run of the workflow it belongs to, while every other modelled type
-//! waits for its schedule, its predicate or the events it batches and so begins no run.
+//! The rule under test: a start addresses a trigger by name in the Region that holds it;
+//! a trigger that waits on something outside the caller — its schedule, its predicate or
+//! the events it batches — is left ARMED in the one `TriggerState` of a started trigger
+//! (`ACTIVATED`) and fires nothing here, while a trigger that waits on nothing but a caller
+//! — an `ON_DEMAND` one — is FIRED there and then: it initiates the actions it names,
+//! beginning a run of each job they name and a run of the workflow it belongs to, and is
+//! left in the state it waits in (`CREATED`), ready for the next caller.
 //! A start for a name the Region does not hold is refused with `EntityNotFoundException`,
 //! and a firing past the concurrency ceiling the workflow named with
 //! `ConcurrentRunsExceededException`, leaving the workflow with the runs it already had.
@@ -87,8 +89,12 @@ struct StartCase {
     workflow: Option<Value>,
     /// The `CreateTrigger` body, minus `Name` and `WorkflowName`.
     trigger: Value,
-    /// Whether starting this trigger fires it, beginning a run of its workflow.
+    /// Whether starting this trigger begins a run of its workflow: it fires as soon as it
+    /// is started AND it belongs to a workflow.
     fires: bool,
+    /// The `TriggerState` a read reports once the start has been served: the state the
+    /// trigger's own type is left in by a start.
+    state_after: &'static str,
     /// `WorkflowRunStatistics$TotalActions` of the run a firing begins: the actions the
     /// trigger initiates.
     total_actions: i64,
@@ -106,6 +112,7 @@ fn start_cases() -> Vec<StartCase> {
                 "Actions": [{ "JobName": JOB }],
             }),
             fires: true,
+            state_after: TRIGGER_STATE_CREATED,
             total_actions: 1,
         },
         StartCase {
@@ -116,6 +123,7 @@ fn start_cases() -> Vec<StartCase> {
                 "Actions": [{ "JobName": JOB }, { "CrawlerName": CRAWLER }],
             }),
             fires: true,
+            state_after: TRIGGER_STATE_CREATED,
             total_actions: 2,
         },
         StartCase {
@@ -130,6 +138,7 @@ fn start_cases() -> Vec<StartCase> {
                 ],
             }),
             fires: true,
+            state_after: TRIGGER_STATE_CREATED,
             total_actions: 3,
         },
         StartCase {
@@ -140,6 +149,7 @@ fn start_cases() -> Vec<StartCase> {
                 "Actions": [{ "JobName": JOB }],
             }),
             fires: false,
+            state_after: TRIGGER_STATE_CREATED,
             total_actions: 0,
         },
         StartCase {
@@ -152,6 +162,7 @@ fn start_cases() -> Vec<StartCase> {
                 "Actions": [{ "JobName": JOB }],
             }),
             fires: false,
+            state_after: TRIGGER_STATE_ACTIVATED,
             total_actions: 0,
         },
         StartCase {
@@ -170,6 +181,7 @@ fn start_cases() -> Vec<StartCase> {
                 "Actions": [{ "CrawlerName": CRAWLER }],
             }),
             fires: false,
+            state_after: TRIGGER_STATE_ACTIVATED,
             total_actions: 0,
         },
         StartCase {
@@ -182,6 +194,7 @@ fn start_cases() -> Vec<StartCase> {
                 "Actions": [{ "JobName": JOB }],
             }),
             fires: false,
+            state_after: TRIGGER_STATE_ACTIVATED,
             total_actions: 0,
         },
     ]
@@ -277,9 +290,9 @@ pub(crate) fn set_due_instant(
 // Start, then read back
 // ---------------------------------------------------------------------------
 
-/// A start answers 200 with the trigger's name, leaves the trigger in the started state a
-/// later read reports, and begins a run of the trigger's workflow exactly when the trigger
-/// is one that fires as soon as it is started.
+/// A start answers 200 with the trigger's name, leaves the trigger in the state a start of
+/// its own type leaves it in, and begins a run of the trigger's workflow exactly when the
+/// trigger is one that fires as soon as it is started.
 #[tokio::test]
 async fn a_start_activates_the_trigger_and_fires_the_on_demand_ones() {
     let (router, engine) = emulator_with_engine();
@@ -311,8 +324,9 @@ async fn a_start_activates_the_trigger_and_fires_the_on_demand_ones() {
 
         let after = trigger_state(&router, &trigger).await;
         assert_eq!(
-            after, TRIGGER_STATE_ACTIVATED,
-            "case {case:?}: a started trigger is in {TRIGGER_STATE_ACTIVATED}, got {after:?}"
+            after, row.state_after,
+            "case {case:?}: a started trigger of this type is in {:?}, got {after:?}",
+            row.state_after
         );
 
         let Some(workflow) = workflow else {
@@ -494,11 +508,12 @@ async fn a_firing_past_the_workflow_concurrency_ceiling_is_refused() {
             allowed,
             "case {case:?}: the refused firing records no run, got {ids:?}"
         );
-        // The refusal left the trigger started: it is the RUN that was refused.
+        // The refusal left the trigger as any start of an on-demand trigger leaves it: it
+        // is the RUN that was refused, and such a trigger is never armed by a start.
         let state = trigger_state(&router, &trigger).await;
         assert_eq!(
-            state, TRIGGER_STATE_ACTIVATED,
-            "case {case:?}: the trigger stays started, got {state:?}"
+            state, TRIGGER_STATE_CREATED,
+            "case {case:?}: the trigger stays in the state it waits in, got {state:?}"
         );
 
         // Once the clock has finished the runs in flight, the next firing begins a run
