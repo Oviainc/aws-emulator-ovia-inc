@@ -27,6 +27,11 @@
 //! INSTANTS on the stored record and materialised by [`ComAmazonawsMpaAwsfluffycoreserviceState::materialize_due`],
 //! which every handler calls before it reads or writes. Nothing sleeps.
 //!
+//! Each one is stamped with the instant it was DUE rather than with the instant it was
+//! materialised, and two of them that bear on the same record are applied in the order
+//! those instants fall, so the store a handler reads is the store a caller who polled at
+//! every instant would have seen — and never a function of when the next request arrived.
+//!
 //! * An invited approver's response ([`INVITATION_RESPONSE_DELAY`]). A team whose every
 //!   approver has accepted their invitation is `ACTIVE`; until then it is `PENDING`
 //!   with status code `PENDING_ACTIVATION`, which is what AWS reports for a team whose
@@ -2433,6 +2438,12 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
     /// approval and activation of a change a team was asked for, the approval of a
     /// deletion it was asked for, and the removal an APPROVED deletion owes once its
     /// pending window has run out. Nothing a caller has to ask for.
+    ///
+    /// What is owed is applied in the order the CLOCK made it due, not in the order this
+    /// function walks the store, so the outcome depends on `now` alone and not on when the
+    /// request that materialises it happens to arrive: where two changes bear on the same
+    /// record — the approvers' answer to a session and that session's expiration — the one
+    /// that fell due first is applied first, and the later one acts on its result.
     pub fn materialize_due(&mut self, now: SystemTime) {
         for team in self.approval_teams.values_mut() {
             // The approvers of the team AND of the change it has been asked to approve:
@@ -2510,6 +2521,32 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
             self.remove_identity_source(&arn);
         }
 
+        // The instant the approvers' answer is owed at, per session the clock owes one in:
+        // a requested change's approval ([`PendingTeamUpdate::approval_due`]) and a
+        // requested deletion's ([`PendingTeamDeletion::approval_due`]). It is read BEFORE
+        // the endings below, because what the clock owes is owed in the order it fell due,
+        // not in the order this function happens to walk the store: an answer owed while
+        // the session was still open is the earlier change, so the session carries that
+        // answer (the loops below record it) instead of ending unanswered, however long
+        // after both instants the next request arrives.
+        let answers_owed: BTreeMap<&str, SystemTime> = self
+            .approval_teams
+            .values()
+            .flat_map(|team| {
+                let update = team.outstanding_update().and_then(|update| {
+                    update
+                        .approval_due
+                        .map(|due| (update.update_session_arn.as_str(), due))
+                });
+                let deletion = team.unapproved_deletion().and_then(|deletion| {
+                    deletion
+                        .approval_due
+                        .map(|due| (deletion.session_arn.as_str(), due))
+                });
+                update.into_iter().chain(deletion)
+            })
+            .collect();
+
         for session in self.sessions.values_mut() {
             // A new session is PENDING — waiting on its approvers — once its activation
             // comes due.
@@ -2525,7 +2562,17 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
             // The completion is stamped with the DUE instant, not with `now`, so a
             // materialised value does not move between reads. Nothing claims an approver
             // answered: every response stays `NO_RESPONSE`.
-            if session.status.is_outstanding() && session.expiration_time <= now {
+            //
+            // A session whose answer the clock owed BEFORE that expiration was answered
+            // while it was still open, so the expiration pre-empts nothing: it is left
+            // outstanding for the loops below to record the answer in, and only a session
+            // no answer was owed in before it ran out ends unanswered.
+            if session.status.is_outstanding()
+                && session.expiration_time <= now
+                && answers_owed
+                    .get(session.arn.as_str())
+                    .is_none_or(|due| *due >= session.expiration_time)
+            {
                 session.status = SessionStatus::Failed;
                 session.status_code = Some(SessionStatusCode::Expired);
                 session.completion_time = Some(session.expiration_time);
@@ -2535,8 +2582,10 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
 
         // The change a team's approvers were asked to approve: their approval comes due
         // first, then the activation of the configuration it carries. A session that ended
-        // without an approval — cancelled, or expired unanswered — is a change the team
-        // never approved, so the team keeps the configuration it has.
+        // BEFORE that approval was owed — cancelled, or run out unanswered — is a change
+        // the team never approved, so the team keeps the configuration it has; a session
+        // whose expiration fell due only afterwards was left outstanding above, so the
+        // approval the clock owed first is recorded here.
         let requested: Vec<String> = self
             .approval_teams
             .values()
@@ -2586,8 +2635,8 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
                     }
                     // Nothing is owed yet: an approval that has not come due.
                     Some((SessionStatus::Approved, _)) => {}
-                    // The session ended without an approval, or no longer exists: the
-                    // requested version is one this team will never move to.
+                        // The session ended before an approval was owed in it, or no longer
+                    // exists: the requested version is one this team will never move to.
                     _ => {
                         if let Some(team) = self.approval_teams.get_mut(&team_arn) {
                             team.record_update_failure();
@@ -2612,8 +2661,11 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
 
         // The deletion a team's approvers were asked to approve. Their approval is what
         // STARTS the pending window, so it is recorded first and the removal below is owed
-        // only afterwards. A session that ended without an approval — cancelled, or
-        // expired unanswered — is a deletion the team refused, so the team stays.
+        // only afterwards. A session that ended BEFORE that approval was owed — cancelled,
+        // or run out unanswered — is a deletion the team refused, so the team stays; a
+        // session whose expiration fell due only afterwards was left outstanding above, so
+        // the approval the clock owed first is recorded here and the deletion the caller
+        // was promised stands.
         let requested_deletions: Vec<String> = self
             .approval_teams
             .values()
@@ -2663,9 +2715,9 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
                 }
                 // Nothing is owed yet: an approval that has not come due.
                 Some((SessionStatus::Approved, _)) => {}
-                // The session ended without an approval, or no longer exists: this is a
-                // deletion the team did not approve, and an unapproved deletion deletes
-                // nothing.
+                // The session ended before an approval was owed in it, or no longer
+                // exists: this is a deletion the team did not approve, and an unapproved
+                // deletion deletes nothing.
                 _ => {
                     if let Some(team) = self.approval_teams.get_mut(&team_arn) {
                         team.record_deletion_failure();

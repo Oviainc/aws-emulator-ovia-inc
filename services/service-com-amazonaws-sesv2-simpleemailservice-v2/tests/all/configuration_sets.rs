@@ -76,7 +76,7 @@ impl Reply {
     /// A boolean at `pointer`, where absent reads as `false`: the modelled default of
     /// every boolean on a configuration set is `false`, so a serializer that omits a
     /// defaulted member and one that writes it out agree here.
-    fn flag(&self, pointer: &str) -> bool {
+    pub(crate) fn flag(&self, pointer: &str) -> bool {
         self.body
             .pointer(pointer)
             .and_then(Value::as_bool)
