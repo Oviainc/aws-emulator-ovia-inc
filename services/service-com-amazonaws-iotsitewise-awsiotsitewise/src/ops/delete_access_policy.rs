@@ -156,11 +156,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The policy goes, ARN and tags with it: the record owns its own tag set, so
         // removing it is what makes the tagging operations stop resolving its ARN. An
         // id that resolves to no stored policy is the modelled 404 rather than a
-        // silent success — which is also what a retry carrying the `clientToken` of a
-        // delete that already landed gets, because this store keeps no token ->
-        // answer mapping to replay from, exactly as the creates in this crate leave
-        // it to the idempotency issue.
+        // silent success.
+        //
+        // `clientToken` makes this delete idempotent, as the member documents: "A
+        // unique case-sensitive identifier that you can provide to ensure the
+        // idempotency of the request." A retry carries the token of the call it
+        // repeats, so it replays that call's success rather than the not-found
+        // refusal the removal itself would now produce, and removes nothing further.
+        // This operation's error list declares no conflict error, so the token alone
+        // names the call it repeats: a request reusing it is answered from that call
+        // rather than refused with an error this operation does not model, exactly as
+        // `CreateDashboard` answers a reused token.
         let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+
+        let fingerprint = crate::state::request_fingerprint(&[&input.access_policy_id], None);
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(_) | crate::state::TokenVerdict::Spent(_) => {
+                // The answer the first call gave: the policy it removed is gone by the
+                // time its retry lands, which is exactly why that answer is replayed
+                // from the record of the call rather than re-derived from the store.
+                return Ok(DeleteAccessPolicyOutput {});
+            }
+            crate::state::TokenVerdict::Serve => {}
+        }
+
         if store
             .access_policies
             .remove(&input.access_policy_id)
@@ -168,6 +188,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(not_found(&input.access_policy_id));
         }
+
+        // The token is spent only now that the delete has succeeded: a refused
+        // request removed nothing, so the caller may send its token again.
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &input.access_policy_id,
+            now,
+        );
 
         Ok(DeleteAccessPolicyOutput {})
     }

@@ -183,14 +183,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             ))
         })?;
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
 
-        // `clientToken` is NOT honoured for idempotent replay: this change stores no
-        // token -> answer mapping, so a retry with the same token updates the dataset
-        // a second time rather than replaying the first answer. Left to the
-        // idempotency issue, exactly as `UpdateAsset` leaves it.
+        // `clientToken` makes this update idempotent, as the member documents: "A
+        // unique case-sensitive identifier that you can provide to ensure the
+        // idempotency of the request." A retry carries the token of the call it
+        // repeats, so it reports that dataset's status and writes nothing — it neither
+        // restarts the UPDATING transition the first call owes nor mints a second
+        // version; a token already spent on a DIFFERENT request belongs to another
+        // call, which is the modelled conflict. It is the FIRST thing decided, because
+        // the call it repeats was already accepted and it is that very call which left
+        // the dataset UPDATING.
         let mut store = state.lock();
+
+        let fingerprint = crate::state::request_fingerprint(
+            &[
+                &input.dataset_id,
+                &input.dataset_name,
+                &input.dataset_description,
+                &input.dataset_config,
+                &input.dataset_source,
+                &input.workspace_name,
+                &input.metadata,
+            ],
+            None,
+        );
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(replayed) => {
+                // A dataset deleted since leaves the retry nothing to answer from, so
+                // that retry is served as the fresh update it now is — which is the
+                // not-found refusal below.
+                if let Some(dataset) = store.datasets.get(&replayed) {
+                    return Ok(UpdateDatasetOutput {
+                        dataset_id: Some(dataset.id.clone()),
+                        dataset_arn: Some(dataset.arn.clone()),
+                        dataset_status: Some(dataset.status(now)),
+                    });
+                }
+            }
+            crate::state::TokenVerdict::Spent(spent_on) => {
+                // The ARN the conflict reports is the one the stored dataset CARRIES,
+                // read back from the record rather than rebuilt, so the refusal cannot
+                // name an ARN no dataset of this store has. A dataset removed since the
+                // token was spent leaves only its id to build one from.
+                let conflicting_arn = store
+                    .datasets
+                    .get(&spent_on)
+                    .map(|dataset| dataset.arn.clone())
+                    .unwrap_or_else(|| crate::state::dataset_arn(&region, &spent_on));
+                return Err(token_spent(&spent_on, conflicting_arn));
+            }
+            crate::state::TokenVerdict::Serve => {}
+        }
 
         let dataset = store
             .datasets
@@ -222,12 +267,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this call owes falls due.
         dataset.begin_update(now);
 
-        Ok(UpdateDatasetOutput {
+        let output = UpdateDatasetOutput {
             dataset_id: Some(dataset.id.clone()),
             dataset_arn: Some(dataset.arn.clone()),
             dataset_status: Some(dataset.status(now)),
-        })
+        };
+
+        // The token is spent only now that the update has succeeded: a refused
+        // request changed nothing, so the caller may send its token again.
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &input.dataset_id,
+            now,
+        );
+
+        Ok(output)
     }
+}
+
+/// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
+/// request already spent: the conflict is with the dataset that request updated,
+/// so `resourceId`/`resourceArn` name it.
+fn token_spent(dataset_id: &str, resource_arn: String) -> UpdateDatasetError {
+    UpdateDatasetError::Modeled(UpdateDatasetErrorModeled::ConflictingOperationException(
+        ConflictingOperationException {
+            message: crate::state::already_using_message("dataset", "clientToken"),
+            resource_id: dataset_id.to_string(),
+            resource_arn,
+        },
+    ))
 }
 
 /// HTTP 404 `ResourceNotFoundException` naming the id that resolved to nothing.

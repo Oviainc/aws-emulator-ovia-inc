@@ -149,7 +149,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteWorkspaceError::Modeled(DeleteWorkspaceErrorModeled::InternalFailureException(
@@ -159,14 +159,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+
+        // `clientToken` makes this delete idempotent, as the member documents: "A
+        // unique case-sensitive identifier that you can provide to ensure the
+        // idempotency of the request." A retry carries the token of the call it
+        // repeats, so it replays that call's answer — the workspace it removed,
+        // reported DELETING — rather than the not-found refusal the removal itself
+        // would now produce, and removes nothing further; a token already spent on a
+        // DIFFERENT request belongs to another call, which is the modelled conflict.
+        // It is the FIRST thing decided, because the call it repeats was already
+        // served.
+        let fingerprint = crate::state::request_fingerprint(&[&input.workspace_name], None);
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(_) => {
+                return Ok(DeleteWorkspaceOutput {
+                    workspace_status: WorkspaceStatus {
+                        state: crate::state::STATE_DELETING.to_string(),
+                        error: None,
+                    },
+                });
+            }
+            crate::state::TokenVerdict::Spent(spent_on) => {
+                return Err(token_spent(&region, &spent_on));
+            }
+            crate::state::TokenVerdict::Serve => {}
+        }
 
         // A workspace is identified by its name in this account and region, so a name
         // this store holds no workspace under is the modelled 404 rather than a silent
-        // success — which is also what a retry carrying the `clientToken` of a delete
-        // that already landed gets, because this store keeps no token -> answer mapping
-        // to replay from, exactly as `DeleteProject` and the creates in this crate
-        // leave it to the idempotency issue.
+        // success.
         if !store.workspaces.contains_key(&input.workspace_name) {
             return Err(not_found(&input.workspace_name));
         }
@@ -209,6 +233,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ran in it, resolves to nothing, and its tags stop resolving by ARN.
         store.forget_workspace(&input.workspace_name);
 
+        // The token is spent only now that the delete has succeeded: a refused
+        // request removed nothing, so the caller may send its token again.
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &input.workspace_name,
+            now,
+        );
+
         Ok(DeleteWorkspaceOutput {
             // "The status of the workspace after the deletion request, which is
             // DELETING when the operation returns" — the lifecycle state this
@@ -234,6 +268,20 @@ fn contained(contents: &[(&'static str, usize)]) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
+/// request already spent: the conflict is with the workspace that request removed,
+/// so `resourceId`/`resourceArn` name it — built from this request's region,
+/// because the workspace that call deleted no longer carries an ARN of its own.
+fn token_spent(region: &str, workspace_name: &str) -> DeleteWorkspaceError {
+    DeleteWorkspaceError::Modeled(DeleteWorkspaceErrorModeled::ConflictingOperationException(
+        ConflictingOperationException {
+            message: crate::state::already_using_message("workspace", "clientToken"),
+            resource_id: workspace_name.to_string(),
+            resource_arn: crate::state::workspace_arn(region, workspace_name),
+        },
+    ))
 }
 
 /// HTTP 404 `ResourceNotFoundException` naming the workspace the request addressed.

@@ -186,12 +186,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::check_tag_key(tag_key).map_err(invalid_request)?;
         }
 
-        // `clientToken` is NOT honoured for idempotent replay: this change stores no
-        // token -> created-id mapping, so a retry with the same token mints a second
-        // project rather than replaying the first answer. Deliberately left to the
-        // idempotency issue rather than half-done here, exactly as `CreatePortal`
-        // leaves it; nothing is fabricated for it.
+        // `clientToken` makes this create idempotent, as the member documents: "A
+        // unique case-sensitive identifier that you can provide to ensure the
+        // idempotency of the request." A retry carries the token of the call it
+        // repeats, so it answers from the project THAT call minted and writes nothing.
+        // This operation's error list declares no conflict error, so the token alone
+        // names the call it repeats: a request reusing it is answered from that call
+        // rather than refused with an error this operation does not model, exactly as
+        // `CreateDashboard` answers a reused token. Decided BEFORE the request is
+        // resolved against the store, because the call it repeats was already served.
         let mut store = state.lock();
+
+        let fingerprint = crate::state::request_fingerprint(
+            &[
+                &input.portal_id,
+                &input.project_name,
+                &input.project_description,
+            ],
+            input.tags.as_ref(),
+        );
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(replayed)
+            | crate::state::TokenVerdict::Spent(replayed) => {
+                // One deleted since leaves the retry nothing to answer from, so that
+                // retry is served as the fresh create it now is.
+                if let Some(project) = store.projects.get(&replayed) {
+                    return Ok(CreateProjectOutput {
+                        project_id: project.id.clone(),
+                        project_arn: project.arn.clone(),
+                    });
+                }
+            }
+            crate::state::TokenVerdict::Serve => {}
+        }
 
         // A project is created IN a portal, so a `portalId` that resolves to no
         // stored portal names no container for the project to live in.
@@ -246,6 +273,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         store.projects.insert(record.id.clone(), record);
+        // The token is spent only now that the create has succeeded: a refused
+        // request created nothing, so the caller may send its token again.
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &project_id,
+            now,
+        );
 
         Ok(output)
     }

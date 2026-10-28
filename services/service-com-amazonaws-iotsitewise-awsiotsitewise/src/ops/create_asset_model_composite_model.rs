@@ -239,6 +239,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
+        // `clientToken` makes this create idempotent, as the member documents: "A
+        // unique case-sensitive identifier that you can provide to ensure the
+        // idempotency of the request." A retry carries the token of the call it
+        // repeats, so it answers from the composite model THAT call created and
+        // writes nothing — it neither mints a second composite model nor a second
+        // version of the asset model holding it; a token already spent on a
+        // DIFFERENT request belongs to another call, which is the modelled conflict.
+        // It is the FIRST thing decided, ahead even of the conditional headers: the
+        // first call moved the ETag they were written against, so a retry judged on
+        // them would be refused the precondition its own call had already satisfied.
+        let fingerprint = crate::state::request_fingerprint(
+            &[
+                &input.asset_model_id,
+                &input.asset_model_composite_model_id,
+                &input.asset_model_composite_model_external_id,
+                &input.asset_model_composite_model_name,
+                &input.asset_model_composite_model_description,
+                &input.asset_model_composite_model_type,
+                &input.asset_model_composite_model_properties,
+                &input.composed_asset_model_id,
+                &input.parent_asset_model_composite_model_id,
+                &input.if_match,
+                &input.if_none_match,
+                &input.match_for_version_type,
+            ],
+            None,
+        );
+        // The resource this create minted is the COMPOSITE model, which is
+        // addressable only through the asset model that holds it, so both the replay
+        // and the conflict reach that holder from the composite model's own id. A
+        // composite model — or the asset model holding it — deleted since leaves the
+        // retry nothing to answer from and the conflict no resource to name, so such
+        // a request is served as the fresh call it now is.
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(replayed) => {
+                let answered = store
+                    .asset_model_holding_composite_model(&replayed)
+                    .map(|model| CreateAssetModelCompositeModelOutput {
+                        asset_model_composite_model_id: replayed.clone(),
+                        asset_model_composite_model_path: model.composite_model_path(&replayed),
+                        asset_model_status: model.status(now),
+                        asset_model_id: Some(model.id.clone()),
+                    });
+                if let Some(output) = answered {
+                    return Ok(output);
+                }
+            }
+            crate::state::TokenVerdict::Spent(spent_on) => {
+                let conflicting = store
+                    .asset_model_holding_composite_model(&spent_on)
+                    .map(|model| (model.id.clone(), model.arn.clone()));
+                if let Some((asset_model_id, arn)) = conflicting {
+                    return Err(token_spent(&asset_model_id, arn));
+                }
+            }
+            crate::state::TokenVerdict::Serve => {}
+        }
+
         // The target asset model is resolved FIRST: a request that names no stored
         // asset model is a 404, whatever else is wrong with it. Every id member
         // here is a `CustomID` label: a raw UUID or `externalId:<id>`.
@@ -460,14 +518,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // owes a transition back to ACTIVE — the rule every mutating call on a
         // record follows, kept on the record itself.
         record.begin_update(superseded, now);
-
-        Ok(CreateAssetModelCompositeModelOutput {
+        let output = CreateAssetModelCompositeModelOutput {
             asset_model_composite_model_id: composite_model_id.clone(),
             asset_model_composite_model_path: record.composite_model_path(&composite_model_id),
             asset_model_status: record.status(now),
             asset_model_id: Some(asset_model_id),
-        })
+        };
+
+        // The token is spent only now that the create has succeeded: a refused
+        // request created nothing, so the caller may send its token again. The
+        // resource it acted on is the composite model it minted, which is what a
+        // retry of this call replays.
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &composite_model_id,
+            now,
+        );
+
+        Ok(output)
     }
+}
+
+/// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
+/// request already spent: the conflict is with the asset model that holds the
+/// composite model that request created, so `resourceId`/`resourceArn` name it —
+/// the ARN the stored record carries rather than one rebuilt from this request.
+fn token_spent(asset_model_id: &str, resource_arn: String) -> CreateAssetModelCompositeModelError {
+    CreateAssetModelCompositeModelErrorModeled::ConflictingOperationException(
+        ConflictingOperationException {
+            message: crate::state::already_using_message("composite model", "clientToken"),
+            resource_id: asset_model_id.to_string(),
+            resource_arn,
+        },
+    )
+    .into()
 }
 
 /// HTTP 500 `InternalFailureException`: this service's store is not reachable.

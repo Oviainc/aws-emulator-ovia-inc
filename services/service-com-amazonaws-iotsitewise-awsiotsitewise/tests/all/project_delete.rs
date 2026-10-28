@@ -402,8 +402,9 @@ async fn a_delete_of_a_project_the_store_does_not_hold_is_a_modelled_not_found()
     let before = describe_project(&router, &stored).await.1;
 
     // A delete that lands first, so the SECOND delete of the same id is a row of
-    // this table: a `clientToken` buys no replay of the answer that already went
-    // out, exactly as the creates in this crate leave idempotency to its own issue.
+    // this table: a delete carrying no token, or one of its own, is judged on the
+    // state it finds — only a retry carrying the token the first delete SPENT
+    // replays that call's answer.
     let doomed = create_project(
         &router,
         "the-twice-deleted-project",

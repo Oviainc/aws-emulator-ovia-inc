@@ -233,12 +233,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clone()
             .unwrap_or_else(|| crate::state::DEFAULT_PORTAL_AUTH_MODE.to_string());
 
-        // `clientToken` is NOT honoured for idempotent replay: this change stores no
-        // token -> created-id mapping, so a retry with the same token mints a second
-        // portal rather than replaying the first answer. Deliberately left to the
-        // idempotency issue rather than half-done here, exactly as `CreateAssetModel`
-        // leaves it; nothing is fabricated for it.
+        // `clientToken` makes this create idempotent, as the member documents: "A
+        // unique case-sensitive identifier that you can provide to ensure the
+        // idempotency of the request." A retry — an SDK's own, after a timeout —
+        // carries the token of the call it repeats, so it answers from the portal THAT
+        // call minted and writes nothing. This operation's error list declares no
+        // conflict error, so the token alone names the call it repeats: a request
+        // reusing it is answered from that call rather than refused with an error this
+        // operation does not model, exactly as `CreateDashboard` answers a reused
+        // token. Decided BEFORE the request is resolved against the store, because the
+        // call it repeats was already served.
         let mut store = state.lock();
+
+        let fingerprint = crate::state::request_fingerprint(
+            &[
+                &input.portal_name,
+                &input.portal_contact_email,
+                &input.portal_description,
+                &auth_mode,
+                &input.notification_sender_email,
+                &input.alarms,
+                &input.portal_type,
+                &crate::state::portal_type_configuration_fingerprint(
+                    input.portal_type_configuration.as_ref(),
+                ),
+                &input.role_arn,
+                &crate::state::image_file_fingerprint(input.portal_logo_image_file.as_ref()),
+            ],
+            input.tags.as_ref(),
+        );
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(replayed)
+            | crate::state::TokenVerdict::Spent(replayed) => {
+                // One deleted since leaves the retry nothing to answer from, so that
+                // retry is served as the fresh create it now is.
+                if let Some(portal) = store.portals.get(&replayed) {
+                    return Ok(CreatePortalOutput {
+                        portal_id: portal.id.clone(),
+                        portal_arn: portal.arn.clone(),
+                        portal_start_url: portal.start_url.clone(),
+                        portal_status: portal.status(now),
+                        sso_application_id: portal.sso_application_id.clone(),
+                    });
+                }
+            }
+            crate::state::TokenVerdict::Serve => {}
+        }
 
         // The store is bounded: a create is the only thing that adds a portal and
         // nothing evicts one, so past the cap this is a quota refusal.
@@ -319,6 +359,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         store.portals.insert(record.id.clone(), record);
+        // The token is spent only now that the create has succeeded: a refused
+        // request created nothing, so the caller may send its token again.
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &portal_id,
+            now,
+        );
 
         Ok(output)
     }

@@ -385,14 +385,39 @@ async fn deleting_a_portal_removes_it_and_everything_it_holds() {
         }
 
         // A second delete of the same portal has nothing left to remove: the id
-        // resolves to no portal, so it is the modelled 404.
-        let (status, again) = call(&router, "DELETE", &uri, None).await;
+        // resolves to no portal, so a request carrying no token — or a token of
+        // its own — is the modelled 404.
+        let (status, again) = call(
+            &router,
+            "DELETE",
+            &format!("{PORTALS}/{}", target.portal),
+            None,
+        )
+        .await;
         assert_eq!(
             (status, error_code(&again)),
             (404, "ResourceNotFoundException"),
             "case {:?}: a repeated DeletePortal expected 404, got {status} {again}",
             case.label
         );
+
+        // A repeat carrying the `clientToken` the delete above spent is the RETRY
+        // of that call, so it replays its answer instead of that refusal — and
+        // removes nothing further.
+        if case.client_token.is_some() {
+            let (status, replayed) = call(&router, "DELETE", &uri, None).await;
+            assert_eq!(
+                status, 202,
+                "case {:?}: a retried DeletePortal expected 202, got {status} {replayed}",
+                case.label
+            );
+            assert_eq!(
+                replayed["portalStatus"]["state"].as_str().unwrap_or(""),
+                DELETING,
+                "case {:?}: a retried DeletePortal replays the first answer, got {replayed}",
+                case.label
+            );
+        }
 
         // The store itself holds only the bystander's resources: asserted directly
         // because this service's listing operations are still scaffolds, so the wire

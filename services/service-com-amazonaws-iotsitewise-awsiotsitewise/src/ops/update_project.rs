@@ -158,11 +158,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let now = ::std::time::SystemTime::now();
 
-        // `clientToken` is NOT honoured for idempotent replay: this change stores no
-        // token -> answer mapping, so a retry with the same token writes the project a
-        // second time rather than replaying the first answer. Left to the idempotency
-        // issue, exactly as `UpdateAsset` leaves it; nothing is fabricated for it.
+        // `clientToken` makes this update idempotent, as the member documents: "A
+        // unique case-sensitive identifier that you can provide to ensure the
+        // idempotency of the request." A retry carries the token of the call it
+        // repeats, so it succeeds and writes nothing — it does not write the project a
+        // second time. This operation's error list declares no conflict error, so the
+        // token alone names the call it repeats: a request reusing it is answered from
+        // that call rather than refused with an error this operation does not model,
+        // exactly as `CreateDashboard` answers a reused token. It is the FIRST thing
+        // decided, because the call it repeats was already served.
         let mut store = state.lock();
+
+        let fingerprint = crate::state::request_fingerprint(
+            &[
+                &input.project_id,
+                &input.project_name,
+                &input.project_description,
+            ],
+            None,
+        );
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(replayed)
+            | crate::state::TokenVerdict::Spent(replayed) => {
+                // A project deleted since leaves the retry nothing to answer from, so
+                // that retry is served as the fresh update it now is — which is the
+                // not-found refusal below.
+                if store.projects.contains_key(&replayed) {
+                    return Ok(UpdateProjectOutput {});
+                }
+            }
+            crate::state::TokenVerdict::Serve => {}
+        }
 
         let project = store
             .projects
@@ -177,6 +203,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         project.apply_update(
             input.project_name.clone(),
             input.project_description.clone(),
+            now,
+        );
+
+        // The token is spent only now that the update has succeeded: a refused
+        // request changed nothing, so the caller may send its token again.
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &input.project_id,
             now,
         );
 

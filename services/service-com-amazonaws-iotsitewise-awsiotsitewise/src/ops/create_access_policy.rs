@@ -204,12 +204,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_request(message));
         }
 
-        // `clientToken` is NOT honoured for idempotent replay: this change stores no
-        // token -> created-id mapping, so a retry with the same token mints a second
-        // access policy rather than replaying the first answer. Left to the
-        // idempotency issue, exactly as `CreatePortal` leaves it; nothing is
-        // fabricated for it.
+        // `clientToken` makes this create idempotent, as the member documents: "A
+        // unique case-sensitive identifier that you can provide to ensure the
+        // idempotency of the request." A retry carries the token of the call it
+        // repeats, so it answers from the access policy THAT call minted and writes
+        // nothing. This operation's error list declares no conflict error, so the token
+        // alone names the call it repeats: a request reusing it is answered from that
+        // call rather than refused with an error this operation does not model, exactly
+        // as `CreateDashboard` answers a reused token. Decided BEFORE the request is
+        // resolved against the store, because the call it repeats was already served.
         let mut store = state.lock();
+
+        let fingerprint = crate::state::request_fingerprint(
+            &[
+                &input.access_policy_identity,
+                &input.access_policy_resource,
+                &input.access_policy_permission,
+            ],
+            input.tags.as_ref(),
+        );
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(replayed)
+            | crate::state::TokenVerdict::Spent(replayed) => {
+                // One deleted since leaves the retry nothing to answer from, so that
+                // retry is served as the fresh create it now is.
+                if let Some(policy) = store.access_policies.get(&replayed) {
+                    return Ok(CreateAccessPolicyOutput {
+                        access_policy_id: policy.id.clone(),
+                        access_policy_arn: policy.arn.clone(),
+                    });
+                }
+            }
+            crate::state::TokenVerdict::Serve => {}
+        }
 
         // The policy is about a Monitor resource, so a resource this store does not
         // hold is the absence this operation's modelled 404 states. Checked for the
@@ -260,6 +287,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         store.access_policies.insert(record.id.clone(), record);
+        // The token is spent only now that the create has succeeded: a refused
+        // request created nothing, so the caller may send its token again.
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &access_policy_id,
+            now,
+        );
 
         Ok(output)
     }

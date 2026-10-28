@@ -159,15 +159,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(internal_failure)?;
         let _ = ctx;
+        let now = ::std::time::SystemTime::now();
 
-        // `clientToken` is NOT honoured for idempotent replay: this change stores no
-        // token -> outcome mapping, so a retry with the same token is judged on the
-        // state it finds, exactly like a first call. Deliberately left to the
-        // idempotency issue rather than half-done here, as `CreateProject` and
-        // `AssociateAssets` leave it. It needs no replay to be safe either way: the
-        // membership this call writes is a SET, so a repeat of the same request leaves
-        // the project holding exactly the same assets.
+        // `clientToken` makes this association idempotent, as the member documents: "A
+        // unique case-sensitive identifier that you can provide to ensure the
+        // idempotency of the request." A retry carries the token of the call it
+        // repeats, so it replays that call's answer and writes nothing. This
+        // operation's error list declares no conflict error, so the token alone names
+        // the call it repeats: a request reusing it is answered from that call rather
+        // than refused with an error this operation does not model, exactly as
+        // `CreateDashboard` answers a reused token. It is the FIRST thing decided,
+        // because the call it repeats was already served.
         let mut store = state.lock();
+
+        let fingerprint =
+            crate::state::request_fingerprint(&[&input.project_id, &input.asset_ids], None);
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(replayed)
+            | crate::state::TokenVerdict::Spent(replayed) => {
+                // A project deleted since leaves the retry nothing to answer from, so
+                // that retry is served as the fresh association it now is — which is
+                // the not-found refusal below.
+                if store.projects.contains_key(&replayed) {
+                    return Ok(BatchAssociateProjectAssetsOutput {
+                        errors: Some(Vec::new()),
+                    });
+                }
+            }
+            crate::state::TokenVerdict::Serve => {}
+        }
 
         // The project is what the association is recorded ON, so an id that resolves to
         // no stored project names no project to associate anything with. Resolved
@@ -230,6 +250,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(internal_failure());
         };
         project.asset_ids = associated;
+
+        // The token is spent only now that the association has been made: a refused
+        // request associated nothing, so the caller may send its token again. The
+        // resource the call acted on is the project the membership is held on.
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &input.project_id,
+            now,
+        );
 
         // "A list of associated error information, if any": none, so the list is
         // empty. Nothing in this handler can fail for one asset while succeeding for

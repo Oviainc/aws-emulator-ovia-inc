@@ -162,14 +162,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // project is gone could never have been created. The access policies that name
         // the project are left alone — a policy is a resource of its own, addressed by
         // its own id and removed by `DeleteAccessPolicy`. An id that resolves to no
-        // stored project is the modelled 404 rather than a silent success — which is
-        // also what a retry carrying the `clientToken` of a delete that already landed
-        // gets, because this store keeps no token -> answer mapping to replay from,
-        // exactly as the creates in this crate leave it to the idempotency issue.
+        // stored project is the modelled 404 rather than a silent success.
+        //
+        // `clientToken` makes this delete idempotent, as the member documents: "A
+        // unique case-sensitive identifier that you can provide to ensure the
+        // idempotency of the request." A retry carries the token of the call it
+        // repeats, so it replays that call's success rather than the not-found refusal
+        // the removal itself would now produce, and removes nothing further. This
+        // operation's error list declares no conflict error, so the token alone names
+        // the call it repeats: a request reusing it is answered from that call rather
+        // than refused with an error this operation does not model, exactly as
+        // `CreateDashboard` answers a reused token.
         let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+
+        let fingerprint = crate::state::request_fingerprint(&[&input.project_id], None);
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(_) | crate::state::TokenVerdict::Spent(_) => {
+                return Ok(DeleteProjectOutput {});
+            }
+            crate::state::TokenVerdict::Serve => {}
+        }
+
         if store.forget_project(&input.project_id).is_none() {
             return Err(not_found(&input.project_id));
         }
+
+        // The token is spent only now that the delete has succeeded: a refused
+        // request removed nothing, so the caller may send its token again.
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &input.project_id,
+            now,
+        );
 
         Ok(DeleteProjectOutput {})
     }

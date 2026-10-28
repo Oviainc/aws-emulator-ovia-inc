@@ -221,7 +221,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.notification_sender_email,
                 &input.alarms,
                 &input.portal_type,
-                &portal_type_configuration_fingerprint(input.portal_type_configuration.as_ref()),
+                &crate::state::portal_type_configuration_fingerprint(
+                    input.portal_type_configuration.as_ref(),
+                ),
                 &logo_image_fingerprint(input.portal_logo_image.as_ref()),
             ],
             None,
@@ -343,11 +345,6 @@ const IMAGE_MEMBERS: [&str; 2] = ["id", "file"];
 /// ([`crate::state::not_found_message`]).
 const RESOURCE_IMAGE: &str = "Image";
 
-/// How a member the request did not carry renders in a fingerprint. No rendering of
-/// a member it DID carry can collide with it: both renderings below are a `Debug`
-/// form, which starts with a bracket or a member name.
-const ABSENT: &str = "<absent>";
-
 /// Refuse a `portalLogoImage` that does not name EXACTLY ONE of its alternatives.
 ///
 /// `Image` is a choice spelled as a structure of optional members — "Contains an
@@ -367,45 +364,23 @@ fn check_logo_image(image: &Image) -> Result<(), String> {
     ))
 }
 
-/// A canonical rendering of the `portalTypeConfiguration` a request carried, for the
-/// idempotency fingerprint of that request.
-///
-/// The configuration is a MAP, which has no order of its own, so its entries go in
-/// SORTED by key: a retry of one call has to render identically to it whatever order
-/// either request's map happens to iterate in.
-fn portal_type_configuration_fingerprint(
-    configuration: Option<&::std::collections::HashMap<String, PortalTypeEntry>>,
-) -> String {
-    match configuration {
-        None => ABSENT.to_string(),
-        Some(configuration) => {
-            let mut entries: Vec<(&String, &PortalTypeEntry)> = configuration.iter().collect();
-            entries.sort_by_key(|(key, _)| *key);
-            format!("{entries:?}")
-        }
-    }
-}
-
 /// A canonical and BOUNDED rendering of the `portalLogoImage` a request carried, for
 /// the idempotency fingerprint of that request.
 ///
-/// The image's own BYTES are not rendered: `ImageFile$data` admits up to 1.5 MB and a
-/// fingerprint is kept for as long as the token it was spent under, so an uploaded
-/// file goes in as the SHA-256 digest of its contents beside its file type. Two
-/// different files still render differently and the same file renders identically,
-/// which is all a retry has to be told apart by.
+/// The file alternative goes in through [`crate::state::image_file_fingerprint`], the
+/// one rendering of an uploaded image this service keeps.
 fn logo_image_fingerprint(image: Option<&Image>) -> String {
     match image {
-        None => ABSENT.to_string(),
+        None => crate::state::FINGERPRINT_ABSENT.to_string(),
         Some(image) => {
             // Both alternatives are rendered although exactly one of them is set by
             // the time this runs: which one the request named is itself part of what
             // tells two requests apart, so neither is left out of the rendering.
-            let file = image.file.as_ref().map(|file| {
-                let digest = <::sha2::Sha256 as ::sha2::Digest>::digest(&file.data);
-                format!("{}:{}", file.r#type, ::hex::encode(digest))
-            });
-            format!("id={:?},file={file:?}", image.id)
+            format!(
+                "id={:?},file={}",
+                image.id,
+                crate::state::image_file_fingerprint(image.file.as_ref())
+            )
         }
     }
 }

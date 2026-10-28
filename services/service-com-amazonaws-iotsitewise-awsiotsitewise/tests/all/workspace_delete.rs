@@ -830,9 +830,9 @@ async fn a_delete_of_a_workspace_this_service_does_not_hold_is_a_modelled_not_fo
     let before = describe_workspace(&router, HELD).await.1;
 
     // A delete that lands first, so the SECOND delete of that name is a row of
-    // this table: a `clientToken` buys no replay of the answer that already went
-    // out, exactly as this crate's other deletes leave idempotency to its own
-    // issue.
+    // this table: a delete carrying no token, or one of its own, is judged on the
+    // state it finds — only a retry carrying the token the first delete SPENT
+    // replays that call's answer.
     let (status, created) = create_workspace(
         &router,
         json!({

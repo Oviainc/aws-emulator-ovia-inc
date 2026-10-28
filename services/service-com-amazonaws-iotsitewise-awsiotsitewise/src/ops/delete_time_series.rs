@@ -187,7 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteTimeSeriesError::Modeled(
@@ -196,8 +196,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }),
             )
         })?;
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         let now = ::std::time::SystemTime::now();
+
+        // `clientToken` makes this delete idempotent, as the member documents: "A
+        // unique case-sensitive identifier that you can provide to ensure the
+        // idempotency of the request." A retry carries the token of the call it
+        // repeats, so it replays that call's success rather than the not-found refusal
+        // the removal itself would now produce, and removes nothing further; a token
+        // already spent on a DIFFERENT request belongs to another call, which is the
+        // modelled conflict. It is the FIRST thing decided, because the call it repeats
+        // was already served.
+        let fingerprint = crate::state::request_fingerprint(
+            &[
+                &input.alias,
+                &input.asset_id,
+                &input.property_id,
+                &input.workspace_name,
+            ],
+            None,
+        );
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(_) => return Ok(DeleteTimeSeriesOutput),
+            crate::state::TokenVerdict::Spent(spent_on) => {
+                return Err(token_spent(&region, &spent_on));
+            }
+            crate::state::TokenVerdict::Serve => {}
+        }
 
         // `workspaceName` scopes the delete to one SiteWise workspace. This store
         // holds no time series inside a workspace — nothing that ingests one
@@ -273,6 +299,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // against the pair, and the property itself survives; for a DISASSOCIATED one
         // the record goes and the alias names nothing afterwards. Both forms of the
         // request leave the store in one state.
+        //
+        // The stream's own `TimeSeriesId` is read BEFORE it goes: it is the resource
+        // this call acted on, which is what a reused token's conflict names.
+        let deleted_time_series_id = match &stream {
+            crate::state::SeriesKey::Property(asset_id, property_id) => {
+                crate::state::time_series_id(asset_id, property_id)
+            }
+            crate::state::SeriesKey::Disassociated(alias) => store
+                .disassociated_time_series
+                .get(alias)
+                .map(|series| series.time_series_id.clone())
+                .unwrap_or_else(|| alias.clone()),
+        };
         match &stream {
             crate::state::SeriesKey::Property(asset_id, property_id) => {
                 // Dropping the binding is an accepted write to the asset that
@@ -285,8 +324,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The token is spent only now that the delete has succeeded: a refused
+        // request removed nothing, so the caller may send its token again.
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &deleted_time_series_id,
+            now,
+        );
+
         Ok(DeleteTimeSeriesOutput)
     }
+}
+
+/// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
+/// request already spent: the conflict is with the time series that request
+/// removed, so `resourceId`/`resourceArn` name it — built from this request's
+/// region, because the stream that call deleted is gone.
+fn token_spent(region: &str, time_series_id: &str) -> DeleteTimeSeriesError {
+    DeleteTimeSeriesError::Modeled(
+        DeleteTimeSeriesErrorModeled::ConflictingOperationException(ConflictingOperationException {
+            message: crate::state::already_using_message("time series", "clientToken"),
+            resource_id: time_series_id.to_string(),
+            resource_arn: crate::state::time_series_arn(region, time_series_id),
+        }),
+    )
 }
 
 /// HTTP 404 `ResourceNotFoundException` carrying `message`.

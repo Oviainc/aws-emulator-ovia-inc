@@ -181,10 +181,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             ))
         })?;
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
 
         let mut store = state.lock();
         let now = ::std::time::SystemTime::now();
+
+        // `clientToken` makes this delete idempotent, as the member documents: "A
+        // unique case-sensitive identifier that you can provide to ensure the
+        // idempotency of the request." A retry carries the token of the call it
+        // repeats, so it replays that call's answer — the asset model it removed,
+        // reported DELETING — rather than the not-found refusal the removal itself
+        // would now produce, and removes nothing further; a token already spent on a
+        // DIFFERENT request belongs to another call, which is the modelled conflict.
+        // It is the FIRST thing decided, ahead even of the conditional headers: the
+        // first call took the version they were written against away with the model.
+        let fingerprint = crate::state::request_fingerprint(
+            &[
+                &input.asset_model_id,
+                &input.if_match,
+                &input.if_none_match,
+                &input.match_for_version_type,
+            ],
+            None,
+        );
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(replayed) => {
+                // The answer the first call gave: the asset model it removed is gone by
+                // the time its retry lands, which is exactly why that answer is
+                // replayed from the record of the call rather than re-derived.
+                return Ok(DeleteAssetModelOutput {
+                    asset_model_id: Some(replayed),
+                    asset_model_status: AssetModelStatus {
+                        state: crate::state::STATE_DELETING.to_string(),
+                        error: None,
+                    },
+                });
+            }
+            crate::state::TokenVerdict::Spent(spent_on) => {
+                return Err(token_spent(&region, &spent_on));
+            }
+            crate::state::TokenVerdict::Serve => {}
+        }
+
         // The label is either the raw UUID or the `externalId:<externalId>` alias form.
         let id = store
             .resolve_asset_model_id(&input.asset_model_id)
@@ -296,6 +334,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         store.forget_asset_model(&id);
 
+        // The token is spent only now that the delete has succeeded: a refused
+        // request removed nothing, so the caller may send its token again.
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &id,
+            now,
+        );
+
         Ok(DeleteAssetModelOutput {
             asset_model_id: Some(id),
             asset_model_status: AssetModelStatus {
@@ -304,6 +352,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         })
     }
+}
+
+/// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
+/// request already spent: the conflict is with the asset model that request
+/// removed, so `resourceId`/`resourceArn` name it — built from this request's
+/// region, because the model that call deleted no longer carries an ARN of its own.
+fn token_spent(region: &str, asset_model_id: &str) -> DeleteAssetModelError {
+    DeleteAssetModelError::Modeled(
+        DeleteAssetModelErrorModeled::ConflictingOperationException(ConflictingOperationException {
+            message: crate::state::already_using_message("asset model", "clientToken"),
+            resource_id: asset_model_id.to_string(),
+            resource_arn: crate::state::asset_model_arn(region, asset_model_id),
+        }),
+    )
 }
 
 /// HTTP 412 `PreconditionFailedException` for a conditional header that evaluated

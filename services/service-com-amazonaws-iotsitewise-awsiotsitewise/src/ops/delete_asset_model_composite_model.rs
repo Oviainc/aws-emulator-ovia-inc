@@ -184,6 +184,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
+        // `clientToken` makes this delete idempotent, as the member documents: "A
+        // unique case-sensitive identifier that you can provide to ensure the
+        // idempotency of the request." A retry carries the token of the call it
+        // repeats, so it reports the asset model's status and writes nothing — it
+        // neither removes a second composite model nor mints a second version; a
+        // token already spent on a DIFFERENT request belongs to another call, which
+        // is the modelled conflict. It is the FIRST thing decided, ahead even of the
+        // conditional headers: the first call moved the ETag they were written
+        // against, so a retry judged on them would be refused the precondition its
+        // own call had already satisfied.
+        let fingerprint = crate::state::request_fingerprint(
+            &[
+                &input.asset_model_id,
+                &input.asset_model_composite_model_id,
+                &input.if_match,
+                &input.if_none_match,
+                &input.match_for_version_type,
+            ],
+            None,
+        );
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(replayed) => {
+                // An asset model deleted since leaves the retry nothing to answer
+                // from, so that retry is served as the fresh delete it now is — which
+                // is the not-found refusal below.
+                let answered = store.asset_models.get(&replayed).map(|model| {
+                    DeleteAssetModelCompositeModelOutput {
+                        asset_model_id: Some(model.id.clone()),
+                        asset_model_status: model.status(now),
+                    }
+                });
+                if let Some(output) = answered {
+                    return Ok(output);
+                }
+            }
+            crate::state::TokenVerdict::Spent(spent_on) => {
+                // The ARN the conflict reports is the one the stored model CARRIES,
+                // read back from the record rather than rebuilt; a model removed
+                // since the token was spent leaves no resource to name, so such a
+                // request is served as the fresh call it now is.
+                let conflicting = store
+                    .asset_models
+                    .get(&spent_on)
+                    .map(|model| (model.id.clone(), model.arn.clone()));
+                if let Some((asset_model_id, arn)) = conflicting {
+                    return Err(token_spent(&asset_model_id, arn));
+                }
+            }
+            crate::state::TokenVerdict::Serve => {}
+        }
+
         // Both id members are `CustomID` labels — a raw UUID or
         // `externalId:<externalId>`. The asset model is resolved FIRST: a request
         // that names no stored asset model is a 404 whatever else it asks for,
@@ -312,6 +363,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record.begin_update(superseded, now);
         let asset_model_status = record.status(now);
 
+        // The token is spent only now that the delete has succeeded: a refused
+        // request removed nothing, so the caller may send its token again. The
+        // resource the call acted on is the asset model it wrote to, which is what
+        // a retry of this call replays.
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &asset_model_id,
+            now,
+        );
+
         Ok(DeleteAssetModelCompositeModelOutput {
             asset_model_id: Some(asset_model_id),
             asset_model_status,
@@ -400,6 +463,23 @@ fn depends_on(
                 .filter_map(|segment| segment.id.as_deref())
                 .any(|id| doomed_properties.contains(id) || doomed.contains(id))
     })
+}
+
+/// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
+/// request already spent: the conflict is with the asset model that request
+/// wrote to, so `resourceId`/`resourceArn` name it.
+fn token_spent(
+    asset_model_id: &str,
+    resource_arn: String,
+) -> DeleteAssetModelCompositeModelError {
+    DeleteAssetModelCompositeModelErrorModeled::ConflictingOperationException(
+        ConflictingOperationException {
+            message: crate::state::already_using_message("composite model", "clientToken"),
+            resource_id: asset_model_id.to_string(),
+            resource_arn,
+        },
+    )
+    .into()
 }
 
 /// HTTP 500 `InternalFailureException`: this service's store is not reachable.
