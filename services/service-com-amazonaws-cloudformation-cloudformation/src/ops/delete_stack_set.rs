@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteStackSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteStackSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteStackSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: deletes the StackSet the request addresses — the record this administrator
+//! account and Region holds under that name or id — leaving its summary behind with the
+//! `DELETED` status `ListStackSets` reports for it until a new StackSet takes that name in
+//! that Region, and taking it out of everything that RESOLVES a StackSet.
+//! A StackSet that still holds stack instances is refused with the modelled
+//! `StackSetNotEmptyException`, one with an operation still in flight with
+//! `OperationInProgressException`, and a name nothing resolves is a success, since the
+//! operation models no not-found failure and the request asks for a state the store is
+//! already in.
 //!
 //! ## Shape of an operation
 //!
@@ -76,6 +76,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::stack_sets::status;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -146,18 +147,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteStackSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteStackSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteStackSet"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no StackSet store to delete from, so
+            // nothing was written and 501 is the only honest answer.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteStackSet",
+            ));
+        };
+
+        // `CallAs` chooses which administrator account the call is made from — the
+        // management account itself or a delegated administrator in a member account. This
+        // emulator holds one administrator account's StackSets, so either value writes the
+        // same store, and the operation models no error to refuse one with.
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // Every status transition the clock had already made due is materialised before this
+        // call decides anything: an operation whose conclusion was owed is concluded, so a
+        // StackSet is not told an operation is in progress on the strength of a record the
+        // clock had already retired.
+        store.settle(::std::time::SystemTime::now());
+
+        // "The name or unique ID of the StackSet that you're deleting." The operation models
+        // NO not-found failure — `OperationInProgressException` and
+        // `StackSetNotEmptyException` are the two it declares — so a name this administrator
+        // account and Region resolves no StackSet for, one never created or one already
+        // deleted, is a success: the request asks for a state the store is already in, and a
+        // repeated delete of one StackSet answers exactly as the first did.
+        let Some(stack_set) = store.resolve_stack_set_mut(&region, &input.stack_set_name) else {
+            return Ok(DeleteStackSetOutput {});
+        };
+
+        // "Only one operation can be performed for a stack set at a given time": the refusal
+        // names the StackSet it is about and the operation that still holds it, both read off
+        // the record the store holds.
+        if let Some(in_flight) = stack_set.operation_in_flight() {
+            return Err(DeleteStackSetErrorModeled::OperationInProgressException(
+                OperationInProgressException {
+                    message: Some(crate::state::stack_sets::operation_in_progress_message(
+                        &stack_set.stack_set_arn,
+                        &in_flight.operation_id,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "Before you can delete a StackSet, all its member stack instances must be
+        // deleted": a StackSet that still holds an instance is refused with the modelled
+        // `StackSetNotEmptyException`, and nothing of it is deleted.
+        if !stack_set.instances.is_empty() {
+            return Err(DeleteStackSetErrorModeled::StackSetNotEmptyException(
+                StackSetNotEmptyException {
+                    message: Some(crate::state::stack_sets::STACK_SET_NOT_EMPTY.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The deletion itself: the record keeps its id, ARN and configuration and takes the
+        // terminal `StackSetStatus` the model declares for a deleted StackSet, which is what
+        // `ListStackSets` reports for one asked for that status — and what takes the StackSet
+        // out of everything that RESOLVES one, since a deleted StackSet is no longer
+        // addressable.
+        stack_set.status = status::DELETED.to_string();
+
+        // `DeleteStackSetOutput` models no member: the deletion is immediate, so there is no
+        // StackSet operation for a caller to monitor.
+        Ok(DeleteStackSetOutput {})
     }
 }

@@ -4754,7 +4754,8 @@ impl ComAmazonawsCloudformationCloudformationState {
 
     /// The stack set `name_or_id` addresses in the request's Region, if this store holds it:
     /// `StackSetName` is "the name or unique ID of the StackSet", and nothing outside that
-    /// Region is addressable (see [`stack_sets`]).
+    /// Region is addressable — nor is a stack set a deletion has already taken, whose summary
+    /// stays for `ListStackSets` alone (see [`stack_sets::StoredStackSet::is_addressed_by`]).
     pub fn resolve_stack_set(
         &self,
         region: &str,
