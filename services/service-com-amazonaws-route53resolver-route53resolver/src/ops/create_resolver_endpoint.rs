@@ -274,6 +274,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // An endpoint's addresses are placed IN subnets of the caller's VPC, so
+        // every `SubnetId` the request names has to be a subnet the account
+        // holds; one that resolves to nothing is refused before the store is
+        // locked, so no endpoint is created against a subnet that does not
+        // exist.
+        if let Some(unknown) = crate::state::unresolvable_subnet_id(
+            &*self.engine,
+            input
+                .ip_addresses
+                .iter()
+                .map(|requested| requested.subnet_id.as_str()),
+        ) {
+            return Err(CreateResolverEndpointErrorModeled::InvalidParameterException(
+                crate::state::subnet_not_found(&unknown),
+            )
+            .into());
+        }
+
         let mut store = state.lock();
         // `CreatorRequestId` exists so "failed requests [can] be retried without
         // the risk of running the operation twice": a repeat of a request id that
@@ -329,8 +347,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ip_id: crate::state::mint_ip_id(ip_seq),
                 subnet_id: requested.subnet_id.clone(),
                 // An address the request did not supply is left unset rather than
-                // invented: the emulator holds no subnet inventory, so it cannot
-                // know a value that lies inside the subnet's CIDR.
+                // invented: the service does not pick one out of the subnet's
+                // CIDR range here.
                 ip: requested.ip.clone(),
                 ipv6: requested.ipv6.clone(),
                 status: crate::state::IP_STATUS_CREATING.to_string(),

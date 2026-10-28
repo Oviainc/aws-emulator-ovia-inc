@@ -19,7 +19,9 @@ use service_com_amazonaws_route53resolver_route53resolver::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::harness::{call, emulator, error_type, expect_error, ok, parse_time, string_member};
+use super::harness::{
+    call, emulator, error_type, expect_error, ok, parse_time, string_member, Emulator,
+};
 
 /// A create request body with `count` IP addresses, one per subnet named
 /// `subnet-<creator>-<index>`.
@@ -44,8 +46,18 @@ fn endpoint(body: &Value) -> &Value {
 }
 
 /// Create an endpoint with `count` addresses and return its `Id`.
-async fn seed_endpoint(router: &MultiServiceRouter, creator: &str, count: usize) -> String {
-    let created = ok(router, "CreateResolverEndpoint", create_body(creator, count)).await;
+///
+/// The subnets it is placed in are registered in the account's own Amazon EC2
+/// store first: an endpoint's addresses live in subnets of the caller's VPC, and
+/// the write path resolves every `SubnetId` against that store.
+async fn seed_endpoint(router: &Emulator, creator: &str, count: usize) -> String {
+    let body = create_body(creator, count);
+    router.hold_subnets(
+        (0..count)
+            .map(|index| format!("subnet-{creator}-{index}"))
+            .collect::<Vec<String>>(),
+    );
+    let created = ok(router, "CreateResolverEndpoint", body).await;
     string_member(endpoint(&created), "Id")
 }
 
@@ -129,6 +141,14 @@ async fn an_associated_ip_address_is_read_back_from_state() {
 
     let mut expected_count = 2;
     for AssociateCase { case, ip_address } in &cases {
+        // The subnet the addition names is one of the account's own, as on a
+        // create.
+        router.hold_subnets(
+            ip_address
+                .get("SubnetId")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        );
         let before: Vec<String> = stored_addresses(&router, &id)
             .await
             .iter()
@@ -215,6 +235,7 @@ async fn an_associated_ip_address_is_read_back_from_state() {
 async fn an_associated_address_attaches_once_the_clock_owes_it() {
     let router = emulator();
     let id = seed_endpoint(&router, "assoc-clock", 2).await;
+    router.hold_subnets(["subnet-assoc-clock-new"]);
 
     let associated = ok(
         &router,
@@ -305,6 +326,7 @@ async fn a_disassociated_ip_address_is_removed_from_state() {
         if let Some(ipv6) = ipv6 {
             address["Ipv6"] = json!(ipv6);
         }
+        router.hold_subnets([format!("subnet-disassoc-extra-{index}")]);
         ok(
             &router,
             "AssociateResolverEndpointIpAddress",
@@ -490,6 +512,7 @@ async fn the_address_set_stays_within_its_modelled_bounds() {
     // The maximum: an endpoint already holding the most addresses it could be
     // created with takes no more.
     let largest = seed_endpoint(&router, "bounds-max", MAX_ENDPOINT_IP_ADDRESSES).await;
+    router.hold_subnets(["subnet-bounds-max-new"]);
     let full = stored_addresses(&router, &largest).await;
     expect_error(
         &router,
@@ -540,6 +563,7 @@ async fn the_address_set_stays_within_its_modelled_bounds() {
 async fn a_refused_request_writes_nothing() {
     let router = emulator();
     let id = seed_endpoint(&router, "refusals", 3).await;
+    router.hold_subnets(["subnet-refusals-new"]);
     let before = stored_addresses(&router, &id).await;
     let stored_ip_id = string_member(&before[0], "IpId");
 

@@ -320,7 +320,7 @@
 //!   the zone's `Name`, its `HostedZoneConfig`'s comment and the first of the `VPCs` a
 //!   private zone answers for, each further one an `AssociateVPCWithHostedZone` of its own —
 //!   beside the `CallerReference` every such create requires and the type publishes no
-//!   property for ([`hosted_zone_caller_reference`]). Its `HostedZoneTags` are no member of
+//!   property for ([`route53_caller_reference`]). Its `HostedZoneTags` are no member of
 //!   that create at all: a zone is tagged by `ChangeTagsForResource`, in the batches that
 //!   call's own bound admits. The zone's identity is Route 53's OWN — "Ref returns the hosted
 //!   zone ID", which that create MINTS and no naming rule could compute — so the id it
@@ -337,6 +337,17 @@
 //!   removed by the `DELETE` one, which Route 53 matches against the record's own values, so
 //!   the delete carries the declaration the create was made from. Its identity is
 //!   CloudFormation's ("Ref returns the record name"), so the create answers none of its own.
+//!
+//! * `AWS::Route53::HealthCheck`'s `HealthCheckConfig` property states the members of the
+//!   configuration `CreateHealthCheck` takes ([`HEALTH_CHECK_CONFIG_MEMBERS`]), spelled
+//!   identically on both sides, beside the `CallerReference` that create requires and the
+//!   type publishes no property for ([`route53_caller_reference`]); its `HealthCheckTags`
+//!   reach Route 53 through `ChangeTagsForResource`, as a zone's do. A changed declaration
+//!   is applied through `UpdateHealthCheck`, whose members are the editable settings of a
+//!   live check, with `ResetElements` for an element the declaration stopped stating. The
+//!   check's identity is Route 53's OWN — "Ref returns the health check ID", which that
+//!   create MINTS — so the id it answered with is what the stack reports, and that is the
+//!   value `GetHealthCheck` and a record set's `HealthCheckId` take.
 //!
 //! * the three `AWS::Backup::*` types' properties are their creates' own members, with two
 //!   differences and no others: a plan's rule list is published as `BackupPlanRule` where
@@ -412,7 +423,8 @@ use super::template::{
     MQ_BROKER, MSK_CLUSTER,
     MSK_SERVERLESS_CLUSTER, OPENSEARCH_DOMAIN, REDSHIFT_CLUSTER, ROUTE53RESOLVER_ENDPOINT,
     ROUTE53RESOLVER_RULE,
-    ROUTE53RESOLVER_RULE_ASSOCIATION, ROUTE53_HOSTED_ZONE, ROUTE53_RECORD_SET,
+    ROUTE53RESOLVER_RULE_ASSOCIATION, ROUTE53_HEALTH_CHECK, ROUTE53_HOSTED_ZONE,
+    ROUTE53_RECORD_SET,
     S3VECTORS_BUCKET_SEGMENT, S3VECTORS_INDEX,
     S3VECTORS_VECTOR_BUCKET, SAGEMAKER_MODEL_PACKAGE_GROUP, SCHEDULER_SCHEDULE,
     SCHEDULER_SCHEDULE_GROUP, SES_CONFIGURATION_SET, SES_RECEIPT_RULE, SES_RECEIPT_RULE_SET,
@@ -559,6 +571,7 @@ pub(super) enum Provisioner {
     Route53ResolverRuleAssociation,
     Route53HostedZone,
     Route53RecordSet,
+    Route53HealthCheck,
     ElasticBeanstalkApplication,
     ElasticBeanstalkApplicationVersion,
     ElasticBeanstalkEnvironment,
@@ -650,6 +663,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         ROUTE53RESOLVER_RULE_ASSOCIATION => Some(Provisioner::Route53ResolverRuleAssociation),
         ROUTE53_HOSTED_ZONE => Some(Provisioner::Route53HostedZone),
         ROUTE53_RECORD_SET => Some(Provisioner::Route53RecordSet),
+        ROUTE53_HEALTH_CHECK => Some(Provisioner::Route53HealthCheck),
         ELASTIC_BEANSTALK_APPLICATION => Some(Provisioner::ElasticBeanstalkApplication),
         ELASTIC_BEANSTALK_APPLICATION_VERSION => {
             Some(Provisioner::ElasticBeanstalkApplicationVersion)
@@ -879,6 +893,12 @@ impl Provisioner {
             // hosted zone, not a record set — so the type is not taggable and no tags are
             // propagated to one.
             Self::Route53RecordSet => create_record_set(ctx, region, resource).await,
+            // `AWS::Route53::HealthCheck` publishes `HealthCheckTags`, which the health
+            // check carries beside the ones CloudFormation gives it — applied through
+            // `ChangeTagsForResource`, since `CreateHealthCheck` takes no tags.
+            Self::Route53HealthCheck => {
+                create_health_check(ctx, region, resource, propagated).await
+            }
             // `AWS::ElasticBeanstalk::Application` publishes `ApplicationName`,
             // `Description` and `ResourceLifecycleConfig` and no `Tags`: the type is not
             // taggable, so no tags are propagated to it. The same goes for
@@ -1249,6 +1269,11 @@ impl Provisioner {
                 )
                 .await
             }
+            // Every member of a health check's configuration that can change on a live one
+            // is a member of `UpdateHealthCheck`, so a changed declaration is applied to the
+            // health check the stack created — under the id its `Ref` resolves to — rather
+            // than replacing it ([`update_health_check`]).
+            Self::Route53HealthCheck => update_health_check(ctx, region, resource, declared).await,
             // `UpdateJob` takes the `JobUpdate` that "completely overwrites" the previous
             // job definition, and every property of `AWS::Glue::Job` but its name is a
             // member of that shape — so a changed declaration is applied to the job the
@@ -1485,6 +1510,9 @@ impl Provisioner {
             // Route 53 removes a record set by its own values, which only the resource's
             // own record carries — as is the zone its declaration names.
             Self::Route53RecordSet => delete_record_set(ctx, region, resource).await,
+            Self::Route53HealthCheck => {
+                delete_health_check(ctx, region, physical_resource_id).await
+            }
             Self::ElasticBeanstalkApplication => {
                 delete_eb_application(ctx, region, physical_resource_id).await
             }
@@ -1730,6 +1758,8 @@ impl Provisioner {
             // The read is addressed by the record's own name, type and set identifier in the
             // zone its declaration names, which only the resource's own record carries.
             Self::Route53RecordSet => describe_record_set(ctx, region, resource).await,
+            // Read back by the id Route 53 minted, which is this resource's physical id.
+            Self::Route53HealthCheck => describe_health_check(ctx, region, resource).await,
             Self::ElasticBeanstalkApplication => {
                 describe_eb_application(ctx, region, physical_resource_id).await
             }
@@ -17851,9 +17881,11 @@ const NO_SUCH_HOSTED_ZONE: &str = "NoSuchHostedZone";
 /// zone id accepts beside the bare form.
 const HOSTED_ZONE_ID_PATH_PREFIX: &str = "/hostedzone/";
 
-/// The `ResourceType` a tagging call names a hosted zone under: "The resource type for
-/// hosted zones is `hostedzone`" (`ChangeTagsForResource$ResourceType`).
+/// The `ResourceType` a tagging call names a hosted zone and a health check under: "the
+/// resource type for hosted zones is `hostedzone`" and "the resource type for health checks
+/// is `healthcheck`" (`ChangeTagsForResource$ResourceType`).
 const HOSTED_ZONE_TAG_RESOURCE_TYPE: &str = "hostedzone";
+const HEALTH_CHECK_TAG_RESOURCE_TYPE: &str = "healthcheck";
 
 /// The most tags one `ChangeTagsForResource` carries: its `AddTags` list is
 /// `@length(min: 1, max: 10)`, so a larger set is applied in that many calls.
@@ -17957,17 +17989,21 @@ fn unmapped_property(properties: &Map<String, Value>, mapped: &[&str]) -> Option
         .cloned()
 }
 
-/// The `CallerReference` CloudFormation sends with `CreateHostedZone`.
+/// The `CallerReference` CloudFormation sends with a Route 53 create that requires one.
 ///
-/// That member is REQUIRED ("a unique string that identifies the request and that allows
-/// failed CreateHostedZone requests to be retried without the risk of executing the
-/// operation twice") and the resource type publishes no property for it, so it is
+/// `CreateHostedZone$CallerReference` and `CreateHealthCheck$CallerReference` are both
+/// REQUIRED ("a unique string that identifies the request and that allows failed
+/// CreateHostedZone requests to be retried without the risk of executing the operation
+/// twice") and neither resource type publishes a property for it, so it is
 /// CloudFormation's to supply. It is derived from the stack this resource belongs to and its
 /// place in it — the two tags CloudFormation records on every resource it provisions — so it
 /// is unique per stack and logical id, and the SAME string if this deployment is attempted
 /// again, which is exactly the retry that member exists for. The digest keeps it inside the
-/// `Nonce` bound (1..128) whatever the stack is called.
-fn hosted_zone_caller_reference(
+/// shorter of the two bounds (`Nonce` is 1..128 and `HealthCheckNonce` 1..64) whatever the
+/// stack is called, and `salt` keeps the reference of one stack's zone apart from its health
+/// check's.
+fn route53_caller_reference(
+    salt: &str,
     resource: &StoredResource,
     propagated: &[(String, String)],
 ) -> String {
@@ -17976,12 +18012,12 @@ fn hosted_zone_caller_reference(
         .find(|(key, _)| key == super::provisioning::STACK_ID_TAG)
         .map(|(_, value)| value.as_str())
         .unwrap_or_default();
-    super::template::content_digest(
-        "route53-hosted-zone",
-        &format!("{stack}/{}", resource.logical_id),
-        32,
-    )
+    super::template::content_digest(salt, &format!("{stack}/{}", resource.logical_id), 32)
 }
+
+/// The salt each Route 53 type's caller reference is derived under.
+const HOSTED_ZONE_CALLER_REFERENCE_SALT: &str = "route53-hosted-zone";
+const HEALTH_CHECK_CALLER_REFERENCE_SALT: &str = "route53-health-check";
 
 /// Each Amazon VPC a hosted zone's declaration names, as the `VPC` element `CreateHostedZone`
 /// and `AssociateVPCWithHostedZone` both take.
@@ -18055,7 +18091,7 @@ async fn create_hosted_zone(
     }
     members.push_str(&xml_leaf(
         "CallerReference",
-        &hosted_zone_caller_reference(resource, propagated),
+        &route53_caller_reference(HOSTED_ZONE_CALLER_REFERENCE_SALT, resource, propagated),
     ));
     // The type's `HostedZoneConfig` publishes `Comment` alone; whether the zone is private
     // follows from the VPCs it names, which is what `CreateHostedZone` reads it from.
@@ -18102,26 +18138,35 @@ async fn create_hosted_zone(
         )
         .await?;
     }
-    change_hosted_zone_tags(ctx, region, &id, &hosted_zone_tags(resource, propagated)).await?;
+    change_route53_tags(
+        ctx,
+        region,
+        HOSTED_ZONE_TAG_RESOURCE_TYPE,
+        &id,
+        &route53_tags(resource, "HostedZoneTags", propagated),
+    )
+    .await?;
     Ok(Created {
         physical_resource_id: Some(id),
         attributes: BTreeMap::new(),
     })
 }
 
-/// The tags a hosted zone is to carry: the ones its declaration asks for plus the ones
-/// CloudFormation gives the resource.
+/// The tags a Route 53 resource is to carry: the ones its declaration asks for plus the
+/// ones CloudFormation gives the resource.
 ///
-/// This type spells its tag property `HostedZoneTags` rather than `Tags`, so the declared
-/// list is read under the name [`tags_of`] — the one place the declared and the propagated
-/// halves are merged — looks for.
-fn hosted_zone_tags(
+/// Neither Route 53 type spells its tag property `Tags` — a zone's are `HostedZoneTags` and
+/// a health check's `HealthCheckTags` — so the declared list is read out of `property` and
+/// offered under the name [`tags_of`] looks for, that being the one place the declared and
+/// the propagated halves are merged.
+fn route53_tags(
     resource: &StoredResource,
+    property: &str,
     propagated: &[(String, String)],
 ) -> Vec<(String, String)> {
     let declared = resource
         .properties
-        .get("HostedZoneTags")
+        .get(property)
         .cloned()
         .unwrap_or(Value::Null);
     let mut properties = Map::new();
@@ -18129,12 +18174,13 @@ fn hosted_zone_tags(
     tags_of(&Value::Object(properties), propagated)
 }
 
-/// Add `tags` to the hosted zone `id`, in the batches `ChangeTagsForResource` takes
-/// ([`MAX_TAGS_PER_TAG_CHANGE`]). A zone to carry no tags at all has nothing called about
-/// it: that call's `AddTags` is `@length(min: 1, …)`.
-async fn change_hosted_zone_tags(
+/// Add `tags` to the Route 53 resource `id` of `resource_type`, in the batches
+/// `ChangeTagsForResource` takes ([`MAX_TAGS_PER_TAG_CHANGE`]). A resource to carry no tags
+/// at all has nothing called about it: that call's `AddTags` is `@length(min: 1, …)`.
+async fn change_route53_tags(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
+    resource_type: &str,
     id: &str,
     tags: &[(String, String)],
 ) -> Result<(), Refusal> {
@@ -18152,7 +18198,8 @@ async fn change_hosted_zone_tags(
             region,
             "POST",
             &format!(
-                "/tags/{HOSTED_ZONE_TAG_RESOURCE_TYPE}/{}",
+                "/tags/{}/{}",
+                percent_encoded(resource_type),
                 percent_encoded(id)
             ),
             Some(&route53_request(
@@ -18223,52 +18270,59 @@ async fn describe_hosted_zone(
     Ok(Some(reported_as_properties(&reported, &[("Name", "Name")])))
 }
 
-/// What one published property of `AWS::Route53::RecordSet` is on the `ResourceRecordSet`
-/// the change batch carries.
+/// What one published property of an Amazon Route 53 resource type is on the shape the
+/// operation that deploys it carries — the `ResourceRecordSet` of a change batch, or the
+/// `HealthCheckConfig` of a health-check create.
 #[derive(Debug, Clone, Copy)]
-enum RecordSetMember {
+enum Route53Member {
     /// A scalar member, written as its own element carrying the declared text.
     Scalar,
-    /// The record's VALUES: a list of strings in a template, a list of `ResourceRecord`
-    /// structures on the wire ("`Value` — the current or new DNS record value").
-    Records,
+    /// A LIST member: a list of scalars in a template, and on the wire one `entry` element
+    /// per value — carrying the value itself (`ChildHealthChecks` is a list of
+    /// `ChildHealthCheck` elements), or its one named member where the modelled entry is a
+    /// structure (a record's VALUES are a list of `ResourceRecord` structures, "`Value` —
+    /// the current or new DNS record value").
+    Entries {
+        entry: &'static str,
+        member: Option<&'static str>,
+    },
     /// A nested structure, whose own members are these.
-    Structure(&'static [(&'static str, RecordSetMember)]),
+    Structure(&'static [(&'static str, Route53Member)]),
 }
 
 /// `GeoLocation`'s members, spelled identically on the type and in the model.
-const GEO_LOCATION_MEMBERS: &[(&str, RecordSetMember)] = &[
-    ("ContinentCode", RecordSetMember::Scalar),
-    ("CountryCode", RecordSetMember::Scalar),
-    ("SubdivisionCode", RecordSetMember::Scalar),
+const GEO_LOCATION_MEMBERS: &[(&str, Route53Member)] = &[
+    ("ContinentCode", Route53Member::Scalar),
+    ("CountryCode", Route53Member::Scalar),
+    ("SubdivisionCode", Route53Member::Scalar),
 ];
 
 /// `Coordinates`' members, the latitude and longitude a geoproximity rule is measured from.
-const COORDINATES_MEMBERS: &[(&str, RecordSetMember)] = &[
-    ("Latitude", RecordSetMember::Scalar),
-    ("Longitude", RecordSetMember::Scalar),
+const COORDINATES_MEMBERS: &[(&str, Route53Member)] = &[
+    ("Latitude", Route53Member::Scalar),
+    ("Longitude", Route53Member::Scalar),
 ];
 
 /// `GeoProximityLocation`'s members.
-const GEO_PROXIMITY_MEMBERS: &[(&str, RecordSetMember)] = &[
-    ("AWSRegion", RecordSetMember::Scalar),
-    ("LocalZoneGroup", RecordSetMember::Scalar),
-    ("Coordinates", RecordSetMember::Structure(COORDINATES_MEMBERS)),
-    ("Bias", RecordSetMember::Scalar),
+const GEO_PROXIMITY_MEMBERS: &[(&str, Route53Member)] = &[
+    ("AWSRegion", Route53Member::Scalar),
+    ("LocalZoneGroup", Route53Member::Scalar),
+    ("Coordinates", Route53Member::Structure(COORDINATES_MEMBERS)),
+    ("Bias", Route53Member::Scalar),
 ];
 
 /// `AliasTarget`'s members — the zone and the DNS name an alias routes to, and whether it
 /// inherits that target's health.
-const ALIAS_TARGET_MEMBERS: &[(&str, RecordSetMember)] = &[
-    ("HostedZoneId", RecordSetMember::Scalar),
-    ("DNSName", RecordSetMember::Scalar),
-    ("EvaluateTargetHealth", RecordSetMember::Scalar),
+const ALIAS_TARGET_MEMBERS: &[(&str, Route53Member)] = &[
+    ("HostedZoneId", Route53Member::Scalar),
+    ("DNSName", Route53Member::Scalar),
+    ("EvaluateTargetHealth", Route53Member::Scalar),
 ];
 
 /// `CidrRoutingConfig`'s members.
-const CIDR_ROUTING_MEMBERS: &[(&str, RecordSetMember)] = &[
-    ("CollectionId", RecordSetMember::Scalar),
-    ("LocationName", RecordSetMember::Scalar),
+const CIDR_ROUTING_MEMBERS: &[(&str, Route53Member)] = &[
+    ("CollectionId", Route53Member::Scalar),
+    ("LocationName", Route53Member::Scalar),
 ];
 
 /// Every published property of `AWS::Route53::RecordSet` that is a member of the
@@ -18281,23 +18335,29 @@ const CIDR_ROUTING_MEMBERS: &[(&str, RecordSetMember)] = &[
 /// members of it are handled by the arm itself — `HostedZoneId` and `HostedZoneName` say
 /// which zone the record belongs to (the URI label the operation binds), and `Comment` is
 /// the `ChangeBatch`'s own.
-const RECORD_SET_MEMBERS: &[(&str, RecordSetMember)] = &[
-    ("Name", RecordSetMember::Scalar),
-    ("Type", RecordSetMember::Scalar),
-    ("SetIdentifier", RecordSetMember::Scalar),
-    ("Weight", RecordSetMember::Scalar),
-    ("Region", RecordSetMember::Scalar),
-    ("GeoLocation", RecordSetMember::Structure(GEO_LOCATION_MEMBERS)),
-    ("Failover", RecordSetMember::Scalar),
-    ("MultiValueAnswer", RecordSetMember::Scalar),
-    ("TTL", RecordSetMember::Scalar),
-    ("ResourceRecords", RecordSetMember::Records),
-    ("AliasTarget", RecordSetMember::Structure(ALIAS_TARGET_MEMBERS)),
-    ("HealthCheckId", RecordSetMember::Scalar),
-    ("CidrRoutingConfig", RecordSetMember::Structure(CIDR_ROUTING_MEMBERS)),
+const RECORD_SET_MEMBERS: &[(&str, Route53Member)] = &[
+    ("Name", Route53Member::Scalar),
+    ("Type", Route53Member::Scalar),
+    ("SetIdentifier", Route53Member::Scalar),
+    ("Weight", Route53Member::Scalar),
+    ("Region", Route53Member::Scalar),
+    ("GeoLocation", Route53Member::Structure(GEO_LOCATION_MEMBERS)),
+    ("Failover", Route53Member::Scalar),
+    ("MultiValueAnswer", Route53Member::Scalar),
+    ("TTL", Route53Member::Scalar),
+    (
+        "ResourceRecords",
+        Route53Member::Entries {
+            entry: "ResourceRecord",
+            member: Some("Value"),
+        },
+    ),
+    ("AliasTarget", Route53Member::Structure(ALIAS_TARGET_MEMBERS)),
+    ("HealthCheckId", Route53Member::Scalar),
+    ("CidrRoutingConfig", Route53Member::Structure(CIDR_ROUTING_MEMBERS)),
     (
         "GeoProximityLocation",
-        RecordSetMember::Structure(GEO_PROXIMITY_MEMBERS),
+        Route53Member::Structure(GEO_PROXIMITY_MEMBERS),
     ),
 ];
 
@@ -18309,45 +18369,46 @@ fn record_set_properties() -> Vec<&'static str> {
     mapped
 }
 
-/// One member of a record set as the change batch carries it, or `None` for a property the
+/// One member of a Route 53 shape as the request carries it, or `None` for a property the
 /// declaration does not state.
-fn record_set_member(
+fn route53_member(
     name: &str,
-    member: RecordSetMember,
+    member: Route53Member,
     declared: &Value,
 ) -> Result<Option<String>, Refusal> {
     match member {
-        RecordSetMember::Scalar => Ok(scalar_text(declared)
+        Route53Member::Scalar => Ok(scalar_text(declared)
             .filter(|text| !text.is_empty())
             .map(|text| xml_leaf(name, &text))),
-        RecordSetMember::Records => {
+        Route53Member::Entries { entry, member } => {
             let Value::Array(values) = declared else {
                 return Err(malformed_property(name));
             };
-            let mut records = String::new();
+            let mut entries = String::new();
             for value in values {
                 let value = scalar_text(value).ok_or_else(|| malformed_property(name))?;
-                records.push_str(&format!(
-                    "<ResourceRecord>{}</ResourceRecord>",
-                    xml_leaf("Value", &value)
-                ));
+                let held = match member {
+                    Some(member) => xml_leaf(member, &value),
+                    None => ::quick_xml::escape::escape(&value).into_owned(),
+                };
+                entries.push_str(&format!("<{entry}>{held}</{entry}>"));
             }
-            Ok(Some(format!("<{name}>{records}</{name}>")))
+            Ok(Some(format!("<{name}>{entries}</{name}>")))
         }
-        RecordSetMember::Structure(members) => {
+        Route53Member::Structure(members) => {
             let Value::Object(declared) = declared else {
                 return Err(malformed_property(name));
             };
             let mut rendered = String::new();
             for (member_name, member) in members {
                 if let Some(value) = declared.get(*member_name) {
-                    if let Some(written) = record_set_member(member_name, *member, value)? {
+                    if let Some(written) = route53_member(member_name, *member, value)? {
                         rendered.push_str(&written);
                     }
                 }
             }
             // A member of the structure the catalogue does not name is no member of the
-            // shape: refused rather than dropped, so a record set is never created with
+            // shape: refused rather than dropped, so a resource is never created with
             // less than its declaration asked for.
             for member_name in declared.keys() {
                 if !members.iter().any(|(known, _)| known == member_name) {
@@ -18378,7 +18439,7 @@ fn record_set_element(resource: &StoredResource) -> Result<String, Refusal> {
         let Some(declared) = resource.properties.get(*name) else {
             continue;
         };
-        if let Some(written) = record_set_member(name, *member, declared)? {
+        if let Some(written) = route53_member(name, *member, declared)? {
             rendered.push_str(&written);
         }
     }
@@ -18586,6 +18647,356 @@ async fn describe_record_set(
             ("HealthCheckId", "HealthCheckId"),
         ],
     )))
+}
+
+// ---------------------------------------------------------------------------
+// Amazon Route 53 health checks: AWS::Route53::HealthCheck
+// ---------------------------------------------------------------------------
+
+/// The error code Route 53 answers for a health check it does not hold: "no health check
+/// exists with the specified ID" (`NoSuchHealthCheck`).
+const NO_SUCH_HEALTH_CHECK: &str = "NoSuchHealthCheck";
+
+/// `AlarmIdentifier`'s members — the Region the CloudWatch alarm lives in and its name —
+/// spelled identically on the type and in the model.
+const ALARM_IDENTIFIER_MEMBERS: &[(&str, Route53Member)] = &[
+    ("Region", Route53Member::Scalar),
+    ("Name", Route53Member::Scalar),
+];
+
+/// Every member of the `HealthCheckConfig` a health check is created with, in the order the
+/// model declares them.
+///
+/// The type's `HealthCheckConfig` property states those members under the very same names,
+/// so each declared value goes through as the template wrote it. The two list members carry
+/// one element per value, under the element name the model gives the list's member
+/// (`ChildHealthChecks` a `ChildHealthCheck` each, `Regions` a `Region` each), and
+/// `AlarmIdentifier` is a structure of its own.
+const HEALTH_CHECK_CONFIG_MEMBERS: &[(&str, Route53Member)] = &[
+    ("IPAddress", Route53Member::Scalar),
+    ("Port", Route53Member::Scalar),
+    ("Type", Route53Member::Scalar),
+    ("ResourcePath", Route53Member::Scalar),
+    ("FullyQualifiedDomainName", Route53Member::Scalar),
+    ("SearchString", Route53Member::Scalar),
+    ("RequestInterval", Route53Member::Scalar),
+    ("FailureThreshold", Route53Member::Scalar),
+    ("MeasureLatency", Route53Member::Scalar),
+    ("Inverted", Route53Member::Scalar),
+    ("Disabled", Route53Member::Scalar),
+    ("HealthThreshold", Route53Member::Scalar),
+    (
+        "ChildHealthChecks",
+        Route53Member::Entries {
+            entry: "ChildHealthCheck",
+            member: None,
+        },
+    ),
+    ("EnableSNI", Route53Member::Scalar),
+    (
+        "Regions",
+        Route53Member::Entries {
+            entry: "Region",
+            member: None,
+        },
+    ),
+    (
+        "AlarmIdentifier",
+        Route53Member::Structure(ALARM_IDENTIFIER_MEMBERS),
+    ),
+    ("InsufficientDataHealthStatus", Route53Member::Scalar),
+    ("RoutingControlArn", Route53Member::Scalar),
+];
+
+/// The properties of `AWS::Route53::HealthCheck` this arm maps onto `CreateHealthCheck` and
+/// the calls beside it.
+///
+/// Source: AWS's CloudFormation resource reference for the type, which publishes exactly
+/// two: the `HealthCheckConfig` the check is created with, and `HealthCheckTags`, the
+/// check's own tags.
+const HEALTH_CHECK_PROPERTIES: &[&str] = &["HealthCheckConfig", "HealthCheckTags"];
+
+/// The members of a `HealthCheckConfig` that no `UpdateHealthCheck` carries, so a change to
+/// one cannot be applied to a health check that already exists.
+///
+/// `Type`, `RequestInterval` and `MeasureLatency` each state that you can't change their
+/// value after you create a health check, and `RoutingControlArn` is not a member of that
+/// operation's input at all.
+const UNCHANGEABLE_HEALTH_CHECK_MEMBERS: &[&str] = &[
+    "Type",
+    "RequestInterval",
+    "MeasureLatency",
+    "RoutingControlArn",
+];
+
+/// The elements `UpdateHealthCheck$ResetElements` can put back to their default, which are
+/// the only ones a declaration can stop stating and have the health check follow: the
+/// `ResettableElementName` enum's own value set.
+const RESETTABLE_HEALTH_CHECK_MEMBERS: &[&str] = &[
+    "ChildHealthChecks",
+    "FullyQualifiedDomainName",
+    "Regions",
+    "ResourcePath",
+];
+
+/// The `HealthCheckConfig` a declaration states, as the member document it is.
+///
+/// That property is REQUIRED by the resource type, `CreateHealthCheck$HealthCheckConfig` is
+/// `@required` and so is its own `Type` ("the type of health check that you want to create,
+/// which indicates how Amazon Route 53 determines whether an endpoint is healthy"), so a
+/// declaration missing either describes no health check that could be created and is refused
+/// here rather than with a request Route 53 would have to reject. A member the catalogue does
+/// not name is no member of the shape, and is refused rather than dropped.
+fn health_check_config<'a>(
+    resource_type: &str,
+    declared: &'a Value,
+) -> Result<&'a Map<String, Value>, Refusal> {
+    let missing = |member: &str| Refusal {
+        code: MISSING_PROPERTY_CODE.to_string(),
+        message: format!(
+            "Property {member} cannot be empty for resource of type {resource_type}"
+        ),
+    };
+    let Some(config) = declared.get("HealthCheckConfig") else {
+        return Err(missing("HealthCheckConfig"));
+    };
+    let Value::Object(config) = config else {
+        return Err(malformed_property("HealthCheckConfig"));
+    };
+    for member in config.keys() {
+        if !HEALTH_CHECK_CONFIG_MEMBERS
+            .iter()
+            .any(|(known, _)| known == member)
+        {
+            return Err(malformed_property(&format!("HealthCheckConfig.{member}")));
+        }
+    }
+    if config
+        .get("Type")
+        .and_then(scalar_text)
+        .is_none_or(|kind| kind.is_empty())
+    {
+        return Err(missing("HealthCheckConfig.Type"));
+    }
+    Ok(config)
+}
+
+/// The `HealthCheckConfig` element one declaration renders to, member by member in the
+/// order the model declares them.
+fn health_check_config_element(
+    resource_type: &str,
+    declared: &Value,
+) -> Result<String, Refusal> {
+    let config = health_check_config(resource_type, declared)?;
+    let mut rendered = String::new();
+    for (name, member) in HEALTH_CHECK_CONFIG_MEMBERS {
+        if let Some(value) = config.get(*name) {
+            if let Some(written) = route53_member(name, *member, value)? {
+                rendered.push_str(&written);
+            }
+        }
+    }
+    Ok(format!("<HealthCheckConfig>{rendered}</HealthCheckConfig>"))
+}
+
+/// Create the health check an `AWS::Route53::HealthCheck` declares, so a client reading the
+/// stack's output and then calling Route 53 with that value — `GetHealthCheck`,
+/// `GetHealthCheckStatus`, a record set's own `HealthCheckId` — reaches the health check the
+/// template asked for.
+///
+/// `Ref` on this resource returns the health check ID, which `CreateHealthCheck` MINTS, so
+/// the id that answer carries replaces the computed physical id and the type's
+/// `HealthCheckId` attribute is read off it
+/// ([`super::provisioning::adopt_minted_identity`]). The health check carries the tags its
+/// declaration asks for plus the ones CloudFormation gives the resource ([`tags_of`]),
+/// applied through `ChangeTagsForResource`, which is how Route 53 tags a health check:
+/// `CreateHealthCheck` takes no tags at all.
+async fn create_health_check(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    refuse_unmapped_properties(resource, HEALTH_CHECK_PROPERTIES)?;
+    // In the order `CreateHealthCheckRequest` declares its members.
+    let members = format!(
+        "{}{}",
+        xml_leaf(
+            "CallerReference",
+            &route53_caller_reference(HEALTH_CHECK_CALLER_REFERENCE_SALT, resource, propagated)
+        ),
+        health_check_config_element(&resource.resource_type, &resource.properties)?
+    );
+    let answered = call_route53(
+        ctx,
+        region,
+        "POST",
+        "/healthcheck",
+        Some(&route53_request("CreateHealthCheckRequest", &members)),
+    )
+    .await?;
+    let reported = xml_scalar_children(&answered, "HealthCheck");
+    let id = reported
+        .get("Id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| Refusal {
+            code: UNIDENTIFIED_FAILURE.to_string(),
+            message: "CreateHealthCheck answered no HealthCheck.Id".to_string(),
+        })?
+        .to_string();
+    change_route53_tags(
+        ctx,
+        region,
+        HEALTH_CHECK_TAG_RESOURCE_TYPE,
+        &id,
+        &route53_tags(resource, "HealthCheckTags", propagated),
+    )
+    .await?;
+    Ok(Created {
+        physical_resource_id: Some(id),
+        attributes: BTreeMap::new(),
+    })
+}
+
+/// Apply a CHANGED `AWS::Route53::HealthCheck` declaration to the health check the stack
+/// already has, through Route 53's own `UpdateHealthCheck` — whose members are exactly the
+/// settings of a live health check that are editable, so the check keeps the id every
+/// reference to it resolves to and its `HealthCheckVersion` advances.
+///
+/// `Ok(None)` is a change that call cannot make, so the deployment reports it as not applied
+/// rather than as a success that dropped it:
+///
+/// * a declaration that changes a member no `UpdateHealthCheck` carries
+///   ([`UNCHANGEABLE_HEALTH_CHECK_MEMBERS`]);
+/// * a declaration that no longer states a member that call cannot unset — only the four
+///   elements `ResetElements` names go back to their default, and a member the call simply
+///   leaves out keeps its stored value;
+/// * a declaration that changes the health check's TAGS, which reach Route 53 through
+///   `ChangeTagsForResource` rather than through this call.
+async fn update_health_check(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+) -> Result<Option<Created>, Refusal> {
+    let held = health_check_config(&resource.resource_type, &resource.properties)?;
+    let wanted = health_check_config(&resource.resource_type, declared)?;
+    if resource.properties.get("HealthCheckTags") != declared.get("HealthCheckTags") {
+        return Ok(None);
+    }
+    for member in UNCHANGEABLE_HEALTH_CHECK_MEMBERS {
+        if held.get(*member) != wanted.get(*member) {
+            return Ok(None);
+        }
+    }
+    // Dropping the four unchangeable members above is already settled, so what is left is
+    // the editable ones: the declared value of each, and `ResetElements` for each the
+    // declaration no longer states.
+    let mut members = String::new();
+    let mut reset = String::new();
+    for (name, member) in HEALTH_CHECK_CONFIG_MEMBERS {
+        if UNCHANGEABLE_HEALTH_CHECK_MEMBERS.contains(name) {
+            continue;
+        }
+        match wanted.get(*name) {
+            Some(value) => {
+                if let Some(written) = route53_member(name, *member, value)? {
+                    members.push_str(&written);
+                }
+            }
+            None if held.contains_key(*name) => {
+                if !RESETTABLE_HEALTH_CHECK_MEMBERS.contains(name) {
+                    return Ok(None);
+                }
+                reset.push_str(&xml_leaf("ResettableElementName", name));
+            }
+            None => {}
+        }
+    }
+    if !reset.is_empty() {
+        members.push_str(&format!("<ResetElements>{reset}</ResetElements>"));
+    }
+    call_route53(
+        ctx,
+        region,
+        "POST",
+        &format!(
+            "/healthcheck/{}",
+            percent_encoded(&resource.physical_resource_id)
+        ),
+        Some(&route53_request("UpdateHealthCheckRequest", &members)),
+    )
+    .await?;
+    // The type publishes `HealthCheckId` alone, which is the identity the stack already
+    // records, so the update reports no attribute of its own.
+    Ok(Some(Created::attributes(BTreeMap::new())))
+}
+
+/// Delete the health check a stack created, by the id its create minted. One Route 53 no
+/// longer holds (`NoSuchHealthCheck`) is already in the state the delete asks for.
+///
+/// "Amazon Route 53 does not prevent you from deleting a health check even if the health
+/// check is associated with one or more resource record sets", so a stack that declares a
+/// record set referencing its own health check has nothing to undo first.
+async fn delete_health_check(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    match call_route53(
+        ctx,
+        region,
+        "DELETE",
+        &format!("/healthcheck/{}", percent_encoded(physical_resource_id)),
+        None,
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == NO_SUCH_HEALTH_CHECK => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The health check's configuration as Route 53 reports it, for drift detection. An id it
+/// no longer holds a health check for (`NoSuchHealthCheck`) was deleted.
+///
+/// Only the SCALAR members `GetHealthCheck` reports inside the health check's configuration
+/// are compared, and the property is left out of the reported document altogether where the
+/// declaration states a member that read does not carry as one — a child-check list, the
+/// alarm identifier — because a value the owning service did not report is not evidence of
+/// anything ([`super::drift::differs`]). The declared `HealthCheckTags` are no part of the
+/// reported health check at all.
+async fn describe_health_check(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Option<Value>, Refusal> {
+    let answered = match call_route53(
+        ctx,
+        region,
+        "GET",
+        &format!(
+            "/healthcheck/{}",
+            percent_encoded(&resource.physical_resource_id)
+        ),
+        None,
+    )
+    .await
+    {
+        Ok(answered) => answered,
+        Err(refusal) if refusal.code == NO_SUCH_HEALTH_CHECK => return Ok(None),
+        Err(refusal) => return Err(refusal),
+    };
+    let reported = xml_scalar_children(&answered, "HealthCheckConfig");
+    let mut properties = Map::new();
+    if let Ok(declared) = health_check_config(&resource.resource_type, &resource.properties) {
+        if declared.keys().all(|member| reported.contains_key(member)) {
+            properties.insert("HealthCheckConfig".to_string(), Value::Object(reported));
+        }
+    }
+    Ok(Some(Value::Object(properties)))
 }
 
 // ---------------------------------------------------------------------------

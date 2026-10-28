@@ -182,9 +182,10 @@ async fn versions_listing(harness: &Harness) -> Listing {
     }
 }
 
-/// A run holding [`ITEMS`] task instances, for the `ListTaskInstances` walk. Nothing in
-/// this service's API creates a task instance, so the records are seeded into the store
-/// the handler reads, through the same seam the `GetTaskInstance` suite uses.
+/// A run holding [`ITEMS`] task instances, for the `ListTaskInstances` walk. This run's
+/// version staged no definition, so it declares no task and the run materialises none:
+/// the records are seeded into the store the handler reads, through the same seam the
+/// `GetTaskInstance` suite uses.
 async fn task_instances_listing(harness: &Harness) -> Listing {
     let arn = created_workflow(harness, "pageSizeTasks").await;
     let run_id = started_run(harness, &arn, None).await;
