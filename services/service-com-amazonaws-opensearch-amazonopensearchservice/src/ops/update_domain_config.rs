@@ -440,6 +440,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(UpdateDomainConfigErrorModeled::ValidationException(refusal).into());
         }
 
+        // Cognito authentication for Dashboards has to be a configuration the service
+        // can provision, whichever call sets it, and by the same rule the create path
+        // applies. It is checked on the REQUEST's container: a supplied
+        // `CognitoOptions` REPLACES the stored one whole, so the container the request
+        // carries IS the configuration this change would leave the domain with, and a
+        // request that carries none changes nothing about the domain's sign-in path. A
+        // dry run is refused too — it reports what applying the change would do, and
+        // this change cannot be applied.
+        if let Some(refusal) = crate::state::cognito_authentication::cognito_options_refusal(
+            &*self.engine,
+            input.cognito_options.as_ref(),
+        ) {
+            return Err(UpdateDomainConfigErrorModeled::ValidationException(refusal).into());
+        }
+
         let touched = merge(&mut merged, input, now);
         let deployment = deployment_type(&merged, &touched);
 

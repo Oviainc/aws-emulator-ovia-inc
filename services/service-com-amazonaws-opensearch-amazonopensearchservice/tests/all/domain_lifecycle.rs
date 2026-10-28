@@ -72,6 +72,20 @@ impl Emulator {
         Self { router, engine }
     }
 
+    /// The same emulator with the Cognito user-pool service mounted on the SAME shared
+    /// engine, so a suite can create the user pool a domain's Dashboards authentication
+    /// names through that service's own `CreateUserPool` — the store this service
+    /// resolves a `CognitoOptions$UserPoolId` in — rather than by hand-building a pool
+    /// record.
+    pub(crate) fn with_user_pools() -> Self {
+        let mut emulator = Self::new();
+        emulator.router.register_service(
+            service_com_amazonaws_cognitoidentityprovider_awscognitoidentityproviderservice
+                ::EmulatedService::new(std::sync::Arc::clone(&emulator.engine)),
+        );
+        emulator
+    }
+
     /// This emulator's store, reached exactly as a handler reaches it. A suite uses it
     /// to put the record into a state no implemented operation can reach yet — the
     /// service software a landed deployment leaves behind, say, whose deploying
@@ -119,6 +133,13 @@ impl Emulator {
             .header("content-type", "application/json")
             .body(Bytes::from(payload))
             .expect("the test request is well formed");
+        self.dispatch(request).await
+    }
+
+    /// Answer a request the suite built itself — the seam a suite reaching ANOTHER
+    /// service mounted on this router drives its own protocol through, so the answer is
+    /// read the same way whichever service served it.
+    pub(crate) async fn dispatch(&self, request: http::Request<Bytes>) -> Answer {
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
         let error = response

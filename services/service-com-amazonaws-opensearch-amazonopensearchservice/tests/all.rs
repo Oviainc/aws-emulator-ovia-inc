@@ -23,6 +23,8 @@ mod application_updates;
 mod applications;
 #[path = "all/change_progress.rs"]
 mod change_progress;
+#[path = "all/cognito_dashboards_authentication.rs"]
+mod cognito_dashboards_authentication;
 #[path = "all/collection_element_refusals.rs"]
 mod collection_element_refusals;
 #[path = "all/compatible_versions.rs"]

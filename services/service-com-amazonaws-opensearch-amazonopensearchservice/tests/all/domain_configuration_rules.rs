@@ -71,7 +71,7 @@ fn fine_grained_access(password: &str) -> Value {
 
 /// Assert that `answer` is a modelled 400 refusal carrying `code` — the error the
 /// service answers this class of unprovisionable configuration with.
-fn assert_refusal(answer: &Answer, code: &str, case: &str) {
+pub(crate) fn assert_refusal(answer: &Answer, code: &str, case: &str) {
     assert_eq!(
         (answer.status, error_code(answer).as_str()),
         (400, code),
@@ -84,7 +84,7 @@ fn assert_refusal(answer: &Answer, code: &str, case: &str) {
 
 /// Assert that the store holds no domain under `name` — what a refused create must
 /// leave behind.
-async fn assert_no_domain(emulator: &Emulator, name: &str) {
+pub(crate) async fn assert_no_domain(emulator: &Emulator, name: &str) {
     let answer = emulator.describe(name).await;
     assert_eq!(
         error_code(&answer),

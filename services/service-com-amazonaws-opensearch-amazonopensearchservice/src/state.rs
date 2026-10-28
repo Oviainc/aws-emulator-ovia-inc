@@ -30,6 +30,11 @@ use std::time::{Duration, SystemTime};
 /// an index operation takes before it reads or writes the index the request names.
 pub mod authorization;
 
+/// Whether the Amazon Cognito authentication a request asks a domain's Dashboards to be
+/// reached through is a configuration the service can provision — the check the create
+/// path and the update path share.
+pub mod cognito_authentication;
+
 use crate::ops::types::{
     AIMLOptionsInput, AIMLOptionsOutput, AIMLOptionsStatus, AWSDomainInformation,
     AccessPoliciesStatus, AdditionalLimit,

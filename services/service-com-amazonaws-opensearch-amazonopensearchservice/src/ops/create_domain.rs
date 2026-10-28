@@ -288,12 +288,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // provision together is refused and NO domain is created — the master
         // credential of the internal user database has to meet the published
         // complexity requirement, an enabled log-publishing option has to name the
-        // group it publishes to, and the off-peak window cannot be asked for disabled.
+        // group it publishes to, the off-peak window cannot be asked for disabled, and
+        // an enabled Cognito authentication configuration has to name all three of the
+        // resources it is served by and a user pool that exists.
         if let Some(refusal) = [
             crate::state::master_user_password_refusal(input.advanced_security_options.as_ref()),
             crate::state::warm_storage_refusal(input.cluster_config.as_ref()),
             crate::state::log_publishing_refusal(input.log_publishing_options.iter().flatten()),
             crate::state::off_peak_window_refusal(input.off_peak_window_options.as_ref()),
+            crate::state::cognito_authentication::cognito_options_refusal(
+                &*self.engine,
+                input.cognito_options.as_ref(),
+            ),
         ]
         .into_iter()
         .flatten()
