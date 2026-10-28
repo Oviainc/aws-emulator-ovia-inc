@@ -312,6 +312,163 @@ async fn a_comparison_the_decode_cannot_read_is_refused_at_every_level() {
     }
 }
 
+/// Spellings the float syntax reads but that name no magnitude: the non-finite
+/// words `nan`, `inf` and `infinity`, in any case and with an optional sign
+/// (`f64`'s `FromStr` grammar), and the exponents past the largest magnitude a
+/// double holds (about `1.8e308`), which read as infinity rather than as the
+/// number written. Each row also stays inside the modelled `Value` bounds —
+/// 1..20 characters, and a pattern that admits letters, the space, `-` and `.`
+/// but no leading `+` (`smithy_query(query="shape",shape="Value")`) — so each
+/// is a value the service accepts and then has to read.
+fn spellings_naming_no_magnitude() -> Vec<String> {
+    let rows: Vec<String> = [
+        "NaN",
+        "nan",
+        "NAN",
+        "naN",
+        "-NaN",
+        "-nan",
+        " NaN ",
+        "inf",
+        "Inf",
+        "INF",
+        "-inf",
+        "infinity",
+        "Infinity",
+        "INFINITY",
+        "-infinity",
+        " -inf ",
+        "1e400",
+        "1E400",
+        "-1e400",
+        "1e309",
+    ]
+    .iter()
+    .map(|spelling| (*spelling).to_string())
+    .collect();
+    for row in &rows {
+        assert!(
+            (1..=MAX_VALUE_LENGTH).contains(&row.len()),
+            "case {row:?}: the probe must be a value the model admits, got {} characters",
+            row.len()
+        );
+        let read = row.trim().parse::<f64>().unwrap_or_else(|error| {
+            panic!("case {row:?}: the probe must be one the float syntax reads at all: {error}")
+        });
+        assert!(
+            !read.is_finite(),
+            "case {row:?}: the probe must name no finite magnitude, got {read}"
+        );
+    }
+    rows
+}
+
+/// RULE, from the checking side, over the values the float syntax reads yet
+/// that name no magnitude: a comparison on the numeric dimension is refused
+/// unless every one of `Values` names a magnitude, i.e. one finite number, so a
+/// non-finite spelling is refused exactly as `"half"` is — never accepted and
+/// then answered with a page whose contents the spelling alone decides (empty
+/// under either option, or every record under `GREATER_THAN_OR_EQUAL`).
+#[tokio::test]
+async fn a_value_naming_no_finite_magnitude_is_refused_like_any_unreadable_value() {
+    let (router, _engine) = harness();
+    let records = all_records(&router).await;
+    assert!(
+        !records.is_empty(),
+        "case setup: the account must hold usage records, so an accepted comparison would have \
+         rows to select"
+    );
+
+    let readable = comparison(SERVICE, &[EQUALS], &["AWSLambda".to_string()]);
+    for spelling in spellings_naming_no_magnitude() {
+        for option in [EQUALS, GREATER_THAN_OR_EQUAL] {
+            let case = format!("{USAGE_PERCENTAGE} {option} {spelling:?}");
+            let filter = comparison(
+                USAGE_PERCENTAGE,
+                &[option],
+                std::slice::from_ref(&spelling),
+            );
+            refuses(&router, &case, &filter).await;
+
+            // Beside values that DO name magnitudes, in each position: one
+            // value the decode cannot read makes the whole comparison
+            // unevaluable, wherever in the array it sits.
+            for beside in [
+                vec![spelling.clone(), "50".to_string()],
+                vec!["50".to_string(), spelling.clone()],
+                vec!["0".to_string(), spelling.clone(), "100".to_string()],
+            ] {
+                refuses(
+                    &router,
+                    &format!("{case} beside {beside:?}"),
+                    &comparison(USAGE_PERCENTAGE, &[option], &beside),
+                )
+                .await;
+            }
+
+            // The same comparison nested: the decode is the same decode
+            // wherever the comparison sits, including under a negation, where
+            // an accepted non-finite value would otherwise select every record.
+            for (place, nested) in [
+                (
+                    "inside And",
+                    json!({"And": [readable.clone(), filter.clone()]}),
+                ),
+                ("inside Or", json!({"Or": [filter.clone()]})),
+                ("inside Not", json!({"Not": filter.clone()})),
+            ] {
+                refuses(&router, &format!("{case} {place}"), &nested).await;
+            }
+        }
+    }
+}
+
+/// RULE, at the boundary of the refusal above: a value that names a FINITE
+/// magnitude is still read and still selects by comparison, however extreme the
+/// magnitude is — so the refusal is the rule's own edge (the largest and
+/// smallest magnitudes a double holds, and an exponent that underflows to zero)
+/// and not a refusal of large numbers.
+#[tokio::test]
+async fn a_finite_magnitude_is_still_read_however_extreme() {
+    let (router, _engine) = harness();
+    let records = all_records(&router).await;
+
+    // Rows at the edge of the double range, each the finite neighbour of a row
+    // the refusal above covers: the largest and smallest magnitudes that fit in
+    // 20 characters, an exponent small enough to underflow to zero, and a
+    // plain magnitude for contrast.
+    for spelling in ["1e308", "-1e308", "1e-400", "0", "50"] {
+        let magnitude = spelling
+            .trim()
+            .parse::<f64>()
+            .expect("the probe names a number");
+        assert!(
+            magnitude.is_finite(),
+            "case {spelling:?}: the probe must name a finite magnitude, got {magnitude}"
+        );
+        for option in [EQUALS, GREATER_THAN_OR_EQUAL] {
+            let expected: BTreeSet<String> = records
+                .iter()
+                .filter(|record| {
+                    let value = percentage(record);
+                    if option == GREATER_THAN_OR_EQUAL {
+                        value >= magnitude
+                    } else {
+                        (value - magnitude).abs() < f64::EPSILON
+                    }
+                })
+                .map(record_key)
+                .collect();
+            let filter = comparison(USAGE_PERCENTAGE, &[option], &[spelling.to_string()]);
+            let got = selected(&router, &filter).await;
+            assert_eq!(
+                got, expected,
+                "case {USAGE_PERCENTAGE} {option} {spelling:?}: expected {expected:?}, got {got:?}"
+            );
+        }
+    }
+}
+
 /// RULE, at its edge: reading a value as a magnitude is what ignores the
 /// whitespace around it, so a text dimension compares the value exactly as
 /// written — the padding that makes no difference to a magnitude makes all the

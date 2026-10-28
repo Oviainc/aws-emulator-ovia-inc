@@ -322,7 +322,7 @@ struct CheckedComparison<'a> {
 
 /// The `Values` of one comparison in the form the dimension's kind compares
 /// them in (`crate::state::DimensionKind`): text as written, and a numeric
-/// dimension's values as the magnitudes they name.
+/// dimension's values as the finite magnitudes they name.
 enum CheckedValues<'a> {
     Text(&'a [String]),
     Magnitudes(Vec<f64>),
@@ -421,9 +421,9 @@ fn check_branches<'a>(
 /// `MatchOptions` carries exactly one option ("You can specify only one of
 /// these values in the array", `DimensionValues$MatchOptions`), it has to be one
 /// the dimension's kind can be compared by, and comparing magnitudes needs
-/// values that are magnitudes — none of which depends on a record, so all of it
-/// is settled here — and settled ONCE: what this function decodes is what
-/// [`matches_dimension`] then compares by.
+/// values that each name a magnitude, i.e. one finite number — none of which
+/// depends on a record, so all of it is settled here — and settled ONCE: what
+/// this function decodes is what [`matches_dimension`] then compares by.
 fn check_dimension(
     dimensions: &DimensionValues,
 ) -> Result<CheckedComparison<'_>, GetFreeTierUsageError> {
@@ -481,7 +481,22 @@ fn check_dimension(
             }
             let mut magnitudes = Vec::with_capacity(dimensions.values.len());
             for wanted in &dimensions.values {
-                let Ok(magnitude) = wanted.trim().parse::<f64>() else {
+                // A value names a magnitude only when it reads as a FINITE
+                // number: the float syntax also spells the non-finite values
+                // (`NaN`, `inf`, `infinity`, signed or not, in any case) and an
+                // exponent too large for a `f64` reads as one too, and none of
+                // them names a magnitude a record's percentage could be
+                // compared against. Letting one through would defer the
+                // refusal to a comparison that is decided by its own form
+                // rather than by the record — false for every record, or true
+                // for every record — which is the empty page (or the
+                // unfiltered one) this branch exists instead of.
+                let Some(magnitude) = wanted
+                    .trim()
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|magnitude: &f64| magnitude.is_finite())
+                else {
                     return Err(validation(format!(
                         "filter.Dimensions.Values: {wanted} is not a number, and {key} compares \
                          numbers"
