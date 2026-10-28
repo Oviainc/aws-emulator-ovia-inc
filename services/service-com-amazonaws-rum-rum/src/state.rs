@@ -314,6 +314,40 @@ pub fn extended_metric(name: &str) -> Option<&'static ExtendedMetric> {
     EXTENDED_METRIC_CATALOG.iter().find(|entry| entry.name == name)
 }
 
+/// Every field a RUM event carries, which is every FIRST-LEVEL key a custom metric's
+/// `ValueKey`, `EventPattern` and `DimensionKeys` may name.
+///
+/// Source: the model's `MetricDefinitionRequest` documentation, "Valid key values for
+/// first-level keys in the `ValueKey`, `EventPattern`, and `DimensionKeys` fields"
+/// (`smithy_query(query="doc", shape="MetricDefinitionRequest")`), in the order it lists
+/// them.
+pub const RUM_EVENT_FIELDS: &[&str] = &[
+    "account_id",
+    "application_Id",
+    "application_version",
+    "application_name",
+    "batch_id",
+    "event_details",
+    "event_id",
+    "event_interaction",
+    "event_timestamp",
+    "event_type",
+    "event_version",
+    "log_stream",
+    "metadata",
+    "sessionId",
+    "user_details",
+    "userId",
+];
+
+/// The event field carrying the details of the event an `EventPattern` matches — the one
+/// whose presence the model pairs with [`EVENT_TYPE_FIELD`].
+pub const EVENT_DETAILS_FIELD: &str = "event_details";
+
+/// The event field carrying the type of the event an `EventPattern` matches, which decides
+/// which details that event has.
+pub const EVENT_TYPE_FIELD: &str = "event_type";
+
 /// The most bytes a resource-policy document may carry.
 ///
 /// From the model: `PutResourcePolicy` documents "The maximum size of the policy is 4
@@ -1447,6 +1481,11 @@ pub fn metric_destination_not_found(
 ///   dimensions listed in this field must also be included in `EventPattern`" — the
 ///   dimension's value is read out of the matched event, so the pattern has to name that
 ///   field, and a definition with dimensions but no pattern names none of them.
+/// * The event fields a CUSTOM metric reads and the pattern it reads them by (from the
+///   model): every first-level key its `ValueKey`, `EventPattern` and `DimensionKeys` name
+///   has to be a field a RUM event carries, a pattern filtering on `event_details` has to
+///   filter on `event_type` too, and an array in its pattern carries one value
+///   ([`custom_metric_refusal`]).
 pub fn metric_definition_refusal(definition: &MetricDefinitionRequest) -> Option<String> {
     let namespace = definition.namespace.as_deref();
     if let Some(namespace) = namespace {
@@ -1487,6 +1526,8 @@ pub fn metric_definition_refusal(definition: &MetricDefinitionRequest) -> Option
         if let Some(message) = extended_metric_refusal(definition, namespace, pattern.as_ref()) {
             return Some(message);
         }
+    } else if let Some(message) = custom_metric_refusal(definition, pattern.as_ref()) {
+        return Some(message);
     }
 
     // Sorted, so the one dimension a refusal names is the same whichever order the
@@ -1576,6 +1617,140 @@ fn extended_metric_refusal(
         ));
     }
     None
+}
+
+/// Why this definition is not the CUSTOM metric its namespace says it is, or `None` when
+/// it is one.
+///
+/// Reached for a definition published to a namespace of the caller's own, so the model's
+/// CUSTOM-metric rules are the ones in force. A custom metric is computed from the RUM
+/// events its pattern matches, which is what each of these rules follows from:
+///
+/// * "The values that you specify for `ValueKey`, `EventPattern`, and `DimensionKeys` must
+///   be fields in RUM events, so all first-level keys in these fields must be one of the
+///   keys in the list later in this section" — the keys that list holds are
+///   [`RUM_EVENT_FIELDS`], and a key outside it reads a field no event has.
+/// * "If `EventPattern` contains an `event_details` field, it must also contain an
+///   `event_type`", restated as "For every non-empty `event_details`, there must be a
+///   non-empty `event_type`" — the event's type is what decides which details it carries,
+///   so details are filtered on only beside a type.
+/// * "In `EventPattern`, any JSON array must contain only one value" — an array in a
+///   pattern is the one value its field is matched against.
+fn custom_metric_refusal(
+    definition: &MetricDefinitionRequest,
+    pattern: Option<&::serde_json::Value>,
+) -> Option<String> {
+    // The first-level key of each member that names event fields, in the order the model
+    // lists those members. A dotted path (`event_details.latency`) reads the field its
+    // FIRST segment names; a pattern reads the fields its top-level members name; and a
+    // dimension is keyed by the path its value is read from. Each member's keys are sorted,
+    // so the key a refusal names is the same whichever order the request spelled them in.
+    let mut named: Vec<(&str, Vec<&str>)> = Vec::new();
+    if let Some(value_key) = definition
+        .value_key
+        .as_deref()
+        .filter(|value_key| !value_key.is_empty())
+    {
+        named.push(("ValueKey", vec![first_level_key(value_key)]));
+    }
+    if let Some(members) = pattern.and_then(::serde_json::Value::as_object) {
+        named.push((
+            "EventPattern",
+            members.keys().map(String::as_str).collect(),
+        ));
+    }
+    let dimensions: Vec<&str> = definition
+        .dimension_keys
+        .iter()
+        .flatten()
+        .map(|(field, _)| first_level_key(field))
+        .collect();
+    if !dimensions.is_empty() {
+        named.push(("DimensionKeys", dimensions));
+    }
+    for (member, mut keys) in named {
+        keys.sort_unstable();
+        if let Some(unknown) = keys
+            .into_iter()
+            .find(|key| !RUM_EVENT_FIELDS.contains(key))
+        {
+            return Some(format!(
+                "{member} names the first-level key {unknown}, which is not a field of a RUM \
+                 event: a custom metric can name only the fields a RUM event carries."
+            ));
+        }
+    }
+
+    // Everything left is a rule about the pattern, so a definition carrying none is done.
+    let pattern = pattern?;
+    if !pattern_member_is_empty(pattern.get(EVENT_DETAILS_FIELD))
+        && pattern_member_is_empty(pattern.get(EVENT_TYPE_FIELD))
+    {
+        return Some(format!(
+            "EventPattern filters on {EVENT_DETAILS_FIELD}, so it must also carry a non-empty \
+             {EVENT_TYPE_FIELD}: the event's type is what decides which details it has."
+        ));
+    }
+    single_value_array_violation(pattern, "").map(|(path, held)| {
+        format!(
+            "EventPattern matches the field {path} against {held} values: an array in an \
+             EventPattern carries only one value."
+        )
+    })
+}
+
+/// The event field a dotted field path reads — its FIRST segment, which is the "first-level
+/// key" the model's valid-key list is about.
+fn first_level_key(path: &str) -> &str {
+    path.split('.').next().unwrap_or(path)
+}
+
+/// Whether this member of an event pattern filters on nothing: one that is absent, or one
+/// present but carrying no matcher at all.
+///
+/// The model states the `event_details`/`event_type` pairing in terms of emptiness ("For
+/// every non-empty `event_details`, there must be a non-empty `event_type`"), so a member
+/// that is there and empty is the same input as one left out.
+fn pattern_member_is_empty(member: Option<&::serde_json::Value>) -> bool {
+    match member {
+        None | Some(::serde_json::Value::Null) => true,
+        Some(::serde_json::Value::Object(members)) => members.is_empty(),
+        Some(::serde_json::Value::Array(items)) => items.is_empty(),
+        Some(::serde_json::Value::String(text)) => text.is_empty(),
+        Some(_) => false,
+    }
+}
+
+/// The path of the first array inside `value` that does not carry exactly ONE value, and
+/// how many values it carries — or `None` when every array in it carries one.
+///
+/// The path is spelled the way a request spells a field path: the member names from the
+/// pattern's root, dot-separated, with an index where the walk went through an array. The
+/// walk descends an ALREADY-PARSED pattern, whose nesting the JSON parser bounded, so a
+/// caller cannot choose how deep it goes.
+fn single_value_array_violation(
+    value: &::serde_json::Value,
+    path: &str,
+) -> Option<(String, usize)> {
+    match value {
+        ::serde_json::Value::Object(members) => members.iter().find_map(|(member, held)| {
+            let nested = if path.is_empty() {
+                member.clone()
+            } else {
+                format!("{path}.{member}")
+            };
+            single_value_array_violation(held, &nested)
+        }),
+        ::serde_json::Value::Array(items) => {
+            if items.len() != 1 {
+                return Some((path.to_string(), items.len()));
+            }
+            items.iter().enumerate().find_map(|(index, held)| {
+                single_value_array_violation(held, &format!("{path}[{index}]"))
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Whether the event pattern `pattern` INCLUDES everything `required` asks for.

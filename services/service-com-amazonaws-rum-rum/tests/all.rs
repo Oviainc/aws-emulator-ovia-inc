@@ -29,6 +29,8 @@ mod batch_get_metric_definitions_reads;
 mod constraint_refusals;
 #[path = "all/create_app_monitor_tags.rs"]
 mod create_app_monitor_tags;
+#[path = "all/custom_metric_event_fields.rs"]
+mod custom_metric_event_fields;
 #[path = "all/cw_log_delivery.rs"]
 mod cw_log_delivery;
 #[path = "all/cw_log_event_copies.rs"]
