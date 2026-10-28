@@ -324,10 +324,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }
                 }
                 crate::state::TokenVerdict::Mismatch => {
+                    // No cluster of this request exists to name: the token belongs
+                    // to another request, and the identifier this one would have
+                    // minted was never minted.
                     return Err(CreateClusterErrorModeled::ConflictException(ConflictException {
                         message: crate::state::CLIENT_TOKEN_MISMATCH_MESSAGE.to_string(),
                         resource_id: None,
-                        resource_type: Some("cluster".to_string()),
+                        resource_type: Some(crate::state::RESOURCE_TYPE_CLUSTER.to_string()),
                     })
                     .into());
                 }
@@ -347,9 +350,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::MAX_CLUSTERS
                     ),
                     resource_id: ::engine::emulator_account_id().to_string(),
-                    resource_type: "cluster".to_string(),
-                    service_code: "dsql".to_string(),
-                    quota_code: "clusters-per-account".to_string(),
+                    resource_type: crate::state::RESOURCE_TYPE_CLUSTER.to_string(),
+                    service_code: crate::state::ARN_SERVICE.to_string(),
+                    quota_code: QUOTA_CODE_CLUSTERS_PER_ACCOUNT.to_string(),
                 },
             )
             .into());
@@ -410,6 +413,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(created)
     }
 }
+
+/// The `quotaCode` the refusal at the cluster ceiling carries: the quota bounds
+/// how many clusters ONE account holds.
+const QUOTA_CODE_CLUSTERS_PER_ACCOUNT: &str = "clusters-per-account";
 
 /// The parameters a `CreateCluster` `clientToken` is bound to: every member of
 /// the request except the token itself, so a retry carrying the same token is
