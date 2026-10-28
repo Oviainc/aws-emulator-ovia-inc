@@ -151,25 +151,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // The config's type is implied by whichever member of the `ConfigTypeData` union
-        // the caller set, and the `{configType}` label is part of the config's address:
-        // an update whose `configData` selects another type would change the config's
-        // type and its ARN, which this URI cannot address, so it is refused as a bad
-        // parameter rather than silently retyping the config.
-        let data_type = crate::state::config_type_of(&input.config_data);
-        if data_type != input.config_type {
-            return Err(UpdateConfigErrorModeled::InvalidParameterException(
-                InvalidParameterException {
-                    message: Some(format!(
-                        "configData selects config type {data_type}, but this config is of type {}",
-                        input.config_type
-                    )),
-                    parameter_name: Some("configData".to_string()),
-                },
-            )
-            .into());
-        }
-
         // A config is addressed by BOTH labels, so an id whose stored type is not the
         // `{configType}` label names no config to update — just as an unknown id does
         // not. Asked FIRST, before the body is judged at all, so what the caller hears
@@ -185,19 +166,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )),
             })
         };
-        // Both are judged from this service's OWN store, under one short lock, before the
-        // cross-service bucket resolution below: the config the URI addresses has to be
-        // there, and what the service and this account may use in a `configData` — the
-        // ranges the model documents for its numeric members and the uplink frequencies
-        // this account is authorised to transmit on — holds of the parameters an update
-        // stores exactly as of the ones a create stores. So a local fault is never
-        // reported behind a cross-service call, and a refused update leaves the stored
-        // config as it was.
+        // All three gates below are judged from this service's OWN store, under one short
+        // lock, before the cross-service bucket resolution further down, and IN THIS
+        // ORDER: the config the URI addresses has to be there first, and only then is the
+        // body judged against it — the capability the `configData` selects, and what the
+        // service and this account may use in it (the ranges the model documents for its
+        // numeric members and the uplink frequencies this account is authorised to
+        // transmit on), which holds of the parameters an update stores exactly as of the
+        // ones a create stores. So a local fault is never reported behind a cross-service
+        // call, and a refused update leaves the stored config as it was.
         {
             let guard = state.lock();
-            if !guard.configs.contains_key(&key) {
+            let Some(stored) = guard.configs.get(&key) else {
                 return Err(not_found().into());
+            };
+
+            // The config's type is implied by whichever member of the `ConfigTypeData`
+            // union the caller set, and the type a config is stored under is part of its
+            // address: an update whose `configData` selects another type would change the
+            // config's type and its ARN, which this URI cannot address, so it is refused
+            // as a bad parameter rather than silently retyping the config. The refusal
+            // speaks about the type the ADDRESSED config is stored under, so it is only
+            // reachable once that config has been resolved just above — a pair holding no
+            // config is answered for the config that is missing, not for a body judged
+            // against a stored type nothing holds.
+            let data_type = crate::state::config_type_of(&input.config_data);
+            if data_type != stored.config_type {
+                return Err(UpdateConfigErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "configData selects config type {data_type}, but this config is of \
+                             type {}",
+                            stored.config_type
+                        )),
+                        parameter_name: Some("configData".to_string()),
+                    },
+                )
+                .into());
             }
+
             guard
                 .validate_config_data(&input.config_data)
                 .map_err(UpdateConfigErrorModeled::InvalidParameterException)?;
