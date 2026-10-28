@@ -10614,6 +10614,13 @@ pub const INVALID_ARGUMENT_CODE: &str = "InvalidArgument";
 /// The HTTP status [`INVALID_ARGUMENT_CODE`] is rendered with: 400, from the same list.
 pub const INVALID_ARGUMENT_STATUS: u16 = 400;
 
+/// The `<Message>` S3 sends with [`INVALID_ARGUMENT_CODE`] for a
+/// `NotificationConfiguration` naming a destination it could not validate.
+///
+/// A FIXED sentence: nothing about the request is interpolated into it.
+pub const UNABLE_TO_VALIDATE_DESTINATIONS_MESSAGE: &str =
+    "Unable to validate the following destination configurations";
+
 /// The code S3 answers a request whose content is not one it can carry out as given:
 /// "InvalidRequest", HTTP 400 (Amazon S3 "Error responses", list of error codes).
 ///

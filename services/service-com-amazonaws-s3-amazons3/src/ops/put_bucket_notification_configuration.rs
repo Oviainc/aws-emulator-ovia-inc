@@ -2,8 +2,11 @@
 
 //! @op PutBucketNotificationConfiguration
 //! Sets a bucket's whole event notification configuration, replacing whatever it carried
-//! before, and answers the modelled 200 with an empty body. `GetBucketNotificationConfiguration`
-//! reports what this stored.
+//! before, and answers the modelled 200 with an empty body. Every destination the container
+//! names is resolved against the service that owns it first — by publishing the
+//! `s3:TestEvent` test notification to it — and a container naming one that service refuses
+//! is refused whole with `InvalidArgument` (400) rather than recorded.
+//! `GetBucketNotificationConfiguration` reports what this stored.
 //!
 //! ## Shape of an operation
 //!
@@ -191,8 +194,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Nothing about this write depends on request metadata.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // The store is unreachable only when this service is mounted on an engine that
             // is not the shared `InMemoryEngine`; nothing can then be persisted, and
@@ -208,14 +209,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The container the request carried, in the order it arrived.
-        //
-        // `SkipDestinationValidation` is read but cannot change the outcome here: AWS's
-        // destination validation is a test message to the SNS topic, SQS queue or Lambda
-        // function named, and this handler reaches none of those services, so every put
-        // behaves the way AWS behaves when validation is skipped — the configuration is
-        // recorded as given. What IS checked below is the request itself: the destination
-        // ARNs, the events, the filter rules and the ids.
-        let _ = input.skip_destination_validation;
         let configuration = crate::state::BucketNotificationConfiguration {
             topic_configurations: input
                 .notification_configuration
@@ -265,14 +258,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The bucket is looked up FIRST, so a request naming a bucket this emulator does
         // not hold answers that — the way every other bucket subresource put orders the
         // two refusals — rather than reporting what is wrong with a configuration the
-        // bucket could never have carried.
-        let mut store = state.lock();
-        if store.bucket(&input.bucket).is_none() {
-            return Err(
-                PutBucketNotificationConfigurationErrorModeled::NoSuchBucket(NoSuchBucket {})
-                    .into(),
-            );
-        }
+        // bucket could never have carried. The bucket's Region travels on: it is the
+        // Region a destination whose own ARN names none is resolved in.
+        let bucket_region = {
+            let store = state.lock();
+            let Some(record) = store.bucket(&input.bucket) else {
+                return Err(
+                    PutBucketNotificationConfigurationErrorModeled::NoSuchBucket(NoSuchBucket {})
+                        .into(),
+                );
+            };
+            record.region.clone()
+        };
 
         // Validated BEFORE anything is written, because "the PUT notification is an atomic
         // operation … If the message fails, the entire PUT action will fail, and Amazon S3
@@ -288,10 +285,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // The pair this call is named by, minted before the test notification is published
+        // so that notification reports the request id this response carries — the same
+        // seam an object event's `responseElements` is named through.
+        let correlation = crate::state::request_ids::RequestCorrelation::mint();
+
+        // The DESTINATIONS, resolved against the services that own them: "after Amazon S3
+        // receives this request, it first verifies that any Amazon Simple Notification
+        // Service (Amazon SNS) or Amazon Simple Queue Service (Amazon SQS) destination
+        // exists, and that the bucket owner has permission to publish to it by sending a
+        // test notification. In the case of Lambda destinations, Amazon S3 verifies that
+        // the Lambda function permissions grant Amazon S3 permission to invoke the
+        // function" — and a configuration naming one that does not resolve is refused
+        // whole, because the put is atomic. The store's guard is released across this: the
+        // resolution calls other services of this same emulator, and this call has written
+        // nothing yet.
+        //
+        // `SkipDestinationValidation` "skips validation of Amazon SQS, Amazon SNS, and
+        // Lambda destinations", so a request asking for that records the configuration as
+        // given and publishes no test notification.
+        if input.skip_destination_validation != Some(true) {
+            let unvalidated = crate::state::notifications::unvalidated_destinations(
+                ctx.callback(),
+                &input.bucket,
+                &bucket_region,
+                &configuration,
+                &correlation,
+            )
+            .await;
+            if !unvalidated.is_empty() {
+                // The ARNs ride in the log: the sentence S3 sends for this refusal is
+                // fixed text, and the one error document this channel renders carries the
+                // code and that sentence.
+                ::tracing::warn!(
+                    bucket = %input.bucket,
+                    destinations = ?unvalidated,
+                    "this notification configuration names destinations that do not \
+                     resolve; it is refused rather than recorded"
+                );
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::INVALID_ARGUMENT_CODE,
+                    crate::state::INVALID_ARGUMENT_STATUS,
+                    crate::state::UNABLE_TO_VALIDATE_DESTINATIONS_MESSAGE,
+                ));
+            }
+        }
+
         // A replacement of the whole subresource, with an id minted for every
-        // configuration that named none. The bucket was found above and the guard has not
-        // been released since, so the `None` arm is unreachable; it answers the same 404
-        // rather than claiming a configuration was stored.
+        // configuration that named none. The bucket was found above and may have been
+        // deleted while the destinations were being resolved, so the `None` arm answers the
+        // same 404 rather than claiming a configuration was stored.
+        let mut store = state.lock();
         if store
             .put_notification_configuration(&input.bucket, configuration)
             .is_none()
@@ -301,6 +345,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
             );
         }
+        drop(store);
+
+        // Recorded LAST, so the response this returns carries the pair the test
+        // notifications above already named this call by.
+        correlation.answer();
 
         // `Unit` output: success is the 200 and an empty body.
         Ok(PutBucketNotificationConfigurationOutput)

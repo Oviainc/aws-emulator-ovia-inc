@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! S3's EVENT NOTIFICATION EMITTER: the half of a bucket's notification configuration
-//! that runs when an object changes.
+//! S3's EVENT NOTIFICATION EMITTER: what a bucket's notification configuration DOES —
+//! when it is installed, and when an object changes.
 //!
 //! [`super::BucketNotificationConfiguration`] is what
 //! `PutBucketNotificationConfiguration` records and `GetBucketNotificationConfiguration`
@@ -30,6 +30,14 @@
 //! call's own response carries ([`super::request_ids`]): the `Records` envelope reports
 //! both in its `responseElements` and the EventBridge detail reports the request id as
 //! its `request-id`, which is how a consumer tells which API call produced which event.
+//!
+//! The SAME destinations are resolved when the configuration is INSTALLED, which is the
+//! one thing a notification configuration does before any object changes: S3 "first
+//! verifies that any Amazon Simple Notification Service (Amazon SNS) or Amazon Simple
+//! Queue Service (Amazon SQS) destination exists, and that the bucket owner has permission
+//! to publish to it by sending a test notification". That is
+//! [`unvalidated_destinations`], and the test notification it publishes is the
+//! `s3:TestEvent` a consumer of a validated destination receives.
 //!
 //! Delivery is BEST EFFORT and never changes what the operation answers: S3 publishes a
 //! notification asynchronously, after the write that produced it was accepted, so a write
@@ -792,7 +800,9 @@ pub async fn deliver(callback: &::smithy_server_runtime::EmbeddedEmulator, pendi
                         failed_entry_count = output.failed_entry_count(),
                         "EventBridge refused the object event this bucket published"
                     ),
-                    Err(error) => report("EventBridge", detail_type, &error),
+                    Err(error) => {
+                        report(DELIVERY_NOT_MADE, "EventBridge", detail_type, &error)
+                    }
                 }
             }
             Delivery::Queue { region, url, body } => {
@@ -804,7 +814,7 @@ pub async fn deliver(callback: &::smithy_server_runtime::EmbeddedEmulator, pendi
                     .send()
                     .await;
                 if let Err(error) = answer {
-                    report("an Amazon SQS queue", &url, &error);
+                    report(DELIVERY_NOT_MADE, "an Amazon SQS queue", &url, &error);
                 }
             }
             Delivery::Topic { region, arn, body } => {
@@ -816,7 +826,7 @@ pub async fn deliver(callback: &::smithy_server_runtime::EmbeddedEmulator, pendi
                     .send()
                     .await;
                 if let Err(error) = answer {
-                    report("an Amazon SNS topic", &arn, &error);
+                    report(DELIVERY_NOT_MADE, "an Amazon SNS topic", &arn, &error);
                 }
             }
             Delivery::Function {
@@ -837,15 +847,26 @@ pub async fn deliver(callback: &::smithy_server_runtime::EmbeddedEmulator, pendi
                     .send()
                     .await;
                 if let Err(error) = answer {
-                    report("a Lambda function", &arn, &error);
+                    report(DELIVERY_NOT_MADE, "a Lambda function", &arn, &error);
                 }
             }
         }
     }
 }
 
-/// Log one failed delivery, with the error rendered the way the SDK renders a failure.
-fn report<E>(destination: &str, named: &str, error: &E)
+/// The sentence [`report`] logs for a notification that did not reach its destination:
+/// delivery is best effort, so the operation that produced the event was already answered.
+const DELIVERY_NOT_MADE: &str = "an object event this bucket published did not reach its destination";
+
+/// The sentence [`report`] logs for a destination the service that owns it gave NO verdict
+/// on, which is why the configuration naming it is recorded as given.
+const DESTINATION_NOT_RESOLVED: &str = "a notification destination could not be resolved \
+                                        against the service that owns it; the configuration \
+                                        naming it is recorded as given";
+
+/// Log one call to a destination that did not succeed — `outcome` says what that means —
+/// with the error rendered the way the SDK renders a failure.
+fn report<E>(outcome: &'static str, destination: &str, named: &str, error: &E)
 where
     E: ::std::error::Error + Send + Sync + 'static,
 {
@@ -853,8 +874,221 @@ where
         destination,
         named,
         error = %::aws_smithy_types::error::display::DisplayErrorContext(error),
-        "an object event this bucket published did not reach its destination"
+        "{outcome}"
     );
+}
+
+/// The `Event` value of the message S3 publishes to a destination to VALIDATE it.
+///
+/// "After Amazon S3 receives this request, it first verifies that any Amazon Simple
+/// Notification Service (Amazon SNS) or Amazon Simple Queue Service (Amazon SQS)
+/// destination exists, and that the bucket owner has permission to publish to it by
+/// sending a test notification" (`PutBucketNotificationConfiguration`'s own
+/// documentation): that test notification is this event, so a consumer of a destination
+/// whose configuration was accepted finds it waiting on the destination.
+const TEST_EVENT: &str = "s3:TestEvent";
+
+/// The `Service` the test notification names as its publisher.
+const TEST_EVENT_SERVICE: &str = "Amazon S3";
+
+/// The test notification S3 publishes to one destination: the members the *Event message
+/// structure*'s test message carries — the service and the event that produced it, when it
+/// was published, the bucket it was configured on, and the pair naming the call that
+/// configured it ([`super::request_ids`]), which is also the pair that call's own response
+/// carries.
+fn test_notification(bucket: &str, correlation: &RequestCorrelation) -> ::serde_json::Value {
+    ::serde_json::json!({
+        "Service": TEST_EVENT_SERVICE,
+        "Event": TEST_EVENT,
+        "Time": event_instant(SystemTime::now()),
+        "Bucket": bucket,
+        "RequestId": correlation.request_id.clone(),
+        "HostId": correlation.extended_request_id.clone(),
+    })
+}
+
+/// The destinations of `configuration` that could NOT be validated, in configuration
+/// order — empty when every one of them was, which is what lets the put be recorded.
+///
+/// Each destination is resolved against the service that owns it, through this same
+/// emulator: a queue and a topic by publishing the test notification
+/// ([`test_notification`]) to it, which is how the real service validates them, and a
+/// function by reading its configuration, because S3 "verifies that the Lambda function
+/// permissions grant Amazon S3 permission to invoke the function" rather than invoking it.
+/// Nothing is written by any of them, so a put this refuses leaves every service it asked
+/// exactly as it was.
+///
+/// A destination whose own service REFUSES the test notification is not validated: "the PUT
+/// notification is an atomic operation … if the message fails, the entire PUT action will
+/// fail, and Amazon S3 will not add the configuration to your bucket". Where this emulator
+/// could not reach that service AT ALL ([`TRANSPORT_REFUSALS`]) nothing judged the
+/// destination, so it is treated as validated and the failure logged — the outcome
+/// `PutBucketNotificationConfigurationRequest$SkipDestinationValidation` asks for
+/// explicitly.
+///
+/// Nothing here opens a socket or leaves the host: every destination is reached through the
+/// in-process callback, the way a delivery to it is, and the ARN decides only which service
+/// of this same emulator is asked and in which Region. The work is bounded by the container
+/// itself — at most [`super::MAX_NOTIFICATION_CONFIGURATIONS_PER_BUCKET`] destinations, one
+/// await each, with the store's guard released — so one request cannot grow it.
+pub async fn unvalidated_destinations(
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
+    bucket: &str,
+    bucket_region: &str,
+    configuration: &super::BucketNotificationConfiguration,
+    correlation: &RequestCorrelation,
+) -> Vec<String> {
+    let mut clients = Clients::default();
+    let mut unvalidated = Vec::new();
+    let notification = test_notification(bucket, correlation).to_string();
+    for (destination, target) in configuration.targets() {
+        // Each destination is reached in the Region ITS OWN ARN names, exactly as a
+        // delivery to it is, falling back to the bucket's Region.
+        let region = destination_region(&target.arn)
+            .unwrap_or(bucket_region)
+            .to_string();
+        let validated = match destination {
+            super::NotificationDestination::Queue => {
+                queue_validated(&mut clients, callback, &region, &target.arn, &notification).await
+            }
+            super::NotificationDestination::Topic => {
+                topic_validated(&mut clients, callback, &region, &target.arn, &notification).await
+            }
+            super::NotificationDestination::LambdaFunction => {
+                function_validated(&mut clients, callback, &region, &target.arn).await
+            }
+        };
+        if !validated {
+            unvalidated.push(target.arn.clone());
+        }
+    }
+    unvalidated
+}
+
+/// Whether the queue `arn` names took the test notification.
+async fn queue_validated(
+    clients: &mut Clients,
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+    arn: &str,
+    notification: &str,
+) -> bool {
+    // A value that addresses no queue at all names no destination to validate. The stored
+    // ARN is already known to be an SQS ARN (`super::validate_notification_configuration`),
+    // so this is the resource field that does not name a queue.
+    let Some(url) = queue_url(arn) else {
+        return false;
+    };
+    let answer = clients
+        .sqs(callback, region)
+        .send_message()
+        .queue_url(&url)
+        .message_body(notification)
+        .send()
+        .await;
+    match answer {
+        Ok(_) => true,
+        Err(error) => {
+            if refused_by_its_service(&error) {
+                return false;
+            }
+            unverifiable("an Amazon SQS queue", &url, &error);
+            true
+        }
+    }
+}
+
+/// Whether the topic `arn` names took the test notification.
+async fn topic_validated(
+    clients: &mut Clients,
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+    arn: &str,
+    notification: &str,
+) -> bool {
+    let answer = clients
+        .sns(callback, region)
+        .publish()
+        .topic_arn(arn)
+        .message(notification)
+        .send()
+        .await;
+    match answer {
+        Ok(_) => true,
+        Err(error) => {
+            if refused_by_its_service(&error) {
+                return false;
+            }
+            unverifiable("an Amazon SNS topic", arn, &error);
+            true
+        }
+    }
+}
+
+/// Whether the function `arn` names resolves in Lambda.
+async fn function_validated(
+    clients: &mut Clients,
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+    arn: &str,
+) -> bool {
+    let answer = clients
+        .lambda(callback, region)
+        .get_function_configuration()
+        .function_name(arn)
+        .send()
+        .await;
+    match answer {
+        Ok(_) => true,
+        Err(error) => {
+            if refused_by_its_service(&error) {
+                return false;
+            }
+            unverifiable("a Lambda function", arn, &error);
+            true
+        }
+    }
+}
+
+/// The error codes that are the EMULATOR's own refusal of the call rather than an answer
+/// from the service that owns the destination: no service of this emulator serves the
+/// endpoint that was called, more than one of them claims it, or the in-process callback
+/// chain was cut short. The destination's own service was never reached in any of them.
+const TRANSPORT_REFUSALS: &[&str] = &[
+    "UnknownService",
+    "AmbiguousService",
+    "CallbackRecursionLimitExceeded",
+];
+
+/// Whether `error` is the service that OWNS the destination refusing the call — the one
+/// outcome that fails a destination's validation.
+///
+/// A failure with no error document behind it (a transport that could not carry the call)
+/// and the emulator's own refusal of it ([`TRANSPORT_REFUSALS`]) are not that: nothing
+/// judged the destination, which is a different thing from its own service rejecting it.
+fn refused_by_its_service<E, R>(
+    error: &::aws_smithy_runtime_api::client::result::SdkError<E, R>,
+) -> bool
+where
+    E: ::aws_smithy_types::error::metadata::ProvideErrorMetadata,
+{
+    use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
+
+    let Some(code) = error.as_service_error().and_then(ProvideErrorMetadata::code) else {
+        return false;
+    };
+    // The code may carry a shape namespace; the code itself is its last segment.
+    let code = code.rsplit_once('#').map_or(code, |(_, name)| name);
+    !TRANSPORT_REFUSALS.contains(&code)
+}
+
+/// Log one destination the service that owns it gave no verdict on, which is why the
+/// configuration naming it is recorded as given.
+fn unverifiable<E>(destination: &str, named: &str, error: &E)
+where
+    E: ::std::error::Error + Send + Sync + 'static,
+{
+    report(DESTINATION_NOT_RESOLVED, destination, named, error);
 }
 
 /// The clients one operation's deliveries are made through, built on first use and then

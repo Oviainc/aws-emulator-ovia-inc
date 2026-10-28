@@ -125,6 +125,8 @@ mod multipart_upload_event_notifications;
 mod multipart_upload_initiation;
 #[path = "all/multipart_upload_listing.rs"]
 mod multipart_upload_listing;
+#[path = "all/notification_destination_validation.rs"]
+mod notification_destination_validation;
 #[path = "all/object_acl.rs"]
 mod object_acl;
 #[path = "all/object_and_policy.rs"]
@@ -155,6 +157,8 @@ mod object_encryption;
 mod object_encryption_update;
 #[path = "all/object_event_notifications.rs"]
 mod object_event_notifications;
+#[path = "all/object_event_sequencer_order.rs"]
+mod object_event_sequencer_order;
 #[path = "all/object_legal_hold.rs"]
 mod object_legal_hold;
 #[path = "all/object_listing_and_deletion.rs"]

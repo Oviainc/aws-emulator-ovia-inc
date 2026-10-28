@@ -55,7 +55,7 @@ pub(crate) const REGION: &str = "us-east-1";
 const ACCOUNT: &str = "000000000000";
 
 /// The XML namespace a client puts on an S3 request payload.
-const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
+pub(crate) const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 
 /// The `Id` every queue configuration below carries, which a delivered record reports as
 /// its `configurationId`.
@@ -70,12 +70,16 @@ const DELIVERY_BUDGET: Duration = Duration::from_secs(10);
 const QUIET_BUDGET: Duration = Duration::from_millis(1_500);
 
 /// A well-formed Lambda execution role ARN, satisfying that model's `RoleArn` pattern.
-const LAMBDA_ROLE: &str = "arn:aws:iam::000000000000:role/service-role/lambda-exec";
+///
+/// `pub(crate)`: the destination-validation suite
+/// ([`super::notification_destination_validation`]) creates its functions with the same
+/// role and package rather than spelling a second pair of its own.
+pub(crate) const LAMBDA_ROLE: &str = "arn:aws:iam::000000000000:role/service-role/lambda-exec";
 
 /// A deployment package's bytes, base64-encoded as `FunctionCode$ZipFile` carries them.
 /// Nothing runs it: what this suite asserts is the invocation S3 made, which carries the
 /// event, not the package.
-const PACKAGE_ZIP_FILE: &str = "ZGVwbG95bWVudC1wYWNrYWdl";
+pub(crate) const PACKAGE_ZIP_FILE: &str = "ZGVwbG95bWVudC1wYWNrYWdl";
 
 /// S3, EventBridge, SQS and Lambda over one shared engine, reached exactly the way the
 /// production router reaches them.
@@ -110,7 +114,7 @@ impl Answer {
     /// "a value created by Amazon S3 that uniquely identifies the request" and "a special
     /// token that helps Amazon Web Services troubleshoot problems" (Amazon S3 API
     /// Reference, *Common Response Headers*), which every S3 response carries.
-    fn correlation(&self, case: &str) -> (String, String) {
+    pub(crate) fn correlation(&self, case: &str) -> (String, String) {
         let request_id = self
             .header("x-amz-request-id")
             .unwrap_or_else(|| panic!("case {case:?}: the response carried no x-amz-request-id"));
@@ -232,7 +236,10 @@ impl Emulator {
     }
 
     /// An SQS call (`awsJson1_0`).
-    async fn sqs(&self, operation: &str, body: &Value) -> Value {
+    ///
+    /// `pub(crate)`: the sequencer suite ([`super::object_event_sequencer_order`]) takes a
+    /// whole fan-out off a queue in one receive rather than one message at a time.
+    pub(crate) async fn sqs(&self, operation: &str, body: &Value) -> Value {
         self.rpc("sqs", "AmazonSQS", "1.0", operation, body).await
     }
 
@@ -279,7 +286,7 @@ impl Emulator {
 
     /// `PUT /<bucket>/<key>` — `PutObject`, with `body` as the object's bytes. Answers
     /// what the write reported, so a row can compare the notification against the call.
-    async fn put_object(&self, bucket: &str, key: &str, body: &[u8]) -> Answer {
+    pub(crate) async fn put_object(&self, bucket: &str, key: &str, body: &[u8]) -> Answer {
         let answer = self
             .send(
                 "s3",
@@ -300,7 +307,7 @@ impl Emulator {
     }
 
     /// `DELETE /<bucket>/<key>` — `DeleteObject`.
-    async fn delete_object(&self, bucket: &str, key: &str) -> Answer {
+    pub(crate) async fn delete_object(&self, bucket: &str, key: &str) -> Answer {
         let answer = self
             .s3_xml("DELETE", &format!("/{bucket}/{}", request_key(key)), "")
             .await;
@@ -358,7 +365,7 @@ impl Emulator {
     }
 
     /// `PUT /<bucket>/<key>?tagging` — `PutObjectTagging`.
-    async fn put_object_tagging(&self, bucket: &str, key: &str) -> Answer {
+    pub(crate) async fn put_object_tagging(&self, bucket: &str, key: &str) -> Answer {
         let body = format!(
             "<Tagging xmlns=\"{XMLNS}\"><TagSet><Tag><Key>reviewed</Key>\
              <Value>yes</Value></Tag></TagSet></Tagging>"
@@ -426,6 +433,33 @@ impl Emulator {
             answer.status,
             answer.text()
         );
+        // "After Amazon S3 receives this request, it first verifies that any … Amazon
+        // Simple Queue Service (Amazon SQS) destination exists … by sending a test
+        // notification" (`PutBucketNotificationConfiguration`'s own documentation): a
+        // queue destination that validated carries that `s3:TestEvent` already, so it is
+        // taken here — and asserted, because it is the observable half of the validation —
+        // leaving the rows below reading only what their own object change delivered.
+        if destination.element == QUEUE_CONFIGURATION_ELEMENT {
+            let url = self.queue_url_of(destination.arn).await;
+            let test_event = self.delivered(&url).await.unwrap_or_else(|| {
+                panic!(
+                    "configuring notifications on {bucket} must publish an s3:TestEvent to \
+                     the queue it validated"
+                )
+            });
+            assert_eq!(
+                test_event["Event"].as_str(),
+                Some("s3:TestEvent"),
+                "the first message a validated queue destination receives must be the test \
+                 notification, got {test_event}"
+            );
+            assert_eq!(
+                test_event["Bucket"].as_str(),
+                Some(bucket),
+                "the test notification must name the bucket it was configured on, got \
+                 {test_event}"
+            );
+        }
     }
 
     /// Create the queue named `name` and answer its url.
@@ -434,6 +468,19 @@ impl Emulator {
         created["QueueUrl"]
             .as_str()
             .unwrap_or_else(|| panic!("CreateQueue must answer a QueueUrl, got {created}"))
+            .to_string()
+    }
+
+    /// The url SQS addresses the queue `arn` names, read from SQS itself rather than
+    /// rebuilt here — a queue ARN names the queue by its bare resource field.
+    async fn queue_url_of(&self, arn: &str) -> String {
+        let name = arn.rsplit_once(':').map_or(arn, |(_, name)| name);
+        let answered = self.sqs("GetQueueUrl", &json!({ "QueueName": name })).await;
+        answered["QueueUrl"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!("GetQueueUrl must answer a QueueUrl for {name:?}, got {answered}")
+            })
             .to_string()
     }
 
@@ -524,11 +571,15 @@ pub(crate) struct Destination<'a> {
     arn: &'a str,
 }
 
+/// The element one SQS queue destination configuration is carried in — the one destination
+/// kind whose test notification a test can read back.
+const QUEUE_CONFIGURATION_ELEMENT: &str = "QueueConfiguration";
+
 impl<'a> Destination<'a> {
     /// The SQS queue `arn` names, as a `QueueConfiguration`.
     pub(crate) fn queue(arn: &'a str) -> Self {
         Self {
-            element: "QueueConfiguration",
+            element: QUEUE_CONFIGURATION_ELEMENT,
             arn_element: "Queue",
             arn,
         }
