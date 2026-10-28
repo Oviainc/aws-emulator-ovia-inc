@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEndpointAccess
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEndpointAccess`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEndpointAccess::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates one Redshift-managed VPC endpoint on a cluster: the subnet group it is
+//! deployed from is resolved first, then the cluster it connects to, and only an
+//! endpoint whose name the account does not already hold is minted. The record
+//! starts `creating` and is serving once [`crate::state::PROVISIONING_SPAN`] has
+//! passed.
 //!
 //! ## Shape of an operation
 //!
@@ -121,7 +118,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `CreateEndpointAccessError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#CreateEndpointAccess")]
+// `DependentServiceUnavailableFault` is widened in: the model does not list it for
+// this operation, but the service declares the shape, and it is the only modelled
+// way to say "the control-plane store could not be reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#CreateEndpointAccess",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum CreateEndpointAccessErrorModeled {
     AccessToClusterDeniedFault(AccessToClusterDeniedFault),
@@ -134,6 +137,7 @@ pub enum CreateEndpointAccessErrorModeled {
     InvalidClusterStateFault(InvalidClusterStateFault),
     UnauthorizedOperation(UnauthorizedOperation),
     UnsupportedOperationFault(UnsupportedOperationFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -187,18 +191,211 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEndpointAccess` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEndpointAccessErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                CreateEndpointAccessErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let started = ::std::time::Instant::now();
+        let region = st::request_region(ctx);
+
+        // Every name the request carries is resolved BEFORE anything else about
+        // the request is judged, so a name that resolves to nothing is answered
+        // with that resource's own modelled fault rather than with a refusal of
+        // the request's shape.
+        let mut store = state.lock();
+        store.settle(started);
+
+        // The account HAS a default cluster subnet group before anybody creates
+        // one, so a request naming it resolves whether or not a cluster has
+        // materialised that record yet.
+        let requested_group = st::normalized_subnet_group_name(&input.subnet_group_name);
+        if requested_group == st::DEFAULT_CLUSTER_SUBNET_GROUP {
+            store.ensure_default_subnet_group(&region);
+        }
+
+        // "The subnet group from which Amazon Redshift chooses the subnet to
+        // deploy the endpoint": resolved BEFORE the cluster, which is the order
+        // the service resolves the two names in, so a request naming neither an
+        // existing subnet group nor an existing cluster is refused on the subnet
+        // group.
+        let Some(subnet_group) = store.subnet_group(&input.subnet_group_name).cloned() else {
+            return Err(
+                CreateEndpointAccessErrorModeled::ClusterSubnetGroupNotFoundFault(
+                    ClusterSubnetGroupNotFoundFault {
+                        message: Some(format!(
+                            "Cluster subnet group '{}' does not exist.",
+                            input.subnet_group_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The endpoint is created ON a cluster, and the `EndpointAccess` record
+        // reports which one, so a request that names none describes no endpoint.
+        let Some(cluster_identifier) = input.cluster_identifier.clone() else {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_combination(
+                "ClusterIdentifier must be specified to create a Redshift-managed VPC endpoint.",
+            ));
+        };
+
+        // "The cluster identifier of the cluster to access": the endpoint carries
+        // the cluster's own connection port, so the cluster has to be there and to
+        // be serving.
+        let Some(stored_cluster) = store.cluster(&cluster_identifier) else {
+            return Err(CreateEndpointAccessErrorModeled::ClusterNotFoundFault(
+                ClusterNotFoundFault {
+                    message: Some(format!("Cluster {cluster_identifier} not found.")),
+                },
+            )
+            .into());
+        };
+        let cluster_status = stored_cluster
+            .cluster
+            .cluster_status
+            .clone()
+            .unwrap_or_default();
+        let port = stored_cluster.endpoint.port;
+        if cluster_status != st::STATUS_AVAILABLE {
+            return Err(CreateEndpointAccessErrorModeled::InvalidClusterStateFault(
+                InvalidClusterStateFault {
+                    message: Some(format!(
+                        "Cluster {cluster_identifier} is in state {cluster_status}; it must be {} to create an endpoint to it.",
+                        st::STATUS_AVAILABLE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Both names resolved, so what is left is what the request itself says.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEndpointAccess"))
+        // "The Amazon Web Services account ID of the owner of the cluster. This is
+        // only required if the cluster is in another Amazon Web Services account."
+        // This emulator holds ONE account's clusters, so a request naming any
+        // other owner names a cluster it cannot reach and is refused with the
+        // modelled access fault rather than served from the local record.
+        let resource_owner = match input.resource_owner.as_deref() {
+            None => ::engine::emulator_account_id().to_string(),
+            Some(requested) => match st::account_id_value("ResourceOwner", requested) {
+                Err(message) => {
+                    return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                        message,
+                    ))
+                }
+                Ok(owner) => {
+                    if owner != ::engine::emulator_account_id() {
+                        return Err(
+                            CreateEndpointAccessErrorModeled::AccessToClusterDeniedFault(
+                                AccessToClusterDeniedFault {
+                                    message: Some(format!(
+                                        "The owner of the specified cluster, account {owner}, has not authorized this account to create an endpoint to it."
+                                    )),
+                                },
+                            )
+                            .into(),
+                        );
+                    }
+                    owner
+                }
+            },
+        };
+
+        // "An endpoint name must contain 1-30 characters…" is a documented rule
+        // the model expresses no constraint for, so it is checked here — after the
+        // names, so that an unresolvable one is never masked by it.
+        if let Err(message) = st::check_identifier(
+            st::ENDPOINT_NAME_RULE,
+            "EndpointName",
+            &input.endpoint_name,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                message,
+            ));
+        }
+
+        // An endpoint's identity is its name, so a name the account already holds
+        // is the modelled already-exists refusal rather than a second record.
+        if store.endpoint_access(&input.endpoint_name).is_some() {
+            return Err(CreateEndpointAccessErrorModeled::EndpointAlreadyExistsFault(
+                EndpointAlreadyExistsFault {
+                    message: Some(st::endpoint_exists_message(&input.endpoint_name)),
+                },
+            )
+            .into());
+        }
+        if store.endpoints_of_cluster(&cluster_identifier) >= st::ENDPOINTS_PER_CLUSTER_QUOTA {
+            return Err(
+                CreateEndpointAccessErrorModeled::EndpointsPerClusterLimitExceededFault(
+                    EndpointsPerClusterLimitExceededFault {
+                        message: Some(format!(
+                            "Cluster {cluster_identifier} already has the allowed number of Redshift-managed VPC endpoints ({}).",
+                            st::ENDPOINTS_PER_CLUSTER_QUOTA
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Where the endpoint lands: the VPC of its subnet group, and the one
+        // subnet of that group the service chooses for it.
+        let subnet = st::endpoint_deployment_subnet(&subnet_group, &input.endpoint_name);
+        let vpc_id = subnet_group
+            .vpc_id
+            .clone()
+            .unwrap_or_else(|| st::derived_vpc_id(&requested_group));
+        let availability_zone = subnet
+            .as_ref()
+            .and_then(|subnet| subnet.subnet_availability_zone.as_ref())
+            .and_then(|zone| zone.name.clone())
+            .unwrap_or_default();
+
+        // The record every later read of this endpoint reports verbatim.
+        let endpoint = CreateEndpointAccessOutput {
+            cluster_identifier: Some(cluster_identifier),
+            resource_owner: Some(resource_owner),
+            // The stored subnet group name is the folded form the group is held
+            // under, so the endpoint reports the group as that group reports
+            // itself.
+            subnet_group_name: subnet_group.cluster_subnet_group_name.clone(),
+            endpoint_status: Some(st::ENDPOINT_STATUS_CREATING.to_string()),
+            endpoint_name: Some(input.endpoint_name.clone()),
+            endpoint_create_time: Some(::aws_smithy_types::DateTime::from(
+                ::std::time::SystemTime::now(),
+            )),
+            // "The port number on which the cluster accepts incoming
+            // connections": the cluster's own port, not one this call chooses.
+            port,
+            address: Some(st::endpoint_access_address(&input.endpoint_name, &region)),
+            vpc_security_groups: Some(st::endpoint_security_groups(
+                input.vpc_security_group_ids.as_deref(),
+                &vpc_id,
+            )),
+            vpc_endpoint: Some(st::vpc_interface_endpoint(
+                &input.endpoint_name,
+                &vpc_id,
+                &availability_zone,
+                subnet
+                    .as_ref()
+                    .and_then(|subnet| subnet.subnet_identifier.as_deref()),
+            )),
+        };
+        store.endpoint_accesses.push(st::StoredEndpointAccess {
+            endpoint: endpoint.clone(),
+            active_at: started + st::PROVISIONING_SPAN,
+            removed_at: None,
+        });
+
+        Ok(endpoint)
     }
 }

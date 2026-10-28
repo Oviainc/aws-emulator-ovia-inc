@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RevokeEndpointAccess
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RevokeEndpointAccess`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RevokeEndpointAccess::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Revokes an account's access to a cluster: the cluster is resolved, then the
+//! authorization granted on it to that account, and the request either withdraws
+//! the VPCs it names from the grant or — naming none — the grant itself, which is
+//! reported `Revoking` and leaves the store once
+//! [`crate::state::PROVISIONING_SPAN`] has passed. An authorization that still
+//! admits Redshift-managed VPC endpoints can only be revoked with `Force`, which
+//! deletes them with it.
 //!
 //! ## Shape of an operation
 //!
@@ -109,7 +108,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `RevokeEndpointAccessError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#RevokeEndpointAccess")]
+// `DependentServiceUnavailableFault` is widened in: the model does not list it for
+// this operation, but the service declares the shape, and it is the only modelled
+// way to say "the control-plane store could not be reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#RevokeEndpointAccess",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum RevokeEndpointAccessErrorModeled {
     ClusterNotFoundFault(ClusterNotFoundFault),
@@ -119,6 +124,7 @@ pub enum RevokeEndpointAccessErrorModeled {
     InvalidClusterSecurityGroupStateFault(InvalidClusterSecurityGroupStateFault),
     InvalidClusterStateFault(InvalidClusterStateFault),
     InvalidEndpointStateFault(InvalidEndpointStateFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -170,20 +176,189 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RevokeEndpointAccess` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RevokeEndpointAccessErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RevokeEndpointAccess"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                RevokeEndpointAccessErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let started = ::std::time::Instant::now();
+
+        // Every name the request carries is resolved BEFORE anything else about
+        // the request is judged, so a name that resolves to nothing is answered
+        // with that resource's own modelled fault rather than with a refusal of
+        // the request's shape. The pair this call revokes is a cluster and an
+        // account, so a request that names no cluster names no authorization.
+        let Some(cluster_identifier) = input.cluster_identifier.clone() else {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_combination(
+                "ClusterIdentifier must be specified to revoke endpoint access to a cluster.",
+            ));
+        };
+
+        let mut store = state.lock();
+        store.settle(started);
+
+        // "The cluster to revoke access from": resolved BEFORE the authorization,
+        // so a request naming neither an existing cluster nor an existing
+        // authorization is refused on the cluster.
+        if store.cluster(&cluster_identifier).is_none() {
+            return Err(RevokeEndpointAccessErrorModeled::ClusterNotFoundFault(
+                ClusterNotFoundFault {
+                    message: Some(format!("Cluster {cluster_identifier} not found.")),
+                },
+            )
+            .into());
+        }
+        // The cluster resolved, so the other half of the pair is what the request
+        // itself says: the account whose access is revoked.
+        let Some(requested_account) = input.account.as_deref() else {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_combination(
+                "Account must be specified to revoke endpoint access to a cluster.",
+            ));
+        };
+        let grantee = match st::account_id_value("Account", requested_account) {
+            Ok(account) => account,
+            Err(message) => {
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                    message,
+                ))
+            }
+        };
+        let Some(position) = store.endpoint_authorization_position(&cluster_identifier, &grantee)
+        else {
+            return Err(
+                RevokeEndpointAccessErrorModeled::EndpointAuthorizationNotFoundFault(
+                    EndpointAuthorizationNotFoundFault {
+                        message: Some(st::endpoint_authorization_not_found_message(
+                            &cluster_identifier,
+                            &grantee,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let refuse_state = |why: String| {
+            Err(
+                RevokeEndpointAccessErrorModeled::InvalidAuthorizationStateFault(
+                    InvalidAuthorizationStateFault { message: Some(why) },
+                )
+                .into(),
+            )
+        };
+
+        // An authorization a revoke has already started on can take no second one.
+        let stored = &store.endpoint_authorizations[position];
+        if stored.authorization.status.as_deref() == Some(st::AUTHORIZATION_STATUS_REVOKING) {
+            return refuse_state(format!(
+                "The endpoint authorization for cluster {cluster_identifier} and account {grantee} is in state {}; it must be {} to be revoked.",
+                st::AUTHORIZATION_STATUS_REVOKING,
+                st::AUTHORIZATION_STATUS_AUTHORIZED
+            ));
+        }
+
+        // "The virtual private cloud (VPC) identifiers for which access is to be
+        // revoked": naming some withdraws exactly those from the grant, and naming
+        // none withdraws the grant itself. A VPC the grant does not list — and any
+        // VPC at all while the grant covers every VPC of the account — is nothing
+        // this call can withdraw.
+        let requested_vpcs: Vec<String> = input.vpc_ids.clone().unwrap_or_default();
+        let allowed_all = stored.authorization.allowed_all_vp_cs == Some(true);
+        let allowed: Vec<String> = stored
+            .authorization
+            .allowed_vp_cs
+            .clone()
+            .unwrap_or_default();
+        if !requested_vpcs.is_empty() {
+            if allowed_all {
+                return refuse_state(format!(
+                    "The endpoint authorization for cluster {cluster_identifier} and account {grantee} allows every VPC of that account, so no single VPC can be revoked from it."
+                ));
+            }
+            if let Some(unknown) = requested_vpcs
+                .iter()
+                .find(|wanted| !allowed.iter().any(|held| held == *wanted))
+            {
+                return refuse_state(format!(
+                    "The endpoint authorization for cluster {cluster_identifier} and account {grantee} does not allow VPC {unknown}."
+                ));
+            }
+        }
+
+        // The endpoints this call takes the access of away from: the ones in the
+        // VPCs being withdrawn, or every endpoint the grant admits when the grant
+        // itself is being withdrawn. "If true, the Redshift-managed VPC endpoints
+        // associated with the endpoint authorization are also deleted" — so
+        // without `Force` an authorization that still admits one is left alone.
+        let withdrawn: Vec<usize> = store
+            .endpoint_accesses
+            .iter()
+            .enumerate()
+            .filter(|(_, endpoint)| {
+                endpoint.endpoint.cluster_identifier.as_deref() == Some(&cluster_identifier)
+                    && endpoint.removed_at.is_none()
+            })
+            .filter(|(_, endpoint)| {
+                let vpc = endpoint.vpc_id();
+                if requested_vpcs.is_empty() {
+                    allowed_all
+                        || vpc.is_some_and(|vpc| allowed.iter().any(|held| held == vpc))
+                } else {
+                    vpc.is_some_and(|vpc| requested_vpcs.iter().any(|held| held == vpc))
+                }
+            })
+            .map(|(position, _)| position)
+            .collect();
+        if !withdrawn.is_empty() && input.force != Some(true) {
+            return refuse_state(format!(
+                "The endpoint authorization for cluster {cluster_identifier} and account {grantee} still has {} Redshift-managed VPC endpoints; set Force to true to delete them with it.",
+                withdrawn.len()
+            ));
+        }
+        for position in withdrawn {
+            let endpoint = &mut store.endpoint_accesses[position];
+            endpoint.endpoint.endpoint_status = Some(st::ENDPOINT_STATUS_DELETING.to_string());
+            endpoint.removed_at = Some(started + st::PROVISIONING_SPAN);
+        }
+
+        // What the grant now says. Withdrawing every VPC it listed leaves it
+        // granting nothing, so that is the grant itself being revoked.
+        let stored = &mut store.endpoint_authorizations[position];
+        let remaining: Vec<String> = allowed
+            .into_iter()
+            .filter(|held| !requested_vpcs.iter().any(|wanted| wanted == held))
+            .collect();
+        if requested_vpcs.is_empty() || remaining.is_empty() {
+            stored.authorization.status = Some(st::AUTHORIZATION_STATUS_REVOKING.to_string());
+            stored.removed_at = Some(started + st::PROVISIONING_SPAN);
+        }
+        if !requested_vpcs.is_empty() {
+            stored.authorization.allowed_vp_cs = Some(remaining);
+        }
+
+        // The authorization as it now stands, by the one rule every operation on
+        // an authorization reports one by.
+        let stored = store.endpoint_authorizations[position].clone();
+        let view = store.endpoint_authorization_view(&stored);
+        Ok(RevokeEndpointAccessOutput {
+            grantor: view.grantor,
+            grantee: view.grantee,
+            cluster_identifier: view.cluster_identifier,
+            authorize_time: view.authorize_time,
+            cluster_status: view.cluster_status,
+            status: view.status,
+            allowed_all_vp_cs: view.allowed_all_vp_cs,
+            allowed_vp_cs: view.allowed_vp_cs,
+            endpoint_count: view.endpoint_count,
+        })
     }
 }

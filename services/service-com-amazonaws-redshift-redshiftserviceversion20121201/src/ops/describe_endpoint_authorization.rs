@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeEndpointAuthorization
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeEndpointAuthorization`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeEndpointAuthorization::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the endpoint authorizations this service's store holds, one page at a
+//! time, from the point of view the request asks for: the grants this account
+//! made (the default) or the grants it was given, narrowed by the cluster and by
+//! the other party's account id. A report — the only state it writes is the
+//! clock-owed settlement every read applies — and a cluster that does not exist
+//! is `ClusterNotFoundFault`.
 //!
 //! ## Shape of an operation
 //!
@@ -100,11 +98,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `DescribeEndpointAuthorizationError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#DescribeEndpointAuthorization")]
+// `DependentServiceUnavailableFault` is widened in: the model does not list it for
+// this operation, but the service declares the shape, and it is the only modelled
+// way to say "the control-plane store could not be reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#DescribeEndpointAuthorization",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum DescribeEndpointAuthorizationErrorModeled {
     ClusterNotFoundFault(ClusterNotFoundFault),
     UnsupportedOperationFault(UnsupportedOperationFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -156,20 +161,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeEndpointAuthorization` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeEndpointAuthorizationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeEndpointAuthorization"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                DescribeEndpointAuthorizationErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+        // The clock already owed these transitions at this instant, so applying
+        // them here shows nothing a later caller could not already have seen.
+        store.settle(::std::time::Instant::now());
+
+        // Refuse before doing any work: a cluster identifier that names no
+        // cluster is answered without walking the store.
+        if let Some(wanted) = input.cluster_identifier.as_deref() {
+            if store.cluster(wanted).is_none() {
+                return Err(
+                    DescribeEndpointAuthorizationErrorModeled::ClusterNotFoundFault(
+                        ClusterNotFoundFault {
+                            message: Some(format!("Cluster {wanted} not found.")),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // "Indicates whether to check authorization from a grantor or grantee
+        // point of view. If true, Amazon Redshift returns endpoint authorizations
+        // that you've been granted. If false (default), checks authorization from
+        // a grantor point of view." So the point of view decides which side of
+        // each record this account has to be on — and, with it, which side the
+        // `Account` filter names: "the Amazon Web Services account ID of either
+        // the cluster owner (grantor) or grantee. If Grantee parameter is true,
+        // then the Account value is of the grantor."
+        let as_grantee = input.grantee.unwrap_or(false);
+        let this_account = ::engine::emulator_account_id();
+        let matched: Vec<&st::StoredEndpointAuthorization> = store
+            .endpoint_authorizations
+            .iter()
+            .filter(|stored| {
+                let (mine, other) = if as_grantee {
+                    (
+                        stored.authorization.grantee.as_deref(),
+                        stored.authorization.grantor.as_deref(),
+                    )
+                } else {
+                    (
+                        stored.authorization.grantor.as_deref(),
+                        stored.authorization.grantee.as_deref(),
+                    )
+                };
+                mine == Some(this_account)
+                    && input
+                        .account
+                        .as_deref()
+                        .is_none_or(|wanted| other == Some(wanted))
+                    && input.cluster_identifier.as_deref().is_none_or(|wanted| {
+                        stored.authorization.cluster_identifier.as_deref() == Some(wanted)
+                    })
+            })
+            .collect();
+
+        let (start, end, next_marker) =
+            match st::page_bounds(input.marker.as_deref(), input.max_records, matched.len()) {
+                Ok(page) => page,
+                Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
+            };
+
+        // Each record is reported by the one rule every operation on an
+        // authorization reports one by, so the cluster status and the endpoint
+        // count a read carries are the ones that hold right now.
+        let page: Vec<AuthorizeEndpointAccessOutput> = matched[start..end]
+            .iter()
+            .map(|stored| store.endpoint_authorization_view(stored))
+            .collect();
+
+        Ok(DescribeEndpointAuthorizationOutput {
+            endpoint_authorization_list: Some(page),
+            marker: next_marker,
+        })
     }
 }

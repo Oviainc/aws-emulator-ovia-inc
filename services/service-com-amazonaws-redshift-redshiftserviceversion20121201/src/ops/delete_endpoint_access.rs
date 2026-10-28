@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteEndpointAccess
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteEndpointAccess`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteEndpointAccess::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes one Redshift-managed VPC endpoint: the endpoint the `EndpointName`
+//! names is resolved, refused unless it is serving, and then reported as
+//! `deleting` — the record leaves the store once
+//! [`crate::state::PROVISIONING_SPAN`] has passed, so a caller polling straight
+//! after the call still observes the tear-down.
 //!
 //! ## Shape of an operation
 //!
@@ -100,7 +97,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `DeleteEndpointAccessError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#DeleteEndpointAccess")]
+// `DependentServiceUnavailableFault` is widened in: the model does not list it for
+// this operation, but the service declares the shape, and it is the only modelled
+// way to say "the control-plane store could not be reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#DeleteEndpointAccess",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum DeleteEndpointAccessErrorModeled {
     ClusterNotFoundFault(ClusterNotFoundFault),
@@ -108,6 +111,7 @@ pub enum DeleteEndpointAccessErrorModeled {
     InvalidClusterSecurityGroupStateFault(InvalidClusterSecurityGroupStateFault),
     InvalidClusterStateFault(InvalidClusterStateFault),
     InvalidEndpointStateFault(InvalidEndpointStateFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -159,20 +163,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteEndpointAccess` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteEndpointAccessErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteEndpointAccess"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                DeleteEndpointAccessErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let started = ::std::time::Instant::now();
+
+        let mut store = state.lock();
+        store.settle(started);
+
+        // "The Redshift-managed VPC endpoint to delete": the endpoint's name is
+        // the whole of what this call resolves, so a name that names none is the
+        // modelled not-found refusal.
+        let Some(position) = store.endpoint_access_position(&input.endpoint_name) else {
+            return Err(DeleteEndpointAccessErrorModeled::EndpointNotFoundFault(
+                EndpointNotFoundFault {
+                    message: Some(st::endpoint_not_found_message(&input.endpoint_name)),
+                },
+            )
+            .into());
+        };
+
+        // An endpoint that is not serving yet, or that a delete already started
+        // on, can take no delete: "the status of the endpoint is not valid".
+        let status = store.endpoint_accesses[position]
+            .endpoint
+            .endpoint_status
+            .clone()
+            .unwrap_or_default();
+        if status != st::ENDPOINT_STATUS_ACTIVE {
+            return Err(DeleteEndpointAccessErrorModeled::InvalidEndpointStateFault(
+                InvalidEndpointStateFault {
+                    message: Some(format!(
+                        "Endpoint {} is in state {status}; it must be {} to be deleted.",
+                        input.endpoint_name,
+                        st::ENDPOINT_STATUS_ACTIVE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The tear-down is under way rather than done: the endpoint reports
+        // `deleting` from now on and the record leaves the store once the span has
+        // passed, which `settle` applies whether or not anybody calls again.
+        let stored = &mut store.endpoint_accesses[position];
+        stored.endpoint.endpoint_status = Some(st::ENDPOINT_STATUS_DELETING.to_string());
+        stored.removed_at = Some(started + st::PROVISIONING_SPAN);
+
+        // The endpoint as it now stands, which is also what a `DescribeEndpointAccess`
+        // reports for the rest of that span.
+        let endpoint = &stored.endpoint;
+        Ok(DeleteEndpointAccessOutput {
+            cluster_identifier: endpoint.cluster_identifier.clone(),
+            resource_owner: endpoint.resource_owner.clone(),
+            subnet_group_name: endpoint.subnet_group_name.clone(),
+            endpoint_status: endpoint.endpoint_status.clone(),
+            endpoint_name: endpoint.endpoint_name.clone(),
+            endpoint_create_time: endpoint.endpoint_create_time,
+            port: endpoint.port,
+            address: endpoint.address.clone(),
+            vpc_security_groups: endpoint.vpc_security_groups.clone(),
+            vpc_endpoint: endpoint.vpc_endpoint.clone(),
+        })
     }
 }

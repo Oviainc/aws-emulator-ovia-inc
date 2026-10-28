@@ -45,6 +45,8 @@ mod copy_cluster_snapshot;
 mod custom_domain_and_partners;
 #[path = "all/default_cluster_parameters.rs"]
 mod default_cluster_parameters;
+#[path = "all/endpoint_access.rs"]
+mod endpoint_access;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
 #[path = "all/event_categories.rs"]

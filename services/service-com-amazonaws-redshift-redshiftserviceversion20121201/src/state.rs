@@ -14,7 +14,9 @@
 //! subscriptions that say which Amazon Redshift events are published to an
 //! Amazon SNS topic, and the authentication profiles that hold, under a name a
 //! client names instead of repeating them, the connection settings it connects
-//! with, and the resource policies attached to the resources whose ARNs a
+//! with, the Redshift-managed VPC endpoints the account created on its clusters
+//! and the endpoint authorizations that say which account may create one,
+//! and the resource policies attached to the resources whose ARNs a
 //! `PutResourcePolicy` named. Every collection keeps
 //! INSERTION ORDER, so the `Marker`
 //! cursor the paginated `Describe*` operations hand out is a stable, resumable
@@ -41,9 +43,11 @@
 use crate::ops::types::{
     AccountAttribute, AccountWithRestoreAccess, AquaConfiguration, Association,
     AttributeValueTarget,
-    AuthenticationProfile, AvailabilityZone, CertificateAssociation, Cluster, ClusterIamRole,
+    AuthenticationProfile, AuthorizeEndpointAccessOutput, AvailabilityZone, CertificateAssociation,
+    Cluster, ClusterIamRole,
     ClusterNode, ClusterParameterGroup, ClusterParameterGroupStatus, ClusterParameterStatus,
-    ClusterSubnetGroup, ClusterVersion, CreateIntegrationOutput, CreateUsageLimitOutput, Endpoint,
+    ClusterSubnetGroup, ClusterVersion, CreateEndpointAccessOutput, CreateIntegrationOutput,
+    CreateUsageLimitOutput, Endpoint,
     Event, EventCategoriesMap, EventInfoMap,
     EventSubscription, HsmClientCertificate, HsmConfiguration, InboundIntegration,
     MaintenanceTrack,
@@ -3126,15 +3130,11 @@ pub enum NamespaceRefusal {
 /// (`smithy_query(query="doc", shape="RegisterNamespaceInputMessage",
 /// member="ConsumerIdentifiers")`) and the model constrains it only by length,
 /// so the one form an account id takes — [`ACCOUNT_ID_DIGITS`] digits, as
-/// [`account_with_restore_access`] also admits — is checked here rather than
-/// storing a registration for an account that cannot exist.
+/// [`account_with_restore_access`] also admits — is checked through
+/// [`account_id_value`] rather than storing a registration for an account that
+/// cannot exist.
 pub fn consumer_account_id(value: &str) -> Result<String, String> {
-    if value.len() == ACCOUNT_ID_DIGITS && value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Ok(value.to_string());
-    }
-    Err(format!(
-        "Invalid value for ConsumerIdentifiers: '{value}'. It must be a {ACCOUNT_ID_DIGITS}-digit Amazon Web Services account identifier."
-    ))
+    account_id_value("ConsumerIdentifiers", value)
 }
 
 /// A namespace registration as this service stores it: which namespace is
@@ -3500,6 +3500,12 @@ pub struct ComAmazonawsRedshiftRedshiftserviceversion20121201State {
     pub hsm_client_certificates: Vec<HsmClientCertificate>,
     /// Every zero-ETL integration, keyed by `IntegrationArn`, in creation order.
     pub integrations: Vec<StoredIntegration>,
+    /// Every Redshift-managed VPC endpoint, keyed by `EndpointName`, in creation
+    /// order.
+    pub endpoint_accesses: Vec<StoredEndpointAccess>,
+    /// Every endpoint authorization, keyed by the cluster and the grantee account
+    /// it was granted for, in creation order.
+    pub endpoint_authorizations: Vec<StoredEndpointAuthorization>,
 }
 
 /// Where in the store one resource an ARN names sits: its collection and its
@@ -3553,6 +3559,8 @@ impl Default for ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             partner_integrations: Vec::new(),
             hsm_client_certificates: Vec::new(),
             integrations: Vec::new(),
+            endpoint_accesses: Vec::new(),
+            endpoint_authorizations: Vec::new(),
         }
     }
 }
@@ -3709,6 +3717,23 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
         let oldest_readable = wall.secs() - EVENT_RETENTION.as_secs() as i64;
         self.events
             .retain(|event| event.date.is_none_or(|at| at.secs() >= oldest_readable));
+        // A Redshift-managed VPC endpoint a create left coming up is serving
+        // once that call's span has passed, and one a delete marked is GONE once
+        // the delete's span has passed: both were due at this instant whether or
+        // not anybody called.
+        for stored in &mut self.endpoint_accesses {
+            if stored.endpoint.endpoint_status.as_deref() == Some(ENDPOINT_STATUS_CREATING)
+                && now >= stored.active_at
+            {
+                stored.endpoint.endpoint_status = Some(ENDPOINT_STATUS_ACTIVE.to_string());
+            }
+        }
+        self.endpoint_accesses
+            .retain(|stored| stored.removed_at.is_none_or(|due| now < due));
+        // An endpoint authorization a revoke marked is likewise gone once the
+        // revoke's span has passed.
+        self.endpoint_authorizations
+            .retain(|stored| stored.removed_at.is_none_or(|due| now < due));
     }
 
     /// Append one raised event to the log this store keeps for an event read.
@@ -5179,6 +5204,129 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             }
         }
     }
+
+    /// The stored Redshift-managed VPC endpoint with this name, if any.
+    ///
+    /// The name is compared exactly as the request carried it: the model
+    /// documents no folding for `EndpointName` (unlike a subnet group name, see
+    /// [`normalized_subnet_group_name`]), so the spelling a create stored is the
+    /// spelling a later call reaches it by.
+    pub fn endpoint_access(&self, endpoint_name: &str) -> Option<&StoredEndpointAccess> {
+        self.endpoint_accesses
+            .iter()
+            .find(|stored| stored.endpoint.endpoint_name.as_deref() == Some(endpoint_name))
+    }
+
+    /// The position of the Redshift-managed VPC endpoint with this name, if any.
+    ///
+    /// The name is compared exactly as [`Self::endpoint_access`] compares it, so
+    /// the read path and the write path can never resolve one name differently.
+    pub fn endpoint_access_position(&self, endpoint_name: &str) -> Option<usize> {
+        self.endpoint_accesses
+            .iter()
+            .position(|stored| stored.endpoint.endpoint_name.as_deref() == Some(endpoint_name))
+    }
+
+    /// How many Redshift-managed VPC endpoints this store holds for one cluster:
+    /// what [`ENDPOINTS_PER_CLUSTER_QUOTA`] bounds.
+    pub fn endpoints_of_cluster(&self, cluster_identifier: &str) -> usize {
+        self.endpoint_accesses
+            .iter()
+            .filter(|stored| {
+                stored.endpoint.cluster_identifier.as_deref() == Some(cluster_identifier)
+            })
+            .count()
+    }
+
+    /// The position of the endpoint authorization granted on `cluster_identifier`
+    /// to `grantee`, if any.
+    ///
+    /// An authorization's identity is that PAIR — "Grants access to a cluster"
+    /// for one grantee account — so a cluster carries at most one authorization
+    /// per account, which is what makes a second `AuthorizeEndpointAccess` for
+    /// the same pair the modelled `EndpointAuthorizationAlreadyExistsFault`.
+    pub fn endpoint_authorization_position(
+        &self,
+        cluster_identifier: &str,
+        grantee: &str,
+    ) -> Option<usize> {
+        self.endpoint_authorizations.iter().position(|stored| {
+            stored.authorization.cluster_identifier.as_deref() == Some(cluster_identifier)
+                && stored.authorization.grantee.as_deref() == Some(grantee)
+        })
+    }
+
+    /// The endpoint authorization granted on `cluster_identifier` to `grantee`,
+    /// resolved exactly as [`Self::endpoint_authorization_position`] resolves it.
+    pub fn endpoint_authorization(
+        &self,
+        cluster_identifier: &str,
+        grantee: &str,
+    ) -> Option<&StoredEndpointAuthorization> {
+        self.endpoint_authorization_position(cluster_identifier, grantee)
+            .and_then(|position| self.endpoint_authorizations.get(position))
+    }
+
+    /// What every operation reports for one endpoint authorization: the stored
+    /// record plus the two members DERIVED from the state around it.
+    ///
+    /// `ClusterStatus` is "the status of the cluster"
+    /// (`smithy_query(query="doc", shape="EndpointAuthorization",
+    /// member="ClusterStatus")`) and `EndpointCount` "the number of
+    /// Redshift-managed VPC endpoints created for the authorization", so neither
+    /// is a property of the authorization record: both are read off the cluster
+    /// and the endpoints as they stand NOW. One rule, so the authorize, the
+    /// revoke and the read paths cannot report an authorization differently.
+    pub fn endpoint_authorization_view(
+        &self,
+        stored: &StoredEndpointAuthorization,
+    ) -> AuthorizeEndpointAccessOutput {
+        let mut view = stored.authorization.clone();
+        let cluster_identifier = view.cluster_identifier.clone().unwrap_or_default();
+        view.cluster_status = self
+            .cluster(&cluster_identifier)
+            .and_then(|cluster| cluster.cluster.cluster_status.clone());
+        view.endpoint_count = Some(self.authorized_endpoint_count(stored));
+        view
+    }
+
+    /// How many of the cluster's Redshift-managed VPC endpoints this
+    /// authorization admits: every endpoint of the cluster when the
+    /// authorization allows all VPCs, and otherwise the ones whose VPC it names.
+    ///
+    /// Counted from the stored endpoints rather than tracked on the
+    /// authorization, so creating or deleting an endpoint moves the count with no
+    /// separate bookkeeping.
+    pub fn authorized_endpoint_count(&self, stored: &StoredEndpointAuthorization) -> i32 {
+        let cluster_identifier = stored
+            .authorization
+            .cluster_identifier
+            .as_deref()
+            .unwrap_or_default();
+        let all_vpcs = stored.authorization.allowed_all_vp_cs == Some(true);
+        let allowed = stored
+            .authorization
+            .allowed_vp_cs
+            .as_deref()
+            .unwrap_or_default();
+        let admitted = self
+            .endpoint_accesses
+            .iter()
+            .filter(|endpoint| {
+                endpoint.endpoint.cluster_identifier.as_deref() == Some(cluster_identifier)
+            })
+            .filter(|endpoint| {
+                all_vpcs
+                    || endpoint
+                        .vpc_id()
+                        .is_some_and(|vpc| allowed.iter().any(|named| named == vpc))
+            })
+            .count();
+        // The collection is bounded by [`ENDPOINTS_PER_CLUSTER_QUOTA`], far below
+        // what the modelled `Integer` holds, so the saturating conversion can
+        // only ever be the exact count.
+        i32::try_from(admitted).unwrap_or(i32::MAX)
+    }
 }
 
 /// One `TaggedResource` per tag of one resource: the tag, the resource's ARN and
@@ -6125,31 +6273,62 @@ pub fn cluster_vpc_endpoints(
     vpc_id: &str,
     availability_zone: &str,
 ) -> Vec<VpcEndpoint> {
-    vec![VpcEndpoint {
+    vec![vpc_interface_endpoint(
+        cluster_identifier,
+        vpc_id,
+        availability_zone,
+        None,
+    )]
+}
+
+/// ONE VPC interface endpoint, as [`cluster_vpc_endpoints`] reports it, for the
+/// resource `owner` names.
+///
+/// The same derivation serves a cluster's own endpoint and a Redshift-managed
+/// VPC endpoint of that cluster (`EndpointAccess$VpcEndpoint`), because both are
+/// the same kind of thing — "the connection endpoint for connecting to an Amazon
+/// Redshift cluster through the proxy" — so `owner` is whichever resource the
+/// interface belongs to and every id stays derived from it. `subnet_id` is the
+/// subnet the interface was placed in where the caller KNOWS it (an endpoint
+/// deployed into a subnet of its subnet group); `None` derives it from the VPC
+/// and the zone, which is what a cluster whose subnets this service does not
+/// enumerate per interface reports.
+pub fn vpc_interface_endpoint(
+    owner: &str,
+    vpc_id: &str,
+    availability_zone: &str,
+    subnet_id: Option<&str>,
+) -> VpcEndpoint {
+    VpcEndpoint {
         vpc_endpoint_id: Some(format!(
             "vpce-{}",
-            short_digest(&format!("vpce/{cluster_identifier}/{vpc_id}"), 17)
+            short_digest(&format!("vpce/{owner}/{vpc_id}"), 17)
         )),
         vpc_id: Some(vpc_id.to_string()),
         network_interfaces: Some(vec![NetworkInterface {
             network_interface_id: Some(format!(
                 "eni-{}",
-                short_digest(&format!("eni/{cluster_identifier}/{availability_zone}"), 17)
+                short_digest(&format!("eni/{owner}/{availability_zone}"), 17)
             )),
-            subnet_id: Some(format!(
-                "subnet-{}",
-                short_digest(&format!("subnet/{vpc_id}/{availability_zone}"), 17)
+            subnet_id: Some(subnet_id.map_or_else(
+                || {
+                    format!(
+                        "subnet-{}",
+                        short_digest(&format!("subnet/{vpc_id}/{availability_zone}"), 17)
+                    )
+                },
+                str::to_string,
             )),
             private_ip_address: Some(derived_ipv4(
                 10,
-                &format!("eni-address/{cluster_identifier}/{availability_zone}"),
+                &format!("eni-address/{owner}/{availability_zone}"),
             )),
             availability_zone: Some(availability_zone.to_string()),
             // The emulator presents IPv4 subnets only, so an endpoint interface
             // has no IPv6 address to report.
             ipv6_address: None,
         }]),
-    }]
+    }
 }
 
 /// The `AquaConfiguration` every cluster reports.
@@ -7189,6 +7368,213 @@ impl StoredIntegration {
             create_time: self.integration.create_time,
         }
     }
+}
+
+/// The rule for a Redshift-managed VPC endpoint name (`EndpointName`).
+///
+/// Source: `smithy_query(query="doc", shape="CreateEndpointAccessMessage",
+/// member="EndpointName")` — "An endpoint name must contain 1-30 characters.
+/// Valid characters are A-Z, a-z, 0-9, and hyphen(-). The first character must be
+/// a letter. The name can't contain two consecutive hyphens or end with a
+/// hyphen." Uppercase is explicitly VALID here, and the doc states no stored
+/// form, so the name is held exactly as the request spelled it (see
+/// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::endpoint_access`]).
+pub const ENDPOINT_NAME_RULE: IdentifierRule = IdentifierRule {
+    member: "EndpointName",
+    max_len: 30,
+    lowercase_only: false,
+};
+
+/// The `EndpointAccess$EndpointStatus` of an endpoint a create just recorded,
+/// until [`PROVISIONING_SPAN`] has passed.
+///
+/// `smithy_query(query="doc", shape="EndpointAccess", member="EndpointStatus")`
+/// documents only "the status of the endpoint" and the model declares no enum for
+/// it, so the three values this service reports are the cluster lifecycle's own
+/// ([`STATUS_CREATING`], [`STATUS_AVAILABLE`]'s endpoint counterpart below, and
+/// [`STATUS_DELETING`]): a Redshift-managed VPC endpoint is provisioned, serving,
+/// or being torn down.
+pub const ENDPOINT_STATUS_CREATING: &str = STATUS_CREATING;
+
+/// The `EndpointAccess$EndpointStatus` of an endpoint that is serving
+/// connections, which is the state a modify or a delete may be asked for in.
+pub const ENDPOINT_STATUS_ACTIVE: &str = "active";
+
+/// The `EndpointAccess$EndpointStatus` of an endpoint whose deletion is under
+/// way: the record a `DeleteEndpointAccess` reported, until
+/// [`PROVISIONING_SPAN`] has passed and
+/// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::settle`] drops it.
+pub const ENDPOINT_STATUS_DELETING: &str = STATUS_DELETING;
+
+/// The `AuthorizationStatus` of an authorization that is in force.
+///
+/// Source: `smithy_query(query="shape", shape="AuthorizationStatus")` —
+/// `Authorized | Revoking`.
+pub const AUTHORIZATION_STATUS_AUTHORIZED: &str = "Authorized";
+
+/// The `AuthorizationStatus` of an authorization a revoke has started on, until
+/// [`PROVISIONING_SPAN`] has passed and
+/// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::settle`] drops it.
+pub const AUTHORIZATION_STATUS_REVOKING: &str = "Revoking";
+
+/// How many Redshift-managed VPC endpoints one cluster may have before
+/// `CreateEndpointAccess` refuses with the modelled
+/// `EndpointsPerClusterLimitExceededFault`.
+///
+/// The same reasoning as [`USAGE_LIMIT_QUOTA`]: Amazon Redshift publishes an
+/// adjustable quota on endpoints per cluster and this emulator models neither
+/// Service Quotas nor an account's adjustments, so this is the emulator's OWN
+/// bound on
+/// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::endpoint_accesses`]
+/// rather than a claim about any account's limit. Every record it holds is
+/// released by `DeleteEndpointAccess`.
+pub const ENDPOINTS_PER_CLUSTER_QUOTA: usize = 1_000;
+
+/// How many endpoint authorizations one cluster may carry before
+/// `AuthorizeEndpointAccess` refuses with the modelled
+/// `EndpointAuthorizationsPerClusterLimitExceededFault`.
+///
+/// The emulator's own bound, for the same reason as
+/// [`ENDPOINTS_PER_CLUSTER_QUOTA`]; every record it holds is released by
+/// `RevokeEndpointAccess`.
+pub const ENDPOINT_AUTHORIZATIONS_PER_CLUSTER_QUOTA: usize = 1_000;
+
+/// The DNS address a Redshift-managed VPC endpoint is reached at.
+///
+/// Source: `smithy_query(query="doc", shape="EndpointAccess", member="Address")`
+/// — "The DNS address of the endpoint". Built in the same Redshift hostname form
+/// as a cluster's own endpoint ([`endpoint_address`]) and derived from the
+/// endpoint's own name and Region, so the same endpoint always reports the same
+/// address and nothing here is drawn per run.
+pub fn endpoint_access_address(endpoint_name: &str, region: &str) -> String {
+    let token = short_digest(&format!("endpoint-access/{endpoint_name}/{region}"), 12);
+    format!("{endpoint_name}.{token}.{region}.redshift.amazonaws.com")
+}
+
+/// The subnet of `group` that Amazon Redshift deploys the endpoint
+/// `endpoint_name` into, or `None` when the group holds no subnet.
+///
+/// Source: `smithy_query(query="doc", shape="CreateEndpointAccessMessage",
+/// member="SubnetGroupName")` — "The subnet group from which Amazon Redshift
+/// chooses the subnet to deploy the endpoint." The service chooses, so the choice
+/// is DERIVED from the endpoint's own name: the same endpoint always reports the
+/// same subnet and zone, and two endpoints of one group can land in different
+/// subnets.
+pub fn endpoint_deployment_subnet(group: &ClusterSubnetGroup, endpoint_name: &str) -> Option<Subnet> {
+    let subnets = group.subnets.as_deref().unwrap_or_default();
+    if subnets.is_empty() {
+        return None;
+    }
+    let index = digest_byte(&format!("endpoint-subnet/{endpoint_name}")) as usize % subnets.len();
+    subnets.get(index).cloned()
+}
+
+/// The security-group memberships a Redshift-managed VPC endpoint reports.
+///
+/// Source: `smithy_query(query="doc", shape="EndpointAccess",
+/// member="VpcSecurityGroups")` — "The security groups associated with the
+/// endpoint". The ONE rule for them, so the create path and the modify path
+/// cannot report a membership differently: an endpoint that named no group is in
+/// its VPC's default one, exactly as a cluster that named none is
+/// ([`default_vpc_security_group_id`]), so the list is never empty.
+pub fn endpoint_security_groups(
+    requested: Option<&[String]>,
+    vpc_id: &str,
+) -> Vec<VpcSecurityGroupMembership> {
+    let named = requested.unwrap_or_default();
+    let ids: Vec<String> = if named.is_empty() {
+        vec![default_vpc_security_group_id(vpc_id)]
+    } else {
+        named.to_vec()
+    };
+    ids.into_iter()
+        .map(|id| VpcSecurityGroupMembership {
+            vpc_security_group_id: Some(id),
+            status: Some(SECURITY_GROUP_STATUS_ACTIVE.to_string()),
+        })
+        .collect()
+}
+
+/// What every operation on a Redshift-managed VPC endpoint answers when the
+/// `EndpointName` it resolves names none.
+pub fn endpoint_not_found_message(endpoint_name: &str) -> String {
+    format!("Endpoint {endpoint_name} not found.")
+}
+
+/// What `CreateEndpointAccess` answers when the account already holds an
+/// endpoint under the requested name.
+pub fn endpoint_exists_message(endpoint_name: &str) -> String {
+    format!("Endpoint {endpoint_name} already exists.")
+}
+
+/// What every operation on an endpoint authorization answers when the cluster and
+/// account pair it resolves names none.
+pub fn endpoint_authorization_not_found_message(
+    cluster_identifier: &str,
+    grantee: &str,
+) -> String {
+    format!(
+        "Endpoint authorization for cluster {cluster_identifier} and account {grantee} not found."
+    )
+}
+
+/// The Amazon Web Services account id `member` names, or why the value names no
+/// account.
+///
+/// The one form an account id takes — [`ACCOUNT_ID_DIGITS`] digits, as
+/// [`account_with_restore_access`] also admits — checked for whichever member
+/// carries it, so a request naming an account that cannot exist is refused rather
+/// than stored.
+pub fn account_id_value(member: &str, value: &str) -> Result<String, String> {
+    if value.len() == ACCOUNT_ID_DIGITS && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Ok(value.to_string());
+    }
+    Err(format!(
+        "Invalid value for {member}: '{value}'. It must be a {ACCOUNT_ID_DIGITS}-digit Amazon Web Services account identifier."
+    ))
+}
+
+/// A Redshift-managed VPC endpoint as this service stores it: the modelled
+/// projection every endpoint operation reports, plus the two clock-owed instants
+/// the model carries no member for.
+#[derive(Debug, Clone)]
+pub struct StoredEndpointAccess {
+    /// Exactly what `DescribeEndpointAccess` reports, so a read never recomputes
+    /// it.
+    pub endpoint: CreateEndpointAccessOutput,
+    /// When the clock-owed [`ENDPOINT_STATUS_CREATING`] ->
+    /// [`ENDPOINT_STATUS_ACTIVE`] transition falls due. See
+    /// [`PROVISIONING_SPAN`].
+    pub active_at: Instant,
+    /// When the clock-owed REMOVAL of this record falls due, set by the
+    /// `DeleteEndpointAccess` that asked for it and `None` while the endpoint
+    /// exists. See [`PROVISIONING_SPAN`].
+    pub removed_at: Option<Instant>,
+}
+
+impl StoredEndpointAccess {
+    /// The VPC this endpoint has its interface in, as its own record carries it.
+    pub fn vpc_id(&self) -> Option<&str> {
+        self.endpoint
+            .vpc_endpoint
+            .as_ref()
+            .and_then(|vpc_endpoint| vpc_endpoint.vpc_id.as_deref())
+    }
+}
+
+/// An endpoint authorization as this service stores it: the record the
+/// authorize minted, minus the members read off the state around it (see
+/// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::endpoint_authorization_view`]),
+/// plus when the revoke that started on it falls due.
+#[derive(Debug, Clone)]
+pub struct StoredEndpointAuthorization {
+    /// The authorization itself: who granted it, to whom, on which cluster, when,
+    /// which VPCs it allows and whether a revoke has started on it.
+    pub authorization: AuthorizeEndpointAccessOutput,
+    /// When the clock-owed REMOVAL of this record falls due, set by the
+    /// `RevokeEndpointAccess` that asked for it and `None` while the
+    /// authorization is in force. See [`PROVISIONING_SPAN`].
+    pub removed_at: Option<Instant>,
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

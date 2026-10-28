@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyEndpointAccess
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyEndpointAccess`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyEndpointAccess::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the VPC security groups of one Redshift-managed VPC endpoint: the
+//! endpoint is resolved, refused unless it is serving, then its cluster is
+//! resolved and refused unless that cluster is available — and only then does the
+//! membership the request names become the endpoint's complete list.
 //!
 //! ## Shape of an operation
 //!
@@ -103,7 +99,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `ModifyEndpointAccessError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#ModifyEndpointAccess")]
+// `DependentServiceUnavailableFault` is widened in: the model does not list it for
+// this operation, but the service declares the shape, and it is the only modelled
+// way to say "the control-plane store could not be reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#ModifyEndpointAccess",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum ModifyEndpointAccessErrorModeled {
     ClusterNotFoundFault(ClusterNotFoundFault),
@@ -112,6 +114,7 @@ pub enum ModifyEndpointAccessErrorModeled {
     InvalidClusterStateFault(InvalidClusterStateFault),
     InvalidEndpointStateFault(InvalidEndpointStateFault),
     UnauthorizedOperation(UnauthorizedOperation),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -163,20 +166,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyEndpointAccess` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyEndpointAccessErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyEndpointAccess"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                ModifyEndpointAccessErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let started = ::std::time::Instant::now();
+
+        let mut store = state.lock();
+        store.settle(started);
+
+        // "The endpoint to be modified": a name that names no endpoint is the
+        // modelled not-found refusal, raised before anything is changed.
+        let Some(position) = store.endpoint_access_position(&input.endpoint_name) else {
+            return Err(ModifyEndpointAccessErrorModeled::EndpointNotFoundFault(
+                EndpointNotFoundFault {
+                    message: Some(st::endpoint_not_found_message(&input.endpoint_name)),
+                },
+            )
+            .into());
+        };
+        let status = store.endpoint_accesses[position]
+            .endpoint
+            .endpoint_status
+            .clone()
+            .unwrap_or_default();
+        if status != st::ENDPOINT_STATUS_ACTIVE {
+            return Err(ModifyEndpointAccessErrorModeled::InvalidEndpointStateFault(
+                InvalidEndpointStateFault {
+                    message: Some(format!(
+                        "Endpoint {} is in state {status}; it must be {} to be modified.",
+                        input.endpoint_name,
+                        st::ENDPOINT_STATUS_ACTIVE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The endpoint reaches ONE cluster, so a configuration change to it is a
+        // change to how that cluster is reached: the cluster has to be there and
+        // to be in the state that admits a configuration change.
+        let cluster_identifier = store.endpoint_accesses[position]
+            .endpoint
+            .cluster_identifier
+            .clone()
+            .unwrap_or_default();
+        let Some(stored_cluster) = store.cluster(&cluster_identifier) else {
+            return Err(ModifyEndpointAccessErrorModeled::ClusterNotFoundFault(
+                ClusterNotFoundFault {
+                    message: Some(format!("Cluster {cluster_identifier} not found.")),
+                },
+            )
+            .into());
+        };
+        let cluster_status = stored_cluster
+            .cluster
+            .cluster_status
+            .clone()
+            .unwrap_or_default();
+        if cluster_status != st::STATUS_AVAILABLE {
+            return Err(ModifyEndpointAccessErrorModeled::InvalidClusterStateFault(
+                InvalidClusterStateFault {
+                    message: Some(format!(
+                        "Cluster {cluster_identifier} is in state {cluster_status}; it must be {} to modify an endpoint to it.",
+                        st::STATUS_AVAILABLE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "The complete list of VPC security groups associated with the endpoint
+        // after the endpoint is modified": the named list REPLACES the membership,
+        // and a request that names none leaves the endpoint exactly as it stands.
+        // Every other member of the record — its cluster, its subnet group, its
+        // address, its port, its interface — is not this call's to touch.
+        let stored = &mut store.endpoint_accesses[position];
+        if input
+            .vpc_security_group_ids
+            .as_deref()
+            .is_some_and(|ids| !ids.is_empty())
+        {
+            let vpc_id = stored.vpc_id().unwrap_or_default().to_string();
+            stored.endpoint.vpc_security_groups = Some(st::endpoint_security_groups(
+                input.vpc_security_group_ids.as_deref(),
+                &vpc_id,
+            ));
+        }
+
+        // The endpoint as it now stands, which is also what a later
+        // `DescribeEndpointAccess` reports.
+        let endpoint = &stored.endpoint;
+        Ok(ModifyEndpointAccessOutput {
+            cluster_identifier: endpoint.cluster_identifier.clone(),
+            resource_owner: endpoint.resource_owner.clone(),
+            subnet_group_name: endpoint.subnet_group_name.clone(),
+            endpoint_status: endpoint.endpoint_status.clone(),
+            endpoint_name: endpoint.endpoint_name.clone(),
+            endpoint_create_time: endpoint.endpoint_create_time,
+            port: endpoint.port,
+            address: endpoint.address.clone(),
+            vpc_security_groups: endpoint.vpc_security_groups.clone(),
+            vpc_endpoint: endpoint.vpc_endpoint.clone(),
+        })
     }
 }

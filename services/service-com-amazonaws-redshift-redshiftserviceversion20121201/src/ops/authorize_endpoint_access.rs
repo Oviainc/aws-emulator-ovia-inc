@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AuthorizeEndpointAccess
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AuthorizeEndpointAccess`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AuthorizeEndpointAccess::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Grants one account access to create Redshift-managed VPC endpoints to a
+//! cluster: the cluster is resolved and refused unless it is available, and the
+//! grant is recorded for the cluster-and-account pair that identifies it — either
+//! for the VPCs the request names or, when it names none, for every VPC of the
+//! grantee account.
 //!
 //! ## Shape of an operation
 //!
@@ -105,7 +102,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `AuthorizeEndpointAccessError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#AuthorizeEndpointAccess")]
+// `DependentServiceUnavailableFault` is widened in: the model does not list it for
+// this operation, but the service declares the shape, and it is the only modelled
+// way to say "the control-plane store could not be reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#AuthorizeEndpointAccess",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum AuthorizeEndpointAccessErrorModeled {
     ClusterNotFoundFault(ClusterNotFoundFault),
@@ -114,6 +117,7 @@ pub enum AuthorizeEndpointAccessErrorModeled {
     InvalidAuthorizationStateFault(InvalidAuthorizationStateFault),
     InvalidClusterStateFault(InvalidClusterStateFault),
     UnsupportedOperationFault(UnsupportedOperationFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -165,20 +169,158 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AuthorizeEndpointAccess` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AuthorizeEndpointAccessErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                AuthorizeEndpointAccessErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let started = ::std::time::Instant::now();
+
+        // Every name the request carries is resolved BEFORE anything else about
+        // the request is judged, so a name that resolves to nothing is answered
+        // with that resource's own modelled fault rather than with a refusal of
+        // the request's shape.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AuthorizeEndpointAccess"))
+        // An authorization is granted ON one cluster and reports which one, so a
+        // request that names none describes no authorization.
+        let Some(cluster_identifier) = input.cluster_identifier.clone() else {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_combination(
+                "ClusterIdentifier must be specified to grant endpoint access to a cluster.",
+            ));
+        };
+
+        let mut store = state.lock();
+        store.settle(started);
+
+        // "The cluster identifier of the cluster to grant access to": the cluster
+        // is what is granted, so it has to be there and to be in the state that
+        // admits a configuration change.
+        let Some(stored_cluster) = store.cluster(&cluster_identifier) else {
+            return Err(AuthorizeEndpointAccessErrorModeled::ClusterNotFoundFault(
+                ClusterNotFoundFault {
+                    message: Some(format!("Cluster {cluster_identifier} not found.")),
+                },
+            )
+            .into());
+        };
+        let cluster_status = stored_cluster
+            .cluster
+            .cluster_status
+            .clone()
+            .unwrap_or_default();
+        if cluster_status != st::STATUS_AVAILABLE {
+            return Err(
+                AuthorizeEndpointAccessErrorModeled::InvalidClusterStateFault(
+                    InvalidClusterStateFault {
+                        message: Some(format!(
+                            "Cluster {cluster_identifier} is in state {cluster_status}; it must be {} to grant endpoint access to it.",
+                            st::STATUS_AVAILABLE
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The cluster resolved, so what is left is what the request itself says:
+        // a grant to an account that cannot exist is nothing this service can
+        // record.
+        let grantee = match st::account_id_value("Account", &input.account) {
+            Ok(account) => account,
+            Err(message) => {
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                    message,
+                ))
+            }
+        };
+
+        // An authorization's identity is the cluster-and-account pair, so a
+        // second grant for the same pair is the modelled already-exists refusal —
+        // and one a revoke has already started on can take no grant at all.
+        if let Some(existing) = store.endpoint_authorization(&cluster_identifier, &grantee) {
+            if existing.authorization.status.as_deref()
+                == Some(st::AUTHORIZATION_STATUS_REVOKING)
+            {
+                return Err(
+                    AuthorizeEndpointAccessErrorModeled::InvalidAuthorizationStateFault(
+                        InvalidAuthorizationStateFault {
+                            message: Some(format!(
+                                "The endpoint authorization for cluster {cluster_identifier} and account {grantee} is in state {}; it must be {} to be changed.",
+                                st::AUTHORIZATION_STATUS_REVOKING,
+                                st::AUTHORIZATION_STATUS_AUTHORIZED
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            return Err(
+                AuthorizeEndpointAccessErrorModeled::EndpointAuthorizationAlreadyExistsFault(
+                    EndpointAuthorizationAlreadyExistsFault {
+                        message: Some(format!(
+                            "Endpoint authorization for cluster {cluster_identifier} and account {grantee} already exists."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        let held = store
+            .endpoint_authorizations
+            .iter()
+            .filter(|stored| {
+                stored.authorization.cluster_identifier.as_deref() == Some(&cluster_identifier)
+            })
+            .count();
+        if held >= st::ENDPOINT_AUTHORIZATIONS_PER_CLUSTER_QUOTA {
+            return Err(
+                AuthorizeEndpointAccessErrorModeled::EndpointAuthorizationsPerClusterLimitExceededFault(
+                    EndpointAuthorizationsPerClusterLimitExceededFault {
+                        message: Some(format!(
+                            "Cluster {cluster_identifier} already has the allowed number of endpoint authorizations ({}).",
+                            st::ENDPOINT_AUTHORIZATIONS_PER_CLUSTER_QUOTA
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "The virtual private cloud (VPC) identifiers to grant access to": a
+        // request that names none grants every VPC of the grantee account, which
+        // is what `AllowedAllVPCs` reports.
+        let allowed_vpcs = input.vpc_ids.clone().unwrap_or_default();
+        let authorization = AuthorizeEndpointAccessOutput {
+            grantor: Some(::engine::emulator_account_id().to_string()),
+            grantee: Some(grantee),
+            cluster_identifier: Some(cluster_identifier),
+            authorize_time: Some(::aws_smithy_types::DateTime::from(
+                ::std::time::SystemTime::now(),
+            )),
+            // Read off the cluster and the endpoints as they stand, by the one
+            // rule every operation on an authorization reports them by.
+            cluster_status: None,
+            status: Some(st::AUTHORIZATION_STATUS_AUTHORIZED.to_string()),
+            allowed_all_vp_cs: Some(allowed_vpcs.is_empty()),
+            allowed_vp_cs: Some(allowed_vpcs),
+            endpoint_count: None,
+        };
+        let stored = st::StoredEndpointAuthorization {
+            authorization,
+            removed_at: None,
+        };
+        let view = store.endpoint_authorization_view(&stored);
+        store.endpoint_authorizations.push(stored);
+
+        Ok(view)
     }
 }
