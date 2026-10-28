@@ -201,6 +201,19 @@ pub const DEPLOYMENT_PATTERN_VERSION_NOT_FOUND_MESSAGE: &str =
 /// deployment limit is exceeded.
 pub const MAX_DEPLOYMENTS: usize = 200;
 
+/// What the modelled `ResourceLimitException` of a create that cannot fit says.
+///
+/// One function rather than a message per call site, so the read-only fit check a
+/// checked request is answered from and the eviction the performed request runs cannot
+/// drift into refusing the same request with two different messages. It names the
+/// ceiling and what frees a slot, and nothing the caller sent.
+pub fn deployment_limit_message() -> String {
+    format!(
+        "The maximum of {MAX_DEPLOYMENTS} deployments has been reached; delete a deployment \
+         before creating another."
+    )
+}
+
 /// How many events ONE deployment's history keeps.
 ///
 /// AWS publishes no bound on a deployment's event history, so this is the EMULATOR's
@@ -920,11 +933,29 @@ impl ComAmazonawsLaunchwizardLaunchwizardState {
         all
     }
 
+    /// Whether one more deployment WOULD fit, deciding it without changing anything.
+    ///
+    /// The read-only half of [`Self::make_room_for_a_deployment`], true in exactly the
+    /// cases that reports room: the records it may drop to fit a new one are the
+    /// already-deleted ones, so what decides the answer is how many records are still
+    /// live against [`MAX_DEPLOYMENTS`]. A caller that only wants the ANSWER — a
+    /// request being checked rather than performed — asks this one, so the check
+    /// persists nothing, not even the eviction of a terminal record.
+    pub fn has_room_for_a_deployment(&self) -> bool {
+        self.deployments
+            .values()
+            .filter(|deployment| !deployment.is_deleted())
+            .count()
+            < MAX_DEPLOYMENTS
+    }
+
     /// Make room for one more deployment, reporting whether there is any.
     ///
     /// See [`MAX_DEPLOYMENTS`]: already-deleted records are dropped oldest-first to
     /// fit a new one, and `false` means even that was not enough, which the caller
-    /// answers with the modelled `ResourceLimitException`.
+    /// answers with the modelled `ResourceLimitException`. Called only on the path
+    /// that is actually storing a record; [`Self::has_room_for_a_deployment`] is the
+    /// one to ask before that.
     pub fn make_room_for_a_deployment(&mut self) -> bool {
         while self.deployments.len() >= MAX_DEPLOYMENTS {
             let oldest_deleted = self

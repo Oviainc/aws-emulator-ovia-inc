@@ -689,6 +689,21 @@ pub fn update_not_allowed_message(name: &str, status: &str) -> String {
     )
 }
 
+/// Why no change can be applied to an environment in this status.
+///
+/// An environment whose teardown has started is on its way out: its record still reads
+/// back until the clock removes it, but nothing can be applied to it (see
+/// [`EnvironmentRecord::is_deleting`]), so a write that reached such a record is refused
+/// with `ValidationException` (HTTP 400) and this sentence. It is built from the stored
+/// environment's own name and the status it is actually in, so the caller can tell from
+/// the sentence alone which environment refused the change and why.
+pub fn change_not_allowed_message(name: &str, status: &str) -> String {
+    format!(
+        "Environment {name} is in status {status}. No change can be applied to an \
+         environment that is being deleted."
+    )
+}
+
 /// The status a NEW environment starts in, and the status changes the clock owes it — one
 /// decision, made from who manages the environment's VPC endpoints, so every create
 /// follows the lifecycle its own endpoint-management mode implies.
@@ -882,6 +897,27 @@ impl EnvironmentRecord {
     /// applied to it and the clock owes its removal.
     pub fn is_deleting(&self) -> bool {
         self.status == STATUS_DELETING
+    }
+
+    /// Whether a change a request asks for can be applied to this environment at all:
+    /// false exactly while its teardown is running, the one status in which the record
+    /// still reads back and still holds its name but takes no change
+    /// ([`Self::is_deleting`]).
+    ///
+    /// Deliberately weaker than [`Self::accepts_update`]: an `UpdateEnvironment`
+    /// reconfigures a RUNNING environment and so needs one that has settled, while a tag
+    /// write or a write through the environment's own Apache Airflow REST API only needs a
+    /// record that is not on its way out.
+    pub fn accepts_change(&self) -> bool {
+        !self.is_deleting()
+    }
+
+    /// The sentence refusing a change this environment cannot take, or `None` when it can
+    /// take one. Every writer that reaches a stored record asks THIS, so the condition and
+    /// its wording are decided in one place and no writer can drift from the others; see
+    /// [`change_not_allowed_message`].
+    pub fn change_refusal(&self) -> Option<String> {
+        (!self.accepts_change()).then(|| change_not_allowed_message(&self.name, &self.status))
     }
 
     /// Start the teardown a `DeleteEnvironment` asks for: the environment enters
