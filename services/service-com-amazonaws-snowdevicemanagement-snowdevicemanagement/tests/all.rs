@@ -25,6 +25,8 @@ mod create_task_tag_validation;
 mod device_ec2_instance_cache;
 #[path = "all/device_ec2_instances.rs"]
 mod device_ec2_instances;
+#[path = "all/device_record_refresh_instant.rs"]
+mod device_record_refresh_instant;
 #[path = "all/device_region_gate.rs"]
 mod device_region_gate;
 #[path = "all/device_resources.rs"]

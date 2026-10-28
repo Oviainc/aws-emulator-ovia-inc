@@ -302,7 +302,19 @@ pub struct Device {
     pub device_capacities: Vec<Capacity>,
     pub software: SoftwareInformation,
     pub tags: BTreeMap<String, String>,
+    /// "When the device last contacted the Amazon Web Services Cloud. Indicates
+    /// that the device is online." A device contacts the Cloud whenever a command
+    /// reaches it or it answers one.
     pub last_reached_out_at: SystemTime,
+    /// "When the device last pushed an update to the Amazon Web Services Cloud.
+    /// Indicates when the device cache was refreshed."
+    ///
+    /// This is the freshness of the whole cloud-side record of the device, so it
+    /// advances to the instant ANY part of that record last changed — the device's
+    /// own reported members or the Amazon EC2 instance cache in
+    /// [`Device::ec2_instances`] — and not only when its `UnlockState` moved. A
+    /// check-in that left every part of the record as it stood advances
+    /// [`Device::last_reached_out_at`] alone.
     pub last_updated_at: SystemTime,
     /// The Amazon EC2 instances running on this device, keyed by `instanceId`.
     ///
@@ -1072,7 +1084,9 @@ impl ComAmazonawsSnowdevicemanagementSnowdevicemanagementState {
     /// A device's Amazon EC2 instance cache evolves under the same clock: an
     /// instance state that names work in flight is carried to the state that work
     /// ends in ([`Ec2Instance::settle`]), and a device that answered a `reboot`
-    /// reports its whole instance set afresh ([`Ec2Instance::restart`]).
+    /// reports its whole instance set afresh ([`Ec2Instance::restart`]) — which is a
+    /// refresh of that device's cached record, so the device's own
+    /// [`Device::last_updated_at`] advances with it.
     ///
     /// Nothing here depends on who called: the same changes were owed at this
     /// instant even if nobody had.
@@ -1180,16 +1194,24 @@ impl ComAmazonawsSnowdevicemanagementSnowdevicemanagementState {
                 // starts unlocking until it is unlocked.
                 (TaskCommand::Unlock, DeviceCommandPhase::Begun) => Some("UNLOCKING"),
                 (TaskCommand::Unlock, DeviceCommandPhase::Finished) => Some("UNLOCKED"),
-                // "Reboots the device." A reboot leaves no member of the device
-                // record different afterwards, and `UnlockState` has no value
-                // that reports one in flight; only the check-in above, and the
-                // instances the restart brings back up below, record that it
-                // happened.
+                // "Reboots the device." A reboot leaves the device's own
+                // `UnlockState` as it was, and that enum has no value that
+                // reports one in flight; what a reboot leaves different is the
+                // instance cache the restart below reports afresh.
                 (TaskCommand::Reboot, _) => None,
             };
+            // Whether the cloud-side record this device pushed is DIFFERENT after
+            // this check-in. `lastUpdatedAt` is when the device last pushed an
+            // update — "when the device cache was refreshed" — so it advances
+            // whenever ANY part of that cached record changed, the device's own
+            // reported members or the Amazon EC2 instance cache held under them,
+            // and not only its `UnlockState`. A check-in that left every part of
+            // the record as it stood moves the contact instant above and nothing
+            // else: that device is online without having pushed anything new.
+            let mut refreshed = false;
             if let Some(reported) = reported.filter(|state| device.device_state != *state) {
                 device.device_state = reported.to_string();
-                device.last_updated_at = at;
+                refreshed = true;
             }
             // The device restarted, so it brought the compute environment its
             // instances run in back up and reported that whole set afresh: the
@@ -1204,6 +1226,14 @@ impl ComAmazonawsSnowdevicemanagementSnowdevicemanagementState {
                     instance.settle(at);
                     instance.restart(at);
                 }
+                // Every entry the restart pushed carries `at` as its freshness
+                // ([`Ec2Instance::restart`]), so a device holding any entry at all
+                // pushed a refreshed cache at that instant; one holding none
+                // pushed a record no part of which is different.
+                refreshed |= !device.ec2_instances.is_empty();
+            }
+            if refreshed {
+                device.last_updated_at = at;
             }
         }
 
