@@ -965,7 +965,8 @@ impl Invoice {
 /// the delimiters and make two different listings hash alike.
 ///
 /// `issued` is the ONE window the request's two issued-time bounds name, as the
-/// handler reads them: after, then before.
+/// handler reads them: after, then before. Each is rendered by
+/// [`scope_instant`], the one rendering every windowed scope here shares.
 pub fn invoice_line_item_scope(
     operation: &str,
     agreement_id: &str,
@@ -975,7 +976,6 @@ pub fn invoice_line_item_scope(
     billing_period: Option<&InvoiceBillingPeriod>,
     issued: (Option<f64>, Option<f64>),
 ) -> String {
-    let instant = |bound: Option<f64>| bound.map(|secs| format!("{secs:?}")).unwrap_or_default();
     let period = billing_period
         .map(|period| format!("{}/{}", period.month, period.year))
         .unwrap_or_default();
@@ -988,8 +988,8 @@ pub fn invoice_line_item_scope(
             invoice_id.unwrap_or_default(),
             invoice_type.unwrap_or_default(),
             &period,
-            &instant(issued_after),
-            &instant(issued_before),
+            &scope_instant(issued_after),
+            &scope_instant(issued_before),
         ],
     )
 }
@@ -3026,6 +3026,9 @@ impl BillingAdjustmentRequest {
 /// Every part is length-prefixed by [`query_scope`], and the minting operation
 /// is a part too ([`listing_scope`]), so no value a caller supplies can imitate
 /// the delimiters and make two different listings hash alike.
+///
+/// The two creation-time bounds are rendered by [`scope_instant`], the one
+/// rendering every windowed scope here shares.
 pub fn billing_adjustment_scope(
     operation: &str,
     agreement_id: Option<&str>,
@@ -3035,7 +3038,6 @@ pub fn billing_adjustment_scope(
     created_after: Option<f64>,
     created_before: Option<f64>,
 ) -> String {
-    let instant = |bound: Option<f64>| bound.map(|secs| format!("{secs:?}")).unwrap_or_default();
     listing_scope(
         operation,
         &[
@@ -3043,8 +3045,8 @@ pub fn billing_adjustment_scope(
             status.unwrap_or_default(),
             catalog.unwrap_or_default(),
             agreement_type.unwrap_or_default(),
-            &instant(created_after),
-            &instant(created_before),
+            &scope_instant(created_after),
+            &scope_instant(created_before),
         ],
     )
 }
@@ -3102,6 +3104,20 @@ fn filter_instant(value: &str) -> Option<f64> {
 /// scope is built from.
 fn counted(value: &str) -> String {
     format!("{}:{value}", value.len())
+}
+
+/// The scope part one bound of a time window is: the epoch seconds the call
+/// named, to their full precision, and the empty part when the call left that
+/// bound out — so a window a caller narrows by any amount, and an open end
+/// closed at any instant, never render alike.
+///
+/// The one spelling of that rule: every page-token scope of this module whose
+/// query carries such a window renders BOTH of its bounds through this
+/// ([`invoice_line_item_scope`] and [`billing_adjustment_scope`]), so the two
+/// never drift apart. The part is length-prefixed by [`query_scope`] like every
+/// other, so no rendering of a bound can imitate the delimiters.
+fn scope_instant(bound: Option<f64>) -> String {
+    bound.map(|secs| format!("{secs:?}")).unwrap_or_default()
 }
 
 /// Seconds since the epoch, for comparing a stored instant with a filter's or

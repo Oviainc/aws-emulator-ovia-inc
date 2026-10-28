@@ -99,3 +99,5 @@ mod unknown_ids;
 mod validation_envelope;
 #[path = "all/validation_messages.rs"]
 mod validation_messages;
+#[path = "all/window_token_scopes.rs"]
+mod window_token_scopes;
