@@ -716,7 +716,10 @@ async fn a_change_the_operation_cannot_make_is_refused_and_arms_nothing() {
             arn: channel_arn(REGION, missing),
             update: json!({ "S3DestinationConfiguration": { "DataFreshnessInSeconds": 400 } }),
             code: "ResourceNotFoundException",
-            says: format!("channel {} not found", channel_arn(REGION, missing)),
+            says: format!(
+                "Channel {missing} under account {} not found.",
+                engine::EMULATOR_ACCOUNT_ID
+            ),
         },
     ];
 

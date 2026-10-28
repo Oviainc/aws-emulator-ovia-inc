@@ -21,6 +21,8 @@ mod job_template_idempotency;
 mod job_template_lifecycle;
 #[path = "all/managed_endpoint_create_admission.rs"]
 mod managed_endpoint_create_admission;
+#[path = "all/managed_endpoint_delete.rs"]
+mod managed_endpoint_delete;
 #[path = "all/managed_endpoint_describe.rs"]
 mod managed_endpoint_describe;
 #[path = "all/managed_endpoint_listing.rs"]

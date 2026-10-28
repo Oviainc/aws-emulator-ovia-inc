@@ -658,12 +658,13 @@ async fn describe_unknown_endpoint_is_not_found() {
     )
     .await;
 
-    // The ways a well-formed ACME endpoint ARN can have no record behind it: never
-    // created, another Region, another account, and several id forms.
+    // The ways a well-formed ACME endpoint ARN OF THIS ACCOUNT can have no record behind
+    // it: never created, another Region, and several id forms. An ARN of ANOTHER account
+    // is not a missing resource but a bad request, refused before the lookup — pinned by
+    // [`crate::acme_authorization`].
     let missing = [
         format!("arn:aws:acm:{REGION}:{ACCOUNT}:acme-endpoint/00000000-0000-0000-0000-000000000000"),
         format!("arn:aws:acm:eu-central-1:{ACCOUNT}:acme-endpoint/{}", endpoint_id(&created)),
-        format!("arn:aws:acm:{REGION}:210987654321:acme-endpoint/{}", endpoint_id(&created)),
         format!("arn:aws:acm:{REGION}:{ACCOUNT}:acme-endpoint/a"),
         format!("arn:aws:acm:{REGION}:{ACCOUNT}:acme-endpoint/{}", "e".repeat(64)),
     ];

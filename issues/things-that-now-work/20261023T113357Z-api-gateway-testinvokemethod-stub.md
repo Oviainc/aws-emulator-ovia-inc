@@ -10,6 +10,13 @@ Issue-Commit: 048778663a26e363156c6db724999c4fb229af36
 
 > _Note: this issue was identified against the code base at commit `048778663a26e363156c6db724999c4fb229af36`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+## Resolution
+Fixed. The code base drifted after this report was filed: `TestInvokeMethod` is implemented in `services/service-com-amazonaws-apigateway-backplanecontrolservice/src/ops/test_invoke_method.rs` — it resolves the `RestApi`, the `Resource` and the verb from the live records, refuses a method carrying no integration as `BadRequestException`, performs the integration through `crate::service::invoke::perform_integration` (the very function the `execute-api` data plane serves a real request through) and reports the status, body, headers, execution log and measured latency — and the file carries no `//! SCAFFOLDED, NOT IMPLEMENTED:` header line, so the stub census already records it as implemented. The duplicate report of the same stub, `issues/things-that-now-work/20261023T125454Z-apigateway-testinvokemethod-stub.md`, is where that work landed.
+
+What this change adds is the coverage that pins the implemented behaviour from the side neither existing suite covered: `services/service-com-amazonaws-apigateway-backplanecontrolservice/tests/all/test_invoke_method_data_plane_parity.rs` asserts, over a table of stored configurations (a `MOCK` that answers, one whose template cannot be evaluated, one refusing an unmapped media type, a type naming an uncallable backend; the declared and accepted media types; the verb; a mapped response header), that a simulated invocation reports exactly what the API's deployed stage serves for the same records, that the simulation applies neither `authorizationType` nor `apiKeyRequired` (over `NONE`, `AWS_IAM`, `CUSTOM` and the API-key gate), and that simulating a call changes nothing a later caller sees.
+
+Still open and tracked elsewhere: an `AWS` / `AWS_PROXY` integration naming a Lambda function is reported through the API's `API_CONFIGURATION_ERROR` gateway response, because no deployment package runs in this emulator — `issues/things-that-do-not-work/20261026T054047Z-apigateway-cloudformation-lambda-api-gateway-aws-proxy-integration-pointing-at-a.md`. The two units named below exercise exactly that Lambda-backed path, so they unblock with that issue rather than with this one.
+
 ## Operation
 TestInvokeMethod
 

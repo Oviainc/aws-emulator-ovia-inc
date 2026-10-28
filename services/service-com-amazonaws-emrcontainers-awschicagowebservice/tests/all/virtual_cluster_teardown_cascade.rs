@@ -24,7 +24,7 @@ use service_com_amazonaws_emrcontainers_awschicagowebservice::ops::types::ENDPOI
 use service_com_amazonaws_emrcontainers_awschicagowebservice::state;
 
 use crate::managed_endpoint_listing::{
-    create_endpoint, describe_endpoint, described, endpoint_body, list_endpoints, listed_ids,
+    create_endpoint, endpoint_body, endpoint_state, list_endpoints, listed_ids,
 };
 use crate::virtual_cluster_job_run_loop::{field, text, Emr};
 use crate::virtual_cluster_scheduler_status::{
@@ -63,13 +63,6 @@ struct TeardownCase {
     /// the row is set up and BEFORE the teardown, so a row that means to leave a run
     /// waiting behind the cluster's concurrency limit proves it did.
     queued_and_running_before: (i64, i64),
-}
-
-/// The `state` `DescribeManagedEndpoint` reports for one endpoint.
-async fn endpoint_state(emr: &Emr, case: &str, cluster: &str, endpoint: &str) -> String {
-    let answer = describe_endpoint(emr, cluster, endpoint).await;
-    let endpoint = described(answer.ok(case), case);
-    text(&endpoint, "/state", case)
 }
 
 /// The `state` `DescribeVirtualCluster` reports for one cluster.
@@ -237,7 +230,7 @@ async fn a_cluster_teardown_carries_down_the_endpoints_and_runs_it_holds() {
         // about.
         for (child, id) in &children {
             let before = if child.is_endpoint() {
-                endpoint_state(&emr, label, &cluster, id).await
+                endpoint_state(&emr, &cluster, id, label).await
             } else {
                 run_state(&emr, label, &cluster, id).await
             };
@@ -278,7 +271,7 @@ async fn a_cluster_teardown_carries_down_the_endpoints_and_runs_it_holds() {
         for (child, id) in &children {
             let (reported, expected) = if child.is_endpoint() {
                 (
-                    endpoint_state(&emr, label, &cluster, id).await,
+                    endpoint_state(&emr, &cluster, id, label).await,
                     state::ENDPOINT_TERMINATING,
                 )
             } else {
@@ -319,7 +312,7 @@ async fn a_cluster_teardown_carries_down_the_endpoints_and_runs_it_holds() {
         );
         for (child, id) in &children {
             if child.is_endpoint() {
-                let reported = endpoint_state(&emr, label, &cluster, id).await;
+                let reported = endpoint_state(&emr, &cluster, id, label).await;
                 assert_eq!(
                     reported,
                     state::ENDPOINT_TERMINATED,
