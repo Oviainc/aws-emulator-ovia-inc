@@ -173,10 +173,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // No request metadata is needed: the `AcmeDomainValidationArn` the request names
+        // Authorization comes FIRST: AWS decides it at the IAM layer, ahead of the
+        // service looking at the resource, so a caller whose identity-based policies do
+        // not allow the action is refused without being told anything about the resource,
+        // and nothing is updated. `ctx` carries the credential the request presented,
+        // which is who is judged ([`crate::service::authorization`]).
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.acme_domain_validation_arn,
+        )
+        .map_err(UpdateAcmeDomainValidationErrorModeled::AccessDeniedException)?;
+
+        // The account segment of the ARN is INPUT this operation validates: a caller
+        // addresses only their own account's resources, so an ARN carrying another
+        // account's id names nothing they could update — a fact about the REQUEST, decided
+        // before the store is consulted at all. Reported in the one sentence this service
+        // words that verdict with, as every sibling ACME operation reports it.
+        if !crate::state::arn_is_in_caller_account(&input.acme_domain_validation_arn) {
+            return Err(
+                UpdateAcmeDomainValidationErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::service::cross_account_arn_refusal()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Nothing else about the request is needed: the `AcmeDomainValidationArn` it names
         // carries the Region and the account the validation was minted under, so the
         // record is found by ARN alone — as in `DescribeAcmeDomainValidation`.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Unreachable in the assembled emulator (the engine IS the shared store);
             // this operation models a server fault, so that is the honest answer.
