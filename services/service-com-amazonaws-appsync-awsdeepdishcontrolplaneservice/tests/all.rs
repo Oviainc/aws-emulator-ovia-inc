@@ -47,6 +47,8 @@ mod error_contract;
 mod event_api;
 #[path = "all/event_api_create_outcomes.rs"]
 mod event_api_create_outcomes;
+#[path = "all/event_api_delete.rs"]
+mod event_api_delete;
 #[path = "all/event_api_update.rs"]
 mod event_api_update;
 #[path = "all/function_delete.rs"]
