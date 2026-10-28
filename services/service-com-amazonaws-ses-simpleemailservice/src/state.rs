@@ -202,6 +202,18 @@ pub const MAX_TEMPLATES: usize = 10_000;
 /// than letting caller input grow this store without end.
 pub const MAX_CUSTOM_VERIFICATION_EMAIL_TEMPLATES: usize = 50;
 
+/// The bytes one custom verification email template's content may carry, and so
+/// the size a creating call is refused from.
+///
+/// The model documents it on the member itself:
+/// `CreateCustomVerificationEmailTemplateRequest$TemplateContent` is "The content
+/// of the custom verification email. The total size of the email must be less
+/// than 10 MB." Read in decimal megabytes, as the sentence writes them, so the
+/// bound is 10,000,000 bytes rather than ten binary mebibytes. Applied where the
+/// content is taken in, so this store is bounded in BYTES and not only in
+/// entries ([`MAX_CUSTOM_VERIFICATION_EMAIL_TEMPLATES`]).
+pub const MAX_CUSTOM_VERIFICATION_EMAIL_CONTENT_BYTES: usize = 10_000_000;
+
 /// Whether the account a freshly booted emulator serves has been granted
 /// production access.
 ///
@@ -889,6 +901,39 @@ impl ReceiptRuleSet {
     }
 }
 
+/// One custom verification email template in the account's store.
+///
+/// The members are the model's own, as the creating request carries them
+/// (`CreateCustomVerificationEmailTemplateRequest`): the name, the sender, the
+/// subject, the content, and the two URLs a recipient is sent to. That is a
+/// SUPERSET of the modelled `CustomVerificationEmailTemplate` shape, which
+/// carries no `TemplateContent` while `GetCustomVerificationEmailTemplate`
+/// reports one — so the record keeps what every reader of it needs instead of
+/// that shape alone.
+///
+/// Kept VERBATIM as the caller submitted it: a reader reports back the text that
+/// was stored rather than a re-rendering of it.
+#[derive(Debug, Clone, Default)]
+pub struct CustomVerificationEmailTemplate {
+    /// `TemplateName`, which is this record's key in the store.
+    pub template_name: String,
+    /// `FromEmailAddress` — "The email address that the custom verification
+    /// email is sent from."
+    pub from_email_address: String,
+    /// `TemplateSubject` — "The subject line of the custom verification email."
+    pub template_subject: String,
+    /// `TemplateContent` — "The content of the custom verification email",
+    /// bounded at [`MAX_CUSTOM_VERIFICATION_EMAIL_CONTENT_BYTES`] by the
+    /// operations that take it in.
+    pub template_content: String,
+    /// `SuccessRedirectionURL` — where a recipient whose address was verified is
+    /// sent.
+    pub success_redirection_url: String,
+    /// `FailureRedirectionURL` — where a recipient whose address was not
+    /// verified is sent.
+    pub failure_redirection_url: String,
+}
+
 /// Per-service state for com-amazonaws-ses-simpleemailservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSesSimpleemailserviceState {
@@ -931,16 +976,14 @@ pub struct ComAmazonawsSesSimpleemailserviceState {
     /// pagination resumable. Bounded at [`MAX_TEMPLATES`].
     pub templates: BTreeMap<String, EmailTemplate>,
     /// The custom verification email templates a `SendCustomVerificationEmail`
-    /// may name, keyed by template name and held as the modelled
-    /// [`crate::ops::types::CustomVerificationEmailTemplate`] shape so a
-    /// template a caller wrote is reported back unchanged instead of being
-    /// projected through a second copy of the same structure. A `BTreeMap` so
+    /// may name, keyed by template name and held as
+    /// [`CustomVerificationEmailTemplate`], which carries every member the
+    /// creating request does. A `BTreeMap` so
     /// every listing is in one stable (lexicographic) order, which is what makes
     /// `ListCustomVerificationEmailTemplates`' pagination resumable. Grown ONLY
     /// through [`Self::put_custom_verification_email_template`], which is where
     /// its ceiling ([`MAX_CUSTOM_VERIFICATION_EMAIL_TEMPLATES`]) is applied.
-    pub custom_verification_email_templates:
-        BTreeMap<String, crate::ops::types::CustomVerificationEmailTemplate>,
+    pub custom_verification_email_templates: BTreeMap<String, CustomVerificationEmailTemplate>,
     /// How many opaque ids this store has minted, which is what makes the next
     /// one UNIQUE rather than merely unlikely to repeat: every id digests this
     /// counter, and the counter is never reused. Written only by
@@ -1043,17 +1086,16 @@ impl ComAmazonawsSesSimpleemailserviceState {
     /// [`MAX_CUSTOM_VERIFICATION_EMAIL_TEMPLATES`] templates and this is a new
     /// one: the caller refuses the request rather than growing the store past the
     /// account's limit. Replacing a template already in the store always
-    /// succeeds, since it adds nothing. A template carrying no name is refused
-    /// the same way, since the name is its key.
+    /// succeeds, since it adds nothing.
     ///
-    /// `CreateCustomVerificationEmailTemplate` is the intended caller — it is
-    /// still a scaffold stub, carried by its own issue — so until it lands the
-    /// only writers are the suites that seed a template to send.
+    /// `CreateCustomVerificationEmailTemplate` is the creating caller; it refuses
+    /// a name the store already holds before reaching here, so what replaces a
+    /// stored template is `UpdateCustomVerificationEmailTemplate`.
     pub fn put_custom_verification_email_template(
         &mut self,
-        template: crate::ops::types::CustomVerificationEmailTemplate,
-    ) -> Option<&crate::ops::types::CustomVerificationEmailTemplate> {
-        let name = template.template_name.clone()?;
+        template: CustomVerificationEmailTemplate,
+    ) -> Option<&CustomVerificationEmailTemplate> {
+        let name = template.template_name.clone();
         if !self.custom_verification_email_templates.contains_key(&name)
             && self.custom_verification_email_templates.len()
                 >= MAX_CUSTOM_VERIFICATION_EMAIL_TEMPLATES
@@ -2443,6 +2485,30 @@ pub fn daily_quota_exceeded_message(quota: f64, already_sent: f64) -> String {
         "Daily message quota exceeded: this account may send {quota} messages per 24 hours \
          and has sent {already_sent}"
     )
+}
+
+/// How this service states the absence of a custom verification email template,
+/// for every operation that resolves one by name.
+///
+/// `CustomVerificationEmailTemplateDoesNotExistException` is "Indicates that a
+/// custom verification email template with the name you specified does not
+/// exist", so the name the request carried is the one variable part. One
+/// wording, for the same reason as [`illegal_address_message`]: the operations
+/// that resolve a template out of one store report its absence identically.
+pub fn missing_custom_verification_email_template_message(template_name: &str) -> String {
+    format!("Custom verification email template <{template_name}> does not exist.")
+}
+
+/// How this service refuses a custom verification email whose sender this
+/// account has not verified, for every operation that gates one on it.
+///
+/// `FromEmailAddressNotVerifiedException` is "Indicates that the sender address
+/// specified for a custom verification email is not verified, and is therefore
+/// not eligible to send the custom verification email", so the address the
+/// request (or the stored template) carried is the one variable part. One
+/// wording, for the same reason as [`illegal_address_message`].
+pub fn unverified_from_address_message(from_email_address: &str) -> String {
+    format!("From email address <{from_email_address}> is not verified.")
 }
 
 /// 64 bits of entropy this process did not choose, salting a minted id so it is

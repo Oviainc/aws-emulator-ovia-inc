@@ -30,12 +30,13 @@
 //! `X-Amz-Target: DynamoDB_20120810.<OperationName>`) through the same
 //! `MultiServiceRouter` the emulator's front doors use.
 //!
-//! The command that STOPS replication, `DisableKinesisStreamingDestination`, is still a
-//! scaffold tracked by its own issue, so the rows about a destination whose replication
-//! has stopped are seeded through the same per-service store the handlers read (the
-//! shared engine `emulator_and_engine` hands back), exactly as the `ListImports` suite
-//! seeds the import records its reader reports. Everything a registration can set up is
-//! driven over the wire instead.
+//! The rows about a destination whose replication has STOPPED place the stop's span in
+//! the past through the same per-service store the handlers read (the shared engine
+//! `emulator_and_engine` hands back), exactly as the `ListImports` suite seeds the
+//! import records its reader reports, so this suite settles no stop span of its own.
+//! `DisableKinesisStreamingDestination` over the wire has its own suite
+//! (`disable_kinesis_streaming_destination`); everything else here is driven over the
+//! wire.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -72,10 +73,10 @@ type Destination = (&'static str, Option<&'static str>, Replication);
 /// Leave `destinations` on `table`: each is REGISTERED over the wire, and the ones a row
 /// wants stopped are stopped in the store the handlers read.
 ///
-/// `DisableKinesisStreamingDestination` is still a scaffold tracked by its own issue, so
-/// the stop is the one step applied through the store rather than over the wire — the
-/// same per-service store the handlers read (the shared engine `emulator_and_engine`
-/// hands back), reached the way the `ListImports` suite reaches it.
+/// The stop is the one step applied through the store rather than over the wire, because
+/// a row wants its span already elapsed: that is a stop placed in the past, which only
+/// the store can state — the same per-service store the handlers read (the shared engine
+/// `emulator_and_engine` hands back), reached the way the `ListImports` suite reaches it.
 async fn set_up(
     router: &MultiServiceRouter,
     engine: &Arc<engine::InMemoryEngine>,

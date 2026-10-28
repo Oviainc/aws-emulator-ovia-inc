@@ -237,6 +237,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The pair of ids that name this request: the response below carries them in its
+        // `x-amz-request-id` / `x-amz-id-2` headers, and every notification this removal
+        // owes names the call it came of by them.
+        let correlation = crate::state::request_ids::RequestCorrelation::mint();
         // "The account ID of the expected bucket owner"
         // (`DeleteObjectAnnotationRequest$ExpectedBucketOwner`), judged the way the writer
         // and the reader of this same subresource judge it: this emulator serves one
@@ -374,9 +378,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(object) => unannotated.of_object(object),
             None => unannotated,
         };
-        let pending = crate::state::notifications::pending(&store, &input.bucket, &[unannotated]);
+        let pending = crate::state::notifications::pending(
+            &store,
+            &input.bucket,
+            &[unannotated],
+            &correlation,
+        );
         drop(store);
         crate::state::notifications::publish(ctx, pending);
+        // Recorded LAST, so the response carries the pair the notifications already named
+        // this call by.
+        correlation.answer();
 
         Ok(DeleteObjectAnnotationNoContent {
             object_version_id,

@@ -57,6 +57,12 @@
 //! which the framework's error renderers omit. Everything else about those paths —
 //! status, `<Type>`, `<Code>`, `<Message>` — stays with the framework.
 //!
+//! That same wrapper is where this front door's AUDIT leg hangs: it serves each request
+//! through the operation wrapped in the shared management-event recorder
+//! ([`management_events`]), so every call this service serves is recorded in the account's
+//! event history where CloudTrail's `LookupEvents` reports it — one code path for every
+//! operation rather than a recording written into each handler.
+//!
 //! `can_handle` keeps the generated `rds` key. THREE mounted models resolve to it — this
 //! one, the Amazon DocumentDB view and the Amazon Neptune view — because all three
 //! publish one and the same wire identity (service shape `AmazonRDSv19`, version
@@ -68,6 +74,7 @@
 //! three control planes, which is why their models share its endpoint prefix.
 
 pub mod api_version;
+pub mod management_events;
 pub mod query_error_envelope;
 
 use api_version::UnsupportedApiVersionOperation;
@@ -149,9 +156,15 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
+            // Every modelled operation, each constructed from this same shared engine and
+            // served behind the audit recorder, so each call this front door serves is
+            // recorded as a management event of `rds.amazonaws.com` (see
+            // [`management_events`]). The envelope wrapper routes to it first and to the
+            // generated table for anything it does not hold, which is what keeps the
+            // `<RequestId>` element on every error response either way.
+            envelope: RequestIdEnvelopeOperation::new(management_events::audited_table(&engine)),
             entry: RdsDefinition::new(engine),
             unsupported_api_version: UnsupportedApiVersionOperation,
-            envelope: RequestIdEnvelopeOperation,
         }
     }
 }
@@ -207,8 +220,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             return Some(&self.unsupported_api_version);
         }
         // Every request the generated routing table can serve is served through the
-        // envelope wrapper, which delegates to that same table entry and then adds the
-        // `<RequestId>` the awsQuery error envelope carries (see
+        // envelope wrapper, which delegates to the audited operation for that same key
+        // (and to the generated table entry for a key the audit table does not hold) and
+        // then adds the `<RequestId>` the awsQuery error envelope carries (see
         // [`query_error_envelope`]). The routing stays the model's: a request whose
         // `Action` names no modelled operation is declined here, so the framework answers
         // it as the unroutable request it is — through the wrapped definition, which adds

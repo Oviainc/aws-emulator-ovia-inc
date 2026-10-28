@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisableKinesisStreamingDestination
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisableKinesisStreamingDestination`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisableKinesisStreamingDestination::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The command that STOPS a table's replication to a Kinesis data stream: it resolves
+//! the table, addresses the destination still replicating to the stream its `StreamArn`
+//! names, and reports that replication as `DISABLING` until the clock settles it on
+//! `DISABLED` — this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +162,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisableKinesisStreamingDestination` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisableKinesisStreamingDestinationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisableKinesisStreamingDestination"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        let name = crate::state::resolve_table_name(&input.table_name).map_err(lift)?;
+        // A destination IS a Kinesis data stream, so a value that names no stream
+        // addresses no destination of this table.
+        let stream = crate::state::check_stream_arn(&input.stream_arn).map_err(lift)?;
+        let precision = input
+            .enable_kinesis_streaming_configuration
+            .as_ref()
+            .and_then(|configuration| {
+                configuration
+                    .approximate_creation_date_time_precision
+                    .as_deref()
+            });
+        // The precision is a modelled enum, so the request validator has already refused
+        // every value outside its set; this refusal is what keeps that true of what
+        // reaches the store, and it is worded the way that validator words a value
+        // outside an enumerated member's set.
+        if let Some(precision) = precision {
+            if !APPROXIMATE_CREATION_DATE_TIME_PRECISION_VALUES.contains(&precision) {
+                return Err(lift(crate::state::invalid_member(
+                    "enableKinesisStreamingConfiguration.approximateCreationDateTimePrecision",
+                    Some(precision),
+                    &crate::state::enum_value_requirement(
+                        APPROXIMATE_CREATION_DATE_TIME_PRECISION_VALUES,
+                    ),
+                )));
+            }
+        }
+
+        let mut store = state.lock();
+        store.apply_due_transitions(now);
+        let table = store.table_mut(&region, &name).map_err(lift)?;
+        // The refusal below is stated over the table's STORED name, so reading it cannot
+        // overlap the borrow of the destination it is looked up for.
+        let table_name = table.name.clone();
+        let destination = table
+            .replicating_kinesis_destination_mut(&input.stream_arn, now)
+            .ok_or_else(|| {
+                lift(crate::state::kinesis_destination_not_found(
+                    &table_name,
+                    &input.stream_arn,
+                ))
+            })?;
+        destination.apply_disable(now);
+        let stream_arn = destination.stream_arn.clone();
+        let status = destination.status(now).to_string();
+
+        // The audit record for a state-changing call: who asked, what was changed and
+        // that it succeeded. Never a credential — only the access key id the caller
+        // presented.
+        ::tracing::info!(
+            operation = Self::NAME,
+            akid = %::emulator_server::extract_akid(&ctx.parts().headers),
+            table_name = %table_name,
+            stream = %stream,
+            destination_status = %status,
+            outcome = "disabled",
+            "kinesis streaming destination disabled"
+        );
+
+        Ok(DisableKinesisStreamingDestinationOutput {
+            table_name: Some(table_name),
+            stream_arn: Some(stream_arn),
+            destination_status: Some(status),
+            // The output member is documented as "the destination for the Kinesis
+            // streaming information that is being ENABLED". This command enables
+            // nothing — it stops replication and changes no configuration — so there is
+            // no such destination to report and the member stays absent.
+            enable_kinesis_streaming_configuration: None,
+        })
+    }
+}
+
+/// The modelled server error for a request that cannot reach this service's store.
+fn store_unavailable() -> DisableKinesisStreamingDestinationError {
+    DisableKinesisStreamingDestinationErrorModeled::InternalServerError(InternalServerError {
+        message: Some("the DynamoDB table store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// Lift a store refusal into this operation's error channel: a table that is not there
+/// is the `ResourceNotFoundException` this operation models, and a request the service
+/// itself refuses — a member it cannot read, or a stream the addressed table does not
+/// replicate to — is the 400 `ValidationException`.
+fn lift(error: crate::state::RequestError) -> DisableKinesisStreamingDestinationError {
+    match error {
+        crate::state::RequestError::NotFound(message) => {
+            DisableKinesisStreamingDestinationErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+        crate::state::RequestError::Validation(message) => {
+            crate::scaffolded::Scaffolded::validation(message)
+        }
     }
 }

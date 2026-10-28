@@ -4606,6 +4606,30 @@ pub fn data_source_directory<Eng: Send + Sync + 'static>(
         )
 }
 
+/// The account's MANAGEMENT-EVENT (audit) log in the SAME shared engine — the one store
+/// CloudTrail's `LookupEvents` reads: call it with `&*engine`.
+///
+/// A SHARED type ([`::service_common::management_events::ManagementEventLog`]) and not a
+/// field of [`ComAmazonawsRdsAmazonrdsv19State`], because the service that SERVES a call
+/// is the one that knows the call happened while the service that REPORTS it is
+/// CloudTrail; the engine keys state by TYPE, so a copy of its own here would be
+/// invisible to the reader.
+///
+/// Answer `None` by leaving the call unrecorded: the record is the account's audit trail,
+/// never part of this operation's own answer, so an engine carrying no log still serves
+/// the call.
+pub fn management_event_log<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<::service_common::management_events::ManagementEventLog>> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(
+            ::engine::InMemoryEngine::state::<
+                ::service_common::management_events::ManagementEventLog,
+            >,
+        )
+}
+
 /// The region this request was signed for: every ARN and endpoint host this service
 /// mints is scoped to it, and it is half of every stored record's key.
 ///
