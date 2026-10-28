@@ -164,6 +164,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // An `Arn` that carries no characters names no resource at all, so it takes the
+        // test every resource-naming member in this service takes and is refused naming
+        // the member it arrived in, exactly as `AssociateCertificate` refuses a blank
+        // `Arn` before it looks at the value's form.
+        if crate::state::carries_no_characters(&input.arn) {
+            return Err(TagResourceErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::blank_member_message("Arn")),
+            })
+            .into());
+        }
         // A value that is not a MediaConvert resource ARN is a problem in the request,
         // not a resource that is missing.
         let Some(resource) = crate::state::parse_resource_arn(&input.arn) else {

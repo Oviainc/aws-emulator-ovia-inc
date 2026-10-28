@@ -617,6 +617,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CompleteMultipart
             acl: None,
             checksum,
             parts,
+            // Replication is settled by the store once this version is recorded, from the
+            // bucket's own replication configuration — the same seam a one-shot write goes
+            // through.
+            replication: None,
             body,
         };
         let region = bucket_record.region.clone();
@@ -650,6 +654,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CompleteMultipart
                 return Err(refused_write(&input, refusal));
             }
         }
+
+        // The replication the bucket's own configuration owes for the version this
+        // completion stored — the same seam `PutObject` replicates its write through, so an
+        // object assembled from parts is replicated exactly like one written whole.
+        let _ = store.replicate_write(&input.bucket, &input.key);
 
         // The object event this completion produced, and the notifications the bucket's
         // configuration owes for it — the same seam `PutObject` publishes its write

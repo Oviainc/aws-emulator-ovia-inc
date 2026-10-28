@@ -37,7 +37,7 @@ use super::site_and_outpost_lifecycle::{
 /// PowerFeedDrop,UplinkGbps,UplinkCount,FiberOpticCableType,OpticalStandard,
 /// MaximumSupportedWeightLbs")` against this service's model — the same nine members
 /// `UpdateSiteRackPhysicalProperties` takes.
-const RACK_PROPERTY_VALUES: &[(&str, &[&str])] = &[
+pub(crate) const RACK_PROPERTY_VALUES: &[(&str, &[&str])] = &[
     (
         "PowerDrawKva",
         &["POWER_5_KVA", "POWER_10_KVA", "POWER_15_KVA", "POWER_30_KVA"],
