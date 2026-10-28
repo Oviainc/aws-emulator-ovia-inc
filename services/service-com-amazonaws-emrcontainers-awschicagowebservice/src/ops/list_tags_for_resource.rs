@@ -178,7 +178,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(tags) = state.resource_tags(&region, &resource, &input.resource_arn) else {
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Resource {} was not found", input.resource_arn)),
+                    // The one not-found wording of this service
+                    // ([`crate::state::ResourceKind`]), reporting the resource the ARN's
+                    // path names rather than echoing the whole ARN.
+                    message: Some(resource.not_found_message()),
                 },
             )
             .into());

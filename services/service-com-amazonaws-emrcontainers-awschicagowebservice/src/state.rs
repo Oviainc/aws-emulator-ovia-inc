@@ -619,6 +619,52 @@ pub fn managed_endpoint_arn(region: &str, virtual_cluster_id: &str, id: &str) ->
     )
 }
 
+/// A resource kind this service refuses a request for when the request names one that is
+/// not there.
+///
+/// EMR on EKS words every not-found refusal from the identifier the request named the
+/// resource by, in ONE form: `<Resource type> <identifier> doesn't exist.` — the form the
+/// recorded refusals of this service show for a job template and for a security
+/// configuration, and the form it uses for every other resource it serves. The resource
+/// type is spelled the way the service spells it in a message, which is NOT derivable from
+/// the shape name, so each kind carries its own spelling here.
+///
+/// Every operation that reports a resource missing carries
+/// [`ResourceKind::not_found_message`] in its own modelled error — beside
+/// [`PageRefusal::message`], the other wording this service shares — so the message cannot
+/// differ between two operations reporting the same kind of resource missing, nor drift
+/// from the form above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceKind {
+    VirtualCluster,
+    JobRun,
+    ManagedEndpoint,
+    JobTemplate,
+    SecurityConfiguration,
+}
+
+impl ResourceKind {
+    /// The resource type as this service names it in a message.
+    pub fn resource_type(self) -> &'static str {
+        match self {
+            Self::VirtualCluster => "Virtual cluster",
+            Self::JobRun => "Job run",
+            // The model calls the resource a managed endpoint HOSTS an `Endpoint` (its
+            // shape, its `endpoint` output member and its `endpointIdentifier` input).
+            Self::ManagedEndpoint => "Endpoint",
+            Self::JobTemplate => "Job Template",
+            Self::SecurityConfiguration => "Security Configuration",
+        }
+    }
+
+    /// The `message` a refusal carries for an `identifier` that names no such resource of
+    /// this region: `<Resource type> <identifier> doesn't exist.`, with the identifier as
+    /// the request spelled it.
+    pub fn not_found_message(self, identifier: &str) -> String {
+        format!("{} {identifier} doesn't exist.", self.resource_type())
+    }
+}
+
 /// The resource a tagging call's `resourceArn` (an `RsiArn`) names.
 ///
 /// `RsiArn`'s pattern (`^arn:(aws[a-zA-Z0-9-]*):emr-containers:.+:(\d{12}):/virtualclusters/.+$`)
@@ -644,6 +690,34 @@ pub enum TaggedResource {
 /// `VirtualClusterArn`, `JobArn` and `EndpointArn` all spell theirs `[0-9a-zA-Z]+`.
 fn is_arn_id_segment(segment: &str) -> bool {
     !segment.is_empty() && segment.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+impl TaggedResource {
+    /// Which kind of resource the ARN's path names.
+    pub fn kind(&self) -> ResourceKind {
+        match self {
+            Self::VirtualCluster { .. } => ResourceKind::VirtualCluster,
+            Self::JobRun { .. } => ResourceKind::JobRun,
+            Self::ManagedEndpoint { .. } => ResourceKind::ManagedEndpoint,
+        }
+    }
+
+    /// The id the ARN names that resource by — the LAST id of its path, which is the
+    /// resource the call is about rather than the cluster it lives under.
+    pub fn id(&self) -> &str {
+        match self {
+            Self::VirtualCluster { id }
+            | Self::JobRun { id, .. }
+            | Self::ManagedEndpoint { id, .. } => id,
+        }
+    }
+
+    /// The `message` a refusal carries when the ARN is well formed but names no stored
+    /// resource: the one not-found wording of this service ([`ResourceKind`]), reporting
+    /// the resource the ARN's path names rather than the whole ARN.
+    pub fn not_found_message(&self) -> String {
+        self.kind().not_found_message(self.id())
+    }
 }
 
 /// The resource an `RsiArn` names, read out of the ARN's resource path.

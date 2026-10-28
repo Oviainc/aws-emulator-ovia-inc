@@ -163,13 +163,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DescribeSecurityConfigurationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        // The not-found message form the recorded refusals of this service
-                        // show: `<Resource type> <id> doesn't exist.`, built from the id
-                        // the request asked for.
-                        message: Some(format!(
-                            "Security Configuration {} doesn't exist.",
-                            input.id
-                        )),
+                        // The one not-found wording of this service
+                        // ([`crate::state::ResourceKind`]), built from the id the request
+                        // asked for.
+                        message: Some(
+                            crate::state::ResourceKind::SecurityConfiguration
+                                .not_found_message(&input.id),
+                        ),
                     },
                 )
                 .into(),
