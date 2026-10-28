@@ -1338,3 +1338,658 @@ async fn a_declared_group_is_enumerated_by_list_schedule_groups() {
         }
     }
 }
+
+/// The names one update row's stack declares, each carrying the row's index so rows deployed
+/// onto the one emulator never name the same resource.
+struct Declared {
+    group: String,
+    schedule: String,
+    primary_queue: String,
+    secondary_queue: String,
+    role: String,
+}
+
+impl Declared {
+    fn for_row(index: usize) -> Self {
+        Self {
+            group: format!("update-group-{index}"),
+            schedule: format!("update-schedule-{index}"),
+            primary_queue: format!("update-primary-{index}"),
+            secondary_queue: format!("update-secondary-{index}"),
+            role: format!("update-role-{index}"),
+        }
+    }
+}
+
+/// A template declaring a schedule group, the two queues a schedule's target can name, a
+/// scheduler-trusted role and ONE schedule carrying `properties` — the row's declaration,
+/// with the name CloudFormation is to give the schedule written in.
+///
+/// `group_tags` is the group's declared `Tags` property, left out entirely when it is
+/// `Value::Null`.
+fn update_template(declared: &Declared, group_tags: Value, properties: Value) -> String {
+    let mut properties = properties;
+    if let Some(object) = properties.as_object_mut() {
+        object.insert("Name".to_string(), json!(declared.schedule));
+    }
+    let mut group_properties = json!({ "Name": declared.group });
+    if let (Some(object), false) = (group_properties.as_object_mut(), group_tags.is_null()) {
+        object.insert("Tags".to_string(), group_tags);
+    }
+    json!({
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Group": {
+                "Type": "AWS::Scheduler::ScheduleGroup",
+                "Properties": group_properties
+            },
+            "Primary": {
+                "Type": "AWS::SQS::Queue",
+                "Properties": { "QueueName": declared.primary_queue }
+            },
+            "Secondary": {
+                "Type": "AWS::SQS::Queue",
+                "Properties": { "QueueName": declared.secondary_queue }
+            },
+            "Role": {
+                "Type": "AWS::IAM::Role",
+                "Properties": {
+                    "RoleName": declared.role,
+                    "AssumeRolePolicyDocument": scheduler_trust_policy()
+                }
+            },
+            "Schedule": {
+                "Type": "AWS::Scheduler::Schedule",
+                "Properties": properties
+            }
+        },
+        "Outputs": {
+            "GroupRef": { "Value": { "Ref": "Group" } },
+            "ScheduleRef": { "Value": { "Ref": "Schedule" } },
+            "ScheduleArn": { "Value": { "Fn::GetAtt": ["Schedule", "Arn"] } }
+        }
+    })
+    .to_string()
+}
+
+/// One stack operation (a create or an update) on an update row's stack, waited past the
+/// stack's clock-owed span and answered with the `DescribeStacks` body.
+async fn deploy(
+    router: &MultiServiceRouter,
+    region: &str,
+    case: &str,
+    action: &str,
+    stack_name: &str,
+    template: &str,
+) -> String {
+    let (status, body) = cloudformation(
+        router,
+        region,
+        action,
+        &[
+            ("StackName", stack_name),
+            ("TemplateBody", template),
+            // Every row's template declares a role it NAMES, which is the acknowledgement
+            // CloudFormation asks for separately.
+            ("Capabilities.member.1", "CAPABILITY_NAMED_IAM"),
+            ("Tags.member.1.Key", STACK_TAG.0),
+            ("Tags.member.1.Value", STACK_TAG.1),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from {action}, got {status} with body {body}"
+    );
+    tokio::time::sleep(PAST_STACK_SPAN).await;
+    let (status, described) =
+        cloudformation(router, region, "DescribeStacks", &[("StackName", stack_name)]).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from DescribeStacks, got {status} with body {described}"
+    );
+    described
+}
+
+/// The one stack-level tag every update row deploys with, which CloudFormation propagates to
+/// the resources in the stack and which therefore survives every change to a declaration's
+/// own tags.
+const STACK_TAG: (&str, &str) = ("Service", "scheduling");
+
+/// The schedule group an `AWS::Scheduler::Schedule` declaration puts its schedule in: the
+/// `GroupName` it names, else the account's `default` group.
+fn declared_group(properties: &Value, group: &str) -> String {
+    match properties.get("GroupName") {
+        Some(_) => group.to_string(),
+        None => DEFAULT_GROUP.to_string(),
+    }
+}
+
+/// Assert EventBridge Scheduler holds, in `group`, exactly the schedule `declared` describes.
+///
+/// The expectation is the DECLARATION itself, member by member: a member it states must be
+/// reported with that value, and one it does not state must not be reported at all — which
+/// is what makes a declaration that drops a member a real assertion rather than a weaker
+/// one. `State` is the one member with a system default (`ENABLED`), so a declaration that
+/// drops it expects that default.
+async fn assert_holds_declared_schedule(
+    router: &MultiServiceRouter,
+    region: &str,
+    case: &str,
+    group: &str,
+    name: &str,
+    declared: &Value,
+    target_queue: &str,
+) {
+    let wanted_target_arn = format!("arn:aws:sqs:{region}:{ACCOUNT_ID}:{target_queue}");
+    let (status, schedule) = scheduler(
+        router,
+        region,
+        "GET",
+        &format!("/schedules/{name}?groupName={group}"),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from GetSchedule({name:?}) in {group:?}, got {status} \
+         with body {schedule}"
+    );
+    assert_eq!(
+        schedule.get("GroupName").and_then(Value::as_str),
+        Some(group),
+        "case {case:?}: expected the schedule to be in {group:?}, got {schedule}"
+    );
+    assert_eq!(
+        schedule.get("Arn").and_then(Value::as_str),
+        Some(schedule_arn(region, group, name).as_str()),
+        "case {case:?}: expected the ARN of {name:?} in {group:?}, got {schedule}"
+    );
+    for member in ["Description", "ScheduleExpression", "ScheduleExpressionTimezone"] {
+        let wanted = declared.get(member).and_then(Value::as_str);
+        assert_eq!(
+            schedule.get(member).and_then(Value::as_str),
+            wanted,
+            "case {case:?}: expected {member} to be the declared {wanted:?}, got {schedule}"
+        );
+    }
+    let wanted_state = declared
+        .get("State")
+        .and_then(Value::as_str)
+        .unwrap_or("ENABLED");
+    assert_eq!(
+        schedule.get("State").and_then(Value::as_str),
+        Some(wanted_state),
+        "case {case:?}: expected State to be {wanted_state:?}, got {schedule}"
+    );
+    let wanted_window = declared
+        .get("FlexibleTimeWindow")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let window = schedule
+        .get("FlexibleTimeWindow")
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert_eq!(
+        window.get("Mode").and_then(Value::as_str),
+        wanted_window.get("Mode").and_then(Value::as_str),
+        "case {case:?}: expected the declared flexible-window mode {:?}, got {schedule}",
+        wanted_window.get("Mode").and_then(Value::as_str)
+    );
+    assert_eq!(
+        window.get("MaximumWindowInMinutes").and_then(Value::as_u64),
+        wanted_window
+            .get("MaximumWindowInMinutes")
+            .and_then(Value::as_u64),
+        "case {case:?}: expected the declared window {:?}, got {schedule}",
+        wanted_window
+            .get("MaximumWindowInMinutes")
+            .and_then(Value::as_u64)
+    );
+    let declared_target = declared.get("Target").cloned().unwrap_or(Value::Null);
+    let target = schedule.get("Target").cloned().unwrap_or(Value::Null);
+    let wanted_input = declared_target.get("Input").and_then(Value::as_str);
+    assert_eq!(
+        target.get("Input").and_then(Value::as_str),
+        wanted_input,
+        "case {case:?}: expected the declared target input {wanted_input:?}, got {schedule}"
+    );
+    assert_eq!(
+        target.get("Arn").and_then(Value::as_str),
+        Some(wanted_target_arn.as_str()),
+        "case {case:?}: expected the target to be {wanted_target_arn:?}, got {schedule}"
+    );
+    let wanted_role = format!("arn:aws:iam::{ACCOUNT_ID}:role/");
+    let role = target
+        .get("RoleArn")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        role.starts_with(&wanted_role),
+        "case {case:?}: expected the target to carry the stack's own role, got {role:?}"
+    );
+}
+
+/// One row of the stack-update table: the declaration the stack is created with, the one it
+/// is then updated to, and which of the two queues each names as its target.
+struct UpdateRow {
+    case: &'static str,
+    /// The schedule's property document before the update, and the queue its target names.
+    before: fn() -> Value,
+    before_queue: TargetQueue,
+    /// The document the update declares, and the queue it names.
+    after: fn() -> Value,
+    after_queue: TargetQueue,
+}
+
+/// Which of the two queues a row's template declares its target names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TargetQueue {
+    Primary,
+    Secondary,
+}
+
+impl TargetQueue {
+    /// The queue name the stack gives that queue, which is what its ARN carries.
+    fn name_in(self, declared: &Declared) -> String {
+        match self {
+            Self::Primary => declared.primary_queue.clone(),
+            Self::Secondary => declared.secondary_queue.clone(),
+        }
+    }
+}
+
+/// The base of every row's declaration: the two required members beside the target, with the
+/// target naming the stack's `Primary` queue and its role.
+fn primary_target() -> Value {
+    json!({
+        "Arn": { "Fn::GetAtt": ["Primary", "Arn"] },
+        "RoleArn": { "Fn::GetAtt": ["Role", "Arn"] }
+    })
+}
+
+/// The same target over the stack's OTHER queue, with the input the row sends to it.
+fn secondary_target(input: &str) -> Value {
+    json!({
+        "Arn": { "Fn::GetAtt": ["Secondary", "Arn"] },
+        "RoleArn": { "Fn::GetAtt": ["Role", "Arn"] },
+        "Input": input
+    })
+}
+
+/// The rows differ along what the rule generalises over: which FORM the changed expression
+/// takes, whether an optional member is added, re-valued or DROPPED, whether the target
+/// moves to another resource and gains an input, whether the flexible-time window opens or
+/// closes, and whether the schedule moves between the group the stack declares and the
+/// account's own `default` group.
+const UPDATE_ROWS: &[UpdateRow] = &[
+    UpdateRow {
+        case: "the expression changes from a rate to a cron, in a named timezone",
+        before: || {
+            json!({
+                "GroupName": { "Ref": "Group" },
+                "ScheduleExpression": "rate(1 day)",
+                "FlexibleTimeWindow": { "Mode": "OFF" },
+                "Target": primary_target()
+            })
+        },
+        before_queue: TargetQueue::Primary,
+        after: || {
+            json!({
+                "GroupName": { "Ref": "Group" },
+                "ScheduleExpression": "cron(0 3 * * ? *)",
+                "ScheduleExpressionTimezone": "Europe/Berlin",
+                "FlexibleTimeWindow": { "Mode": "OFF" },
+                "Target": primary_target()
+            })
+        },
+        after_queue: TargetQueue::Primary,
+    },
+    UpdateRow {
+        case: "the state flips and the description the first declaration carried is dropped",
+        before: || {
+            json!({
+                "GroupName": { "Ref": "Group" },
+                "Description": "the first pass",
+                "State": "ENABLED",
+                "ScheduleExpression": "rate(1 hour)",
+                "FlexibleTimeWindow": { "Mode": "OFF" },
+                "Target": primary_target()
+            })
+        },
+        before_queue: TargetQueue::Primary,
+        after: || {
+            json!({
+                "GroupName": { "Ref": "Group" },
+                "State": "DISABLED",
+                "ScheduleExpression": "rate(1 hour)",
+                "FlexibleTimeWindow": { "Mode": "OFF" },
+                "Target": primary_target()
+            })
+        },
+        after_queue: TargetQueue::Primary,
+    },
+    UpdateRow {
+        case: "the target becomes the stack's other queue, with an input",
+        before: || {
+            json!({
+                "GroupName": { "Ref": "Group" },
+                "ScheduleExpression": "rate(30 minutes)",
+                "FlexibleTimeWindow": { "Mode": "OFF" },
+                "Target": primary_target()
+            })
+        },
+        before_queue: TargetQueue::Primary,
+        after: || {
+            json!({
+                "GroupName": { "Ref": "Group" },
+                "ScheduleExpression": "rate(30 minutes)",
+                "FlexibleTimeWindow": { "Mode": "OFF" },
+                "Target": secondary_target("{\"pass\":2}")
+            })
+        },
+        after_queue: TargetQueue::Secondary,
+    },
+    UpdateRow {
+        case: "the flexible time window opens",
+        before: || {
+            json!({
+                "GroupName": { "Ref": "Group" },
+                "ScheduleExpression": "rate(7 days)",
+                "FlexibleTimeWindow": { "Mode": "OFF" },
+                "Target": primary_target()
+            })
+        },
+        before_queue: TargetQueue::Primary,
+        after: || {
+            json!({
+                "GroupName": { "Ref": "Group" },
+                "ScheduleExpression": "rate(7 days)",
+                "FlexibleTimeWindow": { "Mode": "FLEXIBLE", "MaximumWindowInMinutes": 10 },
+                "Target": primary_target()
+            })
+        },
+        after_queue: TargetQueue::Primary,
+    },
+    UpdateRow {
+        case: "the schedule moves out of the account's default group into the declared one",
+        before: || {
+            json!({
+                "ScheduleExpression": "rate(2 hours)",
+                "FlexibleTimeWindow": { "Mode": "OFF" },
+                "Target": primary_target()
+            })
+        },
+        before_queue: TargetQueue::Primary,
+        after: || {
+            json!({
+                "GroupName": { "Ref": "Group" },
+                "ScheduleExpression": "rate(2 hours)",
+                "FlexibleTimeWindow": { "Mode": "OFF" },
+                "Target": primary_target()
+            })
+        },
+        after_queue: TargetQueue::Primary,
+    },
+    UpdateRow {
+        case: "the schedule moves out of the declared group into the account's default",
+        before: || {
+            json!({
+                "GroupName": { "Ref": "Group" },
+                "ScheduleExpression": "rate(3 hours)",
+                "FlexibleTimeWindow": { "Mode": "OFF" },
+                "Target": primary_target()
+            })
+        },
+        before_queue: TargetQueue::Primary,
+        after: || {
+            json!({
+                "ScheduleExpression": "rate(3 hours)",
+                "FlexibleTimeWindow": { "Mode": "OFF" },
+                "Target": primary_target()
+            })
+        },
+        after_queue: TargetQueue::Primary,
+    },
+];
+
+/// Every row: a stack update that re-declares its `AWS::Scheduler::Schedule` differently
+/// reaches `UPDATE_COMPLETE`, and the very next read through EventBridge Scheduler's own API
+/// reports the schedule the NEW declaration describes — never the one the first declaration
+/// did, and never a stack that failed over a change its owning service can make.
+#[tokio::test]
+async fn a_stack_update_applies_a_changed_schedule_declaration() {
+    let router = build_router();
+    let region = "eu-central-1";
+
+    for (index, row) in UPDATE_ROWS.iter().enumerate() {
+        let case = row.case;
+        let declared = Declared::for_row(index);
+        let stack_name = format!("scheduler-update-{index}");
+        let before = (row.before)();
+        let after = (row.after)();
+
+        let described = deploy(
+            &router,
+            region,
+            case,
+            "CreateStack",
+            &stack_name,
+            &update_template(&declared, Value::Null, before.clone()),
+        )
+        .await;
+        assert_eq!(
+            opt_element(&described, "StackStatus").as_deref(),
+            Some("CREATE_COMPLETE"),
+            "case {case:?}: expected the stack to reach CREATE_COMPLETE, got {described}"
+        );
+        let group_before = declared_group(&before, &declared.group);
+        assert_holds_declared_schedule(
+            &router,
+            region,
+            case,
+            &group_before,
+            &declared.schedule,
+            &before,
+            &row.before_queue.name_in(&declared),
+        )
+        .await;
+
+        let described = deploy(
+            &router,
+            region,
+            case,
+            "UpdateStack",
+            &stack_name,
+            &update_template(&declared, Value::Null, after.clone()),
+        )
+        .await;
+        assert_eq!(
+            opt_element(&described, "StackStatus").as_deref(),
+            Some("UPDATE_COMPLETE"),
+            "case {case:?}: expected the update to reach UPDATE_COMPLETE, got {described}"
+        );
+        let group_after = declared_group(&after, &declared.group);
+        assert_holds_declared_schedule(
+            &router,
+            region,
+            case,
+            &group_after,
+            &declared.schedule,
+            &after,
+            &row.after_queue.name_in(&declared),
+        )
+        .await;
+        // The stack still publishes the ARN of the schedule that really exists, which for a
+        // row that moved it between groups is a different ARN from the one it published
+        // before.
+        let outputs = outputs_of(&described);
+        let arn = schedule_arn(region, &group_after, &declared.schedule);
+        assert_eq!(
+            outputs.get("ScheduleArn").map(String::as_str),
+            Some(arn.as_str()),
+            "case {case:?}: expected the stack to publish {arn:?}, got {outputs:?}"
+        );
+
+        // A row that moved the schedule left nothing of it behind in the group it left.
+        if group_after != group_before {
+            let (status, gone) = scheduler(
+                &router,
+                region,
+                "GET",
+                &format!("/schedules/{}?groupName={group_before}", declared.schedule),
+            )
+            .await;
+            assert_eq!(
+                status, 404,
+                "case {case:?}: expected HTTP 404 from GetSchedule in the group the schedule \
+                 left ({group_before:?}), got {status} with body {gone}"
+            );
+        }
+    }
+}
+
+/// One row of the group-tagging table: the `Tags` a group is declared with, the ones it is
+/// re-declared with, and the set the rule says EventBridge Scheduler must then hold.
+struct TagRow {
+    case: &'static str,
+    before: fn() -> Value,
+    after: fn() -> Value,
+    /// The declared tags the group must end up carrying, beside [`STACK_TAG`].
+    expected: &'static [(&'static str, &'static str)],
+}
+
+/// The rows differ along what a re-declaration can do to a tag set: add a key, re-value one,
+/// drop one, and drop the declared set entirely — the stack's own propagated tag surviving
+/// every one of them.
+const TAG_ROWS: &[TagRow] = &[
+    TagRow {
+        case: "a key is added",
+        before: || json!([{ "Key": "Owner", "Value": "orders" }]),
+        after: || {
+            json!([
+                { "Key": "Owner", "Value": "orders" },
+                { "Key": "Tier", "Value": "gold" }
+            ])
+        },
+        expected: &[("Owner", "orders"), ("Tier", "gold")],
+    },
+    TagRow {
+        case: "a key is re-valued",
+        before: || json!([{ "Key": "Owner", "Value": "orders" }]),
+        after: || json!([{ "Key": "Owner", "Value": "payments" }]),
+        expected: &[("Owner", "payments")],
+    },
+    TagRow {
+        case: "a key is dropped",
+        before: || {
+            json!([
+                { "Key": "Owner", "Value": "orders" },
+                { "Key": "Tier", "Value": "gold" }
+            ])
+        },
+        after: || json!([{ "Key": "Owner", "Value": "orders" }]),
+        expected: &[("Owner", "orders")],
+    },
+    TagRow {
+        case: "the declared tag set goes away entirely",
+        before: || json!([{ "Key": "Owner", "Value": "orders" }]),
+        after: || json!([]),
+        expected: &[],
+    },
+];
+
+/// Every row: a stack update that re-declares its `AWS::Scheduler::ScheduleGroup`'s `Tags`
+/// reaches `UPDATE_COMPLETE`, and `ListTagsForResource` on the group then reports exactly
+/// the set the new declaration asks for beside the stack's own propagated tag — a key the
+/// re-declaration dropped is gone, and one it re-valued carries the new value.
+#[tokio::test]
+async fn a_stack_update_applies_a_changed_schedule_group_tag_set() {
+    let router = build_router();
+    let region = "us-west-1";
+
+    for (index, row) in TAG_ROWS.iter().enumerate() {
+        let case = row.case;
+        // Offset past the schedule table's rows, so the two suites never name one resource.
+        let declared = Declared::for_row(UPDATE_ROWS.len() + index);
+        let stack_name = format!("scheduler-group-update-{index}");
+        let properties = json!({
+            "GroupName": { "Ref": "Group" },
+            "ScheduleExpression": "rate(1 day)",
+            "FlexibleTimeWindow": { "Mode": "OFF" },
+            "Target": primary_target()
+        });
+
+        let described = deploy(
+            &router,
+            region,
+            case,
+            "CreateStack",
+            &stack_name,
+            &update_template(&declared, (row.before)(), properties.clone()),
+        )
+        .await;
+        assert_eq!(
+            opt_element(&described, "StackStatus").as_deref(),
+            Some("CREATE_COMPLETE"),
+            "case {case:?}: expected the stack to reach CREATE_COMPLETE, got {described}"
+        );
+
+        let described = deploy(
+            &router,
+            region,
+            case,
+            "UpdateStack",
+            &stack_name,
+            &update_template(&declared, (row.after)(), properties.clone()),
+        )
+        .await;
+        assert_eq!(
+            opt_element(&described, "StackStatus").as_deref(),
+            Some("UPDATE_COMPLETE"),
+            "case {case:?}: expected the update to reach UPDATE_COMPLETE, got {described}"
+        );
+
+        let arn = group_arn(region, &declared.group);
+        let (status, listed) =
+            scheduler(&router, region, "GET", &format!("/tags/{}", form_encode(&arn))).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from ListTagsForResource({arn}), got {status} with \
+             body {listed}"
+        );
+        let reported: BTreeMap<String, String> = listed
+            .get("Tags")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("case {case:?}: no 'Tags' array in {listed}"))
+            .iter()
+            .filter_map(|tag| {
+                Some((
+                    tag.get("Key").and_then(Value::as_str)?.to_string(),
+                    tag.get("Value").and_then(Value::as_str)?.to_string(),
+                ))
+            })
+            .collect();
+        let mut expected: BTreeMap<String, String> = row
+            .expected
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect();
+        expected.insert(STACK_TAG.0.to_string(), STACK_TAG.1.to_string());
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: expected the group to carry exactly {expected:?}, got {reported:?}"
+        );
+
+        // The schedule the group holds is untouched by a change to the group's own tags.
+        assert_holds_declared_schedule(
+            &router,
+            region,
+            case,
+            &declared.group,
+            &declared.schedule,
+            &properties,
+            &declared.primary_queue,
+        )
+        .await;
+    }
+}

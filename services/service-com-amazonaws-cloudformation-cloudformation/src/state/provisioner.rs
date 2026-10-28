@@ -221,7 +221,11 @@
 //!   those `restJson1` operations bind it to — so each arm passes the evaluated property
 //!   document through, a group's declared tags beside the ones CloudFormation gives it. A
 //!   schedule is keyed by its name AND the group holding it
-//!   ([`scheduled_group_of`]), so its delete and its drift read carry both.
+//!   ([`scheduled_group_of`]), so its delete and its drift read carry both. The same
+//!   document is what a CHANGED declaration reaches that service as: `UpdateSchedule`
+//!   overrides a schedule with every value the request states, and a group's tags — its one
+//!   property no call changes on a group that exists — reach it through its own tagging
+//!   calls ([`retag_schedule_group`]).
 //! * the two `AWS::MSK::*` cluster types' properties are their creates' own members in
 //!   lower camel case, so each arm walks the evaluated document ([`msk_members`]) with the
 //!   one member whose API spelling is not a case change renamed
@@ -1330,6 +1334,18 @@ impl Provisioner {
             Self::GlueJob => update_glue_job(ctx, region, resource, declared)
                 .await
                 .map(Some),
+            // EventBridge Scheduler's `UpdateSchedule` "uses all values, including empty
+            // values, specified in the request and overrides the existing schedule", which
+            // is exactly what a declaration states about a schedule — so the document that
+            // created it is the document that applies a changed declaration to it
+            // ([`update_schedule`]).
+            Self::SchedulerSchedule => update_schedule(ctx, region, resource, declared).await,
+            // A schedule group publishes its `Name`, which IS the group's identity, and its
+            // `Tags`, which are no part of any call that changes a group that exists and
+            // reach EventBridge Scheduler through its own tagging calls ([`Self::retag`]) —
+            // so a declaration whose change is its tags has nothing else to ask of that
+            // service ([`update_schedule_group`]).
+            Self::SchedulerScheduleGroup => Ok(update_schedule_group(resource, declared)),
             // Every other type's in-place update is its own entry here, exactly as its
             // create and delete are: until one is written, nothing is asked of the owning
             // service and the deployment says so.
@@ -1385,6 +1401,13 @@ impl Provisioner {
             // member of `CreateTopic` and no attribute of a topic — which is why
             // [`update_topic`] does not carry them.
             Self::SnsTopic => retag_topic(ctx, region, resource, declared, propagated).await,
+            // A schedule group's tags are EventBridge Scheduler's own `TagResource` and
+            // `UntagResource`: `CreateScheduleGroup`'s `Tags` member applies to the group
+            // that call creates and to no group that already exists, so this is where the
+            // set a group is to end up carrying is reconciled.
+            Self::SchedulerScheduleGroup => {
+                retag_schedule_group(ctx, region, resource, declared, propagated).await
+            }
             // Every other type's re-tagging is its own entry here, for the same reason its
             // create, update and delete are: the tag set is the same for every type, but the
             // calls that apply it are each service's own.
@@ -2326,20 +2349,7 @@ async fn retag_dashboard(
         )
         .await?,
     );
-    let added: Vec<(String, String)> = desired
-        .iter()
-        .filter(|(key, value)| {
-            held.iter()
-                .find(|(held_key, _)| held_key == key)
-                .is_none_or(|(_, held_value)| held_value != value)
-        })
-        .cloned()
-        .collect();
-    let removed: Vec<Value> = held
-        .iter()
-        .filter(|(key, _)| !desired.iter().any(|(wanted, _)| wanted == key))
-        .map(|(key, _)| Value::String(key.clone()))
-        .collect();
+    let (added, removed) = tag_delta(&held, &desired);
     if !added.is_empty() {
         call_json_rpc(
             ctx,
@@ -2361,7 +2371,10 @@ async fn retag_dashboard(
             region,
             AWS_JSON_1_0,
             &format!("{CLOUDWATCH_TARGET_PREFIX}.UntagResource"),
-            &serde_json::json!({ "ResourceARN": &arn, "TagKeys": Value::Array(removed) }),
+            &serde_json::json!({
+                "ResourceARN": &arn,
+                "TagKeys": tag_keys_as_list(&removed),
+            }),
         )
         .await?;
     }
@@ -6856,6 +6869,42 @@ fn tags_as_map(tags: &[(String, String)]) -> Map<String, Value> {
         .collect()
 }
 
+/// The two halves of bringing a resource's tags to the set this deployment gives it: the
+/// tags to WRITE — one the resource does not carry at all, or carries with another value —
+/// and the KEYS to drop, which are the ones it carries that the set no longer states.
+///
+/// A tag set is a map from key to value, and that arithmetic is the same whichever service
+/// owns the resource: only the calls that apply the two halves are each service's own. So it
+/// is written once here and every re-tagging arm ([`Provisioner::retag`]) asks it, which is
+/// also what makes those arms idempotent — a resource whose tags already agree with the set
+/// yields two empty halves and nothing is called about it.
+fn tag_delta(
+    held: &[(String, String)],
+    desired: &[(String, String)],
+) -> (Vec<(String, String)>, Vec<String>) {
+    let added: Vec<(String, String)> = desired
+        .iter()
+        .filter(|(key, value)| {
+            held.iter()
+                .find(|(held_key, _)| held_key == key)
+                .is_none_or(|(_, held_value)| held_value != value)
+        })
+        .cloned()
+        .collect();
+    let removed: Vec<String> = held
+        .iter()
+        .filter(|(key, _)| !desired.iter().any(|(wanted, _)| wanted == key))
+        .map(|(key, _)| key.clone())
+        .collect();
+    (added, removed)
+}
+
+/// One tag-key list as the JSON array of strings an untagging call takes, for a service
+/// whose wire carries it as one ([`tag_delta`]'s second half).
+fn tag_keys_as_list(keys: &[String]) -> Value {
+    Value::Array(keys.iter().map(|key| Value::String(key.clone())).collect())
+}
+
 // ---------------------------------------------------------------------------
 // Amazon SNS: AWS::SNS::Topic
 // ---------------------------------------------------------------------------
@@ -7178,20 +7227,7 @@ async fn retag_topic(
         .zip(super::provisioning::xml_elements(&listed, "Value"))
         .collect();
     let desired = tags_of(declared, propagated);
-    let added: Vec<(String, String)> = desired
-        .iter()
-        .filter(|(key, value)| {
-            held.iter()
-                .find(|(held_key, _)| held_key == key)
-                .is_none_or(|(_, held_value)| held_value != value)
-        })
-        .cloned()
-        .collect();
-    let removed: Vec<String> = held
-        .iter()
-        .filter(|(key, _)| !desired.iter().any(|(wanted, _)| wanted == key))
-        .map(|(key, _)| key.clone())
-        .collect();
+    let (added, removed) = tag_delta(&held, &desired);
     if !added.is_empty() {
         let mut parameters = vec![("ResourceArn".to_string(), arn.clone())];
         push_tag_list(&mut parameters, "Tags", "member", &added);
@@ -13049,6 +13085,11 @@ const SCHEDULER_SIGNING_NAME: &str = "scheduler";
 const SCHEDULER_SCHEDULE_GROUPS_URI: &str = "/schedule-groups";
 const SCHEDULER_SCHEDULES_URI: &str = "/schedules";
 
+/// The URI that model binds its three tagging operations to (`GET|POST|DELETE
+/// /tags/{ResourceArn}`), the delete naming the keys it drops in the `TagKeys` query
+/// parameter it binds them to.
+const SCHEDULER_TAGS_URI: &str = "/tags";
+
 /// The error code EventBridge Scheduler answers for a schedule group or a schedule it does
 /// not hold (`ResourceNotFoundException`, the modelled 404 of its reads and its deletes).
 const SCHEDULER_RESOURCE_NOT_FOUND: &str = "ResourceNotFoundException";
@@ -13142,15 +13183,131 @@ async fn describe_schedule_group(
     region: &str,
     physical_resource_id: &str,
 ) -> Result<Option<Value>, Refusal> {
+    Ok(read_schedule_group(ctx, region, physical_resource_id)
+        .await?
+        .map(|answer| reported_as_properties(&answer, &[("Name", "Name")])))
+}
+
+/// `GetScheduleGroup`'s whole answer for the group of `name`, or `None` for one EventBridge
+/// Scheduler no longer holds (`ResourceNotFoundException`, judged on the CODE).
+///
+/// The one read of a group in this module, so the drift comparison above and the ARN its
+/// tagging calls address it by ([`retag_schedule_group`]) come from the same answer rather
+/// than from two spellings of the same request.
+async fn read_schedule_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    name: &str,
+) -> Result<Option<Value>, Refusal> {
     let uri = format!(
         "{SCHEDULER_SCHEDULE_GROUPS_URI}/{}",
-        percent_encoded(physical_resource_id)
+        percent_encoded(name)
     );
     match call_rest_json(ctx, SCHEDULER_SIGNING_NAME, region, "GET", &uri, None).await {
-        Ok(answer) => Ok(Some(reported_as_properties(&answer, &[("Name", "Name")]))),
+        Ok(answer) => Ok(Some(answer)),
         Err(refusal) if refusal.code == SCHEDULER_RESOURCE_NOT_FOUND => Ok(None),
         Err(refusal) => Err(refusal),
     }
+}
+
+/// Apply a CHANGED `AWS::Scheduler::ScheduleGroup` declaration to the group the stack
+/// already has.
+///
+/// The type publishes exactly two properties. Its `Name` IS the group's identity — the
+/// physical id a change to which replaces the resource rather than reaching here — and its
+/// `Tags` are no member of any call that changes a group that exists, so they travel
+/// through that service's own tagging calls instead ([`retag_schedule_group`]). A
+/// declaration whose change is its tags is therefore applied with nothing asked of
+/// EventBridge Scheduler here, and one that states some other property differently is
+/// reported as NOT applied rather than as a success that dropped it.
+fn update_schedule_group(resource: &StoredResource, declared: &Value) -> Option<Created> {
+    if schedule_group_configuration(&resource.properties) != schedule_group_configuration(declared)
+    {
+        return None;
+    }
+    Some(Created::attributes(BTreeMap::new()))
+}
+
+/// One schedule-group declaration less its `Tags`: the half of it a configuration change is
+/// judged on, the other half being the one the tagging calls carry.
+fn schedule_group_configuration(properties: &Value) -> Map<String, Value> {
+    match properties {
+        Value::Object(object) => object
+            .iter()
+            .filter(|(member, _)| member.as_str() != "Tags")
+            .map(|(member, value)| (member.clone(), value.clone()))
+            .collect(),
+        _ => Map::new(),
+    }
+}
+
+/// Bring the tags of the schedule group a resource record names to the ones this deployment
+/// gives it, through EventBridge Scheduler's own `TagResource` and `UntagResource`.
+///
+/// The set is the declaration's own `Tags` beside the ones CloudFormation propagates
+/// ([`tags_of`]) — the same set the CREATE applied — so a key outside it is one this
+/// deployment no longer gives the resource and is removed, and one in it with another value
+/// is re-valued. Where the two already agree nothing is called at all, which is what makes
+/// this safe to ask on every deployment.
+///
+/// Those calls address a group by its ARN, which is the handle that service minted rather
+/// than one rebuilt here, so it is read back from the group itself
+/// ([`read_schedule_group`]). A group EventBridge Scheduler no longer holds has no tags to
+/// reconcile.
+async fn retag_schedule_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+    propagated: &[(String, String)],
+) -> Result<(), Refusal> {
+    let Some(arn) = read_schedule_group(ctx, region, &resource.physical_resource_id)
+        .await?
+        .as_ref()
+        .and_then(|group| group.get("Arn"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+    else {
+        return Ok(());
+    };
+    let uri = format!("{SCHEDULER_TAGS_URI}/{}", percent_encoded(&arn));
+    // That service answers its tag read as the same `[{Key, Value}]` list a declaration's
+    // `Tags` property is written as, so one reader serves both sides.
+    let held = declared_tags(
+        &call_rest_json(ctx, SCHEDULER_SIGNING_NAME, region, "GET", &uri, None).await?,
+    );
+    let desired = tags_of(declared, propagated);
+    let (added, removed) = tag_delta(&held, &desired);
+    if !added.is_empty() {
+        call_rest_json(
+            ctx,
+            SCHEDULER_SIGNING_NAME,
+            region,
+            "POST",
+            &uri,
+            Some(&serde_json::json!({ "Tags": tags_as_list(&added, UPPER_CASED_TAG) })),
+        )
+        .await?;
+    }
+    if !removed.is_empty() {
+        // `TagKeys` is an `@httpQuery` LIST, which travels as the parameter repeated once
+        // per key rather than as one joined value.
+        let keys = removed
+            .iter()
+            .map(|key| format!("TagKeys={}", percent_encoded(key)))
+            .collect::<Vec<String>>()
+            .join("&");
+        call_rest_json(
+            ctx,
+            SCHEDULER_SIGNING_NAME,
+            region,
+            "DELETE",
+            &format!("{uri}?{keys}"),
+            None,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// Create the schedule an `AWS::Scheduler::Schedule` declares, in the group its
@@ -13163,9 +13320,7 @@ async fn describe_schedule_group(
 /// `Input`, `DeadLetterConfig`, `RetryPolicy` and the five templated parameter structures;
 /// a `FlexibleTimeWindow`'s `Mode` and `MaximumWindowInMinutes` —
 /// `smithy_query(shape="Target,FlexibleTimeWindow")`) — so the evaluated property document
-/// IS the request. `Name` is the one member CloudFormation decides, and the one that create
-/// binds to its URI (`POST /schedules/{Name}`), so it is lifted out of the body; the two
-/// timestamp members are carried as the wire carries a timestamp ([`epoch_seconds`]).
+/// IS the request ([`schedule_request`]).
 ///
 /// "Ref returns the schedule name", so the physical id stays the name the stack computed,
 /// and the schedule's ARN is reported back as its `Arn` attribute.
@@ -13174,7 +13329,84 @@ async fn create_schedule(
     region: &str,
     resource: &StoredResource,
 ) -> Result<Created, Refusal> {
-    let mut request = match &resource.properties {
+    let answered = call_rest_json(
+        ctx,
+        SCHEDULER_SIGNING_NAME,
+        region,
+        "POST",
+        &format!(
+            "{SCHEDULER_SCHEDULES_URI}/{}",
+            percent_encoded(&resource.physical_resource_id)
+        ),
+        Some(&schedule_request(&resource.properties)?),
+    )
+    .await?;
+    Ok(Created::attributes(schedule_arn_of(
+        &answered,
+        "CreateSchedule",
+    )?))
+}
+
+/// Apply a CHANGED `AWS::Scheduler::Schedule` declaration to the schedule the stack already
+/// has, through EventBridge Scheduler's own `UpdateSchedule` (`PUT /schedules/{Name}`).
+///
+/// That call "uses all values, including empty values, specified in the request and
+/// overrides the existing schedule", so a member the new declaration leaves out is set back
+/// to its system default — which is exactly what the declaration now states about it. The
+/// request is therefore the same document the create builds from a declaration
+/// ([`schedule_request`]), and the ARN that service answers with is reported back as the
+/// resource's `Arn` attribute.
+///
+/// The pair EventBridge Scheduler keys a schedule by is its name AND its group, and no call
+/// of that service moves a schedule from one group to another: a declaration that names
+/// another group is applied the way CloudFormation applies a change no in-place call can
+/// make — the schedule is created where the declaration now puts it, and the one it left is
+/// deleted — so that service ends up holding exactly the declared schedule and the group it
+/// left holds nothing of this stack's.
+async fn update_schedule(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+) -> Result<Option<Created>, Refusal> {
+    let held_group = scheduled_group_of(&resource.properties);
+    if held_group != scheduled_group_of(declared) {
+        let declaring = StoredResource {
+            properties: declared.clone(),
+            ..resource.clone()
+        };
+        // Created before the one it replaces is deleted, so the schedule the stack
+        // publishes exists throughout the change.
+        let created = create_schedule(ctx, region, &declaring).await?;
+        delete_schedule_in(ctx, region, &resource.physical_resource_id, &held_group).await?;
+        return Ok(Some(created));
+    }
+    let answered = call_rest_json(
+        ctx,
+        SCHEDULER_SIGNING_NAME,
+        region,
+        "PUT",
+        &format!(
+            "{SCHEDULER_SCHEDULES_URI}/{}",
+            percent_encoded(&resource.physical_resource_id)
+        ),
+        Some(&schedule_request(declared)?),
+    )
+    .await?;
+    Ok(Some(Created::attributes(schedule_arn_of(
+        &answered,
+        "UpdateSchedule",
+    )?)))
+}
+
+/// The request body `CreateSchedule` and `UpdateSchedule` take for one declaration: the
+/// evaluated property document itself, less the `Name` both of them bind to their URI, with
+/// each timestamp member carried as the wire carries a timestamp ([`epoch_seconds`]).
+///
+/// The one place a declaration becomes a request, so the create and the in-place update of
+/// the same declaration cannot build two different schedules out of it.
+fn schedule_request(properties: &Value) -> Result<Value, Refusal> {
+    let mut request = match properties {
         Value::Object(object) => object.clone(),
         _ => Map::new(),
     };
@@ -13195,45 +13427,54 @@ async fn create_schedule(
         })?;
         request.insert((*member).to_string(), instant);
     }
-    let answered = call_rest_json(
-        ctx,
-        SCHEDULER_SIGNING_NAME,
-        region,
-        "POST",
-        &format!(
-            "{SCHEDULER_SCHEDULES_URI}/{}",
-            percent_encoded(&resource.physical_resource_id)
-        ),
-        Some(&Value::Object(request)),
-    )
-    .await?;
+    Ok(Value::Object(request))
+}
+
+/// The `Arn` attribute a schedule write reports: the `ScheduleArn` the named call answered
+/// with, which is the handle EventBridge Scheduler really minted for it.
+fn schedule_arn_of(answered: &Value, call: &str) -> Result<BTreeMap<String, String>, Refusal> {
     let arn = answered
         .get("ScheduleArn")
         .and_then(Value::as_str)
         .filter(|arn| !arn.is_empty())
         .ok_or_else(|| Refusal {
             code: "InternalFailure".to_string(),
-            message: "EventBridge Scheduler answered CreateSchedule without a ScheduleArn"
-                .to_string(),
+            message: format!("EventBridge Scheduler answered {call} without a ScheduleArn"),
         })?;
     let mut attributes = BTreeMap::new();
     attributes.insert("Arn".to_string(), arn.to_string());
-    Ok(Created::attributes(attributes))
+    Ok(attributes)
 }
 
 /// Delete the schedule a stack created, addressed by the pair EventBridge Scheduler keys
 /// one by: its name — this resource's physical id — and the group holding it
-/// ([`scheduled_group_of`]). One that service no longer holds
-/// (`ResourceNotFoundException`, judged on the CODE) is already in the state the delete
-/// asks for, which is also the state a deleted group leaves its schedules in ("deleting a
-/// schedule group results in EventBridge Scheduler deleting all schedules associated with
-/// the group").
+/// ([`scheduled_group_of`]).
 async fn delete_schedule(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     resource: &StoredResource,
 ) -> Result<(), Refusal> {
-    let uri = schedule_uri(resource);
+    delete_schedule_in(
+        ctx,
+        region,
+        &resource.physical_resource_id,
+        &scheduled_group_of(&resource.properties),
+    )
+    .await
+}
+
+/// Delete the schedule of `name` in `group`. One that service no longer holds
+/// (`ResourceNotFoundException`, judged on the CODE and never on a message that carries the
+/// request's own name) is already in the state the delete asks for, which is also the state
+/// a deleted group leaves its schedules in ("deleting a schedule group results in
+/// EventBridge Scheduler deleting all schedules associated with the group").
+async fn delete_schedule_in(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    name: &str,
+    group: &str,
+) -> Result<(), Refusal> {
+    let uri = schedule_uri(name, group);
     match call_rest_json(ctx, SCHEDULER_SIGNING_NAME, region, "DELETE", &uri, None).await {
         Ok(_) => Ok(()),
         Err(refusal) if refusal.code == SCHEDULER_RESOURCE_NOT_FOUND => Ok(()),
@@ -13253,7 +13494,10 @@ async fn describe_schedule(
     region: &str,
     resource: &StoredResource,
 ) -> Result<Option<Value>, Refusal> {
-    let uri = schedule_uri(resource);
+    let uri = schedule_uri(
+        &resource.physical_resource_id,
+        &scheduled_group_of(&resource.properties),
+    );
     match call_rest_json(ctx, SCHEDULER_SIGNING_NAME, region, "GET", &uri, None).await {
         Ok(answer) => Ok(Some(reported_as_properties(
             &answer,
@@ -13276,21 +13520,20 @@ async fn describe_schedule(
 
 /// The URI that addresses ONE schedule: its name in the path and its group in the
 /// `groupName` query parameter `GetSchedule` and `DeleteSchedule` bind it to.
-fn schedule_uri(resource: &StoredResource) -> String {
+fn schedule_uri(name: &str, group: &str) -> String {
     format!(
         "{SCHEDULER_SCHEDULES_URI}/{}?groupName={}",
-        percent_encoded(&resource.physical_resource_id),
-        percent_encoded(&scheduled_group_of(resource))
+        percent_encoded(name),
+        percent_encoded(group)
     )
 }
 
-/// The schedule group a provisioned `AWS::Scheduler::Schedule` record belongs to: the
-/// `GroupName` its declaration names, else the account's `default` group — "if you omit
-/// this, the default schedule group is used" — which is the group the create landed it in
-/// and half of the pair EventBridge Scheduler keys a schedule by.
-fn scheduled_group_of(resource: &StoredResource) -> String {
-    resource
-        .properties
+/// The schedule group one `AWS::Scheduler::Schedule` property document puts its schedule
+/// in: the `GroupName` it names, else the account's `default` group — "if you omit this, the
+/// default schedule group is used" — which is the group the create lands it in and half of
+/// the pair EventBridge Scheduler keys a schedule by.
+fn scheduled_group_of(properties: &Value) -> String {
+    properties
         .get("GroupName")
         .and_then(Value::as_str)
         .filter(|group| !group.is_empty())
@@ -17975,20 +18218,7 @@ async fn retag_kms_key(
         )
         .await?,
     );
-    let added: Vec<(String, String)> = desired
-        .iter()
-        .filter(|(key, value)| {
-            held.iter()
-                .find(|(held_key, _)| held_key == key)
-                .is_none_or(|(_, held_value)| held_value != value)
-        })
-        .cloned()
-        .collect();
-    let removed: Vec<Value> = held
-        .iter()
-        .filter(|(key, _)| !desired.iter().any(|(wanted, _)| wanted == key))
-        .map(|(key, _)| Value::String(key.clone()))
-        .collect();
+    let (added, removed) = tag_delta(&held, &desired);
     if !added.is_empty() {
         call_kms(
             ctx,
@@ -18006,7 +18236,10 @@ async fn retag_kms_key(
             ctx,
             region,
             "UntagResource",
-            &serde_json::json!({ "KeyId": &key_id, "TagKeys": Value::Array(removed) }),
+            &serde_json::json!({
+                "KeyId": &key_id,
+                "TagKeys": tag_keys_as_list(&removed),
+            }),
         )
         .await?;
     }
