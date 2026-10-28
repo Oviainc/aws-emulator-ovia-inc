@@ -53,6 +53,8 @@ mod regional_partitioning;
 mod replication_region_catalog;
 #[path = "all/replication_region_set.rs"]
 mod replication_region_set;
+#[path = "all/reported_replication_regions.rs"]
+mod reported_replication_regions;
 #[path = "all/reserved_tag_key_stage.rs"]
 mod reserved_tag_key_stage;
 #[path = "all/resource_tagging.rs"]

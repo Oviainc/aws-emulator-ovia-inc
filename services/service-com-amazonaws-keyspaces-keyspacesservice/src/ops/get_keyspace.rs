@@ -189,25 +189,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // "If the replicationStrategy of the keyspace is MULTI_REGION, a list of
-        // replication Regions is returned" — and only then: the modelled minimum length of
-        // both `replicationRegions` and `replicationGroupStatuses` is 2, which a
-        // single-Region keyspace's one Region cannot satisfy. A MULTI_REGION keyspace's
-        // `regionList` is modelled `length 2..`, so the stored list satisfies it.
-        let multi_region = keyspace.replication_strategy == crate::state::MULTI_REGION_STRATEGY;
+        // Which Regions a report of this keyspace carries, decided once on the stored
+        // keyspace itself ([`crate::state::Keyspace::reported_replication_regions`] /
+        // [`crate::state::Keyspace::table_replica_regions`]) rather than restated here, so
+        // this report and every other one answer the same rule.
+        let replication_regions = keyspace.reported_replication_regions();
+        let replication_group_regions = keyspace.table_replica_regions();
 
         Ok(GetKeyspaceOutput {
             keyspace_name: keyspace.name.clone(),
             resource_arn: keyspace.resource_arn.clone(),
             replication_strategy: keyspace.replication_strategy.clone(),
-            replication_regions: multi_region.then(|| keyspace.replication_regions.clone()),
+            replication_regions,
             // "This shows the summary status of the keyspace after a new Amazon Web
             // Services Region was added": one entry per Region the keyspace is replicated
             // in, carrying the keyspace's own status in that Region.
-            replication_group_statuses: multi_region.then(|| {
+            replication_group_statuses: replication_group_regions.map(|regions| {
                 let progress = tables_replication_progress(&keyspace);
-                keyspace
-                    .replication_regions
+                regions
                     .iter()
                     .map(|replication_region| ReplicationGroupStatus {
                         region: replication_region.clone(),
