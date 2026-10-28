@@ -5,27 +5,31 @@
 //!
 //! The rule under test: the listing reports EVERY version the named profile
 //! holds — its DRAFT (version 0) and each version published from it — in reverse
-//! chronological order, newest first, where a version's chronology is when it
-//! last changed; it reports each version through the modelled summary, carrying
-//! the profile's own metadata and that version's `ChangeDescription` and
-//! `LastUpdatedAt`; and it serves that one order a page at a time, each page
-//! holding at most `MaxResults` entries and carrying a `NextToken` exactly when
-//! versions remain after it. A profile no record holds is refused, a token that
-//! resumes nothing is refused, and the listing writes nothing, so two identical
-//! calls answer identically.
+//! chronological order, newest first, where a version's chronology is WHEN IT WAS
+//! CREATED: the DRAFT is minted with the profile and each publish mints the next
+//! version number, so the newest version is the highest-numbered one and the
+//! DRAFT comes last, however often it is later rewritten. It reports each version
+//! through the modelled summary, carrying the profile's own metadata and that
+//! version's `ChangeDescription` and `LastUpdatedAt`; and it serves that one order
+//! a page at a time, each page holding at most `MaxResults` entries and carrying a
+//! `NextToken` exactly when versions remain after it. Because the order is keyed
+//! on something no later call rewrites, the pages partition the listing — nothing
+//! repeated and nothing skipped — even when the profile is written to between two
+//! pages. A profile no record holds is refused, a token that resumes nothing is
+//! refused, and the listing writes nothing, so two identical calls answer
+//! identically.
 //!
 //! The rows differ along what the rule generalises over: the source format, how
 //! many versions the profile holds, whether each version carries a
-//! `ChangeDescription`, and the ORDER the versions were last touched in — a DRAFT
-//! rewritten after a publish is newer than that publish, so the version numbers
-//! and the reported order come apart.
+//! `ChangeDescription`, and whether the DRAFT was rewritten after a publish — a
+//! rewrite restamps the DRAFT's `LastUpdatedAt` without moving it in the listing,
+//! so the reported timestamps and the reported order come apart.
 //!
 //! Every call below goes through the shared [`Profiles`] harness, i.e.
 //! `MultiServiceRouter::dispatch` — the same entry point `core/router` serves — so
 //! routing, deserialization, the modelled constraints and the error envelope are
 //! all exercised, not bypassed.
 
-use std::cmp::Reverse;
 use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
@@ -46,8 +50,9 @@ const MAX_PAGE_SIZE: i32 = 100;
 
 /// One step of a row's history, after the create that leaves the DRAFT behind.
 ///
-/// Each step touches exactly ONE version, so the order the steps run in is the
-/// chronology the listing must report in reverse.
+/// Each step touches exactly ONE version: a publish CREATES the next version,
+/// and a DRAFT rewrite creates nothing, so only the publishes extend the
+/// listing.
 #[derive(Debug, Clone)]
 enum Step {
     /// `PublishDataTransformationProfile`: snapshots the DRAFT into the next
@@ -98,7 +103,8 @@ fn listing_cases() -> Vec<ListingCase> {
             ],
         },
         ListingCase {
-            case: "CSV, a publish then a DRAFT rewrite, which makes the DRAFT newest",
+            case: "CSV, a publish then a DRAFT rewrite, so the newest CHANGE is the \
+                    oldest version",
             profile_name: "csv-draft-rewritten-last",
             source_format: "CSV",
             steps: vec![
@@ -143,7 +149,7 @@ fn listing_cases() -> Vec<ListingCase> {
 /// must report for it.
 struct Built {
     profile_id: String,
-    /// The versions the listing must report, NEWEST FIRST.
+    /// The versions the listing must report, NEWEST CREATED FIRST.
     expected_order: Vec<i32>,
     /// The `ChangeDescription` each version carries, `None` for one that has
     /// none.
@@ -152,10 +158,11 @@ struct Built {
 
 /// Run `row`'s history and derive what the listing must report for it.
 ///
-/// The expectation is derived from the ORDER the steps ran in, not from any
-/// timestamp the service returned: step `n` touched its version after step
-/// `n - 1` touched its own, so sorting the versions by the step that last
-/// touched them, descending, is the reverse chronological order under test.
+/// The expectation is derived from the order the versions were CREATED in, not
+/// from any timestamp the service returned: the create mints the DRAFT and each
+/// publish mints the next version number, so the version numbers descending is
+/// the reverse chronological order under test — whatever a later DRAFT rewrite
+/// does to the DRAFT's `LastUpdatedAt`.
 async fn build(healthlake: &Profiles, row: &ListingCase) -> Built {
     let case = row.case;
     let created = healthlake
@@ -174,9 +181,7 @@ async fn build(healthlake: &Profiles, row: &ListingCase) -> Built {
         .await;
     let profile_id = string_at(&created, "ProfileId");
 
-    // The step that last touched each version, the DRAFT first: the create is
-    // step 0 and leaves the DRAFT behind.
-    let mut touched_by: BTreeMap<i32, usize> = BTreeMap::from([(0, 0)]);
+    // The create leaves the DRAFT, version 0, behind.
     let mut descriptions: BTreeMap<i32, Option<String>> = BTreeMap::from([(0, None)]);
     let mut published = 0i32;
 
@@ -201,7 +206,6 @@ async fn build(healthlake: &Profiles, row: &ListingCase) -> Built {
                     "case {case:?}: step {step_number} must publish version {published}, \
                      got {response}"
                 );
-                touched_by.insert(published, step_number);
                 descriptions.insert(published, description.map(str::to_string));
             }
             Step::UpdateDraft(content, description) => {
@@ -215,14 +219,14 @@ async fn build(healthlake: &Profiles, row: &ListingCase) -> Built {
                 healthlake
                     .ok(case, "UpdateDataTransformationProfile", &request)
                     .await;
-                touched_by.insert(0, step_number);
                 descriptions.insert(0, description.map(str::to_string));
             }
         }
     }
 
-    let mut expected_order: Vec<i32> = touched_by.keys().copied().collect();
-    expected_order.sort_by_key(|version| Reverse(touched_by[version]));
+    // Newest created first: the highest published version down to the DRAFT,
+    // which was minted by the create and so is the oldest version there is.
+    let expected_order: Vec<i32> = (0..=published).rev().collect();
 
     Built {
         profile_id,
@@ -334,17 +338,15 @@ async fn the_listing_reports_every_version_newest_first() {
                  version newest first, got {reported:?}"
             );
 
-            // Newest first is also visible in the reported timestamps on their
-            // own: each entry was last updated no later than the one before it.
+            // Newest first is also visible in the entries on their own: each
+            // version was created before the one above it, so the version
+            // numbers strictly decrease down the listing.
             for pair in items.windows(2) {
-                let (earlier, later) = (
-                    last_updated_at(case, &pair[0]),
-                    last_updated_at(case, &pair[1]),
-                );
+                let (earlier, later) = (version_of(case, &pair[0]), version_of(case, &pair[1]));
                 assert!(
-                    earlier >= later,
-                    "case {case:?}: LastUpdatedAt must not increase down the listing, \
-                     got {earlier} then {later}"
+                    earlier > later,
+                    "case {case:?}: the version numbers must strictly decrease down the \
+                     listing, got {earlier} then {later}"
                 );
             }
 
@@ -467,6 +469,230 @@ async fn a_next_token_resumes_where_its_page_ended() {
             "case {case:?}: the token from a page of {page_size} resumes at the next version, \
              got {resumed_versions:?}"
         );
+    }
+}
+
+/// One write that lands BETWEEN two pages of a single walk.
+#[derive(Debug, Clone, Copy)]
+enum MidWalkWrite {
+    /// Nothing is written between the pages — the control row.
+    Nothing,
+    /// `UpdateDataTransformationProfile` rewrites the DRAFT, restamping its
+    /// `LastUpdatedAt` and replacing its `ChangeDescription`. This is the write
+    /// a chronology measured on `LastUpdatedAt` would move to the front of the
+    /// listing, shifting every entry after it.
+    RewriteDraft,
+    /// `PublishDataTransformationProfile` mints a version AFTER the walk began,
+    /// so the new version belongs ahead of every entry the walk has served and
+    /// the walk itself serves the versions it started with.
+    PublishNewVersion,
+}
+
+impl MidWalkWrite {
+    /// How a row names itself in a failure message.
+    fn label(self) -> &'static str {
+        match self {
+            MidWalkWrite::Nothing => "no write between two pages",
+            MidWalkWrite::RewriteDraft => "a DRAFT rewrite between two pages",
+            MidWalkWrite::PublishNewVersion => "a publish between two pages",
+        }
+    }
+}
+
+/// Resume a walk from `token` and report every version the rest of it serves,
+/// page by page at `max_results`, until a page hands out no token.
+async fn resume_walk(
+    healthlake: &Profiles,
+    case: &str,
+    profile_id: &str,
+    max_results: i32,
+    token: String,
+) -> Vec<Value> {
+    let mut items: Vec<Value> = Vec::new();
+    let mut next = Some(token);
+    let mut pages = 0usize;
+
+    while let Some(current) = next {
+        let body = healthlake
+            .ok(
+                case,
+                "ListDataTransformationProfileVersions",
+                &json!({
+                    "ProfileId": profile_id,
+                    "MaxResults": max_results,
+                    "NextToken": current,
+                }),
+            )
+            .await;
+        items.extend(body["Items"].as_array().cloned().unwrap_or_default());
+        pages += 1;
+        // A profile holds at most its DRAFT and the modelled `ProfileVersion`
+        // maximum of published versions, so at worst one page per version plus
+        // one terminating page.
+        let ceiling = usize::try_from(MAX_PROFILE_VERSION).unwrap_or(99) + 2;
+        assert!(
+            pages <= ceiling,
+            "case {case:?}: paging must terminate, got {pages} pages"
+        );
+        next = body
+            .get("NextToken")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+    }
+
+    items
+}
+
+/// The pages PARTITION the listing even when the profile is WRITTEN TO between
+/// two of them: whichever write lands mid-walk, the walk serves each version the
+/// profile held when it began exactly once, in the one order — nothing repeated
+/// and nothing skipped.
+///
+/// The rows differ along the write that lands mid-walk (none, a DRAFT rewrite, a
+/// publish) and along the page size the walk is read at, so each row's walk
+/// spans a different number of pages.
+#[tokio::test]
+async fn a_write_between_two_pages_repeats_and_skips_nothing() {
+    let healthlake = Profiles::new();
+    let rewritten_draft = &[("patients.csv.map", "Patient.id <- mrn")];
+
+    for write in [
+        MidWalkWrite::Nothing,
+        MidWalkWrite::RewriteDraft,
+        MidWalkWrite::PublishNewVersion,
+    ] {
+        for page_size in 1..=3 {
+            let case = write.label();
+            // Three publishes and then a DRAFT rewrite: the DRAFT is the version
+            // most recently CHANGED while being the version created first, which
+            // is exactly the state the two chronologies disagree about.
+            let built = build(
+                &healthlake,
+                &ListingCase {
+                    case,
+                    profile_name: "csv-mid-walk-write",
+                    source_format: "CSV",
+                    steps: vec![
+                        Step::Publish(Some("v1")),
+                        Step::Publish(None),
+                        Step::Publish(Some("v3")),
+                        Step::UpdateDraft(rewritten_draft, Some("draft ahead of v3")),
+                    ],
+                },
+            )
+            .await;
+            let row = format!("{case} at MaxResults {page_size}");
+
+            let first = healthlake
+                .ok(
+                    &row,
+                    "ListDataTransformationProfileVersions",
+                    &json!({ "ProfileId": built.profile_id, "MaxResults": page_size }),
+                )
+                .await;
+            let token = first["NextToken"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "case {row:?}: a page of {page_size} of {} versions carries a \
+                         NextToken: {first}",
+                        built.expected_order.len()
+                    )
+                })
+                .to_string();
+            let mut served: Vec<Value> = first["Items"].as_array().cloned().unwrap_or_default();
+
+            // The write that lands between the page above and the rest of the
+            // walk below.
+            match write {
+                MidWalkWrite::Nothing => {}
+                MidWalkWrite::RewriteDraft => {
+                    healthlake
+                        .ok(
+                            &row,
+                            "UpdateDataTransformationProfile",
+                            &json!({
+                                "ProfileId": built.profile_id,
+                                "ProfileMapping": request_mapping(&mapping(&[(
+                                    "patients.csv.map",
+                                    "Patient.identifier <- mrn",
+                                )])),
+                                "ChangeDescription": "rewritten mid-walk",
+                            }),
+                        )
+                        .await;
+                }
+                MidWalkWrite::PublishNewVersion => {
+                    healthlake
+                        .ok(
+                            &row,
+                            "PublishDataTransformationProfile",
+                            &json!({
+                                "ProfileId": built.profile_id,
+                                "SourceFormat": "CSV",
+                                "ChangeDescription": "published mid-walk",
+                            }),
+                        )
+                        .await;
+                }
+            }
+
+            served.extend(
+                resume_walk(
+                    &healthlake,
+                    &row,
+                    &built.profile_id,
+                    page_size,
+                    token,
+                )
+                .await,
+            );
+            let versions: Vec<i32> = served.iter().map(|item| version_of(&row, item)).collect();
+            assert_eq!(
+                versions, built.expected_order,
+                "case {row:?}: the walk must serve the versions the profile held when it \
+                 began, each exactly once and in the one order, got {versions:?}"
+            );
+
+            // Each page is read from the live profile, so the DRAFT served after
+            // a mid-walk rewrite carries what that rewrite wrote.
+            if matches!(write, MidWalkWrite::RewriteDraft) {
+                let draft = served
+                    .iter()
+                    .find(|item| version_of(&row, item) == 0)
+                    .unwrap_or_else(|| panic!("case {row:?}: the walk serves the DRAFT"));
+                assert_eq!(
+                    draft.get("ChangeDescription").and_then(Value::as_str),
+                    Some("rewritten mid-walk"),
+                    "case {row:?}: the DRAFT summary must carry the mid-walk rewrite's \
+                     ChangeDescription, got {draft}"
+                );
+                let published = served
+                    .iter()
+                    .find(|item| version_of(&row, item) == 3)
+                    .unwrap_or_else(|| panic!("case {row:?}: the walk serves version 3"));
+                assert!(
+                    last_updated_at(&row, draft) >= last_updated_at(&row, published),
+                    "case {row:?}: the rewrite restamped the DRAFT, so its LastUpdatedAt is \
+                     no older than the publish it follows, got {draft} against {published}"
+                );
+            }
+
+            // A walk started AFTER the mid-walk publish does report the version
+            // it minted, at the front: nothing was lost, it was simply not part
+            // of the listing the earlier walk was partitioning.
+            if matches!(write, MidWalkWrite::PublishNewVersion) {
+                let fresh = list_every_page(&healthlake, &row, &built.profile_id, None).await;
+                let fresh_versions: Vec<i32> =
+                    fresh.iter().map(|item| version_of(&row, item)).collect();
+                let expected: Vec<i32> = (0..=4).rev().collect();
+                assert_eq!(
+                    fresh_versions, expected,
+                    "case {row:?}: a walk started after the publish reports the version it \
+                     minted first, got {fresh_versions:?}"
+                );
+            }
+        }
     }
 }
 

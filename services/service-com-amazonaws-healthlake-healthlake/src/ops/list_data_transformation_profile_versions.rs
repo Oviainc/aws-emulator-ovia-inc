@@ -176,9 +176,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let ordered = profile.versions_newest_first();
 
         // `NextToken` is the version number of the first entry the next page
-        // returns, so resuming is a lookup in this same order. A token that
-        // names no version of this profile resumes nothing, which is a bad
-        // request rather than an empty page.
+        // returns, so resuming is a lookup in this same order — an order no
+        // later write reshuffles, which is what makes the pages partition the
+        // listing. A token that names no version of this profile resumes
+        // nothing, which is a bad request rather than an empty page.
         let start = match input.next_token.as_deref() {
             None => 0,
             Some(token) => ordered
@@ -225,10 +226,11 @@ const MAX_PAGE_SIZE: i32 = 100;
 
 /// The `NextToken` that resumes this listing at the version numbered `version`.
 ///
-/// A version number is unique within its profile and the listing is a stable
-/// total order, so the number alone says where to resume. Rendered as decimal,
-/// which is one or two characters and so always inside the modelled
-/// `DataTransformationNextToken` length bound (1..2048).
+/// A version number is unique within its profile and is also the listing's sort
+/// key, which no later call rewrites, so the number alone says where to resume
+/// and it resolves to the same place however the profile is written to in
+/// between. Rendered as decimal, which is one or two characters and so always
+/// inside the modelled `DataTransformationNextToken` length bound (1..2048).
 fn page_token(version: i32) -> String {
     version.to_string()
 }

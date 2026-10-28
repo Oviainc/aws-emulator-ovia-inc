@@ -1538,23 +1538,25 @@ impl DataTransformationProfile {
     /// versions of a specific data transformation profile (DRAFT and
     /// published), in reverse chronological order (newest first)").
     ///
-    /// A version's `LastUpdatedAt` is when it last changed, so that is what
-    /// "chronological" is measured on: the DRAFT moves to the front when
-    /// `UpdateDataTransformationProfile` rewrites it, and a publish puts the
-    /// snapshot it took in front of every older version. The version number
-    /// breaks a tie between two versions stamped at the same instant,
-    /// descending for the same reason, so the order is a stable total one and
-    /// paging through it is resumable. The walk is bounded: at most
+    /// "Chronological" is measured on when a version CAME INTO BEING, which is
+    /// the one thing about a version no later call can rewrite: the DRAFT is
+    /// minted with the profile and each publish mints the version one past the
+    /// latest published one, so the version numbers run in the order the
+    /// versions were created and DESCENDING version number is exactly newest
+    /// first — with the DRAFT, minted at create, last. Nothing renumbers or
+    /// removes a version, so the order is a total one that no write can
+    /// reshuffle, and a page resumed into it by version number lands where it
+    /// was issued for.
+    ///
+    /// A version's `LastUpdatedAt` cannot order this listing: it is rewritten
+    /// in place on the DRAFT, which would move an entry between two pages of
+    /// one walk and serve another entry twice. The walk is bounded: at most
     /// `1 + MAX_PROFILE_VERSION` versions.
     pub fn versions_newest_first(&self) -> Vec<&ProfileVersionRecord> {
         let mut versions: Vec<&ProfileVersionRecord> = ::std::iter::once(&self.draft)
             .chain(self.published.values())
             .collect();
-        versions.sort_by(|a, b| {
-            epoch_nanos(&b.last_updated_at)
-                .cmp(&epoch_nanos(&a.last_updated_at))
-                .then_with(|| b.version.cmp(&a.version))
-        });
+        versions.sort_by_key(|version| ::std::cmp::Reverse(version.version));
         versions
     }
 
