@@ -285,6 +285,16 @@ pub struct StoredTunnel {
     pub destination_access_token: String,
     pub created_at: SystemTime,
     pub last_updated_at: SystemTime,
+    /// The instant this tunnel reached `CLOSED`, and `None` while it is still
+    /// open.
+    ///
+    /// The record of ONE lifecycle event, written once by [`StoredTunnel::close`]
+    /// — the single writer of the transition, so this carries a value exactly
+    /// when `status` is `CLOSED` — and never rewritten afterwards, unlike
+    /// `last_updated_at`, which every call that changes anything the tunnel
+    /// reports (its tag set included) stamps with the instant of ITS change.
+    /// Anything that has to order closed records against each other reads this.
+    pub closed_at: Option<SystemTime>,
     /// The instant the tunnel's `maxLifetimeTimeoutMinutes` runs out, after which
     /// the clock owes it a transition to `CLOSED`.
     pub expires_at: SystemTime,
@@ -306,12 +316,16 @@ impl StoredTunnel {
     /// that is already `CLOSED` is left exactly as it is, stamps included,
     /// because a close that changes nothing about the resource has nothing to
     /// report; `true` means this call was the one that closed it.
+    ///
+    /// It also records [`Self::closed_at`], the instant of this transition, which
+    /// no later write to the record changes.
     pub fn close(&mut self, at: SystemTime) -> bool {
         if self.status != TunnelStatus::Open {
             return false;
         }
         self.status = TunnelStatus::Closed;
         self.last_updated_at = at;
+        self.closed_at = Some(at);
         self.source_connection_state = StoredConnectionState::disconnected(at);
         self.destination_connection_state = StoredConnectionState::disconnected(at);
         true
@@ -446,6 +460,16 @@ impl ComAmazonawsIotsecuretunnelingIotsecuredtunnelingState {
     /// of it: the Region a record belongs to comes from the request, so a bound
     /// held per Region would be no bound on the store at all.
     ///
+    /// The order is read from [`StoredTunnel::closed_at`], the instant of the
+    /// close transition itself: a record carries one exactly while it is
+    /// `CLOSED`, so selecting on it is selecting a closed record, and no later
+    /// write to the record moves it in this order. `last_updated_at` reports the
+    /// last change of ANY kind to a tunnel, so it says nothing about when a
+    /// record was closed and cannot order closes.
+    ///
+    /// Ties — two records closed in the same instant — are broken by creation
+    /// order, so the eviction is total and deterministic.
+    ///
     /// Called by the one operation that grows the store, which refuses the
     /// request when this answers `false` rather than inserting anyway.
     pub fn make_room_for_tunnel(&mut self) -> bool {
@@ -453,9 +477,13 @@ impl ComAmazonawsIotsecuretunnelingIotsecuredtunnelingState {
             let Some((region, tunnel_id)) = self
                 .tunnels
                 .iter()
-                .filter(|(_, tunnel)| tunnel.status != TunnelStatus::Open)
-                .min_by_key(|(_, tunnel)| (tunnel.last_updated_at, tunnel.creation_seq))
-                .map(|((region, tunnel_id), _)| (region.clone(), tunnel_id.clone()))
+                .filter_map(|(key, tunnel)| {
+                    tunnel
+                        .closed_at
+                        .map(|closed_at| (key, closed_at, tunnel.creation_seq))
+                })
+                .min_by_key(|(_, closed_at, creation_seq)| (*closed_at, *creation_seq))
+                .map(|((region, tunnel_id), _, _)| (region.clone(), tunnel_id.clone()))
             else {
                 // Every record is open, so there is nothing retention may
                 // reclaim and the store has no room for another tunnel.

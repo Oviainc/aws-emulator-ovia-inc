@@ -297,6 +297,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             destination_access_token: destination_access_token.clone(),
             created_at: now,
             last_updated_at: now,
+            // The tunnel is OPEN, so there is no close instant to record yet;
+            // the close transition writes it.
+            closed_at: None,
             expires_at,
             creation_seq,
         };
