@@ -59,32 +59,36 @@ pub const ARN_NAMESPACE: &str = "ecr-public";
 /// repositories, images, layer uploads, tags, policies and both catalog legs — is served
 /// from either of them.
 ///
-/// The repository, image, layer, tag and policy surface is served from either of them, so
-/// a request naming any Region reaches it ([`serves_region`] governs the one call that is
-/// Region-scoped, and nothing else consults the Region at all).
+/// Nothing but the one Region-scoped call consults the Region at all: the repository,
+/// image, layer, tag and policy surface is served whatever Region a request names, and
+/// [`serves_region`] governs the Region-scoped call alone — which is served from every
+/// Region in this list and refused from a Region that carries no ECR Public endpoint.
 pub const ENDPOINT_REGIONS: &[&str] = &["us-east-1", "us-west-2"];
 
-/// The ONE Region AWS performs the account-global registry-catalog write
-/// (`PutRegistryCatalogData`) in: the first of [`ENDPOINT_REGIONS`].
+/// The primary Region of this surface: the first of [`ENDPOINT_REGIONS`], and the one the
+/// Region refusal below names.
 ///
-/// Publishing an API endpoint in a Region and performing a Region-scoped write in it are
-/// different properties: this is the second one, and it holds for exactly one Region.
+/// It is the Region a caller that reached this API from a Region it is not offered in is
+/// directed to, and the Region ordinary (Region-independent) calls are signed for.
 pub const API_REGION: &str = ENDPOINT_REGIONS[0];
 
-/// Whether a Region-scoped call a request names `region` for is one this service performs:
-/// an account-global write AWS performs in a single Region is served for that Region and
-/// refused for every other, whichever endpoint the request reached.
+/// Whether a Region-scoped call a request names `region` for is one this service offers
+/// there: `UnsupportedCommandException` says the action is not supported in the caller's
+/// Region, so the call is served from every Region this API is published in
+/// ([`ENDPOINT_REGIONS`]) and refused only from a Region that publishes none of it.
 ///
 /// A Region name is case-insensitive, so the comparison is too.
 pub fn serves_region(region: &str) -> bool {
-    region.eq_ignore_ascii_case(API_REGION)
+    ENDPOINT_REGIONS
+        .iter()
+        .any(|published| region.eq_ignore_ascii_case(published))
 }
 
 /// The `UnsupportedCommandException` a Region-scoped call naming `region` is refused with,
-/// or `None` when that Region is the one the call is performed in ([`serves_region`]).
+/// or `None` when that Region is one the call is served from ([`serves_region`]).
 ///
 /// The message is a deterministic function of the request and of the service: the operation
-/// the caller named, then the single Region that performs it.
+/// the caller named, then the Region such a caller is directed to ([`API_REGION`]).
 pub fn unsupported_for_region(
     region: &str,
     operation: &str,
@@ -100,13 +104,13 @@ pub fn unsupported_for_region(
 }
 
 /// The `UnsupportedCommandException` a Region-scoped ECR Public call signed for a Region
-/// other than the one that performs it is refused with, or `None` when it is served
+/// that carries no ECR Public endpoint is refused with, or `None` when it is served
 /// ([`unsupported_for_region`]).
 ///
 /// This is the gate of the ONE Region-scoped operation: it is called by
 /// `PutRegistryCatalogData` before it touches the account-global record, and by nothing
-/// else — an operation AWS serves from every published endpoint must not consult it, or a
-/// caller that reached ECR Public from another Region is refused everything.
+/// else — an operation AWS serves whatever Region its caller named must not consult it, or
+/// a caller that reached ECR Public from another Region is refused everything.
 ///
 /// The Region a request carries is the one in its SigV4 credential scope, parsed by
 /// `emulator_server::sigv4_credential_scope` (the single source of SigV4-scope parsing). A

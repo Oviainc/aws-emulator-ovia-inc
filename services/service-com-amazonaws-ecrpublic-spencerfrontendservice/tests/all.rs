@@ -43,6 +43,8 @@ mod put_image_layer_resolution;
 mod region_gate;
 #[path = "all/registry_catalog_data.rs"]
 mod registry_catalog_data;
+#[path = "all/registry_catalog_write_published_regions.rs"]
+mod registry_catalog_write_published_regions;
 #[path = "all/registry_catalog_write_regions.rs"]
 mod registry_catalog_write_regions;
 #[path = "all/registry_describe.rs"]

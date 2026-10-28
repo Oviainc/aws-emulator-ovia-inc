@@ -151,12 +151,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(denied);
         }
         // The account-global registry catalog record is the ONE Region-scoped ECR Public
-        // write: AWS performs it in a single Region (`crate::state::API_REGION`) and
-        // refuses it everywhere else, so a request signed for any other Region is answered
-        // with the service-common `UnsupportedCommandException` before the record is
-        // touched. Every other operation of this service — including the matching read
-        // (`GetRegistryCatalogData`) and the whole repository, image, layer, tag and policy
-        // surface — is served whatever Region its request names. See
+        // write: `UnsupportedCommandException` says the action is not offered in the
+        // caller's Region, so the write is served from every Region this API is published
+        // in (`crate::state::ENDPOINT_REGIONS`) and only a request whose credential scope
+        // names a Region that carries no ECR Public endpoint is refused with it — before
+        // the record is touched. Every other operation of this service — including the
+        // matching read (`GetRegistryCatalogData`) and the whole repository, image, layer,
+        // tag and policy surface — is served whatever Region its request names. See
         // `crate::state::serves_region`.
         if let Some(unsupported) = crate::state::unsupported_in_region(ctx.parts(), Self::NAME) {
             return Err(

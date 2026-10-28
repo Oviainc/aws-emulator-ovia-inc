@@ -3,21 +3,17 @@
 //! The account-singleton registry catalog write, driven end to end from every Region a
 //! caller can reach this endpoint as.
 //!
-//! The rule under test: `PutRegistryCatalogData` is the one ECR Public call AWS performs
-//! in a single Region (`state::API_REGION`) — a request signed for that Region is served
-//! and a `displayName` within the modelled `RegistryDisplayName` length
+//! The rule under test: `PutRegistryCatalogData` is the one ECR Public call whose Region is
+//! part of its contract — `UnsupportedCommandException` says the action is not offered in
+//! the caller's Region, so the write is served from every Region this API is published in
+//! (`state::ENDPOINT_REGIONS`) and a `displayName` within the modelled
+//! `RegistryDisplayName` length
 //! (`smithy_query(query="shape", shape="RegistryDisplayName")`: `length {min: 0, max: 100}`)
 //! is stored verbatim and read back by `GetRegistryCatalogData` signed for any Region,
-//! while a request signed for any OTHER Region is refused HTTP 400
-//! `UnsupportedCommandException` and stores nothing, and one whose `displayName` is past
+//! while a request signed for a Region that carries no ECR Public endpoint is refused HTTP
+//! 400 `UnsupportedCommandException` and stores nothing, and one whose `displayName` is past
 //! the modelled length is refused HTTP 400 `InvalidParameterException` naming the member
 //! and the modelled bound, before the stored value is touched.
-//!
-//! The tables below span the classes the rule generalises over: every Region a caller can
-//! reach this endpoint as — both Regions ECR Public publishes an endpoint in and Regions
-//! from five other partitions — each in the letter cases a Region name arrives in, crossed
-//! with display names at the published lower bound, inside the range, at the published upper
-//! bound and one past it, in several scripts and byte widths.
 //!
 //! The tables below span the classes the rule generalises over: every Region a caller can
 //! reach this endpoint as — both Regions ECR Public publishes an endpoint in and Regions
@@ -36,12 +32,12 @@ use crate::repository_image_lifecycle::{call_signed_for, service};
 
 /// The modelled upper bound on `RegistryDisplayName`
 /// (`smithy_query(query="shape", shape="RegistryDisplayName")`: `length {min: 0, max: 100}`).
-const MAX_DISPLAY_NAME_LEN: usize = 100;
+pub(crate) const MAX_DISPLAY_NAME_LEN: usize = 100;
 
 /// The clause ECR Public states for a member outside its modelled length: fixed wording
 /// whose variable parts are the member the request carried and the bound the model declares
 /// for it (`src/service.rs`, `clause`).
-fn expected_length_refusal(member: &str, max: usize) -> String {
+pub(crate) fn expected_length_refusal(member: &str, max: usize) -> String {
     format!(
         "Invalid parameter at '{member}' failed to satisfy constraint: \
          'Member must have length less than or equal to {max}'"
@@ -49,7 +45,7 @@ fn expected_length_refusal(member: &str, max: usize) -> String {
 }
 
 /// The `displayName` a response reports: `None` when the member is absent.
-fn display_name(body: &Value, case: &str) -> Option<String> {
+pub(crate) fn display_name(body: &Value, case: &str) -> Option<String> {
     let catalog = &body["registryCatalogData"];
     assert!(
         catalog.is_object(),
