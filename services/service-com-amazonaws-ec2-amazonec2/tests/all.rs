@@ -861,3 +861,8 @@ mod create_local_gateway_route_table;
 // documented filters and the page size narrow it.
 #[path = "all/get_coip_pool_usage.rs"]
 mod get_coip_pool_usage;
+// Appended at the END of this file, for the reason the header gives. What
+// `DescribeTransitGatewayConnects` reports out of the attachment store, and how the id list,
+// the documented filters and the page size narrow it.
+#[path = "all/describe_transit_gateway_connects.rs"]
+mod describe_transit_gateway_connects;
