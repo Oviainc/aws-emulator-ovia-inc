@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopExperimentRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopExperimentRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: ends the addressed experiment run — it stops delivering treatments as of
+//! this call, records the conclusion the call states and the stop on the run's timeline,
+//! and leaves the definition with no experiment in flight.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopExperimentRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A run the experiment has already finished with takes no second stop: that is a
+//! conflict with the state of the run, not a bad request, and it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -169,20 +166,160 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopExperimentRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopExperimentRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopExperimentRun"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StopExperimentRunErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("AppConfig state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let now = std::time::SystemTime::now();
+        // ONE lock for the whole read-check-write: the status check below and the write
+        // that ends the run are not separable, or two stops that both found the run
+        // running would both end it and both report themselves as the one that did.
+        let mut store = state.lock();
+
+        // Both identifier members are `Identifier`s, documented as the resource's "ID or
+        // name", so either addresses the record — and the whole path resolves BEFORE
+        // anything is written, so a refused stop leaves the run exactly as it was.
+        let Some(application_id) = store.resolve_application_id(&input.application_identifier)
+        else {
+            return Err(StopExperimentRunErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::application_not_found(
+                        &input.application_identifier,
+                    )),
+                    resource_name: Some(input.application_identifier),
+                },
+            )
+            .into());
+        };
+        let Some(application) = store.application_mut(&application_id) else {
+            return Err(StopExperimentRunErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The application could not be read while stopping the experiment run"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let Some(definition_id) =
+            application.resolve_experiment_definition_id(&input.experiment_definition_identifier)
+        else {
+            return Err(StopExperimentRunErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::experiment_definition_not_found(
+                        &input.application_identifier,
+                        &input.experiment_definition_identifier,
+                    )),
+                    resource_name: Some(input.experiment_definition_identifier),
+                },
+            )
+            .into());
+        };
+        let Some(definition) = application.experiment_definitions.get_mut(&definition_id) else {
+            return Err(StopExperimentRunErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The experiment definition could not be read after it was resolved"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        // A run number the definition never issued addresses no run, and neither does one
+        // whose record the definition no longer holds.
+        let Some(run) = definition.runs.get_mut(&input.run) else {
+            return Err(StopExperimentRunErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::experiment_run_not_found(
+                        &input.application_identifier,
+                        &input.experiment_definition_identifier,
+                        input.run,
+                    )),
+                    resource_name: Some(input.run.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // This operation "stops a running experiment" (its own documentation), and a run
+        // the experiment has already finished with is exposing no audience left to end —
+        // so a stop of it conflicts with the current state of the resource and writes
+        // nothing, leaving the instant it DID end, and the conclusion it ended with, as
+        // the stop that ended it wrote them.
+        if !run.is_active() {
+            return Err(StopExperimentRunErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(crate::state::experiment_run_not_stoppable(
+                        &run.experiment_definition_id,
+                        run.run,
+                        &run.status,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Stopping the run "ends audience exposure and returns users to the currently
+        // deployed feature flag configuration" (this operation's own documentation): the
+        // run is over as of now, which is the instant it ended, the instant the record was
+        // last written and the instant its timeline reports the stop at. `Result` is the
+        // experiment's conclusion, which the caller supplies here and nothing else
+        // computes, so a stop that carries one stores it and a stop that carries none
+        // leaves the record's own. `DeploymentParameters` governs how the configuration
+        // this run's treatments were delivered through is rolled back; nothing in it is a
+        // member of the run, and no reader of this service reports it, so none of it is
+        // stored rather than being kept where no call could report it.
+        run.end(now, input.result);
+        // Answered from the stored record, so this response and a later `GetExperimentRun`
+        // report the same run.
+        let output = StopExperimentRunOutput {
+            application_id: Some(run.application_id.clone()),
+            experiment_definition_id: Some(run.experiment_definition_id.clone()),
+            run: run.run,
+            description: run.description.clone(),
+            status: Some(run.status.clone()),
+            exposure_percentage: run.exposure_percentage,
+            treatment_overrides: run.treatment_overrides.clone(),
+            result: run.result.clone(),
+            started_at: Some(crate::state::to_date_time(run.started_at)),
+            updated_at: Some(crate::state::to_date_time(run.updated_at)),
+            ended_at: run.ended_at.map(crate::state::to_date_time),
+            experiment_definition_snapshot: Some(run.definition_snapshot.clone()),
+        };
+
+        // No run of the definition is delivering treatments any more, so the definition
+        // leaves the status it reports while an experiment is in flight and is back to the
+        // one a definition with no run in flight holds — the status that lets
+        // `UpdateExperimentDefinition` and `DeleteExperimentDefinition` take it again — and
+        // the write makes this the instant the definition was last updated. An archived
+        // definition keeps the status an archiving delete gave it: that status is not
+        // about a run.
+        if definition.status == crate::state::EXPERIMENT_DEFINITION_ACTIVE {
+            definition.status = crate::state::EXPERIMENT_DEFINITION_IDLE.to_string();
+        }
+        definition.updated_at = now;
+
+        // An attribution record for the write: the ids of the records this call changed and
+        // the run it ended, and nothing the caller sent — a result summary belongs in the
+        // response, not in a log.
+        tracing::debug!(
+            operation = "StopExperimentRun",
+            outcome = "stopped",
+            application_id = definition.application_id.as_str(),
+            experiment_definition_id = definition.id.as_str(),
+            run = input.run,
+            "stopped an experiment run"
+        );
+
+        Ok(output)
     }
 }
