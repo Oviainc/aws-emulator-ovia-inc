@@ -197,8 +197,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // members, the name carries the modelled `ResourceName` pattern and the
         // port the modelled -1..65535 range, so the centralized walk refused
         // anything outside them before this body ran. What is left is what the
-        // model cannot express: the certificate members have to come as a pair,
-        // a health check path has to be one the load balancer could report, the
+        // model cannot express: the certificate members have to come as a pair
+        // and have to describe a certificate this service could issue, a health
+        // check path has to be one the load balancer could report, the
         // caller-sized collections have to be within their bounds, the name must
         // still be free in this Region and the Region must have room. Every one
         // of those is checked BEFORE the first write, so a refused request
@@ -239,25 +240,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .to_string(),
             ));
         }
-        // How many entries the list may carry is bounded before any of them is
-        // read, because the de-duping below examines every one of them.
-        if requested_alternatives.len() > crate::state::MAX_DOMAIN_NAME_LIST_ENTRIES {
-            return Err(invalid(format!(
-                "certificateAlternativeNames carries {} entries, more than the {} this service \
-                 reads for one certificate",
-                requested_alternatives.len(),
-                crate::state::MAX_DOMAIN_NAME_LIST_ENTRIES
-            )));
-        }
-        // "Lightsail will de-dupe the names for you" — reduced through the one
-        // owner of that rule, so the certificate this call stores carries the
-        // same shape as one `CreateLoadBalancerTlsCertificate` stores.
-        let alternative_names = certificate
-            .as_ref()
-            .map(|(_, domain_name)| {
-                crate::state::alternative_domain_names(domain_name, requested_alternatives)
-            })
-            .unwrap_or_default();
+        // How many entries the list may carry, whether each name is a domain
+        // name, and how many distinct domains survive Lightsail's own de-duping
+        // are all the shared rule of a certificate of a load balancer, so they
+        // are applied through its one owner
+        // ([`crate::state::load_balancer_certificate_alternative_names`]) —
+        // which is why the certificate this call stores carries the same shape,
+        // and is held to the same documented maximum, as one
+        // `CreateLoadBalancerTlsCertificate` stores.
+        let alternative_names = match certificate.as_ref() {
+            Some((_, domain_name)) => {
+                crate::state::load_balancer_certificate_alternative_names(
+                    domain_name,
+                    requested_alternatives,
+                )
+                .map_err(invalid)?
+            }
+            None => Vec::new(),
+        };
         // `LoadBalancer$healthCheckPath` is a `NonEmptyString` (pattern `\S`),
         // so a blank path is not one this load balancer could ever report (the
         // shared rule, [`crate::state::health_check_path_value`]); an ABSENT one

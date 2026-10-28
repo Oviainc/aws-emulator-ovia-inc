@@ -196,58 +196,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let load_balancer_name = input.load_balancer_name;
         let certificate_name = input.certificate_name;
         let domain_name = input.certificate_domain_name;
-        crate::state::validate_domain_name(&domain_name).map_err(|detail| {
-            invalid(format!(
-                "certificateDomainName '{domain_name}' is not the domain name of a \
-                 certificate: {detail}"
-            ))
-        })?;
-        // Each alternative domain has to be a domain name too, which is also
-        // what refuses the wildcards the documentation says are not supported,
-        // because `*` is not a character a DNS label carries.
-        //
-        // "Lightsail will de-dupe the names for you": a name the list repeats,
-        // and a name that already IS the certificate's primary domain, add no
-        // domain to the certificate — so the list is reduced, through the one
-        // owner of that rule, to the domains the certificate covers BEYOND its
-        // primary one, and the documented maximum is applied to what is left
-        // rather than to a list whose repeats Lightsail itself would have
-        // dropped.
-        //
-        // Whether an entry is a repeat is only known once it has been examined,
-        // so how many entries the list may carry is bounded HERE, before a
-        // single one is looked at: every validation and every de-dupe comparison
-        // below is then bounded by that constant rather than by what the caller
-        // sent.
-        let requested_alternatives = input.certificate_alternative_names.unwrap_or_default();
-        if requested_alternatives.len() > crate::state::MAX_DOMAIN_NAME_LIST_ENTRIES {
-            return Err(invalid(format!(
-                "certificateAlternativeNames carries {} entries, more than the {} this service \
-                 reads for one certificate",
-                requested_alternatives.len(),
-                crate::state::MAX_DOMAIN_NAME_LIST_ENTRIES
-            )));
-        }
-        for requested in &requested_alternatives {
-            crate::state::validate_domain_name(requested).map_err(|detail| {
-                invalid(format!(
-                    "certificateAlternativeNames entry '{requested}' is not an alternative \
-                     domain of this certificate: {detail}"
-                ))
-            })?;
-        }
-        let alternative_names =
-            crate::state::alternative_domain_names(&domain_name, requested_alternatives);
-        if alternative_names.len()
-            > crate::state::MAX_LOAD_BALANCER_TLS_CERTIFICATE_ALTERNATIVE_NAMES
-        {
-            return Err(invalid(format!(
-                "certificateAlternativeNames names {} alternative domains, more than the {} a \
-                 certificate may have in addition to its primary domain",
-                alternative_names.len(),
-                crate::state::MAX_LOAD_BALANCER_TLS_CERTIFICATE_ALTERNATIVE_NAMES
-            )));
-        }
+        // The primary domain, each alternative domain and how many distinct
+        // domains survive Lightsail's own de-duping are the shared rule of a
+        // certificate of a load balancer, applied through its one owner — the
+        // same rule `CreateLoadBalancer` applies to the same three members.
+        let alternative_names = crate::state::load_balancer_certificate_alternative_names(
+            &domain_name,
+            input.certificate_alternative_names.unwrap_or_default(),
+        )
+        .map_err(invalid)?;
         let tags = input.tags.unwrap_or_default();
         if tags.len() > crate::state::MAX_TAGS {
             return Err(invalid(format!(

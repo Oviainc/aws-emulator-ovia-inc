@@ -205,6 +205,8 @@ mod key_pair_read;
 mod known_host_keys_delete;
 #[path = "all/load_balancer_attribute_update.rs"]
 mod load_balancer_attribute_update;
+#[path = "all/load_balancer_certificate_domain_rule.rs"]
+mod load_balancer_certificate_domain_rule;
 #[path = "all/load_balancer_delete.rs"]
 mod load_balancer_delete;
 #[path = "all/load_balancer_instance_attachment.rs"]

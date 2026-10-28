@@ -10814,6 +10814,66 @@ pub fn alternative_domain_names(primary: &str, requested: Vec<String>) -> Vec<St
     covered
 }
 
+/// The alternative domains a load balancer's SSL/TLS certificate covers for the
+/// `certificateDomainName`/`certificateAlternativeNames` pair a request asked
+/// for, or the refusal message those members earned.
+///
+/// The ONE owner of the rule a request describing a certificate of a load
+/// balancer has to satisfy, whichever operation carries those members: the
+/// primary domain and every alternative name have to be domain names (which is
+/// also what refuses the wildcards the documentation says are not supported,
+/// because `*` is not a character a DNS label carries), and the de-duped list
+/// has to be within the documented
+/// [`MAX_LOAD_BALANCER_TLS_CERTIFICATE_ALTERNATIVE_NAMES`].
+///
+/// "Lightsail will de-dupe the names for you": a name the list repeats, and a
+/// name that already IS the primary domain, add no domain to the certificate —
+/// so the documented maximum is applied to what [`alternative_domain_names`]
+/// leaves rather than to a list whose repeats Lightsail itself would have
+/// dropped.
+///
+/// Whether an entry is a repeat is only known once it has been examined, so how
+/// many entries the list may carry is bounded HERE, before a single one is
+/// looked at: every validation and every de-dupe comparison below is then
+/// bounded by [`MAX_DOMAIN_NAME_LIST_ENTRIES`] rather than by what the caller
+/// sent.
+pub fn load_balancer_certificate_alternative_names(
+    domain_name: &str,
+    requested: Vec<String>,
+) -> Result<Vec<String>, String> {
+    validate_domain_name(domain_name).map_err(|detail| {
+        format!(
+            "certificateDomainName '{domain_name}' is not the domain name of a \
+             certificate: {detail}"
+        )
+    })?;
+    if requested.len() > MAX_DOMAIN_NAME_LIST_ENTRIES {
+        return Err(format!(
+            "certificateAlternativeNames carries {} entries, more than the \
+             {MAX_DOMAIN_NAME_LIST_ENTRIES} this service reads for one certificate",
+            requested.len()
+        ));
+    }
+    for name in &requested {
+        validate_domain_name(name).map_err(|detail| {
+            format!(
+                "certificateAlternativeNames entry '{name}' is not an alternative domain of \
+                 this certificate: {detail}"
+            )
+        })?;
+    }
+    let covered = alternative_domain_names(domain_name, requested);
+    if covered.len() > MAX_LOAD_BALANCER_TLS_CERTIFICATE_ALTERNATIVE_NAMES {
+        return Err(format!(
+            "certificateAlternativeNames names {} alternative domains, more than the \
+             {MAX_LOAD_BALANCER_TLS_CERTIFICATE_ALTERNATIVE_NAMES} a certificate may have in \
+             addition to its primary domain",
+            covered.len()
+        ));
+    }
+    Ok(covered)
+}
+
 /// The resource portion an ARN of a load balancer's SSL/TLS certificate carries
 /// before its id. Mirrors the `Instance/<uuid>` form the modelled
 /// `Instance$arn` documentation shows, with this resource's own `ResourceType`
