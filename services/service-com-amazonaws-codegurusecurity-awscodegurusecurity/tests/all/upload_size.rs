@@ -19,9 +19,9 @@
 //!   together stays bounded whatever was uploaded, with nothing the account already
 //!   uploaded limiting the next upload;
 //! * the sizes an upload IS refused at are the published maximum of one `PUT`
-//!   (`S3_SINGLE_PUT_MAX_BYTES`) and what this process takes in one upload
-//!   (`UPLOAD_ACCEPTED_MAX_BYTES`), both judged on the declared length before the body is
-//!   read, and checked here on each side of each bound.
+//!   (`S3_SINGLE_PUT_MAX_BYTES`) and what this emulator holds against one target
+//!   (`UPLOAD_ACCEPTED_MAX_BYTES`), both judged on the declared length and then on the
+//!   length that arrived, and checked here on each side of each bound.
 //!
 //! Every HTTP request goes through the real router (`MultiServiceRouter::dispatch`), the
 //! same path a client takes.

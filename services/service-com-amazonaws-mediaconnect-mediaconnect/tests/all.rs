@@ -183,3 +183,5 @@ mod get_router_network_interface;
 mod router_tier_bitrate_rule;
 #[path = "all/router_input_stop.rs"]
 mod router_input_stop;
+#[path = "all/router_output_take_input.rs"]
+mod router_output_take_input;

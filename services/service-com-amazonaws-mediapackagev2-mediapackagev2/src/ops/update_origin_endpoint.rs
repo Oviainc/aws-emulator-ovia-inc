@@ -216,19 +216,6 @@ impl From<UpdateOriginEndpointErrorModeled> for UpdateOriginEndpointError {
     }
 }
 
-/// How many manifests the request carries per family, in
-/// [`crate::state::ManifestFamily::ALL`] order. An update carries the WHOLE manifest set
-/// ("This replaces the existing MSS manifest configurations"), so the counts are the
-/// counts the endpoint will have.
-fn manifest_counts(input: &UpdateOriginEndpointInput) -> [usize; 4] {
-    [
-        input.hls_manifests.as_ref().map_or(0, Vec::len),
-        input.low_latency_hls_manifests.as_ref().map_or(0, Vec::len),
-        input.dash_manifests.as_ref().map_or(0, Vec::len),
-        input.mss_manifests.as_ref().map_or(0, Vec::len),
-    ]
-}
-
 /// A member of an origin endpoint the model documents as fixed once the endpoint exists:
 /// the member path a message names, the `ValidationExceptionType` that names its
 /// refusal, and the sentence the refusal states.
@@ -368,7 +355,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // without that an endpoint's stored record size would be caller-chosen again.
         if let Some(violation) = crate::state::manifest_set_violation(
             &input.container_type,
-            manifest_counts(&input),
+            // An update carries the WHOLE manifest set ("This replaces the existing MSS
+            // manifest configurations"), so the counts the request carries are the counts
+            // the endpoint will have — built by the same builder the create counts
+            // through, which owns the array's family order.
+            crate::state::manifest_counts(
+                input.hls_manifests.as_deref(),
+                input.low_latency_hls_manifests.as_deref(),
+                input.dash_manifests.as_deref(),
+                input.mss_manifests.as_deref(),
+            ),
             crate::state::ManifestSetOn::Update,
         ) {
             return Err(UpdateOriginEndpointErrorModeled::ValidationException(

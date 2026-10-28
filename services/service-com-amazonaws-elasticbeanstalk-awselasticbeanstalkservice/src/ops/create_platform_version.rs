@@ -5,6 +5,11 @@
 //! `Creating` until the clock makes the build completion due. This is the ONLY file to
 //! touch for this operation.
 //!
+//! The `Tags` the request carries ("Specifies the tags applied to the new platform
+//! version") are stored ON that version, so `ListTagsForResource` and
+//! `UpdateTagsForResource` read and write them by the `PlatformArn` this call answered
+//! with; the environments a client then launches on the version hold their own tags.
+//!
 //! The platform definition archive named by `PlatformDefinitionBundle` is DOWNLOADED —
 //! a create whose archive object storage cannot hand back is refused — but its contents
 //! are not interpreted and no builder environment is launched, so every value a built

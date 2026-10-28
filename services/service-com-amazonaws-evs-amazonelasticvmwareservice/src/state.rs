@@ -16,6 +16,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use smithy_server_runtime::{Violation, ViolationKind};
 
+use ::service_com_amazonaws_ec2_amazonec2::state as ec2;
+
 use crate::ops::types::{
     AccountSetting, Check, ConnectivityInfo, Connector, ConnectorCheck, EipAssociation, Environment,
     EnvironmentSummary, Host, InstanceTypeEsxVersionsInfo, LicenseInfo, NetworkInterface,
@@ -1116,20 +1118,25 @@ impl StoredHost {
     }
 }
 
-/// One IPv4 CIDR block, reduced to the inclusive address range it covers.
+/// One IPv4 CIDR block this service was handed, read the way the account's own Amazon
+/// EC2 store reads one.
 ///
-/// Hand-written rather than taken from `ipnet`, which the workspace already resolves:
-/// the three rules this service needs are a mask, a range comparison and an offset into
-/// the block, and the offset — the addresses AWS leaves usable in a subnet — is not
-/// something a general CIDR crate expresses. Switching the parse and the overlap onto
-/// `ipnet::Ipv4Net` is a behaviour-neutral follow-up.
-#[derive(Debug, Clone, Copy)]
+/// The parse and the overlap are EC2's own published readers — `canonical_ipv4_cidr`,
+/// `cidr_block_prefix_length` and `ipv4_cidr_blocks_overlap` — which are the readers
+/// [`ec2_resources::vlan_placement_failures`] already judges these same blocks against
+/// the VPC and its existing subnets with. So one reading of a block serves every
+/// judgement this service makes about it, and the block an environment's own VLAN plan
+/// is judged by cannot be a different block from the one the VPC judges.
+///
+/// What is kept on top of that reading is the one question no general CIDR reader
+/// answers: which addresses of a SUBNET block a workload may take
+/// ([`Self::usable_addresses`]).
+#[derive(Debug, Clone)]
 pub struct Ipv4Cidr {
-    /// The first address of the block (the network address).
-    pub first: u32,
-    /// The last address of the block (the broadcast address).
-    pub last: u32,
-    /// The block's prefix length, in bits.
+    /// The block in the canonical form EC2 holds one in — the address it names with the
+    /// host bits below its prefix cleared — so two spellings of one range are one block.
+    block: String,
+    /// The block's prefix length, in bits, as read off that block.
     pub prefix_len: u8,
 }
 
@@ -1137,46 +1144,38 @@ impl Ipv4Cidr {
     /// Parse `a.b.c.d/<prefix length>`; `None` for anything that is not an IPv4 CIDR
     /// block.
     pub fn parse(cidr: &str) -> Option<Self> {
-        let (address, prefix_len) = cidr.split_once('/')?;
-        let address: ::std::net::Ipv4Addr = address.parse().ok()?;
-        let prefix_len: u8 = prefix_len.parse().ok()?;
-        if prefix_len > 32 {
-            return None;
-        }
-        // The host bits below the prefix are what the block spans: clearing them gives
-        // its first address, setting them its last.
-        let host_bits = 32 - u32::from(prefix_len);
-        let mask = if host_bits == 32 { 0 } else { u32::MAX << host_bits };
-        let first = u32::from(address) & mask;
-        Some(Self {
-            first,
-            last: first | !mask,
-            prefix_len,
-        })
+        let block = ec2::canonical_ipv4_cidr(cidr).ok()?;
+        let prefix_len = u8::try_from(ec2::cidr_block_prefix_length(&block)?).ok()?;
+        Some(Self { block, prefix_len })
     }
 
     /// Whether the two blocks share any address.
     pub fn overlaps(&self, other: &Self) -> bool {
-        self.first <= other.last && other.first <= self.last
+        ec2::ipv4_cidr_blocks_overlap(&self.block, &other.block)
     }
 
     /// Every address of the block a workload may take, in order.
     ///
     /// "The first four IP addresses and the last IP address in each subnet CIDR block
-    /// are not available for you to use" (Amazon VPC User Guide, subnet sizing), so the
-    /// usable range starts four addresses into the block and stops one short of its end.
-    /// Empty for a block too small to hold any.
-    pub fn usable_addresses(&self) -> impl Iterator<Item = ::std::net::Ipv4Addr> {
-        const RESERVED_AT_START: u32 = 4;
-        let first = self.first.saturating_add(RESERVED_AT_START);
-        let last = self.last.saturating_sub(1);
-        // A block too small to hold a usable address yields nothing: the count is taken
-        // first, so the range is never walked backwards.
-        let count = last.saturating_sub(first).saturating_add(1) as usize;
-        let count = if first <= last { count } else { 0 };
-        (first..)
-            .take(count)
-            .map(::std::net::Ipv4Addr::from)
+    /// are not available for you to use" (Amazon VPC User Guide, subnet sizing) — the
+    /// window EC2 publishes as `is_assignable_subnet_address`. The addresses are drawn
+    /// out of the block itself (`nth_address_in_cidr_block`) and each is kept only if
+    /// that window holds it, so the reserved addresses are read once for both services
+    /// rather than counted again here. Empty for a block too small to hold any.
+    ///
+    /// Takes the block BY VALUE, because the addresses are drawn out of it one at a
+    /// time: the iterator carries the block it is reading rather than borrowing it, so a
+    /// caller can walk it straight off a parse.
+    pub fn usable_addresses(self) -> impl Iterator<Item = String> {
+        let block = self.block;
+        (0u32..)
+            .map_while(move |index| {
+                let address = ec2::nth_address_in_cidr_block(&block, index)?;
+                // Inside the block but reserved: skipped, while an index PAST the block
+                // ends the walk.
+                Some(ec2::is_assignable_subnet_address(&block, &address).then_some(address))
+            })
+            .flatten()
     }
 }
 
@@ -1519,7 +1518,6 @@ impl StoredEnvironment {
             .collect();
         Ipv4Cidr::parse(&vmk.cidr)?
             .usable_addresses()
-            .map(|address| address.to_string())
             .find(|address| !taken.contains(&address.as_str()))
     }
 

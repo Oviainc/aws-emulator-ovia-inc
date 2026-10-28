@@ -184,12 +184,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut state = state.lock();
 
-        // One instant for the whole call, with the verification move the clock
-        // already owes each of this account's identities materialised against it:
-        // the sender gate below reads the status a caller reading the same
-        // identity at this instant is reported.
-        state.settle_identities(::std::time::SystemTime::now());
-
         // The size the model documents for this email is the one this operation
         // can refuse content on: `TemplateContent` is "The content of the custom
         // verification email. The total size of the email must be less than 10
@@ -240,15 +234,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The template's sender is the address the verification message would be
-        // sent FROM, so it must be an identity this account has verified — what
-        // `FromEmailAddressNotVerifiedException` reports: "the sender address
-        // specified for a custom verification email is not verified, and is
-        // therefore not eligible to send the custom verification email". Read with
-        // the same reading of a verified sender as every other send
-        // (`state::is_verified_sender`), so a verified domain covers the mailboxes
-        // in it, and read BEFORE anything is written, so a refused call leaves no
+        // sent FROM, so it must be an address this account has an identity for —
+        // what `FromEmailAddressNotVerifiedException` reports: "the sender
+        // address specified for a custom verification email is not verified, and
+        // is therefore not eligible to send the custom verification email".
+        // RECORDING the template asks only that the identity exist
+        // (`state::holds_sending_identity`), whatever state its verification is
+        // in: a verification the account has started but not completed still
+        // carries a template, while whether that verification succeeded is read
+        // where a message is actually sent (`send_custom_verification_email.rs`,
+        // which gates on `state::is_verified_sender`). The domain reading is the
+        // send's, so an identity for a domain covers the mailboxes in it; and
+        // this is read BEFORE anything is written, so a refused call leaves no
         // template behind.
-        if !state.is_verified_sender(&input.from_email_address) {
+        if !state.holds_sending_identity(&input.from_email_address) {
             return Err(
                 CreateCustomVerificationEmailTemplateErrorModeled::FromEmailAddressNotVerifiedException(
                     FromEmailAddressNotVerifiedException {

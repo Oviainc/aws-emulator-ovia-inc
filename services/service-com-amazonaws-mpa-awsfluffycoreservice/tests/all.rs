@@ -25,6 +25,8 @@ mod approver_mfa_synchronization;
 mod authorization_gate;
 #[path = "all/baseline_session_minting.rs"]
 mod baseline_session_minting;
+#[path = "all/clock_owed_order.rs"]
+mod clock_owed_order;
 #[path = "all/identity_source_approval_portal.rs"]
 mod identity_source_approval_portal;
 #[path = "all/identity_source_deletion.rs"]

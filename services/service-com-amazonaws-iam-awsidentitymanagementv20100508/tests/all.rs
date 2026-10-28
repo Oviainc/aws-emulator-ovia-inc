@@ -59,6 +59,8 @@ mod group_attached_policy_listing;
 mod group_creation;
 #[path = "all/group_deletion.rs"]
 mod group_deletion;
+#[path = "all/group_inherited_authorization.rs"]
+mod group_inherited_authorization;
 #[path = "all/group_inline_policies.rs"]
 mod group_inline_policies;
 #[path = "all/group_inline_policy_removal.rs"]
@@ -95,6 +97,8 @@ mod instance_profile_tag_removal;
 mod instance_profile_tags;
 #[path = "all/instance_profiles.rs"]
 mod instance_profiles;
+#[path = "all/login_profile_absence_wording.rs"]
+mod login_profile_absence_wording;
 #[path = "all/login_profile_deletion.rs"]
 mod login_profile_deletion;
 #[path = "all/login_profile_updates.rs"]

@@ -89,6 +89,8 @@ mod email_validation_dispatch;
 mod generic_tagging_certificate_refusal_text;
 #[path = "all/imported_certificate_arn_is_a_reference.rs"]
 mod imported_certificate_arn_is_a_reference;
+#[path = "all/imported_certificate_issuer_and_key_purposes.rs"]
+mod imported_certificate_issuer_and_key_purposes;
 #[path = "all/imported_certificate_serves_an_https_listener.rs"]
 mod imported_certificate_serves_an_https_listener;
 #[path = "all/imported_certificate_serves_custom_domain.rs"]

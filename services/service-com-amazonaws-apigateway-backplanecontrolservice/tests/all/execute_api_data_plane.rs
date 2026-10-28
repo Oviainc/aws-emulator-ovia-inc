@@ -93,7 +93,11 @@ pub(crate) async fn invoke(
 
 /// [`invoke`] against an arbitrary host, for the cases that assert which hosts this
 /// service does NOT claim.
-async fn invoke_on_host(
+///
+/// `pub(crate)` for the sibling `private_api_resource_policy` suite, which addresses a
+/// PRIVATE api on its VPC endpoint's own DNS name rather than on the api's — a host this
+/// helper's caller chooses, with the api id in a header.
+pub(crate) async fn invoke_on_host(
     gateway: &Gateway,
     host: &str,
     verb: &str,
@@ -279,7 +283,10 @@ pub(crate) async fn deploy(gateway: &Gateway, api: &str, stage: &str) -> String 
 /// This is the one integration type that needs no backend — "for testing without actually
 /// invoking the backend" (`IntegrationType`) — so it is what a data-plane case that asserts
 /// a SERVED response is built from.
-async fn mock_resource(
+///
+/// `pub(crate)` for the sibling `private_api_resource_policy` suite, which stands one up to
+/// assert that a request its api's resource policy refuses never reaches it.
+pub(crate) async fn mock_resource(
     gateway: &Gateway,
     api: &str,
     parent: &str,
@@ -319,7 +326,9 @@ async fn mock_method(
 }
 
 /// A JSON response-template map answering `body` for `application/json` callers.
-fn json_template(body: &str) -> Value {
+///
+/// `pub(crate)` for the sibling `private_api_resource_policy` suite; see [`mock_resource`].
+pub(crate) fn json_template(body: &str) -> Value {
     json!({ "application/json": body })
 }
 

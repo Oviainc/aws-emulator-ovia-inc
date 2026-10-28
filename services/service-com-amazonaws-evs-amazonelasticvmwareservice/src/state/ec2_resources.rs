@@ -838,7 +838,10 @@ fn vpc_ipv4_blocks(vpc: &ec2_types::Vpc) -> Vec<String> {
 /// This is the same overlap rule `CreateEnvironment` applies among an environment's own
 /// ten blocks, at the scope the doc states it: the whole VPC. It has to hold, because
 /// each block becomes a real EC2 subnet of that VPC, and EC2 holds no two overlapping
-/// subnets in one VPC.
+/// subnets in one VPC. It is also the same IMPLEMENTATION of that rule: the type
+/// `CreateEnvironment` judges the environment's own blocks with
+/// ([`crate::state::Ipv4Cidr`]) reads a block through these same published helpers, so
+/// one block cannot be read one way here and another way there.
 ///
 /// An unknown VPC leaves nothing to judge the blocks against, so nothing is reported —
 /// [`invalid_vpc_clause`] is the clause for that — and so does an unreadable EC2 store.

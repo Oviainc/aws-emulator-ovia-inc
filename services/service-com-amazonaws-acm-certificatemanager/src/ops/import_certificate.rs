@@ -391,8 +391,9 @@ struct ImportedCertificate {
     subject_alternative_names: Vec<String>,
     /// The subject distinguished name, as [`distinguished_name`] writes one.
     subject: String,
-    /// The issuer distinguished name — "the name of the certificate authority that
-    /// issued and signed the certificate" (`CertificateDetail$Issuer` doc).
+    /// The NAME of the issuing authority — "the name of the certificate authority that
+    /// issued and signed the certificate" (`CertificateDetail$Issuer` doc), as
+    /// [`issuer_common_name`] reads it out of the certificate's issuer field.
     issuer: String,
     /// The X.509 serial number, rendered as ACM reports a serial
     /// (`crate::state::serial_number`).
@@ -403,10 +404,13 @@ struct ImportedCertificate {
     /// algorithm this service has no spelling for — an absent member rather than a
     /// wrong one.
     signature_algorithm: Option<String>,
-    /// The `KeyUsageName` values of the certificate's Key Usage extension.
+    /// The `KeyUsageName` values of the certificate's Key Usage extension, or the
+    /// sentinel for a certificate that carries no such extension
+    /// ([`key_usage_names`]).
     key_usages: Vec<String>,
     /// The key purposes of its Extended Key Usage extension, each as the name and the
-    /// object identifier ACM publishes it as.
+    /// object identifier ACM publishes it as, or the sentinel for a certificate that
+    /// carries no such extension ([`extended_key_usages`]).
     extended_key_usages: Vec<crate::state::ExtendedKeyUsageRecord>,
     not_before: ::std::time::SystemTime,
     not_after: ::std::time::SystemTime,
@@ -548,11 +552,8 @@ fn imported_certificate(
         ));
     };
 
-    let public_key = public_key(&tbs.subject_public_key_info).ok_or_else(|| {
-        invalid_parameter(
-            "the certificate's public key algorithm and size are not ones ACM supports",
-        )
-    })?;
+    let public_key =
+        public_key(&tbs.subject_public_key_info).ok_or_else(unsupported_key_material)?;
     check_private_key(&input.private_key, &public_key)?;
 
     Ok(ImportedCertificate {
@@ -561,7 +562,7 @@ fn imported_certificate(
         domain_name,
         subject_alternative_names: names,
         subject: distinguished_name(&tbs.subject),
-        issuer: distinguished_name(&tbs.issuer),
+        issuer: issuer_common_name(&tbs.issuer),
         serial: crate::state::serial_number(tbs.serial_number.as_bytes()),
         key_algorithm: public_key.key_algorithm,
         signature_algorithm: signature_algorithm(&certificate.signature_algorithm.oid),
@@ -692,9 +693,9 @@ fn stored_pem(text: &str) -> String {
 /// modulus' own bit length, and `EC_<curve>` for an elliptic-curve key, taken from the
 /// named curve its parameters carry.
 ///
-/// `None` for a key of any other algorithm, or an RSA key of a size the `KeyAlgorithm`
-/// enum does not declare — ACM reports a certificate under one of those values or not
-/// at all.
+/// `None` for a key of any other algorithm, for an RSA key of a size the `KeyAlgorithm`
+/// enum does not declare and for an elliptic-curve key on a curve it does not declare —
+/// ACM reports a certificate under one of those values or not at all.
 fn public_key(spki: &SubjectPublicKeyInfoOwned) -> Option<PublicKey> {
     let bits = spki.subject_public_key.as_bytes()?;
     if spki.algorithm.oid == oid::RSA_ENCRYPTION {
@@ -740,6 +741,20 @@ fn public_key(spki: &SubjectPublicKeyInfoOwned) -> Option<PublicKey> {
     } else {
         None
     }
+}
+
+/// The refusal for a certificate whose public key is of an algorithm, a size or a curve
+/// the `KeyAlgorithm` enum does not declare.
+///
+/// Material ACM has no `KeyAlgorithm` to report a certificate under is material the
+/// `Certificate` member cannot hold, which is supplied input failing the service's
+/// constraints — the same modelled class as every other defect in the key material a
+/// request carries (a chain that is not a chain, a private key that is not this
+/// certificate's), rather than the class that reports an invalid input PARAMETER. Like
+/// those, it is told apart by its own fixed sentence: the key TYPE is what is
+/// unsupported, whichever algorithm, size or curve the certificate carries.
+fn unsupported_key_material() -> ImportCertificateError {
+    validation_exception("ACM does not support this key type.")
 }
 
 /// A certificate's public key: the `KeyAlgorithm` it is reported under, and the
@@ -883,11 +898,16 @@ fn dns_names(certificate: &X509Certificate) -> Vec<String> {
 }
 
 /// The `KeyUsageName` values of a certificate's Key Usage extension, in the bit order
-/// RFC 5280 section 4.2.1.3 fixes. A certificate carrying no such extension asserts no
-/// key usage, which is the empty list.
+/// RFC 5280 section 4.2.1.3 fixes.
+///
+/// A certificate carrying no such extension restricts its key to no purpose, and that
+/// absence is itself a reportable value: the sentinel `KeyUsageName` the model declares
+/// for a key held to every purpose (`crate::state::no_key_usage`). Recording it is what
+/// lets every reader of this certificate say so, and what lets the `keyUsage` filters
+/// select exactly the certificates whose key is unrestricted.
 fn key_usage_names(certificate: &X509Certificate) -> Vec<String> {
     let Some(usage) = extension::<pkix::KeyUsage>(certificate) else {
-        return Vec::new();
+        return crate::state::no_key_usage();
     };
     // Each bit RFC 5280 section 4.2.1.3 defines, with the `KeyUsageName` the model
     // spells it with (`smithy_query(query="shape",
@@ -911,13 +931,19 @@ fn key_usage_names(certificate: &X509Certificate) -> Vec<String> {
 
 /// The key purposes of a certificate's Extended Key Usage extension, in the order the
 /// extension lists them, each as the name and identifier pair ACM publishes it as
-/// (`crate::state::extended_key_usage`). A certificate carrying no such extension
-/// asserts no purpose, which is the empty list.
+/// (`crate::state::extended_key_usage`).
+///
+/// A certificate carrying no such extension asserts no purpose, and that absence is
+/// itself a reportable value: the sentinel `ExtendedKeyUsageName` the model declares
+/// beside the real purposes (`crate::state::no_extended_key_usage`). Recording it is
+/// what lets every reader of this certificate — its detail, its listing summary and its
+/// search result — say so, and what lets the `extendedKeyUsage` filters select exactly
+/// the certificates that assert no purpose.
 fn extended_key_usages(
     certificate: &X509Certificate,
 ) -> Vec<crate::state::ExtendedKeyUsageRecord> {
     let Some(usage) = extension::<pkix::ExtendedKeyUsage>(certificate) else {
-        return Vec::new();
+        return crate::state::no_extended_key_usage();
     };
     usage
         .0
@@ -969,6 +995,22 @@ fn distinguished_name(name: &Name) -> String {
         })
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// `CertificateDetail$Issuer`: "the name of the certificate authority that issued and
+/// signed the certificate", read out of the certificate's own issuer field.
+///
+/// The name of an authority is its COMMON NAME — the attribute an X.500 name carries an
+/// entity's own name in — so the issuer field's common-name value ALONE is the name
+/// reported, with no attribute-type prefix and none of the other relative distinguished
+/// names that field places the authority under. A self-signed certificate is its own
+/// issuer and therefore reports its own common name.
+///
+/// An issuer field naming no common name has no such value, and the only name it
+/// carries is then the field itself, so that name is reported as
+/// [`distinguished_name`] writes one.
+fn issuer_common_name(issuer: &Name) -> String {
+    attribute_value(issuer, oid::COMMON_NAME).unwrap_or_else(|| distinguished_name(issuer))
 }
 
 /// The value of the first `attribute` a distinguished name carries, as the string a

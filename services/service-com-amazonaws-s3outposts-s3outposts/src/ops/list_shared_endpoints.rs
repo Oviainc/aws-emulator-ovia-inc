@@ -168,12 +168,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The Outpost the request named, as this Region reaches it: an Outpost
         // installed in another Region is not one this Region's endpoint serves,
         // so it resolves to the modelled 404 like one that does not exist.
-        if crate::state::outpost_in(&inventory, &region, &input.outpost_id).is_none() {
-            return Err(ListSharedEndpointsErrorModeled::ResourceNotFoundException(
-                crate::state::not_found(),
-            )
-            .into());
-        }
+        crate::state::resolve_outpost(&inventory, &region, &input.outpost_id)
+            .map_err(ListSharedEndpointsErrorModeled::ResourceNotFoundException)?;
 
         // The walk, the page bound and the cursor are the one listing rule this
         // service's listings serve, so they live in `crate::state`; what is this

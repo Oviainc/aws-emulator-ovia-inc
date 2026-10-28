@@ -29,6 +29,8 @@ mod quota_refusal_bodies;
 mod regional_rule_isolation;
 #[path = "all/reserved_tag_keys.rs"]
 mod reserved_tag_keys;
+#[path = "all/resource_tag_filter_pair_identity.rs"]
+mod resource_tag_filter_pair_identity;
 #[path = "all/resource_tag_pair_quota.rs"]
 mod resource_tag_pair_quota;
 #[path = "all/resource_tags.rs"]

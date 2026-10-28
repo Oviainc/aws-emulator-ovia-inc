@@ -31,7 +31,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_codegurusecurity_awscodegurusecurity::state::{
     self as cgs_state, UploadArtifact, UploadedResource, DEFAULT_REGION,
     SCAN_RESOURCE_NOT_UPLOADED_MESSAGE, SCAN_STATE_FAILED, SCAN_STATE_SUCCESSFUL,
-    STANDARD_SCAN_SETTLE_MILLIS, UPLOAD_ARTIFACT_TTL_MILLIS, UPLOAD_RETAINED_PREFIX_MAX_BYTES,
+    STANDARD_SCAN_SETTLE_MILLIS, UPLOAD_RETAINED_PREFIX_MAX_BYTES,
+    UPLOAD_URL_SIGNATURE_WINDOW_MILLIS,
 };
 use service_com_amazonaws_codegurusecurity_awscodegurusecurity::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -93,7 +94,8 @@ fn split_url(url: &str) -> (&str, &str) {
 
 /// Address a published upload target exactly as a client does: `method` against the host
 /// and path the URL names, with the headers the response said are required, and with NO
-/// credential of any kind — a pre-signed URL is followed unsigned.
+/// credential of any kind — a pre-signed URL is followed unsigned. The archive's length is
+/// declared, as an HTTP client sending a body declares it.
 pub(crate) async fn send_to_target(
     router: &MultiServiceRouter,
     method: &str,
@@ -106,6 +108,15 @@ pub(crate) async fn send_to_target(
         .method(method)
         .uri(path)
         .header("host", host);
+    // The length of the archive, as an HTTP client sending a body declares it — unless the
+    // case declares one of its own, which is how `crate::upload_size` drives a declaration
+    // that does not match what it sends.
+    if !headers
+        .keys()
+        .any(|name| name.eq_ignore_ascii_case("content-length"))
+    {
+        request = request.header("content-length", body.len().to_string());
+    }
     for (name, value) in headers {
         request = request.header(name, value);
     }
@@ -547,6 +558,83 @@ async fn the_published_target_is_written_only_by_the_documented_method() {
 }
 
 #[tokio::test]
+async fn an_upload_that_declares_no_readable_length_is_refused_and_stores_nothing() {
+    let (engine, router) = harness();
+    let minted = create_upload_url(&router, "length-required").await;
+    let artifact = minted.str_of("codeArtifactId");
+    let url = minted.str_of("s3Url");
+    let archive = archive_of(192, 41);
+
+    // A `PUT` of an object states its length, and the size bounds of this plane are judged
+    // from that statement before the archive is reached, so an upload that states none —
+    // whatever the reason — is refused rather than measured afterwards.
+    //
+    // Row 1 carries no `Content-Length` at all, so it is sent with the builder directly;
+    // the rest carry one no reader can take as a byte count.
+    let (host, path) = split_url(&url);
+    let undeclared = http::Request::builder()
+        .method("PUT")
+        .uri(path)
+        .header("host", host)
+        .header(::http::header::CONTENT_TYPE.as_str(), ARCHIVE_CONTENT_TYPE)
+        .body(Bytes::from(archive.clone()))
+        .expect("a well-formed test request");
+    let response = router.dispatch(undeclared).await;
+    let answered = (
+        response.status().as_u16(),
+        response
+            .headers()
+            .get("x-amzn-errortype")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string(),
+    );
+    assert_eq!(
+        (answered.0, answered.1.as_str()),
+        (411, "MissingContentLength"),
+        "case \"no Content-Length at all\": expected 411 MissingContentLength, got {} {:?}",
+        answered.0,
+        answered.1
+    );
+
+    for (case, declared) in [
+        ("a declaration that is not a number", "not-a-number"),
+        ("a declaration carrying a unit", "192 bytes"),
+        ("a negative declaration", "-192"),
+        ("an empty declaration", ""),
+    ] {
+        let mut headers = required_headers(&minted);
+        headers.insert("content-length".to_string(), declared.to_string());
+        let answer = upload(&router, &url, &headers, archive.clone()).await;
+        assert_eq!(
+            (answer.status, answer.error_code.as_str()),
+            (411, "MissingContentLength"),
+            "case {case:?}: expected 411 MissingContentLength, got {} {:?}",
+            answer.status,
+            answer.error_code
+        );
+    }
+
+    // None of them stored anything, and the documented upload — which declares its length
+    // — is still accepted against the same target.
+    assert!(
+        stored_upload(&engine, &artifact).is_none(),
+        "a refused upload stores nothing, got {:?}",
+        stored_upload(&engine, &artifact).map(|held| describe(&held))
+    );
+    let accepted = upload(&router, &url, &required_headers(&minted), archive.clone()).await;
+    assert_eq!(
+        accepted.status, 200,
+        "case \"the documented upload\": expected 200, got {} {:?}",
+        accepted.status, accepted.error_code
+    );
+    assert!(
+        stored_upload(&engine, &artifact).is_some_and(|held| is_record_of(&held, &archive)),
+        "case \"the documented upload\": the archive must be held against the artifact"
+    );
+}
+
+#[tokio::test]
 async fn a_path_that_names_no_target_of_this_account_is_refused() {
     let (engine, router) = harness();
     let minted = create_upload_url(&router, "real-target").await;
@@ -556,8 +644,9 @@ async fn a_path_that_names_no_target_of_this_account_is_refused() {
     let account = engine::emulator_account_id();
     let host = cgs_state::upload_host(REGION);
 
-    // An artifact whose minted lifetime the clock has already ended: its target is
-    // released, so nothing can be uploaded to it.
+    // An artifact whose published URL is no longer inside its signature window: the
+    // target still names its code artifact, so the upload is refused the way a
+    // pre-signed S3 URL refuses one offered after it expired.
     let expired_scan = "expired-target";
     let expired_artifact = "11111111-2222-3333-4444-555555555555";
     let now = cgs_state::now_millis();
@@ -566,8 +655,8 @@ async fn a_path_that_names_no_target_of_this_account_is_refused() {
         scan_name: expired_scan.to_string(),
         s3_url: cgs_state::upload_url(REGION, expired_scan, expired_artifact),
         request_headers: BTreeMap::new(),
-        created_at_millis: now - UPLOAD_ARTIFACT_TTL_MILLIS - 1,
-        expires_at_millis: now - 1,
+        created_at_millis: now - UPLOAD_URL_SIGNATURE_WINDOW_MILLIS - 1,
+        url_expires_at_millis: now - 1,
         upload: None,
     });
 
@@ -594,10 +683,10 @@ async fn a_path_that_names_no_target_of_this_account_is_refused() {
             "NoSuchKey",
         ),
         (
-            "a target whose lifetime has ended",
+            "a target whose pre-signed URL is past its signature window",
             format!("https://{host}/{account}/{expired_scan}/{expired_artifact}"),
-            404,
-            "NoSuchKey",
+            403,
+            "AccessDenied",
         ),
         ("the target itself", url.clone(), 200, ""),
     ];

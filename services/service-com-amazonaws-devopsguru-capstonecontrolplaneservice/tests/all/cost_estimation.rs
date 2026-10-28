@@ -167,8 +167,8 @@ struct ResolutionCase {
 ///
 /// The rows differ along which half of the collection is named, how many entries it
 /// names (none, one, two) and how the resources the account holds overlap it
-/// (identical, a superset) — plus the app-boundary key's form, inside and outside the
-/// documented `Devops-guru-` prefix.
+/// (identical, a superset) — plus the app-boundary key's form, with the documented
+/// prefix cased as the documentation's examples case it and cased differently.
 #[tokio::test]
 async fn a_start_prices_the_collection_it_names_and_not_what_else_the_account_holds() {
     /// `ServiceResourceCost.Type` for the stack half of a collection.
@@ -202,9 +202,12 @@ async fn a_start_prices_the_collection_it_names_and_not_what_else_the_account_ho
             expect: Expect::Accepted(&[(TAG, 1)]),
         },
         ResolutionCase {
-            name: "an app boundary key outside the Devops-guru- prefix",
-            coverage: Some(tags(&[("Team", &["payments"])])),
-            collection: tags(&[("Team", &["payments"])]),
+            // The documented prefix is case-insensitive ("the case of characters in the
+            // key can be whatever you choose"), so a key whose prefix is cased
+            // differently from the documented example still defines coverage.
+            name: "an app boundary key whose prefix is cased differently",
+            coverage: Some(tags(&[("DEVOPS-GURU-team", &["payments"])])),
+            collection: tags(&[("DEVOPS-GURU-team", &["payments"])]),
             expect: Expect::Accepted(&[(TAG, 1)]),
         },
         ResolutionCase {

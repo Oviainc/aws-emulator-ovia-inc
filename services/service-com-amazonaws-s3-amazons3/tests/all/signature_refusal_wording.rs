@@ -31,18 +31,22 @@ use super::bucket_lifecycle::Answer;
 
 /// The sentence AWS's SigV4 layer produces for a signature that does not verify. Fixed
 /// text: it names neither the request, the key nor the signature.
-const SIGNATURE_MISMATCH_MESSAGE: &str =
+///
+/// `pub(crate)`, like the harness below it: the suite that pins the DIAGNOSTICS this same
+/// refusal carries ([`super::presigned_query_authentication`]) asserts the same sentence,
+/// and one constant for both keeps them from drifting.
+pub(crate) const SIGNATURE_MISMATCH_MESSAGE: &str =
     "The request signature we calculated does not match the signature you provided. Check \
      your key and signing method.";
 
 /// The signing algorithm a SigV4 request names, in its `Authorization` header and in the
 /// `X-Amz-Algorithm` parameter of a presigned URL.
-const SIGV4_ALGORITHM: &str = "AWS4-HMAC-SHA256";
+pub(crate) const SIGV4_ALGORITHM: &str = "AWS4-HMAC-SHA256";
 
 /// A signature value that is not the one the emulator computes for any of these requests:
 /// 64 hex digits, the shape SigV4 signatures have, so what the request fails is the
 /// comparison and not the parse.
-const WRONG_SIGNATURE: &str =
+pub(crate) const WRONG_SIGNATURE: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 
 /// One request as a row names it: the URI it addresses and the headers it carries.
@@ -50,16 +54,16 @@ type Presented = (String, Vec<(String, String)>);
 
 /// An emulator with request authentication ON, plus the access key id it published for this
 /// run — the credential a refusal has RESOLVED.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
-    access_key_id: String,
+    pub(crate) access_key_id: String,
     /// The shared engine, so a suite can take a SESSION on a directory bucket and then
     /// present that credential — a second credential form the emulator ISSUED.
     engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(true);
@@ -86,12 +90,12 @@ impl Emulator {
     }
 
     /// Dispatch one request and reduce the answer the way the other suites here do.
-    async fn send(&self, method: &str, uri: &str, headers: &[(String, String)]) -> Answer {
+    pub(crate) async fn send(&self, method: &str, uri: &str, headers: &[(String, String)]) -> Answer {
         self.send_body(method, uri, headers, b"").await
     }
 
     /// [`Self::send`] with a body, for the fixture requests that carry one.
-    async fn send_body(
+    pub(crate) async fn send_body(
         &self,
         method: &str,
         uri: &str,
@@ -121,7 +125,7 @@ impl Emulator {
 /// `YYYYMMDDTHHMMSSZ` for this instant, as SigV4 writes a signing date — rendered by the
 /// library's own calendar (`DateTime::fmt`, RFC 3339 in UTC) with the separators SigV4
 /// omits removed, rather than by any date arithmetic written here.
-fn amz_date_now() -> String {
+pub(crate) fn amz_date_now() -> String {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("the clock must be after the epoch")
@@ -134,14 +138,14 @@ fn amz_date_now() -> String {
 
 /// The credential scope a request signed now for this service names:
 /// `<key>/<date>/<region>/s3/aws4_request`.
-fn credential_scope(access_key_id: &str, amz_date: &str) -> String {
+pub(crate) fn credential_scope(access_key_id: &str, amz_date: &str) -> String {
     let date = &amz_date[..8];
     format!("{access_key_id}/{date}/us-east-1/s3/aws4_request")
 }
 
 /// The `Authorization` header a SigV4-signed request carries, with `signature` as its
 /// `Signature` field.
-fn authorization(access_key_id: &str, amz_date: &str, signature: &str) -> String {
+pub(crate) fn authorization(access_key_id: &str, amz_date: &str, signature: &str) -> String {
     format!(
         "{SIGV4_ALGORITHM} Credential={}, SignedHeaders=host, Signature={signature}",
         credential_scope(access_key_id, amz_date)
@@ -150,10 +154,17 @@ fn authorization(access_key_id: &str, amz_date: &str, signature: &str) -> String
 
 /// The query of a presigned URL, percent-encoded the way a client's signer writes it, with
 /// `expires` seconds of validity and `signature` as its `X-Amz-Signature`.
-fn presigned_query(
+///
+/// `expires` is the TEXT the URL carries rather than a count, because a window a client can
+/// put in a URL is not always one: the suite that pins the accepted range
+/// ([`super::presigned_query_authentication`]) drives values no counter holds.
+///
+/// The pairs are written in the order SigV4's canonical query string sorts them, with the
+/// signature — the one pair a signature cannot cover — last.
+pub(crate) fn presigned_query(
     access_key_id: &str,
     amz_date: &str,
-    expires: u64,
+    expires: &str,
     signature: &str,
 ) -> String {
     let scope = credential_scope(access_key_id, amz_date).replace('/', "%2F");
@@ -190,7 +201,7 @@ async fn an_unverifiable_signature_is_refused_in_aws_own_words() {
             ],
         )
     };
-    let presigned = |uri: &str, expires: u64| {
+    let presigned = |uri: &str, expires: &str| {
         let separator = if uri.contains('?') { '&' } else { '?' };
         (
             format!(
@@ -225,7 +236,7 @@ async fn an_unverifiable_signature_is_refused_in_aws_own_words() {
         (
             "a presigned GetObject",
             "GET",
-            presigned("/signature-bucket/object.txt", 300),
+            presigned("/signature-bucket/object.txt", "300"),
         ),
         (
             // The recorded instance: a presigned GET whose signed `X-Amz-Expires` is
@@ -233,7 +244,7 @@ async fn an_unverifiable_signature_is_refused_in_aws_own_words() {
             // verifies even though its `X-Amz-Signature` is untouched.
             "a presigned GetObject whose X-Amz-Expires was doubled after signing",
             "GET",
-            presigned("/signature-bucket/object.txt", 600),
+            presigned("/signature-bucket/object.txt", "600"),
         ),
     ];
 
@@ -306,7 +317,7 @@ async fn a_credential_the_emulator_never_issued_is_not_a_signature_mismatch() {
                     presigned_query(
                         &emulator.access_key_id,
                         "20200101T000000Z",
-                        300,
+                        "300",
                         WRONG_SIGNATURE
                     )
                 ),

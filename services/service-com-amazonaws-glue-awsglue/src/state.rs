@@ -5111,14 +5111,16 @@ pub const DEFAULT_ML_TRANSFORM_TIMEOUT_MINUTES: i32 = 2_880;
 /// columns".
 pub const MAX_TRANSFORM_SCHEMA_COLUMNS: usize = 100;
 
-/// The separator between the parts of a transform listing's ordering key (and so of its
-/// `NextToken`).
+/// The separator between the parts of a sorted listing's ordering key (and so of its
+/// `NextToken`): the sorted value and then the record's own id.
 ///
-/// `U+0001` cannot appear in a name, a status, an algorithm type or a minted id: every
-/// such value's modelled pattern admits `\u0020` and up, so the separator can never be
-/// confused with a character inside one of the parts it joins — and a key whose first part
-/// is a prefix of another's therefore still orders before it.
-const TRANSFORM_KEY_SEPARATOR: char = '\u{1}';
+/// ONE copy, shared by the listings that page over a value a `Sort` names (the machine
+/// learning transforms and the task runs of one transform), so the token format cannot
+/// drift between them. `U+0001` cannot appear in a name, a status, a type or a minted id:
+/// every such value's modelled pattern admits `\u0020` and up, so the separator can never
+/// be confused with a character inside one of the parts it joins — and a key whose first
+/// part is a prefix of another's therefore still orders before it.
+const LISTING_KEY_SEPARATOR: char = '\u{1}';
 
 /// `at` rendered so that lexicographic order over the rendering is the order of the
 /// instants themselves: nanoseconds since the epoch, zero-padded, so no comparison of
@@ -5219,6 +5221,16 @@ pub struct MlTransformEntry {
     /// read: the shape carries no tag member, so the tags are reachable only through the
     /// tagging operations.
     pub tags: HashMap<String, String>,
+    /// The task runs started of this transform, oldest first.
+    ///
+    /// Held ON the transform, the way a job definition holds its own runs
+    /// ([`JobEntry::runs`]): every operation that addresses a task run
+    /// (`GetMLTaskRun`, `CancelMLTaskRun`) names the parent `TransformId` and then the
+    /// `TaskRunId` the start minted, so a run of one transform is unreachable through
+    /// another. Kept in start order, so a listing that names no sort criteria still has
+    /// one deterministic order to page over, and bounded by
+    /// [`MAX_TASK_RUNS_PER_TRANSFORM`].
+    pub task_runs: Vec<MlTaskRunEntry>,
 }
 
 impl MlTransformEntry {
@@ -5264,6 +5276,9 @@ impl MlTransformEntry {
             max_retries: input.max_retries,
             transform_encryption: input.transform_encryption.clone(),
             tags: input.tags.clone().unwrap_or_default(),
+            // A create starts no task run: "Call this operation as the first step in the
+            // process of using a machine learning transform" (`CreateMLTransform`).
+            task_runs: Vec::new(),
         }
     }
 
@@ -5435,9 +5450,60 @@ impl MlTransformEntry {
             Some(TRANSFORM_SORT_COLUMN_NAME) | Some(_) | None => self.name.clone(),
         };
         format!(
-            "{sorted}{TRANSFORM_KEY_SEPARATOR}{}",
+            "{sorted}{LISTING_KEY_SEPARATOR}{}",
             self.transform_id
         )
+    }
+
+    /// Give every task run of this transform the status the CLOCK already owed it at
+    /// `now`.
+    ///
+    /// The one write a reporting operation performs, exactly as [`JobEntry::settle_due_runs`]
+    /// is for a job run: a run's next status was due at [`MlTaskRunEntry::settles_at`]
+    /// whether or not anybody called, so materialising it on read reports the status the
+    /// clock had already reached. It never moves a run because something was read.
+    pub fn settle_due_task_runs(&mut self, now: SystemTime) {
+        for run in &mut self.task_runs {
+            run.settle_if_due(now);
+        }
+    }
+
+    /// Append a task run of this transform, keeping at most
+    /// [`MAX_TASK_RUNS_PER_TRANSFORM`] of them.
+    pub fn record_task_run(&mut self, run: MlTaskRunEntry) {
+        self.task_runs.push(run);
+        if self.task_runs.len() > MAX_TASK_RUNS_PER_TRANSFORM {
+            let overflow = self.task_runs.len() - MAX_TASK_RUNS_PER_TRANSFORM;
+            self.task_runs.drain(..overflow);
+        }
+    }
+
+    /// Every task run of this transform `filter` admits, in the order `sort` names, each
+    /// paired with its ordering key — which is what the listing's continuation token
+    /// carries ([`MlTaskRunEntry::ordering_key`]).
+    ///
+    /// Call [`Self::settle_due_task_runs`] first, or a run the clock has already finished
+    /// is reported, and filtered on, in a status it has already left. Bounded by
+    /// [`MAX_TASK_RUNS_PER_TRANSFORM`].
+    pub fn task_runs_in_order(
+        &self,
+        filter: Option<&TaskRunFilterCriteria>,
+        sort: Option<&TaskRunSortCriteria>,
+    ) -> Vec<(String, &MlTaskRunEntry)> {
+        let column = sort.map(|criteria| criteria.column.as_str());
+        let mut ordered: Vec<(String, &MlTaskRunEntry)> = self
+            .task_runs
+            .iter()
+            .filter(|run| filter.is_none_or(|criteria| run.matches(criteria)))
+            .map(|run| (run.ordering_key(column), run))
+            .collect();
+        ordered.sort_by(|left, right| left.0.cmp(&right.0));
+        if sort.is_some_and(|criteria| criteria.sort_direction == SORT_DIRECTION_DESCENDING) {
+            // The ordering key is unique per run, so reversing the ascending order is
+            // exactly the descending one.
+            ordered.reverse();
+        }
+        ordered
     }
 }
 
@@ -5504,6 +5570,274 @@ pub fn ml_transform_update_names_a_change(input: &UpdateMLTransformInput) -> boo
         || input.number_of_workers.is_some()
         || input.timeout.is_some()
         || input.max_retries.is_some()
+}
+
+// The shapes a machine learning TASK RUN is made of, declared beside the records and the
+// selection that use them rather than in the catalog's own import list above.
+use crate::ops::types::{TaskRun, TaskRunFilterCriteria, TaskRunProperties, TaskRunSortCriteria};
+
+/// How many task runs of ONE machine learning transform this store keeps.
+///
+/// CHOSEN: Glue publishes no retention for a transform's task run history, so this is the
+/// emulator's own window, for the reason [`MAX_RUNS_PER_JOB`] gives: it bounds
+/// [`MlTransformEntry::task_runs`] and every walk over it. The OLDEST run is dropped
+/// first, so the runs a caller is most likely to read are kept.
+pub const MAX_TASK_RUNS_PER_TRANSFORM: usize = 100;
+
+/// The `TaskType` of a run `StartMLLabelingSetGenerationTaskRun` starts: of the modelled
+/// enum (`EVALUATION | LABELING_SET_GENERATION | IMPORT_LABELS | EXPORT_LABELS |
+/// FIND_MATCHES`), the one that names generating a labelling set, which is what that
+/// operation starts ("Starts the active learning workflow for your machine learning
+/// transform to improve the transform's quality by generating label sets").
+pub const ML_TASK_TYPE_LABELING_SET_GENERATION: &str = "LABELING_SET_GENERATION";
+
+/// The `TaskStatusType` a task run is recorded in by the call that starts it: of the
+/// modelled enum (`STARTING | RUNNING | STOPPING | STOPPED | SUCCEEDED | FAILED |
+/// TIMEOUT`), the one that says the run has been accepted and no task has begun yet.
+pub const ML_TASK_RUN_STATUS_STARTING: &str = "STARTING";
+
+/// See [`ML_TASK_RUN_STATUS_STARTING`]: the status a run that did not run comes to rest
+/// in.
+pub const ML_TASK_RUN_STATUS_FAILED: &str = "FAILED";
+
+/// How long a task run stays in the status the call that started it put it in before the
+/// clock owes it the next one.
+///
+/// CHOSEN, not documented: Glue publishes no duration for starting a machine learning
+/// task run, so this is the emulator's own span, the same one a job run's transitions take
+/// ([`JOB_RUN_SETTLES_AFTER`]) — deliberately not zero, so a caller that lists the runs
+/// straight after a start still observes the run in flight. The due instant is stored on
+/// the run and materialised by whichever later call reads it; nothing sleeps.
+pub const ML_TASK_RUN_SETTLES_AFTER: Duration = JOB_RUN_SETTLES_AFTER;
+
+/// `TaskRun$ErrorString` for the terminal status the clock owes every machine learning
+/// task run.
+///
+/// This emulator is the Glue control plane: it records a task run faithfully, but it runs
+/// no machine learning task over the transform's data, so a run can never reach
+/// `SUCCEEDED` — it comes to rest in the modelled failure status carrying a reason that
+/// says exactly that, rather than reporting a labelling set or a metric nothing produced.
+pub const ML_TASK_RUN_NOT_EXECUTED_MESSAGE: &str =
+    "This emulator records machine learning task runs but runs no machine learning task, \
+     so the task run ended without running.";
+
+/// The `TaskRunSortColumnType` that orders a transform's task runs by their task type. One
+/// of the modelled values the generated
+/// [`crate::ops::types::TASK_RUN_SORT_COLUMN_TYPE_VALUES`] carries (`TASK_RUN_TYPE`,
+/// `STATUS`, `STARTED`), which the request layer validates a sort criteria against.
+pub const ML_TASK_RUN_SORT_COLUMN_TASK_RUN_TYPE: &str = "TASK_RUN_TYPE";
+/// See [`ML_TASK_RUN_SORT_COLUMN_TASK_RUN_TYPE`]: orders by the status each run stands in.
+pub const ML_TASK_RUN_SORT_COLUMN_STATUS: &str = "STATUS";
+/// See [`ML_TASK_RUN_SORT_COLUMN_TASK_RUN_TYPE`]: orders by the instant each run started.
+pub const ML_TASK_RUN_SORT_COLUMN_STARTED: &str = "STARTED";
+
+/// How many machine learning task run ids this process has minted. A nonce source for
+/// [`new_ml_task_run_id`], exactly as [`MINTED_JOB_RUN_IDS`] is for a job run id.
+static MINTED_ML_TASK_RUN_IDS: AtomicU64 = AtomicU64::new(0);
+
+/// How many 64-bit words a machine learning task run id carries: two, i.e. 128 bits
+/// rendered as 32 lowercase hexadecimal characters.
+const ML_TASK_RUN_ID_WORDS: usize = 2;
+
+/// A fresh `TaskRunId`: the id the service assigns a machine learning task run when a
+/// start records it.
+///
+/// 32 lowercase hexadecimal characters, i.e. 128 bits, which is inside `HashString`'s
+/// `length 1..255` — the same shape and width as the transform id this store mints
+/// ([`new_ml_transform_id`]), because the service publishes no spelling for either. The
+/// bits come from [`mint_hex_id`], so two starts landing in the same nanosecond cannot be
+/// given the same id, and the id is stored on the run, so every later read of that run
+/// reports the same one.
+///
+/// This names a RESOURCE, not a credential: a credential would come from the credential
+/// store, never from here.
+pub fn new_ml_task_run_id() -> String {
+    mint_hex_id(&MINTED_ML_TASK_RUN_IDS, ML_TASK_RUN_ID_WORDS)
+}
+
+/// One machine learning task run, as the call that started it recorded it.
+///
+/// A run carries the transform it was started of, the configuration properties of the task
+/// that start asked for, and the members only a run has: the minted id, the status it
+/// stands in and the instants it moved between statuses. The properties are the modelled
+/// `TaskRunProperties` shape, which is where the TYPE of the task lives
+/// ([`Self::task_type`]), so each start records the properties of its own task kind and a
+/// listing reports them unchanged.
+#[derive(Debug, Clone)]
+pub struct MlTaskRunEntry {
+    /// `TaskRun$TaskRunId`, minted by [`new_ml_task_run_id`].
+    pub id: String,
+    /// The `TransformId` of the transform this run was started of, which is the first half
+    /// of a run's address.
+    pub transform_id: String,
+    /// "Specifies configuration properties associated with this task run"
+    /// (`TaskRun$Properties`), as the start that recorded the run described the task: its
+    /// `TaskType` and the properties of that one kind of task.
+    pub properties: TaskRunProperties,
+    /// One of the modelled `TaskStatusType` values; see [`ML_TASK_RUN_STATUS_STARTING`].
+    pub status: String,
+    /// The instant the clock owes this run its next status; `None` once it has settled.
+    pub settles_at: Option<SystemTime>,
+    /// "The date and time that this task run started" (`TaskRun$StartedOn`).
+    pub started_on: SystemTime,
+    /// "The last point in time that the requested task run was updated"
+    /// (`TaskRun$LastModifiedOn`).
+    pub last_modified_on: SystemTime,
+    /// "The last point in time that the requested task run was completed"
+    /// (`TaskRun$CompletedOn`), absent until the run has finished.
+    pub completed_on: Option<SystemTime>,
+    /// "The list of error strings associated with this task run"
+    /// (`TaskRun$ErrorString`), absent until the run has failed.
+    pub error_string: Option<String>,
+}
+
+impl MlTaskRunEntry {
+    /// Record a run of `transform_id` performing the task `properties` describes, in
+    /// [`ML_TASK_RUN_STATUS_STARTING`] with its next status due
+    /// [`ML_TASK_RUN_SETTLES_AFTER`] out.
+    ///
+    /// Taken as the modelled properties rather than as one start's request, so every
+    /// operation that starts a task run of a transform records one the same way and the
+    /// listing cannot tell them apart by anything but the properties themselves.
+    pub fn start(
+        transform_id: &str,
+        id: String,
+        properties: TaskRunProperties,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            id,
+            transform_id: transform_id.to_string(),
+            properties,
+            status: ML_TASK_RUN_STATUS_STARTING.to_string(),
+            settles_at: Some(now.checked_add(ML_TASK_RUN_SETTLES_AFTER).unwrap_or(now)),
+            started_on: now,
+            last_modified_on: now,
+            completed_on: None,
+            // Nothing has failed yet: a run carries an error string only once it has.
+            error_string: None,
+        }
+    }
+
+    /// This run's `TaskType`, the one a filter and a sort select and order on: the type
+    /// recorded in its own properties, so there is one place a run's kind is held.
+    pub fn task_type(&self) -> &str {
+        self.properties.task_type.as_deref().unwrap_or_default()
+    }
+
+    /// Move this run into the status the clock owed it at `now`, if it owed one.
+    ///
+    /// The run was due to leave [`ML_TASK_RUN_STATUS_STARTING`] at [`Self::settles_at`]
+    /// whether or not anybody called, and the instants recorded are that DUE instant, not
+    /// the instant somebody read it — so two reads of a settled run report the same run.
+    pub fn settle_if_due(&mut self, now: SystemTime) {
+        let Some(due) = self.settles_at else {
+            return;
+        };
+        if due > now {
+            return;
+        }
+        self.settles_at = None;
+        self.status = ML_TASK_RUN_STATUS_FAILED.to_string();
+        self.error_string = Some(ML_TASK_RUN_NOT_EXECUTED_MESSAGE.to_string());
+        self.completed_on = Some(due);
+        self.last_modified_on = due;
+    }
+
+    /// `TaskRun$ExecutionTime`: "The amount of time (in seconds) that the task run
+    /// consumed resources" — the whole seconds between the run starting and finishing, and
+    /// the model's own default of 0 while it has not finished.
+    fn execution_time_seconds(&self) -> i32 {
+        let Some(completed_on) = self.completed_on else {
+            return 0;
+        };
+        let elapsed = completed_on
+            .duration_since(self.started_on)
+            .unwrap_or_default();
+        i32::try_from(elapsed.as_secs()).unwrap_or(i32::MAX)
+    }
+
+    /// Whether this run satisfies every criterion `filter` names.
+    ///
+    /// A `TaskRunFilterCriteria` is a conjunction: each member it carries narrows the
+    /// listing, and a member it leaves out narrows nothing. The two enum members are
+    /// matched exactly, and the two instants bound the window the criteria describe
+    /// ("filter on task runs started before this date"), so a run started exactly at a
+    /// bound is outside it — the same reading the transform filter's instant windows take
+    /// ([`MlTransformEntry::matches`]).
+    pub fn matches(&self, filter: &TaskRunFilterCriteria) -> bool {
+        if filter
+            .task_run_type
+            .as_deref()
+            .is_some_and(|kind| kind != self.task_type())
+        {
+            return false;
+        }
+        if filter
+            .status
+            .as_deref()
+            .is_some_and(|status| status != self.status.as_str())
+        {
+            return false;
+        }
+        let started = secs_since_epoch(self.started_on);
+        if filter
+            .started_before
+            .as_ref()
+            .is_some_and(|bound| started >= bound.as_secs_f64())
+        {
+            return false;
+        }
+        if filter
+            .started_after
+            .as_ref()
+            .is_some_and(|bound| started <= bound.as_secs_f64())
+        {
+            return false;
+        }
+        true
+    }
+
+    /// This run's place in a listing ordered by `column`, as the continuation token
+    /// renders it: the sorted value, then the run's own id so that two runs sharing that
+    /// value still have one total order to page over.
+    ///
+    /// `None` is the order a request that names no sort criteria gets, which is the same
+    /// key [`ML_TASK_RUN_SORT_COLUMN_STARTED`] names: the operation documents no default
+    /// order for "a list of historic runs" (`GetMLTaskRuns`), so the listing falls back on
+    /// the order the runs were started in rather than on however the store happens to hold
+    /// them. A column outside the modelled list cannot reach here — the request layer
+    /// validates `Sort$Column` against it — and is ordered the same way.
+    pub fn ordering_key(&self, column: Option<&str>) -> String {
+        let sorted = match column {
+            Some(ML_TASK_RUN_SORT_COLUMN_TASK_RUN_TYPE) => self.task_type().to_string(),
+            Some(ML_TASK_RUN_SORT_COLUMN_STATUS) => self.status.clone(),
+            Some(ML_TASK_RUN_SORT_COLUMN_STARTED) | Some(_) | None => {
+                ordered_instant(self.started_on)
+            }
+        };
+        format!("{sorted}{LISTING_KEY_SEPARATOR}{}", self.id)
+    }
+
+    /// Rebuild the modelled `TaskRun` output shape from what is stored, so a listing
+    /// reports the same run a single-run read does.
+    pub fn to_task_run(&self) -> TaskRun {
+        TaskRun {
+            transform_id: Some(self.transform_id.clone()),
+            task_run_id: Some(self.id.clone()),
+            status: Some(self.status.clone()),
+            // "The names of the log group for secure logging, associated with this task
+            // run": no task runs here, so nothing writes this run's output anywhere and
+            // there is no log group holding it to name.
+            log_group_name: None,
+            properties: Some(self.properties.clone()),
+            error_string: self.error_string.clone(),
+            started_on: Some(to_date_time(self.started_on)),
+            last_modified_on: Some(to_date_time(self.last_modified_on)),
+            completed_on: self.completed_on.map(to_date_time),
+            execution_time: self.execution_time_seconds(),
+        }
+    }
 }
 
 /// Whether an `UpdateWorkflow` request names a member of the workflow to change at all.

@@ -138,9 +138,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Reporting one delivery destination reads the account's store; nothing on the
-        // request but the name it asks for takes part, and nothing is written.
-        let _ = ctx;
+        // Reporting one delivery destination reads the delivery destinations of the Region the
+        // request was signed for — a delivery destination is a regional resource, so this
+        // endpoint serves only the ones created through it — and nothing is written.
+        let region = crate::state::request_region(ctx.parts());
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetDeliveryDestinationError::from(
@@ -154,15 +155,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
 
         let destination = store
-            .delivery_destinations
-            .get(&input.name)
+            .delivery_destination(&region, &input.name)
             .ok_or_else(|| {
                 GetDeliveryDestinationError::from(
                     GetDeliveryDestinationErrorModeled::ResourceNotFoundException(
                         ResourceNotFoundException {
                             // The sentence every delivery-destination operation refuses an
                             // unknown name with: the service states that the requested
-                            // delivery destination is not in this account.
+                            // delivery destination is not in this account. A name only ANOTHER
+                            // Region holds a destination under is such a name here.
                             message: Some(
                                 crate::state::DELIVERY_DESTINATION_NOT_FOUND_MESSAGE.to_string(),
                             ),

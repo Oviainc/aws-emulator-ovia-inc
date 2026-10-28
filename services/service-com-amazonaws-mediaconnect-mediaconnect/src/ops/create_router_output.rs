@@ -374,6 +374,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }),
                 // Nothing is routed to an output that has just been created.
                 routed_input_arn: None,
+                // and no association is in flight for it, so the clock owes its routed
+                // state nothing: only TakeRouterInput records one.
+                routing_due_at: None,
                 messages: Vec::new(),
                 // No maintenance window is scheduled for an output that is not carrying
                 // content yet: StartRouterOutput schedules one when it starts the output.

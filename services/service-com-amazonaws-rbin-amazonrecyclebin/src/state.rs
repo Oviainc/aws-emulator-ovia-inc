@@ -460,16 +460,18 @@ impl Rule {
         self.settle_lock_state(now);
     }
 
-    /// Whether every tag in `filter` appears among the rule's resource tags. An
-    /// empty filter selects every rule.
+    /// Whether every pair in `filter` appears among the rule's resource tags, a pair
+    /// being the key together with its value and a tag carrying no value being the
+    /// empty value. An empty filter selects every rule.
     pub fn has_resource_tags(&self, filter: &[ResourceTag]) -> bool {
         filter
             .iter()
             .all(|wanted| contains_resource_tag(&self.resource_tags, wanted))
     }
 
-    /// Whether every tag in `filter` appears among the rule's exclusion tags. An
-    /// empty filter selects every rule.
+    /// Whether every pair in `filter` appears among the rule's exclusion tags, a pair
+    /// being the key together with its value and a tag carrying no value being the
+    /// empty value. An empty filter selects every rule.
     pub fn has_exclude_resource_tags(&self, filter: &[ResourceTag]) -> bool {
         filter
             .iter()
@@ -501,16 +503,18 @@ pub fn unlock_delay_end(
     now.checked_add(Duration::from_secs(seconds))
 }
 
-/// A tag matches when the keys are equal and, where the filter names a value, the
-/// values are equal too; a filter that names no value matches any value for the key.
+/// A tag matches when it is the SAME resource tag pair as the filter names, as
+/// [`resource_tag_pair`] identifies a pair: equal keys and equal values, where a tag
+/// carrying no value IS the empty value — on the STORED side and on the FILTER side
+/// alike.
+///
+/// Selecting and counting therefore agree about what one pair is: the pairs the
+/// five-rules-per-pair quota refuses a request for as already taken are exactly the
+/// pairs a filter naming them selects the holders of, whichever of the two forms of a
+/// valueless pair either call writes.
 fn contains_resource_tag(tags: &[ResourceTag], wanted: &ResourceTag) -> bool {
-    tags.iter().any(|tag| {
-        tag.resource_tag_key == wanted.resource_tag_key
-            && wanted
-                .resource_tag_value
-                .as_ref()
-                .is_none_or(|value| tag.resource_tag_value.as_ref() == Some(value))
-    })
+    let wanted = resource_tag_pair(wanted);
+    tags.iter().any(|tag| resource_tag_pair(tag) == wanted)
 }
 
 // ---------------------------------------------------------------------------
