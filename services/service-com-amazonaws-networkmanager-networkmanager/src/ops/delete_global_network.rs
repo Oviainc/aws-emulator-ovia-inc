@@ -147,22 +147,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A global network that still owns children cannot be deleted: the caller has to
-        // empty it first (DeleteSite, DeleteDevice, DeleteCoreNetwork, and the delete of
-        // each other child kind as that slice lands). The refusal is the dependency
+        // empty it first (DeleteSite, DeleteDevice, DeleteCoreNetwork,
+        // DeregisterTransitGateway, and the delete of each other child kind as that slice
+        // lands). The refusal is the dependency
         // ValidationException (400) `crate::state::dependents_block_delete` builds for
         // every delete of this service — the children must go first, which no retry of
         // THIS call can achieve, so it is not the 409 a conflict would be.
         let sites = store.site_ids_of(&input.global_network_id);
         let core_networks = store.core_network_ids_of(&input.global_network_id);
         let devices = store.device_count_of(&input.global_network_id);
+        // A transit gateway registration is a tie this global network holds rather than a
+        // resource with an id of its own, and the caller removes it with
+        // DeregisterTransitGateway — so it blocks the delete exactly like a child resource
+        // does, counted the same way the per-global-network quota counts it. Were it not
+        // counted, deleting the global network would leave a registration keyed by a global
+        // network nobody can address any more: unreadable, undeletable, and still holding
+        // its transit gateway against every other global network.
+        let registrations =
+            store.transit_gateway_registration_count_of(&input.global_network_id);
         // Listed in the order the operation's own documentation names them: "delete all
-        // global network objects (devices, links, and sites) … and delete any core
-        // networks" (a link hangs off a site, so a held link blocks through its site).
+        // global network objects (devices, links, and sites), deregister all transit
+        // gateways, and delete any core networks" (a link hangs off a site, so a held link
+        // blocks through its site).
         if let Some(refusal) = crate::state::dependents_block_delete(
             crate::state::GLOBAL_NETWORK_KIND,
             &[
                 (crate::state::DEVICE_KIND, devices),
                 (crate::state::SITE_KIND, sites.len()),
+                (
+                    crate::state::TRANSIT_GATEWAY_REGISTRATION_KIND,
+                    registrations,
+                ),
                 (crate::state::CORE_NETWORK_KIND, core_networks.len()),
             ],
         ) {

@@ -50,7 +50,7 @@ pub(crate) async fn register(emulator: &Emulator, network: &str, arn: &str) -> (
 
 /// `DeregisterTransitGateway` for `arn` on `network`. The ARN travels in a NON-greedy
 /// `@httpLabel`, so a client sends its `:` and `/` percent-encoded.
-async fn deregister(emulator: &Emulator, network: &str, arn: &str) -> (u16, Value) {
+pub(crate) async fn deregister(emulator: &Emulator, network: &str, arn: &str) -> (u16, Value) {
     emulator
         .delete(&format!(
             "/global-networks/{network}/transit-gateway-registrations/{}",
