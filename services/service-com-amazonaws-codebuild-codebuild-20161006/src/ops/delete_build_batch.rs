@@ -167,12 +167,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "indicates if the batch build is complete", and deleting one that is still
         // running is refused with the single error this operation models, leaving the
         // batch — and the builds of it — exactly where they were.
+        //
+        // The refusal names the batch build the way CodeBuild names a resource it
+        // would not act on: by the resource's own ARN, which is the one the record
+        // carries, or — for a record holding none — the one this service forms for
+        // that id in the region the call was signed for ([`crate::state::build_batch_arn`]),
+        // the same reading `crate::ops::start_command_execution` applies to the
+        // resource ARN it reports.
         if !build_batch.complete {
+            let arn = build_batch.arn.clone().unwrap_or_else(|| {
+                crate::state::build_batch_arn(
+                    &crate::state::request_region(ctx.parts()),
+                    &input.id,
+                )
+            });
             return Err(DeleteBuildBatchErrorModeled::InvalidInputException(
                 InvalidInputException {
                     message: Some(format!(
-                        "Build batch {} is still in progress and cannot be deleted",
-                        input.id
+                        "Cannot delete BuildBatch {arn}, as it is still in progress"
                     )),
                 },
             )

@@ -67,6 +67,7 @@ use smithy_server_runtime::{
     http, ErasedOperation, ErasedServiceDefinition, OperationRoutingTable, Refusal, Refused,
     ServerHttpProtocol, Service, ServiceIdentity,
 };
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
@@ -517,16 +518,17 @@ fn addresses_object(path: &str) -> bool {
     }
 }
 
-/// Whether `uri` addresses the S3 Select data plane: the `select` subresource of an
-/// object.
+/// Whether a request addresses the S3 Select data plane: the `select` subresource of an
+/// object, read from `query` and from `path` — the request's address in PATH-STYLE form
+/// ([`EmulatedService::path_style_path`]), so a Select request resolves the same whether
+/// its bucket arrived in the path or in the host.
 ///
 /// The method is deliberately not part of this predicate, and costs nothing: it is
 /// consulted ONLY for a request no modeled operation claimed, and every other method on an
 /// object path (`GET`/`HEAD`/`PUT`/`DELETE`) resolves to its own modeled operation before
 /// ever reaching here. What is left is a request that asked S3 for Select and nothing else.
-fn addresses_s3_select(uri: &str) -> bool {
-    query_carries(wire::request_query(uri), SELECT_SUBRESOURCE)
-        && addresses_object(wire::request_path(uri))
+fn addresses_s3_select(path: &str, query: &str) -> bool {
+    query_carries(query, SELECT_SUBRESOURCE) && addresses_object(path)
 }
 
 /// The `com-amazonaws-s3-amazons3` emulated service: the generated [`ServiceDefinition`] plus
@@ -573,6 +575,31 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// read, and nothing is written.
     fn holds_bucket(&self, name: &str) -> bool {
         holds_bucket_in(&*self.engine, name)
+    }
+
+    /// The bucket a VIRTUAL-HOSTED-STYLE request names in the first label of its host, when
+    /// it is one ([`addressed_in_host`]) — the one place both routing seams below ask that
+    /// question, so the route a request resolves and the address its refusal is judged
+    /// against cannot disagree about which bucket was named. `path` is the request's own
+    /// path, which the caller has already read and which the answer depends on (a path-style
+    /// request names its bucket there, and is never read out of the host).
+    fn host_addressed_bucket<'r>(&self, req: &'r RtRequest, path: &str) -> Option<&'r str> {
+        let host = request_host_of(req)?;
+        addressed_in_host(host, path, &|name| self.holds_bucket(name))
+    }
+
+    /// The address `req` names, in the PATH-STYLE form every route of this service is bound
+    /// in (`/{Bucket}`, `/{Bucket}/{Key+}`): a virtual-hosted-style request carries its
+    /// bucket in the host and the key alone in the path, so the bucket is put back in front
+    /// of it ([`path_with_bucket`], the same normalization [`Service::override_operation`]
+    /// routes from); a path-style request's path already is that form and is borrowed
+    /// unchanged.
+    fn path_style_path<'r>(&self, req: &'r RtRequest) -> Cow<'r, str> {
+        let path = wire::request_path(req.uri());
+        match self.host_addressed_bucket(req, path) {
+            Some(bucket) => Cow::Owned(path_with_bucket(bucket, path)),
+            None => Cow::Borrowed(path),
+        }
     }
 
     /// Whether `access_key_id` names a credential this emulator ISSUED, and so one an
@@ -739,10 +766,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         //
         // `None` for every path-style request, which leaves the generated routing table to
         // resolve it exactly as before.
-        let host = request_host_of(req)?;
-        let bucket = addressed_in_host(host, wire::request_path(req.uri()), &|name| {
-            self.holds_bucket(name)
-        })?;
+        let bucket = self.host_addressed_bucket(req, wire::request_path(req.uri()))?;
         let rewritten = with_path_style_address(req, bucket)?;
         // The ENTRY's protocol, which is the one carrying this service's model-derived
         // routes (this file's own `self.protocol` serializes and deserializes; it was built
@@ -778,10 +802,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         }
     }
 
-    fn override_routing_error(
-        &self,
-        req: &aws_smithy_runtime_api::http::Request,
-    ) -> Option<aws_smithy_runtime_api::http::Response> {
+    fn override_routing_error(&self, req: &RtRequest) -> Option<RtResponse> {
         // The router calls this when a request reached this service but named no
         // modeled operation — neither `override_operation` nor the generated
         // routing table resolved it. Returning `None` renders the protocol-correct
@@ -805,7 +826,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         //
         // Everything else keeps the framework's default, so an operation that really is
         // merely unwritten still answers the 501 that counts it as such.
-        if !addresses_s3_select(req.uri()) {
+        //
+        // WHICH requests those are is decided on the request's PATH-STYLE address
+        // ([`Self::path_style_path`]), not on the raw path: a virtual-hosted-style Select
+        // request — the form every SDK sends for an endpoint addressed by bucket name —
+        // carries its bucket in the host and the key alone in the path, and reading that raw
+        // path as the address made it look like a request against a bucket rather than
+        // against an object, which is not Select and fell through to the 501.
+        if !addresses_s3_select(&self.path_style_path(req), wire::request_query(req.uri())) {
             return None;
         }
         self.method_not_allowed()

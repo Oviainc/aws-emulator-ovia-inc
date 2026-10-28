@@ -17,12 +17,13 @@
 //! nothing rather than something made up, and its execution keeps the clock-driven arc
 //! the store records for it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
 use super::{
-    s3_client, service_state, ComAmazonawsConfigserviceStarlingdoveserviceState,
-    RemediationConfigurationEntry, S3_BUCKET_RESOURCE_TYPE,
+    s3_client, service_state, ComAmazonawsConfigserviceStarlingdoveserviceState, ComplianceChange,
+    RemediationConfigurationEntry, RemediationExecutionEntry, RemediationExecutionKey,
+    S3_BUCKET_RESOURCE_TYPE, COMPLIANCE_TYPE_NON_COMPLIANT,
 };
 
 /// The action one AWS-owned automation runbook performs, as this emulator performs it.
@@ -143,6 +144,103 @@ pub fn resolved_remediation_inputs(
 }
 
 impl ComAmazonawsConfigserviceStarlingdoveserviceState {
+    /// The remediation runs Config owes for the resources its rules currently find
+    /// NON_COMPLIANT, recording an execution for each of them as of `now`; `changes` are
+    /// the verdicts the pass that calls this just moved.
+    ///
+    /// AUTOMATIC remediation needs no call from the caller: a configuration whose
+    /// `Automatic` is set is the account's standing instruction to remediate what its
+    /// rule finds, so what it acts on is a FINDING — a verdict that has just placed the
+    /// resource at non-compliant, or one no execution of that rule has acted on for the
+    /// resource yet, which is what makes a configuration attached after the rule already
+    /// found the resource act on it. A finding already acted on is not acted on again, so
+    /// a resource is remediated once per finding rather than once per pass, and a rule
+    /// whose configuration remediates only on request
+    /// (`RemediationConfiguration$Automatic`) is left to `StartRemediationExecution`.
+    ///
+    /// A remediation exception is what exempts one resource from being remediated under
+    /// one rule, so a resource an unexpired exception covers is skipped.
+    ///
+    /// The runs themselves happen with the store's lock RELEASED
+    /// ([`run_remediation_actions`]), exactly as a started execution's do.
+    pub fn automatic_remediations(
+        &mut self,
+        changes: &[ComplianceChange],
+        now: SystemTime,
+    ) -> Vec<RemediationAction> {
+        // The findings this pass produced, as the keys an execution is recorded under.
+        let moved_to_non_compliant: BTreeSet<RemediationExecutionKey> = changes
+            .iter()
+            .filter(|change| change.new_result.compliance_type == COMPLIANCE_TYPE_NON_COMPLIANT)
+            .map(|change| {
+                (
+                    change.rule_name.clone(),
+                    change.new_result.resource_type.clone(),
+                    change.new_result.resource_id.clone(),
+                )
+            })
+            .collect();
+
+        // What is owed is decided from the state this pass arrived at, before any
+        // execution is recorded, so a resource cannot be chosen twice.
+        let mut owed: Vec<RemediationExecutionKey> = Vec::new();
+        for (rule_name, remediation) in &self.remediation_configurations {
+            if !remediation.automatic {
+                continue;
+            }
+            let Some(rule) = self.config_rules.get(rule_name) else {
+                continue;
+            };
+            for result in rule.evaluation_results.values() {
+                if result.compliance_type != COMPLIANCE_TYPE_NON_COMPLIANT {
+                    continue;
+                }
+                let key = (
+                    rule_name.clone(),
+                    result.resource_type.clone(),
+                    result.resource_id.clone(),
+                );
+                if !moved_to_non_compliant.contains(&key)
+                    && self.remediation_executions.contains_key(&key)
+                {
+                    continue;
+                }
+                if self
+                    .remediation_exceptions
+                    .get(&key)
+                    .is_some_and(|exception| !exception.expired_by(now))
+                {
+                    continue;
+                }
+                owed.push(key);
+            }
+        }
+
+        let mut actions = Vec::new();
+        for (rule_name, resource_type, resource_id) in owed {
+            let Some(remediation) = self.remediation_configurations.get(&rule_name).cloned() else {
+                continue;
+            };
+            self.record_remediation_execution(
+                &rule_name,
+                RemediationExecutionEntry::invoked(
+                    &resource_type,
+                    &resource_id,
+                    &remediation.target_id,
+                    now,
+                ),
+            );
+            actions.push(RemediationAction {
+                config_rule_name: rule_name,
+                resource_type,
+                target_id: remediation.target_id.clone(),
+                inputs: resolved_remediation_inputs(&remediation, &resource_id),
+                resource_id,
+            });
+        }
+        actions
+    }
+
     /// Note that the run of `action` began at `ran_from` and had performed it by
     /// `ran_to`, onto the execution the run belongs to.
     ///

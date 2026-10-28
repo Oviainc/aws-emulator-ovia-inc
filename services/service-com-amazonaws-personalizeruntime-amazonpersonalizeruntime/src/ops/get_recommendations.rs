@@ -6,19 +6,24 @@
 //!
 //! Everything it returns is read from the inference registry in [`crate::state`]:
 //!
-//! 1. **Resolve the resource.** Exactly one of `campaignArn` / `recommenderArn`
+//! 1. **Settle `numResults`.** "The default is 25. If you are including metadata in
+//!    recommendations, the maximum is 50. Otherwise, the maximum is 500." Both the
+//!    value and the bound it has to satisfy are facts about the REQUEST, so a
+//!    `numResults` past the bound is `InvalidInputException` (400) naming the member
+//!    and the bound BEFORE anything is resolved.
+//! 2. **Resolve the resource.** Exactly one of `campaignArn` / `recommenderArn`
 //!    identifies what to recommend from; an ARN the registry does not hold is
 //!    `InvalidInputException` (400), "does not exist or is not active yet" (see
 //!    [`crate::state::Denied::unresolvable`]). A campaign whose solution version was
 //!    trained with `PERSONALIZED_RANKING` or `PERSONALIZED_ACTIONS` is served by
 //!    another operation, so it is `InvalidInputException` (400) here.
-//! 2. **Check the personalization input the resolved resource needs** — "USER_PERSONALIZATION
+//! 3. **Check the personalization input the resolved resource needs** — "USER_PERSONALIZATION
 //!    - userId required, itemId not used RELATED_ITEMS - itemId required, userId not
 //!    used", and for a recommender the input its domain use case requires.
-//! 3. **Filter.** `filterArn` is resolved against the registry (400 when unknown) and
+//! 4. **Filter.** `filterArn` is resolved against the registry (400 when unknown) and
 //!    its expression, bound to `filterValues`, decides which stored catalog entries
 //!    come back — not what any of them scores.
-//! 4. **Score and order.** Each candidate's score is [`crate::state::scoring::relevance`]
+//! 5. **Score and order.** Each candidate's score is [`crate::state::scoring::relevance`]
 //!    of its STORED `base_score`, the request's `context` and only the ONE
 //!    personalization input the resolved resource uses (see
 //!    [`crate::state::RequiredInput::personalization`]), so an identical request
@@ -27,10 +32,10 @@
 //!    order by prediction score". The scores are normalized across the whole stored catalog BEFORE the
 //!    request's filter, `numResults` and any promotion decide which candidates come
 //!    back, so one item's score is the same whatever the request asked for.
-//! 5. **Promote.** A `promotions` entry takes `percentPromotedItems` of the returned
+//! 6. **Promote.** A `promotions` entry takes `percentPromotedItems` of the returned
 //!    slots from the entries its own filter selects; each such item carries
 //!    `promotionName` and the documented `reason` "Promoted item".
-//! 6. **Metadata.** `metadataColumns` is served from the stored item attributes; with
+//! 7. **Metadata.** `metadataColumns` is served from the stored item attributes; with
 //!    no `metadataColumns` the `metadata` member is omitted entirely.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
@@ -195,14 +200,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = SystemTime::now();
         let mut guard = state.lock();
 
-        // 1. Resolve the campaign or recommender this request recommends from.
+        // 1. How many results to compute. Both `numResults` and the maximum it has to
+        //    satisfy — "If you are including metadata in recommendations, the maximum
+        //    is 50. Otherwise, the maximum is 500." — are facts about the REQUEST: the
+        //    bound is keyed off the same predicate `GetPersonalizedRanking` bounds
+        //    `inputList` with, so one request means one bound in both operations. It is
+        //    therefore settled BEFORE anything is resolved, and a `numResults` past the
+        //    bound is refused whatever the resource turns out to be.
+        let max_num_results = registry::metadata_bounded_max(registry::asks_for_metadata(
+            input.metadata_columns.as_ref(),
+        ));
+        let num_results = registry::effective_num_results(
+            input.num_results,
+            registry::DEFAULT_NUM_RESULTS,
+            max_num_results,
+        )
+        .map_err(deny)?;
+
+        // 2. Resolve the campaign or recommender this request recommends from.
         let resolved = resolve(
             &guard,
             registry::present(input.campaign_arn.as_deref()),
             registry::present(input.recommender_arn.as_deref()),
         )?;
 
-        // 2. The personalization input the resolved resource needs.
+        // 3. The personalization input the resolved resource needs.
         let user_id = registry::present(input.user_id.as_deref()).unwrap_or_default();
         let item_id = registry::present(input.item_id.as_deref()).unwrap_or_default();
         match resolved.required_input {
@@ -221,28 +243,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             _ => {}
         }
 
-        // 3. How much metadata was asked for, which is also what bounds `numResults`.
-        //    The BOUND is keyed off the request alone — the same predicate
-        //    `GetPersonalizedRanking` bounds `inputList` with, so one request means one
-        //    bound in both operations — while the columns themselves are validated
-        //    against the resolved resource and its catalog.
-        let max_num_results = registry::metadata_bounded_max(registry::asks_for_metadata(
-            input.metadata_columns.as_ref(),
-        ));
+        // 4. Which metadata columns come back, validated against the RESOLVED resource
+        //    and its catalog — the one part of `metadataColumns` that needs it; how
+        //    many results the request may ask for was already settled in step 1.
         let metadata_columns = registry::requested_metadata_columns(
             input.metadata_columns.as_ref(),
             resolved.metadata_enabled,
             &registry::catalog_columns(&resolved.items),
         )
         .map_err(deny)?;
-        let num_results = registry::effective_num_results(
-            input.num_results,
-            registry::DEFAULT_NUM_RESULTS,
-            max_num_results,
-        )
-        .map_err(deny)?;
 
-        // 4. The request's filter, and the request's promotion.
+        // 5. The request's filter, and the request's promotion.
         let request_filter = guard
             .bind_filter(
                 registry::present(input.filter_arn.as_deref()),
@@ -252,7 +263,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(deny)?;
         let promotion = promotion(&guard, input.promotions.as_deref(), num_results)?;
 
-        // 5. Score the resolved resource's WHOLE stored catalog and settle each entry's
+        // 6. Score the resolved resource's WHOLE stored catalog and settle each entry's
         //    share of the certainty over it. `RELATED_ITEMS` recommends items related
         //    to `itemId`, never the queried item itself, so that item is no candidate
         //    at all — `itemId` is a personalization input, not a selection member.
@@ -306,7 +317,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         });
 
-        // 6. Fill the returned slots: the promotion's share first, then the rest of
+        // 7. Fill the returned slots: the promotion's share first, then the rest of
         //    the ranking. Both are drawn in descending-score order, and the chosen
         //    positions are re-sorted so the response stays in that order.
         let mut chosen: Vec<(usize, bool)> = Vec::new();

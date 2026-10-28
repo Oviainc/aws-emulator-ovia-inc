@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAggregateDiscoveredResources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAggregateDiscoveredResources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! The AGGREGATOR's view of the discovered-resource inventory: the resources of one
+//! resource type an aggregator aggregates, each named by the source account and Region
+//! it was recorded in.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAggregateDiscoveredResources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What it reports is the SAME inventory the account's own discovered-resource read
+//! projects — the one a running configuration recorder writes — narrowed to the sources
+//! the aggregator's scope takes in and to whatever the request's `Filters` ask for. This
+//! store stands for one account in one Region, so the only source it can report is that
+//! account in the Region the request is signed for.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +173,140 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAggregateDiscoveredResources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAggregateDiscoveredResourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAggregateDiscoveredResources"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // A limit outside the allowable range is what `InvalidLimitException` reports.
+        // The modelled range refuses one before this handler runs; the check stands so
+        // the condition answers this operation's own modelled error either way.
+        if !(0..=crate::state::DISCOVERED_RESOURCES_MAX_LIMIT).contains(&input.limit) {
+            return Err(
+                ListAggregateDiscoveredResourcesErrorModeled::InvalidLimitException(
+                    InvalidLimitException {
+                        message: Some(format!(
+                            "Limit {} is outside the allowable range 0..{}",
+                            input.limit,
+                            crate::state::DISCOVERED_RESOURCES_MAX_LIMIT,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // "If you specify 0, Config uses the default."
+        let page_size = if input.limit == 0 {
+            crate::state::DISCOVERED_RESOURCES_DEFAULT_LIMIT
+        } else {
+            input.limit
+        } as usize;
+
+        // The token is opaque: anything this operation did not issue is malformed.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(resume_at) => Some(resume_at),
+                None => {
+                    return Err(
+                        ListAggregateDiscoveredResourcesErrorModeled::InvalidNextTokenException(
+                            InvalidNextTokenException {
+                                message: Some(
+                                    crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            },
+        };
+
+        // This store stands for ONE account in ONE Region, so the resources it can
+        // report are this account's, in the Region the request is signed for.
+        let account_id = ::emulator_server::emulator_account_id();
+        let region = crate::state::request_region(ctx);
+        let store = state.lock();
+
+        let Some(aggregator) = store
+            .configuration_aggregators
+            .get(&input.configuration_aggregator_name)
+        else {
+            return Err(
+                ListAggregateDiscoveredResourcesErrorModeled::NoSuchConfigurationAggregatorException(
+                    NoSuchConfigurationAggregatorException {
+                        message: Some(
+                            crate::state::NO_SUCH_CONFIGURATION_AGGREGATOR_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Nothing of this store is aggregated when its source sits outside the
+        // aggregator's scope, or when the type asked about is one the aggregator does
+        // not take in — and "you can narrow the results to include only resources that
+        // have specific resource IDs, or a resource name, or source account ID, or
+        // source region", so a filter naming any other source narrows this store away
+        // too.
+        let filters = input.filters.unwrap_or_default();
+        let in_scope = aggregator.aggregates_source(account_id, &region)
+            && aggregator.aggregates_resource_type(&input.resource_type)
+            && filters
+                .account_id
+                .as_deref()
+                .is_none_or(|filtered| filtered == account_id)
+            && filters
+                .region
+                .as_deref()
+                .is_none_or(|filtered| filtered == region);
+
+        // Page over the inventory's own ordering, so a token holds the resource id the
+        // next page resumes at and survives resources recorded or deleted between
+        // pages. One type is in play and the inventory is keyed by `(type, id)`, so the
+        // candidates are contiguous and ordered by resource id.
+        let mut identifiers = Vec::new();
+        let mut next_token = None;
+        let inventory = in_scope.then(|| &store.discovered_resources);
+        for ((resource_type, resource_id), entry) in inventory.into_iter().flatten() {
+            if resource_type != &input.resource_type {
+                continue;
+            }
+            if resume_at
+                .as_ref()
+                .is_some_and(|resume_at| resource_id < resume_at)
+            {
+                continue;
+            }
+            // An aggregate read reports the resources an aggregator holds data for, and
+            // "the API does not return results for deleted resources".
+            if entry.deleted_at.is_some() {
+                continue;
+            }
+            if filters
+                .resource_id
+                .as_deref()
+                .is_some_and(|filtered| filtered != resource_id)
+            {
+                continue;
+            }
+            if filters
+                .resource_name
+                .as_deref()
+                .is_some_and(|filtered| entry.resource_name.as_deref() != Some(filtered))
+            {
+                continue;
+            }
+            if identifiers.len() == page_size {
+                next_token = Some(crate::state::encode_page_token(resource_id));
+                break;
+            }
+            identifiers.push(entry.to_aggregate_identifier(account_id, &region));
+        }
+
+        Ok(ListAggregateDiscoveredResourcesOutput {
+            resource_identifiers: Some(identifiers),
+            next_token,
+        })
     }
 }

@@ -3213,6 +3213,12 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// so a pagination token can name the id the next page starts at.
     pub application_status_checks:
         BTreeMap<String, crate::ops::types::ApplicationStatusCheckResponseObject>,
+    /// A `CreateApplicationStatusCheck` `ClientToken` and the `ApplicationStatusCheckId` it
+    /// minted, so a repeat of the same request reports that check instead of creating a
+    /// second one: "If you retry a request with the same token, the service ignores the
+    /// request but does not return an error"
+    /// (`CreateApplicationStatusCheckRequest$ClientToken`).
+    pub application_status_check_client_tokens: HashMap<String, String>,
     /// The Windows fast launch configuration of every image that has one, by `ImageId` —
     /// see the module docs. Ordered by id, which is the order
     /// `DescribeFastLaunchImages` reports and pages over.
@@ -3931,6 +3937,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             application_status: BTreeMap::new(),
             instance_status_reports: BTreeMap::new(),
             application_status_checks: BTreeMap::new(),
+            application_status_check_client_tokens: HashMap::new(),
             fast_launch_images: BTreeMap::new(),
             store_image_tasks: BTreeMap::new(),
             addresses: BTreeMap::new(),
@@ -16251,9 +16258,10 @@ impl ComAmazonawsEc2Amazonec2State {
 // Application status checks: the configurations `DescribeApplicationStatusChecks` reports
 // ---------------------------------------------------------------------------
 
-/// This service's application status CHECK slice: the store's id prefix, the refusal a
-/// request naming an unknown check answers, and what tells an active check from one inside
-/// its deletion grace period. A SUBMODULE, so that surface grows without touching the parts
+/// This service's application status CHECK slice: the store's id prefix, the documented
+/// defaults and bounds a create fills in and enforces, the quota it asks about, the refusal a
+/// request naming an unknown check answers, and what tells an active check from one inside its
+/// deletion grace period. A SUBMODULE, so that surface grows without touching the parts
 /// of this file the other resource kinds own; `pub use` keeps every name reachable as
 /// `crate::state::<name>`, which is where each handler names it.
 pub mod application_status_checks;

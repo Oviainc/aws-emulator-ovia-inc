@@ -992,8 +992,10 @@ pub struct Identity {
     pub identity_id: String,
     pub identity_pool_id: String,
     pub logins: Vec<String>,
-    /// Whether an unlink has already taken every login provider off this identity, which is
-    /// what makes it a DISABLED one: the record survives, reachable through no login at all
+    /// Whether every login provider has already been taken off this identity by a call that
+    /// takes logins away — an unlink of the last one, or a merge that moved them onto the
+    /// identity it merged this one into — which is what makes it a DISABLED one: the record
+    /// survives, reachable through no login at all
     /// ("removing the last linked login will make this identity inaccessible"), and that is
     /// a different state from an identity that never carried a login — see
     /// [`Identity::is_disabled`].
@@ -1003,8 +1005,8 @@ pub struct Identity {
 }
 
 impl Identity {
-    /// Whether this identity is a DISABLED one: an unlink took its logins off it and none
-    /// has been linked since, so nothing resolves to it.
+    /// Whether this identity is a DISABLED one: an unlink or a merge took its logins off it
+    /// and none has been linked since, so nothing resolves to it.
     pub fn is_disabled(&self) -> bool {
         self.disabled && self.logins.is_empty()
     }
@@ -1012,7 +1014,7 @@ impl Identity {
     /// The `Logins` list every read of this identity reports — `DescribeIdentity` and the
     /// descriptions `ListIdentities` pages — which is the provider names it is linked to,
     /// and for a DISABLED one the single [`DISABLED_LOGIN_PROJECTION`] sentinel standing in
-    /// place of the providers the unlink removed.
+    /// place of the providers that were taken off it.
     pub fn projected_logins(&self) -> Vec<String> {
         if self.is_disabled() {
             return vec![DISABLED_LOGIN_PROJECTION.to_string()];
@@ -1321,10 +1323,17 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
     /// Every login `merged_away` was reached through — its developer user identifiers and
     /// its federated logins alike — now resolves to `survivor`, which is left linked to the
     /// union of the two provider sets and stamped with `now` as the instant it changed. The
-    /// two users are one user afterwards, so `merged_away` is no longer an identity of the
-    /// pool: what named only it goes with it, the credentials outstanding for it and the
-    /// OpenID Connect tokens issued for it, exactly as [`Self::delete_identity_pool`] gives
-    /// up what named the identities it removed.
+    /// two users are one user afterwards, so nothing reaches `merged_away` any more: the
+    /// credentials outstanding for it and the OpenID Connect tokens issued for it spoke for
+    /// a user that is now reached through `survivor` alone, so they are given up.
+    ///
+    /// The RECORD of `merged_away` nevertheless stays stored, in `identities` and in the
+    /// pool's listing order, with its logins emptied and `disabled` set: a merge takes the
+    /// logins off an identity, it does not remove the identity, so what is left is exactly
+    /// the DISABLED identity an unlink of the last login leaves ([`Identity::is_disabled`])
+    /// — still described by a read of its id, still reported by a listing that hides no
+    /// disabled identity, and hidden from one that hides them. Removing the record is
+    /// [`Self::delete_identity`]'s own effect, which no other transition borrows.
     ///
     /// Both identities have to be the named pool's own, which is what the caller resolved
     /// them through: an identity belongs to the pool that minted it and never moves, so a
@@ -1348,14 +1357,19 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
         for (provider, login) in self.pool_logins_of_identity(identity_pool_id, merged_away) {
             self.link_login(identity_pool_id, &provider, &login, survivor);
         }
-        let absorbed = self
-            .identities
-            .remove(merged_away)
-            .map(|identity| identity.logins)
-            .unwrap_or_default();
-        if let Some(identities) = self.identities_by_pool.get_mut(identity_pool_id) {
-            identities.retain(|identity_id| identity_id != merged_away);
-        }
+        // The merged-away identity keeps its place in the store and in the pool's listing
+        // order; what the merge takes off it is its logins, which the survivor carries from
+        // here on. An identity left linked to nothing is a DISABLED one, so that is the
+        // state the record is stamped with, at the instant the merge changed it.
+        let absorbed = match self.identities.get_mut(merged_away) {
+            Some(identity) => {
+                let absorbed = ::std::mem::take(&mut identity.logins);
+                identity.disabled = true;
+                identity.last_modified_date = now;
+                absorbed
+            }
+            None => Vec::new(),
+        };
         if let Some(identity) = self.identities.get_mut(survivor) {
             for provider in absorbed {
                 if !identity.logins.contains(&provider) {
@@ -1609,11 +1623,12 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
     /// credentials the caller must now forget. `None` when this service holds no such
     /// identity, so nothing was written.
     ///
-    /// The same teardown [`Self::delete_identity_pool`] does for every identity of a pool
-    /// and [`Self::merge_identity_into`] does for the identity a merge gave up: once the
-    /// identity is gone, a login that resolved to it resolves nothing (so presenting it
-    /// again is a NEW user), a listing of the pool no longer names it, and the credentials
-    /// and tokens that spoke for it speak for nobody.
+    /// The same teardown [`Self::delete_identity_pool`] does for every identity of a pool:
+    /// once the identity is gone, a login that resolved to it resolves nothing (so
+    /// presenting it again is a NEW user), a listing of the pool no longer names it, and the
+    /// credentials and tokens that spoke for it speak for nobody. Removing the record is
+    /// this transition's own: a merge gives an identity's LOGINS up, not the record, and
+    /// leaves it stored as a disabled one ([`Self::merge_identity_into`]).
     pub fn delete_identity(&mut self, identity_id: &str) -> Option<Vec<String>> {
         let identity = self.identities.remove(identity_id)?;
         if let Some(identities) = self.identities_by_pool.get_mut(&identity.identity_pool_id) {

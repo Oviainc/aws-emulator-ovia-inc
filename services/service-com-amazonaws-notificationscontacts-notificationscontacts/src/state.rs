@@ -191,6 +191,67 @@ where
     }
 }
 
+/// The modelled `EmailContactName` pattern, verbatim
+/// (`smithy_query(query="shape",shape="EmailContactName")`).
+///
+/// Stated here because this one, too, has to be applied by hand: see
+/// [`satisfies_email_contact_name_pattern`].
+pub const EMAIL_CONTACT_NAME_PATTERN: &str = r"[\w-.~]+";
+
+/// The characters [`EMAIL_CONTACT_NAME_PATTERN`]'s class admits BESIDE `\w`.
+///
+/// A Smithy `@pattern` is an ECMA-262 regular expression, and there a `-` between two
+/// class items that are not both single characters is a LITERAL `-` rather than a range
+/// operator — so `[\w-.~]` is the union of `\w`, `-`, `.` and `~`, the unreserved
+/// characters of a URI. The `regex` crate reads the same text as the range `\w`-`.`,
+/// whose start is not a single codepoint, so it refuses to compile it at all.
+pub const EMAIL_CONTACT_NAME_LITERAL_CHARS: [char; 3] = ['-', '.', '~'];
+
+/// Whether `character` is one [`EMAIL_CONTACT_NAME_PATTERN`]'s class admits: an ECMA-262
+/// `\w` — an ASCII letter, an ASCII digit or an underscore, that class being ASCII-only
+/// there, so a letter of another script is not one — or one of
+/// [`EMAIL_CONTACT_NAME_LITERAL_CHARS`].
+fn is_email_contact_name_char(character: char) -> bool {
+    character.is_ascii_alphanumeric()
+        || character == '_'
+        || EMAIL_CONTACT_NAME_LITERAL_CHARS.contains(&character)
+}
+
+/// Whether `name` satisfies the modelled `EmailContactName` `@pattern`
+/// ([`EMAIL_CONTACT_NAME_PATTERN`]).
+///
+/// This modelled constraint cannot be left to the framework's centralized constraint
+/// walk either: the walk compiles a `@pattern` with the `regex` crate, which rejects this
+/// expression's character class outright (see [`EMAIL_CONTACT_NAME_LITERAL_CHARS`]), and
+/// a `@pattern` that fails to compile is treated there as matching EVERY value. So the
+/// expression is applied here instead, by the one operation that accepts a name
+/// (`CreateEmailContact`), as the class it is: every character of the value is one
+/// [`is_email_contact_name_char`] admits, and the `+` quantifier wants at least one of
+/// them (the member's own `@length` 1..64 refuses an empty value at the boundary too).
+///
+/// It holds over the WHOLE value, which is what the service enforces: a value merely
+/// CARRYING a run of admitted characters — `oncall primary`, say — is refused, the way
+/// the modelled expression's own anchored siblings are.
+pub fn satisfies_email_contact_name_pattern(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(is_email_contact_name_char)
+}
+
+/// `Ok` when `name` satisfies the modelled `EmailContactName` `@pattern`, else the
+/// modelled 400 for the input member it arrived through.
+///
+/// `member` is the member the caller named, so the refusal blames what the request wrote
+/// rather than the shape behind it.
+pub fn check_email_contact_name(member: &str, name: &str) -> Result<(), ValidationException> {
+    if satisfies_email_contact_name_pattern(name) {
+        return Ok(());
+    }
+    Err(pattern_validation_failure(
+        member,
+        EMAIL_CONTACT_NAME_PATTERN,
+        name,
+    ))
+}
+
 /// The most email contacts this emulator will hold.
 ///
 /// Emulator resource guard, NOT a published AWS quota: every record is created by a
@@ -459,6 +520,47 @@ pub fn field_validation_failure(member: &str, why: &str) -> ValidationException 
         field_list: Some(vec![ValidationExceptionField {
             name: member.to_string(),
             message: why.to_string(),
+        }]),
+    }
+}
+
+/// What the framework's constraint clause puts between the value it echoes and the
+/// requirement that value broke, so the requirement half can be read back off it.
+const CONSTRAINT_CLAUSE_SEPARATOR: &str = " failed to satisfy constraint: ";
+
+/// The modelled 400 for a `value` outside the `@pattern` its member declares.
+///
+/// The sentence is NOT written here: the violation is handed to the framework's own
+/// renderer, so a `@pattern` this service has to apply itself is refused in exactly the
+/// words the centralized walk uses for a `@pattern` it could apply — the envelope, the
+/// member path, the value the request submitted and the expression the model declares —
+/// and `fieldList` blames the member with the requirement half of that same clause.
+///
+/// The echoed value is bounded by the member's own modelled `@length` maximum, which the
+/// walk has already applied by the time a handler runs, so one clause cannot carry
+/// request-sized content.
+pub fn pattern_validation_failure(
+    member: &str,
+    pattern: &str,
+    value: &str,
+) -> ValidationException {
+    let violation = ::aws_smithy_schema_server::Violation {
+        path: member.to_string(),
+        kind: ::aws_smithy_schema_server::ViolationKind::Pattern(pattern.to_string()),
+        value: Some(value.to_string()),
+    };
+    let clause = violation.message();
+    let requirement = clause
+        .split_once(CONSTRAINT_CLAUSE_SEPARATOR)
+        .map_or(clause.as_str(), |(_, requirement)| requirement)
+        .to_string();
+    ValidationException {
+        message: ::aws_smithy_schema_server::envelope(std::slice::from_ref(&violation))
+            .unwrap_or(clause),
+        reason: VALIDATION_REASON_FIELD.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message: requirement,
         }]),
     }
 }

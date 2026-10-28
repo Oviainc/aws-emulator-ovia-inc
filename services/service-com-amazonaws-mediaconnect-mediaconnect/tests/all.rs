@@ -185,3 +185,5 @@ mod router_tier_bitrate_rule;
 mod router_input_stop;
 #[path = "all/router_output_take_input.rs"]
 mod router_output_take_input;
+#[path = "all/failover_primary_source.rs"]
+mod failover_primary_source;

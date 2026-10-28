@@ -77,6 +77,8 @@ mod delete_connection;
 mod delete_dependency_refusal;
 #[path = "all/delete_device.rs"]
 mod delete_device;
+#[path = "all/delete_global_network_transit_gateway_precondition.rs"]
+mod delete_global_network_transit_gateway_precondition;
 #[path = "all/delete_link.rs"]
 mod delete_link;
 #[path = "all/delete_peering.rs"]

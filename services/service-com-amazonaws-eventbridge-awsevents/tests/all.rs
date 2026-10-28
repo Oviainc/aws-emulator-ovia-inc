@@ -49,6 +49,8 @@ mod global_endpoint_identity;
 mod implicit_default_bus;
 #[path = "all/input_validation.rs"]
 mod input_validation;
+#[path = "all/kinesis_partition_key_json_text.rs"]
+mod kinesis_partition_key_json_text;
 #[path = "all/kinesis_target_delivery.rs"]
 mod kinesis_target_delivery;
 #[path = "all/kinesis_target_stream_consumption.rs"]

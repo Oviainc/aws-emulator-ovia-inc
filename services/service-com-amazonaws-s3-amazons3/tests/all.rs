@@ -115,6 +115,8 @@ mod multipart_part_upload;
 mod multipart_upload_abort;
 #[path = "all/multipart_upload_completion.rs"]
 mod multipart_upload_completion;
+#[path = "all/multipart_upload_event_notifications.rs"]
+mod multipart_upload_event_notifications;
 #[path = "all/multipart_upload_initiation.rs"]
 mod multipart_upload_initiation;
 #[path = "all/multipart_upload_listing.rs"]

@@ -31,6 +31,8 @@ mod campaign_entry_limits_deletion;
 mod campaign_flow_association;
 #[path = "all/campaign_lifecycle.rs"]
 mod campaign_lifecycle;
+#[path = "all/campaign_lifecycle_is_one_rule.rs"]
+mod campaign_lifecycle_is_one_rule;
 #[path = "all/campaign_name_uniqueness.rs"]
 mod campaign_name_uniqueness;
 #[path = "all/campaign_not_found_message.rs"]

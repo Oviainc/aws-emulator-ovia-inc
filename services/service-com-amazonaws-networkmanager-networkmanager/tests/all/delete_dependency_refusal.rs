@@ -26,7 +26,13 @@ use crate::link_lifecycle::{create_link_ok, plain_link};
 /// Every dependent kind a `DeleteGlobalNetwork` / `DeleteSite` refusal can name, as the
 /// refusal spells it (the ARN resource type read as words). Used to assert that a refusal
 /// names the kinds that block it and NONE of the others.
-const DEPENDENT_LABELS: [&str; 4] = ["device", "link", "site", "core network"];
+pub(crate) const DEPENDENT_LABELS: [&str; 5] = [
+    "device",
+    "link",
+    "site",
+    "transit gateway registration",
+    "core network",
+];
 
 /// One row of the `DeleteGlobalNetwork` table: the children to put in a fresh global
 /// network, and the kinds the refusal must then name.
@@ -153,7 +159,7 @@ async fn build_network(emulator: &Emulator, case: &NetworkCase) -> (String, Vec<
 
 /// Assert `body` is the dependency refusal: HTTP 400, `ValidationException`, naming every
 /// kind in `blocking` and no other dependent kind, with no field at fault.
-fn assert_dependency_refusal(
+pub(crate) fn assert_dependency_refusal(
     case: &str,
     parent_label: &str,
     status: u16,
