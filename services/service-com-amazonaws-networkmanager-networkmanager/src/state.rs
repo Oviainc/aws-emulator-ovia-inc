@@ -364,7 +364,8 @@ pub fn resource_not_found(kind: &str, id: &str) -> ResourceNotFoundException {
 }
 
 /// The field names this service reports in `ValidationException$Fields[].Name` for the
-/// parent reference a create carries.
+/// reference a request carries — the parent a create hangs its new resource off, or the
+/// resource a reporting operation is addressed through.
 ///
 /// Network Manager names the offending REQUEST MEMBER in its own lowerCamelCase field
 /// naming, not in the wire (PascalCase) spelling: a recording of `CreateSite` under an
@@ -491,9 +492,9 @@ pub fn requested_reference(supplied: Option<&str>) -> Option<Option<&str>> {
     supplied.map(|id| optional_reference(Some(id)))
 }
 
-/// The modelled `ValidationException` (HTTP 400) a create answers when one of the
-/// references its input carries — the parent the new resource must hang off — names no
-/// stored resource.
+/// The modelled `ValidationException` (HTTP 400) an operation answers when a reference
+/// its input carries — the parent a new resource must hang off, or the resource a
+/// reporting operation is addressed through — names no stored resource.
 ///
 /// A create validates its input before anything is minted, so a reference that resolves
 /// to nothing is a FIELD failure on the member that carried it rather than a missing
@@ -501,6 +502,13 @@ pub fn requested_reference(supplied: Option<&str>) -> Option<Option<&str>> {
 /// that member (see [`FIELD_GLOBAL_NETWORK_ID`]). The prose is the one the recordings
 /// show — "<Kind> not found." for the kind the member references, from [`kind_label`] —
 /// and is repeated as the field's own message, exactly as recorded.
+///
+/// This is the crate's SINGLE construction for an unresolvable reference refused as a
+/// validation failure, so one service reports one field name and one message for the same
+/// member whichever operation refused it. An operation that MODELS
+/// `ResourceNotFoundException` answers the absent resource with that 404 instead (see
+/// [`resource_not_found`]); one that does not — a reporting operation whose only client
+/// error is the `ValidationException` — refuses the reference through here.
 ///
 /// `member` is the field name the refusal reports; `kind` is the resource kind the
 /// member references ([`GLOBAL_NETWORK_KIND`], [`SITE_KIND`], [`CORE_NETWORK_KIND`]).

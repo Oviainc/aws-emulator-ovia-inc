@@ -183,6 +183,8 @@ mod transit_gateway_route_table_attachment;
 mod transit_gateway_route_table_attachment_lifecycle;
 #[path = "all/unknown_parent_reference.rs"]
 mod unknown_parent_reference;
+#[path = "all/unresolvable_reference_field_naming.rs"]
+mod unresolvable_reference_field_naming;
 #[path = "all/update_core_network.rs"]
 mod update_core_network;
 #[path = "all/update_device.rs"]

@@ -198,20 +198,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // lists only AccessDenied / InternalServer / Throttling / Validation), so an
         // unknown global network is refused on the `GlobalNetworkId` member with the
         // modelled 400 — reporting an inventory for a global network the store does not
-        // hold would state a resource tree that does not exist.
+        // hold would state a resource tree that does not exist. The refusal is built by
+        // `crate::state::unknown_reference`, this crate's single construction for a
+        // reference that names no stored resource, so the member it reports is the
+        // service's own lowerCamelCase field name and the prose is the one constant every
+        // other operation of this service answers for the same unresolvable member.
         if !store.global_networks.contains_key(&input.global_network_id) {
             return Err(GetNetworkResourceCountsErrorModeled::ValidationException(
-                ValidationException {
-                    message: format!(
-                        "GlobalNetworkId {} does not name a global network of this account",
-                        input.global_network_id
-                    ),
-                    reason: Some("FieldValidationFailed".to_string()),
-                    fields: Some(vec![ValidationExceptionField {
-                        name: "GlobalNetworkId".to_string(),
-                        message: "must name an existing global network".to_string(),
-                    }]),
-                },
+                crate::state::unknown_reference(
+                    crate::state::FIELD_GLOBAL_NETWORK_ID,
+                    crate::state::GLOBAL_NETWORK_KIND,
+                ),
             )
             .into());
         }
