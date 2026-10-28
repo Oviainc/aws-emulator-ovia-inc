@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tags the Kinesis resource the request's `ResourceARN` names carries in
+//! `crate::state`'s stores — what `CreateStream`, `AddTagsToStream`, `TagResource` and
+//! `CreateChannel` wrote — as the modelled `Tags` list ordered by key. A pure read: nothing
+//! it does changes what a later caller sees, and a resource carrying no tags is reported as
+//! the empty list rather than refused.
+//!
+//! A `ResourceARN` addresses a resource of EITHER kind this service holds (its pattern is
+//! `^arn:aws.*:kinesis:.*:\d{12}:.*(stream|channel)/\S+$`), and a stream and a channel each
+//! carry ONE stored tag set, so the ARN is resolved across both kinds through the one lookup
+//! that spans them
+//! ([`crate::state::ComAmazonawsKinesisKinesis20131202State::resource_tags_by_arn`]): the
+//! set this read reports is the very set the tag writes of that resource wrote. An ARN this
+//! account and region hold no resource under is the modelled `ResourceNotFoundException`,
+//! worded for the kind that ARN names.
 //!
 //! ## Shape of an operation
 //!
@@ -94,7 +100,15 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-kinesis-kinesis-2013120
 // here — hence the `ListTagsForResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.kinesis#ListTagsForResource")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.kinesis#ListTagsForResource",
+    // `InternalFailureException` is widened in with `extra_errors`, exactly as
+    // `ListTagsForStream` widens it: this SERVICE models it ("The processing of the request
+    // failed because of an unknown error, exception, or failure"), the operation shape does
+    // not list it, and it is the only honest answer for a service mounted on an engine that
+    // holds no state for it.
+    extra_errors = ["InternalFailureException"]
+)]
 #[derive(Debug)]
 pub enum ListTagsForResourceErrorModeled {
     AccessDeniedException(AccessDeniedException),
@@ -102,6 +116,7 @@ pub enum ListTagsForResourceErrorModeled {
     LimitExceededException(LimitExceededException),
     ResourceInUseException(ResourceInUseException),
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalFailureException(InternalFailureException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -155,18 +170,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        // A resource "is also scoped by Amazon Web Services Region", so the region the
+        // request was signed for is the region whose resources it addresses.
+        let region = crate::state::request_region(ctx);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListTagsForResourceError::from(
+                ListTagsForResourceErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: Some("the stream store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+
+        let store = state.lock();
+        // `StreamId` is documented "Not Implemented. Reserved for future use", so no
+        // resource carries one and it names nothing: the `ResourceARN` is what this
+        // operation addresses a resource by, whichever kind that ARN names.
+        let tags = store
+            .resource_tags_by_arn(
+                ::std::time::SystemTime::now(),
+                &region,
+                input.resource_arn.as_str(),
+            )
+            .ok_or_else(|| {
+                ListTagsForResourceError::from(
+                    ListTagsForResourceErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(crate::state::resource_not_found_message(
+                                &input.resource_arn,
+                            )),
+                        },
+                    ),
+                )
+            })?;
+
+        // "An array of tags associated with the specified Kinesis resource"
+        // (`ListTagsForResourceOutput$Tags`), which is the EMPTY array for a resource that
+        // carries none — the member is modelled `len 0..200`.
+        Ok(ListTagsForResourceOutput { tags: Some(tags) })
     }
 }
+
