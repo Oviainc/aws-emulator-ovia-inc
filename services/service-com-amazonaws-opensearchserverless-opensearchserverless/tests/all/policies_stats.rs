@@ -8,15 +8,16 @@
 //! codec and the handler all take part, exactly as they do for an SDK client. The harness
 //! is the one `collection_lifecycle` uses; nothing is rebuilt here.
 //!
-//! The rule under test: `GetPoliciesStats` reports, for each policy/configuration TYPE the
-//! response models a counter for, the number of records of that type the account has
-//! stored, and `TotalPolicyCount` as the sum of those counters — so every create raises
-//! exactly one counter and the total by one, every delete lowers them again, and a type the
-//! response models no counter for is never counted under another type's counter. The tables
-//! span what the rule generalises over: the type (every `SecurityPolicyType`, the one
-//! `AccessPolicyType`, the `SecurityConfigType` values with and without a counter, the one
-//! `LifecyclePolicyType`), the direction of the change (create, delete) and the COUNT, from
-//! an empty account up to each resource's own quota.
+//! The rule under test: every counter `GetPoliciesStats` reports is the count its own
+//! member is documented to report — the per-type policy counters count the stored policies
+//! of that one type, and `SecurityConfigStats$SamlConfigCount`, documented as "the number
+//! of security configurations in the current account", counts every stored security
+//! configuration whatever its `SecurityConfigType` — and `TotalPolicyCount` is every policy
+//! and configuration the account holds, so no record the service accepted is missing from
+//! it. The tables span what the rule generalises over: the type (every `SecurityPolicyType`,
+//! the one `AccessPolicyType`, every `SecurityConfigType`, the one `LifecyclePolicyType`),
+//! the direction of the change (create, delete) and the COUNT, from an empty account up to
+//! each resource's own quota.
 
 use std::collections::BTreeMap;
 
@@ -24,6 +25,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::collection_lifecycle::{at, call, emulator, text, CLIENT_ERROR};
+use crate::security_configs::INSTANCE_ARN;
 
 /// A minimal IdP metadata document, as the `security_configs` suite uses it: `samlMetadata`
 /// is `@length(min: 1, max: 51200)` with no structural constraint in the model.
@@ -47,10 +49,21 @@ const LIFECYCLE_POLICY_DOCUMENT: &str =
 /// the response models its own counter for.
 const SECURITY_POLICY_TYPES: [&str; 2] = ["encryption", "network"];
 
+/// Every value `SecurityConfigType` accepts on the wire
+/// (`smithy_query(query="shape", shape="SecurityConfigType")` -> `values`), all of which a
+/// configuration this account holds may carry and which the one configuration counter is
+/// documented to count together.
+const SECURITY_CONFIG_TYPES: [&str; 3] = ["saml", "iamidentitycenter", "iamfederation"];
+
 /// The account's quota for security policies of ONE type, as
 /// `crate::state::MAX_SECURITY_POLICIES_PER_TYPE` records it from AWS's "Quotas for Amazon
 /// OpenSearch Serverless": 20 per type.
 const MAX_SECURITY_POLICIES_PER_TYPE: i64 = 20;
+
+/// The account's quota for security configurations of ONE type, as
+/// `crate::state::MAX_SECURITY_CONFIGS_PER_TYPE` records it from the same quota page: 50
+/// per type.
+const MAX_SECURITY_CONFIGS_PER_TYPE: i64 = 50;
 
 /// Every counter `GetPoliciesStatsResponse` carries, in the one struct a case compares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -61,8 +74,9 @@ struct Counts {
     encryption: i64,
     /// `SecurityPolicyStats$NetworkPolicyCount`.
     network: i64,
-    /// `SecurityConfigStats$SamlConfigCount`.
-    saml: i64,
+    /// `SecurityConfigStats$SamlConfigCount` — the account's security configurations of
+    /// every type, which is what the member is documented to count.
+    configs: i64,
     /// `LifecyclePolicyStats$RetentionPolicyCount`.
     retention: i64,
     /// `TotalPolicyCount`.
@@ -72,14 +86,14 @@ struct Counts {
 impl Counts {
     /// The counts an account holding these records reports, with the total derived from the
     /// parts the way the rule says the service derives it.
-    fn of(data: i64, encryption: i64, network: i64, saml: i64, retention: i64) -> Self {
+    fn of(data: i64, encryption: i64, network: i64, configs: i64, retention: i64) -> Self {
         Self {
             data,
             encryption,
             network,
-            saml,
+            configs,
             retention,
-            total: data + encryption + network + saml + retention,
+            total: data + encryption + network + configs + retention,
         }
     }
 }
@@ -96,7 +110,7 @@ async fn stats(router: &MultiServiceRouter, case: &str) -> Counts {
         data: counter(&answer, "AccessPolicyStats.DataPolicyCount", case),
         encryption: counter(&answer, "SecurityPolicyStats.EncryptionPolicyCount", case),
         network: counter(&answer, "SecurityPolicyStats.NetworkPolicyCount", case),
-        saml: counter(&answer, "SecurityConfigStats.SamlConfigCount", case),
+        configs: counter(&answer, "SecurityConfigStats.SamlConfigCount", case),
         retention: counter(&answer, "LifecyclePolicyStats.RetentionPolicyCount", case),
         total: counter(&answer, "TotalPolicyCount", case),
     }
@@ -127,11 +141,16 @@ enum Step {
     DeleteSecurityConfig { kind: &'static str, name: &'static str },
 }
 
-/// The `samlOptions`/`iamFederationOptions` member a `CreateSecurityConfig` of `kind`
-/// carries, from `CreateSecurityConfigRequest`'s own per-type options members.
+/// The per-type options member a `CreateSecurityConfig` of `kind` carries, from
+/// `CreateSecurityConfigRequest`'s own per-type options members — one per
+/// `SecurityConfigType`, each "required if you specify <type> for the type parameter".
 fn config_options(kind: &str) -> (&'static str, Value) {
     match kind {
         "saml" => ("samlOptions", json!({ "metadata": SAML_METADATA })),
+        "iamidentitycenter" => (
+            "iamIdentityCenterOptions",
+            json!({ "instanceArn": INSTANCE_ARN }),
+        ),
         "iamfederation" => ("iamFederationOptions", json!({ "userAttribute": "Email" })),
         other => panic!("the suite drives no SecurityConfigType {other:?}"),
     }
@@ -212,11 +231,12 @@ async fn an_account_holding_nothing_reports_every_counter_at_zero() {
 }
 
 #[tokio::test]
-async fn every_counter_tracks_the_stored_records_of_its_own_type() {
+async fn every_counter_tracks_the_records_it_is_documented_to_count() {
     // Each row is one change and the counts the account reports once it is applied: the
-    // table walks every type the response counts, in both directions, and includes a
-    // security configuration of a type the response models NO counter for.
-    let table: [(&str, Step, Counts); 14] = [
+    // table walks every policy type the response counts a type at a time, in both
+    // directions, and every `SecurityConfigType` under the one account-wide configuration
+    // counter.
+    let table: [(&str, Step, Counts); 16] = [
         (
             "the first encryption policy",
             Step::CreateSecurityPolicy { kind: "encryption", name: "enc-one" },
@@ -248,33 +268,43 @@ async fn every_counter_tracks_the_stored_records_of_its_own_type() {
             Counts::of(2, 2, 1, 1, 0),
         ),
         (
-            "an IAM-federation configuration, a type with no counter of its own",
+            "an IAM-federation configuration, which the account-wide configuration counter follows too",
             Step::CreateSecurityConfig { kind: "iamfederation", name: "fed-one" },
-            Counts::of(2, 2, 1, 1, 0),
+            Counts::of(2, 2, 1, 2, 0),
+        ),
+        (
+            "an IAM Identity Center configuration",
+            Step::CreateSecurityConfig { kind: "iamidentitycenter", name: "idc-one" },
+            Counts::of(2, 2, 1, 3, 0),
         ),
         (
             "a second SAML security configuration",
             Step::CreateSecurityConfig { kind: "saml", name: "saml-two" },
-            Counts::of(2, 2, 1, 2, 0),
+            Counts::of(2, 2, 1, 4, 0),
         ),
         (
             "a retention lifecycle policy",
             Step::CreateLifecyclePolicy { name: "retain-one" },
-            Counts::of(2, 2, 1, 2, 1),
+            Counts::of(2, 2, 1, 4, 1),
         ),
         (
             "a second retention lifecycle policy",
             Step::CreateLifecyclePolicy { name: "retain-two" },
-            Counts::of(2, 2, 1, 2, 2),
+            Counts::of(2, 2, 1, 4, 2),
         ),
         (
             "deleting one SAML configuration",
             Step::DeleteSecurityConfig { kind: "saml", name: "saml-one" },
-            Counts::of(2, 2, 1, 1, 2),
+            Counts::of(2, 2, 1, 3, 2),
         ),
         (
-            "deleting the IAM-federation configuration, which no counter followed",
+            "deleting the IAM-federation configuration",
             Step::DeleteSecurityConfig { kind: "iamfederation", name: "fed-one" },
+            Counts::of(2, 2, 1, 2, 2),
+        ),
+        (
+            "deleting the IAM Identity Center configuration",
+            Step::DeleteSecurityConfig { kind: "iamidentitycenter", name: "idc-one" },
             Counts::of(2, 2, 1, 1, 2),
         ),
         (
@@ -301,26 +331,53 @@ async fn every_counter_tracks_the_stored_records_of_its_own_type() {
     }
 }
 
+/// One row of the count table: the case name, the stored data, encryption and network
+/// policy counts, the stored configuration count of each `SecurityConfigType` in
+/// [`SECURITY_CONFIG_TYPES`] order, and the stored retention policy count.
+type CountRow = (&'static str, i64, i64, i64, [i64; 3], i64);
+
 #[tokio::test]
-async fn the_total_is_the_sum_of_the_counters_at_every_count_up_to_the_quota() {
+async fn the_total_counts_every_stored_record_at_every_count_up_to_the_quota() {
     // Rows differ in the COUNT of each type, from none at all to each type's own quota
     // bound: the counters are counts of stored records, not a flag that something exists.
-    let table: [(&str, i64, i64, i64, i64, i64); 5] = [
-        ("nothing stored", 0, 0, 0, 0, 0),
-        ("one record of one type", 0, 1, 0, 0, 0),
-        ("a different count per type", 3, 1, 2, 4, 5),
-        ("one of everything", 1, 1, 1, 1, 1),
+    // The security configurations are counted PER TYPE here and expected to add up under
+    // the one account-wide configuration counter.
+    let table: [CountRow; 7] = [
+        ("nothing stored", 0, 0, 0, [0, 0, 0], 0),
+        ("one record of one type", 0, 1, 0, [0, 0, 0], 0),
+        ("a different count per type", 3, 1, 2, [4, 2, 1], 5),
+        ("one of everything", 1, 1, 1, [1, 1, 1], 1),
+        (
+            "configurations of the two non-SAML types only",
+            0,
+            0,
+            0,
+            [0, 3, 2],
+            0,
+        ),
         (
             "both security policy types at their quota",
             2,
             MAX_SECURITY_POLICIES_PER_TYPE,
             MAX_SECURITY_POLICIES_PER_TYPE,
-            1,
+            [1, 1, 1],
             2,
+        ),
+        (
+            "every security configuration type at its quota",
+            0,
+            0,
+            0,
+            [
+                MAX_SECURITY_CONFIGS_PER_TYPE,
+                MAX_SECURITY_CONFIGS_PER_TYPE,
+                MAX_SECURITY_CONFIGS_PER_TYPE,
+            ],
+            0,
         ),
     ];
 
-    for (what, data, encryption, network, saml, retention) in table {
+    for (what, data, encryption, network, configs, retention) in table {
         let router = emulator();
         let mut config_ids = BTreeMap::new();
         for index in 0..data {
@@ -341,14 +398,16 @@ async fn the_total_is_the_sum_of_the_counters_at_every_count_up_to_the_quota() {
                 .await;
             }
         }
-        for index in 0..saml {
-            let name = leaked(format!("saml-{index}"));
-            apply(
-                &router,
-                Step::CreateSecurityConfig { kind: "saml", name },
-                &mut config_ids,
-            )
-            .await;
+        for (kind, wanted) in SECURITY_CONFIG_TYPES.into_iter().zip(configs) {
+            for index in 0..wanted {
+                let name = leaked(format!("cfg-{kind}-{index}"));
+                apply(
+                    &router,
+                    Step::CreateSecurityConfig { kind, name },
+                    &mut config_ids,
+                )
+                .await;
+            }
         }
         for index in 0..retention {
             let name = leaked(format!("retain-{index}"));
@@ -356,10 +415,74 @@ async fn the_total_is_the_sum_of_the_counters_at_every_count_up_to_the_quota() {
         }
 
         let observed = stats(&router, what).await;
-        let expected = Counts::of(data, encryption, network, saml, retention);
+        let expected = Counts::of(
+            data,
+            encryption,
+            network,
+            configs.iter().sum::<i64>(),
+            retention,
+        );
         assert_eq!(
             observed, expected,
             "case {what}: expected {expected:?}, got {observed:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_configuration_of_any_type_raises_the_configuration_counter_and_the_total() {
+    // One row per `SecurityConfigType` value, each driven on its own account: a
+    // configuration the service accepted is one the account holds, so whichever type it
+    // carries it is counted among the account's security configurations and in the
+    // account-wide total.
+    for kind in SECURITY_CONFIG_TYPES {
+        let router = emulator();
+        let mut config_ids = BTreeMap::new();
+        let before = stats(&router, kind).await;
+        assert_eq!(
+            before,
+            Counts::default(),
+            "case {kind}: a fresh account must report every counter at zero, got {before:?}"
+        );
+
+        let name = leaked(format!("cfg-{kind}"));
+        apply(
+            &router,
+            Step::CreateSecurityConfig { kind, name },
+            &mut config_ids,
+        )
+        .await;
+        let created = stats(&router, kind).await;
+        assert_eq!(
+            created,
+            Counts::of(0, 0, 0, 1, 0),
+            "case {kind}: the created configuration must be counted once and in the total, got {created:?}"
+        );
+
+        // The configuration the account holds is readable, so the counter is reporting a
+        // record that is really there rather than a number of its own.
+        let id = config_ids
+            .get(&(kind.to_string(), name.to_string()))
+            .cloned()
+            .unwrap_or_else(|| panic!("case {kind}: the create recorded no id"));
+        let read = accept(&router, "GetSecurityConfig", json!({ "id": id.clone() })).await;
+        assert_eq!(
+            text(&read, "securityConfigDetail.type"),
+            kind,
+            "case {kind}: GetSecurityConfig must answer the stored configuration, got {read}"
+        );
+
+        apply(
+            &router,
+            Step::DeleteSecurityConfig { kind, name },
+            &mut config_ids,
+        )
+        .await;
+        let deleted = stats(&router, kind).await;
+        assert_eq!(
+            deleted,
+            Counts::default(),
+            "case {kind}: deleting the configuration must lower the counter and the total, got {deleted:?}"
         );
     }
 }

@@ -2,9 +2,11 @@
 
 //! @op GetPoliciesStats
 //! IMPLEMENTED: counts the policies and configurations this account has stored in
-//! [`crate::state`] — one counter per policy/configuration TYPE, as the response shape
-//! models it — and reports their sum as `TotalPolicyCount`. A pure read: it writes
-//! nothing, so two calls with no write between them answer the same numbers.
+//! [`crate::state`] — each counter counting what its own member is documented to count,
+//! per policy type where the member names one and account-wide for the security
+//! configurations — and reports every stored policy and configuration as
+//! `TotalPolicyCount`. A pure read: it writes nothing, so two calls with no write between
+//! them answer the same numbers.
 //!
 //! ## Shape of an operation
 //!
@@ -153,35 +155,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Every counter is a COUNT of the records this service stores, so a create is
-        // visible in the next call's numbers and a delete is visible by its absence. The
-        // response models one counter per type value, so each counter counts exactly its
-        // own type: a configuration of a type the response models no counter for is not
-        // reported under another type's counter.
+        // visible in the next call's numbers and a delete is visible by its absence. Each
+        // counter counts what its own member is documented to count: the three counters
+        // documented per policy TYPE (`DataPolicyCount`, `EncryptionPolicyCount` and
+        // `NetworkPolicyCount`, `RetentionPolicyCount`) count the stored policies of that
+        // one type, while `SamlConfigCount` is documented as "the number of security
+        // configurations in the current account" and so counts every stored configuration,
+        // whichever `SecurityConfigType` it carries.
         let (
             data_policy_count,
             encryption_policy_count,
             network_policy_count,
             saml_config_count,
             retention_policy_count,
+            total_policy_count,
         ) = {
             let store = state.lock();
             (
                 counter(store.access_policy_count_of(crate::state::ACCESS_POLICY_DATA)),
-                counter(store.security_policy_count(crate::state::SECURITY_POLICY_ENCRYPTION)),
-                counter(store.security_policy_count(crate::state::SECURITY_POLICY_NETWORK)),
-                counter(store.security_config_count(crate::state::SECURITY_CONFIG_SAML)),
+                counter(store.security_policy_count_of(crate::state::SECURITY_POLICY_ENCRYPTION)),
+                counter(store.security_policy_count_of(crate::state::SECURITY_POLICY_NETWORK)),
+                counter(store.security_config_count()),
                 counter(store.lifecycle_policy_count_of(crate::state::LIFECYCLE_POLICY_RETENTION)),
+                // `TotalPolicyCount` is "the total number of OpenSearch Serverless security
+                // policies and configurations in your account": every stored record of each
+                // of the four classes, counted from the store itself rather than from the
+                // counters beside it, so a record of a type no counter is keyed by is still
+                // in the account's total.
+                counter(
+                    store
+                        .access_policy_count()
+                        .saturating_add(store.security_policy_count())
+                        .saturating_add(store.security_config_count())
+                        .saturating_add(store.lifecycle_policy_count()),
+                ),
             )
         };
-
-        // `TotalPolicyCount` is "the total number of OpenSearch Serverless security
-        // policies and configurations in your account", which is the sum of the counters
-        // reported beside it — so the total can never disagree with its own parts.
-        let total_policy_count = data_policy_count
-            .saturating_add(encryption_policy_count)
-            .saturating_add(network_policy_count)
-            .saturating_add(saml_config_count)
-            .saturating_add(retention_policy_count);
 
         crate::state::audit(Self::NAME, ctx, AuditOutcome::PolicyRead, None);
         Ok(GetPoliciesStatsOutput {

@@ -277,7 +277,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        if store.security_config_count(&input.r#type)
+        if store.security_config_count_of(&input.r#type)
             >= crate::state::MAX_SECURITY_CONFIGS_PER_TYPE
         {
             return Err(

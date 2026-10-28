@@ -141,12 +141,13 @@ pub const SERVERLESS_GENERATION_CLASSIC: &str = "CLASSIC";
 /// [`CollectionGroupRecord::storage_configuration`] reports `v2Enabled` from.
 pub const SERVERLESS_GENERATION_NEXTGEN: &str = "NEXTGEN";
 
-// The single policy/configuration type values the account-wide statistics counters are
-// keyed by. `GetPoliciesStatsResponse` reports ONE counter per type
-// (`AccessPolicyStats$DataPolicyCount`, `SecurityPolicyStats$EncryptionPolicyCount` and
-// `$NetworkPolicyCount`, `SecurityConfigStats$SamlConfigCount`,
-// `LifecyclePolicyStats$RetentionPolicyCount`), so each counter names the type it counts
-// rather than repeating the wire string.
+// The policy type values the per-type account-wide statistics counters are keyed by:
+// `AccessPolicyStats$DataPolicyCount`, `SecurityPolicyStats$EncryptionPolicyCount` and
+// `$NetworkPolicyCount`, and `LifecyclePolicyStats$RetentionPolicyCount` each count one
+// type, so each names the type it counts rather than repeating the wire string.
+// `SecurityConfigStats$SamlConfigCount` is keyed by no type — it is documented as "the
+// number of security configurations in the current account", so it counts the whole class
+// ([`ServiceState::security_config_count`]).
 
 /// `AccessPolicyType$data` — the only value that enum carries
 /// (`smithy_query(query="shape", shape="AccessPolicyType")`).
@@ -157,9 +158,6 @@ pub const SECURITY_POLICY_ENCRYPTION: &str = "encryption";
 
 /// `SecurityPolicyType$network` — "Network policy type".
 pub const SECURITY_POLICY_NETWORK: &str = "network";
-
-/// `SecurityConfigType$saml` — the SAML federation configuration type.
-pub const SECURITY_CONFIG_SAML: &str = "saml";
 
 // `LifecyclePolicyStats$RetentionPolicyCount`'s own type value is
 // [`LIFECYCLE_POLICY_RETENTION`], declared with the retention-rule validation it keys.
@@ -2590,8 +2588,15 @@ impl ComAmazonawsOpensearchserverlessOpensearchserverlessState {
         self.idempotency_tokens.len()
     }
 
-    /// The number of stored security policies of `kind`, which its quota bounds.
-    pub fn security_policy_count(&self, kind: &str) -> usize {
+    /// The number of stored security policies of EVERY `SecurityPolicyType`, which is the
+    /// account's own security-policy holding — what the account-wide total counts them as.
+    pub fn security_policy_count(&self) -> usize {
+        self.security_policies.len()
+    }
+
+    /// The number of stored security policies of `kind`, which its quota bounds and which
+    /// is the per-type counter `SecurityPolicyStats` reports.
+    pub fn security_policy_count_of(&self, kind: &str) -> usize {
         self.security_policies
             .keys()
             .filter(|(policy_kind, _)| policy_kind == kind)
@@ -2611,8 +2616,16 @@ impl ComAmazonawsOpensearchserverlessOpensearchserverlessState {
         self.security_configs.get(id)
     }
 
+    /// The number of stored security configurations of EVERY `SecurityConfigType`, which is
+    /// what `SecurityConfigStats`' single counter is documented to report ("the number of
+    /// security configurations in the current account") and what the account-wide total
+    /// counts them as.
+    pub fn security_config_count(&self) -> usize {
+        self.security_configs.len()
+    }
+
     /// The number of stored security configurations of `kind`, which its quota bounds.
-    pub fn security_config_count(&self, kind: &str) -> usize {
+    pub fn security_config_count_of(&self, kind: &str) -> usize {
         self.security_configs
             .values()
             .filter(|record| record.kind == kind)
