@@ -12,8 +12,9 @@
 //!
 //! The pieces, each held in exactly one place:
 //!
-//! 1. **who** — the pipe's own stored `RoleArn`, read off the record every pass, so a
-//!    pipe whose role `UpdatePipe` has switched is judged by the role it carries now;
+//! 1. **who** — the pipe's own stored `RoleArn`, read off the record at the moment of
+//!    each call, so a pipe whose role `UpdatePipe` has switched is judged by the role it
+//!    carries then and not by one read before the call;
 //! 2. **what it may do** — the identity-based documents the IAM store holds for that
 //!    role (its inline policies and the default version of each managed policy attached
 //!    to it), read through IAM's own
