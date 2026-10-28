@@ -35,6 +35,8 @@ mod environment_service_defaults;
 mod environment_teardown_write_gate;
 #[path = "all/environment_unit_count_ranges.rs"]
 mod environment_unit_count_ranges;
+#[path = "all/environment_update_apply_phase.rs"]
+mod environment_update_apply_phase;
 #[path = "all/environment_update_status_sequence.rs"]
 mod environment_update_status_sequence;
 #[path = "all/list_environments_cursor_scope.rs"]

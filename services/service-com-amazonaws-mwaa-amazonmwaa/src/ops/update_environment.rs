@@ -8,6 +8,11 @@
 //! snapshots the environment's database cluster, then `UPDATING`, which the clock settles
 //! to `AVAILABLE` one `crate::state::TRANSITION_SPAN` after the call.
 //!
+//! The merged configuration is APPLIED by the second of those phases, not by this call:
+//! the snapshot is taken before the change is applied, so an environment still in the
+//! snapshot phase reports the configuration it is running on, with its `LastUpdate` still
+//! `PENDING`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -373,11 +378,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already stored, and vice versa.
         merged.validate().map_err(validation)?;
 
-        stored.spec = merged;
+        // The merged configuration is handed to the update's PHASES rather than written
+        // here: Amazon MWAA snapshots the environment's database cluster before it applies
+        // a change, so the environment goes on reporting the configuration it is running
+        // on until the phase that applies the change comes due.
         stored.begin_update(
             now,
             crate::state::UPDATE_SOURCE_API,
             input.worker_replacement_strategy,
+            merged,
         );
 
         // The stored ARN, never a freshly minted one: the environment keeps the ARN its

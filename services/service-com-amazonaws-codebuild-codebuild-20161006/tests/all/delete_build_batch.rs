@@ -6,7 +6,8 @@
 //!
 //! RULE under test: `DeleteBuildBatch` removes a batch build only once that batch has
 //! finished — a batch still running is refused with the single error the operation
-//! models and stays exactly where it was — and the delete removes the builds that
+//! models, named by its full ARN in the sentence CodeBuild words for that refusal, and
+//! stays exactly where it was — and the delete removes the builds that
 //! batch is made of with it, reporting their ids in `buildsDeleted`, the ids it held
 //! no build record for in `buildsNotDeleted` with a `statusCode` saying so, and the
 //! batch-level outcome in `statusCode`. A removed batch is gone from every later read,
@@ -25,8 +26,8 @@ use service_com_amazonaws_codebuild_codebuild_20161006::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::project_build_lifecycle::{
-    call, create_project, emulator, emulator_on, error_type, listed_ids, PAST_THE_SETTLE_SPAN,
-    REGION,
+    call, create_project, emulator, emulator_on, error_type, expected_arn, listed_ids,
+    PAST_THE_SETTLE_SPAN, REGION,
 };
 
 /// Start one batch build of `project` and hand back its id.
@@ -165,9 +166,11 @@ async fn delete_build_batch_removes_a_finished_batch_and_refuses_one_still_runni
                 assert_eq!(
                     body["message"],
                     Value::String(format!(
-                        "Build batch {requested} is still in progress and cannot be deleted"
+                        "Cannot delete BuildBatch {}, as it is still in progress",
+                        state::build_batch_arn(REGION, &requested)
                     )),
-                    "case {target:?}: the refusal names the batch it would not delete, got {body}"
+                    "case {target:?}: the refusal names the batch it would not delete by its \
+                     full ARN, got {body}"
                 );
             }
             Target::AbsentOfKnownProject
@@ -609,6 +612,154 @@ async fn the_builds_of_a_deleted_batch_build_are_deleted_with_it() {
             string_list(&batches["buildBatchesNotFound"]),
             vec![batch_id.clone()],
             "case {:?}: the deleted batch build reads as not found; got {batches}",
+            row.name
+        );
+    }
+}
+
+/// Whether the stored batch build carries an ARN of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoredArn {
+    /// It carries the ARN this service forms for its id — what a batch build
+    /// `StartBuildBatch` stored holds.
+    Held,
+    /// It carries none, so the refusal forms the ARN for that id in the region the
+    /// call was signed for.
+    Absent,
+}
+
+/// One row of the in-progress refusal table: the halves of the batch build id, and
+/// what the stored record holds for its ARN.
+#[derive(Debug)]
+struct Running {
+    name: &'static str,
+    /// The project half of the batch build id (`<projectName>:<uuid>`).
+    project: &'static str,
+    /// The uuid half.
+    uuid: &'static str,
+    stored_arn: StoredArn,
+}
+
+/// RULE: refusing to act on a resource, CodeBuild names that resource by its full
+/// ARN — `arn:aws:codebuild:<region>:<account>:build-batch/<batch-id>` for a batch
+/// build — never by the bare id, so the refusal of a batch build that has not
+/// finished reads `Cannot delete BuildBatch <arn>, as it is still in progress`.
+///
+/// The table varies both halves of the id and whether the stored record carries its
+/// own ARN, so the message's one variable part is exercised across the class rather
+/// than on a single id; every row also proves the refused batch is left intact and
+/// still running.
+#[tokio::test]
+async fn refusing_a_batch_build_that_has_not_finished_names_it_by_its_arn() {
+    let rows: &[Running] = &[
+        Running {
+            name: "a record carrying the ARN this service formed for it",
+            project: "del-batch-msg",
+            uuid: "7aa4009f-8169-8000-8000-000000000001",
+            stored_arn: StoredArn::Held,
+        },
+        Running {
+            name: "a record carrying no ARN of its own",
+            project: "del-batch-msg",
+            uuid: "7aa4009f-8169-8000-8000-000000000002",
+            stored_arn: StoredArn::Absent,
+        },
+        Running {
+            name: "the shortest project name a batch build id can carry",
+            project: "p1",
+            uuid: "00000000-0000-8000-8000-000000000003",
+            stored_arn: StoredArn::Absent,
+        },
+        Running {
+            name: "a long project name carrying digits, hyphens and an underscore",
+            project: "sim2real-cb_batch-project-0123456789-abcdefghij",
+            uuid: "c2600cc7-f412-8aee-b311-7f2989efd1f6",
+            stored_arn: StoredArn::Held,
+        },
+    ];
+
+    for row in rows {
+        let id = format!("{}:{}", row.project, row.uuid);
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        // Seeded through the store the handlers write, so the row controls exactly
+        // what the record holds: a batch build whose settle instant is far ahead is
+        // one the clock owes nothing, which is what "has not finished" means here.
+        {
+            let handle = engine.state::<CodeBuildState>();
+            let mut guard = handle.lock();
+            let started = state::now_millis();
+            guard.insert_build_batch(
+                id.clone(),
+                StoredBuildBatch {
+                    build_batch: BuildBatch {
+                        id: Some(id.clone()),
+                        arn: match row.stored_arn {
+                            StoredArn::Held => Some(state::build_batch_arn(REGION, &id)),
+                            StoredArn::Absent => None,
+                        },
+                        project_name: Some(row.project.to_string()),
+                        build_batch_status: Some("IN_PROGRESS".to_string()),
+                        complete: false,
+                        ..BuildBatch::default()
+                    },
+                    start_millis: started,
+                    settle_due_millis: started + 60_000,
+                },
+            );
+        }
+        let router = emulator_on(Arc::clone(&engine));
+
+        let (status, body) = call(&router, "DeleteBuildBatch", json!({"id": id.clone()})).await;
+        assert_eq!(
+            status, 400,
+            "case {:?}: expected 400, got {status} with {body}",
+            row.name
+        );
+        assert_eq!(
+            error_type(&body),
+            "InvalidInputException",
+            "case {:?}: expected InvalidInputException, got {body}",
+            row.name
+        );
+        // Built here from the region the call is signed for and the emulator's
+        // account, independently of the handler, so the assertion pins the ARN the
+        // message must carry rather than echoing whatever it produced.
+        let arn = expected_arn(&format!("build-batch/{id}"));
+        assert_eq!(
+            body["message"],
+            Value::String(format!(
+                "Cannot delete BuildBatch {arn}, as it is still in progress"
+            )),
+            "case {:?}: the refusal must name the batch build by its full ARN, got {body}",
+            row.name
+        );
+
+        // The batch is left exactly where it was: still held, still running.
+        let (status, after) =
+            call(&router, "BatchGetBuildBatches", json!({"ids": [id.clone()]})).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: BatchGetBuildBatches after the refusal: expected 200, got {status} \
+             with {after}",
+            row.name
+        );
+        assert_eq!(
+            after["buildBatches"][0]["id"],
+            Value::String(id.clone()),
+            "case {:?}: the refused batch build is still readable, got {after}",
+            row.name
+        );
+        assert_eq!(
+            after["buildBatches"][0]["buildBatchStatus"],
+            Value::String("IN_PROGRESS".to_string()),
+            "case {:?}: the refused batch build is still running, got {after}",
+            row.name
+        );
+        assert_eq!(
+            after["buildBatches"][0]["complete"],
+            Value::Bool(false),
+            "case {:?}: the refused batch build has not been completed by the refusal, \
+             got {after}",
             row.name
         );
     }
