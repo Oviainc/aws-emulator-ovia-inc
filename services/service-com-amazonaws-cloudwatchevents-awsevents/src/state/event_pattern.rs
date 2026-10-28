@@ -296,7 +296,7 @@ fn validate_numeric(argument: &Value) -> Result<(), String> {
     if terms.is_empty() || terms.len() % 2 != 0 {
         return Err("\"numeric\" takes one operator and one value per comparison".to_string());
     }
-    for pair in terms.chunks_exact(2) {
+    for pair in terms.as_chunks::<2>().0 {
         let operator = pair[0]
             .as_str()
             .ok_or_else(|| "\"numeric\" takes a comparison operator first".to_string())?;
@@ -547,7 +547,7 @@ fn numeric_matches(argument: &Value, observed: &Value, budget: &mut MatchBudget)
         return false;
     }
     // Every comparison must hold: `[">", 0, "<=", 5]` is a half-open range.
-    terms.chunks_exact(2).all(|pair| {
+    terms.as_chunks::<2>().0.iter().all(|pair| {
         let (Some(operator), Some(wanted)) = (pair[0].as_str(), pair[1].as_f64()) else {
             return false;
         };
