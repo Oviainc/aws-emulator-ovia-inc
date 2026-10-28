@@ -19,6 +19,8 @@ mod cost_optimization_hub;
 mod management_account_gating;
 #[path = "all/max_results_bounds.rs"]
 mod max_results_bounds;
+#[path = "all/order_by_fidelity.rs"]
+mod order_by_fidelity;
 #[path = "all/preference_gates.rs"]
 mod preference_gates;
 #[path = "all/preference_refusal_atomicity.rs"]

@@ -18,6 +18,12 @@
 //! organization's management account may do, so a populated `accountIds` from
 //! any other caller is refused with the modelled `AccessDeniedException`.
 //!
+//! An `orderBy` the request sets is honoured as a whole: its `dimension` says
+//! which values the rows are put in order of, so one that names no
+//! `Recommendation` member and one that carries no `dimension` at all are both
+//! refused with the modelled `ValidationException` instead of being served in an
+//! order the caller did not ask for.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -186,17 +192,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         };
 
-        // An `orderBy` that names no `Recommendation` member cannot be honoured,
-        // so the request is refused rather than silently served in another order.
+        // An `orderBy` the request SETS is honoured as a whole, or the request is
+        // refused rather than silently served in another order: `dimension` is
+        // the member that says which values the rows are put in order of, so an
+        // `orderBy` carrying none — absent, or blank, with or without an `order`
+        // beside it — names nothing to order by and is refused like a dimension
+        // that names no `Recommendation` member. Only an absent `orderBy` asks
+        // for no ordering at all.
         let order = match &input.order_by {
             None => None,
-            Some(order_by) => match order_by.dimension.as_deref() {
-                None => None,
-                Some(dimension) => match crate::state::Dimension::parse(dimension) {
+            Some(order_by) => {
+                let dimension = order_by.dimension.as_deref().unwrap_or_default();
+                if dimension.trim().is_empty() {
+                    return Err(no_dimension());
+                }
+                match crate::state::Dimension::parse(dimension) {
                     Some(parsed) => Some((parsed, order_by.order.as_deref() == Some(ORDER_DESC))),
                     None => return Err(unknown_dimension(dimension)),
-                },
-            },
+                }
+            }
         };
 
         // The gate on `filter.accountIds`, the caller's effective savings
@@ -248,6 +262,12 @@ const MAX_RESULTS_MAX: i64 = 1000;
 /// The `Order` value that reverses the sort; the other value (`Asc`) is the
 /// order a dimension's values take on their own, and is what an absent `order`
 /// leaves them in.
+///
+/// `order` targets the modelled `Order` enum (`smithy_query(query="shape",
+/// shape="Order")`: `[Asc, Desc]`), whose value set the constraint walk enforces
+/// before this handler runs, so a value outside it is already refused with this
+/// service's `ValidationException` and the comparison below only ever sees one
+/// of the two.
 const ORDER_DESC: &str = "Desc";
 
 /// Order the rows by one `orderBy` dimension.
@@ -330,18 +350,45 @@ fn invalid_next_token() -> ListRecommendationsError {
     .into()
 }
 
+/// The member every refusal of an `orderBy` is attributed to: the one that says
+/// which dimension the rows are ordered on, so it is the member a caller has to
+/// change to get the request served.
+const DIMENSION_MEMBER: &str = "orderBy.dimension";
+
 /// Refuse an `orderBy.dimension` that names no `Recommendation` member.
 fn unknown_dimension(dimension: &str) -> ListRecommendationsError {
+    stated_refusal(
+        format!("Invalid orderBy specified. Cannot order by {dimension} for this operation."),
+        format!("{dimension} is not a dimension recommendations can be sorted by"),
+    )
+}
+
+/// Refuse an `orderBy` that names no dimension at all: one whose `dimension` is
+/// absent or blank. Such a request asks for an ordering while leaving out what
+/// it would be ordered on, which this operation cannot honour — an `order` on
+/// its own does not say which values it orders — so it is refused instead of
+/// being served in an order the caller did not ask for.
+fn no_dimension() -> ListRecommendationsError {
+    stated_refusal(
+        "Invalid orderBy specified. Cannot order by an unspecified dimension for this operation."
+            .to_string(),
+        "a dimension recommendations can be sorted by is required whenever orderBy is specified"
+            .to_string(),
+    )
+}
+
+/// One refused `orderBy`, in the envelope every handler-raised refusal of this
+/// service answers with: `statement` as the top-level `message`, which names the
+/// rejected member and the rule that rejects it, `reason` =
+/// `FieldValidationFailed`, and the same diagnosis attributed to
+/// [`DIMENSION_MEMBER`] in `fields`.
+fn stated_refusal(statement: String, field_message: String) -> ListRecommendationsError {
     ListRecommendationsErrorModeled::ValidationException(
         crate::service::stated_validation_exception(
-            format!(
-                "Invalid orderBy specified. Cannot order by {dimension} for this operation."
-            ),
+            statement,
             vec![ValidationExceptionDetail {
-                field_name: "orderBy.dimension".to_string(),
-                message: format!(
-                    "{dimension} is not a dimension recommendations can be sorted by"
-                ),
+                field_name: DIMENSION_MEMBER.to_string(),
+                message: field_message,
             }],
         ),
     )
