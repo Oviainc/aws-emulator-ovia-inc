@@ -41,7 +41,7 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
 
@@ -98,15 +98,22 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it. A value outside a constraint the MODEL declares is
+        // refused here, ahead of any handler, with HTTP 400 and the error code
+        // `ValidationException` — the same code the framework picks, kept
+        // deliberately: the refusal is the request-validation layer's, not one of
+        // this service's own modelled failures (`InvalidArgsException`,
+        // `InvalidArnException`), which its handlers answer for a request whose
+        // values are well formed but cannot be served. Only the MESSAGE is this
+        // service's own ([`constraint_message`]).
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: "ValidationException".to_string(),
+                message: constraint_message(violations),
+            }),
+            // Authentication is the emulator's to answer, not this service's.
+            _ => None,
+        }
     }
 
     fn override_routing_error(
@@ -136,4 +143,90 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         let _ = error;
         None
     }
+}
+
+/// Where a clause states the requirement a value failed, which is also the one place the
+/// framework's own clause can be split at to read that requirement back off it.
+const CONSTRAINT_PREAMBLE: &str = " failed to satisfy constraint: ";
+
+/// The message a constraint refusal of this service carries: one clause per value that
+/// failed, each naming the member path and the requirement it failed, under the count of
+/// how many failed.
+///
+/// What the clauses say is not the value that failed: a refusal names the MEMBER and the
+/// bound, never the submitted value, so nothing a caller sent is reflected back in the
+/// diagnostic (a member whose value is sensitive is refused like any other).
+///
+/// The count prefix states how many values failed — except for a violation of an
+/// enumerated type's value set, which states the member and the set alone: the set IS the
+/// enumeration of what the member may hold, so the clause is self-contained.
+fn constraint_message(violations: &[Violation]) -> String {
+    let stated = stated_order(violations);
+    let clauses: Vec<String> = stated.iter().map(|violation| clause(violation)).collect();
+    if clauses.is_empty() {
+        return "invalid request".to_string();
+    }
+    let enumerated = stated
+        .iter()
+        .all(|violation| matches!(violation.kind, ViolationKind::EnumValue(_)));
+    if enumerated {
+        return clauses.join("; ");
+    }
+    let errors = if clauses.len() == 1 { "error" } else { "errors" };
+    format!(
+        "{} validation {errors} detected: {}",
+        clauses.len(),
+        clauses.join("; ")
+    )
+}
+
+/// The order the clauses are stated in: the members in the order the validating walk
+/// found them, and — where ONE member failed more than one of its constraints — the
+/// EXPRESSION it must match before the size it must fit, because the expression is the
+/// shape of the value and the length is a bound on it.
+fn stated_order(violations: &[Violation]) -> Vec<&Violation> {
+    let mut stated: Vec<&Violation> = violations.iter().collect();
+    // A stable sort, so two violations this key cannot separate stay in the order the
+    // walk found them.
+    stated.sort_by_key(|violation| {
+        let member = violations
+            .iter()
+            .position(|other| other.path == violation.path)
+            .unwrap_or(usize::MAX);
+        (member, !matches!(violation.kind, ViolationKind::Pattern(_)))
+    });
+    stated
+}
+
+/// One failed value's clause: the member path and the requirement that value failed.
+///
+/// The requirement is the framework's own sentence for the constraint, read back off the
+/// clause it writes, so a constraint cannot be worded one way here and another there. Two
+/// things about the clause are this service's: the submitted value is not stated, and a
+/// `@pattern` is quoted as the EXPRESSION the value must match rather than as the model's
+/// anchored literal — the anchors make it a whole-value match, which "must satisfy regular
+/// expression pattern" already says.
+fn clause(violation: &Violation) -> String {
+    let stated = violation.message();
+    let requirement = match stated.split_once(CONSTRAINT_PREAMBLE) {
+        Some((_, requirement)) => requirement,
+        // A clause in some other shape carries no requirement to restate; the framework's
+        // own wording stands.
+        None => return stated,
+    };
+    let requirement = match &violation.kind {
+        ViolationKind::Pattern(pattern) => {
+            let opened = pattern.strip_prefix('^').unwrap_or(pattern);
+            let unanchored = opened.strip_suffix('$').unwrap_or(opened);
+            requirement.replace(pattern.as_str(), unanchored)
+        }
+        _ => requirement.to_string(),
+    };
+    // An absent member has no value to name, and the clause says so; a value that is
+    // present is not named at all.
+    let held = if violation.value.is_some() { "" } else { " null" };
+    format!(
+        "Value{held} at '{}'{CONSTRAINT_PREAMBLE}{requirement}",
+        violation.path
+    )
 }

@@ -15,6 +15,12 @@
 mod certificate_authority_listing;
 #[path = "all/certificate_authority_tags.rs"]
 mod certificate_authority_tags;
+#[path = "all/constraint_refusal_messages.rs"]
+mod constraint_refusal_messages;
+#[path = "all/create_idempotency.rs"]
+mod create_idempotency;
+#[path = "all/crl_bucket_resolution.rs"]
+mod crl_bucket_resolution;
 #[path = "all/delete_certificate_authority.rs"]
 mod delete_certificate_authority;
 #[path = "all/permissions.rs"]

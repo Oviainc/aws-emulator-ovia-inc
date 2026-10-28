@@ -233,6 +233,9 @@ mod cloudformation_provisions_acm_acme_endpoints;
 // Declared in this same quiet span, for the reason the note above gives.
 #[path = "all/cloudformation_provisions_acm_certificates.rs"]
 mod cloudformation_provisions_acm_certificates;
+// Declared in this same quiet span, for the reason the note above gives.
+#[path = "all/cloudformation_provisions_acmpca_certificate_authorities.rs"]
+mod cloudformation_provisions_acmpca_certificate_authorities;
 #[path = "all/cloudformation_provisions_codedeploy_resources.rs"]
 mod cloudformation_provisions_codedeploy_resources;
 // Declared in this same quiet span of the sorted list, for the reason the note above

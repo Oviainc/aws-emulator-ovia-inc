@@ -4274,6 +4274,12 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // and answers the `CertificateArn` ACM minted, and that type's `Ref` returns that
         // ARN — a template declares the domain the certificate covers, never its id.
         || resource_type == ACM_CERTIFICATE
+        // An Amazon Web Services Private CA certificate authority is the same case:
+        // `CreateCertificateAuthority` takes no identifier and answers the
+        // `CertificateAuthorityArn` that service minted, and "Ref returns the Amazon
+        // Resource Name (ARN) of the private CA" — a template declares the CA's key, its
+        // signing algorithm and its subject, never its id.
+        || resource_type == ACMPCA_CERTIFICATE_AUTHORITY
         || resource_type == MSK_CLUSTER
         || resource_type == MSK_SERVERLESS_CLUSTER
         || resource_type == ROUTE53RESOLVER_ENDPOINT
@@ -4818,6 +4824,15 @@ pub const ACM_ACME_ENDPOINT: &str = "AWS::CertificateManager::AcmeEndpoint";
 /// so the identifier a stack reports for the resource is the value `acm DescribeCertificate`
 /// resolves ("Ref returns the certificate ARN").
 pub const ACM_CERTIFICATE: &str = "AWS::CertificateManager::Certificate";
+
+/// An Amazon Web Services Private CA certificate authority's resource type (the acm-pca
+/// model: `cloudFormationName: ACMPCA`). This is a type `super::provisioning` creates in
+/// that service itself, and the identifier the provider reports for it is the
+/// `CertificateAuthorityArn` acm-pca minted — an ARN `CreateCertificateAuthority` ASSIGNS,
+/// which no naming rule could compute — so the identifier a stack reports and exports for
+/// the resource is the one `acm-pca DescribeCertificateAuthority` resolves ("Ref returns
+/// the Amazon Resource Name (ARN) of the private CA").
+pub const ACMPCA_CERTIFICATE_AUTHORITY: &str = "AWS::ACMPCA::CertificateAuthority";
 
 /// An Amazon EventBridge rule's resource type (the EventBridge model:
 /// `cloudFormationName: Events`). This is a type `super::provisioning` creates in

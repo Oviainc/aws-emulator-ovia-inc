@@ -432,7 +432,8 @@ use super::provisioning::{
     AWS_JSON_1_1,
 };
 use super::template::{
-    ACM_ACME_ENDPOINT, ACM_CERTIFICATE, AOSS_COLLECTION, AOSS_SECURITY_POLICY, APIGATEWAYV2_API,
+    ACMPCA_CERTIFICATE_AUTHORITY, ACM_ACME_ENDPOINT, ACM_CERTIFICATE, AOSS_COLLECTION,
+    AOSS_SECURITY_POLICY, APIGATEWAYV2_API,
     APIGATEWAYV2_API_MAPPING, APIGATEWAYV2_AUTHORIZER, APIGATEWAYV2_DEPLOYMENT,
     APIGATEWAYV2_DOMAIN_NAME, APIGATEWAYV2_INTEGRATION, APIGATEWAYV2_ROUTE,
     APIGATEWAYV2_STAGE, BACKUP_PLAN, BACKUP_SELECTION, BACKUP_VAULT, BATCH_COMPUTE_ENVIRONMENT,
@@ -596,6 +597,10 @@ pub(super) enum Provisioner {
     CognitoUserPoolGroup,
     AcmAcmeEndpoint,
     AcmCertificate,
+    /// `AWS::ACMPCA::CertificateAuthority`: a private certificate authority of Amazon Web
+    /// Services Private CA, whose ARN that service mints — `CreateCertificateAuthority`
+    /// creates it and `DeleteCertificateAuthority` deletes it.
+    AcmPcaCertificateAuthority,
     Route53ResolverEndpoint,
     Route53ResolverRule,
     Route53ResolverRuleAssociation,
@@ -692,6 +697,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         COGNITO_USER_POOL_GROUP => Some(Provisioner::CognitoUserPoolGroup),
         ACM_ACME_ENDPOINT => Some(Provisioner::AcmAcmeEndpoint),
         ACM_CERTIFICATE => Some(Provisioner::AcmCertificate),
+        ACMPCA_CERTIFICATE_AUTHORITY => Some(Provisioner::AcmPcaCertificateAuthority),
         ROUTE53RESOLVER_ENDPOINT => Some(Provisioner::Route53ResolverEndpoint),
         ROUTE53RESOLVER_RULE => Some(Provisioner::Route53ResolverRule),
         ROUTE53RESOLVER_RULE_ASSOCIATION => Some(Provisioner::Route53ResolverRuleAssociation),
@@ -918,6 +924,9 @@ impl Provisioner {
             Self::CognitoUserPoolGroup => create_group(ctx, region, resource).await,
             Self::AcmAcmeEndpoint => create_acme_endpoint(ctx, region, resource, propagated).await,
             Self::AcmCertificate => request_certificate(ctx, region, resource, propagated).await,
+            Self::AcmPcaCertificateAuthority => {
+                create_certificate_authority(ctx, region, resource, propagated).await
+            }
             Self::Route53ResolverEndpoint => {
                 create_resolver_endpoint(ctx, region, resource, propagated).await
             }
@@ -1116,6 +1125,11 @@ impl Provisioner {
                 // tags, in the one check its own crate's tag validation makes, so a
                 // certificate's are left off the same way an ACME endpoint's are.
                 | Self::AcmCertificate
+                // Amazon Web Services Private CA refuses a tag key in the reserved
+                // namespace on `CreateCertificateAuthority` and on
+                // `TagCertificateAuthority` alike, in the one check its own crate's tag
+                // validation makes.
+                | Self::AcmPcaCertificateAuthority
                 | Self::MskCluster
                 | Self::MskServerlessCluster
                 | Self::SqsQueue
@@ -1184,6 +1198,13 @@ impl Provisioner {
             // (`CertificateDetail$Status`) and is usable once ACM has issued it, so the
             // resource's creation is finished when ACM reports it `ISSUED`.
             Self::AcmCertificate => certificate_readiness(ctx, region, physical_resource_id).await,
+            // "Private CA is pending creation" is the status a created CA is reported in
+            // (`CertificateAuthorityStatus$CREATING`), and its certificate signing request
+            // is not available in it, so the resource's creation is finished once that
+            // service reports the CA out of it.
+            Self::AcmPcaCertificateAuthority => {
+                certificate_authority_readiness(ctx, region, physical_resource_id).await
+            }
             // `DomainStatus$Created` is "true if domain creation is complete" and
             // `DomainStatus$Processing` "true if OpenSearch Service is processing
             // configuration changes", so a domain the create has just answered for is still
@@ -1568,6 +1589,9 @@ impl Provisioner {
             Self::CognitoUserPoolGroup => delete_group(ctx, region, resource).await,
             Self::AcmAcmeEndpoint => delete_acme_endpoint(ctx, region, physical_resource_id).await,
             Self::AcmCertificate => delete_certificate(ctx, region, physical_resource_id).await,
+            Self::AcmPcaCertificateAuthority => {
+                delete_certificate_authority(ctx, region, physical_resource_id).await
+            }
             Self::Route53ResolverEndpoint => {
                 delete_resolver_endpoint(ctx, region, physical_resource_id).await
             }
@@ -1832,6 +1856,9 @@ impl Provisioner {
                 describe_acme_endpoint(ctx, region, physical_resource_id).await
             }
             Self::AcmCertificate => describe_certificate(ctx, region, physical_resource_id).await,
+            Self::AcmPcaCertificateAuthority => {
+                describe_certificate_authority(ctx, region, physical_resource_id).await
+            }
             Self::Route53ResolverEndpoint => {
                 describe_resolver_endpoint(ctx, region, physical_resource_id).await
             }
@@ -13931,6 +13958,257 @@ async fn describe_certificate(
             ("DomainName", "DomainName"),
             ("KeyAlgorithm", "KeyAlgorithm"),
             ("CertificateAuthorityArn", "CertificateAuthorityArn"),
+        ],
+    )))
+}
+
+// ---------------------------------------------------------------------------
+// Amazon Web Services Private CA: AWS::ACMPCA::CertificateAuthority
+// ---------------------------------------------------------------------------
+
+/// Amazon Web Services Private CA's signing name and `X-Amz-Target` prefix, from its model
+/// (`sigv4Name: acm-pca`, service shape `ACMPrivateCA`), which speaks `awsJson1_1`.
+const ACMPCA_SIGNING_NAME: &str = "acm-pca";
+const ACMPCA_TARGET_PREFIX: &str = "ACMPrivateCA";
+
+/// The properties of `AWS::ACMPCA::CertificateAuthority` that are members of the create's
+/// `CertificateAuthorityConfiguration` — "name and bit size of the private key algorithm,
+/// the name of the signing algorithm, and X.500 certificate subject information" — each
+/// spelled identically on both sides, so the declared value travels as written
+/// (`smithy_query(operation="CreateCertificateAuthority")`).
+const ACMPCA_CA_CONFIGURATION_MEMBERS: &[(&str, &str)] = &[
+    ("KeyAlgorithm", "KeyAlgorithm"),
+    ("SigningAlgorithm", "SigningAlgorithm"),
+    ("Subject", "Subject"),
+    ("CsrExtensions", "CsrExtensions"),
+];
+
+/// The type's properties that are the create's OWN members, spelled identically the same
+/// way: the revocation mechanisms the CA supports, whether it issues general-purpose or
+/// short-lived certificates, and the compliance standard its key is handled under.
+const ACMPCA_CA_MEMBERS: &[(&str, &str)] = &[
+    ("RevocationConfiguration", "RevocationConfiguration"),
+    ("UsageMode", "UsageMode"),
+    ("KeyStorageSecurityStandard", "KeyStorageSecurityStandard"),
+];
+
+/// The one property whose name is not the member it reaches: the type publishes the CA's
+/// kind as `Type` and the create takes it as `CertificateAuthorityType` (`ROOT` or
+/// `SUBORDINATE`).
+const ACMPCA_CA_TYPE: &str = "Type";
+
+/// The `CertificateAuthorityStatus` member a created CA is reported in while that service
+/// is still making it ("Private CA is pending creation"), and the one a CA that could not
+/// be created reaches.
+const CERTIFICATE_AUTHORITY_CREATING: &str = "CREATING";
+const CERTIFICATE_AUTHORITY_FAILED: &str = "FAILED";
+
+/// Create the private CA an `AWS::ACMPCA::CertificateAuthority` declares, so a client that
+/// reads the stack's physical resource id — or an output that exports it — holds the ARN
+/// Amazon Web Services Private CA minted and can call that service with it
+/// (`DescribeCertificateAuthority`, `IssueCertificate`, `PutPolicy`) rather than an
+/// identifier no CA answers to.
+///
+/// The type's properties are the create's own members under the same names, in two groups:
+/// the three that make up the CA's `CertificateAuthorityConfiguration`
+/// ([`ACMPCA_CA_CONFIGURATION_MEMBERS`]) and the three the request carries itself
+/// ([`ACMPCA_CA_MEMBERS`]), plus the CA's kind ([`ACMPCA_CA_TYPE`]) and the tag list the
+/// create takes as its own member. Nothing the declaration does not state is sent.
+///
+/// The CA's identifier is that service's OWN to mint — the create takes no identifier and
+/// answers with `CertificateAuthorityArn`, and "Ref returns the Amazon Resource Name (ARN)
+/// of the private CA" — so that answer is reported back as the resource's physical id AND
+/// as its `Arn`/`<Type>Arn` attributes, which is what `Fn::GetAtt` then resolves to.
+async fn create_certificate_authority(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let properties = resource
+        .properties
+        .as_object()
+        .cloned()
+        .unwrap_or_else(Map::new);
+    let mut configuration = Map::new();
+    copy_members(&properties, ACMPCA_CA_CONFIGURATION_MEMBERS, &mut configuration);
+    let mut request = Map::new();
+    request.insert(
+        "CertificateAuthorityConfiguration".to_string(),
+        Value::Object(configuration),
+    );
+    copy_members(&properties, ACMPCA_CA_MEMBERS, &mut request);
+    if let Some(kind) = properties.get(ACMPCA_CA_TYPE) {
+        request.insert("CertificateAuthorityType".to_string(), kind.clone());
+    }
+    let tags = tags_of(&resource.properties, propagated);
+    if !tags.is_empty() {
+        request.insert("Tags".to_string(), tags_as_list(&tags, UPPER_CASED_TAG));
+    }
+    let reported = call_json_rpc(
+        ctx,
+        ACMPCA_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{ACMPCA_TARGET_PREFIX}.CreateCertificateAuthority"),
+        &Value::Object(request),
+    )
+    .await?;
+    let Some(arn) = reported
+        .get("CertificateAuthorityArn")
+        .and_then(Value::as_str)
+    else {
+        // The create answered 2xx without the ARN its output models. Nothing addresses a
+        // private CA without one, so this is reported as a failure rather than recorded as
+        // a resource with an identifier nothing minted.
+        return Err(Refusal {
+            code: UNIDENTIFIED_FAILURE.to_string(),
+            message: "CreateCertificateAuthority answered no CertificateAuthorityArn"
+                .to_string(),
+        });
+    };
+    Ok(Created {
+        physical_resource_id: Some(arn.to_string()),
+        attributes: super::template::arn_attributes(&resource.resource_type, arn)
+            .into_iter()
+            .collect(),
+    })
+}
+
+/// Whether Amazon Web Services Private CA has finished creating the CA a stack declared.
+///
+/// A created CA is reported `CREATING` — "Private CA is pending creation", the state in
+/// which its certificate signing request is not available yet — so that is the state the
+/// resource is still coming up in, `FAILED` ("Private CA could not be created") is one no
+/// wait will bring it out of, and every other status is a CA that exists and can be acted
+/// on. A CA that service no longer holds is in the same position as a failed one: nothing
+/// is going to create it.
+async fn certificate_authority_readiness(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Readiness, Refusal> {
+    let request = serde_json::json!({ "CertificateAuthorityArn": physical_resource_id });
+    let reported = match call_json_rpc(
+        ctx,
+        ACMPCA_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{ACMPCA_TARGET_PREFIX}.DescribeCertificateAuthority"),
+        &request,
+    )
+    .await
+    {
+        Ok(reported) => reported,
+        Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => {
+            return Ok(Readiness::Failed(format!(
+                "Amazon Web Services Private CA holds no certificate authority for \
+                 {physical_resource_id}"
+            )))
+        }
+        Err(refusal) => return Err(refusal),
+    };
+    let authority = reported.get("CertificateAuthority");
+    let status = authority
+        .and_then(|authority| authority.get("Status"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match status {
+        CERTIFICATE_AUTHORITY_CREATING => Ok(Readiness::Pending(
+            CERTIFICATE_AUTHORITY_CREATING.to_string(),
+        )),
+        CERTIFICATE_AUTHORITY_FAILED => {
+            // `FailureReason` is reported for a CA that failed, so it is quoted where that
+            // service gave one and the status speaks for itself otherwise.
+            let reason = authority
+                .and_then(|authority| authority.get("FailureReason"))
+                .and_then(Value::as_str);
+            Ok(Readiness::Failed(match reason {
+                Some(reason) => format!(
+                    "Amazon Web Services Private CA reports certificate authority \
+                     {physical_resource_id} as {CERTIFICATE_AUTHORITY_FAILED}: {reason}"
+                ),
+                None => format!(
+                    "Amazon Web Services Private CA reports certificate authority \
+                     {physical_resource_id} as {CERTIFICATE_AUTHORITY_FAILED}"
+                ),
+            }))
+        }
+        _ => Ok(Readiness::Ready),
+    }
+}
+
+/// Delete the private CA a stack created.
+///
+/// A CA that service no longer holds (`ResourceNotFoundException`) is already in the state
+/// the delete asks for, so that answer is a success. Every other refusal is that service's
+/// own and is reported: a CA whose status does not allow a delete is its
+/// `InvalidStateException`, which is a delete that really did not happen.
+///
+/// `PermanentDeletionTimeInDays` is left to that service's own default — "the default value
+/// is 30" — because the restoration window is not something this type's declaration states.
+async fn delete_certificate_authority(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let request = serde_json::json!({ "CertificateAuthorityArn": physical_resource_id });
+    match call_json_rpc(
+        ctx,
+        ACMPCA_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{ACMPCA_TARGET_PREFIX}.DeleteCertificateAuthority"),
+        &request,
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The CA's configuration as Amazon Web Services Private CA reports it, for drift
+/// detection. An ARN that service no longer holds a CA for (`ResourceNotFoundException`)
+/// was deleted.
+///
+/// Only the members the read reports in the SAME shape the type declares them in are
+/// reported, because a property the actual document does not carry is not evidence of
+/// anything (`super::drift::differs`): the CA's kind, which the type publishes as `Type`,
+/// its revocation configuration and its usage mode, each read off the CA that service
+/// answers with. The key algorithm, the signing algorithm and the subject are members of
+/// the reported `CertificateAuthorityConfiguration` rather than properties of the type, and
+/// `Tags` is not part of that read at all.
+async fn describe_certificate_authority(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let request = serde_json::json!({ "CertificateAuthorityArn": physical_resource_id });
+    let reported = match call_json_rpc(
+        ctx,
+        ACMPCA_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{ACMPCA_TARGET_PREFIX}.DescribeCertificateAuthority"),
+        &request,
+    )
+    .await
+    {
+        Ok(reported) => reported,
+        Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => return Ok(None),
+        Err(refusal) => return Err(refusal),
+    };
+    let Some(authority) = reported.get("CertificateAuthority") else {
+        return Ok(Some(Value::Object(Map::new())));
+    };
+    Ok(Some(reported_as_properties(
+        authority,
+        &[
+            (ACMPCA_CA_TYPE, "Type"),
+            ("RevocationConfiguration", "RevocationConfiguration"),
+            ("UsageMode", "UsageMode"),
         ],
     )))
 }

@@ -844,7 +844,12 @@ pub struct CertificateAuthorityRecord {
     /// Permissions granted on this CA, one per (principal, source account) pair.
     pub permissions: Vec<PermissionRecord>,
     /// `IssueCertificate` idempotency tokens -> the certificate ARN they minted.
-    pub issue_idempotency: HashMap<String, IdempotencyEntry>,
+    ///
+    /// The token identifies the call on its own here, so no request accompanies the
+    /// record: "if you call IssueCertificate multiple times with the same idempotency
+    /// token … Amazon Web Services Private CA recognizes that you are requesting only one
+    /// certificate and will issue only one" (`IssueCertificateRequest$IdempotencyToken`).
+    pub issue_idempotency: HashMap<String, IdempotencyEntry<()>>,
 }
 
 impl CertificateAuthorityRecord {
@@ -1086,6 +1091,116 @@ pub fn invalid_revocation_configuration_reason(
     None
 }
 
+/// What Amazon Web Services Private CA answers a revocation configuration whose CRLs are
+/// to be written to an S3 bucket that is not there: one sentence about the bucket, naming
+/// no bucket of its own.
+pub const CRL_BUCKET_ABSENT_MESSAGE: &str = "The S3 bucket you provided does not exist.";
+
+/// Whether an enabled CRL configuration names an S3 bucket that cannot be resolved, which
+/// is what the call carrying it is refused for.
+///
+/// "Your private CA writes CRLs to an S3 bucket that you specify in the `S3BucketName`
+/// parameter […] Your S3 bucket policy must give write permission to Amazon Web Services
+/// Private CA" (`CrlConfiguration`): the bucket is where the CA's CRLs go, so the
+/// configuration is resolved against object storage WHEN IT IS CONFIGURED — a CA accepted
+/// with a bucket nothing holds would look healthy and publish no CRL at all.
+///
+/// S3 is reached the way the framework documents a handler reaching another emulated
+/// service ([`smithy_server_runtime::OperationContext::callback`]): an AWS SDK client over
+/// the in-process callback's HTTP client and credentials, so this crate names no other
+/// service crate and the bucket is resolved against the emulator's OWN S3 state. The
+/// question is put with `HeadBucket`, which S3 documents for exactly it ("You can use this
+/// operation to determine if a bucket exists").
+///
+/// `false` means the call may proceed. That includes every answer that is not S3 reporting
+/// the bucket absent — a router with no S3 mounted, or any other failure to ask: nothing
+/// is then known about the bucket, and a refusal has to be grounded in what S3 answered
+/// rather than assumed. A configuration whose CRLs are disabled, or that names no bucket
+/// at all, has no bucket to resolve.
+pub async fn unresolvable_crl_bucket(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    revocation: Option<&RevocationConfiguration>,
+) -> bool {
+    let Some(crl) = revocation.and_then(|revocation| revocation.crl_configuration.as_ref()) else {
+        return false;
+    };
+    if !crl.enabled {
+        return false;
+    }
+    let Some(bucket) = crl.s3_bucket_name.as_ref() else {
+        return false;
+    };
+    let answer = s3_client(ctx, region)
+        .head_bucket()
+        .bucket(bucket)
+        .send()
+        .await;
+    match answer {
+        // S3 holds the bucket, so the CA can write its CRLs to it.
+        Ok(_) => false,
+        // S3 says this account holds no such bucket: the refusal is grounded.
+        Err(error) if bucket_reported_absent(&error) => true,
+        Err(error) => {
+            ::tracing::warn!(
+                bucket = %bucket,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "the CRL configuration's bucket could not be resolved against S3"
+            );
+            false
+        }
+    }
+}
+
+/// The S3 client this service resolves a CRL bucket through: the AWS SDK driven over the
+/// emulator's own in-process transport, signing in the emulator's name — the bucket is
+/// read on this service's own behalf, not the caller's, exactly as Amazon Web Services
+/// Private CA reads it with its own service principal.
+///
+/// NOTHING here opens a socket or leaves the host: the transport is
+/// `ctx.callback().http_client()`, the emulator's in-process channel into its own services,
+/// and the endpoint is only the address that channel resolves S3 by. The credentials are
+/// the emulator's own and are used to sign this one call; they are never returned or
+/// logged.
+fn s3_client(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> ::aws_sdk_s3::Client {
+    let config = ::aws_sdk_s3::Config::builder()
+        .behavior_version(::aws_sdk_s3::config::BehaviorVersion::latest())
+        .http_client(ctx.callback().http_client())
+        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .region(::aws_sdk_s3::config::Region::new(region.to_string()))
+        .endpoint_url(format!("https://s3.{region}.amazonaws.com"))
+        // The emulator serves one endpoint for every service, so the bucket travels in the
+        // path rather than in a per-bucket host the router could not resolve.
+        .force_path_style(true)
+        // The transport is in-process: there is nothing to retry, time out or watch for a
+        // stalled stream, and each of those would need a sleep implementation this client
+        // is not given. The same goes for caching the identity: the credentials are handed
+        // over directly.
+        .retry_config(::aws_sdk_s3::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_s3::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_s3::config::IdentityCache::no_cache())
+        .stalled_stream_protection(::aws_sdk_s3::config::StalledStreamProtectionConfig::disabled())
+        .build();
+    ::aws_sdk_s3::Client::from_conf(config)
+}
+
+/// Whether an S3 `HeadBucket` failure is S3 reporting that the bucket does not exist
+/// (`NotFound`, the only error that operation models), as opposed to the call not reaching
+/// S3 at all.
+fn bucket_reported_absent(
+    error: &::aws_sdk_s3::error::SdkError<
+        ::aws_sdk_s3::operation::head_bucket::HeadBucketError,
+        ::aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    >,
+) -> bool {
+    error
+        .as_service_error()
+        .is_some_and(::aws_sdk_s3::operation::head_bucket::HeadBucketError::is_not_found)
+}
+
 /// Whether `document` is a resource-based policy this service will attach to a private CA.
 ///
 /// "If this policy does not contain all required statements or if it includes any statement
@@ -1199,11 +1314,18 @@ pub fn remove_tags(existing: &mut Vec<Tag>, tags: &[Tag]) {
     });
 }
 
-/// An idempotency token's record: what it minted and when it stops being honoured.
+/// An idempotency token's record: what it minted, WHAT IT WAS ASKED FOR, and when it
+/// stops being honoured.
+///
+/// `R` is how the operation that holds the map identifies the request a token was honoured
+/// for, so the map can tell a repeat of that request from a different one sharing its
+/// token. An operation whose token identifies the call on its own carries `()`.
 #[derive(Debug, Clone)]
-pub struct IdempotencyEntry {
+pub struct IdempotencyEntry<R> {
     /// The ARN the first call with this token returned.
     pub arn: String,
+    /// The request that ARN was minted for.
+    pub request: R,
     /// End of the five-minute window the token is honoured for.
     pub expires_at: SystemTime,
     /// Insertion order, so eviction at the ceiling is the oldest entry rather than an
@@ -1211,11 +1333,12 @@ pub struct IdempotencyEntry {
     pub sequence: u64,
 }
 
-impl IdempotencyEntry {
-    /// A token recorded at `now`, honoured for [`IDEMPOTENCY_WINDOW`].
-    pub fn new(arn: &str, now: SystemTime) -> Self {
+impl<R> IdempotencyEntry<R> {
+    /// A token recorded at `now` for `request`, honoured for [`IDEMPOTENCY_WINDOW`].
+    pub fn new(arn: &str, request: R, now: SystemTime) -> Self {
         Self {
             arn: arn.to_string(),
+            request,
             expires_at: now + IDEMPOTENCY_WINDOW,
             sequence: next_sequence(),
         }
@@ -1223,14 +1346,23 @@ impl IdempotencyEntry {
 }
 
 /// Look `token` up in an idempotency map, ignoring (and pruning) an expired entry.
-pub fn replay_idempotent(
-    tokens: &mut HashMap<String, IdempotencyEntry>,
+///
+/// A token is a replay only of the request it was recorded for: an entry whose `request`
+/// is not the one being made is not this call's answer, so the caller goes on and creates
+/// a resource of its own rather than being handed a handle to someone else's. That is what
+/// keeps one token reused across two different requests from collapsing them into one
+/// resource — the token distinguishes retries of ONE call, it does not name a resource.
+pub fn replay_idempotent<R: PartialEq>(
+    tokens: &mut HashMap<String, IdempotencyEntry<R>>,
     token: Option<&String>,
+    request: &R,
     now: SystemTime,
 ) -> Option<String> {
     let token = token?;
     match tokens.get(token) {
-        Some(entry) if now < entry.expires_at => Some(entry.arn.clone()),
+        Some(entry) if now < entry.expires_at => {
+            (entry.request == *request).then(|| entry.arn.clone())
+        }
         Some(_) => {
             tokens.remove(token);
             None
@@ -1246,9 +1378,10 @@ pub fn replay_idempotent(
 /// [`MAX_IDEMPOTENCY_TOKENS`] live entries the oldest INSERTED entry (the lowest
 /// `sequence`) makes room. A caller sending a fresh token per request therefore cannot
 /// grow this map without limit, and an absent token is simply not remembered.
-pub fn record_idempotent(
-    tokens: &mut HashMap<String, IdempotencyEntry>,
+pub fn record_idempotent<R>(
+    tokens: &mut HashMap<String, IdempotencyEntry<R>>,
     token: Option<String>,
+    request: R,
     arn: &str,
     now: SystemTime,
 ) {
@@ -1266,7 +1399,7 @@ pub fn record_idempotent(
         };
         tokens.remove(&oldest);
     }
-    tokens.insert(token, IdempotencyEntry::new(arn, now));
+    tokens.insert(token, IdempotencyEntry::new(arn, request, now));
 }
 
 /// Per-service state for com-amazonaws-acmpca-acmprivateca. A handler reaches it through [`service_state`].
@@ -1274,8 +1407,10 @@ pub fn record_idempotent(
 pub struct ComAmazonawsAcmpcaAcmprivatecaState {
     /// Every private CA, keyed by its ARN.
     pub certificate_authorities: HashMap<String, CertificateAuthorityRecord>,
-    /// `CreateCertificateAuthority` idempotency tokens -> the CA ARN they minted.
-    pub create_idempotency: HashMap<String, IdempotencyEntry>,
+    /// `CreateCertificateAuthority` idempotency tokens -> the CA ARN they minted, with
+    /// the configuration that CA was created from: a token is honoured as a replay only
+    /// of a request for the SAME configuration ([`replay_idempotent`]).
+    pub create_idempotency: HashMap<String, IdempotencyEntry<CertificateAuthorityConfiguration>>,
 }
 
 impl ComAmazonawsAcmpcaAcmprivatecaState {

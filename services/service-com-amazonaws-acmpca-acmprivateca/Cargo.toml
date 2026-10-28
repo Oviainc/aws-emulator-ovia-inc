@@ -30,11 +30,20 @@ hex = { workspace = true }
 # service accepts (ImportCertificateAuthorityCertificate, IssueCertificate) and hands
 # out (GetCertificateAuthorityCsr, GetCertificate).
 x509-cert = "0.2"
+# Amazon S3 client the bucket an enabled `CrlConfiguration` names is resolved through
+# before a CA is created or updated with it: Amazon Web Services Private CA writes its
+# CRLs to that bucket, and S3 is called over the in-process callback into this same
+# emulator (no network client feature is enabled: the transport is the emulator's own).
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 
 [dev-dependencies]
 # Generates the real certificates and certification requests the tests feed the
 # service, independently of the DER this crate writes itself.
 rcgen = "0.13"
+# The CRL-bucket suite mounts the S3 service beside this one on a single engine, because
+# CreateCertificateAuthority resolves a CRL configuration's bucket by calling S3 in
+# process.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

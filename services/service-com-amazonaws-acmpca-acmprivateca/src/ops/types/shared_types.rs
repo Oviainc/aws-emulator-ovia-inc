@@ -12,7 +12,10 @@ use super::*;
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-acmpca-acmprivateca.json");
 
 #[smithy_macros::smithy(shape = "com.amazonaws.acmpca#CertificateAuthorityConfiguration")]
-#[derive(Debug, Clone, Default)]
+// `PartialEq`/`Eq` here and on every shape this one reaches: a CA's configuration is what
+// `CreateCertificateAuthority`'s idempotency token is honoured FOR, so two requests sharing
+// a token are compared member by member (`crate::state::replay_idempotent`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CertificateAuthorityConfiguration {
     pub key_algorithm: String,
     pub signing_algorithm: String,
@@ -21,7 +24,7 @@ pub struct CertificateAuthorityConfiguration {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.acmpca#ASN1Subject")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ASN1Subject {
     pub country: Option<String>,
     pub organization: Option<String>,
@@ -41,21 +44,21 @@ pub struct ASN1Subject {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.acmpca#CustomAttribute")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CustomAttribute {
     pub object_identifier: String,
     pub value: String,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.acmpca#CsrExtensions")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CsrExtensions {
     pub key_usage: Option<KeyUsage>,
     pub subject_information_access: Option<Vec<AccessDescription>>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.acmpca#KeyUsage")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct KeyUsage {
     pub digital_signature: bool,
     pub non_repudiation: bool,
@@ -69,21 +72,21 @@ pub struct KeyUsage {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.acmpca#AccessDescription")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AccessDescription {
     pub access_method: AccessMethod,
     pub access_location: GeneralName,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.acmpca#AccessMethod")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AccessMethod {
     pub custom_object_identifier: Option<String>,
     pub access_method_type: Option<String>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.acmpca#GeneralName")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GeneralName {
     pub other_name: Option<OtherName>,
     pub rfc822_name: Option<String>,
@@ -96,14 +99,14 @@ pub struct GeneralName {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.acmpca#OtherName")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OtherName {
     pub type_id: String,
     pub value: String,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.acmpca#EdiPartyName")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EdiPartyName {
     pub party_name: String,
     pub name_assigner: Option<String>,

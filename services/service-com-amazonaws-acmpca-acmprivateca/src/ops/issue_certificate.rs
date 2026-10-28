@@ -296,6 +296,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(arn) = crate::state::replay_idempotent(
             &mut record.issue_idempotency,
             input.idempotency_token.as_ref(),
+            &(),
             now,
         ) {
             return Ok(IssueCertificateOutput {
@@ -412,6 +413,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::record_idempotent(
             &mut record.issue_idempotency,
             input.idempotency_token,
+            (),
             &arn,
             now,
         );

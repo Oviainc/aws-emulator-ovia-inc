@@ -178,7 +178,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let arn = input.certificate_authority_arn;
         if crate::state::parse_certificate_authority_arn(&arn).is_none() {
             return Err(UpdateCertificateAuthorityErrorModeled::InvalidArnException(
@@ -218,6 +217,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.status.is_none() && input.revocation_configuration.is_none() {
             return Err(invalid_args(
                 "Either Status or RevocationConfiguration must be specified.",
+            ));
+        }
+        // The bucket an enabled CRL configuration names is resolved against object
+        // storage before the configuration is written, exactly as it is when a CA is
+        // created: this call states the mechanisms the CA supports FROM NOW ON, so a
+        // bucket nothing holds would leave the CA publishing no CRL. The lookup is an
+        // in-process call to another service, so it is made before the store is locked.
+        if crate::state::unresolvable_crl_bucket(
+            ctx,
+            &crate::state::request_region(&ctx.parts().headers),
+            input.revocation_configuration.as_ref(),
+        )
+        .await
+        {
+            return Err(UpdateCertificateAuthorityError::validation(
+                crate::state::CRL_BUCKET_ABSENT_MESSAGE,
             ));
         }
 

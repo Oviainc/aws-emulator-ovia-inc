@@ -210,6 +210,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         validate_revocation_configuration(input.revocation_configuration.as_ref())?;
         validate_tags(input.tags.as_deref())?;
 
+        let region = crate::state::request_region(&ctx.parts().headers);
+        // The bucket an enabled CRL configuration names is resolved against object
+        // storage BEFORE any CA is registered, so a CA is never created for a CRL
+        // configuration it could not publish to. The lookup is an in-process call to
+        // another service, so it is made before the store is locked.
+        if crate::state::unresolvable_crl_bucket(
+            ctx,
+            &region,
+            input.revocation_configuration.as_ref(),
+        )
+        .await
+        {
+            return Err(CreateCertificateAuthorityError::validation(
+                crate::state::CRL_BUCKET_ABSENT_MESSAGE,
+            ));
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateCertificateAuthorityErrorModeled::RequestFailedException(
                 RequestFailedException {
@@ -222,10 +239,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
 
         // @idempotent: a repeat of the same token inside the five-minute window answers
-        // with the CA the first call minted instead of minting a second one.
+        // with the CA the first call minted instead of minting a second one. A token
+        // reused for a DIFFERENT configuration is not a repeat of that call, so it mints
+        // a CA of its own ([`crate::state::replay_idempotent`]).
         if let Some(arn) = crate::state::replay_idempotent(
             &mut state.create_idempotency,
             input.idempotency_token.as_ref(),
+            &input.certificate_authority_configuration,
             now,
         ) {
             return Ok(CreateCertificateAuthorityOutput {
@@ -251,7 +271,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let region = crate::state::request_region(&ctx.parts().headers);
         let id = crate::state::mint_resource_id();
         let arn = ::emulator_server::emulator_arn(
             crate::state::ARN_SERVICE,
@@ -306,6 +325,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::record_idempotent(
             &mut state.create_idempotency,
             input.idempotency_token,
+            record.configuration.clone(),
             &arn,
             now,
         );
