@@ -16,9 +16,8 @@
 //! preference's own.
 //!
 //! The rows are the forms a submitted code can be wrong in; the shared helpers (the
-//! router, the wire call, the create, the reader, and the out-of-band code issue the
-//! portal flow needs) come from `refused_procurement_portal_writes`, so there is one
-//! harness for this plane.
+//! router, the wire call, the create, the reader, and the code issue the portal flow needs)
+//! come from `refused_procurement_portal_writes`, so there is one harness for this plane.
 
 use serde_json::json;
 
@@ -63,8 +62,8 @@ async fn a_rejected_validation_code_leaves_the_other_preferences_alone() {
     )
     .await;
 
-    let issued = issue_code(&engine, &subject);
-    let bystanders_code = issue_code(&engine, &bystander);
+    let issued = issue_code(&router, &engine, &subject).await;
+    let bystanders_code = issue_code(&router, &engine, &bystander).await;
     let before = get_preference(&router, &bystander).await;
 
     let wrong_codes = [

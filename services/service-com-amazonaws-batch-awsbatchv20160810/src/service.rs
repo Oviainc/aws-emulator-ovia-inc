@@ -39,6 +39,17 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! ## Naming the request a response answers
+//!
+//! Every response AWS sends names the request it answered, in the header this protocol
+//! reports that id in (`x-amzn-RequestId`), on a success exactly as on a failure. This file
+//! wires that report at the layers a response of this service is rendered by:
+//! [`request_id_header::RequestIdHeaderOperation`] for everything an operation answers —
+//! which reports the id a Batch refusal STATES in its message rather than a second one —
+//! and `override_routing_error` below for the answer to a request that named no modelled
+//! operation. See [`request_id_header`] for the rule and for the shared module that owns it
+//! for every emulated service.
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
@@ -113,7 +124,8 @@ fn enum_membership_message(violation: &Violation) -> Option<String> {
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
     /// Serves every routable request through the generated routing table and then reports
-    /// the request id its document states; see [`request_id_header`].
+    /// the request that answer belongs to; see [`request_id_header`]. Held, not built per
+    /// request: `override_operation` hands back a borrow of it.
     request_id_header: RequestIdHeaderOperation,
 }
 
@@ -153,10 +165,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     ) -> Option<&dyn ErasedOperation> {
         // Every request the generated routing table can serve is served through the
         // header wrapper, which delegates to that same table entry and then reports the
-        // answer's own request id in the header AWS carries it in (see
+        // request that answer belongs to in the header AWS carries it in (see
         // [`request_id_header`]). The routing stays the model's: a request whose target
         // names no modelled operation is declined here, so the framework answers it as
-        // the unroutable request it is.
+        // the unroutable request it is (and `override_routing_error` below names the
+        // request on that answer).
         let routes = self
             .entry
             .protocol()
@@ -235,12 +248,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     ) -> Option<aws_smithy_runtime_api::http::Response> {
         // The router calls this when a request reached this service but named no
         // modeled operation — neither `override_operation` nor the generated
-        // routing table resolved it. Returning `None` renders the protocol-correct
-        // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        // routing table resolved it. The ENVELOPE stays the framework's
+        // protocol-correct default (restJson1 -> 501); what is added is the one header
+        // every response of this service names its request in, because an answer no
+        // operation produced is still an answer a client correlates on (see
+        // [`request_id_header`]).
+        Some(request_id_header::with_request_id_header(
+            self.entry.routing_error_response(req),
+        ))
     }
 
     fn override_framework_error(

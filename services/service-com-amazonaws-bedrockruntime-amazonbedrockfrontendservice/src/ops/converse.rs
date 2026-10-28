@@ -11,6 +11,11 @@
 //! token accounting, the stop reason and the metrics are all computed from the
 //! request that was actually served.
 //!
+//! The supplied `inferenceConfig` bounds that message: it is composed to fit
+//! `maxTokens` and it HALTS where the first configured `stopSequences` entry
+//! completes (see [`crate::state::halt_at_stop_sequence`]), so a configured stop
+//! sequence is the last thing the turn serves and nothing follows it.
+//!
 //! A mandatory `toolConfig.toolChoice` (`any` or `tool`) obliges the turn to
 //! request a tool instead of generating text: the assistant message is then one
 //! `toolUse` block whose `toolUseId` is minted here, whose `input` is the
@@ -350,10 +355,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.system.as_ref(),
             input.messages.as_ref(),
             input.tool_config.as_ref(),
-            input
-                .inference_config
-                .as_ref()
-                .and_then(|config| config.max_tokens),
+            crate::state::TurnInference::of(input.inference_config.as_ref()),
             tool_use,
             cache,
         );

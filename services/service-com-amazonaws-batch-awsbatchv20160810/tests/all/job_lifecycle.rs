@@ -182,6 +182,21 @@ impl Batch {
         uri: &str,
         payload: Option<Value>,
     ) -> (u16, Value) {
+        let (status, _headers, decoded) = self.send_reported(method, uri, payload).await;
+        (status, decoded)
+    }
+
+    /// `method` `uri` with `payload` as the JSON body; answer the status, the response's
+    /// HEADERS and the decoded body.
+    ///
+    /// The same one request builder [`Batch::send`] uses — it is this call — for a suite
+    /// that asserts something a response reports in a header rather than in its document.
+    pub(crate) async fn send_reported(
+        &self,
+        method: &str,
+        uri: &str,
+        payload: Option<Value>,
+    ) -> (u16, http::HeaderMap, Value) {
         let body = payload.map_or_else(Bytes::new, |value| {
             Bytes::from(serde_json::to_vec(&value).expect("the request body serializes"))
         });
@@ -195,6 +210,7 @@ impl Batch {
             .expect("a well-formed request");
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
+        let headers = response.headers().clone();
         let bytes = response.into_body();
         let decoded = if bytes.is_empty() {
             Value::Null
@@ -203,7 +219,7 @@ impl Batch {
                 Value::String(String::from_utf8_lossy(bytes.as_ref()).into_owned())
             })
         };
-        (status, decoded)
+        (status, headers, decoded)
     }
 
     /// POST `uri`, requiring a 200.

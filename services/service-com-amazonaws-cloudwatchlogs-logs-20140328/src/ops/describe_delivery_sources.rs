@@ -186,9 +186,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries only request metadata; this operation reports on stored delivery
-        // sources and needs none of it.
-        let _ = ctx;
+        // A delivery source is a regional resource, so what this reports is the sources of the
+        // Region the request was signed for; nothing else on the request takes part.
+        let region = crate::state::request_region(ctx.parts());
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DescribeDeliverySourcesError::from(
@@ -224,14 +224,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
-        // One enumeration, in the order the store holds it (by source name), of the sources
-        // the request's filter selects: `resourceArns` is "An array of Amazon Resource Names
-        // (ARNs) that filters the results to delivery sources associated with ANY specified
-        // ARN", so a source is selected when one of its `resourceArns` is among them, and
-        // every source is selected when the request names no ARN at all.
+        // One enumeration, in the order the store holds it (by source name) of the Region's
+        // own sources, of the ones the request's filter selects: `resourceArns` is "An array of
+        // Amazon Resource Names (ARNs) that filters the results to delivery sources associated
+        // with ANY specified ARN", so a source is selected when one of its `resourceArns` is
+        // among them, and every source is selected when the request names no ARN at all.
         let matching: Vec<&crate::state::DeliverySourceRecord> = store
-            .delivery_sources
-            .values()
+            .delivery_sources_in(&region)
             .filter(|source| {
                 input.resource_arns.as_ref().is_none_or(|arns| {
                     source

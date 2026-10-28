@@ -166,9 +166,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries only request metadata; a delivery destination is identified by its
-        // own name and by nothing about the request.
-        let _ = ctx;
+        // A delivery destination is a regional resource, so the destination this delete
+        // addresses is the one the Region the request was signed for holds under that name.
+        let region = crate::state::request_region(ctx.parts());
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteDeliveryDestinationError::from(
@@ -181,12 +181,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = state.lock();
 
-        // A name this account holds no delivery destination under names no destination, which
+        // A name this Region holds no delivery destination under names no destination, which
         // is the modelled not-found refusal — so deleting the same destination twice refuses
-        // the second time.
+        // the second time, and so does a delete addressed to a Region that holds none under
+        // the name.
         let Some(arn) = store
-            .delivery_destinations
-            .get(&input.name)
+            .delivery_destination(&region, &input.name)
             .map(|destination| destination.arn.clone())
         else {
             return Err(
@@ -201,13 +201,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
         // "You can't delete a delivery destination if any current deliveries are associated
-        // with it": a delivery names its destination by ARN, so the deliveries the store
+        // with it": a delivery names its destination by ARN, so the deliveries this Region
         // holds are what answers that. The refusal is the error class's fixed in-use text,
         // which names no delivery — the documentation points the caller at DescribeDeliveries
         // to find every delivery that references this destination.
         if store
-            .deliveries
-            .values()
+            .deliveries_in(&region)
             .any(|delivery| delivery.delivery_destination_arn == arn)
         {
             return Err(
@@ -219,7 +218,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
-        store.delivery_destinations.remove(&input.name);
+        store
+            .delivery_destinations
+            .remove(&crate::state::RegionalKey::new(&region, &input.name));
 
         Ok(DeleteDeliveryDestinationOutput)
     }

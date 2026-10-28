@@ -31,6 +31,8 @@ mod cache_policy_update;
 mod caller_reference_immutable;
 #[path = "all/connection_function_code.rs"]
 mod connection_function_code;
+#[path = "all/connection_function_delete.rs"]
+mod connection_function_delete;
 #[path = "all/connection_function_lifecycle.rs"]
 mod connection_function_lifecycle;
 #[path = "all/connection_function_list.rs"]

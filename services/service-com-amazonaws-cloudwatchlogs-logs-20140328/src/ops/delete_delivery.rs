@@ -165,9 +165,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries only request metadata; a delivery is identified by its own id and
-        // by nothing about the request.
-        let _ = ctx;
+        // A delivery is a regional resource, so the delivery this delete addresses is the one
+        // the Region the request was signed for holds under that id.
+        let region = crate::state::request_region(ctx.parts());
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteDeliveryError::from(DeleteDeliveryErrorModeled::ServiceUnavailableException(
@@ -180,10 +180,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Deleting a delivery only deletes the connection between the delivery source and
         // delivery destination. It does not delete the delivery destination or the delivery
-        // source": only the delivery itself is removed. An id this account holds no delivery
+        // source": only the delivery itself is removed. An id this Region holds no delivery
         // under names no delivery, which is the modelled not-found refusal — so deleting the
         // same delivery twice refuses the second time.
-        if store.deliveries.remove(&input.id).is_none() {
+        if store
+            .deliveries
+            .remove(&crate::state::RegionalKey::new(&region, &input.id))
+            .is_none()
+        {
             return Err(DeleteDeliveryErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::DELIVERY_NOT_FOUND_MESSAGE.to_string()),

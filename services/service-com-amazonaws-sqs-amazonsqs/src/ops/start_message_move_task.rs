@@ -309,6 +309,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // original source queue is determined exactly when the dead-letter queue has a
         // single source queue; with several of them the task cannot say which queue a
         // given message came from, so the call is refused rather than guessing one.
+        // Whether the request SPECIFIED the destination is part of the task's record: a
+        // reader reports `DestinationArn` for a task whose request named one and NULL for
+        // one that left the field blank, whichever queue this call resolved the messages
+        // back to.
+        let destination_specified = named_destination.is_some();
         let destination_name = match named_destination {
             Some(name) if state.holds_queue(&region, &name) => name,
             Some(_) => {
@@ -392,6 +397,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             region: region.clone(),
             source_queue_name: source_name.clone(),
             destination_queue_name: destination_name.clone(),
+            destination_specified,
             max_number_of_messages_per_second: input.max_number_of_messages_per_second,
             started_at: now,
             message_count: u64::try_from(moving_count).unwrap_or(u64::MAX),
