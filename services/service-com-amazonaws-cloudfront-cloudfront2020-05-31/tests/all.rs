@@ -137,6 +137,8 @@ mod key_value_store_lifecycle;
 mod key_value_store_list;
 #[path = "all/key_value_store_update.rs"]
 mod key_value_store_update;
+#[path = "all/lambda_edge_association.rs"]
+mod lambda_edge_association;
 #[path = "all/managed_cache_policy_catalog.rs"]
 mod managed_cache_policy_catalog;
 #[path = "all/managed_cache_policy_delete_gate.rs"]

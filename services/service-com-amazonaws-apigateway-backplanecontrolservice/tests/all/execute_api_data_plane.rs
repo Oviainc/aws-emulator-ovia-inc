@@ -157,7 +157,16 @@ pub(crate) async fn put_method(
 }
 
 /// `PutIntegration` for `verb` on `resource`, with `request` as its body.
-async fn put_integration(gateway: &Gateway, api: &str, resource: &str, verb: &str, request: Value) {
+///
+/// `pub(crate)` for the sibling suites that stand a `MOCK` method up to invoke it
+/// (`stage_request_validation`).
+pub(crate) async fn put_integration(
+    gateway: &Gateway,
+    api: &str,
+    resource: &str,
+    verb: &str,
+    request: Value,
+) {
     let answer = gateway
         .call(
             "PUT",
@@ -193,7 +202,9 @@ async fn put_integration_response(
 }
 
 /// `PutIntegrationResponse`, asserting the modelled 201.
-async fn integration_response(
+///
+/// `pub(crate)` for the sibling suites that stand a `MOCK` method up to invoke it.
+pub(crate) async fn integration_response(
     gateway: &Gateway,
     api: &str,
     resource: &str,
@@ -210,7 +221,9 @@ async fn integration_response(
 }
 
 /// `PutMethodResponse` for `status` on `verb`, asserting the modelled 201.
-async fn method_response(
+///
+/// `pub(crate)` for the sibling suites that stand a `MOCK` method up to invoke it.
+pub(crate) async fn method_response(
     gateway: &Gateway,
     api: &str,
     resource: &str,

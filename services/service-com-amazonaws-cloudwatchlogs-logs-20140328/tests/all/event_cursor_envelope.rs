@@ -20,23 +20,7 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::{base_ms, batch, group_with_stream, Logs};
-
-/// The `message` values of a `GetLogEvents` page, in the order returned.
-fn messages(page: &Value) -> Vec<String> {
-    page.get("events")
-        .and_then(Value::as_array)
-        .unwrap_or_else(|| panic!("GetLogEvents must return events, got {page}"))
-        .iter()
-        .map(|event| {
-            event
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or_else(|| panic!("every event carries a message, got {event}"))
-                .to_string()
-        })
-        .collect()
-}
+use crate::harness::{base_ms, batch, group_with_stream, messages, Logs};
 
 /// One cursor of a page, as the envelope decomposes it: the direction prefix, the opaque
 /// body, and whether the end-of-stream sentinel is present.

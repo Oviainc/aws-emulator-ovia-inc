@@ -186,28 +186,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let state = store.lock();
 
-        let registry = state.registries.get(&input.registry_name).ok_or_else(|| {
-            ExportSchemaError::from(ExportSchemaErrorModeled::NotFoundException(
-                crate::state::registry_not_found(&input.registry_name),
-            ))
-        })?;
-        let schema = registry.schemas.get(&input.schema_name).ok_or_else(|| {
-            ExportSchemaError::from(ExportSchemaErrorModeled::NotFoundException(
-                crate::state::schema_not_found(&input.schema_name),
-            ))
-        })?;
+        // The one resolution every read that names a schema version makes: the
+        // registry, the schema in it and the version the request selects, each step
+        // answering its own refusal. See `crate::state::readable_schema_version`.
+        //
         // "Specifying this limits the results to only this schema version"; absent,
         // the latest stored version answers. A version this schema does not hold is as
         // absent as a schema that was never created.
-        let version = schema
-            .version_for(input.schema_version.as_deref())
-            .ok_or_else(|| {
+        let crate::state::ResolvedSchemaVersion {
+            registry,
+            schema,
+            version,
+        } = state
+            .readable_schema_version(
+                &input.registry_name,
+                &input.schema_name,
+                input.schema_version.as_deref(),
+            )
+            .map_err(|refusal| {
                 ExportSchemaError::from(ExportSchemaErrorModeled::NotFoundException(
-                    crate::state::schema_version_not_found(
-                        &input.registry_name,
-                        &input.schema_name,
-                        input.schema_version.as_deref(),
-                    ),
+                    refusal.not_found(),
                 ))
             })?;
 

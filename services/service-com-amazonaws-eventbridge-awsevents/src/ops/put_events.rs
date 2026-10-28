@@ -2075,7 +2075,7 @@ impl Clients {
 
 #[cfg(test)]
 mod tests {
-    use super::{sqs_queue, TargetKind};
+    use super::{kinesis_partition_key, sqs_queue, TargetKind};
 
     /// One row of the table below: the case, the target's ARN, the kind that ARN
     /// names, the IAM action its invocation performs, and whether that
@@ -2322,5 +2322,64 @@ mod tests {
             "a Detail at and past {deepest} levels must be judged on a \
              {SMALL_STACK_BYTES}-byte stack"
         );
+    }
+
+    /// The partition key a Kinesis target's record is written under, for the
+    /// cases the wire-level table in `tests/all/kinesis_target_delivery.rs` does
+    /// NOT reach: the value types a delivered event's detail can hold beyond a
+    /// string, a number and an object (a whole array, a boolean, an explicit
+    /// null), a path whose own prefix names no container, a union of member
+    /// names, and a path past the length the shared reading of a path evaluates.
+    /// Every case the wire table already pins is left to it rather than restated
+    /// here.
+    ///
+    /// The rule: the key is the JSON text of the value
+    /// `KinesisParameters$PartitionKeyPath` selects from the delivered text, and
+    /// the empty JSON object when it selects no single value.
+    #[test]
+    fn a_kinesis_targets_record_is_keyed_on_what_its_path_selects() {
+        const EVENT_ID: &str = "11111111-2222-3333-4444-555555555555";
+        // Past the length the shared reading of a path evaluates (the wrapper
+        // `$['…']` adds five bytes to the name), so this row sits outside that
+        // bound rather than merely being long.
+        let long_path = format!(
+            "$['{}']",
+            "a".repeat(::service_common::json_reference_path::MAX_PATH_BYTES)
+        );
+        let delivered = ::serde_json::json!({
+            "id": EVENT_ID,
+            "source": "com.demo.orders",
+            "detail": {
+                "n": 7,
+                "tenant": "tenant-alpha",
+                "list": [1, 2],
+                "flag": true,
+                "nothing": ::serde_json::Value::Null,
+            },
+        })
+        .to_string();
+        // (case, the target's PartitionKeyPath, the key the record carries)
+        let rows: [(&str, &str, &str); 6] = [
+            ("a whole array", "$.detail.list", "[1,2]"),
+            ("a boolean", "$.detail.flag", "true"),
+            ("an explicit null", "$.detail.nothing", "null"),
+            ("a path under no container", "$.detail.n.deeper", "{}"),
+            // A union asks for a node LIST rather than one place, which this
+            // emulator does not follow: it selects nothing rather than being
+            // evaluated against the whole document.
+            ("a union of members", "$['n','tenant']", "{}"),
+            (
+                "a path longer than the shared reading evaluates",
+                long_path.as_str(),
+                "{}",
+            ),
+        ];
+        for (case, path, expected) in rows {
+            let key = kinesis_partition_key(Some(path), EVENT_ID, &delivered);
+            assert_eq!(
+                key, expected,
+                "case {case:?}: expected the partition key {expected:?}, got {key:?}"
+            );
+        }
     }
 }

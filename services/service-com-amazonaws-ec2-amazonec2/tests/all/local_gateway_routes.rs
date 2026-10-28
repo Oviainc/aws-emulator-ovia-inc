@@ -184,6 +184,9 @@ fn emulator_with_routes() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>, S
                     coip_pool_id: None,
                     route_type: row.route_type.to_string(),
                     state: row.state.to_string(),
+                    // Each seeded route is written in the state its row names and stays in
+                    // it: nothing here is a route a call of this emulator just introduced.
+                    becomes: None,
                 })
                 .is_some(),
             "case {case:?}: the store must take the seeded route"
@@ -200,6 +203,7 @@ fn emulator_with_routes() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>, S
                 coip_pool_id: None,
                 route_type: TYPE_STATIC.to_string(),
                 state: STATE_ACTIVE.to_string(),
+                becomes: None,
             })
             .is_some(),
         "the second table must take its seeded route"

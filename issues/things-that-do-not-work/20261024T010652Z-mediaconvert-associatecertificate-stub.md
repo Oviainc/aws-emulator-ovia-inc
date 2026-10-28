@@ -23,3 +23,14 @@ The handler carries the scaffold marker `//! SCAFFOLDED, NOT IMPLEMENTED:` at th
 
 1. Boot the mediaconvert emulator
 2. Call AssociateCertificate and observe HTTP 501 with no state persisted
+
+## Update
+
+`AssociateCertificate` was implemented, and its `//! SCAFFOLDED, NOT IMPLEMENTED:` header
+line deleted, alongside the fix for
+`20261024T010652Z-mediaconvert-disassociatecertificate-stub.md`: the disassociation has
+nothing to remove, and nothing a client can observe, unless the door that adds an
+association exists, so both handlers and the account's certificate set landed in that one
+change (`services/service-com-amazonaws-mediaconvert-mediaconvert/tests/all/certificate_association.rs`
+covers them end to end). This report is left here for its own session to close; the
+operation it describes is no longer a scaffold.

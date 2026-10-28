@@ -19,6 +19,8 @@ mod account_endpoints;
 mod blank_resource_name;
 #[path = "all/cancel_job_idempotence.rs"]
 mod cancel_job_idempotence;
+#[path = "all/certificate_association.rs"]
+mod certificate_association;
 #[path = "all/create_job_validation.rs"]
 mod create_job_validation;
 #[path = "all/created_resource_defaults.rs"]

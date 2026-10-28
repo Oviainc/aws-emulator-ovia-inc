@@ -2,8 +2,8 @@
 
 //! @op PutTaxExemption
 //!
-//! Records one tax exemption for each account the request names: the published
-//! exemption type it asks for, in the jurisdiction its `authority` names. One
+//! Records one tax exemption for each account the request names: the exemption
+//! type it asks for, in the jurisdiction its `authority` names. One
 //! applied submission opens one support case and answers its `caseId`, because
 //! it submits one certificate.
 //!
@@ -14,11 +14,15 @@
 //! past is refused before any record is written, and no case is opened for a
 //! submission that was not applied.
 //!
-//! Two refusals of the request, both `ValidationException`s about the collection
-//! `GetTaxExemptionTypes` publishes: an `exemptionType` that catalog does not
-//! name, and an `authority` outside the jurisdictions that type applies in
-//! ([`crate::state::check_exemption_type`] and
-//! [`crate::state::check_exemption_authority`] decide both against the catalog).
+//! The type a submission names is a free-form string the model constrains only
+//! in length and by a pattern that admits every character, and the model
+//! enumerates no legal values for it, so the submission is admitted on those
+//! constraints and the token is recorded as the caller spelled it — as the entry
+//! of the collection `GetTaxExemptionTypes` publishes when it names one
+//! ([`crate::state::submitted_exemption_type`]). The jurisdiction is admitted on
+//! the constraints the model states for `Authority` as well: the only refusal
+//! left here is the blank `state` its pattern forbids and the boundary cannot
+//! check.
 //!
 //! The accounts a submission names are NOT screened. The request addresses "a
 //! single account or all accounts listed in a consolidated billing family", and
@@ -189,13 +193,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             PutTaxExemptionErrorModeled::InternalServerException(crate::state::state_unavailable())
         })?;
 
-        // The exemption types are the collection this service publishes, and the
-        // model documents that a request names one of them ("Use the supported
-        // tax exemption type description"), so an unknown type is refused before
-        // anything is stored.
-        let exemption_type = crate::state::check_exemption_type(&input.exemption_type)
-            .map_err(PutTaxExemptionErrorModeled::ValidationException)?;
-
+        // `exemptionType` is a free-form string the model constrains only in
+        // length (1..=200) and by a pattern admitting every character, and it
+        // enumerates no legal values for it: the token is admitted on those
+        // constraints and recorded as submitted, so a type the real service
+        // supports is never refused against a collection whose wording is this
+        // emulator's own (see `crate::state::submitted_exemption_type`).
+        //
         // `Authority$state` carries the model's non-blank pattern
         // `^(?!\s*$)[\s\S]+$`, a negative lookahead the boundary validator's
         // regex engine cannot compile, so a blank state reaches this handler
@@ -207,8 +211,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::check_not_blank("authority.state", submitted_state)
                 .map_err(PutTaxExemptionErrorModeled::ValidationException)?;
         }
-        crate::state::check_exemption_authority(exemption_type, &input.authority)
-            .map_err(PutTaxExemptionErrorModeled::ValidationException)?;
 
         let mut store = state.lock();
         // Every account id the request names is written for: the boundary already
@@ -224,7 +226,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store
             .store_exemptions(
                 &input.account_ids,
-                exemption_type,
+                &input.exemption_type,
                 &input.authority,
                 ::std::time::SystemTime::now(),
             )

@@ -172,9 +172,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let state = store.lock();
 
-        let registry = state.registries.get(registry_name).ok_or_else(|| {
+        // The registry step of the one read resolution; the policy this operation reads
+        // is a property of the registry it resolves. See
+        // `crate::state::readable_registry`.
+        let registry = state.readable_registry(registry_name).map_err(|refusal| {
             GetResourcePolicyError::from(GetResourcePolicyErrorModeled::NotFoundException(
-                crate::state::registry_not_found(registry_name),
+                refusal.not_found(),
             ))
         })?;
 
