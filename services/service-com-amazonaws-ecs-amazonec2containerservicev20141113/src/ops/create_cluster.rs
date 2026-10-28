@@ -225,14 +225,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .cluster_name
             .clone()
             .unwrap_or_else(|| crate::state::DEFAULT_CLUSTER_NAME.to_string());
-        if !crate::state::is_valid_name(&name) {
+        if let Some(message) = crate::state::member_name_pattern_violation("clusterName", &name) {
             return Err(CreateClusterErrorModeled::InvalidParameterException(
                 InvalidParameterException {
-                    message: Some(format!(
-                        "clusterName must be 1 to {} letters, numbers, underscores or \
-                         hyphens; got {name:?}",
-                        crate::state::MAX_NAME_LENGTH
-                    )),
+                    message: Some(message),
                 },
             )
             .into());

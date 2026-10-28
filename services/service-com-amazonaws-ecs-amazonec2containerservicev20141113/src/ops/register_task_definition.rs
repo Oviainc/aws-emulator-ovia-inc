@@ -446,14 +446,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        if !crate::state::is_valid_name(&input.family) {
+        if let Some(message) =
+            crate::state::member_name_pattern_violation("family", &input.family)
+        {
             return Err(RegisterTaskDefinitionErrorModeled::InvalidParameterException(
                 InvalidParameterException {
-                    message: Some(format!(
-                        "family must be 1 to {} letters, numbers, underscores or hyphens; \
-                         got {:?}",
-                        crate::state::MAX_NAME_LENGTH, input.family
-                    )),
+                    message: Some(message),
                 },
             )
             .into());

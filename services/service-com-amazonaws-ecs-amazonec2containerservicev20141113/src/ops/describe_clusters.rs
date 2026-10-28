@@ -181,6 +181,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Every entry names a cluster, and a cluster name is "Up to 255 letters (uppercase
+        // and lowercase), numbers, underscores, and hyphens": a value outside that set
+        // names no cluster this account could hold, so it is refused as the invalid
+        // parameter it is rather than reported as a cluster that happens to be missing.
+        for reference in &requested {
+            let name = crate::state::cluster_name_from_reference(Some(reference));
+            if let Some(message) = crate::state::read_cluster_name_violation(&name) {
+                return Err(DescribeClustersErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+        }
+
         let mut guard = state.lock();
         guard.advance_clock(::std::time::SystemTime::now());
 
