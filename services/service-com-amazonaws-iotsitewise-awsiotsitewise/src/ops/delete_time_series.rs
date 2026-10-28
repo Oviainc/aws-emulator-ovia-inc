@@ -262,6 +262,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map_err(|miss| workspace_series_miss(workspace, &miss))?
                 .time_series_id
                 .clone();
+            // The stream's data segments are a dependency on it, whatever scope
+            // the request addressed it in — see `segments_remain`.
+            if let Some(holder) = segment_holder(&store, &time_series_id) {
+                return Err(segments_remain(&time_series_id, &holder));
+            }
             store.forget_capture_source(workspace, &time_series_id);
             // The token is spent only now that the delete has succeeded, and names
             // the series this call removed — the same rule the account-scoped path
@@ -330,6 +335,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|series| series.time_series_id.clone())
                 .unwrap_or_else(|| alias.clone()),
         };
+        // "You can't delete a time series until all of its data segments have been
+        // deleted from session datasets." A data segment names the time series whose
+        // data it covers, so a segment any dataset still holds for this stream depends
+        // on it: removing the stream would leave that segment covering data nothing
+        // holds and naming a stream no read can resolve. Checked BEFORE anything is
+        // removed, so a refused delete leaves the stream, its alias binding and its
+        // samples exactly as they were.
+        if let Some(holder) = segment_holder(&store, &deleted_time_series_id) {
+            return Err(segments_remain(&deleted_time_series_id, &holder));
+        }
+
         match &stream {
             crate::state::SeriesKey::Property(asset_id, property_id) => {
                 // Dropping the binding is an accepted write to the asset that
@@ -368,6 +384,33 @@ fn token_spent(region: &str, time_series_id: &str) -> DeleteTimeSeriesError {
             resource_arn: crate::state::time_series_arn(region, time_series_id),
         }),
     )
+}
+
+/// The dataset still holding a data segment of `time_series_id`, if any holds one:
+/// the dependency that stops the delete, read through the one per-series index the
+/// state exposes so both scopes of this operation ask the same question.
+fn segment_holder(
+    store: &crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState,
+    time_series_id: &str,
+) -> Option<String> {
+    store
+        .data_segment_of_time_series(time_series_id)
+        .map(|(holder, _)| holder.to_string())
+}
+
+/// HTTP 400 `InvalidRequestException` for a delete whose stream a dataset still
+/// holds a data segment of. This is a TERMINAL request error — the caller has to
+/// delete or disassociate the segments first, and no retry of this call can
+/// succeed — so it is `InvalidRequestException` (400) and not the retryable
+/// `ConflictingOperationException` (409), which states a transient conflict
+/// between two operations on one resource; the same rule, and the same mapping,
+/// as `DeleteAsset` and `DeleteDataset` give a delete whose resource is still
+/// depended on.
+fn segments_remain(time_series_id: &str, holder: &str) -> DeleteTimeSeriesError {
+    invalid_request(format!(
+        "The time series {time_series_id} has data segments in the dataset {holder}. \
+         Delete them before deleting it."
+    ))
 }
 
 /// HTTP 404 `ResourceNotFoundException` carrying `message`.

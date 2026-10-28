@@ -34,6 +34,13 @@ mod list_workspaces;
 #[path = "all/delete_dataset.rs"]
 mod delete_dataset;
 
+// `delete_time_series_data_segments` is declared HERE, beside the suite above, for
+// the reason its note gives: the sorted list and the END of this file are both
+// where every concurrent iotsitewise change puts a declaration of its own. Fold it
+// into the list once the churn settles.
+#[path = "all/delete_time_series_data_segments.rs"]
+mod delete_time_series_data_segments;
+
 // `client_token_replay` is declared HERE, at the head of the file, for the reason
 // the note above gives: the sorted list and the END of this file are both where
 // every concurrent iotsitewise change puts a declaration of its own. Fold it into

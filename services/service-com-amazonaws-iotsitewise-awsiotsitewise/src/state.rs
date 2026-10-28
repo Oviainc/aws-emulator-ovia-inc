@@ -4672,6 +4672,38 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             })
     }
 
+    /// A data segment of `time_series_id` any dataset of this store holds,
+    /// paired with the dataset holding it, or `None` when none does.
+    ///
+    /// The dependency `DeleteTimeSeries` refuses to break: "You can't delete a
+    /// time series until all of its data segments have been deleted from session
+    /// datasets" (its model doc). EVERY segment naming the series counts,
+    /// whichever dataset holds it and whichever dataset its data came from
+    /// ([`DataSegmentRecord::source_dataset_id`]) — a session dataset's own
+    /// segment covers that stream's data and a curated dataset's association
+    /// covers the same data from elsewhere, so either one left behind would
+    /// name a stream the store no longer holds. That is the wider question
+    /// [`Self::overlapping_data_segment_association`] does not ask: it compares
+    /// one span against the ASSOCIATIONS of a series, while this asks whether
+    /// anything at all still covers it.
+    ///
+    /// Answered in dataset-then-span order, so one store answers one way
+    /// whatever order its map iterates in.
+    pub fn data_segment_of_time_series(
+        &self,
+        time_series_id: &str,
+    ) -> Option<(&str, &DataSegmentRecord)> {
+        self.dataset_data_segments
+            .iter()
+            .flat_map(|(holder, held)| {
+                held.iter().map(move |segment| (holder.as_str(), segment))
+            })
+            .filter(|(_, segment)| segment.time_series_id == time_series_id)
+            .min_by(|(left_id, left), (right_id, right)| {
+                (*left_id, data_segment_key(left)).cmp(&(*right_id, data_segment_key(right)))
+            })
+    }
+
     /// Forget the segment of `dataset_id` that `time_series_id` and the span
     /// `[start, end)` name EXACTLY, answering whether one was held.
     ///
