@@ -19,7 +19,8 @@
 //! `BatchGetFleets`, `BatchGetSandboxes`, `BatchGetCommandExecutions`,
 //! `BatchGetReportGroups`, `BatchGetReports`, `GetReportGroupTrend`, `ListProjects`,
 //! `ListSharedProjects`,
-//! `ListBuildsForProject`, `ListBuildBatches`, `ListSandboxes`, `ListSandboxesForProject`,
+//! `ListBuildsForProject`, `ListBuildBatches`, `ListBuildBatchesForProject`,
+//! `ListSandboxes`, `ListSandboxesForProject`,
 //! `ListSourceCredentials`) only read them.
 //!
 //! Sharing is its own record: a [`StoredResourcePolicy`] is the resource-based
@@ -1751,6 +1752,42 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
         }
         started.sort();
         started.into_iter().map(|(.., id)| id.clone()).collect()
+    }
+
+    /// One project's batch build ids, OLDEST FIRST, keeping only those whose
+    /// status is `status` when one is given — each record first brought up to
+    /// date with the transition the clock already owes it, exactly as
+    /// [`Self::build_batch_ids_by_start`] does for the whole account, so a
+    /// status filtered on here is the one `BatchGetBuildBatches` reports for the
+    /// same batch build.
+    ///
+    /// `build_batches_by_project` already holds a project's ids in start order,
+    /// which within one project is `buildBatchNumber` order, so this walks that
+    /// listing rather than re-sorting every batch build the account holds. A
+    /// project nothing was ever batch-built for has no entry, which is an empty
+    /// listing and not an error — whether the project exists is the caller's
+    /// check, since `projects` and the batch records outlive each other.
+    pub fn build_batch_ids_for_project(
+        &mut self,
+        project_name: &str,
+        now_millis: i64,
+        status: Option<&str>,
+    ) -> Vec<String> {
+        let ids = self
+            .build_batches_by_project
+            .get(project_name)
+            .cloned()
+            .unwrap_or_default();
+        ids.into_iter()
+            .filter(|id| {
+                self.build_batches.get_mut(id).is_some_and(|stored| {
+                    stored.settle(now_millis);
+                    status.is_none_or(|wanted| {
+                        stored.build_batch.build_batch_status.as_deref() == Some(wanted)
+                    })
+                })
+            })
+            .collect()
     }
 
     /// Persist `stored` under `id` and record it as the newest sandbox of its

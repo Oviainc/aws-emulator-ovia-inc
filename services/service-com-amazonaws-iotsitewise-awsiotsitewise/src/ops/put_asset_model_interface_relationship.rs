@@ -186,12 +186,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let now = ::std::time::SystemTime::now();
 
-        // `clientToken` is NOT honoured for idempotent replay: this change stores no
-        // token -> answer mapping, exactly as `CreateAssetModel` and `UpdateAssetModel`
-        // leave it. Applying the same interface twice is idempotent in the store
-        // anyway — the relationship is keyed by the two models — so no answer is
-        // fabricated for a retry.
+        // `clientToken` makes this application idempotent, as the member documents: "A
+        // unique case-sensitive identifier that you can provide to ensure the
+        // idempotency of the request." A retry carries the token of the call it
+        // repeats, so it reports the asset model's status and writes nothing — it
+        // neither creates a second missing property nor mints a second version; a
+        // token already spent on a DIFFERENT request belongs to another call, which is
+        // the modelled conflict. It is the FIRST thing decided, because the call it
+        // repeats was already served.
         let mut store = state.lock();
+
+        let fingerprint = crate::state::request_fingerprint(
+            &[
+                &input.asset_model_id,
+                &input.interface_asset_model_id,
+                &input.property_mapping_configuration,
+            ],
+            None,
+        );
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(replayed) => {
+                // Either model deleted since leaves the retry nothing to answer from,
+                // so that retry is served as the fresh application it now is.
+                let interface = store.resolve_asset_model_id(&input.interface_asset_model_id);
+                let answered = interface.and_then(|interface_asset_model_id| {
+                    let model = store.asset_models.get(&replayed)?;
+                    Some(PutAssetModelInterfaceRelationshipOutput {
+                        asset_model_id: model.id.clone(),
+                        interface_asset_model_id,
+                        asset_model_arn: model.arn.clone(),
+                        asset_model_status: model.status(now),
+                    })
+                });
+                if let Some(output) = answered {
+                    return Ok(output);
+                }
+            }
+            crate::state::TokenVerdict::Spent(spent_on) => {
+                // The ARN the conflict reports is the one the stored model CARRIES; a
+                // model removed since the token was spent leaves no resource to name,
+                // so such a request is served as the fresh call it now is.
+                let conflicting = store
+                    .asset_models
+                    .get(&spent_on)
+                    .map(|model| (model.id.clone(), model.arn.clone()));
+                if let Some((asset_model_id, arn)) = conflicting {
+                    return Err(token_spent(&asset_model_id, arn));
+                }
+            }
+            crate::state::TokenVerdict::Serve => {}
+        }
 
         // Both members are `CustomID` labels: a raw UUID or the `externalId:` form.
         let asset_model_id = store
@@ -470,8 +514,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // on them the way any other change to the definition is.
         store.propagate_asset_model_definitions(&asset_model_id, now);
 
+        // The token is spent only now that the application has succeeded: a refused
+        // request wrote nothing, so the caller may send its token again. The resource
+        // the call acted on is the asset model it wrote to, which is what a retry of
+        // this call replays.
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &asset_model_id,
+            now,
+        );
+
         Ok(output)
     }
+}
+
+/// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
+/// request already spent: the conflict is with the asset model that request wrote
+/// to, so `resourceId`/`resourceArn` name it.
+fn token_spent(
+    asset_model_id: &str,
+    resource_arn: String,
+) -> PutAssetModelInterfaceRelationshipError {
+    PutAssetModelInterfaceRelationshipError::Modeled(
+        PutAssetModelInterfaceRelationshipErrorModeled::ConflictingOperationException(
+            ConflictingOperationException {
+                message: crate::state::already_using_message(
+                    "interface relationship",
+                    "clientToken",
+                ),
+                resource_id: asset_model_id.to_string(),
+                resource_arn,
+            },
+        ),
+    )
 }
 
 /// HTTP 404 `ResourceNotFoundException` naming the asset-model label that

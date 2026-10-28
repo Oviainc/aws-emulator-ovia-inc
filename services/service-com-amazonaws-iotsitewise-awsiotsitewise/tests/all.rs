@@ -20,6 +20,13 @@
 #[path = "all/query_results.rs"]
 mod query_results;
 
+// `client_token_replay` is declared HERE, at the head of the file, for the reason
+// the note above gives: the sorted list and the END of this file are both where
+// every concurrent iotsitewise change puts a declaration of its own. Fold it into
+// the list once the churn settles.
+#[path = "all/client_token_replay.rs"]
+mod client_token_replay;
+
 // `computation_model_execution_summary` is declared HERE, beside the note above,
 // rather than in the sorted list or at the END of the file: those are the two
 // stretches every concurrent iotsitewise change puts a declaration of its own in.

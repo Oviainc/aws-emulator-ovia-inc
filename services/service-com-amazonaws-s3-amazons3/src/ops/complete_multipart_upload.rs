@@ -337,8 +337,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A completion needs nothing from the request beyond its deserialized input: the
         // upload it assembles is named by the bucket, the key and the upload id, and the
         // parts to assemble arrive as the `@httpPayload` member `MultipartUpload`.
-        let _ = ctx;
-
         // What this emulator cannot carry out faithfully, refused rather than answered with
         // an object that would claim it. The SSE-C members carry a customer-provided KEY
         // that S3 itself does not store, so no upload here was initiated with one
@@ -629,7 +627,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        Ok(CompleteMultipartUploadOutput {
+        // The object event this completion produced, and the notifications the bucket's
+        // configuration owes for it — the same seam `PutObject` publishes its write
+        // through, under this operation's own event value.
+        let created = crate::state::notifications::ObjectEvent::new(
+            crate::state::notifications::ObjectEventKind::CreatedByMultipartUpload,
+            &input.key,
+        );
+        let created = match store
+            .bucket(&input.bucket)
+            .and_then(|bucket| bucket.object(&input.key))
+        {
+            Some(object) => created.of_object(object),
+            None => created,
+        };
+        let pending = crate::state::notifications::pending(&store, &input.bucket, &[created]);
+
+        let output = CompleteMultipartUploadOutput {
             // "The URI that identifies the newly created object"
             // (`CompleteMultipartUploadOutput$Location`) — the virtual-hosted address of the
             // key in the Region its bucket lives in, which is the form the operation's own
@@ -675,7 +689,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Everything else this output can carry describes something no completed upload
             // here has: `RequestCharged` reports a Requester Pays charge nothing here makes.
             ..CompleteMultipartUploadOutput::default()
-        })
+        };
+
+        // Published with the store released, the way `PutObject` publishes its own write.
+        drop(store);
+        crate::state::notifications::publish(ctx, pending);
+
+        Ok(output)
     }
 }
 

@@ -180,13 +180,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let now = ::std::time::SystemTime::now();
 
-        // `clientToken` is NOT honoured for idempotent replay: this change stores no
-        // token -> answer mapping, so a retry with the same token is applied as a
-        // fresh request — reporting the segments the first call removed as the
-        // absences they now are — rather than replaying the first answer. Left to
-        // the idempotency issue, exactly as `BatchAssociateDataSegmentsToDataset`,
-        // `BatchDeleteDatasetDataSegments` and `UpdateDataset` leave it.
-
         // The model puts no `@length` on `disassociateDataSegmentEntries`, so what
         // bounds the work one request asks for under the held store lock is this: a
         // dataset holds at most [`crate::state::MAX_DATA_SEGMENTS_PER_DATASET`]
@@ -207,6 +200,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = state.lock();
+
+        // `clientToken` makes this batch idempotent, as the member documents: "A
+        // unique case-sensitive identifier that you can provide to ensure the
+        // idempotency of the request." A retry carries the token of the call it
+        // repeats, so it replays that call's answer — entry for entry, at the version
+        // the dataset reported then — and writes nothing, rather than reporting the
+        // segments its own first call removed as the absences they now are; a token
+        // already spent on a DIFFERENT request belongs to another call, which is the
+        // modelled conflict. The per-entry answer is no property of the dataset, so it
+        // is remembered with the token and replayed from there.
+        let fingerprint = crate::state::request_fingerprint(
+            &[
+                &input.dataset_id,
+                &input.workspace_name,
+                &input.disassociate_data_segment_entries,
+            ],
+            None,
+        );
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(_) => {
+                let answered = store
+                    .idempotent_batch_answer(Self::NAME, input.client_token.as_deref())
+                    .map(|answer| BatchDisassociateDataSegmentsFromDatasetOutput {
+                        dataset_id: answer.dataset_id.clone(),
+                        dataset_version: answer.dataset_version.clone(),
+                        failed_disassociations: answer
+                            .failures
+                            .iter()
+                            .map(|failure| FailedDataSegmentDisassociation {
+                                // Every entry of THIS operation names a source
+                                // dataset, so the remembered failure carries one.
+                                source_dataset_id: failure
+                                    .source_dataset_id
+                                    .clone()
+                                    .unwrap_or_default(),
+                                time_series_id: failure.time_series_id.clone(),
+                                start_timestamp: failure.start_timestamp.clone(),
+                                end_timestamp: failure.end_timestamp.clone(),
+                                error_code: failure.error_code.clone(),
+                                error_message: failure.error_message.clone(),
+                            })
+                            .collect(),
+                    });
+                if let Some(output) = answered {
+                    return Ok(output);
+                }
+            }
+            crate::state::TokenVerdict::Spent(spent_on) => {
+                // The ARN the conflict reports is the one the stored dataset CARRIES; a
+                // dataset removed since the token was spent leaves no resource to name,
+                // so such a request is served as the fresh call it now is.
+                let conflicting = store
+                    .datasets
+                    .get(&spent_on)
+                    .map(|dataset| (dataset.id.clone(), dataset.arn.clone()));
+                if let Some((dataset_id, arn)) = conflicting {
+                    return Err(token_spent(&dataset_id, arn));
+                }
+            }
+            crate::state::TokenVerdict::Serve => {}
+        }
 
         // `workspaceName` names "the name of the workspace that contains the
         // dataset", so it SCOPES the lookup: a dataset held by another workspace, or
@@ -305,11 +359,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             _ => unchanged_version,
         };
 
-        Ok(BatchDisassociateDataSegmentsFromDatasetOutput {
+        let output = BatchDisassociateDataSegmentsFromDatasetOutput {
             dataset_id: input.dataset_id.clone(),
             dataset_version,
             failed_disassociations,
-        })
+        };
+
+        // The token is spent only now that the batch has been applied: a refused
+        // request removed nothing, so the caller may send its token again. The answer
+        // goes in with it, because a retry cannot rebuild it from the dataset.
+        store.record_idempotent_batch_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            crate::state::DataSegmentBatchAnswer {
+                dataset_id: output.dataset_id.clone(),
+                dataset_version: output.dataset_version.clone(),
+                failures: output
+                    .failed_disassociations
+                    .iter()
+                    .map(|failure| crate::state::DataSegmentFailure {
+                        source_dataset_id: Some(failure.source_dataset_id.clone()),
+                        time_series_id: failure.time_series_id.clone(),
+                        start_timestamp: failure.start_timestamp.clone(),
+                        end_timestamp: failure.end_timestamp.clone(),
+                        error_code: failure.error_code.clone(),
+                        error_message: failure.error_message.clone(),
+                    })
+                    .collect(),
+            },
+            now,
+        );
+
+        Ok(output)
     }
 }
 
@@ -344,6 +426,24 @@ fn failed(
         error_code: error_code.to_string(),
         error_message,
     }
+}
+
+/// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
+/// request already spent: the conflict is with the dataset that request wrote to,
+/// so `resourceId`/`resourceArn` name it.
+fn token_spent(
+    dataset_id: &str,
+    resource_arn: String,
+) -> BatchDisassociateDataSegmentsFromDatasetError {
+    BatchDisassociateDataSegmentsFromDatasetError::Modeled(
+        BatchDisassociateDataSegmentsFromDatasetErrorModeled::ConflictingOperationException(
+            ConflictingOperationException {
+                message: crate::state::already_using_message("data segment batch", "clientToken"),
+                resource_id: dataset_id.to_string(),
+                resource_arn,
+            },
+        ),
+    )
 }
 
 /// HTTP 404 `ResourceNotFoundException` naming the dataset id that resolved to

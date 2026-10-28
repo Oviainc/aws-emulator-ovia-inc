@@ -97,6 +97,8 @@ mod sampled_requests;
 mod settlement_records;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_listing.rs"]
+mod tag_listing;
 #[path = "all/tag_value_round_trip.rs"]
 mod tag_value_round_trip;
 #[path = "all/top_path_statistics.rs"]

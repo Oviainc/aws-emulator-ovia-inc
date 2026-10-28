@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDurableExecutionHistory
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDurableExecutionHistory`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDurableExecutionHistory::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the history of ONE durable execution: the events stored on the execution the
+//! `DurableExecutionArn` addresses, each appended by the call or the clock transition
+//! that made it happen, ordered as the request asks for and cut into pages of at most
+//! `MaxItems` events. No event is derived from the request, and none is invented for work
+//! nothing performed.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +177,249 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDurableExecutionHistory` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDurableExecutionHistoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDurableExecutionHistory"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetDurableExecutionHistoryErrorModeled::ServiceException(
+                ServiceException {
+                    r#type: None,
+                    message: Some("Lambda state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // "The maximum number of history events to return per call. [...] The default is
+        // 100 and the maximum allowed is 1000. A value of 0 uses the default." The member
+        // is `@range(min: 0, max: 1000)` with a default of 0, so the boundary validator
+        // has already refused anything outside that range and a request naming no limit
+        // arrives carrying the 0 that asks for the documented default.
+        let page_size = match usize::try_from(input.max_items).unwrap_or(0) {
+            0 => DEFAULT_PAGE_SIZE,
+            requested => requested.min(MAX_PAGE_SIZE),
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+
+        // The execution is addressed by the ARN `Invoke` answered, which carries the
+        // function, the version and the execution's name and id; resolving it is also
+        // what brings the record up to whatever the clock already made due, so an
+        // execution whose `ExecutionTimeout` has fallen due already carries the event
+        // that timeout owed.
+        let (record, name) = crate::state::resolve_durable_execution(
+            &mut store,
+            &input.durable_execution_arn,
+            &region,
+            now,
+        )
+        .map_err(|failure| match failure {
+            crate::state::ResolveFailure::Malformed(message) => invalid_parameter(message),
+            crate::state::ResolveFailure::NotFound(message) => not_found(message),
+        })?;
+        let record = &*record;
+        let Some(execution) = record.durable_executions.get(&name) else {
+            return Err(not_found(crate::state::durable_execution_not_found_message(
+                &input.durable_execution_arn,
+            )));
+        };
+
+        // "An array of execution history events, ordered chronologically unless
+        // ReverseOrder is set to true": the stored log is append-only and therefore
+        // already oldest first, so chronological order is the order it is in. "When set
+        // to true, returns the history events in reverse chronological order (newest
+        // first). By default, events are returned in chronological order (oldest first)."
+        let mut events: Vec<&Event> = execution.history.iter().collect();
+        if input.reverse_order.unwrap_or(false) {
+            events.reverse();
+        }
+
+        // "If NextMarker was returned from a previous request, use this value to retrieve
+        // the next page of results": the marker names the last event the previous page
+        // reported, so this page starts at the one ordered directly after it. A value
+        // that names no event of this execution names no place to continue from.
+        let start = match input.marker.as_deref() {
+            Some(marker) => {
+                events
+                    .iter()
+                    .position(|event| event_marker(event) == marker)
+                    .ok_or_else(|| {
+                        invalid_parameter(format!(
+                            "1 validation error detected: Value '{marker}' at 'marker' failed \
+                             to satisfy constraint: Member must be the event id of a previous \
+                             page's last entry"
+                        ))
+                    })?
+                    + 1
+            }
+            None => 0,
+        };
+        let page = match events.get(start..) {
+            Some(remaining) => &remaining[..page_size.min(remaining.len())],
+            None => &[][..],
+        };
+        let truncated = start + page.len() < events.len();
+
+        // "Specifies whether to include execution data such as step results and callback
+        // payloads in the history events. Set to true to include data, or false to
+        // exclude it for a more compact response. The default is true."
+        let include_execution_data = input.include_execution_data.unwrap_or(true);
+        Ok(GetDurableExecutionHistoryOutput {
+            events: page
+                .iter()
+                .map(|event| {
+                    if include_execution_data {
+                        (*event).clone()
+                    } else {
+                        without_execution_data(event)
+                    }
+                })
+                .collect(),
+            // "If present, indicates that more history events are available. Use this
+            // value as the Marker parameter in a subsequent request" — so it is absent on
+            // the last page, and it names the last event THIS page reported.
+            next_marker: page
+                .last()
+                .filter(|_| truncated)
+                .map(|event| event_marker(event)),
+        })
     }
+}
+
+/// The history events reported to a caller that names no `MaxItems`, which the member's
+/// own documentation states: "The default is 100 and the maximum allowed is 1000."
+const DEFAULT_PAGE_SIZE: usize = 100;
+
+/// The most events one page reports, from the same sentence and from the member's own
+/// `@range(min: 0, max: 1000)`.
+const MAX_PAGE_SIZE: usize = 1_000;
+
+/// How one event is named by a pagination token.
+///
+/// `EventId` is "the unique identifier for this event. Event IDs increment sequentially",
+/// so it identifies the event a page ended at inside the execution it belongs to, and
+/// `Marker` is modelled as a plain string.
+fn event_marker(event: &Event) -> String {
+    event.event_id.to_string()
+}
+
+/// `event` with every payload it carries left out, which is what a request that excludes
+/// execution data asks for.
+///
+/// Execution data is the payload data of the execution — its input, its results and its
+/// error payloads, the three a function's `DurableConfig` names together ("input, output,
+/// and error payloads") — so it is dropped from EVERY event that carries one, whatever
+/// its type. Everything else an event reports (its type, id, timestamp, the operation it
+/// belongs to, the timeouts and attempt counts around it) is metadata and stays, because
+/// excluding the data makes the response "more compact" rather than empty.
+fn without_execution_data(event: &Event) -> Event {
+    let mut event = event.clone();
+    if let Some(details) = event.execution_started_details.as_mut() {
+        strip_input(&mut details.input);
+    }
+    if let Some(details) = event.execution_succeeded_details.as_mut() {
+        strip_result(&mut details.result);
+    }
+    if let Some(details) = event.execution_failed_details.as_mut() {
+        strip_error(&mut details.error);
+    }
+    if let Some(error) = event
+        .execution_timed_out_details
+        .as_mut()
+        .and_then(|details| details.error.as_mut())
+    {
+        strip_error(error);
+    }
+    if let Some(details) = event.execution_stopped_details.as_mut() {
+        strip_error(&mut details.error);
+    }
+    if let Some(details) = event.context_succeeded_details.as_mut() {
+        strip_result(&mut details.result);
+    }
+    if let Some(details) = event.context_failed_details.as_mut() {
+        strip_error(&mut details.error);
+    }
+    if let Some(error) = event
+        .wait_cancelled_details
+        .as_mut()
+        .and_then(|details| details.error.as_mut())
+    {
+        strip_error(error);
+    }
+    if let Some(details) = event.step_succeeded_details.as_mut() {
+        strip_result(&mut details.result);
+    }
+    if let Some(details) = event.step_failed_details.as_mut() {
+        strip_error(&mut details.error);
+    }
+    if let Some(input) = event
+        .chained_invoke_started_details
+        .as_mut()
+        .and_then(|details| details.input.as_mut())
+    {
+        strip_input(input);
+    }
+    if let Some(details) = event.chained_invoke_succeeded_details.as_mut() {
+        strip_result(&mut details.result);
+    }
+    if let Some(details) = event.chained_invoke_failed_details.as_mut() {
+        strip_error(&mut details.error);
+    }
+    if let Some(details) = event.chained_invoke_timed_out_details.as_mut() {
+        strip_error(&mut details.error);
+    }
+    if let Some(details) = event.chained_invoke_stopped_details.as_mut() {
+        strip_error(&mut details.error);
+    }
+    if let Some(details) = event.callback_succeeded_details.as_mut() {
+        strip_result(&mut details.result);
+    }
+    if let Some(details) = event.callback_failed_details.as_mut() {
+        strip_error(&mut details.error);
+    }
+    if let Some(details) = event.callback_timed_out_details.as_mut() {
+        strip_error(&mut details.error);
+    }
+    if let Some(error) = event
+        .invocation_completed_details
+        .as_mut()
+        .and_then(|details| details.error.as_mut())
+    {
+        strip_error(error);
+    }
+    event
+}
+
+/// Drop the payload an input carries; see [`without_execution_data`].
+fn strip_input(input: &mut EventInput) {
+    input.payload = None;
+}
+
+/// Drop the payload a result carries; see [`without_execution_data`].
+fn strip_result(result: &mut EventResult) {
+    result.payload = None;
+}
+
+/// Drop the payload an error carries; see [`without_execution_data`].
+fn strip_error(error: &mut EventError) {
+    error.payload = None;
+}
+
+/// The modelled 400 this operation refuses a request it cannot satisfy with.
+fn invalid_parameter(message: String) -> GetDurableExecutionHistoryError {
+    GetDurableExecutionHistoryErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            r#type: None,
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// The modelled 404 for an execution this emulator does not hold.
+fn not_found(message: String) -> GetDurableExecutionHistoryError {
+    GetDurableExecutionHistoryErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        r#type: None,
+        message: Some(message),
+    })
+    .into()
 }

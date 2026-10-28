@@ -143,6 +143,8 @@ mod object_default_encryption;
 mod object_encryption;
 #[path = "all/object_encryption_update.rs"]
 mod object_encryption_update;
+#[path = "all/object_event_notifications.rs"]
+mod object_event_notifications;
 #[path = "all/object_legal_hold.rs"]
 mod object_legal_hold;
 #[path = "all/object_listing_and_deletion.rs"]

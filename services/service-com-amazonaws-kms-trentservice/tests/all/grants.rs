@@ -32,20 +32,11 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use super::harness::{
     assert_empty, b64, create_alias, create_key, describe, enabled_key, failure, is_lower_hex, ok,
-    router, text,
+    principal, router, text,
 };
 
 /// The length of a grant id: KMS gives a grant 64 lowercase hexadecimal characters.
 const GRANT_ID_LEN: usize = 64;
-
-/// A principal ARN in the emulator's own account, which is the form KMS requires of a
-/// grantee or retiring principal.
-fn principal(resource: &str) -> String {
-    format!(
-        "arn:aws:iam::{account}:{resource}",
-        account = engine::emulator_account_id()
-    )
-}
 
 /// The `IssuingAccount` every grant created here is issued under: the account that
 /// owns the keys.

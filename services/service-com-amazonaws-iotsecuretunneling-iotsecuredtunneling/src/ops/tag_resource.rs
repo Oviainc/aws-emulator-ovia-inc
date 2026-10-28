@@ -3,7 +3,9 @@
 //! @op TagResource
 //!
 //! Merges the supplied tags into the tag store of the tunnel `resourceArn` names,
-//! overwriting a tag that already carries that key. A key in the reserved
+//! overwriting a tag that already carries that key; a merge that changes the
+//! tunnel's tag set stamps the record's `lastUpdatedAt`, which the tunnel reports
+//! beside those tags. A key in the reserved
 //! [`crate::state::RESERVED_TAG_KEY_PREFIX`] namespace is refused with HTTP 400
 //! `ValidationException` and stores nothing; a request that would take the tunnel
 //! past [`crate::state::MAX_TAGS_PER_TUNNEL`] tags is refused with the modelled
@@ -146,13 +148,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A resource is tagged through the endpoint of its own Region: an ARN of
         // another Region names nothing this endpoint holds.
+        let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx);
         let mut store = state.lock();
+        // A tunnel whose lifetime has already run out is closed by the clock
+        // before this call writes its own stamp, so the stamp this call leaves
+        // is never overtaken by a close that was owed earlier.
+        store.materialize_expired_tunnels(now);
         // An ARN that names no stored tunnel has nothing to tag.
-        if store
-            .tunnel_id_for_arn(&region, &input.resource_arn)
-            .is_none()
-        {
+        let Some(tunnel_id) = store.tunnel_id_for_arn(&region, &input.resource_arn) else {
             return Err(TagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     // The tunnel the ARN names, named the way every other
@@ -163,7 +167,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
-        }
+        };
 
         // The `aws:` prefix marks a tag AWS applied itself, which a caller may
         // neither set nor overwrite, and the modelled `TagKey` pattern admits
@@ -194,9 +198,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let stored = store.tags.entry(input.resource_arn.clone()).or_default();
-        for tag in &input.tags {
-            stored.insert(tag.key.clone(), tag.value.clone());
+        // `DescribeTunnel` reports the tag store inside the same `Tunnel` shape
+        // as `lastUpdatedAt` ("The last time the tunnel was updated"), so
+        // changing a tag the tunnel reports IS an update of the tunnel and is
+        // stamped on the record. A request that only re-writes the key/value
+        // pairs the tunnel already carries changes nothing, and so stamps
+        // nothing.
+        if store.put_tags(&input.resource_arn, &input.tags) {
+            store.stamp_tunnel_updated(&region, &tunnel_id, now);
         }
         drop(store);
 

@@ -74,7 +74,9 @@
 //!
 //! The recorded 200 carries two further top-level members the model declares on no
 //! shape — `accountId` and `onboardingGeneration` — projected out of the stored record
-//! through [`crate::state::RecordedMembers`], exactly as `CreateDomain` does.
+//! through [`crate::state::RecordedMembers`], under the member schemas this module
+//! declares, and with the one member list `CreateDomain` projects the pair with too
+//! ([`crate::state::Domain::recorded_identity_members`]).
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -229,13 +231,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // A resource with no tags has an EMPTY tag map, not an absent one.
                 tags: Some(tags),
             },
-            members: vec![
-                crate::state::RecordedMember::Text(&ACCOUNT_ID_MEMBER, domain.account_id.clone()),
-                crate::state::RecordedMember::Text(
-                    &ONBOARDING_GENERATION_MEMBER,
-                    domain.onboarding_generation.as_wire().to_string(),
-                ),
-            ],
+            members: domain.recorded_identity_members(
+                &ACCOUNT_ID_MEMBER,
+                &ONBOARDING_GENERATION_MEMBER,
+            ),
         })
     }
 }

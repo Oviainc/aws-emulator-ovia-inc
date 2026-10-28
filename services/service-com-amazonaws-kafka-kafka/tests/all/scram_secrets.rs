@@ -23,7 +23,8 @@ use serde_json::{json, Value};
 // The service's own refusal wording and page bound, so the suite and the
 // handlers cannot drift apart on what the service says.
 use service_com_amazonaws_kafka_kafka::state::{
-    MAX_SCRAM_SECRETS_PER_CLUSTER, RESOURCE_NOT_FOUND_MESSAGE, SASL_SCRAM_NOT_ENABLED_MESSAGE,
+    MAX_RESULTS_LIMIT, MAX_SCRAM_SECRETS_PER_CLUSTER, RESOURCE_NOT_FOUND_MESSAGE,
+    SASL_SCRAM_NOT_ENABLED_MESSAGE,
 };
 
 // The router harness, the signing region, the account id and the URI encoder
@@ -877,5 +878,97 @@ async fn an_association_answers_the_stored_clusters_arn() {
         "expected the association to answer the cluster it stored into and no unprocessed \
          secrets, got {}",
         reply.body
+    );
+}
+
+/// RULE: the page size a listing accepts is the range its `MaxResults` member
+/// declares — a value inside it caps the page at that many secrets and carries a
+/// token exactly when secrets remain, and a value outside it is refused with the
+/// service's bad-request error without listing or storing anything.
+///
+/// The bounds come from `MaxResults`'s `range` in this service's model
+/// (`smithy_query(query="shape",shape="MaxResults")`: min 1, max
+/// [`MAX_RESULTS_LIMIT`]), and the rows walk each published bound, a size inside
+/// the range, and one value past each bound.
+#[tokio::test]
+async fn the_page_size_obeys_the_models_declared_range() {
+    // The declared minimum of `MaxResults`' `range`; its maximum is the crate's
+    // own `MAX_RESULTS_LIMIT`, which the listings share.
+    const MIN_RESULTS: i32 = 1;
+
+    let emulator = Emulator::new();
+    let cluster = scram_cluster(&emulator, "scram-page-size-range").await;
+
+    let secrets: Vec<String> = (0..5)
+        .map(|index| secret_arn(&format!("AmazonMSK_range-{index}-4a5b6c")))
+        .collect();
+    assert_eq!(
+        associate(&emulator, &cluster, &secrets).await.status,
+        200,
+        "the association that seeds the page-size table must succeed first"
+    );
+    let mut stored = secrets.clone();
+    stored.sort();
+
+    // Inside the range: the published minimum, a size short of the stored set,
+    // the set's own size, and the published maximum.
+    for page_size in [MIN_RESULTS, 4, stored.len() as i32, MAX_RESULTS_LIMIT] {
+        let case = format!("maxResults={page_size}");
+        let reply = list(&emulator, &cluster, &format!("?maxResults={page_size}")).await;
+        let page = listed(&reply, &case);
+        let expected_len = (page_size as usize).min(stored.len());
+        assert_eq!(
+            page,
+            stored[..expected_len].to_vec(),
+            "case {case}: expected the first {expected_len} stored secret(s), got {page:?}"
+        );
+        let token = reply.at("/nextToken");
+        assert_eq!(
+            token.is_string(),
+            expected_len < stored.len(),
+            "case {case}: expected a token exactly when secrets remain, got {}",
+            reply.body
+        );
+    }
+
+    // Past each published bound, so neither bound is merely clamped into range.
+    // The refusal states the AWS constraint clause for the member, naming the
+    // submitted value, the member path and the bound it failed.
+    for (page_size, requirement) in [
+        (
+            -1,
+            format!("Member must have value greater than or equal to {MIN_RESULTS}"),
+        ),
+        (
+            MIN_RESULTS - 1,
+            format!("Member must have value greater than or equal to {MIN_RESULTS}"),
+        ),
+        (
+            MAX_RESULTS_LIMIT + 1,
+            format!("Member must have value less than or equal to {MAX_RESULTS_LIMIT}"),
+        ),
+    ] {
+        let case = format!("maxResults={page_size}");
+        let reply = list(&emulator, &cluster, &format!("?maxResults={page_size}")).await;
+        assert_bad_request(&reply, &case);
+        // The crate's one rendering of a constraint clause, shared with the
+        // suite that pins this service's refusal wording.
+        let expected_clause = super::refusal_wording::clause(
+            Some(&page_size.to_string()),
+            "maxResults",
+            &requirement,
+        );
+        assert!(
+            reply.error_message().contains(&expected_clause),
+            "case {case}: expected the refusal to state {expected_clause:?}, got {:?}",
+            reply.error_message()
+        );
+    }
+
+    // A refused page size changed nothing: the set is still what was stored.
+    let after = list_every_page(&emulator, &cluster, None, "after-refused-page-sizes").await;
+    assert_eq!(
+        after, stored,
+        "expected a refused page size to leave the stored set alone, got {after:?}"
     );
 }

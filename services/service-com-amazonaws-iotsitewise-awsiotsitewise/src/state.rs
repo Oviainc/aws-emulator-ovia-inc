@@ -113,7 +113,8 @@ use crate::ops::types::{
     ErrorReportLocation,
     ExecutionEnvironmentVariables, ExecutionStatus, ExecutionSummary, ExportErrorReportLocation,
     ExpressionVariable, File, GatewayCapabilitySummary, GatewayPlatform, HierarchyMapping, Identity,
-    ImageLocation, JobConfiguration, LoggingOptions, Mount, MountOverrides, MultiLayerStorage,
+    ImageFile, ImageLocation, JobConfiguration, LoggingOptions, Mount, MountOverrides,
+    MultiLayerStorage,
     PipelineExecutionStateDetails, PipelineExecutionStatus, PortalStatus,
     PortalTypeEntry, ProcessingInput, PropertyMapping, PropertyType, QueryStatistics, QuerySummary,
     ResolveTo, Resource, ResourceStatus, RetentionPeriod, SearchFilters, TargetResource,
@@ -4180,9 +4181,18 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// A composite model id is globally unique, so both the collision check on a
     /// caller-supplied id and the mint draw ask this one question.
     pub fn composite_model_id_taken(&self, id: &str) -> bool {
+        self.asset_model_holding_composite_model(id).is_some()
+    }
+
+    /// The stored asset model that holds the composite model `id`, if any does.
+    ///
+    /// A composite model is addressable only through the asset model that holds
+    /// it, and its id is globally unique, so this is how a caller holding only
+    /// that id reaches the record it lives on.
+    pub fn asset_model_holding_composite_model(&self, id: &str) -> Option<&AssetModelRecord> {
         self.asset_models
             .values()
-            .any(|model| model.composite_model(id).is_some())
+            .find(|model| model.composite_model(id).is_some())
     }
 
     /// The property definitions composite model `composite_id` of `model`
@@ -8713,6 +8723,48 @@ pub struct IdempotentCall {
     pub resource_id: String,
     /// When the token was spent, which is what the bound above evicts by.
     pub spent_at: SystemTime,
+    /// The answer a BATCH data-segment call gave, for the operations whose answer
+    /// their own writes make unreadable afterwards: the per-entry outcome of a
+    /// batch is not a property of the dataset the batch wrote to, so a retry of
+    /// one has nothing in the store to rebuild it from. `None` for every
+    /// operation whose answer is read back from the resource it acted on.
+    ///
+    /// BOUNDED by the request that produced it: one answer carries at most one
+    /// failure per entry, and an entry list is already capped — by
+    /// [`MAX_DATA_SEGMENTS_PER_DATASET`] for the association forms and by the
+    /// model's own `@length` for the deletion form — so the memory the
+    /// idempotency record holds is bounded by that cap times
+    /// [`MAX_IDEMPOTENT_CALLS`].
+    pub batch_answer: Option<DataSegmentBatchAnswer>,
+}
+
+/// One entry a batch data-segment call could not apply, as the three batch
+/// data-segment operations each report it: the segment the entry addressed plus
+/// the code and the message saying why.
+///
+/// One struct for all three, because their modelled failure shapes carry the same
+/// members — `sourceDatasetId` only where the operation's entries name a source —
+/// and each handler maps it back into its own.
+#[derive(Debug, Clone)]
+pub struct DataSegmentFailure {
+    /// The dataset the segment's data came from, for the operations whose entries
+    /// name one.
+    pub source_dataset_id: Option<String>,
+    pub time_series_id: String,
+    pub start_timestamp: TimeInNanos,
+    pub end_timestamp: TimeInNanos,
+    pub error_code: String,
+    pub error_message: String,
+}
+
+/// What one batch data-segment call answered: the dataset it addressed, the
+/// version that dataset reported after the call, and the entries it could not
+/// apply — the whole of what a retry of that call replays.
+#[derive(Debug, Clone)]
+pub struct DataSegmentBatchAnswer {
+    pub dataset_id: String,
+    pub dataset_version: String,
+    pub failures: Vec<DataSegmentFailure>,
 }
 
 /// What the `clientToken` a mutating request carries means for that request.
@@ -8761,6 +8813,50 @@ pub fn request_fingerprint(
     rendered.join("\u{1f}")
 }
 
+/// How a member the request did not carry renders in a [`request_fingerprint`].
+/// No rendering of a member it DID carry can collide with it: those are `Debug`
+/// forms, which start with a bracket, a quote or a member name.
+pub const FINGERPRINT_ABSENT: &str = "<absent>";
+
+/// A canonical rendering of a `portalTypeConfiguration` a request carried, for
+/// the [`request_fingerprint`] of that request.
+///
+/// The configuration is a MAP, which has no order of its own, so its entries go
+/// in SORTED by key: a retry of one call has to render identically to it whatever
+/// order either request's map happens to iterate in. Shared by the operations
+/// that take one, so one configuration renders one way.
+pub fn portal_type_configuration_fingerprint(
+    configuration: Option<&HashMap<String, PortalTypeEntry>>,
+) -> String {
+    match configuration {
+        None => FINGERPRINT_ABSENT.to_string(),
+        Some(configuration) => {
+            let mut entries: Vec<(&String, &PortalTypeEntry)> = configuration.iter().collect();
+            entries.sort_by_key(|(key, _)| *key);
+            format!("{entries:?}")
+        }
+    }
+}
+
+/// A canonical and BOUNDED rendering of an uploaded image FILE, for the
+/// [`request_fingerprint`] of the request that carried it.
+///
+/// The image's own BYTES are not rendered: `ImageFile$data` admits up to 1.5 MB
+/// and a fingerprint is kept for as long as the token it was spent under, so an
+/// uploaded file goes in as the SHA-256 digest of its contents beside its file
+/// type. Two different files still render differently and the same file renders
+/// identically, which is all a retry has to be told apart by. Shared by every
+/// operation that takes an image, so one upload renders one way.
+pub fn image_file_fingerprint(file: Option<&ImageFile>) -> String {
+    match file {
+        None => FINGERPRINT_ABSENT.to_string(),
+        Some(file) => {
+            let digest = <::sha2::Sha256 as ::sha2::Digest>::digest(&file.data);
+            format!("{}:{}", file.r#type, ::hex::encode(digest))
+        }
+    }
+}
+
 impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// What `operation` is to do with the request whose `clientToken` is `token`
     /// and whose identifying members render as `request`.
@@ -8796,6 +8892,47 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         resource_id: &str,
         now: SystemTime,
     ) {
+        self.remember_idempotent_call(operation, token, request, resource_id, None, now);
+    }
+
+    /// [`Self::record_idempotent_call`] for a batch data-segment call, which
+    /// remembers the `answer` it gave as well: its per-entry outcome is no
+    /// property of the dataset it wrote to, so a retry has nothing else to
+    /// rebuild that answer from.
+    pub fn record_idempotent_batch_call(
+        &mut self,
+        operation: &str,
+        token: Option<&str>,
+        request: String,
+        answer: DataSegmentBatchAnswer,
+        now: SystemTime,
+    ) {
+        let resource_id = answer.dataset_id.clone();
+        self.remember_idempotent_call(operation, token, request, &resource_id, Some(answer), now);
+    }
+
+    /// The answer the batch data-segment call `operation` gave under `token`, if
+    /// this store still remembers it.
+    pub fn idempotent_batch_answer(
+        &self,
+        operation: &str,
+        token: Option<&str>,
+    ) -> Option<&DataSegmentBatchAnswer> {
+        self.idempotent_calls
+            .get(&idempotency_key(operation, token?))?
+            .batch_answer
+            .as_ref()
+    }
+
+    fn remember_idempotent_call(
+        &mut self,
+        operation: &str,
+        token: Option<&str>,
+        request: String,
+        resource_id: &str,
+        batch_answer: Option<DataSegmentBatchAnswer>,
+        now: SystemTime,
+    ) {
         let Some(token) = token else {
             return;
         };
@@ -8821,6 +8958,7 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
                 request,
                 resource_id: resource_id.to_string(),
                 spent_at: now,
+                batch_answer,
             },
         );
     }

@@ -89,6 +89,16 @@
 //!    security group belongs to one VPC — rule 7 for the one other member of this
 //!    request that names an existing EC2 resource of the caller's network
 //!    ([`crate::state::ec2_resources::security_group_failures`]).
+//! 14. Each `connectivityInfo.privateRouteServerPeerings` entry names a route server peer
+//!    the account holds: they are "The unique IDs for private route server peers" and
+//!    "during environment creation, the route server endpoints peer with the NSX uplink
+//!    VLAN" (`ConnectivityInfo` docs), so each id names an Amazon EC2 resource of the
+//!    caller's own account that Amazon EVS does not create — rule 7 for one more member
+//!    naming an existing EC2 resource, asked of the same store
+//!    ([`crate::state::ec2_resources::route_server_peer_failures`]). Judged only where
+//!    Amazon EVS INSTALLS VCF, exactly as rules 10 and 12 are, because that peering is
+//!    part of the installation and the member is "Not supported when `vcfVersion` is
+//!    `SELF_DEPLOYED`".
 //!
 //! `initialVlans.hcxNetworkAclId` is NOT among them: a network access control list is an
 //! EC2 resource too, but the account's EC2 store holds no network ACL records at all, so
@@ -450,6 +460,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .collect();
             failures.extend(crate::state::ec2_resources::host_placement_failures(
+                &*self.engine,
+                &references,
+            ));
+        }
+        // The route server peers `connectivityInfo` names are resources of that same
+        // account: "The unique IDs for private route server peers", and "during
+        // environment creation, the route server endpoints peer with the NSX uplink VLAN"
+        // (`ConnectivityInfo` docs) — Amazon EVS creates no peer, so each id has to name
+        // one the account already holds, resolved exactly as the network is. Asked only
+        // where Amazon EVS INSTALLS VCF, because that is the mode the peering is part of
+        // and the member is "Not supported when vcfVersion is SELF_DEPLOYED", where it is
+        // accepted and does nothing.
+        if installs_vcf {
+            let named_peers: Vec<(String, &str)> = input
+                .connectivity_info
+                .as_ref()
+                .map(|info| info.private_route_server_peerings.as_slice())
+                .unwrap_or_default()
+                .iter()
+                .enumerate()
+                .map(|(index, peer_id)| {
+                    (
+                        format!("connectivityInfo.privateRouteServerPeerings[{index}]"),
+                        peer_id.as_str(),
+                    )
+                })
+                .collect();
+            let references: Vec<crate::state::ec2_resources::RouteServerPeerReference<'_>> =
+                named_peers
+                    .iter()
+                    .map(
+                        |(member, peer_id)| crate::state::ec2_resources::RouteServerPeerReference {
+                            member,
+                            peer_id,
+                        },
+                    )
+                    .collect();
+            failures.extend(crate::state::ec2_resources::route_server_peer_failures(
                 &*self.engine,
                 &references,
             ));

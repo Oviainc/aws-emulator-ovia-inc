@@ -59,6 +59,8 @@ mod settings_network_resolution;
 mod state_roundtrip;
 #[path = "all/tag_validation.rs"]
 mod tag_validation;
+#[path = "all/update_settings_network_propagation.rs"]
+mod update_settings_network_propagation;
 #[path = "all/user_associations.rs"]
 mod user_associations;
 #[path = "all/user_disassociation.rs"]

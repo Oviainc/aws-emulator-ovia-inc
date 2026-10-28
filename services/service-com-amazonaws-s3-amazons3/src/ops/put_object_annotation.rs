@@ -225,10 +225,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata only, and this write needs nothing from it.
-        let _ = ctx;
-
         // "If the bucket is owned by a different account, the request fails with an HTTP
         // 403 (Access Denied) error" (`PutObjectAnnotationRequest$ExpectedBucketOwner`),
         // judged the way every other handler here judges it: this emulator serves one
@@ -450,6 +446,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )))
             }
         }
+
+        // Attaching an annotation is an object event of its own
+        // (`s3:ObjectAnnotation:Put`), published to whatever destinations the bucket's
+        // notification configuration names for it — through the same seam `PutObject`
+        // publishes its write through.
+        let annotated = crate::state::notifications::ObjectEvent::new(
+            crate::state::notifications::ObjectEventKind::AnnotationPut,
+            &input.key,
+        );
+        let annotated = match store
+            .bucket(&input.bucket)
+            .and_then(|bucket| bucket.addressed_object(&input.key, input.version_id.as_deref()))
+        {
+            Some(object) => annotated.of_object(object),
+            None => annotated,
+        };
+        let pending = crate::state::notifications::pending(&store, &input.bucket, &[annotated]);
+        drop(store);
+        crate::state::notifications::publish(ctx, pending);
 
         Ok(PutObjectAnnotationOutput {
             // "The name of the annotation" and "The object key" the annotation was attached

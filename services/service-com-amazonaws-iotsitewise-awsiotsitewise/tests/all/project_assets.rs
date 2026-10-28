@@ -78,7 +78,9 @@ struct AssociateCase {
     /// in the created list. Repeats — inside one request and across two — are the
     /// point of several rows.
     requests: Vec<Vec<usize>>,
-    /// The `clientToken` each request carries, if any. A token targets
+    /// The `clientToken` each request carries, if any — the SEED of it: a token
+    /// is spent by one request, so the loop below builds a distinct token per
+    /// request from this seed. A token targets
     /// `ClientToken` (len 36..64, pattern `^\S{36,64}$`), per smithy_query
     /// query="operation" operation="BatchAssociateProjectAssets".
     client_token: Option<&'static str>,
@@ -124,7 +126,7 @@ fn associate_cases() -> Vec<AssociateCase> {
             client_token: None,
         },
         AssociateCase {
-            label: "one-asset-per-request-each-carrying-a-client-token",
+            label: "one-asset-per-request-each-carrying-a-client-token-of-its-own",
             assets: 3,
             requests: vec![vec![0], vec![1], vec![2]],
             client_token: Some("3f1c6a9e-8b2d-4e5f-9a1b-7c6d5e4f3a2b-token"),
@@ -322,9 +324,15 @@ async fn associating_assets_adds_them_to_the_project_membership_the_listing_read
         );
 
         let mut expected: BTreeSet<String> = BTreeSet::new();
-        for request in &case.requests {
+        for (at, request) in case.requests.iter().enumerate() {
             let named: Vec<String> = request.iter().map(|at| asset_ids[*at].clone()).collect();
-            associate(&router, label, &project_id, &named, case.client_token).await;
+            // A token is spent by ONE request: `clientToken` makes the call
+            // idempotent, so each of a row's requests carries a token of its own,
+            // built from the row's seed and the request's place in it.
+            let token = case
+                .client_token
+                .map(|token| format!("{at}-{token}"));
+            associate(&router, label, &project_id, &named, token.as_deref()).await;
             expected.extend(named);
         }
         let expected: Vec<String> = expected.into_iter().collect();

@@ -69,6 +69,8 @@ mod key_rotation_on_demand;
 mod key_rotation_schedule;
 #[path = "all/key_specs.rs"]
 mod key_specs;
+#[path = "all/list_grants_reads.rs"]
+mod list_grants_reads;
 #[path = "all/list_key_rotations_reads.rs"]
 mod list_key_rotations_reads;
 #[path = "all/list_resource_tags_reads.rs"]

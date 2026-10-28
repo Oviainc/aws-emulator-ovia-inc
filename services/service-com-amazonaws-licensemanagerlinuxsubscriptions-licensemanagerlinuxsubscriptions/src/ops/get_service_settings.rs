@@ -3,7 +3,8 @@
 //! @op GetServiceSettings
 //! Reports this account's Linux subscriptions service settings from state: the
 //! singleton `UpdateServiceSettings` persisted, or — for an account that never called it
-//! — the default of discovery `Disabled` with no discovery settings and no home Region.
+//! — the default of discovery `Disabled` with no discovery settings, no status and no
+//! home Region.
 //!
 //! This is the ONLY file to touch for this operation.
 //!

@@ -23,6 +23,8 @@ mod delete_report_group;
 mod fleet_lifecycle;
 #[path = "all/list_build_batches.rs"]
 mod list_build_batches;
+#[path = "all/list_build_batches_for_project.rs"]
+mod list_build_batches_for_project;
 #[path = "all/list_builds.rs"]
 mod list_builds;
 #[path = "all/list_sandboxes.rs"]

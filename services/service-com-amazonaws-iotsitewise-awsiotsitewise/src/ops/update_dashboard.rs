@@ -162,17 +162,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let now = ::std::time::SystemTime::now();
 
-        // `clientToken` is NOT honoured for idempotent replay: this change stores no
-        // token -> answer mapping, so a retry with the same token writes the
-        // dashboard a second time rather than replaying the first answer. Left to the
-        // idempotency issue, exactly as `UpdateAccessPolicy` leaves it.
+        // `clientToken` makes this update idempotent, as the member documents: "A
+        // unique case-sensitive identifier that you can provide to ensure the
+        // idempotency of the request." A retry carries the token of the call it
+        // repeats, so it succeeds and writes nothing — it does not write the dashboard
+        // a second time. This operation's error list declares no conflict error, so
+        // the token alone names the call it repeats: a request reusing it is answered
+        // from that call rather than refused with an error this operation does not
+        // model, exactly as `CreateDashboard` answers a reused token. It is the FIRST
+        // thing decided, because the call it repeats was already served.
         let mut store = state.lock();
+
+        let fingerprint = crate::state::request_fingerprint(
+            &[
+                &input.dashboard_id,
+                &input.dashboard_name,
+                &input.dashboard_description,
+                &input.dashboard_definition,
+            ],
+            None,
+        );
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(replayed)
+            | crate::state::TokenVerdict::Spent(replayed) => {
+                // A dashboard deleted since leaves the retry nothing to answer from,
+                // so that retry is served as the fresh update it now is — which is the
+                // not-found refusal below.
+                if store.dashboards.contains_key(&replayed) {
+                    return Ok(UpdateDashboardOutput {});
+                }
+            }
+            crate::state::TokenVerdict::Serve => {}
+        }
 
         let dashboard = store
             .dashboards
             .get_mut(&input.dashboard_id)
             .ok_or_else(|| not_found(&input.dashboard_id))?;
-
         // The request describes the dashboard's NEW state: its name and definition
         // are required and its description is the one optional member, so an omitted
         // description clears the stored one rather than keeping it. What the request
@@ -182,6 +208,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.dashboard_name,
             input.dashboard_description,
             input.dashboard_definition,
+            now,
+        );
+
+        // The token is spent only now that the update has succeeded: a refused
+        // request changed nothing, so the caller may send its token again.
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &input.dashboard_id,
             now,
         );
 

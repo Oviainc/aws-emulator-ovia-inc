@@ -163,9 +163,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             ))
         })?;
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
 
+        // `clientToken` makes this delete idempotent, as the member documents: "A
+        // unique case-sensitive identifier that you can provide to ensure the
+        // idempotency of the request." A retry carries the token of the call it
+        // repeats, so it replays that call's answer — the asset it removed, reported
+        // DELETING — rather than the not-found refusal the removal itself would now
+        // produce, and removes nothing further; a token already spent on a DIFFERENT
+        // request belongs to another call, which is the modelled conflict. It is the
+        // FIRST thing decided, because the call it repeats was already served.
         let mut store = state.lock();
+
+        let fingerprint = crate::state::request_fingerprint(&[&input.asset_id], None);
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(replayed) => {
+                // The answer the first call gave: the asset it removed is gone by the
+                // time its retry lands, which is exactly why that answer is replayed
+                // from the record of the call rather than re-derived from the store.
+                return Ok(DeleteAssetOutput {
+                    asset_id: Some(replayed),
+                    asset_status: AssetStatus {
+                        state: crate::state::STATE_DELETING.to_string(),
+                        error: None,
+                    },
+                });
+            }
+            crate::state::TokenVerdict::Spent(spent_on) => {
+                return Err(token_spent(&region, &spent_on));
+            }
+            crate::state::TokenVerdict::Serve => {}
+        }
+
         // The label is either the raw UUID or the `externalId:<externalId>` alias form.
         let id = store.resolve_asset_id(&input.asset_id).ok_or_else(|| {
             DeleteAssetError::Modeled(DeleteAssetErrorModeled::ResourceNotFoundException(
@@ -217,6 +246,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // hierarchy associations) go away, so no later read can still see it.
         store.forget_asset(&id);
 
+        // The token is spent only now that the delete has succeeded: a refused
+        // request removed nothing, so the caller may send its token again.
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &id,
+            ::std::time::SystemTime::now(),
+        );
+
         Ok(DeleteAssetOutput {
             asset_id: Some(id),
             asset_status: AssetStatus {
@@ -225,4 +264,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         })
     }
+}
+
+/// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
+/// request already spent: the conflict is with the asset that request removed, so
+/// `resourceId`/`resourceArn` name it — built from this request's region, because
+/// the asset that call deleted no longer carries an ARN of its own.
+fn token_spent(region: &str, asset_id: &str) -> DeleteAssetError {
+    DeleteAssetError::Modeled(DeleteAssetErrorModeled::ConflictingOperationException(
+        ConflictingOperationException {
+            message: crate::state::already_using_message("asset", "clientToken"),
+            resource_id: asset_id.to_string(),
+            resource_arn: crate::state::asset_arn(region, asset_id),
+        },
+    ))
 }

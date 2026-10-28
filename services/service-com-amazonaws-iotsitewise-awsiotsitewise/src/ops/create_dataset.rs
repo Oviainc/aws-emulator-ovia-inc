@@ -196,11 +196,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
 
-        // `clientToken` is NOT honoured for idempotent replay: this change stores no
-        // token -> created-id mapping, so a retry with the same token mints a second
-        // dataset rather than replaying the first answer. Left to the idempotency
-        // issue, exactly as `CreateAsset` leaves it; nothing is fabricated for it.
-
         // Where a dataset lives is the caller's to state, and the model states the
         // rule on `workspaceName` itself: "Required for session and curated datasets.
         // Omit this field for datasets that connect to an external datasource." It is
@@ -231,6 +226,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = state.lock();
+
+        // `clientToken` makes this create idempotent, as the member documents: "A
+        // unique case-sensitive identifier that you can provide to ensure the
+        // idempotency of the request." A retry — an SDK's own, after a timeout —
+        // carries the token of the call it repeats, so it answers from the dataset THAT
+        // call minted and writes nothing; a token already spent on a DIFFERENT request
+        // belongs to another call, which is the modelled conflict rather than a second
+        // dataset. Decided BEFORE the request is resolved against the store, because
+        // the call it repeats was already served.
+        let fingerprint = crate::state::request_fingerprint(
+            &[
+                &input.dataset_name,
+                &input.dataset_id,
+                &input.dataset_description,
+                &input.dataset_type,
+                &input.dataset_config,
+                &input.dataset_source,
+                &input.workspace_name,
+                &input.metadata,
+            ],
+            input.tags.as_ref(),
+        );
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(replayed) => {
+                // One deleted since leaves the retry nothing to answer from, so that
+                // retry is served as the fresh create it now is.
+                if let Some(dataset) = store.datasets.get(&replayed) {
+                    return Ok(CreateDatasetOutput {
+                        dataset_id: dataset.id.clone(),
+                        dataset_arn: dataset.arn.clone(),
+                        dataset_status: dataset.status(now),
+                    });
+                }
+            }
+            crate::state::TokenVerdict::Spent(spent_on) => {
+                // The ARN the conflict reports is the one the stored dataset CARRIES,
+                // read back from the record rather than rebuilt, so the refusal cannot
+                // name an ARN no dataset of this store has. A dataset removed since the
+                // token was spent leaves only its id to build one from.
+                let conflicting_arn = store
+                    .datasets
+                    .get(&spent_on)
+                    .map(|dataset| dataset.arn.clone())
+                    .unwrap_or_else(|| crate::state::dataset_arn(&region, &spent_on));
+                return Err(token_spent(&spent_on, conflicting_arn));
+            }
+            crate::state::TokenVerdict::Serve => {}
+        }
 
         // The store is bounded: a create is the only thing that adds a dataset and
         // nothing evicts one, so past the cap this is a quota refusal.
@@ -289,6 +332,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         store.datasets.insert(record.id.clone(), record);
+        // The token is spent only now that the create has succeeded: a refused
+        // request created nothing, so the caller may send its token again.
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &dataset_id,
+            now,
+        );
 
         Ok(output)
     }
@@ -307,6 +359,19 @@ const DATASET_TYPE_EXTERNAL: &str = "EXTERNAL";
 fn invalid_request(message: String) -> CreateDatasetError {
     CreateDatasetError::Modeled(CreateDatasetErrorModeled::InvalidRequestException(
         InvalidRequestException { message },
+    ))
+}
+
+/// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
+/// request already spent: the conflict is with the dataset that request created,
+/// so `resourceId`/`resourceArn` name it.
+fn token_spent(dataset_id: &str, resource_arn: String) -> CreateDatasetError {
+    CreateDatasetError::Modeled(CreateDatasetErrorModeled::ConflictingOperationException(
+        ConflictingOperationException {
+            message: crate::state::already_using_message("dataset", "clientToken"),
+            resource_id: dataset_id.to_string(),
+            resource_arn,
+        },
     ))
 }
 

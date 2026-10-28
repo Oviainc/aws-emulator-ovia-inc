@@ -46,7 +46,7 @@ fn settled() -> Duration {
 /// declares — `smithy_query(query="operation", operation="CreateAsset")` reports
 /// target `ClientToken`, `length 36..64`, `pattern ^\S{36,64}$` — so a short,
 /// readable seed is padded with a non-whitespace filler up to the minimum.
-fn client_token(seed: &str) -> String {
+pub(crate) fn client_token(seed: &str) -> String {
     let token = format!("{seed:-<36}");
     assert!(
         (36..=64).contains(&token.len()),
@@ -56,7 +56,7 @@ fn client_token(seed: &str) -> String {
 }
 
 /// `body` with `clientToken` set to `token`.
-fn with_token(body: &Value, token: &str) -> Value {
+pub(crate) fn with_token(body: &Value, token: &str) -> Value {
     let mut carried = body.clone();
     carried["clientToken"] = json!(token);
     carried

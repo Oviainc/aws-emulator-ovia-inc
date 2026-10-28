@@ -31,6 +31,11 @@ use md5::{Digest, Md5};
 
 pub mod aws_published;
 
+// What a bucket's stored notification configuration DOES when an object changes — which
+// configured destinations are notified, what each notification carries, and the
+// in-process delivery itself — lives in `state/notifications.rs`.
+pub mod notifications;
+
 /// The Region a general purpose bucket is created in when the request names no
 /// `CreateBucketConfiguration.LocationConstraint`.
 ///

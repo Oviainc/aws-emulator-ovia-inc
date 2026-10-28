@@ -157,8 +157,9 @@ use crate::ops::types::{
     CapacityProviderTelemetryConfig, CapacityProviderVpcConfig, CodeSigningConfig,
     CodeSigningPolicies, Cors, CreateAliasOutput, CreateEventSourceMappingOutput,
     CreateFunctionOutput, DeadLetterConfig, DestinationConfig, DocumentDBEventSourceConfig,
-    DurableConfig, Environment, EnvironmentResponse, EphemeralStorage,
-    EventSourceMappingLoggingConfig, EventSourceMappingMetricsConfig, Execution, FileSystemConfig,
+    DurableConfig, Environment, EnvironmentResponse, EphemeralStorage, Event, EventInput,
+    EventSourceMappingLoggingConfig, EventSourceMappingMetricsConfig, Execution,
+    ExecutionStartedDetails, ExecutionTimedOutDetails, FileSystemConfig,
     FilterCriteria, FunctionCodeLocation, FunctionScalingConfig, GetFunctionScalingConfigOutput,
     GetLayerVersionOutput, GetProvisionedConcurrencyConfigOutput,
     ImageConfig, ImageConfigResponse, InstanceRequirements, Layer, LayerVersionContentOutput,
@@ -1781,6 +1782,15 @@ pub const EXECUTION_STATUS_STOPPED: &str = "STOPPED";
 /// (`…:function:<name>:<qualifier>/durable-execution/<execution-name>/<execution-id>`).
 pub const DURABLE_EXECUTION_ARN_INFIX: &str = "durable-execution";
 
+/// The model's `EventType` for the event a durable execution's history opens with
+/// (`smithy_query(query="shape", shape="EventType")`), carrying the input the execution
+/// started from and the timeout it runs under.
+pub const EVENT_TYPE_EXECUTION_STARTED: &str = "ExecutionStarted";
+
+/// The model's `EventType` for the event an execution that ran past its
+/// `ExecutionTimeout` closes with; see [`EVENT_TYPE_EXECUTION_STARTED`].
+pub const EVENT_TYPE_EXECUTION_TIMED_OUT: &str = "ExecutionTimedOut";
+
 /// One durable execution of a function.
 ///
 /// Held per function on [`FunctionRecord::durable_executions`] and keyed by its name,
@@ -1830,6 +1840,21 @@ pub struct DurableExecutionRecord {
     /// When the execution's `ExecutionTimeout` falls due, while it is running and the
     /// function's `DurableConfig` set one.
     pub timeout_due: Option<SystemTime>,
+    /// Everything that has happened to this execution, oldest first, which
+    /// `GetDurableExecutionHistory` reports: "Retrieves the execution history for a
+    /// durable execution, showing all the steps, callbacks, and events that occurred
+    /// during the execution."
+    ///
+    /// The log is APPEND-ONLY and it is the only record of what happened: an event is
+    /// appended by the call that made it happen (the start, below) or by the clock
+    /// transition that fell due ([`DurableExecutionRecord::materialize`]), so nothing
+    /// reading the history ever invents an event. `EventId` is "the unique identifier for
+    /// this event. Event IDs increment sequentially", which is the position in this
+    /// vector, counted from 1 ([`DurableExecutionRecord::next_event`]).
+    ///
+    /// It is bounded by what can append to it: one event for the start and one for the
+    /// terminal transition the clock owes.
+    pub history: Vec<Event>,
 }
 
 impl DurableExecutionRecord {
@@ -1848,6 +1873,31 @@ impl DurableExecutionRecord {
             self.status = EXECUTION_STATUS_TIMED_OUT.to_string();
             self.ended = Some(due);
             self.timeout_due = None;
+            // The history records what happened, so the transition the clock owed is
+            // appended as the event it is, timed at the instant it fell due rather than
+            // at the call that noticed it. `ExecutionTimedOutDetails$Error` is optional
+            // and no in-process runtime here produced an error payload for the
+            // execution, so none is reported.
+            let mut event = self.next_event(EVENT_TYPE_EXECUTION_TIMED_OUT, due);
+            event.execution_timed_out_details = Some(ExecutionTimedOutDetails { error: None });
+            self.history.push(event);
+        }
+    }
+
+    /// The next history event of this execution: `event_type` at the instant `at` it
+    /// happened, numbered by the events already recorded.
+    ///
+    /// `EventId` is "the unique identifier for this event. Event IDs increment
+    /// sequentially", so it is the event's one-based position in
+    /// [`DurableExecutionRecord::history`]; the caller fills in the one details member
+    /// its type carries and appends the event.
+    #[must_use]
+    pub fn next_event(&self, event_type: &str, at: SystemTime) -> Event {
+        Event {
+            event_type: Some(event_type.to_string()),
+            event_id: i32::try_from(self.history.len() + 1).unwrap_or(i32::MAX),
+            event_timestamp: Some(::aws_smithy_types::DateTime::from(at)),
+            ..Event::default()
         }
     }
 
@@ -1865,6 +1915,24 @@ impl DurableExecutionRecord {
     #[must_use]
     pub fn started_before(&self, at: ::aws_smithy_types::DateTime) -> bool {
         ::aws_smithy_types::DateTime::from(self.started).as_secs_f64() < at.as_secs_f64()
+    }
+}
+
+/// The `EventInput` a history event reports for the payload an execution was started
+/// from.
+///
+/// The model types `InputPayload` as a STRING, so a payload that is not text is reported
+/// as no payload at all rather than as mangled text — the same reading
+/// `GetDurableExecution` gives the stored payload. `Truncated` "indicates if the error
+/// payload was truncated due to size limits": the whole payload the start carried is
+/// stored, so nothing here is ever truncated.
+#[must_use]
+pub fn event_payload(payload: &[u8]) -> EventInput {
+    EventInput {
+        payload: String::from_utf8(payload.to_vec())
+            .ok()
+            .filter(|payload| !payload.is_empty()),
+        truncated: Some(false),
     }
 }
 
@@ -2336,7 +2404,7 @@ impl FunctionRecord {
         let durable_config = self
             .config_of(version)
             .and_then(|config| config.durable_config.clone());
-        let execution = DurableExecutionRecord {
+        let mut execution = DurableExecutionRecord {
             name: name.to_string(),
             execution_id: mint_durable_execution_id(),
             version: version.to_string(),
@@ -2355,7 +2423,24 @@ impl FunctionRecord {
                 // timeout no `SystemTime` can represent falls due at no instant rather
                 // than at a panic.
                 .and_then(|seconds| now.checked_add(Duration::from_secs(seconds))),
+            history: Vec::new(),
         };
+        // The history opens with the event the start itself is: "The input payload
+        // provided for the durable execution" and "the maximum amount of time that the
+        // durable execution is allowed to run, in seconds", which is the
+        // `ExecutionTimeout` of the function's `DurableConfig`. An execution of a
+        // function whose durable configuration names no timeout runs under none, and the
+        // event reports the `DurationSeconds` floor of 0 rather than a limit nothing
+        // bounds it by.
+        let mut started = execution.next_event(EVENT_TYPE_EXECUTION_STARTED, now);
+        started.execution_started_details = Some(ExecutionStartedDetails {
+            input: event_payload(payload),
+            execution_timeout: durable_config
+                .as_ref()
+                .and_then(|config| config.execution_timeout)
+                .unwrap_or(0),
+        });
+        execution.history.push(started);
         let arn = self.durable_execution_arn(&execution);
         self.durable_executions.insert(name.to_string(), execution);
         DurableExecutionStart::Started(arn)

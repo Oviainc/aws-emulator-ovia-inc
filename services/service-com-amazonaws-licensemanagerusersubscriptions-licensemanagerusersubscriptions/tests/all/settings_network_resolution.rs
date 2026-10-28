@@ -43,27 +43,27 @@ use serde_json::{json, Value};
 // second copy.
 use crate::identity_provider_subscriptions::{
     as_str, call, create_network, harness, list_providers, provider_union, register, Harness,
-    Reply, ACCOUNT_SECURITY_GROUPS, ACCOUNT_SUBNETS, ACCOUNT_VPC, PRODUCTS,
+    Reply, UpdateSettingsPayload, ACCOUNT_SECURITY_GROUPS, ACCOUNT_SUBNETS, ACCOUNT_VPC, PRODUCTS,
 };
 
 /// A SECOND VPC of the same account, with one subnet and one security group of its own:
 /// resources that exist, and that still cannot be mixed with another VPC's.
 const OTHER_VPC: &str = "vpc-aaaabbbbccccdddd0";
-const OTHER_VPC_SUBNET: &str = "subnet-bbbbbbbbbbbbbbbbb";
-const OTHER_VPC_SECURITY_GROUP: &str = "sg-bbbbbbbb";
+pub(crate) const OTHER_VPC_SUBNET: &str = "subnet-bbbbbbbbbbbbbbbbb";
+pub(crate) const OTHER_VPC_SECURITY_GROUP: &str = "sg-bbbbbbbb";
 
 /// Ids of the modelled form that NO VPC of the account holds — `Subnets` matches
 /// `^subnet-[a-z0-9]{8,17}` and `SecurityGroupId`
 /// `^sg-(([0-9a-z]{8})|([0-9a-z]{17}))$`, so each passes the boundary validator and
 /// reaches the handler's resolution. The two subnet ids are the shortest and the longest
 /// form the pattern admits.
-const UNHELD_SUBNET: &str = "subnet-00000000";
-const LONG_UNHELD_SUBNET: &str = "subnet-dddddddddddddddde";
-const UNHELD_SECURITY_GROUP: &str = "sg-00000000";
+pub(crate) const UNHELD_SUBNET: &str = "subnet-00000000";
+pub(crate) const LONG_UNHELD_SUBNET: &str = "subnet-dddddddddddddddde";
+pub(crate) const UNHELD_SECURITY_GROUP: &str = "sg-00000000";
 
 /// A directory the shared harness put in the account's fleet, so no row here is refused
 /// for its `DirectoryId`.
-const DIRECTORY: &str = "d-0123456789";
+pub(crate) const DIRECTORY: &str = "d-0123456789";
 
 /// What the service must answer a row with.
 ///
@@ -71,7 +71,7 @@ const DIRECTORY: &str = "d-0123456789";
 /// from the ROW's own values rather than copied as one literal — a refusal that named some
 /// other resource would not match.
 #[derive(Debug, Clone, Copy)]
-enum Expected {
+pub(crate) enum Expected {
     /// HTTP 200, and the settings the call must leave the registration with.
     Accepted,
     /// The subnet the request named is not in the account's store.
@@ -87,7 +87,7 @@ enum Expected {
 impl Expected {
     /// The sentence the refusal must carry, spelled out here rather than read from the
     /// implementation: the fixed text of the error class with the ids of this row.
-    fn message(self) -> Option<String> {
+    pub(crate) fn message(self) -> Option<String> {
         match self {
             Expected::Accepted => None,
             Expected::NoSuchSubnet(subnet_id) => {
@@ -108,7 +108,7 @@ impl Expected {
 }
 
 /// A harness whose account also holds [`OTHER_VPC`] and its one subnet and group.
-fn harness_with_two_vpcs() -> Harness {
+pub(crate) fn harness_with_two_vpcs() -> Harness {
     let h = harness();
     create_network(
         &h.engine,
@@ -119,12 +119,12 @@ fn harness_with_two_vpcs() -> Harness {
     h
 }
 
-async fn update_settings(h: &Harness, body: &Value) -> Reply {
+pub(crate) async fn update_settings(h: &Harness, body: &Value) -> Reply {
     call(h, "/identity-provider/UpdateIdentityProviderSettings", body).await
 }
 
 /// Assert `reply` is the modelled `ValidationException` (HTTP 400) carrying `message`.
-fn assert_refused(reply: &Reply, message: &str, case: &str) {
+pub(crate) fn assert_refused(reply: &Reply, message: &str, case: &str) {
     assert_eq!(
         reply.status, 400,
         "case {case:?}: expected HTTP 400, got {} with body {:?}",
@@ -404,7 +404,7 @@ async fn a_self_managed_domains_subnets_are_resolved_too() {
 }
 
 /// The subnets the registration every update row is applied to is registered with.
-const INITIAL_SUBNETS: &[&str] = &[ACCOUNT_SUBNETS[0], ACCOUNT_SUBNETS[1]];
+pub(crate) const INITIAL_SUBNETS: &[&str] = &[ACCOUNT_SUBNETS[0], ACCOUNT_SUBNETS[1]];
 
 /// The most distinct subnet ids one request may have resolved, spelled out here rather than
 /// read from the production constant so a change to it fails a test instead of silently
@@ -581,14 +581,12 @@ const UPDATE_ROWS: &[UpdateRow] = &[
 
 impl UpdateRow {
     fn payload(&self) -> Value {
-        let mut payload = json!({
-            "AddSubnets": self.add_subnets,
-            "RemoveSubnets": self.remove_subnets,
-        });
-        if let Some(security_group_id) = self.security_group_id {
-            payload["SecurityGroupId"] = json!(security_group_id);
+        UpdateSettingsPayload {
+            add_subnets: self.add_subnets,
+            remove_subnets: self.remove_subnets,
+            security_group_id: self.security_group_id,
         }
-        payload
+        .settings()
     }
 }
 

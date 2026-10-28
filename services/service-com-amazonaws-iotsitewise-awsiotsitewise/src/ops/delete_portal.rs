@@ -148,7 +148,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeletePortalError::Modeled(DeletePortalErrorModeled::InternalFailureException(
@@ -158,12 +158,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
-        // `clientToken` is NOT honoured for idempotent replay: this change stores no
-        // token -> request mapping, so a retry carrying the token of a delete that
-        // already removed the portal is a not-found refusal rather than a replayed
-        // answer. Deliberately left to the idempotency issue rather than half-done
-        // here, exactly as `CreatePortal` leaves it; nothing is fabricated for it.
+        // `clientToken` makes this delete idempotent, as the member documents: "A
+        // unique case-sensitive identifier that you can provide to ensure the
+        // idempotency of the request." A retry carries the token of the call it
+        // repeats, so it replays that call's answer — the portal it removed, reported
+        // DELETING — rather than the not-found refusal the removal itself would now
+        // produce, and removes nothing further; a token already spent on a DIFFERENT
+        // request belongs to another call, which is the modelled conflict. It is the
+        // FIRST thing decided, because the call it repeats was already served.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+
+        let fingerprint = crate::state::request_fingerprint(&[&input.portal_id], None);
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(_) => {
+                return Ok(DeletePortalOutput {
+                    portal_status: PortalStatus {
+                        state: crate::state::STATE_DELETING.to_string(),
+                        error: None,
+                    },
+                });
+            }
+            crate::state::TokenVerdict::Spent(spent_on) => {
+                return Err(token_spent(&region, &spent_on));
+            }
+            crate::state::TokenVerdict::Serve => {}
+        }
 
         // The portal goes, and with it everything this service holds only as a part
         // of it: the projects created in it and those projects' dashboards, so no
@@ -178,6 +199,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_found(&input.portal_id));
         }
 
+        // The token is spent only now that the delete has succeeded: a refused
+        // request removed nothing, so the caller may send its token again.
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &input.portal_id,
+            now,
+        );
+
         Ok(DeletePortalOutput {
             // "The status of the portal, which contains a state (DELETING after
             // successfully calling this operation) and any error message" — and no
@@ -188,6 +219,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         })
     }
+}
+
+/// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
+/// request already spent: the conflict is with the portal that request removed, so
+/// `resourceId`/`resourceArn` name it — built from this request's region, because
+/// the portal that call deleted no longer carries an ARN of its own.
+fn token_spent(region: &str, portal_id: &str) -> DeletePortalError {
+    DeletePortalError::Modeled(DeletePortalErrorModeled::ConflictingOperationException(
+        ConflictingOperationException {
+            message: crate::state::already_using_message("portal", "clientToken"),
+            resource_id: portal_id.to_string(),
+            resource_arn: crate::state::portal_arn(region, portal_id),
+        },
+    ))
 }
 
 /// HTTP 404 `ResourceNotFoundException` naming the portal the request addressed, in
