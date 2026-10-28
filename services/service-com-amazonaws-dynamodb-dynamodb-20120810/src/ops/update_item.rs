@@ -20,7 +20,14 @@
 //! A key attribute cannot be updated, and the stored result is held to the documented
 //! item bounds (400 KB, 32 levels of nesting) before it lands. The expression language
 //! itself lives in [`crate::state`], which is where `PutItem` and `DeleteItem` reach
-//! their own conditions.
+//! their own conditions — including the rule that every substitution token the request
+//! defines is referenced by one of its expressions
+//! ([`crate::state::Substitutions::check_all_referenced`]).
+//!
+//! The write is ADMITTED against the capacity the table is provisioned for and the
+//! per-partition-key ceiling beneath it ([`crate::state::Table::admit_item_write`]): a
+//! write neither covers is `ProvisionedThroughputExceededException`, carrying the
+//! `ThrottlingReasons` entry of the ceiling that bound, and changes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -321,6 +328,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.expression_attribute_names.as_ref(),
             input.expression_attribute_values.as_ref(),
         );
+        // Every token the request DEFINES must be one an expression uses: an unused
+        // entry of either substitution table makes the whole request invalid.
+        substitutions
+            .check_all_referenced(&[
+                input.update_expression.as_deref(),
+                input.condition_expression.as_deref(),
+            ])
+            .map_err(lift)?;
         let report_item_collection = crate::state::returns_item_collection_metrics(
             input.return_item_collection_metrics.as_deref(),
         )
@@ -448,6 +463,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .check_index_keys(&item)
             .map_err(lift)?;
 
+        // The write is ADMITTED before it lands, against the capacity the table is
+        // provisioned for and the per-partition-key ceiling beneath it: a write neither
+        // covers is throttled and leaves nothing behind.
+        let (capacity, throttle) = {
+            let table = store
+                .active_table_mut(&region, &name, now)
+                .map_err(lift)?;
+            let capacity = table.write_capacity(before.as_ref(), Some(&item));
+            let throttle = table
+                .admit_item_write(&key.partition, &capacity, now)
+                .err();
+            (capacity, throttle)
+        };
+        if let Some(throttle) = throttle {
+            return Err(
+                UpdateItemErrorModeled::ProvisionedThroughputExceededException(
+                    crate::state::throughput_exceeded(
+                        &crate::state::table_arn(&region, &name),
+                        throttle,
+                    ),
+                )
+                .into(),
+            );
+        }
+
         store
             .put_item(&region, &name, now, key, item.clone())
             .map_err(lift)?;
@@ -457,7 +497,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the table is charged for the larger of the two versions of the item, and each
         // index only for the ones this update actually moved.
         let table = store.active_table(&region, &name, now).map_err(lift)?;
-        let capacity = table.write_capacity(before.as_ref(), Some(&item));
         let item_collection_metrics =
             report_item_collection.then(|| table.item_collection_metrics(&item));
         // The change this write made reaches the table's stream before the response

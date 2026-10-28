@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPipelineExecutions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPipelineExecutions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPipelineExecutions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -177,20 +168,230 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPipelineExecutions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPipelineExecutionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| internal_failure("the IoT SiteWise store is unavailable".to_string()))?;
+        let now = ::std::time::SystemTime::now();
+
+        // A read: every value reported below is read off the stored execution or
+        // DERIVED from the instant a transition it owes falls due, so this listing
+        // moves no execution on and two readers of one execution cannot disagree
+        // about where it has got to.
+        let store = state.lock();
+
+        // The listing is scoped to ONE pipeline of ONE workspace, so both have to
+        // exist. Resolved outermost-first, as every handler of this slice resolves
+        // the resources its path names, so a request that is wrong in more than one
+        // way reports the outermost absence — and an empty page never stands in for
+        // a resource this service does not hold.
+        if !store.workspaces.contains_key(&input.workspace_name) {
+            return Err(not_found(
+                crate::state::RESOURCE_WORKSPACE,
+                &input.workspace_name,
+            ));
+        }
+        if !store.pipelines.contains_key(&crate::state::pipeline_key(
+            &input.workspace_name,
+            &input.pipeline_name,
+        )) {
+            return Err(not_found(
+                crate::state::RESOURCE_PIPELINE,
+                &input.pipeline_name,
+            ));
+        }
+
+        // The two time-range filters this operation takes are GROUPED: "use
+        // startTime filters (startTimeAfter, startTimeBefore) or endTime filters
+        // (endTimeAfter, endTimeBefore), but not both. Combining startTime and
+        // endTime filters returns an InvalidRequestException." So a request naming a
+        // bound from each group is refused rather than answered with the
+        // intersection it does not model.
+        let start_after = input
+            .start_time_after
+            .as_ref()
+            .map(crate::state::date_time_nanos);
+        let start_before = input
+            .start_time_before
+            .as_ref()
+            .map(crate::state::date_time_nanos);
+        let end_after = input
+            .end_time_after
+            .as_ref()
+            .map(crate::state::date_time_nanos);
+        let end_before = input
+            .end_time_before
+            .as_ref()
+            .map(crate::state::date_time_nanos);
+        if (start_after.is_some() || start_before.is_some())
+            && (end_after.is_some() || end_before.is_some())
+        {
+            return Err(invalid_request(
+                "Time range filters are grouped: use startTime filters (startTimeAfter, \
+                 startTimeBefore) or endTime filters (endTimeAfter, endTimeBefore), but not \
+                 both."
+                    .to_string(),
+            ));
+        }
+        // A range whose upper bound precedes its lower one names no instant at all,
+        // refused the way every other range this service takes is (cf.
+        // `ListSearches`, `ListEnrichmentJobs`).
+        for (lower, upper) in [(start_after, start_before), (end_after, end_before)] {
+            if let (Some(lower), Some(upper)) = (lower, upper) {
+                if upper < lower {
+                    return Err(invalid_request(
+                        "The end of the range must not be earlier than its start.".to_string(),
+                    ));
+                }
+            }
+        }
+
+        // Every execution of the named pipeline that satisfies EVERY filter the
+        // request carried, and no execution of another pipeline: an execution is
+        // addressed only inside the pipeline it was started in, and its record names
+        // that pipeline and workspace.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPipelineExecutions"))
+        // The state compared against and the two instants compared against are the
+        // ones the SUMMARY reports, so a filtered page can never disagree with the
+        // summaries in it. A bound on an instant an execution has not reached
+        // selects nothing: an execution with no `startTime` has no start time to
+        // compare, and only a terminal execution has an `endTime` at all, which is
+        // why "endTime filters only return executions in terminal states".
+        let mut selected: Vec<&crate::state::PipelineExecutionRecord> = store
+            .pipeline_executions
+            .values()
+            .filter(|record| {
+                record.workspace_name == input.workspace_name
+                    && record.pipeline_name == input.pipeline_name
+            })
+            // "Filter by execution state. If not specified, executions in all states
+            // are returned." The value is one of the modelled enum's, which the
+            // runtime refuses outside its value set before this handler runs.
+            .filter(|record| {
+                input
+                    .state
+                    .as_deref()
+                    .is_none_or(|wanted| wanted == record.state(now))
+            })
+            .filter(|record| {
+                let started = record.start_time.as_ref().map(instant_nanos);
+                start_after.is_none_or(|bound| started.is_some_and(|at| at >= bound))
+                    && start_before.is_none_or(|bound| started.is_some_and(|at| at < bound))
+            })
+            .filter(|record| {
+                let ended = record.ended_at(now).map(|at| instant_nanos(&at));
+                end_after.is_none_or(|bound| ended.is_some_and(|at| at >= bound))
+                    && end_before.is_none_or(|bound| ended.is_some_and(|at| at < bound))
+            })
+            .collect();
+
+        // A stable total order is what makes `nextToken` resumable, and the
+        // executions are held in a hash map, so any order this reported unsorted
+        // would be the map's. Most recently accepted first, ties broken by the
+        // execution's own id so two executions accepted in the same instant still
+        // order deterministically.
+        //
+        // CHOSEN, not documented: the operation's model states no order. Newest
+        // first is the order this service's other execution-shaped listings answer
+        // in, so a client paging a pipeline's executions sees one order across the
+        // service.
+        selected.sort_by(|left, right| {
+            right
+                .accepted_at
+                .cmp(&left.accepted_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        // This enumeration's resume point is an execution's id, and the page walk
+        // every paginated listing of this service shares takes it from there: it
+        // resumes at the token's execution, refusing a token whose resume point is
+        // not in this enumeration rather than answering an empty page; it cuts the
+        // page at "the maximum number of results to return per request", which this
+        // operation's model declares a default of 50 for, so the member arrives
+        // carrying one and the walk's own fallback never applies; and it mints "the
+        // token to be used for the next set of paginated results" off the execution
+        // that follows the page.
+        let page = crate::state::page_of(
+            &selected,
+            input.next_token.as_deref(),
+            Some(input.max_results),
+            DEFAULT_MAX_RESULTS,
+            |record| record.id.as_str(),
+        )
+        .ok_or_else(invalid_token)?;
+
+        // `get` rather than a slice index: the bounds above are derived from the
+        // request, so the page is taken in a form that cannot panic whatever they
+        // resolve to.
+        let executions = selected.get(page.start..page.end).unwrap_or_default();
+
+        Ok(ListPipelineExecutionsOutput {
+            pipeline_execution_summaries: executions
+                .iter()
+                .map(|record| summary(record, now))
+                .collect(),
+            next_token: page.next_token,
+        })
     }
+}
+
+/// The page size this operation's `maxResults` declares as its default ("Default:
+/// 50"), which the runtime applies before this handler runs.
+const DEFAULT_MAX_RESULTS: i32 = 50;
+
+/// What this operation reports for one stored execution, as of `now` — every
+/// member read off the record or derived from it exactly as
+/// `DescribePipelineExecution` derives it, so a listed execution and a described
+/// one never disagree.
+fn summary(
+    record: &crate::state::PipelineExecutionRecord,
+    now: ::std::time::SystemTime,
+) -> PipelineExecutionSummary {
+    PipelineExecutionSummary {
+        pipeline_execution_id: record.id.clone(),
+        pipeline_version: record.pipeline_version.clone(),
+        status: record.status(now),
+        execution_priority: Some(record.execution_priority),
+        // "The time the pipeline execution started" / "completed": the instant the
+        // execution's own run began, and the instant it ended — which for a
+        // cancelled execution is when the recorded cancellation fell due.
+        start_time: record.start_time.map(crate::state::to_date_time),
+        end_time: record.ended_at(now).map(crate::state::to_date_time),
+    }
+}
+
+/// A stored instant in whole nanoseconds since the Unix epoch, so it and a
+/// modelled `Timestamp` bound compare at one precision.
+fn instant_nanos(at: &::std::time::SystemTime) -> i128 {
+    crate::state::date_time_nanos(&crate::state::to_date_time(*at))
+}
+
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never
+/// issued for this pipeline.
+fn invalid_token() -> ListPipelineExecutionsError {
+    invalid_request("The nextToken is not a token this operation issued.".to_string())
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> ListPipelineExecutionsError {
+    ListPipelineExecutionsErrorModeled::InvalidRequestException(InvalidRequestException { message })
+        .into()
+}
+
+/// HTTP 404 `ResourceNotFoundException` for the resource of `kind` the request
+/// named: a workspace this service does not hold, or a pipeline that workspace
+/// does not hold.
+fn not_found(kind: &str, identifier: &str) -> ListPipelineExecutionsError {
+    ListPipelineExecutionsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: crate::state::not_found_message(kind, identifier),
+    })
+    .into()
+}
+
+/// HTTP 500 `InternalFailureException` carrying `message`.
+fn internal_failure(message: String) -> ListPipelineExecutionsError {
+    ListPipelineExecutionsErrorModeled::InternalFailureException(InternalFailureException {
+        message,
+    })
+    .into()
 }

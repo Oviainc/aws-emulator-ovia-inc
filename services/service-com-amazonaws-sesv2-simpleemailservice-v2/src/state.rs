@@ -647,11 +647,12 @@ pub fn invalid_tenant_name(tenant_name: &str) -> String {
 
 /// How this service words `NotFoundException` for a tenant it does not hold.
 ///
-/// One wording for the operations that read a tenant, or a tenant's suppression
-/// list, by `TenantName` — `GetTenant`, `GetSuppressedDestination` and
-/// `ListSuppressedDestinations` — so a client sees the same sentence whichever of
-/// them first tells it the tenant is gone. The tenant-resource association surface
-/// words the same condition differently; see [`requested_tenant_not_found`].
+/// One wording for the operations that address the tenant itself, or a tenant's
+/// suppression list, by `TenantName` — `GetTenant`, `DeleteTenant`,
+/// `GetSuppressedDestination` and `ListSuppressedDestinations` — so a client sees the
+/// same sentence whichever of them first tells it the tenant is gone. The
+/// tenant-resource association surface words the same condition differently; see
+/// [`requested_tenant_not_found`].
 pub fn tenant_not_found(tenant_name: &str) -> String {
     format!("Tenant {tenant_name} does not exist.")
 }
@@ -1247,6 +1248,30 @@ impl ComAmazonawsSesv2SimpleemailserviceV2State {
             .as_millis();
         let sequence = self.tenant_sequence;
         format!("{millis:016x}{sequence:016x}")
+    }
+
+    /// Remove the tenant `tenant_name` holds, with the state that belongs to the
+    /// tenant itself, and answer the record removed — or `None` when the account holds
+    /// no tenant of that name.
+    ///
+    /// `DeleteTenant`: "when you delete a tenant, its associations with resources are
+    /// removed, but the resources themselves are not deleted". So nothing the tenant
+    /// holds can block the removal, and every resource it was associated with stays
+    /// exactly as it was. The association rows themselves stay in the table: a row is
+    /// the RESOURCE's record of having been associated, which outlives the tenant, and
+    /// every tenant-keyed view resolves the tenant record before it reads one
+    /// ([`TenantResourceAssociationRecord::belongs_to`]) — so after this a row is
+    /// reported by its resource's listing and by no tenant's.
+    ///
+    /// The tenant's suppression list is part of the tenant and not a resource, so its
+    /// entries go with the record: an address reaches a tenant's list only while that
+    /// tenant exists, so an entry left behind would be reachable by nothing except a
+    /// later tenant that happened to take the same name.
+    pub fn delete_tenant(&mut self, tenant_name: &str) -> Option<TenantRecord> {
+        let removed = self.tenants.remove(tenant_name)?;
+        self.suppressed_destinations
+            .retain(|_, entry| entry.tenant_name.as_deref() != Some(tenant_name));
+        Some(removed)
     }
 }
 
@@ -2213,6 +2238,17 @@ impl TenantResourceAssociationRecord {
             resource_arn: Some(self.resource_arn.clone()),
             associated_timestamp: Some(::aws_smithy_types::DateTime::from(self.associated_at)),
         }
+    }
+
+    /// Whether this association is one `tenant` holds — the record its `TenantName`
+    /// resolves to NOW.
+    ///
+    /// The tenant's id is copied in at association time, so an association made
+    /// against a tenant that has since been deleted belongs to no tenant at all, and in
+    /// particular not to a later tenant that took the same name: a tenant-keyed view
+    /// reports the associations of the tenant record it resolved and no others.
+    pub fn belongs_to(&self, tenant: &TenantRecord) -> bool {
+        self.tenant_name == tenant.name && self.tenant_id == tenant.tenant_id
     }
 
     /// The modelled `TenantResource` view of this association, as

@@ -240,7 +240,7 @@ pub(crate) fn tags_of(record: &Value, case: &str) -> BTreeMap<String, String> {
 }
 
 /// The reported resource with its tag map removed: what a tag call must leave untouched.
-fn without_tags(record: &Value) -> Value {
+pub(crate) fn without_tags(record: &Value) -> Value {
     let mut record = record.clone();
     if let Some(object) = record.as_object_mut() {
         object.remove("tags");

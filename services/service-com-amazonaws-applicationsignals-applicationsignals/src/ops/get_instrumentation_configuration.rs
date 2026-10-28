@@ -176,6 +176,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::region_of(ctx.parts());
         let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+
+        // `CodeLocation.ClassName` is required for one value of its sibling `Language`, a
+        // rule the model cannot express, so the boundary validator admits a location that
+        // omits it and the requirement is enforced here — refused with 400, as it is on the
+        // create that would have stored such a location.
+        if let Some(refusal) =
+            crate::state::identified_location_refusal(&input.location_identifier)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(refusal));
+        }
+
         let scope = crate::state::InstrumentationScope::new(
             &input.instrumentation_type,
             &input.service,

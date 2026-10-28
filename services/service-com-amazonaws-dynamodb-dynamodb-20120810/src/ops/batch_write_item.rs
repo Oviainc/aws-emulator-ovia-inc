@@ -24,10 +24,16 @@
 //! "you cannot specify conditions on individual put and delete requests, and BatchWriteItem
 //! does not return deleted items in the response".
 //!
-//! Every operation this emulator accepts is processed, so `UnprocessedItems` is the empty
-//! map AWS answers with rather than an absent member. `ReturnConsumedCapacity` reports one
-//! `ConsumedCapacity` per table written and `ReturnItemCollectionMetrics=SIZE` one
-//! `ItemCollectionMetrics` list per table, both totalled from stored state by
+//! Each operation is then ADMITTED on its own against the write capacity its table is
+//! provisioned for and against the per-partition-key ceiling beneath it
+//! ([`crate::state::Table::admit_item_write`]): one the throughput component does not
+//! admit is handed back in `UnprocessedItems`, in the form it was sent, and stores
+//! nothing — so a hot partition key is throttled while the same rate spread over many
+//! keys is served. A batch NONE of whose operations were admitted is answered with
+//! `ProvisionedThroughputExceededException`, carrying the `ThrottlingReasons` entry for
+//! the ceiling that bound and the ARN of the table it bound on. `ReturnConsumedCapacity`
+//! reports one `ConsumedCapacity` per table written and `ReturnItemCollectionMetrics=SIZE`
+//! one `ItemCollectionMetrics` list per table, both totalled from stored state by
 //! [`crate::state::WriteLedger`].
 //!
 //! ## Shape of an operation
@@ -288,7 +294,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // depend on the request map's iteration order.
         let mut addressed: Vec<(&String, &Vec<WriteRequest>)> = input.request_items.iter().collect();
         addressed.sort_by(|left, right| left.0.cmp(right.0));
-        let mut pending: Vec<(String, PendingWrite)> = Vec::new();
+        let mut pending: Vec<(String, PendingWrite, WriteRequest)> = Vec::new();
         let mut keyed: std::collections::BTreeSet<(String, crate::state::ItemKey)> =
             std::collections::BTreeSet::new();
         for (table_name, requests) in addressed {
@@ -348,7 +354,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::DUPLICATE_BATCH_KEYS_MESSAGE,
                     ));
                 }
-                pending.push((name.clone(), write));
+                pending.push((name.clone(), write, request.clone()));
             }
         }
 
@@ -356,11 +362,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // landed in, so the capacity fan-out and the item-collection size are computed
         // from stored state rather than from the request.
         let mut ledger = crate::state::WriteLedger::default();
+        // "If any requested operations fail because the table's provisioned throughput
+        // is exceeded ... the failed operations are returned in the UnprocessedItems
+        // response parameter" (the operation's doc): a write the throughput component
+        // does not admit is handed back for the caller to resend, in the form it was
+        // sent in, and nothing of it is stored.
+        let mut unprocessed: std::collections::HashMap<String, Vec<WriteRequest>> =
+            std::collections::HashMap::new();
+        let mut throttled: Option<(String, crate::state::WriteThrottle)> = None;
+        let mut processed = 0usize;
         // Written as a closure's result rather than with `?`, so the changes the batch
         // already made are handed to the streams service on EVERY exit: a write that
         // landed is a change the stream carries whether or not the write after it did.
         let applied = (|| -> Result<(), Self::Error> {
-            for (name, write) in pending {
+            for (name, write, request) in pending {
+                // Each operation of the batch is admitted on its own — "the individual
+                // PutItem and DeleteItem operations specified in BatchWriteItem are
+                // atomic; however BatchWriteItem as a whole is not" — from the capacity
+                // the write would consume against the two ceilings a write is held to.
+                let admitted = {
+                    let table = store
+                        .active_table_mut(&region, &name, now)
+                        .map_err(lift)?;
+                    let before = table.items.get(write.key()).cloned();
+                    let capacity = match &write {
+                        PendingWrite::Put { item, .. } => {
+                            table.write_capacity(before.as_ref(), Some(item))
+                        }
+                        PendingWrite::Delete { .. } => {
+                            table.write_capacity(before.as_ref(), None)
+                        }
+                    };
+                    table.admit_item_write(&write.key().partition, &capacity, now)
+                };
+                if let Err(throttle) = admitted {
+                    throttled = Some((name.clone(), throttle));
+                    unprocessed.entry(name).or_default().push(request);
+                    continue;
+                }
+                processed += 1;
                 match write {
                     PendingWrite::Put { key, item } => {
                         let replaced = store
@@ -392,12 +432,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::publish_item_changes(&*self.engine, &mut store, now);
         applied?;
 
+        // "If BatchWriteItem cannot process any items due to throttling (for example,
+        // insufficient provisioned throughput on the tables in the request, or
+        // partition-level or account-level limits), it returns a
+        // ProvisionedThroughputExceededException" — so a batch NONE of whose operations
+        // were admitted is answered with the throttle itself, naming the ceiling that
+        // bound and the table it bound on; a batch that got some of its work done
+        // answers 200 and hands the rest back.
+        if processed == 0 {
+            if let Some((name, throttle)) = throttled {
+                return Err(
+                    BatchWriteItemErrorModeled::ProvisionedThroughputExceededException(
+                        crate::state::throughput_exceeded(
+                            &crate::state::table_arn(&region, &name),
+                            throttle,
+                        ),
+                    )
+                    .into(),
+                );
+            }
+        }
+
         Ok(BatchWriteItemOutput {
             // "A map of tables and requests against those tables that were not
-            // processed": every operation this emulator accepted was processed, so the
-            // map is EMPTY — the member AWS answers with, which is what lets a client's
-            // retry loop terminate.
-            unprocessed_items: Some(std::collections::HashMap::new()),
+            // processed": the operations the throughput component did not admit, in the
+            // form they were sent, so the value can be handed straight to a later
+            // BatchWriteItem — and an empty map when every one of them landed, which is
+            // what lets a client's retry loop terminate.
+            unprocessed_items: Some(unprocessed),
             item_collection_metrics: ledger.item_collection_metrics(),
             consumed_capacity: ledger.consumed_capacity(input.return_consumed_capacity.as_deref()),
         })

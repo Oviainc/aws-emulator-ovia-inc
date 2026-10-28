@@ -24,6 +24,7 @@
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_sesv2_simpleemailservice_v2::state::ComAmazonawsSesv2SimpleemailserviceV2State;
 use service_com_amazonaws_sesv2_simpleemailservice_v2::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -104,6 +105,9 @@ impl Reply {
 /// wire path.
 pub(crate) struct Ses {
     router: MultiServiceRouter,
+    /// The engine the service is mounted on, kept so a suite can put the account in a
+    /// state no wire call can reach in one step.
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Ses {
@@ -112,8 +116,21 @@ impl Ses {
         let mut router = MultiServiceRouter::new();
         // These cases exercise handler behaviour, not SigV4.
         router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
+    }
+
+    /// Grant this account production access, which is what takes it out of the sandbox.
+    ///
+    /// It is set on the one account record every account operation reads and writes (the
+    /// record `GetAccount` reports `ProductionAccessEnabled` from), because asking for it
+    /// over the wire opens a support case whose decision only falls due later: a suite
+    /// that needs a call a sandboxed account is refused grants it here.
+    pub(crate) fn grant_production_access(&self) {
+        let state = self
+            .engine
+            .state::<ComAmazonawsSesv2SimpleemailserviceV2State>();
+        state.lock().account.production_access_enabled = true;
     }
 
     pub(crate) async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Reply {

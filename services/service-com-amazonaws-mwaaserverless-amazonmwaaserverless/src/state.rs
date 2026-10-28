@@ -177,15 +177,6 @@ pub const RUN_TYPE_ON_DEMAND: &str = "ON_DEMAND";
 /// (`smithy_query(query="shape", shape="RunType")`: `ON_DEMAND | SCHEDULED`).
 pub const RUN_TYPE_SCHEDULED: &str = "SCHEDULED";
 
-/// The `TriggerMode` that asks the service to execute the workflow itself.
-///
-/// `TriggerMode` is modelled as a free string (`GenericString`, length 1..255), and
-/// the two kinds of execution this service distinguishes are the `RunType` values a
-/// run reports, so this is the mode under which the service produces
-/// [`RUN_TYPE_SCHEDULED`] runs. Every other value — and no value at all — leaves the
-/// workflow to be started by a caller.
-pub const TRIGGER_MODE_SCHEDULED: &str = "SCHEDULED";
-
 /// How long after a workflow's automated trigger is configured its FIRST firing falls
 /// due, and the period between firings after that.
 ///
@@ -698,7 +689,7 @@ pub struct Workflow {
     /// [`ComAmazonawsMwaaserverlessAmazonmwaaserverlessState::reap_deleted_workflows`].
     pub deletion_due_at: Option<SystemTime>,
     /// The instant the clock owes this workflow's NEXT automated run, for a workflow
-    /// whose active version asks the service to execute it
+    /// whose active version's definition declares a schedule
     /// ([`Workflow::is_scheduled`]), and `None` for one only a caller starts or whose
     /// teardown has removed its triggers. Stored, never slept on, and materialised by
     /// [`ComAmazonawsMwaaserverlessAmazonmwaaserverlessState::fire_due_scheduled_runs`].
@@ -726,24 +717,36 @@ impl Workflow {
         self.deletion_due_at.is_some()
     }
 
-    /// Whether the version this workflow currently runs asks the SERVICE to execute
-    /// it ([`TRIGGER_MODE_SCHEDULED`]), rather than waiting for a caller to start it.
+    /// Whether the version this workflow currently runs carries the scheduling
+    /// information the service configures an automated trigger from: the schedule its
+    /// snapshotted definition declares
+    /// ([`WorkflowSnapshot::schedule_configuration`]).
+    ///
+    /// The definition is where that information lives — "when a workflow includes
+    /// schedule information in its YAML definition, the service automatically
+    /// configures the appropriate triggers for automated execution"
+    /// (`smithy_query(query="shape", shape="GetWorkflowResponse")`,
+    /// `ScheduleConfiguration`) — so this reads the one input the service's own
+    /// scheduling is derived from, the same one `ScheduleConfiguration` reports. A
+    /// version whose definition declares no schedule the service can configure a
+    /// trigger from, and one holding no snapshotted definition at all, is left to be
+    /// started by a caller; no request member stands in for the declaration.
     pub fn is_scheduled(&self) -> bool {
         self.current_snapshot()
-            .and_then(|snapshot| snapshot.trigger_mode.as_deref())
-            .is_some_and(|mode| mode == TRIGGER_MODE_SCHEDULED)
+            .is_some_and(|snapshot| snapshot.schedule_configuration.is_some())
     }
 
-    /// Point this workflow's automated trigger at the configuration its ACTIVE version
-    /// froze: a version asking for automated execution owes its first firing
-    /// [`SCHEDULED_RUN_EVERY`] from `now`, and one that does not clears the trigger.
+    /// Point this workflow's automated trigger at the definition its ACTIVE version
+    /// froze: a version whose definition declares a schedule ([`Self::is_scheduled`])
+    /// owes its first firing [`SCHEDULED_RUN_EVERY`] from `now`, and one that declares
+    /// none clears the trigger.
     ///
     /// Called wherever the active version changes, because "only one version of a
     /// workflow can have an active schedule at any given time"
     /// (`smithy_query(query="shape", shape="GetWorkflowResponse")`,
     /// `ScheduleConfiguration`): the trigger in force is always the latest version's,
-    /// so a workflow re-pointed at a configuration that no longer asks for automated
-    /// execution stops producing runs of its own.
+    /// so a workflow re-pointed at a definition declaring no schedule stops producing
+    /// runs of its own.
     pub fn configure_trigger(&mut self, now: SystemTime) {
         self.next_scheduled_run_at = self.is_scheduled().then(|| now + SCHEDULED_RUN_EVERY);
     }
@@ -1113,7 +1116,7 @@ impl ComAmazonawsMwaaserverlessAmazonmwaaserverlessState {
     /// Materialise every automated run this store's triggers already owed, and report
     /// how many runs that created.
     ///
-    /// A workflow whose active version asks the service to execute it carries the
+    /// A workflow whose active version's definition declares a schedule carries the
     /// instant its trigger next fires ([`Workflow::next_scheduled_run_at`]). A firing
     /// at or before `now` was owed at THAT instant whether or not anybody called, so
     /// the run it produces is recorded with the due instant as its creation and start

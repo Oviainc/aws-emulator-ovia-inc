@@ -23,7 +23,8 @@
 //! member the request names (either destination's freshness window, the logging settings, or
 //! both at once), the value it carries, whether the channel was already logging, which logging
 //! names the request omits, the destination kind the channel delivers to, the lifecycle status
-//! the channel is in when the call arrives, and how many callers overlap.
+//! the channel is in when the call arrives, the region the request is signed for, and how many
+//! callers overlap.
 //!
 //! Every case drives the real awsJson1_1 request path (`POST /` with `X-Amz-Target:
 //! Kinesis_20131202.<Operation>` through `MultiServiceRouter::dispatch`), so the statuses,
@@ -38,8 +39,8 @@ use service_com_amazonaws_kinesis_kinesis_20131202::state::{
 
 use crate::channel_lifecycle::{
     dead_letter_queue, description, description_without_status, member, on_demand_stream,
-    past_channel_activation, role_arn, schema_arn, storage_configuration, stream_configuration,
-    table_bucket_arn,
+    on_demand_stream_in, past_channel_activation, role_arn, schema_arn, storage_configuration,
+    stream_configuration, table_bucket_arn,
 };
 use crate::stream_tags::{error_code, error_message, Emulator, REGION};
 
@@ -59,6 +60,19 @@ const UPDATING: &str = "UPDATING";
 /// The log stream a channel that names none logs to: "Defaults to DestinationDelivery"
 /// (`CloudWatchLogs$LogStreamName`).
 const DEFAULT_LOG_STREAM_NAME: &str = "DestinationDelivery";
+
+/// A second region, so a case can show a change reaching the channels of the region the request
+/// was signed for and no other.
+const OTHER_REGION: &str = "eu-west-1";
+
+/// How a refusal states that this account holds no channel under the identifier the request
+/// named: the channel named the way a client addresses it, and the account serving the call.
+fn not_found_message(channel_name: &str) -> String {
+    format!(
+        "Channel {channel_name} under account {} not found.",
+        engine::EMULATOR_ACCOUNT_ID
+    )
+}
 
 /// How long a case waits before treating an accepted change as applied: past the instant the
 /// update armed the `UPDATING` -> `ACTIVE` transition for.
@@ -716,10 +730,7 @@ async fn a_change_the_operation_cannot_make_is_refused_and_arms_nothing() {
             arn: channel_arn(REGION, missing),
             update: json!({ "S3DestinationConfiguration": { "DataFreshnessInSeconds": 400 } }),
             code: "ResourceNotFoundException",
-            says: format!(
-                "Channel {missing} under account {} not found.",
-                engine::EMULATOR_ACCOUNT_ID
-            ),
+            says: not_found_message(missing),
         },
     ];
 
@@ -782,4 +793,156 @@ async fn a_change_the_operation_cannot_make_is_refused_and_arms_nothing() {
             );
         }
     }
+}
+
+/// A change reaches the channels of the region the request was signed for and NO other: a
+/// channel's "name is unique within your Amazon Web Services account and Amazon Web Services
+/// Region" (`CreateChannelInput$ChannelName`), so one name in two regions is two channels, each
+/// taking its own changes, and a change signed for one region naming the other's channel
+/// addresses a channel this endpoint holds none of — it is refused `ResourceNotFoundException`,
+/// writes nothing and arms nothing.
+#[tokio::test]
+async fn a_change_reaches_only_the_channels_of_the_region_it_was_signed_for() {
+    let emulator = Emulator::new();
+    let case = "region-scoped";
+
+    // ONE channel name in two regions, each starting on its own freshness window — so a change
+    // that reached the wrong region's record would be visible as that region's value moving.
+    let created: [(&str, i64); 2] = [(REGION, 120), (OTHER_REGION, 240)];
+    for (region, seconds) in created {
+        let source = on_demand_stream_in(&emulator, region, "region-scope-source").await;
+        emulator
+            .ok_in(
+                case,
+                region,
+                "CreateChannel",
+                &s3_create(
+                    case,
+                    &source,
+                    json!({
+                        "DataFreshnessInSeconds": seconds,
+                        "StorageConfiguration": storage_configuration("region-scope-bucket"),
+                    }),
+                    None,
+                ),
+            )
+            .await;
+    }
+    tokio::time::sleep(past_channel_activation()).await;
+
+    // A change signed for one region naming the OTHER region's channel, in both directions.
+    for (region, elsewhere) in [(REGION, OTHER_REGION), (OTHER_REGION, REGION)] {
+        let body = json!({
+            "ChannelARN": channel_arn(elsewhere, case),
+            "S3DestinationConfiguration": { "DataFreshnessInSeconds": 777 },
+        });
+        let (status, response) = emulator.call_in(region, "UpdateChannel", &body).await;
+        assert_eq!(
+            status, 400,
+            "case {case} signed for {region}: expected a change naming {elsewhere}'s channel to \
+             be refused, got {status} with body {response}"
+        );
+        assert_eq!(
+            error_code(&response),
+            "ResourceNotFoundException",
+            "case {case} signed for {region}: expected ResourceNotFoundException, got {response}"
+        );
+        let says = not_found_message(case);
+        assert!(
+            error_message(&response).contains(&says),
+            "case {case} signed for {region}: expected the refusal to name {says:?}, got {:?}",
+            error_message(&response)
+        );
+    }
+
+    // Neither refusal wrote anything and neither armed a transition: both channels still carry
+    // the window their create set, and both are still `ACTIVE`.
+    for (region, seconds) in created {
+        let held = describe_channel_in(&emulator, case, region).await;
+        assert_eq!(
+            member(case, &held, "ChannelStatus"),
+            ACTIVE,
+            "case {case} in {region}: expected the refused change to arm no transition, got {held}"
+        );
+        assert_eq!(
+            held["S3DestinationConfiguration"]["DataFreshnessInSeconds"].as_i64(),
+            Some(seconds),
+            "case {case} in {region}: expected the refused change to have written nothing, got \
+             {held}"
+        );
+    }
+
+    // Each region's channel takes its OWN change, and the other region's record does not move
+    // with it: the change is applied where it was signed for and nowhere else.
+    let changed: [(&str, i64); 2] = [(REGION, 600), (OTHER_REGION, 900)];
+    for (index, (region, seconds)) in changed.iter().enumerate() {
+        // What the region this change is NOT signed for holds right before it, which is what
+        // that region must still hold right after it.
+        let elsewhere = created[1 - index].0;
+        let before = describe_channel_in(&emulator, case, elsewhere).await;
+        let accepted = emulator
+            .ok_in(
+                case,
+                region,
+                "UpdateChannel",
+                &json!({
+                    "ChannelARN": channel_arn(region, case),
+                    "S3DestinationConfiguration": { "DataFreshnessInSeconds": seconds },
+                }),
+            )
+            .await;
+        let reported = description(case, &accepted);
+        assert_eq!(
+            member(case, &reported, "ChannelStatus"),
+            UPDATING,
+            "case {case} in {region}: expected the accepted change to leave the channel \
+             {UPDATING}, got {reported}"
+        );
+        assert_eq!(
+            reported["S3DestinationConfiguration"]["DataFreshnessInSeconds"].as_i64(),
+            Some(*seconds),
+            "case {case} in {region}: expected the accepted change to carry {seconds}, got \
+             {reported}"
+        );
+
+        // The region this change was NOT signed for still reports the configuration it held:
+        // the change reached the channels of the region it was signed for and no other.
+        let held = describe_channel_in(&emulator, case, elsewhere).await;
+        assert_eq!(
+            held["S3DestinationConfiguration"],
+            before["S3DestinationConfiguration"],
+            "case {case}: expected a change signed for {region} to leave {elsewhere}'s channel \
+             as it was, got {held}"
+        );
+    }
+
+    // ONE wait covers both accepted changes' transitions back to `ACTIVE`, and each region's
+    // channel settles on the value ITS caller submitted.
+    tokio::time::sleep(past_channel_update()).await;
+    for (region, seconds) in changed {
+        let settled = describe_channel_in(&emulator, case, region).await;
+        assert_eq!(
+            member(case, &settled, "ChannelStatus"),
+            ACTIVE,
+            "case {case} in {region}: expected the channel to settle {ACTIVE}, got {settled}"
+        );
+        assert_eq!(
+            settled["S3DestinationConfiguration"]["DataFreshnessInSeconds"].as_i64(),
+            Some(seconds),
+            "case {case} in {region}: expected the channel to settle on {seconds}, got {settled}"
+        );
+    }
+}
+
+/// The `ChannelDescription` `region`'s endpoint reports for the channel named `case`.
+async fn describe_channel_in(emulator: &Emulator, case: &str, region: &str) -> Value {
+    let read = emulator
+        .ok_in(
+            case,
+            region,
+            "DescribeChannel",
+            &json!({ "ChannelARN": channel_arn(region, case) }),
+        )
+        .await;
+    description(case, &read)
 }

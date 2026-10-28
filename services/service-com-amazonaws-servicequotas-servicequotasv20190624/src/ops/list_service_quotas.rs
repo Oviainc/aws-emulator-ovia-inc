@@ -179,8 +179,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             quotas
         };
 
-        let page = crate::state::paginate(
+        // The token names a position in the listing THIS request selected — the
+        // region's records for one service, narrowed by the `QuotaCode` and the
+        // plane the caller asked for — so a token cut from another selection cannot
+        // resume here. A caller that names no plane is served the ACCOUNT one, so
+        // the two label the same listing.
+        let listing = crate::state::listing_label(
             Self::NAME,
+            &[
+                Some(&region),
+                Some(&input.service_code),
+                input.quota_code.as_deref(),
+                Some(
+                    input
+                        .quota_applied_at_level
+                        .as_deref()
+                        .unwrap_or(crate::state::LEVEL_ACCOUNT),
+                ),
+            ],
+        );
+        let page = crate::state::paginate(
+            &listing,
             quotas,
             input.max_results,
             input.next_token.as_deref(),

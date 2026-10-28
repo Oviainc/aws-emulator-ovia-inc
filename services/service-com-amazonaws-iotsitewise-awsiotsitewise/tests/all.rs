@@ -362,6 +362,12 @@ mod list_dashboards;
 // with this one.
 #[path = "all/list_datasets.rs"]
 mod list_datasets;
+// In its alphabetical place inside the sorted list rather than appended after it:
+// the END of this file is where every concurrent iotsitewise change appends a
+// declaration of its own, and each append there lost the squash race with this
+// one.
+#[path = "all/list_pipeline_executions.rs"]
+mod list_pipeline_executions;
 #[path = "all/list_pipelines.rs"]
 mod list_pipelines;
 // In its alphabetical place inside the sorted list rather than appended after it:
