@@ -247,6 +247,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
             );
         }
+        // The deobfuscation configuration's own prose-only rule: source maps can only be
+        // enabled for a monitor that names the bucket they are read from
+        // (`crate::state::deobfuscation_configuration_refusal`), so the monitor this create
+        // stores can never carry deobfuscation on with no bucket.
+        if let Some(message) = input
+            .deobfuscation_configuration
+            .as_ref()
+            .and_then(crate::state::deobfuscation_configuration_refusal)
+        {
+            return Err(
+                CreateAppMonitorErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
 
         // The ARN carries the region the request was signed for; `ctx` is the only place
         // that is readable from.

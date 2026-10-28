@@ -223,6 +223,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
             );
         }
+        // And the same rule for the deobfuscation configuration: this member is replaced
+        // WHOLE by the write below, so a configuration that enables source maps without the
+        // bucket they are read from is refused here rather than applied — which is also
+        // what keeps an update from dropping a stored `S3Uri` while leaving the status on.
+        if let Some(message) = input
+            .deobfuscation_configuration
+            .as_ref()
+            .and_then(crate::state::deobfuscation_configuration_refusal)
+        {
+            return Err(
+                UpdateAppMonitorErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
 
         // The region the log group's ARN is taken in; `ctx` is the only place it is
         // readable from.

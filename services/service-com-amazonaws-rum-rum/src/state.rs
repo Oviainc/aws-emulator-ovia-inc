@@ -90,6 +90,12 @@ pub const DEFAULT_PLATFORM: &str = WEB_PLATFORM;
 /// member of [`crate::ops::types::DEOBFUSCATION_STATUS_VALUES`].
 pub const DEFAULT_DEOBFUSCATION_STATUS: &str = "DISABLED";
 
+/// The `JavaScriptSourceMaps$Status` that turns source-map unminification ON — the value
+/// the member's documented requirement on `S3Uri` is conditioned on
+/// ([`deobfuscation_configuration_refusal`]). A member of
+/// [`crate::ops::types::DEOBFUSCATION_STATUS_VALUES`].
+pub const ENABLED_DEOBFUSCATION_STATUS: &str = "ENABLED";
+
 /// `CustomEvents$Status` of an app monitor whose create request named no `CustomEvents`.
 ///
 /// From the model: `CreateAppMonitorRequest$CustomEvents` documents "If you omit this
@@ -1350,6 +1356,33 @@ pub fn app_monitor_configuration_refusal(config: &AppMonitorConfiguration) -> Op
     (includes && excludes).then(|| {
         "AppMonitorConfiguration cannot carry both IncludedPages and ExcludedPages."
             .to_string()
+    })
+}
+
+/// Why this `DeobfuscationConfiguration` cannot be applied, or `None` when it can.
+///
+/// From the model: `JavaScriptSourceMaps$S3Uri` is "The S3Uri of the bucket or folder that
+/// stores the source map files. It is required if status is ENABLED." — source-map
+/// unminification reads the maps out of a bucket, so a configuration that turns it on has
+/// to say which bucket. `S3Uri` is an optional member carrying only a `@length` and a
+/// `@pattern`, so an absent value satisfies every modelled constraint and the conditional
+/// requirement is prose: every operation that accepts a deobfuscation configuration refuses
+/// it here with the `ValidationException` it declares, before anything is written.
+///
+/// A configuration naming no `JavaScriptSourceMaps` turns nothing on, and one whose status
+/// is not the enabling value needs no bucket — an `S3Uri` beside it is accepted, since the
+/// model forbids it nowhere and a caller may keep the bucket it will enable later.
+pub fn deobfuscation_configuration_refusal(
+    configuration: &DeobfuscationConfiguration,
+) -> Option<String> {
+    let source_maps = configuration.java_script_source_maps.as_ref()?;
+    let enabled = source_maps.status == ENABLED_DEOBFUSCATION_STATUS;
+    let names_bucket = source_maps.s3_uri.as_ref().is_some_and(|uri| !uri.is_empty());
+    (enabled && !names_bucket).then(|| {
+        format!(
+            "S3Uri is required when JavaScriptSourceMaps Status is \
+             {ENABLED_DEOBFUSCATION_STATUS}."
+        )
     })
 }
 
