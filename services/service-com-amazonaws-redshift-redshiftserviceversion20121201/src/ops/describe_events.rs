@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeEvents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeEvents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeEvents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the events completed control-plane writes RAISED, in the order they
+//! happened: the ones inside the time interval the request names, narrowed to one
+//! source when it names one, and served one `MaxRecords` page at a time. A pure
+//! report — the only write it makes is the clock-owed one every reporting
+//! operation here makes, which includes dropping an event whose published
+//! retention window has passed.
 //!
 //! ## Shape of an operation
 //!
@@ -112,12 +110,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `DescribeEventsError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#DescribeEvents")]
+// here — hence the `DescribeEventsError` alias below.
+// `DependentServiceUnavailableFault` is widened in: the model lists no error at all
+// for this operation, but the service declares the shape, and it is the only modelled
+// way to say "the control-plane store could not be reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#DescribeEvents",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum DescribeEventsErrorModeled {
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -169,20 +172,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeEvents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeEventsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeEvents"))
+        use crate::state as st;
+
+        // The two source members scope the read TOGETHER — "if SourceIdentifier
+        // is supplied, SourceType must also be provided" and "if SourceType is
+        // supplied, SourceIdentifier must also be provided" — because an
+        // identifier means nothing without the kind of object it identifies.
+        // Decided on the request alone, before the store is reached.
+        match (
+            input.source_identifier.as_deref(),
+            input.source_type.as_deref(),
+        ) {
+            (Some(_), None) => {
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_combination(
+                    "SourceType must also be provided when SourceIdentifier is supplied.",
+                ))
+            }
+            (None, Some(_)) => {
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_combination(
+                    "SourceIdentifier must also be provided when SourceType is supplied.",
+                ))
+            }
+            _ => {}
+        }
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                DescribeEventsErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The interval this request reports over, from its own three time
+        // members, read before the store is locked so the `now` the default
+        // window is measured from is the instant the request was served at.
+        let (window_start, window_end) = st::event_window(
+            input.start_time,
+            input.end_time,
+            input.duration,
+            ::std::time::SystemTime::now(),
+        );
+
+        // A reporting operation: the ONE write it makes is materialising what the
+        // clock already owed — here, an event whose retention window has passed,
+        // which was due to leave the log at this instant whether or not anybody
+        // called.
+        let mut store = state.lock();
+        store.settle(::std::time::Instant::now());
+
+        // Selected by REFERENCE, so only the page is cloned: the work done under
+        // the state lock is proportional to the page, not to the whole log. The
+        // log is appended to as each event is raised, so its order IS the order
+        // the events happened in — the model states no other, and it is the
+        // insertion order every paginated read of this service pages over, which
+        // is what makes the `Marker` a stable offset into one sequence.
+        let matched: Vec<&Event> = store
+            .events
+            .iter()
+            .filter(|event| {
+                // Inside the interval, which is closed at both ends: `StartTime`
+                // is "the beginning of the time interval to retrieve events for"
+                // and `EndTime` "the end" of it.
+                let within = event
+                    .date
+                    .is_some_and(|at| at.secs() >= window_start && at.secs() <= window_end);
+                // "The identifier of the event source for which events will be
+                // returned. If this parameter is not specified, then all sources
+                // are included in the response", and the same for the source
+                // type — each member narrows on its own, and the pair was
+                // already held to being named together.
+                let source = input
+                    .source_identifier
+                    .as_deref()
+                    .is_none_or(|wanted| event.source_identifier.as_deref() == Some(wanted));
+                let kind = input
+                    .source_type
+                    .as_deref()
+                    .is_none_or(|wanted| event.source_type.as_deref() == Some(wanted));
+                within && source && kind
+            })
+            .collect();
+
+        let (start, end, next_marker) =
+            match st::page_bounds(input.marker.as_deref(), input.max_records, matched.len()) {
+                Ok(page) => page,
+                Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
+            };
+
+        Ok(DescribeEventsOutput {
+            events: Some(matched[start..end].iter().map(|e| (*e).clone()).collect()),
+            marker: next_marker,
+        })
     }
 }

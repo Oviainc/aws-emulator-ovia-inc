@@ -35,8 +35,8 @@ use crate::ops::types::{
     ApprovalRuleTemplate, ApprovalStateChangedEventMetadata, Comment, Location, MergeMetadata,
     OriginApprovalRuleTemplate, PullRequest, PullRequestCreatedEventMetadata, PullRequestEvent,
     PullRequestMergedStateChangedEventMetadata, PullRequestSourceReferenceUpdatedEventMetadata,
-    PullRequestStatusChangedEventMetadata, PullRequestTarget, RepositoryMetadata, RepositoryTrigger,
-    UserInfo,
+    PullRequestStatusChangedEventMetadata, PullRequestTarget, ReactionValueFormats,
+    RepositoryMetadata, RepositoryTrigger, UserInfo,
 };
 use git_object::{Kind, Object, TreeEntry};
 
@@ -519,6 +519,13 @@ pub const INVALID_AUTHOR_ARN_MESSAGE: &str =
     "The Amazon Resource Name (ARN) is not valid. Make sure that you have provided the full ARN \
      for the author of the pull request, and then try again.";
 
+/// `InvalidReactionUserArnException`'s message: the sentence the model documents
+/// for that shape, naming nothing from the request. The one place this crate words
+/// that code, as [`INVALID_ACTOR_ARN_MESSAGE`] is the one place it words the
+/// actor's.
+pub const INVALID_REACTION_USER_ARN_MESSAGE: &str =
+    "The Amazon Resource Name (ARN) of the user or identity is not valid.";
+
 /// `InvalidPullRequestEventTypeException`'s message: likewise the shape's own
 /// documented sentence, worded here once for every operation that raises the
 /// code.
@@ -973,22 +980,102 @@ pub const KEEP_EMPTY_FOLDERS_PLACEHOLDER: &str = ".gitkeep";
 /// `ReactionLimitExceededException`.
 pub const MAX_REACTIONS_PER_COMMENT: usize = 100;
 
+/// One reaction CodeCommit accepts on a comment, in every form the API names it.
+///
+/// A reaction is REPORTED in three forms — the model's `ReactionValueFormats`
+/// carries the graphic, the short code and the Unicode codepoint — and ACCEPTED in
+/// any of them, so a row holds the two reported spellings once and lists beside
+/// them the further short codes a caller may send the same reaction as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reaction {
+    /// The emoji short code this service reports the reaction under, and the form
+    /// a stored reaction is held as.
+    pub short_code: &'static str,
+    /// The Emoji Version 1.0 graphic of the reaction.
+    pub emoji: &'static str,
+    /// The further short codes that name this same reaction.
+    pub aliases: &'static [&'static str],
+}
+
+impl Reaction {
+    /// The Unicode codepoint for the reaction, as CodeCommit reports it: `U+` and
+    /// the hexadecimal scalar value of the graphic's code point, at least four
+    /// digits wide.
+    pub fn unicode(&self) -> String {
+        self.emoji
+            .chars()
+            .map(|point| format!("U+{:04X}", u32::from(point)))
+            .collect::<Vec<String>>()
+            .join(" ")
+    }
+
+    /// This reaction in the three forms the model reports it in, which is how
+    /// every reader of a stored reaction renders one.
+    pub fn formats(&self) -> ReactionValueFormats {
+        ReactionValueFormats {
+            emoji: Some(self.emoji.to_string()),
+            short_code: Some(self.short_code.to_string()),
+            unicode: Some(self.unicode()),
+        }
+    }
+
+    /// Does `normalized` — a reaction value already reduced to the comparable
+    /// form [`canonical_reaction`] reduces to — name this reaction?
+    fn named_by(&self, normalized: &str) -> bool {
+        self.short_code == normalized
+            || self.emoji == normalized
+            || self.aliases.contains(&normalized)
+    }
+}
+
 /// The emoji reactions CodeCommit accepts on a comment.
 ///
-/// One row per reaction: the form this emulator reports it under (the markdown
-/// shortcode), then every form a caller may send it as — the shortcode aliases
-/// and the emoji character itself. The catalog is the emoji reaction table in the
-/// CodeCommit User Guide, which the model's `reactionValue` documentation links to
+/// One row per reaction, in the order the catalog lists them, which is the order a
+/// read of a comment's reactions reports them in. The catalog is the emoji
+/// reaction table in the CodeCommit User Guide, which the model's `reactionValue`
+/// documentation links to
 /// (`smithy_query(query="doc",shape="PutCommentReactionInput",member="reactionValue")`).
-pub const REACTION_TABLE: &[(&str, &[&str])] = &[
-    (":thumbsup:", &[":thumbsup:", ":+1:", "\u{1f44d}"]),
-    (":thumbsdown:", &[":thumbsdown:", ":-1:", "\u{1f44e}"]),
-    (":smile:", &[":smile:", "\u{1f604}"]),
-    (":confused:", &[":confused:", "\u{1f615}"]),
-    (":eyes:", &[":eyes:", "\u{1f440}"]),
-    (":heart:", &[":heart:", "\u{2764}"]),
-    (":hooray:", &[":hooray:", ":tada:", "\u{1f389}"]),
-    (":rocket:", &[":rocket:", "\u{1f680}"]),
+pub const REACTION_TABLE: &[Reaction] = &[
+    Reaction {
+        short_code: ":thumbsup:",
+        emoji: "\u{1f44d}",
+        aliases: &[":+1:"],
+    },
+    Reaction {
+        short_code: ":thumbsdown:",
+        emoji: "\u{1f44e}",
+        aliases: &[":-1:"],
+    },
+    Reaction {
+        short_code: ":smile:",
+        emoji: "\u{1f604}",
+        aliases: &[],
+    },
+    Reaction {
+        short_code: ":confused:",
+        emoji: "\u{1f615}",
+        aliases: &[],
+    },
+    Reaction {
+        short_code: ":eyes:",
+        emoji: "\u{1f440}",
+        aliases: &[],
+    },
+    Reaction {
+        short_code: ":heart:",
+        emoji: "\u{2764}",
+        aliases: &[],
+    },
+    Reaction {
+        short_code: ":hooray:",
+        emoji: "\u{1f389}",
+        aliases: &[":tada:"],
+    },
+    Reaction {
+        short_code: ":rocket:",
+        emoji: "\u{1f680}",
+        aliases: &[],
+    },
 ];
 
 /// The reaction value that REMOVES the caller's reaction rather than naming one:
@@ -997,26 +1084,23 @@ pub const REACTION_TABLE: &[(&str, &[&str])] = &[
 /// (`smithy_query(query="doc",shape="PutCommentReactionInput",member="reactionValue")`).
 pub const REACTION_NONE: &str = "none";
 
-/// The form this service reports a reaction value under, or `None` when the
-/// reaction table holds no such reaction.
+/// The reaction a reaction value names, or `None` when the reaction table holds
+/// no such reaction.
 ///
 /// A caller may send a reaction as any of the forms the table lists, so the value
 /// is first reduced to one comparable form: trimmed, lowercased, and with the
 /// Unicode variation selector an emoji may carry (U+FE0F) removed, so `"❤️"` and
 /// `"❤"` are the one reaction the table lists.
-pub fn canonical_reaction(value: &str) -> Option<&'static str> {
+pub fn canonical_reaction(value: &str) -> Option<&'static Reaction> {
     let normalized: String = value
         .trim()
         .chars()
         .filter(|character| *character != '\u{fe0f}')
         .flat_map(char::to_lowercase)
         .collect();
-    REACTION_TABLE.iter().find_map(|(canonical, forms)| {
-        forms
-            .iter()
-            .any(|form| *form == normalized)
-            .then_some(*canonical)
-    })
+    REACTION_TABLE
+        .iter()
+        .find(|reaction| reaction.named_by(&normalized))
 }
 
 /// Does this reaction value ask for the caller's reaction to be REMOVED rather

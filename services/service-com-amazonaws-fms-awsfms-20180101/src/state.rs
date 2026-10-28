@@ -442,6 +442,28 @@ impl ResourceSetRecord {
         resource_set
     }
 
+    /// Make `resources` this resource set's membership, recording `now` as the
+    /// instant the set changed exactly when the membership it holds changed.
+    ///
+    /// The ONE writer of [`Self::resources`] after a record is created, used by
+    /// both batch membership writers. Which resources a set holds is part of the
+    /// set, so a call that adds or removes a member changed the set and
+    /// `LastUpdateTime` — the member every reader projects from
+    /// [`Self::updated_at`] — moves to that instant, exactly as a rewrite of the
+    /// set's document moves it. A call that leaves the membership identical —
+    /// associating a URI the set already holds, removing one it does not, or
+    /// naming nothing at all — changed nothing, so the timestamp stays where it
+    /// is: the membership is a SET, not a log of calls. Answers whether the
+    /// membership changed.
+    pub fn set_resources(&mut self, resources: BTreeSet<String>, now: SystemTime) -> bool {
+        if self.resources == resources {
+            return false;
+        }
+        self.resources = resources;
+        self.updated_at = now;
+        true
+    }
+
     /// The `ResourceSetSummary` projection `ListResourceSets` reports: every
     /// member read off this record, with the same derived `ResourceSetStatus`
     /// [`Self::resource_set`] reports, so a summary cannot disagree with the

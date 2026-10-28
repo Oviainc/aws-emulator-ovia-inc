@@ -428,13 +428,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     })
             };
             if delivering {
-                sqs::encryption::authorize_queue_key(
+                // A receive that found messages to hand over and cannot use the key they
+                // are sealed under still made a delivery attempt on them: the attempt is
+                // counted before the refusal is answered, so a consumer the key does not
+                // permit drives those messages to the queue's dead-letter target rather
+                // than being refused the same messages for ever. Nothing is handed over
+                // and nothing is hidden.
+                if let Err(refusal) = sqs::encryption::authorize_queue_key(
                     &*self.engine,
                     ctx,
                     &input.queue_url,
                     sqs::encryption::DECRYPT_ACTION,
-                )
-                .map_err(kms_refusal)?;
+                ) {
+                    let mut state = store.lock();
+                    if let Some(queue) = state.queue_by_url_mut(&region, &input.queue_url) {
+                        queue.count_refused_delivery(
+                            now,
+                            usize::try_from(max_messages).unwrap_or(1),
+                        );
+                    }
+                    return Err(kms_refusal(refusal));
+                }
             }
             let (messages, wait) = {
                 let mut state = store.lock();
@@ -571,6 +585,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
                 let mut delivered = Vec::with_capacity(taking.len());
                 let mut minted = Vec::with_capacity(taking.len());
+                // The message group the last of these deliveries came from, which is where
+                // the next FIFO receive's walk over the groups starts.
+                let mut served_group: Option<String> = None;
                 for index in taking {
                     let receipt_handle = queue.mint_receipt_handle();
                     let message = &mut queue.messages[index];
@@ -585,6 +602,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // later visibility change may still ask for is counted from.
                     message.last_received_at = Some(now);
                     message.invisible_until = Some(invisible_until);
+                    served_group = Some(message.group().to_string());
                     minted.push((receipt_handle.clone(), message.message_id.clone()));
                     delivered.push(wire_message(
                         message,
@@ -592,6 +610,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         &system_requested,
                         &attribute_requested,
                     ));
+                }
+                if let Some(group) = served_group {
+                    queue.record_delivered_group(&group);
                 }
                 for (receipt_handle, message_id) in &minted {
                     // Replaces the handle an earlier receive minted for this message, so
@@ -739,12 +760,12 @@ fn wire_message(
 /// The message system attributes this emulator holds, filtered to the ones `requested`
 /// selects.
 ///
-/// Only the attributes the emulator genuinely records are reported: `SentTimestamp`,
-/// `ApproximateReceiveCount`, `ApproximateFirstReceiveTimestamp`, the `AWSTraceHeader` a
-/// send carried in `MessageSystemAttributes` and, for a message that carries them,
-/// `MessageGroupId`, `MessageDeduplicationId` and `SequenceNumber`. The rest of the
-/// `MessageSystemAttributeName` set belongs to behaviour that is not implemented
-/// (dead-letter redrive, caller principals), so it is omitted rather than invented.
+/// Only the attributes the emulator genuinely records are reported: `SenderId`,
+/// `SentTimestamp`, `ApproximateReceiveCount`, `ApproximateFirstReceiveTimestamp`, the
+/// `AWSTraceHeader` a send carried in `MessageSystemAttributes` and, for a message that
+/// carries them, `MessageGroupId`, `MessageDeduplicationId` and `SequenceNumber`. The rest
+/// of the `MessageSystemAttributeName` set belongs to behaviour that is not implemented,
+/// so it is omitted rather than invented.
 fn system_attributes(
     message: &sqs::StoredMessage,
     requested: &[String],
@@ -755,6 +776,13 @@ fn system_attributes(
             attributes.insert(name.to_string(), value);
         }
     };
+    // "SenderId — For a user, returns the user ID ... For an IAM role, returns the IAM
+    // role ID": who the send this message arrived on spoke for, stamped at enqueue time.
+    // A message whose sender could not be resolved carries none, and reports none rather
+    // than an empty attribute.
+    if !message.sender_id.is_empty() {
+        offer("SenderId", message.sender_id.clone());
+    }
     offer("SentTimestamp", sqs::epoch_millis(message.sent_at));
     offer(
         "ApproximateReceiveCount",

@@ -67,6 +67,12 @@ pub fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>)
     router.register_service(service_com_amazonaws_ssm_amazonssm::EmulatedService::new(
         Arc::clone(&engine),
     ));
+    // Amazon EC2, for the `AWS::EC2::VPC` and `AWS::EC2::Subnet` a stack really creates
+    // there: a suite that deploys a network reads the VPC and its subnets back through
+    // EC2's own wire (`stack_lifecycle::ec2`).
+    router.register_service(service_com_amazonaws_ec2_amazonec2::EmulatedService::new(
+        Arc::clone(&engine),
+    ));
     (router, engine)
 }
 
@@ -86,6 +92,29 @@ pub fn store(
 /// that never enrolled, which is what `publisher_registration.rs` holds the refusal to.
 pub fn enroll_as_a_marketplace_seller(engine: &Arc<engine::InMemoryEngine>) {
     store(engine).lock().marketplace_seller = MarketplaceSellerEnrollment::enrolled();
+}
+
+/// How many hexadecimal characters an identifier its OWNING service assigns carries after
+/// its prefix: an Amazon EC2 resource id's current (long) form is 17
+/// (`vpc-0123456789abcdef0`).
+pub const SERVICE_ID_HEX_DIGITS: usize = 17;
+
+/// Whether `value` is an identifier of the form the service that assigns it publishes:
+/// `<prefix>-` plus [`SERVICE_ID_HEX_DIGITS`] lowercase hexadecimal characters.
+///
+/// The ONE spelling of that check, because more than one suite asks it — of a stack's
+/// outputs, of the physical ids it reports and of the ARNs built on one — and no request
+/// fixes the hexadecimal part, so the rule is the FORM. `prefix` carries the ARN's head
+/// where the value is an ARN that ends in such an identifier.
+pub fn is_service_assigned_id(value: &str, prefix: &str) -> bool {
+    value
+        .strip_prefix(&format!("{prefix}-"))
+        .is_some_and(|digits| {
+            digits.len() == SERVICE_ID_HEX_DIGITS
+                && digits
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        })
 }
 
 /// Wait past the instant a stack operation's terminal status becomes due.

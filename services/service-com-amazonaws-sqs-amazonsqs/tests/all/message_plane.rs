@@ -161,12 +161,13 @@ async fn message_system_attributes_are_computed_and_selected_by_name() {
     )
     .await;
 
-    // The emulator records these three; the rest of the `MessageSystemAttributeName`
+    // The emulator records these four; the rest of the `MessageSystemAttributeName`
     // set belongs to behaviour it does not implement, so no row expects one. An empty
     // `expected` means the `Attributes` member must be absent entirely.
     const EVERY: &[&str] = &[
         "ApproximateFirstReceiveTimestamp",
         "ApproximateReceiveCount",
+        "SenderId",
         "SentTimestamp",
     ];
     let rows: &[SelectionRow] = &[
@@ -187,6 +188,12 @@ async fn message_system_attributes_are_computed_and_selected_by_name() {
             member: "MessageSystemAttributeNames",
             requested: Some(&["SentTimestamp"]),
             expected: &["SentTimestamp"],
+        },
+        SelectionRow {
+            case: "the name of the sending principal",
+            member: "MessageSystemAttributeNames",
+            requested: Some(&["SenderId"]),
+            expected: &["SenderId"],
         },
         SelectionRow {
             case: "two names",

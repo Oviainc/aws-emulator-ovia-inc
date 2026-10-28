@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCommentReactions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCommentReactions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCommentReactions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the reactions `crate::state` holds for a comment — one
+//! entry per reaction left on it, each naming the principals that left it — a page
+//! at a time, narrowed to one principal where the request names one.
 //!
 //! ## Shape of an operation
 //!
@@ -128,6 +122,32 @@ impl From<GetCommentReactionsErrorModeled> for GetCommentReactionsError {
     }
 }
 
+/// How this operation refuses a page it cannot serve. Both codes come from this
+/// service's one pagination rule ([`crate::state::page_of_at_most`]), so every
+/// paginated read refuses the same `maxResults` and the same `nextToken` with the
+/// same words; this only maps each outcome onto the error THIS operation models
+/// for it.
+fn page_refusal(problem: crate::state::PageProblem) -> GetCommentReactionsError {
+    match problem {
+        crate::state::PageProblem::InvalidMaxResults(message) => {
+            GetCommentReactionsErrorModeled::InvalidMaxResultsException(
+                InvalidMaxResultsException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+        crate::state::PageProblem::InvalidContinuationToken(message) => {
+            GetCommentReactionsErrorModeled::InvalidContinuationTokenException(
+                InvalidContinuationTokenException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+    }
+}
+
 /// The `GetCommentReactions` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -164,18 +184,154 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCommentReactions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCommentReactionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCommentReactions"))
+        // Reporting only: a reaction is reported for whoever left it, so this
+        // answer does not depend on who is asking, and nothing about the comment is
+        // written here.
+        let _ = ctx;
+
+        // The comment id this request names: "The comment ID is missing or null. A
+        // comment ID is required." when blank, and "The comment ID is not in a
+        // valid format. Make sure that you have provided the full comment ID."
+        // when it is not the form this service mints a comment id as. Which ids
+        // address a comment is `crate::state`'s rule, so every operation taking a
+        // `commentId` agrees about it.
+        let comment_id = match crate::state::normalize_comment_id(&input.comment_id) {
+            Ok(comment_id) => comment_id,
+            Err(crate::state::CommentIdProblem::Missing) => {
+                return Err(GetCommentReactionsErrorModeled::CommentIdRequiredException(
+                    CommentIdRequiredException {
+                        message: Some(
+                            "The comment ID is missing or null. A comment ID is required."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into())
+            }
+            Err(crate::state::CommentIdProblem::Invalid) => {
+                return Err(GetCommentReactionsErrorModeled::InvalidCommentIdException(
+                    InvalidCommentIdException {
+                        message: Some(format!(
+                            "the comment ID {} is not in a valid format",
+                            input.comment_id
+                        )),
+                    },
+                )
+                .into())
+            }
+        };
+
+        // "Optional. The Amazon Resource Name (ARN) of the user or identity for
+        // which you want to get reaction information." A blank one narrows nothing,
+        // the same as leaving the member out, and a value that is not a full ARN
+        // names no identity at all — which ARNs name an identity is
+        // `crate::state`'s rule, shared with every other member taking one.
+        let reaction_user_arn = input
+            .reaction_user_arn
+            .as_deref()
+            .map(str::trim)
+            .filter(|arn| !arn.is_empty());
+        if reaction_user_arn.is_some_and(|arn| !crate::state::is_identity_arn(arn)) {
+            return Err(
+                GetCommentReactionsErrorModeled::InvalidReactionUserArnException(
+                    InvalidReactionUserArnException {
+                        message: Some(
+                            crate::state::INVALID_REACTION_USER_ARN_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let store = state.lock();
+        let comment = store.comment(comment_id).ok_or_else(|| {
+            GetCommentReactionsErrorModeled::CommentDoesNotExistException(
+                CommentDoesNotExistException {
+                    message: Some(format!("no comment exists with the ID {comment_id}")),
+                },
+            )
+        })?;
+        // A comment whose content has been deleted is no longer reported on, and
+        // the refusal carries the sentence the exception is recorded with — no
+        // clause of this operation's own, since this call only asks ABOUT the
+        // comment rather than to edit or delete it.
+        if comment.deleted {
+            return Err(GetCommentReactionsErrorModeled::CommentDeletedException(
+                CommentDeletedException {
+                    message: Some(
+                        crate::state::comment_deleted_message(
+                            crate::state::CommentDeletedRefusal::AlreadyDeleted,
+                        )
+                        .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // One entry per reaction the comment actually holds, in the order the
+        // service's reaction catalog lists them, each naming the principals that
+        // left that reaction in the order the comment holds them (ascending ARN).
+        // A named `reactionUserArn` narrows the read to that principal's own
+        // reaction, so a principal holding none is reported no entry at all.
+        let held: Vec<(&'static crate::state::Reaction, Vec<String>)> =
+            crate::state::REACTION_TABLE
+                .iter()
+                .filter_map(|reaction| {
+                    let users: Vec<String> = comment
+                        .reactions
+                        .iter()
+                        .filter(|(arn, short_code)| {
+                            short_code.as_str() == reaction.short_code
+                                && reaction_user_arn.is_none_or(|wanted| arn.as_str() == wanted)
+                        })
+                        .map(|(arn, _)| arn.clone())
+                        .collect();
+                    (!users.is_empty()).then_some((reaction, users))
+                })
+                .collect();
+
+        // A continuation token belongs to the listing it was issued for: the same
+        // comment, narrowed to the same principal. "A non-zero, non-negative
+        // integer used to limit the number of returned results. The default is the
+        // same as the allowed maximum, 1,000." — which is the range this service's
+        // one pagination rule already publishes.
+        let scope = format!(
+            "GetCommentReactions/{comment_id}/{}",
+            reaction_user_arn.unwrap_or_default()
+        );
+        let (page, next_token) = crate::state::page_of_at_most(
+            &scope,
+            &held,
+            input.next_token.as_deref(),
+            input.max_results,
+            crate::state::MAX_MAX_RESULTS,
+            crate::state::DEFAULT_MAX_RESULTS,
+        )
+        .map_err(page_refusal)?;
+
+        Ok(GetCommentReactionsOutput {
+            reactions_for_comment: page
+                .into_iter()
+                .map(|(reaction, reaction_users)| ReactionForComment {
+                    reaction: Some(reaction.formats()),
+                    reaction_users: Some(reaction_users),
+                    // "A numerical count of users who reacted with the specified
+                    // emoji whose identities have been subsequently deleted from
+                    // IAM": a reaction is held against the principal that left it
+                    // and this service removes no such principal, so every
+                    // reaction it holds is one of an identity that still exists
+                    // and none of them is counted here.
+                    reactions_from_deleted_users_count: Some(0),
+                })
+                .collect(),
+            next_token,
+        })
     }
 }

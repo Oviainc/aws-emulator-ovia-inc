@@ -732,6 +732,15 @@ pub fn max_results_refusal(
 /// can have up to 10 attributes."
 pub const MAX_MESSAGE_ATTRIBUTES: usize = 10;
 
+/// How many superseded receipt handles one queue remembers (see
+/// [`Queue::superseded_handles`]).
+///
+/// One message can be received any number of times, so the handles a queue has superseded
+/// are bounded by this emulator rather than by what it holds, exactly as the deleted ones
+/// are: past the bound the handles superseded earliest are forgotten, and a caller
+/// presenting one of those is answered for a handle this queue no longer recognises.
+pub const MAX_SUPERSEDED_HANDLES_PER_QUEUE: usize = MAX_MESSAGES_PER_QUEUE;
+
 /// How many receipt handles one queue remembers as deleted (see
 /// [`Queue::deleted_handles`]).
 ///
@@ -782,8 +791,11 @@ pub enum VisibilityRefusal {
     /// it and it names no message of any queue.
     MalformedHandle,
     /// It IS a receipt handle, but this queue holds no message under it: the message was
-    /// deleted, purged or expired, or a later receive superseded the handle.
+    /// deleted, purged or expired, or the handle is one this queue never minted.
     NoSuchMessage,
+    /// This queue minted it for a message it still holds, and a later receive of that
+    /// message took the lease it carried (FIFO only).
+    ExpiredHandle,
     /// The span asked for reaches past what ONE receive may hide the message for, counted
     /// from that receive.
     BeyondLimit,
@@ -815,8 +827,28 @@ pub struct StoredMessage {
     /// The sequence number a FIFO queue assigned this message; `None` on a standard
     /// queue, which assigns none.
     pub sequence_number: Option<String>,
-    /// When `SendMessage` accepted it.
+    /// When `SendMessage` accepted it. What a receive reports under `SentTimestamp`, and
+    /// the instant the message was SENT whatever queue it is in now: moving a message
+    /// between queues — to a dead-letter queue, or back out of one — does not re-send it.
     pub sent_at: SystemTime,
+    /// When the queue holding this message ENQUEUED it, which is where its
+    /// `MessageRetentionPeriod` is counted from.
+    ///
+    /// The same instant as [`sent_at`](Self::sent_at) for a message in the queue it was
+    /// sent to, where "the expiration of a message is always based on its original
+    /// enqueue timestamp" — and the two part company only where a queue enqueues a
+    /// message it was handed rather than one a sender gave it (see
+    /// [`ComAmazonawsSqsAmazonsqsState::dead_letter_due`]).
+    pub retention_from: SystemTime,
+    /// The principal id of the caller whose send this message arrived on — what
+    /// `ReceiveMessage` reports under `SenderId`: "the Amazon Web Services account number
+    /// (or the IP address, if anonymous access is allowed) of the sender", which for an
+    /// IAM identity is the id that identifies it (an IAM user's `UserId`, or
+    /// `<role id>:<session name>` for an assumed-role session — the same value
+    /// `sts:GetCallerIdentity` answers that credential with). Stamped at enqueue time, so
+    /// every later read reports the sender the message really arrived from, and it travels
+    /// with the message when it changes queue.
+    pub sender_id: String,
     /// `sent_at` + the effective `DelaySeconds`: before this instant the message is
     /// [`Visibility::Delayed`].
     pub available_at: SystemTime,
@@ -995,6 +1027,16 @@ pub struct Queue {
     /// that delete succeed instead of being refused. Bounded by
     /// [`MAX_DELETED_HANDLES_PER_QUEUE`]; a purge empties it with the message plane.
     pub deleted_handles: VecDeque<String>,
+    /// The receipt handles this queue minted that a LATER receive of the same message
+    /// superseded, as `(receipt handle, message id)` in the order they were superseded —
+    /// "if you receive a message more than once, each time you receive it, you get a
+    /// different receipt handle". The message is still here, under the newer handle, so
+    /// what a caller presenting the older one holds is a lease that has run out rather
+    /// than a value that names nothing ([`ReceiptHandleRefusal::Expired`]). An entry goes
+    /// when its message does, and the whole deque is bounded by
+    /// [`MAX_SUPERSEDED_HANDLES_PER_QUEUE`]: past the bound the handles superseded
+    /// earliest are forgotten first.
+    pub superseded_handles: VecDeque<(String, String)>,
     /// The deduplication tokens this queue has accepted, keyed by
     /// `(deduplication scope, token)` — see [`Queue::deduplication_key`]. Only a FIFO
     /// queue writes here; entries lapse with [`DEDUPLICATION_INTERVAL`] and are bounded
@@ -1017,6 +1059,10 @@ pub struct Queue {
     /// purge inside [`PURGE_QUEUE_INTERVAL`] of that instant is what
     /// `PurgeQueueInProgress` reports.
     pub purged_at: Option<SystemTime>,
+    /// The message group this queue last handed a message over FROM, on a FIFO queue:
+    /// where the next receive's walk over the eligible groups starts (see
+    /// [`Queue::delivery_order`]). `None` until a receive has handed anything over.
+    pub group_cursor: Option<String>,
 }
 
 impl Queue {
@@ -1238,24 +1284,110 @@ impl Queue {
     /// nothing behind it is handed over until it is deleted or becomes visible again.
     /// Other groups are unaffected, which is what lets several ordered streams share
     /// one queue.
+    ///
+    /// Which group a FIFO receive serves FIRST rotates: the walk starts at the group
+    /// after the one the last delivery came from ([`group_cursor`](Self::group_cursor)),
+    /// so consecutive receives take their first message from different groups and every
+    /// eligible group is reached within as many receives as the queue has groups. Order
+    /// is defined WITHIN a message group only, so the cross-group interleaving is this
+    /// queue's to choose — but a group that is eligible has to be reachable, which serving
+    /// the globally oldest visible message every time does not make it: a consumer that
+    /// hands each message it is not ready for straight back would be handed the same one
+    /// again forever and never see the groups behind it.
     pub fn delivery_order(&self, now: SystemTime, max: usize) -> Vec<usize> {
-        let fifo = self.is_fifo();
-        let mut stopped: BTreeSet<&str> = BTreeSet::new();
-        let mut taking: Vec<usize> = Vec::new();
+        if !self.is_fifo() {
+            let mut taking: Vec<usize> = Vec::new();
+            for (index, message) in self.messages.iter().enumerate() {
+                if taking.len() >= max {
+                    break;
+                }
+                if message.visibility(now) == Visibility::Visible {
+                    taking.push(index);
+                }
+            }
+            return taking;
+        }
+
+        // Each eligible group's deliverable run, in the arrival order of the group's
+        // oldest message: the messages from its head on while they are visible, stopping
+        // at the first that is not — `(group, the run, whether the group has stopped)`. A
+        // group whose head is not visible is blocked and contributes nothing.
+        let mut runs: Vec<(&str, Vec<usize>, bool)> = Vec::new();
         for (index, message) in self.messages.iter().enumerate() {
+            let group = message.group();
+            let visible = message.visibility(now) == Visibility::Visible;
+            match runs.iter_mut().find(|(named, _, _)| *named == group) {
+                // A group already stopped hands over nothing more, whatever lies behind
+                // the message that stopped it.
+                Some((_, _, true)) => continue,
+                Some((_, run, stopped)) => {
+                    if visible {
+                        run.push(index);
+                    } else {
+                        *stopped = true;
+                    }
+                }
+                None => runs.push((group, if visible { vec![index] } else { Vec::new() }, !visible)),
+            }
+        }
+        // Start after the group the last delivery came from, wrapping around: the groups
+        // keep their arrival order, only where the walk ENTERS that order rotates.
+        let start = self
+            .group_cursor
+            .as_deref()
+            .and_then(|served| runs.iter().position(|(group, _, _)| *group == served))
+            .map_or(0, |position| position + 1);
+        let mut taking: Vec<usize> = Vec::new();
+        for offset in 0..runs.len() {
             if taking.len() >= max {
                 break;
             }
-            if fifo && stopped.contains(message.group()) {
+            let Some((_, run, _)) = runs.get((start + offset) % runs.len()) else {
                 continue;
-            }
-            if message.visibility(now) == Visibility::Visible {
-                taking.push(index);
-            } else if fifo {
-                stopped.insert(message.group());
+            };
+            for index in run {
+                if taking.len() >= max {
+                    break;
+                }
+                taking.push(*index);
             }
         }
         taking
+    }
+
+    /// Remember which message group the delivery this receive is making came from, so the
+    /// next one starts at the group after it (see [`delivery_order`](Self::delivery_order)).
+    ///
+    /// Only a FIFO queue rotates over groups; on a standard queue there is no group order
+    /// to keep, so nothing is remembered.
+    pub fn record_delivered_group(&mut self, group: &str) {
+        if self.is_fifo() {
+            self.group_cursor = Some(group.to_string());
+        }
+    }
+
+    /// Count, against the messages this queue was about to hand over at `now`, a delivery
+    /// it could not make.
+    ///
+    /// A receive that found messages to hand over and was then refused the data key they
+    /// are sealed under made a delivery ATTEMPT: the queue took the messages out to hand
+    /// them over and the hand-over failed. `maxReceiveCount` is "the number of times a
+    /// message is delivered to the source queue before being moved to the dead-letter
+    /// queue", and it counts that attempt — which is why a consumer that cannot decrypt a
+    /// queue's messages drives them to the queue's dead-letter target instead of being
+    /// handed the same undecryptable message forever.
+    ///
+    /// Nothing is handed over, so no receipt handle is minted and no message is hidden: a
+    /// message no consumer received is in flight with nobody, and the next receive sees it
+    /// at once.
+    pub fn count_refused_delivery(&mut self, now: SystemTime, max: usize) {
+        for index in self.delivery_order(now, max) {
+            let Some(message) = self.messages.get_mut(index) else {
+                continue;
+            };
+            message.receive_count = message.receive_count.saturating_add(1);
+            message.queue_receive_count = message.queue_receive_count.saturating_add(1);
+        }
     }
 
     /// Materialise everything the CLOCK already made due on this queue: drop messages
@@ -1267,7 +1399,7 @@ impl Queue {
         let retention = seconds(self.integer(MESSAGE_RETENTION_PERIOD));
         let mut expired: Vec<String> = Vec::new();
         self.messages.retain(|message| {
-            let due = lapsed(message.sent_at, retention, now);
+            let due = lapsed(message.retention_from, retention, now);
             if due {
                 expired.push(message.message_id.clone());
             }
@@ -1275,6 +1407,7 @@ impl Queue {
         });
         if !expired.is_empty() {
             self.handles.retain(|_, id| !expired.contains(id));
+            self.forget_superseded_handles(&expired);
         }
         for message in &mut self.messages {
             if message.invisible_until.is_some_and(|until| now >= until) {
@@ -1348,31 +1481,101 @@ impl Queue {
         )
     }
 
-    /// Record the receipt handle a receive just minted for `message_id`, dropping the
-    /// handle an earlier receive minted for it.
+    /// Record the receipt handle a receive just minted for `message_id`, remembering the
+    /// handle an earlier receive minted for it as superseded.
     ///
     /// Amazon SQS documents exactly this behaviour: "If you receive a message more than
     /// once, each time you receive it, you get a different receipt handle. You must
     /// provide the most recently received receipt handle when you request to delete the
-    /// message." Replacing rather than accumulating is also what bounds
-    /// [`handles`](Self::handles) by the message count.
+    /// message." Holding one live handle per message rather than accumulating them is also
+    /// what bounds [`handles`](Self::handles) by the message count.
     pub fn record_receipt_handle(&mut self, receipt_handle: String, message_id: &str) {
+        let superseded: Vec<String> = self
+            .handles
+            .iter()
+            .filter(|(handle, id)| id.as_str() == message_id && *handle != &receipt_handle)
+            .map(|(handle, _)| handle.clone())
+            .collect();
         self.handles.retain(|_, id| id != message_id);
+        for handle in superseded {
+            self.remember_superseded_handle(handle, message_id);
+        }
         self.handles.insert(receipt_handle, message_id.to_string());
+    }
+
+    /// Remember `receipt_handle` as one a later receive of `message_id` replaced, bounded
+    /// by [`MAX_SUPERSEDED_HANDLES_PER_QUEUE`].
+    fn remember_superseded_handle(&mut self, receipt_handle: String, message_id: &str) {
+        if self
+            .superseded_handles
+            .iter()
+            .any(|(handle, _)| *handle == receipt_handle)
+        {
+            return;
+        }
+        self.superseded_handles
+            .push_back((receipt_handle, message_id.to_string()));
+        while self.superseded_handles.len() > MAX_SUPERSEDED_HANDLES_PER_QUEUE {
+            self.superseded_handles.pop_front();
+        }
+    }
+
+    /// The message `receipt_handle` was minted for, where a LATER receive of that message
+    /// has since replaced it — or `None` for any other value.
+    ///
+    /// An entry is dropped with its message, so one that is here names a message this
+    /// queue still holds.
+    fn superseded_message_id(&self, receipt_handle: &str) -> Option<&str> {
+        self.superseded_handles
+            .iter()
+            .find(|(handle, _)| handle == receipt_handle)
+            .map(|(_, message_id)| message_id.as_str())
+    }
+
+    /// Whether `receipt_handle` is one this queue minted that a later receive superseded
+    /// and that no longer acts on its message: the handle's lease is over, the message is
+    /// not. Only a FIFO queue has such handles — see
+    /// [`message_id_for_handle`](Self::message_id_for_handle).
+    pub fn expired_handle(&self, receipt_handle: &str) -> bool {
+        self.is_fifo() && self.superseded_message_id(receipt_handle).is_some()
+    }
+
+    /// Forget every superseded handle of the messages `message_ids` names: a handle lives
+    /// no longer than the message it was minted for.
+    fn forget_superseded_handles(&mut self, message_ids: &[String]) {
+        self.superseded_handles
+            .retain(|(_, id)| !message_ids.contains(id));
     }
 
     /// The id of the message `receipt_handle` names, or why it names none.
     ///
-    /// Only a handle this queue holds TODAY names a message: a handle a later receive
-    /// superseded, and one whose message has been deleted, purged or expired, name
-    /// nothing, and a value that is not formed as a handle at all names nothing either —
-    /// which is the distinction a caller recovers from differently.
+    /// A handle this queue holds today names its message, and so does one a later receive
+    /// of that message superseded: "the receipt handle is associated with a specific
+    /// instance of receiving a message" and the message is still here, so a consumer that
+    /// kept the handle it was first handed still acts on it.
+    ///
+    /// A FIFO queue is the exception. There a message is "processed one at a time, in
+    /// strict order", so the receive that takes a message takes the LEASE on it with it:
+    /// once a later receive has handed the message to a consumer, the handle the earlier
+    /// one minted no longer acts on it and is [`Expired`](ReceiptHandleRefusal::Expired) —
+    /// otherwise two consumers of one message group could both act on the one message
+    /// either of them is meant to be processing alone.
+    ///
+    /// A handle whose message has been deleted, purged or expired names nothing, and a
+    /// value that is not formed as a handle at all names nothing either — which is the
+    /// distinction a caller recovers from differently.
     pub fn message_id_for_handle(
         &self,
         receipt_handle: &str,
     ) -> Result<String, ReceiptHandleRefusal> {
         if let Some(message_id) = self.handles.get(receipt_handle) {
             return Ok(message_id.clone());
+        }
+        if let Some(message_id) = self.superseded_message_id(receipt_handle) {
+            if self.is_fifo() {
+                return Err(ReceiptHandleRefusal::Expired);
+            }
+            return Ok(message_id.to_string());
         }
         Err(if is_receipt_handle(receipt_handle) {
             ReceiptHandleRefusal::NoSuchMessage
@@ -1413,6 +1616,7 @@ impl Queue {
         self.messages.clear();
         self.handles.clear();
         self.deleted_handles.clear();
+        self.superseded_handles.clear();
         self.receive_attempts.clear();
         self.deduplication.clear();
         self.purged_at = Some(at);
@@ -1425,19 +1629,27 @@ impl Queue {
             .is_some_and(|at| !lapsed(at, PURGE_QUEUE_INTERVAL, now))
     }
 
-    /// Drop a message and every receipt handle that referred to it, remembering those
-    /// handles as handles this queue has already deleted under — which is what makes a
-    /// repeat of the same delete idempotent.
+    /// Drop a message and every receipt handle that referred to it — the live one and
+    /// every one a later receive superseded — remembering those handles as handles this
+    /// queue has already deleted under, which is what makes a repeat of the same delete
+    /// idempotent whichever of them it carries.
     pub fn remove_message(&mut self, message_id: &str) {
         self.messages
             .retain(|message| message.message_id != message_id);
-        let retired: Vec<String> = self
+        let mut retired: Vec<String> = self
             .handles
             .iter()
             .filter(|(_, id)| id.as_str() == message_id)
             .map(|(handle, _)| handle.clone())
             .collect();
+        retired.extend(
+            self.superseded_handles
+                .iter()
+                .filter(|(_, id)| id.as_str() == message_id)
+                .map(|(handle, _)| handle.clone()),
+        );
         self.handles.retain(|_, id| id != message_id);
+        self.forget_superseded_handles(&[message_id.to_string()]);
         for handle in retired {
             self.remember_deleted_handle(handle);
         }
@@ -1493,6 +1705,7 @@ impl Queue {
             .map_err(|refusal| match refusal {
                 ReceiptHandleRefusal::Malformed => VisibilityRefusal::MalformedHandle,
                 ReceiptHandleRefusal::NoSuchMessage => VisibilityRefusal::NoSuchMessage,
+                ReceiptHandleRefusal::Expired => VisibilityRefusal::ExpiredHandle,
             })?;
         // The ceiling of the span one receive may hide a message for is the ceiling of the
         // range the timeout itself takes, and it is counted from the receipt handle's own
@@ -1960,9 +2173,13 @@ impl ComAmazonawsSqsAmazonsqsState {
     /// message in another queue, and the count is of receives "across all queues". The
     /// deliveries the queue it LEFT made are not deliveries of the queue it arrives in,
     /// so the per-queue count its new queue's own `RedrivePolicy` bounds starts afresh.
-    /// It keeps the instant it was SENT too, because "the expiration of a message is
-    /// always based on its original enqueue timestamp" — being dead-lettered does not buy
-    /// a message a fresh retention period. The receipt handles the source queue minted
+    /// On a STANDARD dead-letter queue its RETENTION keeps running from the instant it was
+    /// enqueued originally, because "the expiration of a message is always based on its
+    /// original enqueue timestamp" — being dead-lettered does not buy a message a fresh
+    /// retention period there. A FIFO queue enqueues what it is handed, so a message
+    /// arriving in one is enqueued AT the move and the retention period runs from there.
+    /// Neither re-sends it: `SentTimestamp` is the instant the message was sent, whichever
+    /// queue holds it. The receipt handles the source queue minted
     /// for it go with the message leaving that queue, exactly as they do when a message
     /// movement task takes it: a handle is only ever valid for the queue that minted it.
     ///
@@ -2049,6 +2266,15 @@ impl ComAmazonawsSqsAmazonsqsState {
         }
         let count = moved.len();
         if let Some(target) = self.queues.get_mut(&target_key) {
+            // A FIFO queue ENQUEUES the message it is handed: the arrival is a send into
+            // that queue's message group, so the retention period the dead-letter queue
+            // keeps the message for runs from the move. A standard queue takes the
+            // message as the one it already was, where "the expiration of a message is
+            // always based on its original enqueue timestamp", so being dead-lettered
+            // buys it no fresh retention there. Neither re-SENDS it: the message was sent
+            // once, and `SentTimestamp` is the instant its sender was answered under
+            // whichever queue holds it now.
+            let enqueued_at = target.is_fifo().then_some(now);
             for message in moved {
                 target.messages.push_back(StoredMessage {
                     // "SQS moves the message to the dead-letter queue", where a consumer
@@ -2060,6 +2286,7 @@ impl ComAmazonawsSqsAmazonsqsState {
                     // The deliveries it had from the queue it has left are not deliveries
                     // of this one; its cross-queue `receive_count` is untouched.
                     queue_receive_count: 0,
+                    retention_from: enqueued_at.unwrap_or(message.retention_from),
                     ..message
                 });
             }
@@ -2206,6 +2433,7 @@ impl ComAmazonawsSqsAmazonsqsState {
             for message in moving.into_iter().rev() {
                 source.messages.push_front(StoredMessage {
                     sent_at: now,
+                    retention_from: now,
                     available_at: now,
                     invisible_until: None,
                     moved_by_task: None,
@@ -2324,6 +2552,28 @@ fn count_as_i64(count: u64) -> i64 {
 /// for messages per second is 500"
 /// (`StartMessageMoveTaskRequest$MaxNumberOfMessagesPerSecond`).
 pub const MAX_MESSAGES_PER_SECOND: i32 = 500;
+
+/// The smallest message movement rate it accepts: a rate below one would move no message
+/// at all, so one is the lowest rate a task can be started at.
+pub const MIN_MESSAGES_PER_SECOND: i32 = 1;
+
+/// The parameter that rate is supplied for, as the request carries it.
+pub const MESSAGES_PER_SECOND_PARAMETER: &str = "MaxNumberOfMessagesPerSecond";
+
+/// How a refusal states that the rate a message movement task was asked to move messages
+/// at is outside the range the parameter takes.
+///
+/// It states the RANGE and not the value supplied: the bounds are what the caller has to
+/// fix the request against, and both ends of the range are refused with the one sentence.
+pub fn message_move_rate_out_of_range_message() -> String {
+    invalid_parameter_message_without_value(
+        MESSAGES_PER_SECOND_PARAMETER,
+        &format!(
+            "You must enter a number that's between {MIN_MESSAGES_PER_SECOND} and \
+             {MAX_MESSAGES_PER_SECOND}."
+        ),
+    )
+}
 
 /// How long after the start call the first moved message becomes deliverable in the
 /// destination queue.
@@ -2795,18 +3045,14 @@ fn principals_refusal(account_numbers: &[String]) -> Option<PermissionRefusal> {
 /// could never serve, whatever the queue already carries.
 fn actions_refusal(actions: &[String]) -> Option<PermissionRefusal> {
     for action in actions {
-        if action != ANY_ACTION && !ACTION_NAMES.contains(&action.as_str()) {
+        if action != ANY_ACTION && !authorization::policy_action_names().contains(&action.as_str()) {
             // The action is named back QUALIFIED with the service it was looked up in,
             // the way the statement a grant would have added names it, because that is
             // the name no action of this service answers to.
             let qualified = format!("{POLICY_ACTION_PREFIX}{action}");
-            return Some(PermissionRefusal::Parameter(
-                if action.chars().count() > MAX_ACTION_NAME_LENGTH {
-                    invalid_parameter_message_without_value(ACTION_PARAMETER, UNKNOWN_ACTION_REASON)
-                } else {
-                    invalid_parameter_message(&qualified, ACTION_PARAMETER, UNKNOWN_ACTION_REASON)
-                },
-            ));
+            return Some(PermissionRefusal::Parameter(unknown_action_message(
+                &qualified,
+            )));
         }
     }
     (actions.len() > MAX_ACTIONS_PER_STATEMENT).then(|| {
@@ -2826,6 +3072,20 @@ fn actions_refusal(actions: &[String]) -> Option<PermissionRefusal> {
 /// a grant may allow are published.
 const UNKNOWN_ACTION_REASON: &str =
     "Please refer to the appropriate WSDL for a list of valid actions.";
+
+/// How a refusal states that `named` is no action name this service accepts where an
+/// action name was supplied — in a grant's `ActionName`, or as the `Action` of a statement
+/// of a queue policy, which is the same parameter and the same published set
+/// ([`authorization::policy_action_names`]).
+///
+/// The value is echoed only while it is no longer than a qualified name of this service
+/// can be, so a refusal never hands an unbounded string back.
+pub fn unknown_action_message(named: &str) -> String {
+    if named.chars().count() > POLICY_ACTION_PREFIX.len() + MAX_ACTION_NAME_LENGTH {
+        return invalid_parameter_message_without_value(ACTION_PARAMETER, UNKNOWN_ACTION_REASON);
+    }
+    invalid_parameter_message(named, ACTION_PARAMETER, UNKNOWN_ACTION_REASON)
+}
 
 /// The longest action name a refusal echoes back: the longest name this service has, so
 /// a value no longer than any action name is reported and anything longer is not.
@@ -3273,8 +3533,12 @@ pub enum ReceiptHandleRefusal {
     /// The value is not formed as a receipt handle, so no receive can have minted it.
     Malformed,
     /// It is formed as one, but names no message this queue still holds: the message was
-    /// deleted, purged or expired, or a later receive superseded the handle.
+    /// deleted, purged or expired, or the handle is one this queue never minted.
     NoSuchMessage,
+    /// This queue minted it for a message it STILL holds, and the lease it carried has
+    /// moved on: a later receive of that message took it (FIFO only — see
+    /// [`Queue::message_id_for_handle`]).
+    Expired,
 }
 
 /// Whether `receipt_handle` is formed as a receipt handle at all — a handle is an opaque
@@ -3334,6 +3598,40 @@ pub fn no_message_for_receipt_handle_message(receipt_handle: &str) -> String {
         receipt_handle,
         RECEIPT_HANDLE_PARAMETER,
         "Message does not exist or is not available for visibility timeout change.",
+    )
+}
+
+/// How a refusal states that the handle was valid and has been SUPERSEDED: the lease a
+/// receive handed over moved on with a later receive of the same message, so the caller
+/// has to act under the handle that receive minted rather than retry or re-address.
+///
+/// A parameter fault — the value supplied for `ReceiptHandle` is no longer one this queue
+/// acts on — so it is worded in the one template this service refuses a parameter value
+/// with, and the handle is the only value filled in.
+pub fn receipt_handle_expired_message(receipt_handle: &str) -> String {
+    invalid_parameter_message(
+        receipt_handle,
+        RECEIPT_HANDLE_PARAMETER,
+        RECEIPT_HANDLE_EXPIRED_REASON,
+    )
+}
+
+/// The reason clause [`receipt_handle_expired_message`] states.
+pub const RECEIPT_HANDLE_EXPIRED_REASON: &str = "The receipt handle has expired.";
+
+/// How a refusal states that the `VisibilityTimeout` a call supplied is outside the range
+/// the parameter takes: the value the request carried, and the bounds the parameter
+/// publishes ("Values range: 0 to 43200"), which are whole seconds.
+///
+/// One wording for both ends of the range, and for every operation that takes the
+/// parameter as a value to apply to a message — the single-message call and one entry of
+/// the batch form state the same fault about the same parameter.
+pub fn visibility_timeout_out_of_range_message(requested: i64) -> String {
+    let (min, max) = integer_bounds(VISIBILITY_TIMEOUT);
+    invalid_parameter_message(
+        &requested.to_string(),
+        VISIBILITY_TIMEOUT,
+        &format!("{VISIBILITY_TIMEOUT} must be an integer between {min} and {max}."),
     )
 }
 
@@ -3413,6 +3711,23 @@ pub fn empty_batch_entry_value_message(operation: &str, position: usize, member:
 /// `MaximumMessageSize` bounds EACH message, not the sum of a batch's entries.
 pub fn maximum_batch_payload_bytes() -> i64 {
     integer_bounds(MAXIMUM_MESSAGE_SIZE).1
+}
+
+/// The largest payload one request can carry that this service has to READ in order to
+/// judge it, in bytes.
+///
+/// A batch over the payload ceiling is refused by the SERVICE and not by the transport:
+/// `BatchRequestTooLong` — "the length of all the messages put together is more than the
+/// limit" — is a modelled error of the operation, so the request carrying that batch has
+/// to be read and deserialized before it can be answered with the code and the message
+/// that state which limit it broke. The largest request that can need that answer carries
+/// [`MAX_BATCH_ENTRIES`] entries, each holding at most one maximum-size message
+/// ([`maximum_batch_payload_bytes`], which is also the largest a single message may be),
+/// so that product is the most any one request can make this service read; past it a
+/// request carries more than ten maximum-size messages, which no batch operation of this
+/// service could act on however it is spelled.
+pub fn maximum_request_payload_bytes() -> i64 {
+    maximum_batch_payload_bytes().saturating_mul(i64::try_from(MAX_BATCH_ENTRIES).unwrap_or(1))
 }
 
 // ---------------------------------------------------------------------------
