@@ -181,21 +181,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // "We recommend that you set MaxResults to a value between 5 and 1000"
         // (`DescribeSpotInstanceRequests`) is a recommendation, not a range, and the model
-        // declares no `@range` on the member — so the handler is the only place a page size
-        // can be bounded, and an unbounded one is how a caller asks for the whole store in
-        // one answer.
+        // declares no `@range` on the member — so the only bound on the page size is the
+        // largest page this operation serves: a value above it is not refused, it is served
+        // as that page with a `NextToken` for the rest (the clamp below). A page of NONE is
+        // not a page, so zero and below is still refused.
         if input.max_results.is_some_and(|max_results| max_results < 1) {
             return Err(Scaffolded::invalid_parameter_value(format!(
                 "Invalid value '{}' for maxResults. It must be at least 1",
-                input.max_results.unwrap_or_default()
-            )));
-        }
-        if input
-            .max_results
-            .is_some_and(|max_results| usize::try_from(max_results).unwrap_or(0) > MAX_PAGE_SIZE)
-        {
-            return Err(Scaffolded::invalid_parameter_value(format!(
-                "Invalid value '{}' for maxResults. It must be at most {MAX_PAGE_SIZE}",
                 input.max_results.unwrap_or_default()
             )));
         }

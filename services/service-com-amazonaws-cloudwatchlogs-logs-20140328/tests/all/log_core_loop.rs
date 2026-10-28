@@ -746,7 +746,7 @@ async fn get_log_events_pagination_visits_every_event_exactly_once() {
                 if page_messages.is_empty() {
                     assert_eq!(
                         token.as_deref(),
-                        Some(next.as_str()).filter(|_| token.is_some()),
+                        token.is_some().then_some(next.as_str()),
                         "case {case:?}: an exhausted forward scan repeats its token, got {page}"
                     );
                     break;

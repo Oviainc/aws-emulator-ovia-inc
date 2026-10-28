@@ -169,30 +169,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // jobs started through it.
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
-        // Reporting only: the lookup's sole write is the status transition the clock
-        // already owed this job, which was due at its stored instant whether or not
-        // anybody called.
-        let Some(record) =
-            store.transcription_job_mut(&region, &input.transcription_job_name, now)
-        else {
-            return Err(GetTranscriptionJobErrorModeled::BadRequestException(
-                BadRequestException {
-                    // A job this Region never started is this service's
-                    // `BadRequestException` — the shape its recorded not-found
-                    // responses carry, and the one whose documentation covers an
-                    // entity that "doesn't exist" — not the modelled
-                    // `NotFoundException`. A poll-until-done loop classifies an
-                    // unknown job by this error, so it must be the one the service
-                    // emits.
-                    message: Some(crate::state::not_found_message(crate::state::KIND_JOB)),
-                },
-            )
-            .into());
+        // A finished job's reported output locations SERVE the documents they name, so
+        // the ones the clock already owed are taken here, once, and stored at those
+        // very locations before this reader answers with them: a client that follows
+        // `Transcript.TranscriptFileUri` straight after reading `COMPLETED` fetches the
+        // transcript (`crate::state::due_output_objects`). They are collected while the
+        // store is locked and written after the guard is dropped, so no lock is held
+        // across the in-process call into object storage.
+        //
+        // WHERE they go: into this emulator's OWN Amazon S3, over the in-process
+        // callback every cross-service call of this crate already uses
+        // (`crate::state::s3_client`, the one client a job's media resolution and a
+        // vocabulary's text file also go through) — no socket, no outbound request and
+        // no host resolution. The caller's `OutputBucketName` / `OutputKey` reach it
+        // only as the bucket and key of a `PutObject`, never as a host or a URL, and a
+        // reported location whose authority is not that store is not written at all.
+        //
+        // HOW MANY and HOW LARGE: one small fixed-shape document per DISTINCT location
+        // the record reports — the transcript, its redacted twin, and one subtitle file
+        // per modelled subtitle format — taken once per job, so neither the number of
+        // writes nor the size of one grows with what a request sent.
+        let (outputs, job) = {
+            let mut store = state.lock();
+            // Reporting only: the lookup's sole write is the status transition the clock
+            // already owed this job, which was due at its stored instant whether or not
+            // anybody called.
+            let Some(record) =
+                store.transcription_job_mut(&region, &input.transcription_job_name, now)
+            else {
+                return Err(GetTranscriptionJobErrorModeled::BadRequestException(
+                    BadRequestException {
+                        // A job this Region never started is this service's
+                        // `BadRequestException` — the shape its recorded not-found
+                        // responses carry, and the one whose documentation covers an
+                        // entity that "doesn't exist" — not the modelled
+                        // `NotFoundException`. A poll-until-done loop classifies an
+                        // unknown job by this error, so it must be the one the service
+                        // emits.
+                        message: Some(crate::state::not_found_message(crate::state::KIND_JOB)),
+                    },
+                )
+                .into());
+            };
+            (crate::state::due_output_objects(record), record.to_job())
         };
+        if !crate::state::store_job_outputs(ctx, &region, &outputs).await {
+            // A write the object store did not take leaves the job still owing it, so
+            // the documents go back to the record and a later read takes them again.
+            crate::state::return_due_output_objects(state.lock().transcription_job_mut(
+                &region,
+                &input.transcription_job_name,
+                now,
+            ));
+        }
 
         Ok(GetTranscriptionJobOutput {
-            transcription_job: Some(record.to_job()),
+            transcription_job: Some(job),
         })
     }
 }

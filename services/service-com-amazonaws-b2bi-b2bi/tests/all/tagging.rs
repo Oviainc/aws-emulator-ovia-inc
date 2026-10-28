@@ -522,7 +522,7 @@ async fn tags_are_read_off_the_arn_whatever_region_the_read_is_signed_for() {
             region,
             "CreateProfile",
             json!({
-                "name": format!("{case}"),
+                "name": case.to_string(),
                 "phone": "555-555-0103",
                 "businessName": format!("{case} Corp"),
                 "logging": "ENABLED",

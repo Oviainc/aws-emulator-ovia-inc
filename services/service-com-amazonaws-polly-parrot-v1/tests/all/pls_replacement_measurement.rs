@@ -207,7 +207,7 @@ async fn a_replacement_is_measured_over_its_whole_content() {
     for (outer, nested) in [("alias", "phoneme"), ("phoneme", "alias")] {
         for (index, row) in rows(outer, nested).into_iter().enumerate() {
             let case = format!("<{outer}> with <{nested}> inside: {}", row.case);
-            let name = format!("Nest{}{index:02}", &outer[..1].to_uppercase());
+            let name = format!("Nest{}{index:02}", outer[..1].to_uppercase());
             let content = pls(&row.inner);
             let response = polly.put_lexicon(&name, &content).await;
             let refused = row.characters > MAX_LEXEME_CHARACTERS;

@@ -429,6 +429,11 @@ mod eks_cluster_security_group;
 // concurrently landing router suite puts its line.
 #[path = "all/logs_emf_disabled_errors.rs"]
 mod logs_emf_disabled_errors;
+// Declared HERE, beside the sibling suite above in the same quiet `n`/`o` gap, for the reason
+// that entry records: the appended tail at the end of this file and the head of the list are
+// both regions every concurrently landing router suite puts its line in.
+#[path = "all/logs_emf_extraction_policy_scope.rs"]
+mod logs_emf_extraction_policy_scope;
 #[path = "all/partnercentral_channel_target_routing.rs"]
 mod partnercentral_channel_target_routing;
 #[path = "all/personalize_signing_name_routing.rs"]

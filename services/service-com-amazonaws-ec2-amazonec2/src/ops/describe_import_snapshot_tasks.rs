@@ -169,21 +169,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let requested_ids: ::std::collections::BTreeSet<String> =
             supplied_ids.iter().cloned().collect();
         // "The maximum number of results to return in a single call"
-        // (`DescribeImportSnapshotTasksRequest$MaxResults`), with no modelled `@range` —
-        // so the handler is the only place a page size can be bounded, and an unbounded
-        // one is how a caller asks for the whole store in one answer.
+        // (`DescribeImportSnapshotTasksRequest$MaxResults`), with no modelled `@range` — so
+        // the only bound on the page size is the largest page this operation serves: a
+        // value above it is not refused, it is served as that page with a `NextToken` for
+        // the rest (the clamp below). A page of NONE is not a page, so zero and below is
+        // still refused.
         if input.max_results.is_some_and(|max_results| max_results < 1) {
             return Err(Scaffolded::invalid_parameter_value(format!(
                 "Invalid value '{}' for maxResults. It must be at least 1",
-                input.max_results.unwrap_or_default()
-            )));
-        }
-        if input
-            .max_results
-            .is_some_and(|max_results| usize::try_from(max_results).unwrap_or(0) > MAX_PAGE_SIZE)
-        {
-            return Err(Scaffolded::invalid_parameter_value(format!(
-                "Invalid value '{}' for maxResults. It must be at most {MAX_PAGE_SIZE}",
                 input.max_results.unwrap_or_default()
             )));
         }
@@ -313,12 +306,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A request that names no page size gets the largest page this service serves, so
         // the `NextToken` path behaves the same whether or not a page size was asked for.
-        // A size the request DID name is already inside `1..=MAX_PAGE_SIZE`: the two
-        // refusals above answered every other value.
+        // A size the request DID name is clamped to that same page: the refusal above
+        // answered a page of none, and a size above the largest page asks for it.
         let limit = input
             .max_results
             .and_then(|max_results| usize::try_from(max_results).ok())
-            .unwrap_or(MAX_PAGE_SIZE);
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
 
         // A token only when a task follows this page: "This value is null when there are
         // no more results to return" (`DescribeImportSnapshotTasksResult$NextToken`).
