@@ -10,8 +10,8 @@
 //! (`smithy_query(query="operation", operation="DisassociateUser")`), so the service
 //! itself owns the identifier rules, in this order:
 //!
-//! 1. an EC2 instance the request names is AUTHORIZED first, over the same
-//!    `crate::state::ec2_fleet::authorizes_instance` predicate `AssociateUser` and
+//! 1. an EC2 instance the request names is AUTHORIZED first, through the same
+//!    `crate::state::ec2_fleet::authorize_instance` gate `AssociateUser` and
 //!    `ListUserAssociations` ask — an instance the account does not have cannot be shown
 //!    to be the caller's, so the request fails closed before anything else about it is
 //!    read. That decision is ALSO taken ahead of the boundary validator, by
@@ -184,14 +184,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // service's fleet seam nor the service that OWNS instances reports cannot be shown
         // to be the caller's, so a request that names one fails closed. The member is
         // optional here, so an association addressed by its ARN alone names no instance and
-        // there is nothing to authorize. Asked before the store is locked, because resolving
-        // it reaches another service over the in-process callback.
-        if let Some(instance_id) = input.instance_id.as_deref() {
-            if !crate::state::ec2_fleet::authorizes_instance(&*self.engine, ctx, instance_id).await
-            {
-                return Err(crate::scaffolded::Scaffolded::unauthorized());
-            }
-        }
+        // there is nothing to authorize — which is what the gate answers for a request that
+        // names none, rather than a rule restated here. Asked before the store is locked,
+        // because resolving it reaches another service over the in-process callback.
+        crate::state::ec2_fleet::authorize_instance(
+            &*self.engine,
+            ctx,
+            input.instance_id.as_deref(),
+        )
+        .await?;
 
         // The identifier rules come next, independently of what state holds: a request
         // addressing no association at all is an argument error, not a missing resource.

@@ -89,13 +89,17 @@ const REQUEST_ENVELOPE_ALLOWANCE_BYTES: usize = 64 * 1024;
 
 /// The largest HTTP request body this service reads at all.
 ///
-/// The biggest payload any Amazon SQS request can carry is the largest batch a batch
-/// operation can be asked to judge — ten maximum-size messages
-/// ([`crate::state::maximum_request_payload_bytes`]) — because a batch over the service's
-/// payload ceiling is refused by the OPERATION, with the modelled `BatchRequestTooLong`
-/// naming the limit it broke, which it can only do once the request has been read. The
-/// ceiling is read from there rather than written out a second time. Beyond it sits
-/// [`REQUEST_ENVELOPE_ALLOWANCE_BYTES`] for the request wrapped around that payload.
+/// The biggest payload any Amazon SQS request can carry is ONE maximum total payload
+/// ([`crate::state::maximum_batch_payload_bytes`]) — "the maximum allowed individual
+/// message size and the maximum total payload size (the sum of the individual lengths of
+/// all of the batched messages)" are the same figure, so a single message and a whole
+/// batch are bounded alike and a request carrying more than that figure of message bytes
+/// is past what the service accepts however it is spelled. The ceiling is read from there
+/// rather than written out a second time. Beyond it sits
+/// [`REQUEST_ENVELOPE_ALLOWANCE_BYTES`] for the request wrapped around that payload, which
+/// is what keeps the modelled `BatchRequestTooLong` reachable: a batch whose entries add
+/// up to more than the payload limit is still read, and refused by the OPERATION with the
+/// limit and the bytes it was sent.
 ///
 /// A body larger than the sum cannot carry a payload this service would accept however it
 /// is spelled, so it is refused by the TRANSPORT — a bare HTTP 413 with no error document
@@ -113,7 +117,7 @@ const REQUEST_ENVELOPE_ALLOWANCE_BYTES: usize = 64 * 1024;
 /// the same place `service-com-amazonaws-codecommit-codecommit-20150413` keeps the one
 /// for its git transport.
 pub fn max_request_body_bytes() -> usize {
-    usize::try_from(crate::state::maximum_request_payload_bytes())
+    usize::try_from(crate::state::maximum_batch_payload_bytes())
         .unwrap_or(usize::MAX)
         .saturating_add(REQUEST_ENVELOPE_ALLOWANCE_BYTES)
 }

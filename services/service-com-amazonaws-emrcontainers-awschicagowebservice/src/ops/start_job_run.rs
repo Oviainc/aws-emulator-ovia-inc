@@ -219,17 +219,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A job run runs IN a virtual cluster, so the cluster is resolved out of state
         // first, in the region this request is signed for: a cluster that was never
         // created here, or one that is no longer RUNNING because it was deleted, cannot
-        // accept work.
-        let cluster_running = state
+        // accept work. The two are distinguished in the MESSAGE: a cluster that is not
+        // there is reported with the one not-found wording of this service
+        // ([`crate::state::ResourceKind`]), while one that exists but cannot take work is
+        // reported as what it is.
+        let cluster_state = state
             .virtual_cluster(&region, &input.virtual_cluster_id)
-            .is_some_and(|cluster| cluster.state == crate::state::CLUSTER_RUNNING);
-        if !cluster_running {
+            .map(|cluster| cluster.state.clone());
+        if cluster_state.as_deref() != Some(crate::state::CLUSTER_RUNNING) {
+            let message = match cluster_state {
+                None => crate::state::ResourceKind::VirtualCluster
+                    .not_found_message(&input.virtual_cluster_id),
+                Some(_) => format!(
+                    "Virtual cluster {} is not available to run jobs",
+                    input.virtual_cluster_id
+                ),
+            };
             return Err(StartJobRunErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "Virtual cluster {} is not available to run jobs",
-                        input.virtual_cluster_id
-                    )),
+                    message: Some(message),
                 },
             )
             .into());
@@ -244,7 +252,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let Some(template) = state.job_template(&region, template_id) else {
                     return Err(StartJobRunErrorModeled::ResourceNotFoundException(
                         ResourceNotFoundException {
-                            message: Some(format!("Job Template {template_id} doesn't exist.")),
+                            // The one not-found wording of this service
+                            // ([`crate::state::ResourceKind`]), built from the referenced
+                            // id.
+                            message: Some(
+                                crate::state::ResourceKind::JobTemplate
+                                    .not_found_message(template_id),
+                            ),
                         },
                     )
                     .into());

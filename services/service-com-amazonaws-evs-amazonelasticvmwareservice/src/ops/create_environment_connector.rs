@@ -338,6 +338,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it. The idempotent repeat above returns before here, having changed nothing.
         environment.note_child_change(created_at_ms);
         state.note_transition_due(due_at);
+        // The environment's health checks read its connectors, and this call changed that
+        // population, so they are recomputed from the state the create leaves behind
+        // rather than left standing on the connectors that were there before it.
+        state.recompute_environment_checks();
 
         Ok(CreateEnvironmentConnectorOutput {
             connector: Some(created),

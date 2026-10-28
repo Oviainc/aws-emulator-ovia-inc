@@ -15,6 +15,14 @@
 //! [`crate::state::MAX_CONNECTORS_PER_ENVIRONMENT`] bounds how many finished records an
 //! environment keeps.
 //!
+//! The connector inventory is part of the environment, so removing a connector MODIFIES
+//! the environment as adding one does: the environment record is re-stamped
+//! ([`crate::state::StoredEnvironment::note_child_change`]) and the `environmentSummary`
+//! this operation answers with reports the new `modifiedAt` — and the health the
+//! connectors decide ([`crate::state::StoredEnvironment::refresh_checks`]) is recomputed
+//! from the connector population this call leaves behind, so the summary cannot report a
+//! status that held while the connector was still live.
+//!
 //! "Before deleting a connector, you must remove all entitlements that are associated
 //! with the same vCenter": a connector whose vCenter still has live Windows Server
 //! License entitlements is refused with the operation's modelled `ValidationException`
@@ -302,6 +310,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             environment.purge_finished_connectors();
             state.note_transition_due(due_at);
         }
+        // The environment's health checks read its connectors — the aggregate over what
+        // each of them has decided about its own connectivity — so they are recomputed
+        // after the delete changed that population and before the summary is built: a
+        // connector that is being torn down decides nothing.
+        state.recompute_environment_checks();
         // The environment the connector was deleted FROM, as it stands after the delete.
         let environment_summary = state
             .environment_in_region(&region, &input.environment_id)

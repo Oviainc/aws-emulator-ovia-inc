@@ -162,10 +162,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DescribeManagedEndpointErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "Endpoint {} was not found in virtual cluster {}",
-                            input.id, input.virtual_cluster_id
-                        )),
+                        // The one not-found wording of this service
+                        // ([`crate::state::ResourceKind`]), built from the id the request
+                        // asked for: it is the ENDPOINT this call is about, resolved under
+                        // the cluster the path names.
+                        message: Some(
+                            crate::state::ResourceKind::ManagedEndpoint
+                                .not_found_message(&input.id),
+                        ),
                     },
                 )
                 .into(),

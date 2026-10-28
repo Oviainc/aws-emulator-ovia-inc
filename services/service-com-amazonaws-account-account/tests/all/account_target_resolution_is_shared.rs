@@ -45,9 +45,10 @@ const DENIED: (u16, &str) = (403, "AccessDeniedException");
 /// `ValidationException` at HTTP 400.
 const INVALID: (u16, &str) = (400, "ValidationException");
 
-/// The modelled error code and HTTP status of a sub-resource an otherwise
-/// readable account does not hold: `ResourceNotFoundException` at HTTP 404.
-const NOT_FOUND: (u16, &str) = (404, "ResourceNotFoundException");
+/// The modelled error code and HTTP status of a primary-email call whose
+/// account has no update in flight: `ValidationException` at HTTP 400 (see
+/// `crate::state::no_primary_email_update`).
+const NO_UPDATE: (u16, &str) = (400, "ValidationException");
 
 /// A passcode inside `Otp`'s modelled `^[a-zA-Z0-9]{6}$`, so an acceptance is
 /// refused for its passcode and never for a malformed member. It is NOT the
@@ -275,8 +276,8 @@ async fn a_required_member_lands_on_the_account_it_names() {
         let own_status = call(&router, "/getPrimaryEmailUpdateStatus", json!({})).await;
         assert_eq!(
             (own_status.status, own_status.error_code()),
-            NOT_FOUND,
-            "case {member:?} standalone GetPrimaryEmailUpdateStatus: expected {NOT_FOUND:?} \
+            NO_UPDATE,
+            "case {member:?} standalone GetPrimaryEmailUpdateStatus: expected {NO_UPDATE:?} \
              because the caller's own account has no update, got {} with {:?}",
             own_status.status,
             own_status.body

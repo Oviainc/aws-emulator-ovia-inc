@@ -206,12 +206,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(update) = account.primary_email_update.as_ref() else {
             // No update has ever been started for this account, and `Status` is a
             // REQUIRED output member: there is no most-recent update to report.
-            // The account resolved and is readable and the one input member was
-            // valid, so what this call named can't be found — the answer the
-            // readers of this service's other sub-resources give for the same
-            // condition.
+            // Account Management refuses that as a request it cannot act on —
+            // see `crate::state::no_primary_email_update`.
             return Err(
-                GetPrimaryEmailUpdateStatusErrorModeled::ResourceNotFoundException(
+                GetPrimaryEmailUpdateStatusErrorModeled::ValidationException(
                     crate::state::no_primary_email_update(),
                 )
                 .into(),

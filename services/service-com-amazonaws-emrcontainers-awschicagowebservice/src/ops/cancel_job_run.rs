@@ -154,10 +154,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = state.job_run(&region, &input.virtual_cluster_id, &input.id) else {
             return Err(CancelJobRunErrorModeled::ValidationException(
                 ValidationException {
-                    message: Some(format!(
-                        "Job run {} was not found in virtual cluster {}",
-                        input.id, input.virtual_cluster_id
-                    )),
+                    // The one not-found wording of this service
+                    // ([`crate::state::ResourceKind`]), built from the requested id: the
+                    // refusal is carried by this operation's own modelled error, but what
+                    // it SAYS is that the run does not exist.
+                    message: Some(
+                        crate::state::ResourceKind::JobRun.not_found_message(&input.id),
+                    ),
                 },
             )
             .into());

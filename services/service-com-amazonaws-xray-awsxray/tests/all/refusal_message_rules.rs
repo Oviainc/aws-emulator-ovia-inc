@@ -40,7 +40,7 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_xray_awsxray::state::{
     retrieval_token_check, INVALID_INPUT_PARAMETERS_PREAMBLE, INVERTED_WINDOW_MESSAGE,
-    MALFORMED_RETRIEVAL_TOKEN_DETAIL_PREFIX, MAX_TRACE_IDS_PER_CALL,
+    MALFORMED_RETRIEVAL_TOKEN_CAUSE, MAX_TRACE_IDS_PER_CALL,
 };
 
 use super::xray_wire::{array, trace_id, Answer, Xray};
@@ -702,9 +702,9 @@ async fn a_token_of_no_minted_form_is_refused_with_the_services_template() {
         // Every operation that takes a `RetrievalToken`
         // (`smithy_query(query="operation",operation="CancelTraceRetrieval,
         // ListRetrievedTraces,GetRetrievedTracesGraph")`), with the leading
-        // clause it names the member by. The decoder clause after `passed: ` is
-        // the same on all of them: one fixed phrase closed by the rejected
-        // value, whatever the operation named the member.
+        // clause it names the member by. The cause clause after `passed: ` is
+        // the same fixed phrase on all of them, whatever the operation named the
+        // member and whatever the value was.
         for (operation, path, clause, body) in [
             (
                 "ListRetrievedTraces",
@@ -726,8 +726,7 @@ async fn a_token_of_no_minted_form_is_refused_with_the_services_template() {
             ),
         ] {
             let expected = format!(
-                "Invalid {clause} {token} passed: \
-                 {MALFORMED_RETRIEVAL_TOKEN_DETAIL_PREFIX}{token}"
+                "Invalid {clause} {token} passed: {MALFORMED_RETRIEVAL_TOKEN_CAUSE}"
             );
             let refused = xray.call(path, &body).await;
             assert_eq!(
@@ -742,12 +741,12 @@ async fn a_token_of_no_minted_form_is_refused_with_the_services_template() {
                 "case {label:?} on {operation}: expected {expected:?}, got {:?}",
                 said(&refused)
             );
-            // Both clauses name the rejected value, so the value read out of the
-            // decoder's clause alone is the one the request submitted.
+            // The outer clause names the rejected value, once: the cause clause
+            // states why it could not be read and names no value.
             assert_eq!(
                 said(&refused).matches(token.as_str()).count(),
-                2,
-                "case {label:?} on {operation}: the rejected value must be named in each clause, \
+                1,
+                "case {label:?} on {operation}: the rejected value must be named once, \
                  got {:?}",
                 said(&refused)
             );
@@ -773,7 +772,7 @@ async fn a_token_of_no_minted_form_is_refused_with_the_services_template() {
          {missing:?}"
     );
     assert!(
-        !said(&missing).contains(MALFORMED_RETRIEVAL_TOKEN_DETAIL_PREFIX),
+        !said(&missing).contains(MALFORMED_RETRIEVAL_TOKEN_CAUSE),
         "a token that is not there must not be stated as a malformed one, got {:?}",
         said(&missing)
     );

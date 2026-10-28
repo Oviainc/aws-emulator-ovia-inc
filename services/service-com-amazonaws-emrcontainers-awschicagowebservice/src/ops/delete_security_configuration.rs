@@ -191,13 +191,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(DeleteSecurityConfigurationErrorModeled::ValidationException(
                 ValidationException {
-                    // The not-found message form the recorded refusals of this service
-                    // show: `<Resource type> <id> doesn't exist.`, built from the
-                    // requested id.
-                    message: Some(format!(
-                        "Security Configuration {} doesn't exist.",
-                        input.id
-                    )),
+                    // The one not-found wording of this service
+                    // ([`crate::state::ResourceKind`]), built from the requested id.
+                    message: Some(
+                        crate::state::ResourceKind::SecurityConfiguration
+                            .not_found_message(&input.id),
+                    ),
                 },
             )
             .into());

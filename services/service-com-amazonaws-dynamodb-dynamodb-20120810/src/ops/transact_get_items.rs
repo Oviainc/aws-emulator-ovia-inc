@@ -209,7 +209,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for item in &input.transact_items {
             // Every token this element DEFINES must be one its projection uses.
             crate::state::Substitutions::new(item.get.expression_attribute_names.as_ref(), None)
-                .check_all_referenced(&[item.get.projection_expression.as_deref()])
+                .check_all_referenced(&[(
+                    "ProjectionExpression",
+                    item.get.projection_expression.as_deref(),
+                )])
                 .map_err(lift)?;
             if item.get.projection_expression.is_some() {
                 return Err(crate::scaffolded::Scaffolded::not_implemented(

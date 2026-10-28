@@ -365,8 +365,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // request invalid.
             substitutions
                 .check_all_referenced(&[
-                    action.condition_expression(),
-                    action.update_expression(),
+                    ("ConditionExpression", action.condition_expression()),
+                    ("UpdateExpression", action.update_expression()),
                 ])
                 .map_err(lift)?;
             // A value a condition compares against, or one an update writes, is held to

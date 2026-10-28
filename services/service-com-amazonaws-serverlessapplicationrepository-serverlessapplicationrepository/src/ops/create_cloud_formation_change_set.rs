@@ -304,13 +304,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // that names none deploys the version the application reports as its
                     // latest — and an application with no version at all has nothing to
                     // deploy.
-                    None => application.latest().ok_or_else(|| {
-                        bad_request(format!(
-                            "Application {} does not have any versions. Create one with \
-                             CreateApplicationVersion before deploying it.",
-                            input.application_id
-                        ))
-                    }),
+                    None => application
+                        .latest()
+                        .ok_or_else(|| bad_request(NO_VERSION_TO_DEPLOY)),
                 },
             }
             .map(|version| Deployment {
@@ -475,6 +471,16 @@ const REVIEW_IN_PROGRESS: &str = "REVIEW_IN_PROGRESS";
 /// What this service prefixes a deployment's `StackName` with in CloudFormation; see the
 /// call site.
 const STACK_NAME_PREFIX: &str = "serverlessrepo-";
+
+/// The 400 this operation answers for an application that has published no version at all.
+///
+/// The sentence is FIXED: it names neither the application nor a version, because there is
+/// no version to name and this condition is about the operation that cannot be served, not
+/// about a value in the request. It belongs to THIS deploy path alone — the sibling
+/// `CreateCloudFormationTemplate` states the same precondition in its own words — so it is
+/// stated here rather than in a helper the two would share.
+const NO_VERSION_TO_DEPLOY: &str =
+    "Can't create cloudformation changeset from application with no version.";
 
 /// A CloudFormation client over the in-process callback into this same emulator.
 ///
@@ -698,7 +704,7 @@ fn new_change_set_name() -> String {
 }
 
 /// The 400 this operation answers for a request outside the contract.
-fn bad_request(message: String) -> CreateCloudFormationChangeSetError {
+fn bad_request(message: impl Into<String>) -> CreateCloudFormationChangeSetError {
     CreateCloudFormationChangeSetErrorModeled::BadRequestException(crate::state::bad_request(
         message,
     ))

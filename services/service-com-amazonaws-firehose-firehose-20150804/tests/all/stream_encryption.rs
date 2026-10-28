@@ -22,7 +22,7 @@ use service_com_amazonaws_firehose_firehose_20150804::ComAmazonawsFirehoseFireho
 // for both halves of the pair, so they cannot drift apart.
 use crate::delivery_stream_encryption::{described_encryption, key_arn};
 use crate::delivery_stream_lifecycle::{
-    error_code, s3_configuration, Emulator, PAST_THE_TRANSITION,
+    error_code, error_message, s3_configuration, Emulator, PAST_THE_TRANSITION,
 };
 
 /// How SSE came to be in force on the stream a stop is then asked for. The two paths are
@@ -422,6 +422,20 @@ async fn stop_encryption_is_refused_with_the_modelled_error_for_the_reason() {
             expected_code,
             "case {case:?}: got {refused:?}"
         );
+        // The two rows that have nothing to disable state the stream's encryption as the
+        // fact it already is, naming the stream and nothing else: one sentence for that
+        // condition, whichever way the stream came to have no encryption in force.
+        if matches!(setup, Setup::NeverEncrypted | Setup::AlreadyDisabled) {
+            let expected = format!(
+                "Cannot disable encryption on firehose: {name} when encryption is \
+                 already disabled"
+            );
+            let said = error_message(&refused);
+            assert_eq!(
+                said, expected,
+                "case {case:?}: expected {expected:?}, got {said:?}"
+            );
+        }
 
         // A refused call writes nothing: whatever the stream reported before it, it
         // reports after it too.
