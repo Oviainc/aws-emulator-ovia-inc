@@ -9,10 +9,16 @@
 //!
 //! The rules under test, each asserted over a TABLE of inputs rather than one case:
 //!
-//! * `ResetEnabledControl` starts an asynchronous `RESET_ENABLED_CONTROL` operation that
-//!   re-deploys the configuration the enabled control ALREADY carries, so the configured
-//!   `parameters` read the same before, during and after it — whatever that configuration
-//!   is, whichever catalog control is enabled and whichever call configured it;
+//! * a reset of an enablement of a control AWS Control Tower implements with a service
+//!   control policy is refused with `ValidationException` (400) and starts nothing, because
+//!   the operation "does not work for controls implemented with SCPs" — over every such
+//!   control the catalog publishes, in either ARN form, configured or not, and whatever the
+//!   enablement's current state is;
+//! * for a control implemented otherwise, `ResetEnabledControl` starts an asynchronous
+//!   `RESET_ENABLED_CONTROL` operation that re-deploys the configuration the enabled
+//!   control ALREADY carries, so the configured `parameters` read the same before, during
+//!   and after it — whichever such catalog control is enabled and whichever ARN form named
+//!   it;
 //! * while that operation is in flight the control reads as `UNDER_CHANGE` with the reset
 //!   as its `lastOperationIdentifier` and `UNKNOWN` drift, because a control cannot be
 //!   assessed against a configuration still being deployed; once the clock has made the
@@ -23,10 +29,12 @@
 //!   (409) and mints nothing, whichever call started that operation, and an identifier no
 //!   enabled control matches is `ResourceNotFoundException` (404).
 //!
-//! The controls a row enables, and the parameter keys it configures them with, are read off
-//! `state::CONTROL_CATALOG` — the catalog `EnableControl` resolves a `controlIdentifier`
-//! against — rather than written out by hand, so no row can drift from what this emulator
-//! publishes. The enum values written out here come from
+//! The controls a row enables, the implementation each carries and the parameter keys it
+//! configures them with are read off `state::CONTROL_CATALOG` — the catalog `EnableControl`
+//! resolves a `controlIdentifier` against — rather than written out by hand, so no row can
+//! drift from what this emulator publishes. Every control that catalog publishes WITH
+//! parameters is a preventive one, so the configurations a started reset re-deploys are the
+//! ones a parameterless control can carry; the configured rows are the refusal table's. The enum values written out here come from
 //! `smithy_query(query="shape", shape="ControlOperationType,ControlOperationStatus,\
 //! EnablementStatus,DriftStatus")` on this crate's `smithy-model/`: `ENABLE_CONTROL` |
 //! `DISABLE_CONTROL` | `UPDATE_ENABLED_CONTROL` | `RESET_ENABLED_CONTROL`, `SUCCEEDED` |
@@ -99,12 +107,22 @@ fn identifiers(records: &[serde_json::Value]) -> Vec<String> {
     sorted
 }
 
-/// The catalog controls a caller may enable that declare NO enablement parameters, in
-/// catalog order.
-fn enablable_without_parameters() -> Vec<&'static CatalogControl> {
+/// The catalog controls a caller may enable whose reset starts an operation: the ones AWS
+/// Control Tower implements with something other than a service control policy, in catalog
+/// order.
+fn resettable_controls() -> Vec<&'static CatalogControl> {
     CONTROL_CATALOG
         .iter()
-        .filter(|control| control.enablable && control.parameters.is_empty())
+        .filter(|control| control.enablable && !control.implemented_with_service_control_policy())
+        .collect()
+}
+
+/// The catalog controls a caller may enable that AWS Control Tower implements WITH a service
+/// control policy, which are the ones a reset does not work for, in catalog order.
+fn service_control_policy_controls() -> Vec<&'static CatalogControl> {
+    CONTROL_CATALOG
+        .iter()
+        .filter(|control| control.enablable && control.implemented_with_service_control_policy())
         .collect()
 }
 
@@ -116,15 +134,15 @@ fn enablable_with_parameters() -> Vec<&'static CatalogControl> {
         .collect()
 }
 
-/// The `index`th enablable control declaring no parameters, wrapping round the catalog so a
-/// row never depends on the catalog's length.
-fn plain_control(index: usize) -> &'static CatalogControl {
-    let plain = enablable_without_parameters();
+/// The `index`th enablable control a reset works for, wrapping round the catalog so a row
+/// never depends on the catalog's length.
+fn resettable_control(index: usize) -> &'static CatalogControl {
+    let resettable = resettable_controls();
     assert!(
-        !plain.is_empty(),
-        "the catalog must publish a control a caller may enable that declares no parameters"
+        !resettable.is_empty(),
+        "the catalog must publish a control a caller may enable that a reset works for"
     );
-    plain[index % plain.len()]
+    resettable[index % resettable.len()]
 }
 
 /// A control the catalog publishes WITH parameters, which is what a configured row enables.
@@ -160,84 +178,51 @@ fn parameters_of(
 
 /// One row of the reset table.
 struct Row {
-    case: &'static str,
+    case: String,
     control_identifier: String,
     target_identifier: String,
     /// The `parameters` member `EnableControl` is given; `None` omits it, which configures
     /// the control with nothing.
     initial: Option<serde_json::Value>,
-    /// A configuration applied by an `UpdateEnabledControl` BEFORE the reset, so the
-    /// configuration a reset re-deploys is not only the one an enablement wrote.
-    updated: Option<serde_json::Value>,
 }
 
-/// The reset table: the rows differ along what the rule generalises over — the entry count
-/// of the configuration being re-deployed (none, one, every key the control declares), the
-/// `Document` kind its values carry ("a key/value pair, where Key is of type String and
-/// Value is of type Document"), which catalog control is enabled, the ARN form the
-/// enablement named it by, and whether the configuration in place was written by the
-/// enablement or by a later update. Every row names its own control/target pair, because a
-/// control is enabled at most once per target.
+/// The reset table: EVERY enablable control a reset works for, each named by one of the two
+/// ARN forms AWS publishes for it and enabled either with no `parameters` member or with the
+/// empty list — the configurations a control that declares no parameter can carry, which is
+/// every control this catalog publishes a reset works for. Every row names its own
+/// control/target pair, because a control is enabled at most once per target.
 fn rows() -> Vec<Row> {
-    let parameterized = parameterized_control();
-    let values = [
-        serde_json::json!(["us-west-2", "eu-west-1"]),
-        serde_json::json!("arn:aws:iam::123456789012:role/exempted"),
-        serde_json::json!({ "nested": { "deep": [1, 2, 3] }, "on": true }),
-    ];
-
-    vec![
-        Row {
-            case: "a control configured with nothing, named by its control ARN",
-            control_identifier: control(plain_control(0).name),
-            target_identifier: ou("rs01"),
-            initial: None,
-            updated: None,
-        },
-        Row {
-            case: "a control enabled with an empty list, named by its control catalog ARN",
-            control_identifier: catalog_arn(plain_control(1).catalog_id),
-            target_identifier: ou("rs02"),
-            initial: Some(serde_json::json!([])),
-            updated: None,
-        },
-        Row {
-            case: "a control configured with one of the parameters it declares",
-            control_identifier: control(parameterized.name),
-            target_identifier: ou("rs03"),
-            initial: Some(parameters_of(parameterized, 1, &values)),
-            updated: None,
-        },
-        Row {
-            case: "a control configured with every parameter it declares",
-            control_identifier: catalog_arn(parameterized.catalog_id),
-            target_identifier: ou("rs04"),
-            initial: Some(parameters_of(
-                parameterized,
-                parameterized.parameters.len(),
-                &values,
-            )),
-            updated: None,
-        },
-        Row {
-            case: "a control whose configuration a later update wrote",
-            control_identifier: control(parameterized.name),
-            target_identifier: ou("rs05"),
-            initial: Some(parameters_of(parameterized, 1, &values)),
-            updated: Some(parameters_of(
-                parameterized,
-                parameterized.parameters.len(),
-                &[serde_json::json!("updated"), serde_json::json!(7)],
-            )),
-        },
-        Row {
-            case: "a control an update left configured with nothing",
-            control_identifier: control(parameterized.name),
-            target_identifier: ou("rs06"),
-            initial: Some(parameters_of(parameterized, 2, &values)),
-            updated: Some(serde_json::json!([])),
-        },
-    ]
+    resettable_controls()
+        .into_iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let by_catalog_arn = index % 2 == 1;
+            let empty_list = (index / 2) % 2 == 1;
+            Row {
+                case: format!(
+                    "{}: named by its {}, enabled with {}",
+                    entry.name,
+                    if by_catalog_arn {
+                        "control catalog ARN"
+                    } else {
+                        "control ARN"
+                    },
+                    if empty_list {
+                        "an empty parameters list"
+                    } else {
+                        "no parameters member"
+                    },
+                ),
+                control_identifier: if by_catalog_arn {
+                    catalog_arn(entry.catalog_id)
+                } else {
+                    control(entry.name)
+                },
+                target_identifier: ou(&format!("rs{index:02}")),
+                initial: empty_list.then(|| serde_json::json!([])),
+            }
+        })
+        .collect()
 }
 
 /// RULE: `ResetEnabledControl` starts an asynchronous `RESET_ENABLED_CONTROL` operation
@@ -264,19 +249,6 @@ async fn a_reset_redeploys_the_configuration_the_control_already_carries() {
 
     // The enables are asynchronous too, so wait for them: a control still being deployed
     // refuses a reset as a conflict (asserted separately below).
-    tokio::time::sleep(past_the_settle_span()).await;
-
-    // The rows that ask for it have their configuration rewritten by an update first.
-    for (row, arn) in &enabled {
-        if let Some(parameters) = &row.updated {
-            let updated = update(&router, arn, parameters.clone()).await;
-            assert_eq!(
-                updated.status, 200,
-                "case {:?}: the update before the reset expected 200, got {} body {:?}",
-                row.case, updated.status, updated.body
-            );
-        }
-    }
     tokio::time::sleep(past_the_settle_span()).await;
 
     let mut started: Vec<(Row, String, String, Vec<serde_json::Value>)> = Vec::new();
@@ -436,19 +408,14 @@ async fn a_reset_redeploys_the_configuration_the_control_already_carries() {
 #[tokio::test]
 async fn each_reset_starts_its_own_operation() {
     let router = emulator();
-    let parameterized = parameterized_control();
-    let configured_at_enable = parameters_of(
-        parameterized,
-        parameterized.parameters.len(),
-        &[
-            serde_json::json!(["us-west-2"]),
-            serde_json::json!("one"),
-            serde_json::json!(true),
-        ],
-    );
+    // A control a reset works for. Every control the catalog publishes WITH parameters is
+    // implemented with a service control policy, so the configuration a repeat re-deploys
+    // here is the empty one this control carries.
+    let resettable = resettable_control(0);
+    let configured_at_enable = serde_json::json!([]);
     let (arn, enable_operation) = enable_with(
         &router,
-        &control(parameterized.name),
+        &control(resettable.name),
         &ou("rp01"),
         Some(configured_at_enable.clone()),
     )
@@ -507,41 +474,27 @@ async fn each_reset_starts_its_own_operation() {
 /// operation; once the clock has made it due the same request is accepted.
 #[tokio::test]
 async fn a_reset_overlapping_an_operation_in_flight_is_a_conflict() {
-    let parameterized = parameterized_control();
-    let identifier = control(parameterized.name);
-    let enabled_with = parameters_of(parameterized, 1, &[serde_json::json!(["us-west-2"])]);
-    let differing = parameters_of(parameterized, 1, &[serde_json::json!(["eu-west-1"])]);
+    let resettable = resettable_control(0);
+    let identifier = control(resettable.name);
 
-    // `case` and which call is left in flight when the reset arrives.
+    // `case` and which call is left in flight when the reset arrives. An update is not among
+    // them: a control declaring no parameter has no configuration to supply that differs
+    // from the one it carries, and every control the catalog publishes WITH parameters is
+    // one a reset does not work for at all — where the refusal is the documented one
+    // whatever is in flight, asserted in the service-control-policy case below.
     for (index, (case, in_flight)) in [
         ("while the enable is in flight", "enable"),
-        ("while an update is in flight", "update"),
         ("while another reset is in flight", "reset"),
     ]
     .into_iter()
     .enumerate()
     {
         let router = emulator();
-        let (arn, enable_operation) = enable_with(
-            &router,
-            &identifier,
-            &ou(&format!("cf{index:02}")),
-            Some(enabled_with.clone()),
-        )
-        .await;
+        let (arn, enable_operation) =
+            enable_with(&router, &identifier, &ou(&format!("cf{index:02}")), None).await;
 
         let blocking = match in_flight {
             "enable" => enable_operation.clone(),
-            "update" => {
-                tokio::time::sleep(past_the_settle_span()).await;
-                let first = update(&router, &arn, differing.clone()).await;
-                assert_eq!(
-                    first.status, 200,
-                    "case {case:?}: the update expected 200, got {} body {:?}",
-                    first.status, first.body
-                );
-                first.string("operationIdentifier")
-            }
             _ => {
                 tokio::time::sleep(past_the_settle_span()).await;
                 let first = reset(&router, &arn).await;
@@ -680,5 +633,178 @@ async fn an_identifier_no_enabled_control_matches_is_not_found() {
     assert!(
         control_operations(&router, resets_only()).await.is_empty(),
         "a refused reset must append no RESET_ENABLED_CONTROL record"
+    );
+}
+
+/// The documented refusal, all of it: the modelled `ValidationException` (400), a message
+/// naming the control the request could not be served for, and that the call started
+/// nothing.
+fn assert_documented_refusal(refused: &Answer, case: &str, control_name: &str) {
+    assert_eq!(
+        (refused.status, refused.error_code.as_deref()),
+        (400, Some("ValidationException")),
+        "case {case:?}: expected 400 ValidationException, got {:?} body {:?}",
+        (refused.status, refused.error_code.as_deref()),
+        refused.body
+    );
+    let message = refused.string("message");
+    assert!(
+        message.contains(control_name) && message.contains("SCP"),
+        "case {case:?}: expected a message naming control {control_name} and the \
+         implementation a reset does not work for, got {message:?}"
+    );
+    assert!(
+        refused.body.get("operationIdentifier").is_none(),
+        "case {case:?}: a refused reset must mint no operation, got {:?}",
+        refused.body
+    );
+}
+
+/// RULE: `ResetEnabledControl` does not work for a control AWS Control Tower implements with
+/// a service control policy, so a reset of an enablement of such a control is refused with
+/// the modelled `ValidationException` (400): it starts no operation, appends no record to the
+/// control operation log and leaves the enablement exactly as it was. Asserted over EVERY
+/// enablable control the catalog publishes with that implementation, named by both ARN forms
+/// AWS publishes for a control, configured with every parameter it declares as well as with
+/// none, and read both while its enablement is still deploying and once it is deployed.
+#[tokio::test]
+async fn a_control_implemented_with_a_service_control_policy_cannot_be_reset() {
+    let router = emulator();
+    let policy_controls = service_control_policy_controls();
+    assert!(
+        !policy_controls.is_empty(),
+        "the catalog must publish a control a caller may enable that AWS Control Tower \
+         implements with a service control policy"
+    );
+
+    let values = [
+        serde_json::json!(["us-west-2", "eu-west-1"]),
+        serde_json::json!("arn:aws:iam::123456789012:role/exempted"),
+        serde_json::json!({ "nested": { "deep": [1, 2, 3] }, "on": true }),
+    ];
+
+    // Two rows per such control: one naming it by its control ARN with no `parameters`
+    // member, one naming it by its control catalog ARN carrying every parameter it declares
+    // (the empty list for a control that declares none), so neither the identifier's form
+    // nor the configuration in place moves the answer.
+    let mut cases: Vec<(String, String, String, Option<serde_json::Value>)> = Vec::new();
+    for entry in &policy_controls {
+        cases.push((
+            format!(
+                "{}: named by its control ARN, configured with nothing",
+                entry.name
+            ),
+            entry.name.to_string(),
+            control(entry.name),
+            None,
+        ));
+        cases.push((
+            format!(
+                "{}: named by its control catalog ARN, configured with every parameter it \
+                 declares",
+                entry.name
+            ),
+            entry.name.to_string(),
+            catalog_arn(entry.catalog_id),
+            Some(parameters_of(entry, entry.parameters.len(), &values)),
+        ));
+    }
+
+    let mut enabled: Vec<(String, String, String, String)> = Vec::new();
+    for (index, (case, control_name, control_identifier, initial)) in
+        cases.into_iter().enumerate()
+    {
+        let (arn, enable_operation) = enable_with(
+            &router,
+            &control_identifier,
+            &ou(&format!("sc{index:02}")),
+            initial,
+        )
+        .await;
+
+        // The restriction is a property of the control the enablement applies rather than of
+        // the enablement's state, so it is already the answer while the enable is in flight
+        // — where a control a reset works for earns the 409 instead.
+        let refused = reset(&router, &arn).await;
+        assert_documented_refusal(
+            &refused,
+            &format!("{case}, while the enable is in flight"),
+            &control_name,
+        );
+
+        enabled.push((case, control_name, arn, enable_operation));
+    }
+
+    tokio::time::sleep(past_the_settle_span()).await;
+
+    for (case, control_name, arn, enable_operation) in &enabled {
+        let configured_before = configured(&router, arn).await;
+        let refused = reset(&router, arn).await;
+        assert_documented_refusal(
+            &refused,
+            &format!("{case}, once the control is deployed"),
+            control_name,
+        );
+
+        let untouched = details(&router, arn).await;
+        assert_eq!(
+            (
+                status(&untouched),
+                last_operation(&untouched),
+                drift_dimensions(&untouched),
+                configured(&router, arn).await,
+            ),
+            (
+                Some("SUCCEEDED"),
+                Some(enable_operation.as_str()),
+                (Some("IN_SYNC"), Some("IN_SYNC"), Some("IN_SYNC")),
+                configured_before,
+            ),
+            "case {case:?}: a refused reset must leave the enablement exactly as the enable \
+             left it, got {untouched:?}"
+        );
+    }
+
+    // An operation of this service's OWN in flight against such a control does not change
+    // the answer either: the configurable control the catalog publishes is one a reset does
+    // not work for, so an `UpdateEnabledControl` can be mid-flight when the reset arrives.
+    if let Some(configurable) = policy_controls
+        .iter()
+        .find(|entry| !entry.parameters.is_empty())
+    {
+        let case = format!("{}: while an update is in flight", configurable.name);
+        let (arn, _) = enable_with(
+            &router,
+            &control(configurable.name),
+            &ou("scup"),
+            Some(parameters_of(configurable, 1, &values)),
+        )
+        .await;
+        tokio::time::sleep(past_the_settle_span()).await;
+
+        let started = update(
+            &router,
+            &arn,
+            parameters_of(
+                configurable,
+                configurable.parameters.len(),
+                &[serde_json::json!(["eu-west-1"]), serde_json::json!("changed")],
+            ),
+        )
+        .await;
+        assert_eq!(
+            started.status, 200,
+            "case {case:?}: the update expected 200, got {} body {:?}",
+            started.status, started.body
+        );
+
+        let refused = reset(&router, &arn).await;
+        assert_documented_refusal(&refused, &case, configurable.name);
+    }
+
+    assert!(
+        control_operations(&router, resets_only()).await.is_empty(),
+        "a reset a control implemented with a service control policy refuses must append no \
+         RESET_ENABLED_CONTROL record"
     );
 }

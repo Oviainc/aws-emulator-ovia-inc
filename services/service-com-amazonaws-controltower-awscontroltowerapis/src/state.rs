@@ -2686,6 +2686,23 @@ pub fn is_baseline_arn(identifier: &str) -> bool {
         })
 }
 
+/// How AWS Control Tower IMPLEMENTS a control: the mechanism it deploys to a target to put
+/// the control into effect.
+///
+/// A published property of the control itself, not of one enablement, and the one thing
+/// `ResetEnabledControl` is restricted by — it "does not work for controls implemented with
+/// SCPs" — so it belongs beside the control's other published facts in [`CONTROL_CATALOG`]
+/// and is read off the catalog entry a `controlIdentifier` resolves to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlImplementation {
+    /// A preventive control: AWS Control Tower puts it into effect by attaching a service
+    /// control policy to the target, so what enforces the control is the policy.
+    ServiceControlPolicy,
+    /// A detective control: AWS Control Tower puts it into effect by deploying an AWS
+    /// Config rule that assesses the resources in the target.
+    ConfigRule,
+}
+
 /// One entry of this service's CONTROL catalog: a control AWS Control Tower publishes,
 /// which a caller names with a `controlIdentifier`.
 ///
@@ -2723,6 +2740,16 @@ pub struct CatalogControl {
     /// them — but cannot be enabled by a caller, so a request naming one is refused rather
     /// than persisted. False for exactly those.
     pub enablable: bool,
+    /// The mechanism AWS Control Tower implements this control with.
+    ///
+    /// `ResetEnabledControl` "does not work for controls implemented with SCPs", so a reset
+    /// of an enablement of a control carrying [`ControlImplementation::ServiceControlPolicy`]
+    /// is refused rather than started. The preventive controls — the ones whose published
+    /// behaviour is to disallow or prohibit an action, the Region deny control among them —
+    /// are the ones AWS Control Tower implements with a service control policy; the
+    /// detective controls, which report on resources rather than block anything, are
+    /// implemented with an AWS Config rule.
+    pub implementation: ControlImplementation,
     /// The `EnabledControlParameter` keys this control DECLARES, in a stable order.
     ///
     /// `EnabledControlParameter$key` is "a string denoting the parameter applied to the
@@ -2741,6 +2768,12 @@ impl CatalogControl {
     pub fn declares_parameter(&self, key: &str) -> bool {
         self.parameters.contains(&key)
     }
+
+    /// Whether AWS Control Tower implements this control with a service control policy,
+    /// which is the property `ResetEnabledControl` is restricted by.
+    pub fn implemented_with_service_control_policy(&self) -> bool {
+        self.implementation == ControlImplementation::ServiceControlPolicy
+    }
 }
 
 /// The controls this emulator publishes, in a stable order.
@@ -2751,6 +2784,16 @@ impl CatalogControl {
 /// `EnableControl` applies to a `controlIdentifier` has catalog entries on both sides of
 /// it. It is not AWS's whole catalogue of hundreds of controls: a name outside this set
 /// names no control this emulator has.
+///
+/// Both implementations are published on both sides of `enablable`, so every rule a call
+/// applies to a control's IMPLEMENTATION — `ResetEnabledControl`'s restriction to controls
+/// not implemented with SCPs — has catalog entries on both sides of it too. Which
+/// implementation an entry carries follows the behaviour the controls reference guide
+/// publishes for that control: a control that blocks an action is preventive, hence a
+/// service control policy, while one that only reports on resources is detective, hence an
+/// AWS Config rule — a distinction the names do not settle, since the detective
+/// `AWS-GR_S3_BUCKET_PUBLIC_READ_PROHIBITED` reports on buckets rather than blocking
+/// anything.
 pub const CONTROL_CATALOG: &[CatalogControl] = &[
     // The mandatory controls: AWS Control Tower applies these to every governed account
     // itself, so a caller may not enable them.
@@ -2758,166 +2801,198 @@ pub const CONTROL_CATALOG: &[CatalogControl] = &[
         name: "AWS-GR_AUDIT_BUCKET_DELETION_PROHIBITED",
         catalog_id: "5kvme4m5d2b4d7dcf0fqkdmxt3",
         enablable: false,
+        implementation: ControlImplementation::ServiceControlPolicy,
         parameters: &[],
     },
     CatalogControl {
         name: "AWS-GR_AUDIT_BUCKET_ENCRYPTION_ENABLED",
         catalog_id: "9h2jr6twx1pzn4bq8sm0lyvke5",
         enablable: false,
+        implementation: ControlImplementation::ServiceControlPolicy,
         parameters: &[],
     },
     CatalogControl {
         name: "AWS-GR_AUDIT_BUCKET_POLICY_CHANGES_PROHIBITED",
         catalog_id: "3fxn7cgp5rmbt8wzd1qkj4shvy",
         enablable: false,
+        implementation: ControlImplementation::ServiceControlPolicy,
         parameters: &[],
     },
     CatalogControl {
         name: "AWS-GR_CLOUDTRAIL_CHANGE_PROHIBITED",
         catalog_id: "2mpr9vxtc6gln6tjb5hwqz0dkf",
         enablable: false,
+        implementation: ControlImplementation::ServiceControlPolicy,
         parameters: &[],
     },
     CatalogControl {
         name: "AWS-GR_CLOUDTRAIL_ENABLED",
         catalog_id: "1ysc3nmpx8rvg0kdwt2fqhj7zm",
         enablable: false,
+        implementation: ControlImplementation::ConfigRule,
         parameters: &[],
     },
     CatalogControl {
         name: "AWS-GR_CLOUDTRAIL_VALIDATION_ENABLED",
         catalog_id: "7dcf0fqkdmxt35kvme4m5d2b4d",
         enablable: false,
+        implementation: ControlImplementation::ConfigRule,
         parameters: &[],
     },
     CatalogControl {
         name: "AWS-GR_CONFIG_CHANGE_PROHIBITED",
         catalog_id: "4bq8sm0lyvke59h2jr6twx1pzn",
         enablable: false,
+        implementation: ControlImplementation::ServiceControlPolicy,
         parameters: &[],
     },
     CatalogControl {
         name: "AWS-GR_CONFIG_ENABLED",
         catalog_id: "8wzd1qkj4shvy3fxn7cgp5rmbt",
         enablable: false,
+        implementation: ControlImplementation::ConfigRule,
         parameters: &[],
     },
     CatalogControl {
         name: "AWS-GR_IAM_ROLE_CHANGE_PROHIBITED",
         catalog_id: "6tjb5hwqz0dkf2mpr9vxtc6gln",
         enablable: false,
+        implementation: ControlImplementation::ServiceControlPolicy,
         parameters: &[],
     },
     CatalogControl {
         name: "AWS-GR_LOG_GROUP_POLICY",
         catalog_id: "0kdwt2fqhj7zm1ysc3nmpx8rvg",
         enablable: false,
+        implementation: ControlImplementation::ServiceControlPolicy,
         parameters: &[],
     },
     CatalogControl {
         name: "AWS-GR_SNS_SUBSCRIPTION_CHANGE_PROHIBITED",
         catalog_id: "5kvme4m5d2b4d9h2jr6twx1pzn",
         enablable: false,
+        implementation: ControlImplementation::ServiceControlPolicy,
         parameters: &[],
     },
-    // The strongly recommended and elective controls, which a caller enables on a target.
+    // The strongly recommended and elective DETECTIVE controls, which a caller enables on a
+    // target and which report on the resources in it through an AWS Config rule.
     CatalogControl {
         name: "AWS-GR_ENCRYPTED_VOLUMES",
         catalog_id: "7dcf0fqkdmxt34bq8sm0lyvke5",
         enablable: true,
+        implementation: ControlImplementation::ConfigRule,
         parameters: &[],
     },
     CatalogControl {
         name: "AWS-GR_EBS_OPTIMIZED_INSTANCE",
         catalog_id: "9h2jr6twx1pzn3fxn7cgp5rmbt",
         enablable: true,
+        implementation: ControlImplementation::ConfigRule,
         parameters: &[],
     },
     CatalogControl {
         name: "AWS-GR_EC2_VOLUME_INUSE_CHECK",
         catalog_id: "4bq8sm0lyvke58wzd1qkj4shvy",
         enablable: true,
+        implementation: ControlImplementation::ConfigRule,
         parameters: &[],
     },
     CatalogControl {
         name: "AWS-GR_RDS_INSTANCE_PUBLIC_ACCESS_CHECK",
         catalog_id: "3fxn7cgp5rmbt2mpr9vxtc6gln",
         enablable: true,
+        implementation: ControlImplementation::ConfigRule,
         parameters: &[],
     },
     CatalogControl {
         name: "AWS-GR_RDS_STORAGE_ENCRYPTED",
         catalog_id: "8wzd1qkj4shvy6tjb5hwqz0dkf",
         enablable: true,
+        implementation: ControlImplementation::ConfigRule,
         parameters: &[],
     },
     CatalogControl {
         name: "AWS-GR_RESTRICTED_COMMON_PORTS",
         catalog_id: "2mpr9vxtc6gln1ysc3nmpx8rvg",
         enablable: true,
+        implementation: ControlImplementation::ConfigRule,
         parameters: &[],
     },
     CatalogControl {
         name: "AWS-GR_ROOT_ACCOUNT_MFA_ENABLED",
         catalog_id: "6tjb5hwqz0dkf0kdwt2fqhj7zm",
         enablable: true,
+        implementation: ControlImplementation::ConfigRule,
         parameters: &[],
     },
     CatalogControl {
         name: "AWS-GR_S3_BUCKET_PUBLIC_READ_PROHIBITED",
         catalog_id: "1ysc3nmpx8rvg5kvme4m5d2b4d",
         enablable: true,
+        implementation: ControlImplementation::ConfigRule,
         parameters: &[],
     },
     CatalogControl {
         name: "AWS-GR_S3_BUCKET_PUBLIC_WRITE_PROHIBITED",
         catalog_id: "0kdwt2fqhj7zm7dcf0fqkdmxt3",
         enablable: true,
+        implementation: ControlImplementation::ConfigRule,
         parameters: &[],
     },
     CatalogControl {
         name: "AWS-GR_MFA_ENABLED_FOR_IAM_CONSOLE_ACCESS",
         catalog_id: "5kvme4m5d2b4d4bq8sm0lyvke5",
         enablable: true,
+        implementation: ControlImplementation::ConfigRule,
         parameters: &[],
     },
+    // The strongly recommended and elective PREVENTIVE controls: a caller enables these
+    // too, and AWS Control Tower blocks the actions they name with a service control
+    // policy.
     CatalogControl {
         name: "AWS-GR_RESTRICT_ROOT_USER",
         catalog_id: "7dcf0fqkdmxt33fxn7cgp5rmbt",
         enablable: true,
+        implementation: ControlImplementation::ServiceControlPolicy,
         parameters: &[],
     },
     CatalogControl {
         name: "AWS-GR_RESTRICT_ROOT_USER_ACCESS_KEYS",
         catalog_id: "9h2jr6twx1pzn8wzd1qkj4shvy",
         enablable: true,
+        implementation: ControlImplementation::ServiceControlPolicy,
         parameters: &[],
     },
     CatalogControl {
         name: "AWS-GR_DISALLOW_CROSS_REGION_NETWORKING",
         catalog_id: "4bq8sm0lyvke52mpr9vxtc6gln",
         enablable: true,
+        implementation: ControlImplementation::ServiceControlPolicy,
         parameters: &[],
     },
     CatalogControl {
         name: "AWS-GR_DISALLOW_VPC_INTERNET_ACCESS",
         catalog_id: "3fxn7cgp5rmbt6tjb5hwqz0dkf",
         enablable: true,
+        implementation: ControlImplementation::ServiceControlPolicy,
         parameters: &[],
     },
     CatalogControl {
         name: "AWS-GR_DISALLOW_VPN_CONNECTIONS",
         catalog_id: "8wzd1qkj4shvy1ysc3nmpx8rvg",
         enablable: true,
+        implementation: ControlImplementation::ServiceControlPolicy,
         parameters: &[],
     },
     // The Region deny control: permitted by the member's own documentation despite not
-    // being one of the strongly recommended or elective controls, and the one control this
-    // catalog publishes with parameters.
+    // being one of the strongly recommended or elective controls, the one control this
+    // catalog publishes with parameters, and preventive — it denies actions outside the
+    // Regions it allows, which a service control policy is what enforces.
     CatalogControl {
         name: "AWS-GR_REGION_DENY",
         catalog_id: "2mpr9vxtc6gln0kdwt2fqhj7zm",
         enablable: true,
+        implementation: ControlImplementation::ServiceControlPolicy,
         parameters: &["AllowedRegions", "ExemptedPrincipalArns", "ExemptedActions"],
     },
 ];

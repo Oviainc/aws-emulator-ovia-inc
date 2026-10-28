@@ -185,6 +185,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The documented restriction on this operation: a reset "does not work for
+        // controls implemented with SCPs". Which mechanism puts a control into effect is a
+        // published property of the CONTROL — the same catalog `EnableControl` resolves a
+        // `controlIdentifier` against records it — so the enablement's control is resolved
+        // back to its catalog entry and a preventive one is refused rather than
+        // re-deployed. That depends only on which control the request named, not on this
+        // enablement's current state, so it is settled before anything else about the
+        // enablement is. A `control_identifier` the catalog no longer publishes restricts
+        // nothing: this service knows no mechanism for it.
+        if let Some(catalog) = crate::state::resolve_control(&control.control_identifier)
+            .filter(|catalog| catalog.implemented_with_service_control_policy())
+        {
+            return Err(ResetEnabledControlErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "enabled control {} applies control {}, which is implemented with a \
+                         service control policy; ResetEnabledControl does not work for \
+                         controls implemented with SCPs",
+                        control.arn, catalog.name
+                    ),
+                },
+            )
+            .into());
+        }
+
         // An operation still changing this control owns it: a re-deployment starting now
         // would apply on top of a change only half applied, which is the inconsistent
         // state `ConflictException` reports. That is a property of the control rather than
@@ -208,9 +233,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // record due. What it deploys is the configuration the control already carries —
         // which is why this call takes no `parameters` and changes none; what the
         // re-deployment settles is the control's drift against that configuration.
-        //
-        // Nothing this service stores records HOW a control is implemented, so no request
-        // is refused here for naming one implemented with a service control policy.
         let Some(operation_identifier) = store.record_enabled_control_reset(&control.arn, now)
         else {
             // The ARN was read out of this same locked store above, so nothing can have

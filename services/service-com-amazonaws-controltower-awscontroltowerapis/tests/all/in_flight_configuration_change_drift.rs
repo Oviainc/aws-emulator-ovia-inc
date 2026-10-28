@@ -27,9 +27,11 @@
 //!   enablement that reports no assessment when deployed must report none mid-change
 //!   either);
 //! * for an enabled control, `UpdateEnabledControl` with a configuration that differs from
-//!   the deployed one (a key added, a value re-valued, the configuration cleared) and
-//!   `ResetEnabledControl`, over a control the catalog publishes with parameters and one it
-//!   publishes without.
+//!   the deployed one (a key added, a value re-valued, the configuration cleared) over a
+//!   control the catalog publishes with parameters, and `ResetEnabledControl` over two
+//!   controls whose reset starts an operation at all — a reset of a control implemented
+//!   with a service control policy is refused rather than started, which is
+//!   `enabled_control_reset`'s own case.
 //!
 //! The baselines, their versions and their parameter keys are read off
 //! `state::BASELINE_CATALOG`, and the controls and their parameter keys off
@@ -411,17 +413,27 @@ fn parameters_of(
 }
 
 /// The control table: each kind of call that starts deploying a configuration to a control
-/// already deployed, over a catalog control that declares parameters and one that declares
-/// none.
+/// already deployed, over a catalog control that declares parameters and the controls a
+/// reset starts an operation against.
 fn control_rows() -> Vec<ControlRow> {
     let parameterized = CONTROL_CATALOG
         .iter()
         .find(|control| control.enablable && !control.parameters.is_empty())
         .expect("the catalog must publish an enablable control that declares parameters");
-    let plain = CONTROL_CATALOG
+    // `ResetEnabledControl` "does not work for controls implemented with SCPs", so only a
+    // control the catalog publishes with another implementation has a reset to be in flight.
+    let resettable: Vec<&CatalogControl> = CONTROL_CATALOG
         .iter()
-        .find(|control| control.enablable && control.parameters.is_empty())
-        .expect("the catalog must publish an enablable control that declares no parameters");
+        .filter(|control| control.enablable && !control.implemented_with_service_control_policy())
+        .collect();
+    let first_resettable = resettable
+        .first()
+        .copied()
+        .expect("the catalog must publish an enablable control a reset works for");
+    let last_resettable = resettable
+        .last()
+        .copied()
+        .expect("the catalog must publish an enablable control a reset works for");
     let values = [
         serde_json::json!(["us-west-2", "eu-west-1"]),
         serde_json::json!("arn:aws:iam::123456789012:role/exempted"),
@@ -455,17 +467,20 @@ fn control_rows() -> Vec<ControlRow> {
             change: ControlChange::Update(serde_json::json!([])),
         },
         ControlRow {
-            case: format!("{}: a reset of a configured control", parameterized.name),
-            control_identifier: control(parameterized.name),
+            case: format!("{}: a reset of a deployed control", first_resettable.name),
+            control_identifier: control(first_resettable.name),
             target_identifier: ou("ifd4"),
-            initial: Some(parameters_of(parameterized, 1, &values)),
+            initial: None,
             change: ControlChange::Reset,
         },
         ControlRow {
-            case: format!("{}: a reset of a control configured with nothing", plain.name),
-            control_identifier: control(plain.name),
+            case: format!(
+                "{}: a reset of a control enabled with an empty configuration",
+                last_resettable.name
+            ),
+            control_identifier: control(last_resettable.name),
             target_identifier: ou("ifd5"),
-            initial: None,
+            initial: Some(serde_json::json!([])),
             change: ControlChange::Reset,
         },
     ]
