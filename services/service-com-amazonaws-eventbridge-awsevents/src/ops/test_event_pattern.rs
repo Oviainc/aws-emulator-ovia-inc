@@ -9,10 +9,16 @@
 //! interpreter rule matching uses ([`crate::state::event_pattern`]), so a pattern
 //! tested here and the same pattern on a rule agree about every event. A pattern
 //! the language does not admit is the modelled `InvalidEventPatternException` —
-//! "clients validate patterns with TestEventPattern before PutRule" — and so is
-//! an `Event` that is not an event envelope
-//! ([`crate::state::parse_event_envelope`]), which is the only other thing this
-//! operation can refuse.
+//! "clients validate patterns with TestEventPattern before PutRule".
+//!
+//! The two members are refused SEPARATELY, because they are two different things
+//! to fix: `EventPattern` is the pattern, so only it can be an invalid event
+//! pattern, while `Event` is the event envelope
+//! ([`crate::state::parse_event_envelope`]) and an envelope the service cannot
+//! read is a bad request member — the refusal every other unacceptable member of
+//! this service answers with (`ValidationException`, HTTP 400). A client
+//! branching on the pattern error therefore never has to wonder which of the two
+//! it must change.
 //!
 //! The pattern is read as this operation's own validator reads it
 //! ([`crate::state::event_pattern::Validator::Checker`]): it admits and refuses
@@ -142,7 +148,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::event_pattern::Validator::Checker,
         )
         .map_err(invalid_event_pattern)?;
-        let event = crate::state::parse_event_envelope(&input.event).map_err(invalid_event_pattern)?;
+        let event = crate::state::parse_event_envelope(&input.event).map_err(invalid_event)?;
 
         // The same budget one `PutEvents` entry is matched under, so a pattern
         // that is too costly to evaluate is refused here exactly as routing
@@ -168,4 +174,14 @@ fn invalid_event_pattern(reason: String) -> TestEventPatternError {
         message: Some(reason),
     })
     .into()
+}
+
+/// The `Event` member is not an event envelope this service can match a pattern
+/// against: the request member is at fault, not the pattern, so it is refused as
+/// one, carrying the message the envelope check worded for it
+/// ([`crate::state::parse_event_envelope`]). The model declares no client-input
+/// error for this operation beyond the pattern one, so the refusal travels on the
+/// channel that answers HTTP 400 `ValidationException`.
+fn invalid_event(message: String) -> TestEventPatternError {
+    crate::scaffolded::Scaffolded::validation(message)
 }
