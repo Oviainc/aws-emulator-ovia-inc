@@ -46,7 +46,7 @@ const ADDRESS_TYPES: [&str; 2] = ["OPERATING_ADDRESS", "SHIPPING_ADDRESS"];
 /// `DELIVERED`, `COMPLETED`, `ERROR`. A row is built for each, so the two in which an
 /// order is finished (`ORDER_STATUS_SETTLED`) and the nine in which it is still
 /// outstanding are all covered, including the ones no call of this API reaches.
-const ORDER_STATUSES: [&str; 11] = [
+pub(crate) const ORDER_STATUSES: [&str; 11] = [
     "RECEIVED",
     "PENDING",
     "PROCESSING",
@@ -107,7 +107,7 @@ async fn stored_address(outposts: &Outposts, site_id: &str, address_type: &str) 
 /// [`crate::order_cancellation`] finishes an order through. The transitions the clock
 /// still owed go with it, so the status the row set is the one the next call reads.
 /// Every assertion still goes over the wire.
-fn set_order_status(outposts: &Outposts, order_id: &str, status: &str, case: &str) {
+pub(crate) fn set_order_status(outposts: &Outposts, order_id: &str, status: &str, case: &str) {
     let store = outposts.store();
     let mut store = store.lock();
     let record = store

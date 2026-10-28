@@ -107,6 +107,8 @@ mod list_buckets;
 mod listing_encoding_type;
 #[path = "all/listing_optional_members.rs"]
 mod listing_optional_members;
+#[path = "all/multipart_checksum_type.rs"]
+mod multipart_checksum_type;
 #[path = "all/multipart_part_upload.rs"]
 mod multipart_part_upload;
 #[path = "all/multipart_upload_abort.rs"]
@@ -157,6 +159,8 @@ mod object_listing_encoding;
 mod object_listing_v1;
 #[path = "all/object_partial_reads.rs"]
 mod object_partial_reads;
+#[path = "all/object_replication.rs"]
+mod object_replication;
 #[path = "all/object_retention.rs"]
 mod object_retention;
 #[path = "all/object_restore.rs"]

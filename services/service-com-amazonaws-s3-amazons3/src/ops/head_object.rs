@@ -588,15 +588,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .restore
                 .as_ref()
                 .and_then(|restore| restore.header_value(now)),
+            // The replication of THIS version, from the record its write left on it — the
+            // same renderer `GetObject` reports it through, so a HEAD and a GET of one
+            // version cannot disagree. An object no replication rule covers carries no
+            // record and reports no status.
+            replication_status: object
+                .replication
+                .as_ref()
+                .map(|replication| replication.status_at(now).to_string()),
             // Every remaining member is documented as reported only when something this
             // slice does not serve is true of the object: it is a delete marker
             // (`DeleteMarker`, which a delete records none of), it is in an
             // S3 Intelligent-Tiering archive tier (`ArchiveStatus`, which no stored object
             // here is: a restore is asked for on a storage CLASS), metadata could not be
             // decoded (`MissingMeta`), a customer-provided key encrypted it
-            // (`SSECustomer*`, which `PutObject` refuses), it is replicated
-            // (`ReplicationStatus`), it is locked (`ObjectLock*`) or the bucket is
-            // Requester Pays (`RequestCharged`).
+            // (`SSECustomer*`, which `PutObject` refuses), it is locked (`ObjectLock*`) or
+            // the bucket is Requester Pays (`RequestCharged`).
             checksum_crc32: reported.crc32,
             checksum_crc32_c: reported.crc32c,
             checksum_crc64_nvme: reported.crc64nvme,

@@ -185,15 +185,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
-        // A connector whose deletion already completed is forgotten here, so
-        // this call reports it as absent rather than deleting it twice.
-        let Some((connector, qualified)) = store.settled_mut(&input.identifier, now) else {
-            // The operation is `@idempotent` and "calling delete on a connector
+        // Resolving the identifier materialises a deletion that has fallen due,
+        // so everything below sees the connector as it stands at `now`.
+        if store.settled_mut(&input.identifier, now).is_none() {
+            // "This operation is idempotent — calling delete on a connector
             // that is already deleting or has been deleted succeeds without
-            // error" — but `Arn`, `Name` and `Id` are @required answers that a
-            // forgotten record cannot supply, and this emulator does not invent
-            // them. The modelled refusal for an identifier that names nothing
-            // is what it answers.
+            // error", so the deletion this account already completed is
+            // reported as done, from the identity that deletion left behind.
+            // `ResourceNotFoundException` is for "the specified network
+            // connector does not exist" — an identifier that named no connector
+            // in this account and Region.
+            let Some((deleted, qualified)) = store.completed_deletion(&input.identifier) else {
+                return Err(DeleteNetworkConnectorErrorModeled::ResourceNotFoundException(
+                    crate::state::connector_not_found(&input.identifier),
+                )
+                .into());
+            };
+            return Ok(DeleteNetworkConnectorOutput {
+                arn: deleted.arn.clone(),
+                name: deleted.name,
+                id: deleted.id,
+                // The answer reports the version the request addressed, and an
+                // unqualified request addressed the connector itself.
+                version_arn: qualified.map(|version| format!("{}:{version}", deleted.arn)),
+                version: qualified,
+                // The deletion removed the configuration along with the
+                // versions holding it, so there is none left to report.
+                configuration: None,
+                operator_role: None,
+                // The state the record carried when its deletion completed:
+                // "the State field is typically DELETING after this call".
+                state: Some(deleted.state),
+            });
+        }
+        // The same resolution, under the same lock and the same instant, now as
+        // the record this call deletes from.
+        let Some((connector, qualified)) = store.settled_mut(&input.identifier, now) else {
             return Err(DeleteNetworkConnectorErrorModeled::ResourceNotFoundException(
                 crate::state::connector_not_found(&input.identifier),
             )
@@ -214,6 +241,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
             let Some(version) = connector.versions.remove(&version_number) else {
+                // The same idempotency rule, one level down: a version number
+                // this connector minted and no longer holds was removed by an
+                // earlier delete, so deleting it again "succeeds without
+                // error". Version numbers are minted in order and the latest is
+                // never removed on its own, so a number below the latest named
+                // a version of this connector and a number above it never did.
+                if version_number < connector.latest_version {
+                    return Ok(DeleteNetworkConnectorOutput {
+                        arn: connector.arn.clone(),
+                        name: connector.name.clone(),
+                        id: connector.id.clone(),
+                        version_arn: Some(connector.version_arn(version_number)),
+                        version: Some(version_number),
+                        // The earlier delete removed the version holding this
+                        // configuration, so there is none left to report.
+                        configuration: None,
+                        operator_role: None,
+                        // The connector itself was unaffected either time.
+                        state: Some(connector.state.clone()),
+                    });
+                }
                 return Err(DeleteNetworkConnectorErrorModeled::ResourceNotFoundException(
                     crate::state::connector_not_found(&input.identifier),
                 )

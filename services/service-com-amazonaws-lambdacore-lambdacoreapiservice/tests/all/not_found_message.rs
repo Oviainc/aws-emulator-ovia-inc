@@ -26,6 +26,12 @@
 //!   deleted (so the record the handler would have read is gone), and a version-qualified
 //!   identifier naming a version a live connector does not hold.
 //!
+//! `DeleteNetworkConnector` is the one exception, and only for the connector that existed:
+//! it is modelled `idempotent: true` and documented to succeed "on a connector that is
+//! already deleting or has been deleted", so a deletion this account completed is reported
+//! as done rather than refused. The deleted-connector case below asserts that too, so the
+//! two halves of the rule are stated together.
+//!
 //! The harness (router, request helpers) is the lifecycle suite's; it is `pub(crate)` there
 //! so every suite drives the emulator the same way.
 
@@ -75,6 +81,16 @@ impl Addressed {
                 !matches!(operation, Self::Update | Self::ListVersions)
                     || !names_a_version(identifier)
             })
+            .collect()
+    }
+
+    /// The operations of [`Addressed::reaching`] that REPORT on a connector, so they refuse
+    /// an identifier whose record is gone. `DeleteNetworkConnector` is left out because the
+    /// model marks it `idempotent: true`: a deletion already completed succeeds.
+    fn reporting(identifier: &str) -> Vec<Self> {
+        Self::reaching(identifier)
+            .into_iter()
+            .filter(|operation| !matches!(operation, Self::Delete))
             .collect()
     }
 }
@@ -223,7 +239,7 @@ async fn a_deleted_connector_is_refused_naming_the_identifier_that_was_asked_for
         ("its version-qualified ARN", format!("{arn}:1")),
     ];
     for (case, identifier) in &forms {
-        for operation in Addressed::reaching(identifier) {
+        for operation in Addressed::reporting(identifier) {
             let answer = send(&router, operation, identifier).await;
             assert_not_found(
                 &format!("a deleted connector addressed by {case} through {operation:?}"),
@@ -237,6 +253,22 @@ async fn a_deleted_connector_is_refused_naming_the_identifier_that_was_asked_for
                  connector id {id:?} the caller never used, got {message:?}"
             );
         }
+
+        // The other half of the rule: the one operation the model marks
+        // `idempotent: true` reports the completed deletion instead of refusing it.
+        let repeated = send(&router, Addressed::Delete, identifier).await;
+        assert_eq!(
+            repeated.status, 202,
+            "case {case:?}: a repeated DeleteNetworkConnector of a deleted connector \
+             succeeds, got {} with {:?}",
+            repeated.status, repeated.body
+        );
+        assert_eq!(
+            text(&repeated.body, "/Id"),
+            id,
+            "case {case:?}: the repeated delete reports the deleted connector's id, got {:?}",
+            repeated.body["Id"]
+        );
     }
 }
 

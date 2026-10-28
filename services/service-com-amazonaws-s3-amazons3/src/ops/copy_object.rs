@@ -788,6 +788,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
             // A copy is one write of the whole object, so the destination is not assembled
             // from parts even when the SOURCE was: its bytes arrive as one object.
             parts: Vec::new(),
+            // Replication is settled by the store once this version is recorded, from the
+            // DESTINATION bucket's own replication configuration — the copy is a write into
+            // that bucket, so it is replicated like any other write into it.
+            replication: None,
             body: source_object.body.clone(),
         };
         if replaces_metadata {
@@ -867,6 +871,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
                 )));
             }
         }
+
+        // The replication the DESTINATION bucket's own configuration owes for the version
+        // this copy stored — the same seam `PutObject` replicates its write through.
+        let _ = store.replicate_write(&input.bucket, &input.key);
 
         // The object event this copy produced, and the notifications the destination
         // bucket's configuration owes for it — the same seam `PutObject` publishes its
