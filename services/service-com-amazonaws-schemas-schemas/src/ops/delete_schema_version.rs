@@ -223,12 +223,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and its other versions survive, and the freed number is never minted again.
         // `DeleteSchema` is what removes a schema with all of its versions.
         //
-        // The schema's `LastModified` is deliberately NOT advanced: it reports when a
-        // definition of the schema was last WRITTEN, which taking one away does not
-        // change, and what a caller reads to see which versions a schema holds is the
-        // version set itself (`ListSchemaVersions`, and `ListSchemas`' `VersionCount`),
-        // both read from the stored versions rather than from a timestamp.
-        if !schema.remove_version_named(&input.schema_version) {
+        // Taking a definition away is a write TO the schema, so the removal records it
+        // as the schema's `LastModified` (`Schema::remove_version`, the one recorder
+        // every write to a schema goes through): what a version-less read resolves to
+        // and how many versions the schema holds both change, and the member reports
+        // when the schema was last modified. A request that removes nothing writes
+        // nothing, so the member does not move for the refusal below.
+        let now = ::std::time::SystemTime::now();
+        if !schema.remove_version_named(&input.schema_version, now) {
             return Err(DeleteSchemaVersionErrorModeled::NotFoundException(
                 crate::state::schema_version_not_found(
                     &input.registry_name,

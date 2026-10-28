@@ -286,7 +286,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         // omits it asks for no change — whether or not the same call
                         // also writes a new definition.
                         if let Some(description) = input.description {
-                            schema.description = Some(description);
+                            schema.set_description(description, now);
                         }
                         let minted = schema.add_version(content, r#type, now).version;
                         if let Some(token) = input.client_token_id.clone() {
@@ -302,9 +302,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if let Some(description) = input.description {
                     // The same write as above: the description belongs to the schema,
                     // so this is what every later read of it reports, whichever
-                    // version that read selects.
-                    schema.description = Some(description);
-                    schema.last_modified = now;
+                    // version that read selects — and, being a write to the schema, it
+                    // is recorded as the schema's `LastModified` by the one recorder
+                    // every write to a schema goes through.
+                    schema.set_description(description, now);
                 }
                 // The newest version the schema still HOLDS: a version a delete took
                 // out is reported by nothing afterwards, and a schema every version of
