@@ -216,8 +216,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resuming from it skips exactly the rules already reported.
         let keyed: Vec<(String, String)> =
             rule_arns.into_iter().map(|arn| (arn.clone(), arn)).collect();
-        let (page, next_token) =
-            crate::state::paginate(keyed, input.next_token.as_deref(), input.max_results);
+        let (page, next_token) = crate::state::paginate(
+            &crate::state::page_scope_within(Self::NAME, &pricing_plan_arn),
+            keyed,
+            input.next_token.as_deref(),
+            input.max_results,
+        )
+        .map_err(ListPricingRulesAssociatedToPricingPlanErrorModeled::ValidationException)?;
 
         Ok(ListPricingRulesAssociatedToPricingPlanOutput {
             // "The billing period for which the pricing rule associations are
