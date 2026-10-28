@@ -189,12 +189,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `PackageID` is "the internal ID of the package you want to delete": an id that
         // names no package of this account addresses nothing this call can remove, which
-        // is the modelled missing-resource refusal — and that is also what a repeat of a
+        // is refused as the bad input value it is — and that is also what a repeat of a
         // delete whose removal has landed gets, the record being gone.
         let package = store.packages.get_mut(&input.package_id).ok_or_else(|| {
-            DeletePackageErrorModeled::ResourceNotFoundException(package_not_found(
-                &input.package_id,
-            ))
+            DeletePackageErrorModeled::ValidationException(package_not_found())
         })?;
 
         // The content is not gone the instant this call returns: the package is being

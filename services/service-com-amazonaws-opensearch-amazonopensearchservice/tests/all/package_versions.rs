@@ -37,8 +37,8 @@ use std::time::SystemTime;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
-    PACKAGE_STATUS_AVAILABLE, PACKAGE_STATUS_COPYING, PACKAGE_TYPE_TXT_DICTIONARY,
-    PACKAGE_VERSION_QUOTA,
+    PACKAGE_NOT_FOUND, PACKAGE_STATUS_AVAILABLE, PACKAGE_STATUS_COPYING,
+    PACKAGE_TYPE_TXT_DICTIONARY, PACKAGE_VERSION_QUOTA,
 };
 
 use super::domain_lifecycle::{error_code, Answer, Emulator, PREFIX, SETTLE_WAIT};
@@ -546,8 +546,8 @@ async fn a_copy_in_flight_serialises_updates_of_one_package() {
     );
 }
 
-/// An id that names no package of this account is refused on both paths that resolve
-/// one, over the id forms the model's pattern admits.
+/// An id that names no package of this account is refused as a bad input value on both
+/// paths that resolve one, over the id forms the model's pattern admits.
 #[tokio::test]
 async fn an_unknown_package_id_is_not_found_on_every_path_that_resolves_one() {
     let emulator = Emulator::new();
@@ -575,34 +575,34 @@ async fn an_unknown_package_id_is_not_found_on_every_path_that_resolves_one() {
         )
         .await;
         assert_eq!(
-            refused.status, 409,
-            "case {case}: expected 409, got {} with {:?}",
+            refused.status, 400,
+            "case {case}: expected 400, got {} with {:?}",
             refused.status, refused.body
         );
         assert_eq!(
             error_code(&refused),
-            "ResourceNotFoundException",
-            "case {case}: expected ResourceNotFoundException, got {:?}",
+            "ValidationException",
+            "case {case}: expected ValidationException, got {:?}",
             refused.body
         );
         assert_eq!(
             refused.body["message"].as_str(),
-            Some(format!("Package not found: {id}").as_str()),
-            "case {case}: the refusal names the id that resolved to nothing, got {:?}",
+            Some(PACKAGE_NOT_FOUND),
+            "case {case}: the refusal carries the fixed id-free sentence, got {:?}",
             refused.body
         );
 
         let case = format!("GetPackageVersionHistory({id})");
         let refused = history(&emulator, id, &[]).await;
         assert_eq!(
-            refused.status, 409,
-            "case {case}: expected 409, got {} with {:?}",
+            refused.status, 400,
+            "case {case}: expected 400, got {} with {:?}",
             refused.status, refused.body
         );
         assert_eq!(
             error_code(&refused),
-            "ResourceNotFoundException",
-            "case {case}: expected ResourceNotFoundException, got {:?}",
+            "ValidationException",
+            "case {case}: expected ValidationException, got {:?}",
             refused.body
         );
     }

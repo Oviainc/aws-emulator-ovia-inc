@@ -27,15 +27,15 @@
 //! * a package's scope is bounded: the bound is accepted, one past it is refused
 //!   whether asked for in one call or by adding to a scope already at it, and a
 //!   request that withdraws access is accepted at the bound;
-//! * an id that names no package of the account is refused as not found, over every
-//!   form the `PackageID` pattern admits.
+//! * an id that names no package of the account is refused as a bad input value, over
+//!   every form the `PackageID` pattern admits.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_opensearch_amazonopensearchservice::ops::types::{
     PACKAGE_SCOPE_OPERATION_ENUM_VALUES, PACKAGE_TYPE_VALUES,
 };
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
-    PACKAGE_SCOPE_QUOTA, PACKAGE_TYPE_ZIP_PLUGIN,
+    PACKAGE_NOT_FOUND, PACKAGE_SCOPE_QUOTA, PACKAGE_TYPE_ZIP_PLUGIN,
 };
 
 use super::domain_lifecycle::{error_code, Answer, Emulator, PREFIX, SETTLE_WAIT};
@@ -527,7 +527,7 @@ async fn a_package_is_shared_with_at_most_the_bounded_number_of_users() {
 }
 
 #[tokio::test]
-async fn an_id_that_names_no_package_of_the_account_is_refused_as_not_found() {
+async fn an_id_that_names_no_package_of_the_account_is_refused_as_a_bad_value() {
     let emulator = Emulator::new();
     entitle(&emulator);
     // A real package, so what the rows below are refused for is the id they name and
@@ -547,6 +547,12 @@ async fn an_id_that_names_no_package_of_the_account_is_refused_as_not_found() {
     for id in ids {
         let case = format!("UpdatePackageScope({id:?})");
         let answer = update_scope(&emulator, id, "ADD", &[ACCOUNT_A]).await;
-        refused(&answer, &case, 409, "ResourceNotFoundException");
+        refused(&answer, &case, 400, "ValidationException");
+        assert_eq!(
+            answer.body["message"].as_str(),
+            Some(PACKAGE_NOT_FOUND),
+            "case {case}: expected the fixed id-free sentence, got {:?}",
+            answer.body
+        );
     }
 }

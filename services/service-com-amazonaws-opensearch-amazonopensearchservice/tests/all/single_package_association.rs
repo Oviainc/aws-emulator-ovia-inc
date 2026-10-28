@@ -332,8 +332,8 @@ async fn a_prerequisite_is_satisfied_only_by_an_association_the_domain_already_h
     // package the domain does not have, a package nothing created, and the
     // associating package itself. A call that links a SINGLE package associates
     // nothing else, so nothing but an association the domain already has can satisfy
-    // one. `ResourceNotFoundException` is modelled at HTTP 409 for this operation,
-    // `ValidationException` at 400.
+    // one. `ValidationException` is modelled at HTTP 400 for this operation, and a
+    // prerequisite id that resolves to no package is a bad input value like the rest.
     let table: Vec<(&str, Value, u16, &str)> = vec![
         (
             "a prerequisite the domain already has",
@@ -350,8 +350,8 @@ async fn a_prerequisite_is_satisfied_only_by_an_association_the_domain_already_h
         (
             "a package nothing created",
             json!([UNKNOWN_PACKAGE_ID]),
-            409,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
         (
             "the associating package itself",
@@ -420,11 +420,11 @@ async fn a_request_that_cannot_be_served_associates_nothing() {
     let copying = create_package(&emulator, "still-copying", PACKAGE_TYPES[0]).await;
 
     // One row per way a request cannot be served, each with the status and error code
-    // the model declares for it: `ResourceNotFoundException` at HTTP 409,
-    // `ConflictException` at 409 and `ValidationException` at 400. A `DomainName` that
-    // names no domain is the CLIENT-INPUT refusal: linking a package resolves the
-    // domain as part of reading the request, so the name is a value the caller has to
-    // fix.
+    // the model declares for it: `ConflictException` at HTTP 409 and
+    // `ValidationException` at 400. A `DomainName` that names no domain and a
+    // `PackageID` that resolves to no package are both the CLIENT-INPUT refusal:
+    // linking a package resolves both as part of reading the request, so each is a
+    // value the caller has to fix.
     let table: Vec<(&str, &str, &str, Value, u16, &str)> = vec![
         (
             "a domain nothing created",
@@ -439,8 +439,8 @@ async fn a_request_that_cannot_be_served_associates_nothing() {
             domain,
             UNKNOWN_PACKAGE_ID,
             json!({}),
-            409,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
         (
             "a package whose content is still being copied",

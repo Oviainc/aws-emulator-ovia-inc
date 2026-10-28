@@ -196,14 +196,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The associations reported are the ones of ONE package, so an id that names no
-        // package of this account has no set to report: the modelled missing-resource
-        // refusal rather than an empty page. A package the account DOES hold that no
+        // package of this account has no set to report: refused as the bad input value it
+        // is rather than as an empty page. A package the account DOES hold that no
         // domain has reports the empty set, which is what tells a caller the package is
         // associated with nothing.
         let package = store.packages.get(&input.package_id).ok_or_else(|| {
-            ListDomainsForPackageErrorModeled::ResourceNotFoundException(package_not_found(
-                &input.package_id,
-            ))
+            ListDomainsForPackageErrorModeled::ValidationException(package_not_found())
         })?;
 
         // Order-stable, because the store is keyed by domain name and a domain holds at

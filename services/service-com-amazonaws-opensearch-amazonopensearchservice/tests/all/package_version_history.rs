@@ -32,7 +32,7 @@ use service_com_amazonaws_opensearch_amazonopensearchservice::ops::types::{
     PackageConfiguration, PACKAGE_TYPE_VALUES, REQUIREMENT_LEVEL_VALUES,
 };
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
-    PackageVersionRecord, FIRST_PACKAGE_VERSION, PACKAGE_TYPE_ZIP_PLUGIN,
+    PackageVersionRecord, FIRST_PACKAGE_VERSION, PACKAGE_NOT_FOUND, PACKAGE_TYPE_ZIP_PLUGIN,
 };
 
 use super::domain_lifecycle::{error_code, Answer, Emulator, PREFIX, SETTLE_WAIT};
@@ -568,27 +568,27 @@ async fn a_request_that_cannot_be_served_reports_no_history() {
     let row = &rows()[0];
     let id = created(&emulator, row).await;
 
-    // An id that names no package of this account names no history: both forms the
-    // model's `PackageID` pattern admits, the caller's own and the one addressing a
-    // package the service publishes.
+    // An id that names no package of this account names no history, and is refused as
+    // the bad input value it is: both forms the model's `PackageID` pattern admits, the
+    // caller's own and the one addressing a package the service publishes.
     for unknown in [UNKNOWN_PACKAGE_ID, SERVICE_PACKAGE_ID] {
         let case = format!("GetPackageVersionHistory({unknown:?})");
         let answer = history(&emulator, unknown, "").await;
         assert_eq!(
-            answer.status, 409,
-            "case {case}: expected the modelled 409, got {} with {:?}",
+            answer.status, 400,
+            "case {case}: expected the modelled 400, got {} with {:?}",
             answer.status, answer.body
         );
         assert_eq!(
             error_code(&answer),
-            "ResourceNotFoundException",
-            "case {case}: expected the modelled not-found refusal, got {:?}",
+            "ValidationException",
+            "case {case}: expected the modelled validation refusal, got {:?}",
             answer.body
         );
         assert_eq!(
             answer.body["message"].as_str(),
-            Some(format!("Package not found: {unknown}").as_str()),
-            "case {case}: expected the refusal to name the package it could not resolve, got {:?}",
+            Some(PACKAGE_NOT_FOUND),
+            "case {case}: expected the fixed id-free sentence, got {:?}",
             answer.body
         );
     }

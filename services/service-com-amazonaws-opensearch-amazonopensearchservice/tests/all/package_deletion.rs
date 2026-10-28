@@ -32,7 +32,7 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
-    PACKAGE_QUOTA, PACKAGE_STATUS_AVAILABLE, PACKAGE_STATUS_DELETING,
+    PACKAGE_NOT_FOUND, PACKAGE_QUOTA, PACKAGE_STATUS_AVAILABLE, PACKAGE_STATUS_DELETING,
 };
 
 use super::domain_lifecycle::{create_baseline, error_code, Answer, Emulator, PREFIX, SETTLE_WAIT};
@@ -111,18 +111,26 @@ async fn described_status(emulator: &Emulator, package_id: &str, case: &str) -> 
         .and_then(|details| details["PackageStatus"].as_str().map(str::to_owned))
 }
 
-/// Assert `answer` is the modelled missing-package refusal: `ResourceNotFoundException`,
-/// which this service's model declares at HTTP 409.
+/// Assert `answer` is the refusal of a `PackageID` that resolves to no package of this
+/// account: the service treats it as a bad input value, so `ValidationException` at the
+/// HTTP 400 this service's model declares it at, carrying the fixed sentence for that
+/// condition and no id.
 fn assert_not_found(answer: &Answer, case: &str) {
     assert_eq!(
-        answer.status, 409,
-        "case {case}: expected 409, got {} with {:?}",
+        answer.status, 400,
+        "case {case}: expected 400, got {} with {:?}",
         answer.status, answer.body
     );
     assert_eq!(
         error_code(answer),
-        "ResourceNotFoundException",
-        "case {case}: expected the modelled missing-resource refusal, got {:?}",
+        "ValidationException",
+        "case {case}: expected the modelled validation refusal, got {:?}",
+        answer.body
+    );
+    assert_eq!(
+        answer.body["message"].as_str(),
+        Some(PACKAGE_NOT_FOUND),
+        "case {case}: expected the fixed id-free sentence, got {:?}",
         answer.body
     );
 }
