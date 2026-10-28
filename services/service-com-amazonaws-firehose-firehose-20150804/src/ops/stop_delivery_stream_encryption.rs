@@ -172,10 +172,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 StopDeliveryStreamEncryptionErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "Firehose stream {} not found",
-                            input.delivery_stream_name
-                        )),
+                        // Scoped to the account, and NOT to the name that was probed — see
+                        // `crate::service::not_found_message`.
+                        message: Some(crate::service::not_found_message()),
                     },
                 )
                 .into(),
@@ -187,21 +186,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // change has not settled yet, are both "already in use and not available for this
         // operation" — the same two refusals `StartDeliveryStreamEncryption` makes.
         if stream.status != crate::state::StreamStatus::Active {
-            return Err(in_use(format!(
-                "Firehose stream {} is {} and server-side encryption cannot be changed \
-                 until it is {}",
-                stream.name,
+            return Err(in_use(crate::service::encryption_blocked_by_stream_message(
+                crate::service::EncryptionChange::Disable,
+                &stream.name,
                 stream.status.as_wire(),
-                crate::state::StreamStatus::Active.as_wire()
             )));
         }
         if stream.encryption_change_in_flight() {
-            return Err(in_use(format!(
-                "server-side encryption for Firehose stream {} is {} and cannot be \
-                 changed until that change settles",
-                stream.name,
-                stream.encryption_status().unwrap_or_default()
-            )));
+            return Err(in_use(
+                crate::service::encryption_blocked_by_encryption_message(
+                    crate::service::EncryptionChange::Disable,
+                    &stream.name,
+                    stream.encryption_status().unwrap_or_default(),
+                ),
+            ));
         }
 
         // There has to be encryption in force for this call to disable. A stream that was
@@ -218,11 +216,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 StopDeliveryStreamEncryptionErrorModeled::InvalidArgumentException(
                     InvalidArgumentException {
-                        message: Some(format!(
-                            "Cannot disable encryption on firehose: {} when encryption is \
-                             already disabled",
-                            stream.name
-                        )),
+                        // The same sentence an in-flight change is refused with, stated for
+                        // the encryption status that leaves nothing to disable — a stream
+                        // that was never encrypted carries the documented `DISABLED` one.
+                        message: Some(
+                            crate::service::encryption_blocked_by_encryption_message(
+                                crate::service::EncryptionChange::Disable,
+                                &stream.name,
+                                stream
+                                    .encryption_status()
+                                    .unwrap_or(crate::state::ENCRYPTION_DISABLED),
+                            ),
+                        ),
                     },
                 )
                 .into(),

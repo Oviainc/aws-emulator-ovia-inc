@@ -216,20 +216,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        if let Some(why) = crate::state::details_rejection(input.benefit_application_details.as_ref())
-        {
-            return Err(UpdateBenefitApplicationErrorModeled::ValidationException(
-                ValidationException {
-                    message: why.clone(),
-                    reason: crate::state::VALIDATION_REASON_FIELD.to_string(),
-                    field_list: Some(crate::state::validation_field(
-                        "BenefitApplicationDetails",
-                        &why,
-                        crate::state::VALIDATION_CODE_INVALID_VALUE,
-                    )),
-                },
-            )
-            .into());
+        // `BenefitApplicationDetails` is an unconstrained `Document`, so the bounds on a
+        // document this update would store are this service's own, refused exactly as the
+        // create refuses them — see [`crate::state::details_refusal`].
+        if let Some(refusal) = crate::state::details_refusal(
+            crate::state::DETAILS_MEMBER,
+            input.benefit_application_details.as_ref(),
+        ) {
+            return Err(UpdateBenefitApplicationErrorModeled::ValidationException(refusal).into());
         }
 
         let principal = crate::state::caller_principal(ctx);

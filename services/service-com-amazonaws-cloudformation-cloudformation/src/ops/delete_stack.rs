@@ -12,10 +12,10 @@
 //! gets the no-op success a delete already under way has always answered.
 //!
 //! A deletion the service cannot carry out because the stack publishes an export another
-//! live stack still imports is TAKEN and then cancelled: the model declares no error for
-//! it, so the stack reports `DELETE_IN_PROGRESS` and is then returned to the status it was
-//! in, carrying the reason naming the export and the importing stack, with nothing of it
-//! disposed of.
+//! live stack still imports is TAKEN and then FAILS: the model declares no error for it, so
+//! the stack reports `DELETE_IN_PROGRESS` and then the terminal `DELETE_FAILED`, carrying
+//! the reason naming the export and the importing stack, with nothing of it disposed of — so
+//! a caller waiting on the deletion reads a terminal outcome it can stop on.
 //!
 //! Deleting a stack also DELETES THE RESOURCES it created, newest first, through the
 //! services that own them ([`crate::state::provisioning`]); a resource one of those
@@ -237,9 +237,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // An exported output value that another stack still IMPORTS cannot be removed:
             // deleting the stack that publishes it would break the cross-stack reference
             // the importing stack resolved. The model declares no error for it, so the CALL
-            // is not refused — the deletion workflow below is what declines it, which is
-            // read off this store's own index (`ListImports` reports the same relation) and
-            // so lets the identical call through as soon as the last importer is gone.
+            // is not refused — the deletion workflow below is what FAILS, which is read off
+            // this store's own index (`ListImports` reports the same relation) and so lets
+            // the identical call through as soon as the last importer is gone.
             let export_in_use = store.export_in_use(previous);
             // "For stacks in the DELETE_FAILED state, a list of resource logical IDs that
             // are associated with the resources you want to retain." A stack in any other
@@ -313,18 +313,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
             // "All events initiated by a given stack operation are assigned the same client
             // request token": the attempt is this stack's operation whether it goes through
-            // or is cancelled, so the token it runs under is the stack's from here on.
+            // or fails, so the token it runs under is the stack's from here on.
             stack.client_request_token = Some(client_request_token.clone());
-            // The deletion was taken and then CANCELLED: the stack reports the attempt, is
-            // returned to the status it settles to carrying the reason the attempt was
-            // abandoned for, and none of its resources is touched — so the caller polling
-            // the delete reads which export, and which importer, blocked it. The delete's
-            // own configuration is NOT recorded: a cancelled deletion leaves the stack's
-            // deletion mode, deployment configuration and role exactly as they were.
+            // The deletion was taken and then FAILED: the stack reports the attempt and then
+            // the TERMINAL failed status carrying the reason it could not be carried out,
+            // and none of its resources is touched — so the caller polling the delete reads
+            // an outcome it can stop on, and which export and which importer blocked it. The
+            // delete's own configuration is NOT recorded: a deletion that removed nothing
+            // leaves the stack's deletion mode, deployment configuration and role exactly as
+            // they were.
             if let Some((export_name, importing_stack_name)) = export_in_use {
-                stack.begin_canceled_deletion(
+                stack.begin_failing_deletion(
                     now,
-                    crate::state::delete_canceled_export_in_use_reason(
+                    crate::state::export_in_use_delete_failure_reason(
                         &export_name,
                         &importing_stack_name,
                     ),

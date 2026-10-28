@@ -11,13 +11,18 @@
 //! * "If the destination type is the same, Firehose merges the configuration parameters
 //!   specified with the destination configuration that already exists on the delivery
 //!   stream. If any of the parameters are not specified in the call, the existing values
-//!   are retained";
+//!   are retained" — including inside a block the model says survives being switched off
+//!   ([`merge_data_format_conversion`]);
 //! * "If the destination type is not the same ... Firehose does not merge any parameters.
 //!   In this case, all parameters must be specified" — a required member the new
 //!   configuration lacks is refused with `InvalidArgumentException`;
-//! * "Switching between Amazon OpenSearch Service and other services is not supported. For
+//! * some destination types take no part in a type change at all ([`FixedType`]):
+//!   "Switching between Amazon OpenSearch Service and other services is not supported. For
 //!   an Amazon OpenSearch Service destination, you can only update to another Amazon
-//!   OpenSearch Service destination" — also `InvalidArgumentException`;
+//!   OpenSearch Service destination", and an HTTP endpoint destination is the same. A
+//!   switch across one of those boundaries is refused as UNSUPPORTED
+//!   (`InvalidArgumentException`), before any parameter of the new type is looked at, so
+//!   supplying more of them cannot make it succeed;
 //! * every `RoleARN` the update names is resolved against IAM, and every `BucketARN` it
 //!   names against Amazon S3, before the stored destination is rewritten: an update onto a
 //!   role Firehose cannot assume or a bucket that does not exist is refused with
@@ -248,10 +253,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(stream) = store.streams.get_mut(&input.delivery_stream_name) else {
             return Err(UpdateDestinationErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "Firehose stream {} not found",
-                        input.delivery_stream_name
-                    )),
+                    // Scoped to the account, and NOT to the name that was probed — see
+                    // `crate::service::not_found_message`.
+                    message: Some(crate::service::not_found_message()),
                 },
             )
             .into());
@@ -263,11 +267,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if stream.status != crate::state::StreamStatus::Active {
             return Err(UpdateDestinationErrorModeled::ResourceInUseException(
                 ResourceInUseException {
-                    message: Some(format!(
-                        "Firehose stream {} is in status {}; its destination cannot be \
-                         updated until it is ACTIVE",
-                        input.delivery_stream_name,
-                        stream.status.as_wire()
+                    message: Some(crate::service::update_blocked_message(
+                        &stream.name,
+                        stream.status.as_wire(),
                     )),
                 },
             )
@@ -281,12 +283,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 UpdateDestinationErrorModeled::ConcurrentModificationException(
                     ConcurrentModificationException {
-                        message: Some(format!(
-                            "Cannot update Firehose stream {}: the current version id is {} \
-                             and the specified version id is {}",
-                            input.delivery_stream_name,
-                            stream.version_id,
-                            input.current_delivery_stream_version_id
+                        message: Some(crate::service::version_mismatch_message(
+                            &stream.name,
+                            &stream.version_id.to_string(),
+                            &input.current_delivery_stream_version_id,
                         )),
                     },
                 )
@@ -302,10 +302,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The id is a well-formed `DestinationId` (the model's pattern is checked
             // before this handler runs) that names no destination of this stream, so it is
             // an input parameter with a value that is not valid for this stream.
-            return Err(invalid_argument(format!(
-                "destination id {} is not a destination of Firehose stream {}",
-                input.destination_id, input.delivery_stream_name
-            )));
+            return Err(invalid_argument(
+                crate::service::destination_not_found_message(&input.destination_id),
+            ));
         };
 
         destination.config = applied(&destination.config, update)?;
@@ -524,37 +523,58 @@ impl DestinationUpdateKind {
         }
     }
 
-    /// Which Amazon OpenSearch Service offering this destination type belongs to, if any.
-    fn search_offering(&self) -> Option<SearchOffering> {
+    /// The destination type this update switches a destination TO, when that is a type a
+    /// stream cannot be switched into or out of.
+    fn fixed_type(&self) -> Option<FixedType> {
         match self {
             Self::Elasticsearch(_) | Self::AmazonOpenSearchService(_) => {
-                Some(SearchOffering::Domain)
+                Some(FixedType::SearchDomain)
             }
-            Self::AmazonOpenSearchServerless(_) => Some(SearchOffering::Serverless),
+            Self::AmazonOpenSearchServerless(_) => Some(FixedType::SearchServerless),
+            Self::HttpEndpoint(_) => Some(FixedType::HttpEndpoint),
             _ => None,
         }
     }
 }
 
-/// The Amazon OpenSearch Service offerings a destination can belong to. Switching a
-/// destination between an offering and anything outside it is not supported, so these are
-/// the groups a type change may not cross.
-#[derive(PartialEq, Eq)]
-enum SearchOffering {
+/// A destination type a stream can NEITHER be switched into NOR out of.
+///
+/// `UpdateDestination` changes a destination's type ("Use this operation to change the
+/// destination type"), but not every type takes part: a switch that crosses the boundary of
+/// one of these is refused outright, whichever — and however many — parameters of the new
+/// type the update carries, so the refusal never reads as an invitation to supply more.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum FixedType {
     /// Amazon OpenSearch Service (domains) — the `Elasticsearch` and
     /// `Amazonopensearchservice` destination types, the same offering under its old and
-    /// new names.
-    Domain,
+    /// new names, so a switch between those two does not cross this boundary.
+    SearchDomain,
     /// The Serverless offering for Amazon OpenSearch Service.
-    Serverless,
+    SearchServerless,
+    /// An HTTP endpoint destination.
+    HttpEndpoint,
 }
 
-/// Which Amazon OpenSearch Service offering a STORED destination belongs to, if any.
-fn stored_search_offering(config: &crate::state::DestinationConfigKind) -> Option<SearchOffering> {
+impl FixedType {
+    /// The sentence a switch across this type's boundary is refused with, which names the
+    /// destination types the switch may not cross rather than the parameters it carried.
+    fn refusal(self) -> &'static str {
+        match self {
+            Self::SearchDomain | Self::SearchServerless => {
+                crate::service::UNSUPPORTED_SEARCH_TYPE_CHANGE
+            }
+            Self::HttpEndpoint => crate::service::UNSUPPORTED_HTTP_ENDPOINT_TYPE_CHANGE,
+        }
+    }
+}
+
+/// Which [`FixedType`] a STORED destination is, if any.
+fn stored_fixed_type(config: &crate::state::DestinationConfigKind) -> Option<FixedType> {
     use crate::state::DestinationConfigKind as Kind;
     match config {
-        Kind::Elasticsearch(_) | Kind::AmazonOpenSearchService(_) => Some(SearchOffering::Domain),
-        Kind::AmazonOpenSearchServerless(_) => Some(SearchOffering::Serverless),
+        Kind::Elasticsearch(_) | Kind::AmazonOpenSearchService(_) => Some(FixedType::SearchDomain),
+        Kind::AmazonOpenSearchServerless(_) => Some(FixedType::SearchServerless),
+        Kind::HttpEndpoint(_) => Some(FixedType::HttpEndpoint),
         _ => None,
     }
 }
@@ -705,16 +725,14 @@ fn applied(
         }
         // The destination type changes.
         (stored, update) => {
-            // "Switching between Amazon OpenSearch Service and other services is not
-            // supported. For an Amazon OpenSearch Service destination, you can only update
-            // to another Amazon OpenSearch Service destination."
-            let (from, to) = (stored_search_offering(stored), update.search_offering());
-            if (from.is_some() || to.is_some()) && from != to {
-                return Err(invalid_argument(format!(
-                    "changing the destination type to or from an Amazon OpenSearch Service \
-                     offering is not supported, so {} cannot be applied to this destination",
-                    update.member()
-                )));
+            // A type a stream can be switched neither into nor out of refuses the switch
+            // ITSELF — before any parameter of the new type is looked at, so the answer
+            // does not depend on which members the update carried.
+            let (from, to) = (stored_fixed_type(stored), update.fixed_type());
+            if from != to {
+                if let Some(fixed) = from.or(to) {
+                    return Err(invalid_argument(fixed.refusal().to_string()));
+                }
             }
             // "If the destination type is not the same ... Firehose does not merge any
             // parameters. In this case, all parameters must be specified."
@@ -930,6 +948,60 @@ fn merge_required<T: Clone>(stored: &mut T, supplied: &Option<T>) {
     }
 }
 
+/// Merge a supplied `DataFormatConversionConfiguration` into the one the destination holds.
+///
+/// Its members are merged ONE BY ONE rather than the block being taken whole, because this
+/// block's own `Enabled` says the rest of it outlives being switched off: "Defaults to
+/// true. Set it to false if you want to disable format conversion while preserving the
+/// configuration details". So an update that only turns conversion off keeps the Glue
+/// schema the stream is bound to, and the deserializer and serializer it converts with, for
+/// a later update to turn back on — and `DescribeDeliveryStream` keeps reporting them.
+///
+/// The schema binding itself is merged member-wise for the same reason the destination's
+/// own parameters are ("If any of the parameters are not specified in the call, the existing
+/// values are retained"); the deserializer and the serializer are each a choice of one
+/// format, so a supplied one stands for that whole choice.
+fn merge_data_format_conversion(
+    stored: &mut Option<DataFormatConversionConfiguration>,
+    supplied: &Option<DataFormatConversionConfiguration>,
+) {
+    let Some(supplied) = supplied.as_ref() else {
+        return;
+    };
+    let current = stored.get_or_insert_with(DataFormatConversionConfiguration::default);
+    merge_schema_configuration(
+        &mut current.schema_configuration,
+        &supplied.schema_configuration,
+    );
+    merge_optional(
+        &mut current.input_format_configuration,
+        &supplied.input_format_configuration,
+    );
+    merge_optional(
+        &mut current.output_format_configuration,
+        &supplied.output_format_configuration,
+    );
+    merge_optional(&mut current.enabled, &supplied.enabled);
+}
+
+/// Merge a supplied `SchemaConfiguration` into the stored schema binding, parameter by
+/// parameter.
+fn merge_schema_configuration(
+    stored: &mut Option<SchemaConfiguration>,
+    supplied: &Option<SchemaConfiguration>,
+) {
+    let Some(supplied) = supplied.as_ref() else {
+        return;
+    };
+    let current = stored.get_or_insert_with(SchemaConfiguration::default);
+    merge_optional(&mut current.role_arn, &supplied.role_arn);
+    merge_optional(&mut current.catalog_id, &supplied.catalog_id);
+    merge_optional(&mut current.database_name, &supplied.database_name);
+    merge_optional(&mut current.table_name, &supplied.table_name);
+    merge_optional(&mut current.region, &supplied.region);
+    merge_optional(&mut current.version_id, &supplied.version_id);
+}
+
 /// Merge an `S3DestinationUpdate` into a nested Amazon S3 configuration the destination
 /// already holds.
 fn merge_s3(stored: &mut S3DestinationConfiguration, update: &S3DestinationUpdate) {
@@ -1017,7 +1089,7 @@ fn merge_extended_s3(
         &update.s3_backup_update,
         "ExtendedS3DestinationUpdate.S3BackupUpdate",
     )?;
-    merge_optional(
+    merge_data_format_conversion(
         &mut stored.data_format_conversion_configuration,
         &update.data_format_conversion_configuration,
     );

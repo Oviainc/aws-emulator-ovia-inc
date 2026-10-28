@@ -32,6 +32,10 @@ aws-sdk-iam = { version = "1", default-features = false }
 # `BucketARN` is resolved with `HeadBucket` before `UpdateDestination` rewrites a stream's
 # destination. Only the generated client is needed — the emulator supplies the transport.
 aws-sdk-s3 = { version = "1", default-features = false }
+# The AWS SDK for KMS, driven over the same in-process callback: the `KeyARN` an encrypted
+# stream names is resolved with `DescribeKey` before the stream is reported as encrypted
+# under it.
+aws-sdk-kms = { version = "1", default-features = false }
 # `iam_trust_policy`: the one reading of an IAM trust policy, shared with every other
 # service that resolves a caller-supplied role.
 service-common = { path = "../common" }
@@ -64,6 +68,9 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The CMK an encrypted stream names is resolved against the KMS service, so the suite that
+# asserts that gate mounts KMS beside Firehose on the same engine and creates a real key.
+service-com-amazonaws-kms-trentservice = { workspace = true }
 # The destination reads of the delivery suite go through Amazon S3's own restXml wire, so
 # its listings are read with the same XML reader that service's tests use.
 quick-xml = "0.41"
