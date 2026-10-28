@@ -151,36 +151,11 @@ pub struct RedundantIngestCredential {
     pub stream_key: Option<String>,
 }
 
-// `ParticipantToken` is the ONE shape in this module whose schema is written out by
-// hand rather than produced by `#[smithy_macros::smithy(shape = ...)]`, and the reason
-// is a single trait the macro does not read: `@timestampFormat`.
-//
-// The model targets `expirationTime` at `ParticipantTokenExpirationTime`, which carries
-// `@timestampFormat("date-time")` (`smithy_query(query="shape",shape="ParticipantToken")`
-// reports `"timestampFormat": "date-time"` on that member, and its doc says "ISO 8601
-// timestamp (returned as a string)"). The vendored codegen never emits
-// `with_timestamp_format`, so a macro-built member schema reports no format and the
-// restJson1 JSON codec falls back to its protocol default, epoch seconds — a NUMBER
-// where the model, and every AWS SDK's generated deserializer for a `date-time` member,
-// requires an ISO-8601 string. The hand-written member schemas below differ from the
-// macro's output in exactly that one chain call.
-//
-// Everything else mirrors the macro's output for a structure: one `M_<MEMBER>` member
-// schema per member (index = position in the member list, with the `key`/`value` and
-// `member` sub-schemas a map and a list member carry), a `SCHEMA` naming them in order,
-// the `<SHAPE>_SCHEMA` alias, and the serialize/deserialize pair. Constraint traits are
-// deliberately absent: the validating walk runs on operation INPUTS only, and
-// `ParticipantToken` is an output shape, so the macro's captured constraints would be
-// inert here too.
-//
-// REMOVE THIS BLOCK when the vendored codegen learns `smithy.api#timestampFormat`: the
-// fix belongs there, not here, because every `@timestampFormat` member of every service
-// has the same defect and `vendor/` is outside what a fix may change. Once
-// `vendor/smithy-macros` emits `with_timestamp_format`, delete the hand-written schema,
-// the two impls and this comment, and put
-// `#[smithy_macros::smithy(shape = "com.amazonaws.ivsrealtime#ParticipantToken")]` back
-// on the struct — `tests/all/stages.rs` pins the rendering, so it fails if the attribute
-// does not carry it.
+/// `expirationTime` targets `ParticipantTokenExpirationTime`
+/// (`@timestampFormat("date-time")`), so this shape's schema comes from
+/// `ivsrt_schema_and_codec!` — see `types/date_time_wire.rs`. Member set, order and
+/// requiredness from
+/// `smithy_query(query="shape", shape="com.amazonaws.ivsrealtime#ParticipantToken")`.
 #[derive(Debug, Clone, Default)]
 pub struct ParticipantToken {
     pub participant_id: Option<String>,
@@ -192,227 +167,45 @@ pub struct ParticipantToken {
     pub expiration_time: Option<::aws_smithy_types::DateTime>,
 }
 
-#[allow(non_upper_case_globals)]
-impl ParticipantToken {
-    const SHAPE_ID: &'static str = "com.amazonaws.ivsrealtime#ParticipantToken";
-    const NAMESPACE: &'static str = "com.amazonaws.ivsrealtime";
+ivsrt_schema_and_codec!(
+    ParticipantToken,
+    PARTICIPANT_TOKEN_SCHEMA,
+    "com.amazonaws.ivsrealtime#ParticipantToken",
+    "com.amazonaws.ivsrealtime",
+    "ParticipantToken",
+    (
+        M_PARTICIPANT_ID,
+        participant_id,
+        "participantId",
+        0,
+        opt,
+        string
+    ),
+    (M_TOKEN, token, "token", 1, opt, string),
+    (M_USER_ID, user_id, "userId", 2, opt, string),
+    (M_ATTRIBUTES, attributes, "attributes", 3, opt, map_of_string),
+    (M_DURATION, duration, "duration", 4, opt, integer),
+    (
+        M_CAPABILITIES,
+        capabilities,
+        "capabilities",
+        5,
+        opt,
+        list_of_string
+    ),
+    (
+        M_EXPIRATION_TIME,
+        expiration_time,
+        "expirationTime",
+        6,
+        opt,
+        date_time
+    ),
+);
 
-    pub const M_PARTICIPANT_ID: ::aws_smithy_schema::Schema =
-        ::aws_smithy_schema::Schema::new_member(
-            ::aws_smithy_schema::ShapeId::from_static(
-                "com.amazonaws.ivsrealtime#ParticipantToken$participantId",
-                Self::NAMESPACE,
-                "participantId",
-            ),
-            ::aws_smithy_schema::ShapeType::String,
-            "participantId",
-            0,
-        );
-    pub const M_TOKEN: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
-        ::aws_smithy_schema::ShapeId::from_static(
-            "com.amazonaws.ivsrealtime#ParticipantToken$token",
-            Self::NAMESPACE,
-            "token",
-        ),
-        ::aws_smithy_schema::ShapeType::String,
-        "token",
-        1,
-    );
-    pub const M_USER_ID: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
-        ::aws_smithy_schema::ShapeId::from_static(
-            "com.amazonaws.ivsrealtime#ParticipantToken$userId",
-            Self::NAMESPACE,
-            "userId",
-        ),
-        ::aws_smithy_schema::ShapeType::String,
-        "userId",
-        2,
-    );
-    const M_ATTRIBUTES_KEY: ::aws_smithy_schema::Schema =
-        ::aws_smithy_schema::Schema::new_member(
-            ::aws_smithy_schema::ShapeId::from_static(
-                "com.amazonaws.ivsrealtime#ParticipantToken$attributes$key",
-                Self::NAMESPACE,
-                "key",
-            ),
-            ::aws_smithy_schema::ShapeType::String,
-            "key",
-            0,
-        );
-    const M_ATTRIBUTES_VALUE: ::aws_smithy_schema::Schema =
-        ::aws_smithy_schema::Schema::new_member(
-            ::aws_smithy_schema::ShapeId::from_static(
-                "com.amazonaws.ivsrealtime#ParticipantToken$attributes$value",
-                Self::NAMESPACE,
-                "value",
-            ),
-            ::aws_smithy_schema::ShapeType::String,
-            "value",
-            0,
-        );
-    pub const M_ATTRIBUTES: ::aws_smithy_schema::Schema =
-        ::aws_smithy_schema::Schema::new_member(
-            ::aws_smithy_schema::ShapeId::from_static(
-                "com.amazonaws.ivsrealtime#ParticipantToken$attributes",
-                Self::NAMESPACE,
-                "attributes",
-            ),
-            ::aws_smithy_schema::ShapeType::Map,
-            "attributes",
-            3,
-        )
-        .with_map_members(&Self::M_ATTRIBUTES_KEY, &Self::M_ATTRIBUTES_VALUE);
-    pub const M_DURATION: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
-        ::aws_smithy_schema::ShapeId::from_static(
-            "com.amazonaws.ivsrealtime#ParticipantToken$duration",
-            Self::NAMESPACE,
-            "duration",
-        ),
-        ::aws_smithy_schema::ShapeType::Integer,
-        "duration",
-        4,
-    );
-    const M_CAPABILITIES_MEMBER: ::aws_smithy_schema::Schema =
-        ::aws_smithy_schema::Schema::new_member(
-            ::aws_smithy_schema::ShapeId::from_static(
-                "com.amazonaws.ivsrealtime#ParticipantToken$capabilities$member",
-                Self::NAMESPACE,
-                "member",
-            ),
-            ::aws_smithy_schema::ShapeType::String,
-            "member",
-            0,
-        );
-    pub const M_CAPABILITIES: ::aws_smithy_schema::Schema =
-        ::aws_smithy_schema::Schema::new_member(
-            ::aws_smithy_schema::ShapeId::from_static(
-                "com.amazonaws.ivsrealtime#ParticipantToken$capabilities",
-                Self::NAMESPACE,
-                "capabilities",
-            ),
-            ::aws_smithy_schema::ShapeType::List,
-            "capabilities",
-            5,
-        )
-        .with_list_member(&Self::M_CAPABILITIES_MEMBER);
-    /// `@timestampFormat("date-time")` from `ParticipantTokenExpirationTime` — the
-    /// chain the macro cannot emit, and the whole reason this schema is hand-written.
-    pub const M_EXPIRATION_TIME: ::aws_smithy_schema::Schema =
-        ::aws_smithy_schema::Schema::new_member(
-            ::aws_smithy_schema::ShapeId::from_static(
-                "com.amazonaws.ivsrealtime#ParticipantToken$expirationTime",
-                Self::NAMESPACE,
-                "expirationTime",
-            ),
-            ::aws_smithy_schema::ShapeType::Timestamp,
-            "expirationTime",
-            6,
-        )
-        .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
-
-    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
-        ::aws_smithy_schema::ShapeId::from_static(
-            Self::SHAPE_ID,
-            Self::NAMESPACE,
-            "ParticipantToken",
-        ),
-        ::aws_smithy_schema::ShapeType::Structure,
-        &[
-            &Self::M_PARTICIPANT_ID,
-            &Self::M_TOKEN,
-            &Self::M_USER_ID,
-            &Self::M_ATTRIBUTES,
-            &Self::M_DURATION,
-            &Self::M_CAPABILITIES,
-            &Self::M_EXPIRATION_TIME,
-        ],
-    );
-}
-
-pub static PARTICIPANT_TOKEN_SCHEMA: &::aws_smithy_schema::Schema = &ParticipantToken::SCHEMA;
-
-impl ::aws_smithy_schema::serde::SerializableStruct for ParticipantToken {
-    fn serialize_members(
-        &self,
-        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
-    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
-        if let Some(v) = self.participant_id.as_ref() {
-            s.write_string(&Self::M_PARTICIPANT_ID, v.as_str())?;
-        }
-        if let Some(v) = self.token.as_ref() {
-            s.write_string(&Self::M_TOKEN, v.as_str())?;
-        }
-        if let Some(v) = self.user_id.as_ref() {
-            s.write_string(&Self::M_USER_ID, v.as_str())?;
-        }
-        if let Some(v) = self.attributes.as_ref() {
-            s.write_map(&Self::M_ATTRIBUTES, &|__sm| {
-                for (__k, __v) in v.iter() {
-                    __sm.write_string(&Self::M_ATTRIBUTES, __k.as_str())?;
-                    __sm.write_string(&Self::M_ATTRIBUTES, __v.as_str())?;
-                }
-                Ok(())
-            })?;
-        }
-        if let Some(v) = self.duration.as_ref() {
-            s.write_integer(&Self::M_DURATION, *v)?;
-        }
-        if let Some(v) = self.capabilities.as_ref() {
-            s.write_list(&Self::M_CAPABILITIES, &|__sl| {
-                for __it in v.iter() {
-                    __sl.write_string(&Self::M_CAPABILITIES, __it.as_str())?;
-                }
-                Ok(())
-            })?;
-        }
-        if let Some(v) = self.expiration_time.as_ref() {
-            s.write_timestamp(&Self::M_EXPIRATION_TIME, v)?;
-        }
-        Ok(())
-    }
-}
-
-impl ::aws_smithy_schema_server::DeserializableStruct for ParticipantToken {
-    fn deserialize(
-        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
-    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
-        let mut out = Self::default();
-        d.read_struct(&Self::SCHEMA, &mut |member, d| {
-            match member.member_index() {
-                Some(0) => out.participant_id = Some(d.read_string(&Self::M_PARTICIPANT_ID)?),
-                Some(1) => out.token = Some(d.read_string(&Self::M_TOKEN)?),
-                Some(2) => out.user_id = Some(d.read_string(&Self::M_USER_ID)?),
-                Some(3) => {
-                    let mut __out: std::collections::HashMap<String, String> =
-                        ::std::default::Default::default();
-                    d.read_map(&Self::M_ATTRIBUTES, &mut |__k, __dm| {
-                        let __value = __dm.read_string(&Self::M_ATTRIBUTES)?;
-                        __out.insert(__k, __value);
-                        Ok(())
-                    })?;
-                    out.attributes = Some(__out);
-                }
-                Some(4) => out.duration = Some(d.read_integer(&Self::M_DURATION)?),
-                Some(5) => {
-                    let mut __out: Vec<String> = Vec::new();
-                    d.read_list(&Self::M_CAPABILITIES, &mut |__dl| {
-                        __out.push(__dl.read_string(&Self::M_CAPABILITIES)?);
-                        Ok(())
-                    })?;
-                    out.capabilities = Some(__out);
-                }
-                Some(6) => out.expiration_time = Some(d.read_timestamp(&Self::M_EXPIRATION_TIME)?),
-                _ => {}
-            }
-            Ok(())
-        })?;
-        Ok(out)
-    }
-}
-
-// `AutoParticipantRecordingConfiguration` is the second shape in this module whose
-// schema and serde pair are written out by hand rather than produced by
-// `#[smithy_macros::smithy(shape = ...)]`, and the reason is PRESENCE.
+// `AutoParticipantRecordingConfiguration`'s schema and serde pair are written out by
+// hand rather than produced by `#[smithy_macros::smithy(shape = ...)]`, and the reason is
+// PRESENCE.
 //
 // Two of its members carry a Smithy `@default` (`smithy_query(query="shape",
 // shape="AutoParticipantRecordingConfiguration")`): `recordingReconnectWindowSeconds`
@@ -436,9 +229,10 @@ impl ::aws_smithy_schema_server::DeserializableStruct for ParticipantToken {
 // per member (index = position in the model's member list, plus the `member` sub-schema
 // a list member carries), the constraint traits the dispatch-boundary validating walk
 // reads off those schemas, a `SCHEMA` naming the members in order, the `<SHAPE>_SCHEMA`
-// alias, and the serialize/deserialize pair. Unlike `ParticipantToken` below this is an
-// INPUT shape, so its constraint traits are carried here too — the walk enforces them
-// and a dropped trait would accept a request AWS refuses.
+// alias, and the serialize/deserialize pair. Unlike the output shapes built by
+// `ivsrt_schema_and_codec!` this is an INPUT shape, so its constraint traits are carried
+// here too — the walk enforces them and a dropped trait would accept a request AWS
+// refuses.
 //
 // REMOVE THIS BLOCK when the vendored codegen keeps a `@default` member's presence
 // (an `Option<T>` field plus "materialise the declared default only where the member is
@@ -781,7 +575,10 @@ pub struct StorageConfiguration {
     pub tags: Option<std::collections::HashMap<String, String>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ivsrealtime#Composition")]
+/// `startTime`/`endTime` target `Time` (`@timestampFormat("date-time")`), so this shape's
+/// schema comes from `ivsrt_schema_and_codec!` — see `types/date_time_wire.rs`. Member
+/// set, order and requiredness from
+/// `smithy_query(query="shape", shape="com.amazonaws.ivsrealtime#Composition")`.
 #[derive(Debug, Clone, Default)]
 pub struct Composition {
     pub arn: String,
@@ -793,6 +590,36 @@ pub struct Composition {
     pub start_time: Option<::aws_smithy_types::DateTime>,
     pub end_time: Option<::aws_smithy_types::DateTime>,
 }
+
+ivsrt_schema_and_codec!(
+    Composition,
+    COMPOSITION_SCHEMA,
+    "com.amazonaws.ivsrealtime#Composition",
+    "com.amazonaws.ivsrealtime",
+    "Composition",
+    (M_ARN, arn, "arn", 0, req, string),
+    (M_STAGE_ARN, stage_arn, "stageArn", 1, req, string),
+    (M_STATE, state, "state", 2, req, string),
+    (
+        M_LAYOUT,
+        layout,
+        "layout",
+        3,
+        req,
+        struct_of(LayoutConfiguration)
+    ),
+    (
+        M_DESTINATIONS,
+        destinations,
+        "destinations",
+        4,
+        req,
+        list_of_struct(Destination)
+    ),
+    (M_TAGS, tags, "tags", 5, opt, map_of_string),
+    (M_START_TIME, start_time, "startTime", 6, opt, date_time),
+    (M_END_TIME, end_time, "endTime", 7, opt, date_time),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.ivsrealtime#LayoutConfiguration")]
 #[derive(Debug, Clone, Default)]
@@ -1057,7 +884,10 @@ pub struct PipConfiguration {
     pub participant_order_attribute: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ivsrealtime#Destination")]
+/// `startTime`/`endTime` target `Time` (`@timestampFormat("date-time")`), so this shape's
+/// schema comes from `ivsrt_schema_and_codec!` — see `types/date_time_wire.rs`. Member
+/// set, order and requiredness from
+/// `smithy_query(query="shape", shape="com.amazonaws.ivsrealtime#Destination")`.
 #[derive(Debug, Clone, Default)]
 pub struct Destination {
     pub id: String,
@@ -1067,6 +897,34 @@ pub struct Destination {
     pub configuration: DestinationConfiguration,
     pub detail: Option<DestinationDetail>,
 }
+
+ivsrt_schema_and_codec!(
+    Destination,
+    DESTINATION_SCHEMA,
+    "com.amazonaws.ivsrealtime#Destination",
+    "com.amazonaws.ivsrealtime",
+    "Destination",
+    (M_ID, id, "id", 0, req, string),
+    (M_STATE, state, "state", 1, req, string),
+    (M_START_TIME, start_time, "startTime", 2, opt, date_time),
+    (M_END_TIME, end_time, "endTime", 3, opt, date_time),
+    (
+        M_CONFIGURATION,
+        configuration,
+        "configuration",
+        4,
+        req,
+        struct_of(DestinationConfiguration)
+    ),
+    (
+        M_DETAIL,
+        detail,
+        "detail",
+        5,
+        opt,
+        struct_of(DestinationDetail)
+    ),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.ivsrealtime#DestinationConfiguration")]
 #[derive(Debug, Clone, Default)]

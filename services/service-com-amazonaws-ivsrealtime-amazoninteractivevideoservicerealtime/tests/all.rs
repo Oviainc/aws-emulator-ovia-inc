@@ -31,6 +31,8 @@ mod compositions;
 mod create_ingest_configuration_inputs;
 #[path = "all/create_storage_configuration_inputs.rs"]
 mod create_storage_configuration_inputs;
+#[path = "all/date_time_members_wire_form.rs"]
+mod date_time_members_wire_form;
 #[path = "all/delete_ingest_configuration.rs"]
 mod delete_ingest_configuration;
 #[path = "all/delete_stage_associations.rs"]

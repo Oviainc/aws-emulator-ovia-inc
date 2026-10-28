@@ -300,20 +300,19 @@ fn now_secs() -> i64 {
 /// The epoch-second instant a modelled timestamp member denotes.
 ///
 /// `StageSessionSummary$startTime` targets `Time`, which carries
-/// `@timestampFormat("date-time")`; whether this emulator's restJson1 serializer
-/// renders that as the ISO-8601 string or as the protocol's default epoch-seconds
-/// number is a separate question from the one this suite asks, so both renderings are
-/// read here as the instant they denote.
+/// `@timestampFormat("date-time")`, so the rendering on this service's restJson1 wire IS
+/// the ISO-8601 string and a bare epoch number is not a timestamp this suite accepts;
+/// `tests/all/date_time_members_wire_form.rs` is where that rendering is pinned for every
+/// such member of this service.
 fn timestamp_secs(case: &str, value: &Value) -> i64 {
-    match value {
-        Value::String(rendered) => DateTime::from_str(rendered, Format::DateTime)
-            .unwrap_or_else(|error| {
-                panic!("case {case:?}: {rendered:?} is not an ISO-8601 instant: {error}")
-            })
-            .secs(),
-        Value::Number(epoch) => epoch.as_f64().unwrap_or_default() as i64,
-        other => panic!("case {case:?}: expected a timestamp, got {other}"),
-    }
+    let rendered = value.as_str().unwrap_or_else(|| {
+        panic!("case {case:?}: expected an ISO-8601 timestamp string, got {value}")
+    });
+    DateTime::from_str(rendered, Format::DateTime)
+        .unwrap_or_else(|error| {
+            panic!("case {case:?}: {rendered:?} is not an ISO-8601 instant: {error}")
+        })
+        .secs()
 }
 
 // ---------------------------------------------------------------------------

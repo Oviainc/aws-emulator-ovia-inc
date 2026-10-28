@@ -24,11 +24,25 @@ pub struct GetStageSessionOutput {
     pub stage_session: Option<StageSession>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ivsrealtime#StageSession")]
+/// `startTime`/`endTime` target `Time` (`@timestampFormat("date-time")`), so this shape's
+/// schema comes from `ivsrt_schema_and_codec!` — see `types/date_time_wire.rs`. Member
+/// set, order and requiredness from
+/// `smithy_query(query="shape", shape="com.amazonaws.ivsrealtime#StageSession")`.
 #[derive(Debug, Clone, Default)]
 pub struct StageSession {
     pub session_id: Option<String>,
     pub start_time: Option<::aws_smithy_types::DateTime>,
     pub end_time: Option<::aws_smithy_types::DateTime>,
 }
+
+ivsrt_schema_and_codec!(
+    StageSession,
+    STAGE_SESSION_SCHEMA,
+    "com.amazonaws.ivsrealtime#StageSession",
+    "com.amazonaws.ivsrealtime",
+    "StageSession",
+    (M_SESSION_ID, session_id, "sessionId", 0, opt, string),
+    (M_START_TIME, start_time, "startTime", 1, opt, date_time),
+    (M_END_TIME, end_time, "endTime", 2, opt, date_time),
+);
 

@@ -31,7 +31,10 @@ pub struct ListParticipantsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ivsrealtime#ParticipantSummary")]
+/// `firstJoinTime` targets `Time` (`@timestampFormat("date-time")`), so this shape's
+/// schema comes from `ivsrt_schema_and_codec!` — see `types/date_time_wire.rs`. Member
+/// set, order and requiredness from
+/// `smithy_query(query="shape", shape="com.amazonaws.ivsrealtime#ParticipantSummary")`.
 #[derive(Debug, Clone, Default)]
 pub struct ParticipantSummary {
     pub participant_id: Option<String>,
@@ -47,4 +50,87 @@ pub struct ParticipantSummary {
     pub redundant_ingest: bool,
     pub ingest_configuration_arn: Option<String>,
 }
+
+ivsrt_schema_and_codec!(
+    ParticipantSummary,
+    PARTICIPANT_SUMMARY_SCHEMA,
+    "com.amazonaws.ivsrealtime#ParticipantSummary",
+    "com.amazonaws.ivsrealtime",
+    "ParticipantSummary",
+    (
+        M_PARTICIPANT_ID,
+        participant_id,
+        "participantId",
+        0,
+        opt,
+        string
+    ),
+    (M_USER_ID, user_id, "userId", 1, opt, string),
+    (M_STATE, state, "state", 2, opt, string),
+    (
+        M_FIRST_JOIN_TIME,
+        first_join_time,
+        "firstJoinTime",
+        3,
+        opt,
+        date_time
+    ),
+    (M_PUBLISHED, published, "published", 4, def_false, boolean),
+    (
+        M_RECORDING_STATE,
+        recording_state,
+        "recordingState",
+        5,
+        opt,
+        string
+    ),
+    (
+        M_REPLICATION_TYPE,
+        replication_type,
+        "replicationType",
+        6,
+        opt,
+        string
+    ),
+    (
+        M_REPLICATION_STATE,
+        replication_state,
+        "replicationState",
+        7,
+        opt,
+        string
+    ),
+    (
+        M_SOURCE_STAGE_ARN,
+        source_stage_arn,
+        "sourceStageArn",
+        8,
+        opt,
+        string
+    ),
+    (
+        M_SOURCE_SESSION_ID,
+        source_session_id,
+        "sourceSessionId",
+        9,
+        opt,
+        string
+    ),
+    (
+        M_REDUNDANT_INGEST,
+        redundant_ingest,
+        "redundantIngest",
+        10,
+        def_false,
+        boolean
+    ),
+    (
+        M_INGEST_CONFIGURATION_ARN,
+        ingest_configuration_arn,
+        "ingestConfigurationArn",
+        11,
+        opt,
+        string
+    ),
+);
 

@@ -25,7 +25,10 @@ pub struct GetParticipantOutput {
     pub participant: Option<Participant>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ivsrealtime#Participant")]
+/// `firstJoinTime` targets `Time` (`@timestampFormat("date-time")`), so this shape's
+/// schema comes from `ivsrt_schema_and_codec!` — see `types/date_time_wire.rs`. Member
+/// set, order and requiredness from
+/// `smithy_query(query="shape", shape="com.amazonaws.ivsrealtime#Participant")`.
 #[derive(Debug, Clone, Default)]
 pub struct Participant {
     pub participant_id: Option<String>,
@@ -51,4 +54,118 @@ pub struct Participant {
     pub redundant_ingest: bool,
     pub ingest_configuration_arn: Option<String>,
 }
+
+ivsrt_schema_and_codec!(
+    Participant,
+    PARTICIPANT_SCHEMA,
+    "com.amazonaws.ivsrealtime#Participant",
+    "com.amazonaws.ivsrealtime",
+    "Participant",
+    (
+        M_PARTICIPANT_ID,
+        participant_id,
+        "participantId",
+        0,
+        opt,
+        string
+    ),
+    (M_USER_ID, user_id, "userId", 1, opt, string),
+    (M_STATE, state, "state", 2, opt, string),
+    (
+        M_FIRST_JOIN_TIME,
+        first_join_time,
+        "firstJoinTime",
+        3,
+        opt,
+        date_time
+    ),
+    (M_ATTRIBUTES, attributes, "attributes", 4, opt, map_of_string),
+    (M_PUBLISHED, published, "published", 5, def_false, boolean),
+    (M_ISP_NAME, isp_name, "ispName", 6, opt, string),
+    (M_OS_NAME, os_name, "osName", 7, opt, string),
+    (M_OS_VERSION, os_version, "osVersion", 8, opt, string),
+    (M_BROWSER_NAME, browser_name, "browserName", 9, opt, string),
+    (
+        M_BROWSER_VERSION,
+        browser_version,
+        "browserVersion",
+        10,
+        opt,
+        string
+    ),
+    (M_SDK_VERSION, sdk_version, "sdkVersion", 11, opt, string),
+    (
+        M_RECORDING_S3_BUCKET_NAME,
+        recording_s3_bucket_name,
+        "recordingS3BucketName",
+        12,
+        opt,
+        string
+    ),
+    (
+        M_RECORDING_S3_PREFIX,
+        recording_s3_prefix,
+        "recordingS3Prefix",
+        13,
+        opt,
+        string
+    ),
+    (
+        M_RECORDING_STATE,
+        recording_state,
+        "recordingState",
+        14,
+        opt,
+        string
+    ),
+    (M_PROTOCOL, protocol, "protocol", 15, opt, string),
+    (
+        M_REPLICATION_TYPE,
+        replication_type,
+        "replicationType",
+        16,
+        opt,
+        string
+    ),
+    (
+        M_REPLICATION_STATE,
+        replication_state,
+        "replicationState",
+        17,
+        opt,
+        string
+    ),
+    (
+        M_SOURCE_STAGE_ARN,
+        source_stage_arn,
+        "sourceStageArn",
+        18,
+        opt,
+        string
+    ),
+    (
+        M_SOURCE_SESSION_ID,
+        source_session_id,
+        "sourceSessionId",
+        19,
+        opt,
+        string
+    ),
+    (
+        M_REDUNDANT_INGEST,
+        redundant_ingest,
+        "redundantIngest",
+        20,
+        def_false,
+        boolean
+    ),
+    (
+        M_INGEST_CONFIGURATION_ARN,
+        ingest_configuration_arn,
+        "ingestConfigurationArn",
+        21,
+        opt,
+        string
+    ),
+);
 

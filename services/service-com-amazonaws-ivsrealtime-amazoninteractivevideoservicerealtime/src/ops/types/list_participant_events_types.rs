@@ -28,7 +28,10 @@ pub struct ListParticipantEventsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ivsrealtime#Event")]
+/// `eventTime` targets `Time` (`@timestampFormat("date-time")`), so this shape's schema
+/// comes from `ivsrt_schema_and_codec!` — see `types/date_time_wire.rs`. Member set,
+/// order and requiredness from
+/// `smithy_query(query="shape", shape="com.amazonaws.ivsrealtime#Event")`.
 #[derive(Debug, Clone, Default)]
 pub struct Event {
     pub name: Option<String>,
@@ -43,7 +46,71 @@ pub struct Event {
     pub new_token: Option<ExchangedParticipantToken>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ivsrealtime#ExchangedParticipantToken")]
+ivsrt_schema_and_codec!(
+    Event,
+    EVENT_SCHEMA,
+    "com.amazonaws.ivsrealtime#Event",
+    "com.amazonaws.ivsrealtime",
+    "Event",
+    (M_NAME, name, "name", 0, opt, string),
+    (
+        M_PARTICIPANT_ID,
+        participant_id,
+        "participantId",
+        1,
+        opt,
+        string
+    ),
+    (M_EVENT_TIME, event_time, "eventTime", 2, opt, date_time),
+    (
+        M_REMOTE_PARTICIPANT_ID,
+        remote_participant_id,
+        "remoteParticipantId",
+        3,
+        opt,
+        string
+    ),
+    (M_ERROR_CODE, error_code, "errorCode", 4, opt, string),
+    (
+        M_DESTINATION_STAGE_ARN,
+        destination_stage_arn,
+        "destinationStageArn",
+        5,
+        opt,
+        string
+    ),
+    (
+        M_DESTINATION_SESSION_ID,
+        destination_session_id,
+        "destinationSessionId",
+        6,
+        opt,
+        string
+    ),
+    (M_REPLICA, replica, "replica", 7, def_false, boolean),
+    (
+        M_PREVIOUS_TOKEN,
+        previous_token,
+        "previousToken",
+        8,
+        opt,
+        struct_of(ExchangedParticipantToken)
+    ),
+    (
+        M_NEW_TOKEN,
+        new_token,
+        "newToken",
+        9,
+        opt,
+        struct_of(ExchangedParticipantToken)
+    ),
+);
+
+/// `expirationTime` targets `ParticipantTokenExpirationTime`
+/// (`@timestampFormat("date-time")`), so this shape's schema comes from
+/// `ivsrt_schema_and_codec!` — see `types/date_time_wire.rs`. Member set, order and
+/// requiredness from
+/// `smithy_query(query="shape", shape="com.amazonaws.ivsrealtime#ExchangedParticipantToken")`.
 #[derive(Debug, Clone, Default)]
 pub struct ExchangedParticipantToken {
     pub capabilities: Option<Vec<String>>,
@@ -51,4 +118,30 @@ pub struct ExchangedParticipantToken {
     pub user_id: Option<String>,
     pub expiration_time: Option<::aws_smithy_types::DateTime>,
 }
+
+ivsrt_schema_and_codec!(
+    ExchangedParticipantToken,
+    EXCHANGED_PARTICIPANT_TOKEN_SCHEMA,
+    "com.amazonaws.ivsrealtime#ExchangedParticipantToken",
+    "com.amazonaws.ivsrealtime",
+    "ExchangedParticipantToken",
+    (
+        M_CAPABILITIES,
+        capabilities,
+        "capabilities",
+        0,
+        opt,
+        list_of_string
+    ),
+    (M_ATTRIBUTES, attributes, "attributes", 1, opt, map_of_string),
+    (M_USER_ID, user_id, "userId", 2, opt, string),
+    (
+        M_EXPIRATION_TIME,
+        expiration_time,
+        "expirationTime",
+        3,
+        opt,
+        date_time
+    ),
+);
 

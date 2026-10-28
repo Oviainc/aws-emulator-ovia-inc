@@ -27,7 +27,10 @@ pub struct ListCompositionsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ivsrealtime#CompositionSummary")]
+/// `startTime`/`endTime` target `Time` (`@timestampFormat("date-time")`), so this shape's
+/// schema comes from `ivsrt_schema_and_codec!` — see `types/date_time_wire.rs`. Member
+/// set, order and requiredness from
+/// `smithy_query(query="shape", shape="com.amazonaws.ivsrealtime#CompositionSummary")`.
 #[derive(Debug, Clone, Default)]
 pub struct CompositionSummary {
     pub arn: String,
@@ -39,7 +42,32 @@ pub struct CompositionSummary {
     pub end_time: Option<::aws_smithy_types::DateTime>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ivsrealtime#DestinationSummary")]
+ivsrt_schema_and_codec!(
+    CompositionSummary,
+    COMPOSITION_SUMMARY_SCHEMA,
+    "com.amazonaws.ivsrealtime#CompositionSummary",
+    "com.amazonaws.ivsrealtime",
+    "CompositionSummary",
+    (M_ARN, arn, "arn", 0, req, string),
+    (M_STAGE_ARN, stage_arn, "stageArn", 1, req, string),
+    (
+        M_DESTINATIONS,
+        destinations,
+        "destinations",
+        2,
+        req,
+        list_of_struct(DestinationSummary)
+    ),
+    (M_STATE, state, "state", 3, req, string),
+    (M_TAGS, tags, "tags", 4, opt, map_of_string),
+    (M_START_TIME, start_time, "startTime", 5, opt, date_time),
+    (M_END_TIME, end_time, "endTime", 6, opt, date_time),
+);
+
+/// `startTime`/`endTime` target `Time` (`@timestampFormat("date-time")`), so this shape's
+/// schema comes from `ivsrt_schema_and_codec!` — see `types/date_time_wire.rs`. Member
+/// set, order and requiredness from
+/// `smithy_query(query="shape", shape="com.amazonaws.ivsrealtime#DestinationSummary")`.
 #[derive(Debug, Clone, Default)]
 pub struct DestinationSummary {
     pub id: String,
@@ -47,4 +75,16 @@ pub struct DestinationSummary {
     pub start_time: Option<::aws_smithy_types::DateTime>,
     pub end_time: Option<::aws_smithy_types::DateTime>,
 }
+
+ivsrt_schema_and_codec!(
+    DestinationSummary,
+    DESTINATION_SUMMARY_SCHEMA,
+    "com.amazonaws.ivsrealtime#DestinationSummary",
+    "com.amazonaws.ivsrealtime",
+    "DestinationSummary",
+    (M_ID, id, "id", 0, req, string),
+    (M_STATE, state, "state", 1, req, string),
+    (M_START_TIME, start_time, "startTime", 2, opt, date_time),
+    (M_END_TIME, end_time, "endTime", 3, opt, date_time),
+);
 

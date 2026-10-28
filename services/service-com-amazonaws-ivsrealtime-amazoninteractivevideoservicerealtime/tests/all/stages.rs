@@ -123,7 +123,8 @@ fn now_secs() -> i64 {
 /// `ParticipantTokenExpirationTime` `@timestampFormat("date-time")` and its doc says
 /// "ISO 8601 timestamp (returned as a string)", so only a STRING is accepted here — a
 /// bare epoch number (the restJson1 protocol default, which this service avoids by
-/// carrying the format on the hand-written member schema in `src/ops/types/shared_types.rs`)
+/// carrying the format on the member schema `ivsrt_schema_and_codec!` builds, see
+/// `src/ops/types/date_time_wire.rs`)
 /// fails the parse and the case.
 fn timestamp_secs(value: &Value) -> i64 {
     let rendered = value
