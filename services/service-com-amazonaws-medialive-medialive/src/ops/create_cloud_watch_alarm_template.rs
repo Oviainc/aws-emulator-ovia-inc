@@ -184,7 +184,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        let state = crate::state::service_state(&*self.engine, ctx.parts()).ok_or_else(unavailable)?;
 
         // A tag key in the reserved namespace names a system tag, which is not
         // the caller's to set, so a request carrying one is refused before

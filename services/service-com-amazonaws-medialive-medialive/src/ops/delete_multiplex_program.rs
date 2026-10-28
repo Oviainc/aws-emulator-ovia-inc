@@ -21,7 +21,7 @@
 //! [`crate::state::service_state`] and read and write it through the guard it hands back:
 //!
 //! ```ignore
-//!     let state = crate::state::service_state(&*self.engine)
+//!     let state = crate::state::service_state(&*self.engine, ctx.parts())
 //!         .ok_or(/* a modelled server error */)?;
 //!     state.lock().your_field = /* ... */;
 //! ```
@@ -163,7 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // its multiplex and its `ProgramName` — so nothing here depends on the
         // region the request was signed for.
         let _ = ctx;
-        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        let state = crate::state::service_state(&*self.engine, ctx.parts()).ok_or_else(unavailable)?;
 
         let mut state = state.lock();
         // Transitions the clock had already made due were owed whether or not

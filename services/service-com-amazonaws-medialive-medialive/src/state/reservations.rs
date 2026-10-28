@@ -419,9 +419,7 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// The next reservation id, as AWS shapes MediaLive resource ids: a numeric
     /// string.
     fn mint_reservation_id(&mut self) -> String {
-        let id = FIRST_RESERVATION_ID + self.next_reservation_id;
-        self.next_reservation_id += 1;
-        id.to_string()
+        (FIRST_RESERVATION_ID + self.mints.next(|mints| &mut mints.reservation)).to_string()
     }
 
     /// Store a reservation purchased in `region` and answer its minted id, or

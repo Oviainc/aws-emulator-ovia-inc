@@ -260,9 +260,11 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// The next eventbridge rule template id: seven decimal digits, which is the
     /// bare (not AWS-provided) form of `__stringMin7Max11PatternAws097`.
     fn mint_event_bridge_rule_template_id(&mut self) -> String {
-        let id = FIRST_EVENT_BRIDGE_RULE_TEMPLATE_ID + self.next_event_bridge_rule_template_id;
-        self.next_event_bridge_rule_template_id += 1;
-        id.to_string()
+        (FIRST_EVENT_BRIDGE_RULE_TEMPLATE_ID
+            + self
+                .mints
+                .next(|mints| &mut mints.event_bridge_rule_template))
+            .to_string()
     }
 
     /// Store an eventbridge rule template in `region`, inside the group

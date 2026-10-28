@@ -814,8 +814,9 @@ async fn an_id_that_names_nothing_is_not_found() {
 
 /// Rule 5: a reservation is `ACTIVE` while its lease runs and `EXPIRED` from its
 /// `End` on — the clock's own transition, which a read reports without writing
-/// anything — and the reservation is reported for the region it was purchased in
-/// whatever region the read is signed for.
+/// anything — and it is reported by the region it was purchased in, which is the
+/// region its `Region` member and its ARN name; no other region's endpoint
+/// resolves its id.
 ///
 /// The rows differ along WHERE the stored lease ends relative to the read: well
 /// before it, a second before it, exactly at it, and after it.
@@ -853,14 +854,22 @@ async fn the_clock_decides_whether_a_lease_still_runs() {
         purchased["arn"]
     );
 
-    // A read signed for another region still reports the purchased one.
-    let (status, described) = describe(&router, DEFAULT_REGION, &id).await;
+    // The region the purchase was signed for is the region that holds the
+    // reservation: it reserves capacity where it was bought.
+    let (status, described) = describe(&router, bought_in, &id).await;
     assert_eq!(status, 200, "setup: expected the read to answer 200, got {status}: {described}");
     assert_eq!(
         described["region"],
         json!(bought_in),
-        "expected a read from another region to report the purchased region, got {:?}",
+        "expected the read to report the purchased region, got {:?}",
         described["region"]
+    );
+
+    // Another region's endpoint holds no reservation under that id.
+    let (status, elsewhere) = describe(&router, DEFAULT_REGION, &id).await;
+    assert_eq!(
+        status, 404,
+        "expected {DEFAULT_REGION} to hold no reservation {id}, got {status}: {elsewhere}"
     );
 
     let now = SystemTime::now();
@@ -879,7 +888,8 @@ async fn the_clock_decides_whether_a_lease_still_runs() {
         // The store's own record, so the state the read reports is derived from
         // the lease something stored rather than from a second copy.
         {
-            let store = state::service_state(&*engine).expect("the medialive store");
+            let store = state::service_state_in(&*engine, bought_in)
+                .expect("the medialive store");
             let mut store = store.lock();
             let reservation = store
                 .reservations
@@ -888,7 +898,7 @@ async fn the_clock_decides_whether_a_lease_still_runs() {
             reservation.end = end;
         }
 
-        let (status, described) = describe(&router, DEFAULT_REGION, &id).await;
+        let (status, described) = describe(&router, bought_in, &id).await;
         assert_eq!(
             status, 200,
             "case {case:?}: expected the read to answer 200, got {status}: {described}"
@@ -902,7 +912,7 @@ async fn the_clock_decides_whether_a_lease_still_runs() {
 
         // Reporting changes nothing a later caller sees.
         for attempt in 1..=2 {
-            let (status, again) = describe(&router, DEFAULT_REGION, &id).await;
+            let (status, again) = describe(&router, bought_in, &id).await;
             assert_eq!(
                 status, 200,
                 "case {case:?}: expected repeated read {attempt} to answer 200, got {status}: \
@@ -918,8 +928,9 @@ async fn the_clock_decides_whether_a_lease_still_runs() {
     // The tags the purchase carried are the reservation's own, readable through
     // the tag reader that addresses it by ARN.
     let arn = purchased["arn"].as_str().expect("a minted ARN");
-    let (status, tags) = call(
+    let (status, tags) = call_in_region(
         &router,
+        bought_in,
         "GET",
         &format!("/prod/tags/{}", percent_encoded(arn)),
         None,

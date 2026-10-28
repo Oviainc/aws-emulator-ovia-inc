@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::channel_lifecycle::wait_for_the_clock;
-use crate::wire::{call, error_code, error_message, medialive, ACCOUNT, DEFAULT_REGION};
+use crate::wire::{call, call_in_region, error_code, error_message, medialive, ACCOUNT, DEFAULT_REGION};
 
 async fn claim(router: &MultiServiceRouter, body: Value) -> (u16, Value) {
     call(router, "POST", "/prod/claimDevice", Some(body)).await
@@ -33,8 +33,26 @@ pub async fn claim_device(router: &MultiServiceRouter, case: &str, id: &str) {
     );
 }
 
+/// `DescribeInputDevice` on `id`, signed for `region` — a device belongs to the
+/// region its claim was signed for, so a suite whose rule is about that region
+/// reads it through this.
+pub async fn describe_device_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    id: &str,
+) -> (u16, Value) {
+    call_in_region(
+        router,
+        region,
+        "GET",
+        &format!("/prod/inputDevices/{id}"),
+        None,
+    )
+    .await
+}
+
 pub async fn describe_device(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
-    call(router, "GET", &format!("/prod/inputDevices/{id}"), None).await
+    describe_device_in(router, DEFAULT_REGION, id).await
 }
 
 pub async fn start_maintenance_window(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
@@ -47,14 +65,24 @@ pub async fn start_maintenance_window(router: &MultiServiceRouter, id: &str) -> 
     .await
 }
 
-/// The device as `DescribeInputDevice` reports it right now.
-pub async fn device(router: &MultiServiceRouter, case: &str, id: &str) -> Value {
-    let (status, described) = describe_device(router, id).await;
+/// The device as `DescribeInputDevice` reports it right now in `region`.
+pub async fn device_in(
+    router: &MultiServiceRouter,
+    case: &str,
+    region: &str,
+    id: &str,
+) -> Value {
+    let (status, described) = describe_device_in(router, region, id).await;
     assert_eq!(
         status, 200,
-        "case {case:?}: DescribeInputDevice({id}): expected 200, got {status}: {described}"
+        "case {case:?}: DescribeInputDevice({id}) in {region}: expected 200, got {status}: {described}"
     );
     described
+}
+
+/// The device as `DescribeInputDevice` reports it right now.
+pub async fn device(router: &MultiServiceRouter, case: &str, id: &str) -> Value {
+    device_in(router, case, DEFAULT_REGION, id).await
 }
 
 /// The `DeviceUpdateStatus` the device reports right now.

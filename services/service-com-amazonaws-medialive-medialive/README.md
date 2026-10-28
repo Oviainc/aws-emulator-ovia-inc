@@ -85,10 +85,11 @@ async fn handle(
     input: Self::Input,
     ctx: &smithy_server_runtime::OperationContext<'_>,
 ) -> Result<Self::Output, Self::Error> {
-    let Some(state) = crate::state::service_state(&*self.engine) else {
+    let Some(state) = crate::state::service_state(&*self.engine, ctx.parts()) else {
         return Err(/* mounted on an engine that holds no state: a modelled server error */);
     };
-    // A LOCKABLE handle, not the value — read and mutate through the guard:
+    // A LOCKABLE handle on the resources of the REGION this request was signed
+    // for — read and mutate through the guard:
     state.lock().your_field = /* ... */;
 }
 ```
@@ -99,8 +100,12 @@ async fn handle(
 > looks like it succeeded and the next call sees nothing. Reach the shared store
 > through `self.engine`, never a fresh engine.
 
-State lives in the SINGLE shared engine, keyed by type. Reach it through
-`crate::state::service_state`, which `src/state.rs` generates.
+State lives in the SINGLE shared engine, keyed by type, and is PARTITIONED BY
+REGION: MediaLive is a regional service, so `crate::state::service_state` hands a
+handler the resources of the region its own request was signed for and no other.
+An operation whose subject is the account rather than a region's resources (the
+account configuration) reaches the whole store through
+`crate::state::service_store` instead.
 
 Do not add a second engine crate — the router and every service must share
 one `InMemoryEngine` type or the engine the router injects cannot be handed to this

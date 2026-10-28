@@ -16,7 +16,7 @@
 //! [`crate::state::service_state`] and read and write it through the guard it hands back:
 //!
 //! ```ignore
-//!     let state = crate::state::service_state(&*self.engine)
+//!     let state = crate::state::service_state(&*self.engine, ctx.parts())
 //!         .ok_or(/* a modelled server error */)?;
 //!     state.lock().your_field = /* ... */;
 //! ```
@@ -172,7 +172,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // region it was purchased in, which is on the record, not for the region
         // this read was signed for.
         let _ = ctx;
-        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        let state = crate::state::service_state(&*self.engine, ctx.parts()).ok_or_else(unavailable)?;
 
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();

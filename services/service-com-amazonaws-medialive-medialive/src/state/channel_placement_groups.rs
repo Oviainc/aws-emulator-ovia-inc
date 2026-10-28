@@ -400,9 +400,9 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// The next channel placement group id: seven decimal digits, for the
     /// reasons on [`FIRST_CHANNEL_PLACEMENT_GROUP_ID`].
     fn mint_channel_placement_group_id(&mut self) -> String {
-        let id = FIRST_CHANNEL_PLACEMENT_GROUP_ID + self.next_channel_placement_group_id;
-        self.next_channel_placement_group_id += 1;
-        id.to_string()
+        (FIRST_CHANNEL_PLACEMENT_GROUP_ID
+            + self.mints.next(|mints| &mut mints.channel_placement_group))
+            .to_string()
     }
 
     /// Store a channel placement group in `cluster_id` and answer its minted

@@ -442,9 +442,7 @@ impl ComAmazonawsMedialiveMedialiveState {
 
     /// The next node id, as AWS shapes MediaLive resource ids: a numeric string.
     fn mint_node_id(&mut self) -> String {
-        let id = FIRST_NODE_ID + self.next_node_id;
-        self.next_node_id += 1;
-        id.to_string()
+        (FIRST_NODE_ID + self.mints.next(|mints| &mut mints.node)).to_string()
     }
 
     /// Store a node created in `region`, in the cluster `cluster_id`, and answer

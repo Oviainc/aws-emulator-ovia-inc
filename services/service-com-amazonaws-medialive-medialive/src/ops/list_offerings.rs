@@ -21,7 +21,7 @@
 //! [`crate::state::service_state`] and read and write it through the guard it hands back:
 //!
 //! ```ignore
-//!     let state = crate::state::service_state(&*self.engine)
+//!     let state = crate::state::service_state(&*self.engine, ctx.parts())
 //!         .ok_or(/* a modelled server error */)?;
 //!     state.lock().your_field = /* ... */;
 //! ```
@@ -230,7 +230,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let channel_configuration = match input.channel_configuration.as_deref() {
             None => None,
             Some(channel_id) => {
-                let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+                let state = crate::state::service_state(&*self.engine, ctx.parts()).ok_or_else(unavailable)?;
                 let mut state = state.lock();
                 // Reporting only: `settle` materialises the transitions the
                 // clock had already made due, which were owed at this instant

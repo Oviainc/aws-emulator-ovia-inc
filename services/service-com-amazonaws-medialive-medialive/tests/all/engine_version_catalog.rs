@@ -34,7 +34,7 @@ use service_com_amazonaws_medialive_medialive::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::support::{epoch_seconds, timestamp, unix_seconds};
-use crate::wire::{call, medialive, medialive_with_engine};
+use crate::wire::{call, medialive, medialive_with_engine, DEFAULT_REGION};
 
 /// The URI `ListVersions` is bound to (`smithy_query(query="operation",
 /// operation="ListVersions")`: GET /prod/versions).
@@ -64,13 +64,13 @@ fn shifted(base: SystemTime, offset: i64) -> SystemTime {
 
 /// The catalogue a row installs, replacing the seeded one.
 fn install(engine: &engine::InMemoryEngine, catalogue: ChannelEngineVersionCatalog) {
-    let store = state::service_state(engine).expect("the medialive store");
+    let store = state::service_state_in(engine, DEFAULT_REGION).expect("the medialive store");
     store.lock().channel_engine_versions = catalogue;
 }
 
 /// The build identifiers the store holds, expired entries included.
 fn stored_versions(engine: &engine::InMemoryEngine) -> Vec<String> {
-    let store = state::service_state(engine).expect("the medialive store");
+    let store = state::service_state_in(engine, DEFAULT_REGION).expect("the medialive store");
     let held: Vec<String> = store
         .lock()
         .channel_engine_versions

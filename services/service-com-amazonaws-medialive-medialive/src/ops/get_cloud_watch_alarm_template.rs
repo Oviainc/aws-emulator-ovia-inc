@@ -149,7 +149,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        let state = crate::state::service_state(&*self.engine, ctx.parts()).ok_or_else(unavailable)?;
         let region = crate::state::request_region(ctx.parts());
 
         // "Retrieves the specified cloudwatch alarm template" — a pure read:

@@ -84,9 +84,8 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// The next cloudwatch alarm template group id: seven decimal digits, which
     /// is the bare (not AWS-provided) form of `__stringMin7Max11PatternAws097`.
     fn mint_alarm_template_group_id(&mut self) -> String {
-        let id = FIRST_ALARM_TEMPLATE_GROUP_ID + self.next_alarm_template_group_id;
-        self.next_alarm_template_group_id += 1;
-        id.to_string()
+        (FIRST_ALARM_TEMPLATE_GROUP_ID + self.mints.next(|mints| &mut mints.alarm_template_group))
+            .to_string()
     }
 
     /// Store a cloudwatch alarm template group in `region` and answer its minted

@@ -299,6 +299,9 @@ mod partner_input;
 #[path = "all/post_delete_mutation_classification.rs"]
 mod post_delete_mutation_classification;
 
+#[path = "all/region_isolation.rs"]
+mod region_isolation;
+
 #[path = "all/rejection_messages.rs"]
 mod rejection_messages;
 

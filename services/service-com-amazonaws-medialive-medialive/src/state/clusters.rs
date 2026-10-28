@@ -482,9 +482,7 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// The next cluster id, as AWS shapes MediaLive resource ids: a numeric
     /// string.
     fn mint_cluster_id(&mut self) -> String {
-        let id = FIRST_CLUSTER_ID + self.next_cluster_id;
-        self.next_cluster_id += 1;
-        id.to_string()
+        (FIRST_CLUSTER_ID + self.mints.next(|mints| &mut mints.cluster)).to_string()
     }
 
     /// The id of the cluster stored under `name`, if the account holds one.

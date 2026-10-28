@@ -2,6 +2,15 @@
 
 //! Engine state for the com-amazonaws-medialive-medialive service.
 //!
+//! The store is PARTITIONED BY REGION
+//! ([`ComAmazonawsMedialiveMedialiveStore`]): MediaLive is a regional service,
+//! so every resource it mints belongs to the region whose endpoint created it —
+//! the region its ARN names — and the state an operation is handed
+//! ([`service_state`]) is the partition of the region ITS request was signed
+//! for. Everything below therefore describes ONE region's resources, and a
+//! reader, a mutation or a reference that resolves an id resolves it in that
+//! region alone.
+//!
 //! The channel lifecycle lives here: one [`ChannelRecord`] per created channel,
 //! the monotonic id counter that mints its `Id`, and the idempotency-token map
 //! that makes a retried `CreateChannel` return the channel it already created.
@@ -120,7 +129,8 @@
 //! template reports the group it belongs to out of state rather than out of the
 //! request.
 //!
-//! The ACCOUNT's own MediaLive settings live here too, beside the resources:
+//! The ACCOUNT's own MediaLive settings live here too, beside the region
+//! partitions rather than inside one:
 //! one [`AccountConfigurationRecord`] per region an `UpdateAccountConfiguration`
 //! has written one in. That is not a resource a caller creates — the account
 //! always has a configuration — so a region nothing has configured yet reads as
@@ -239,7 +249,7 @@ pub use alarm_template_groups::{
 /// of its own for the same reason as [`alarm_template_groups`]. What stays in
 /// this file is the part the rest of the state needs: the
 /// `account_configurations` store member on
-/// [`ComAmazonawsMedialiveMedialiveState`].
+/// [`ComAmazonawsMedialiveMedialiveStore`].
 pub mod account_configuration;
 
 pub use account_configuration::{
@@ -2243,21 +2253,20 @@ pub struct SignalMapChanges {
     pub event_bridge_rule_template_group_identifiers: Option<Vec<String>>,
 }
 
-/// Per-service state for com-amazonaws-medialive-medialive. A handler reaches it through [`service_state`].
+/// One REGION's resources for com-amazonaws-medialive-medialive. A handler
+/// reaches the partition of the region its own request was signed for through
+/// [`service_state`], and no other
+/// ([`ComAmazonawsMedialiveMedialiveStore`] is what holds them all).
 #[derive(Debug, Default)]
 pub struct ComAmazonawsMedialiveMedialiveState {
     /// Every channel that exists, keyed by its minted `Id`. A `BTreeMap` so
     /// `ListChannels` walks it in id order on every call and its `NextToken`
     /// means the same thing on the next one.
     pub channels: BTreeMap<String, ChannelRecord>,
-    /// Mint counter behind [`Self::mint_channel_id`].
-    pub next_channel_id: u64,
     /// Every input security group that exists, keyed by its minted `Id`. A
     /// `BTreeMap` for the same reason as [`Self::channels`]: a reader walks it in
     /// id order on every call.
     pub input_security_groups: BTreeMap<String, InputSecurityGroupRecord>,
-    /// Mint counter behind [`Self::mint_input_security_group_id`].
-    pub next_input_security_group_id: u64,
     /// `CreateChannel`'s `RequestId` (`@idempotencyToken`) -> the channel it
     /// created, so a retry returns that channel instead of a second one.
     ///
@@ -2268,15 +2277,17 @@ pub struct ComAmazonawsMedialiveMedialiveState {
     /// Every input that exists, keyed by its minted `Id`, in id order for the
     /// same reason as [`Self::channels`].
     pub inputs: BTreeMap<String, InputRecord>,
-    /// Mint counter behind [`Self::mint_input_id`].
-    pub next_input_id: u64,
     /// `CreateInput`'s `RequestId` (`@idempotencyToken`) -> the input it created.
     input_tokens: IdempotencyTokens,
-    /// Next offset into the emulated public address pool, so no two endpoints
-    /// this service reports — a push input's ingest address, a channel
-    /// pipeline's egress address — are the same. PRIVATE: the only way in is
-    /// [`Self::allocate_pool_address`], which owns the pool.
-    next_pool_ip: u32,
+    /// The id mints every region partition of one store SHARES, so no two
+    /// regions can hand out the same id and no address this service reports in
+    /// one region is reported in another. Set by
+    /// [`ComAmazonawsMedialiveMedialiveStore::region`] when it creates the
+    /// partition.
+    ///
+    /// PRIVATE: every id comes out of a `mint_*` method of this store, which is
+    /// where the kind of id and its first value live.
+    mints: ::std::sync::Arc<IdMints>,
     /// Every cloudwatch alarm template group that exists, keyed by its minted
     /// `Id`. A `BTreeMap` so a later `ListCloudWatchAlarmTemplateGroups` walks it
     /// in id order on every call.
@@ -2284,8 +2295,6 @@ pub struct ComAmazonawsMedialiveMedialiveState {
     /// PRIVATE, so the name-uniqueness rule, the cap and the mint stay invariants
     /// of [`Self::insert_alarm_template_group`] rather than of each handler.
     alarm_template_groups: BTreeMap<String, CloudWatchAlarmTemplateGroupRecord>,
-    /// Mint counter behind [`Self::mint_alarm_template_group_id`].
-    next_alarm_template_group_id: u64,
     /// `CreateCloudWatchAlarmTemplateGroup`'s `RequestId` (`@idempotencyToken`),
     /// keyed per region by [`template_group_token_key`] -> the group it
     /// created. PRIVATE for the same reason as [`Self::channel_tokens`].
@@ -2298,8 +2307,6 @@ pub struct ComAmazonawsMedialiveMedialiveState {
     /// the mint stay invariants of [`Self::insert_alarm_template`] rather than of
     /// each handler.
     alarm_templates: BTreeMap<String, CloudWatchAlarmTemplateRecord>,
-    /// Mint counter behind [`Self::mint_alarm_template_id`].
-    next_alarm_template_id: u64,
     /// `CreateCloudWatchAlarmTemplate`'s `RequestId` (`@idempotencyToken`), keyed
     /// per region by [`template_group_token_key`] -> the template it created.
     /// PRIVATE for the same reason as [`Self::channel_tokens`].
@@ -2307,8 +2314,6 @@ pub struct ComAmazonawsMedialiveMedialiveState {
     /// Every SdiSource that exists, keyed by its minted `Id`, in a `BTreeMap`
     /// for the same reason as [`Self::channels`].
     pub sdi_sources: BTreeMap<String, SdiSourceRecord>,
-    /// Mint counter behind [`Self::mint_sdi_source_id`].
-    pub next_sdi_source_id: u64,
     /// `CreateSdiSource`'s `RequestId` (`@idempotencyToken`) -> the SdiSource it
     /// created. PRIVATE for the same reason as [`Self::channel_tokens`].
     sdi_source_tokens: IdempotencyTokens,
@@ -2317,8 +2322,6 @@ pub struct ComAmazonawsMedialiveMedialiveState {
     /// order on every call and its `NextToken` means the same thing on the next
     /// one.
     pub networks: BTreeMap<String, NetworkRecord>,
-    /// Mint counter behind [`Self::mint_network_id`].
-    pub next_network_id: u64,
     /// `CreateNetwork`'s `RequestId` (`@idempotencyToken`) -> the network it
     /// created. PRIVATE for the same reason as [`Self::channel_tokens`].
     network_tokens: IdempotencyTokens,
@@ -2326,8 +2329,6 @@ pub struct ComAmazonawsMedialiveMedialiveState {
     /// `Id`. A `BTreeMap` so a walk over the groups is in id order on every
     /// call.
     pub event_bridge_rule_template_groups: BTreeMap<String, EventBridgeRuleTemplateGroupRecord>,
-    /// Mint counter behind [`Self::mint_event_bridge_rule_template_group_id`].
-    pub next_event_bridge_rule_template_group_id: u64,
     /// `CreateEventBridgeRuleTemplateGroup`'s `RequestId` (`@idempotencyToken`)
     /// -> the group it created, so a retry returns that group instead of a
     /// second one. PRIVATE for the same reason as [`Self::channel_tokens`].
@@ -2340,8 +2341,6 @@ pub struct ComAmazonawsMedialiveMedialiveState {
     /// the mint stay invariants of
     /// [`Self::insert_event_bridge_rule_template`] rather than of each handler.
     event_bridge_rule_templates: BTreeMap<String, EventBridgeRuleTemplateRecord>,
-    /// Mint counter behind [`Self::mint_event_bridge_rule_template_id`].
-    next_event_bridge_rule_template_id: u64,
     /// `CreateEventBridgeRuleTemplate`'s `RequestId` (`@idempotencyToken`), keyed
     /// per region by [`template_group_token_key`] -> the template it created.
     /// PRIVATE for the same reason as [`Self::channel_tokens`].
@@ -2349,21 +2348,12 @@ pub struct ComAmazonawsMedialiveMedialiveState {
     /// Every signal map that exists, keyed by its minted `Id`, in mint order for
     /// the same reason as [`Self::channels`].
     pub signal_maps: BTreeMap<String, SignalMapRecord>,
-    /// Mint counter behind [`Self::mint_signal_map_id`].
-    pub next_signal_map_id: u64,
     /// `CreateSignalMap`'s `RequestId` (`@idempotencyToken`) -> the signal map it
     /// created.
     signal_map_tokens: IdempotencyTokens,
     /// Every multiplex that exists, keyed by its minted `Id`, in id order for
     /// the same reason as [`Self::channels`].
     pub multiplexes: BTreeMap<String, MultiplexRecord>,
-    /// Mint counter behind the multiplex slice's `mint_multiplex_id`.
-    pub next_multiplex_id: u64,
-    /// Mint counter behind the alert ids the multiplex slice's `apply_alerts`
-    /// hands out. It lives on the store rather than on one multiplex because
-    /// `MultiplexAlert$Id` is "The unique ID for this alert instance": two
-    /// multiplexes cannot raise an alert under the same id.
-    pub next_multiplex_alert_id: u64,
     /// `CreateMultiplex`'s `RequestId` (`@idempotencyToken`) -> the multiplex it
     /// created. PRIVATE for the same reason as [`Self::channel_tokens`].
     multiplex_tokens: IdempotencyTokens,
@@ -2383,8 +2373,6 @@ pub struct ComAmazonawsMedialiveMedialiveState {
     /// same reason as [`Self::channels`]: a reader walks it in id order on every
     /// call. The alerts raised against a cluster live on its own record.
     pub clusters: BTreeMap<String, ClusterRecord>,
-    /// Mint counter behind the cluster slice's `mint_cluster_id`.
-    pub next_cluster_id: u64,
     /// `CreateCluster`'s `RequestId` (`@idempotencyToken`) -> the cluster it
     /// created. PRIVATE for the same reason as [`Self::channel_tokens`].
     cluster_tokens: IdempotencyTokens,
@@ -2392,35 +2380,15 @@ pub struct ComAmazonawsMedialiveMedialiveState {
     /// `BTreeMap` so a later `ListChannelPlacementGroups` walks it in id order
     /// on every call.
     pub channel_placement_groups: BTreeMap<String, ChannelPlacementGroupRecord>,
-    /// Mint counter behind the channel placement group slice's
-    /// `mint_channel_placement_group_id`.
-    pub next_channel_placement_group_id: u64,
     /// `CreateChannelPlacementGroup`'s `RequestId` (`@idempotencyToken`), keyed
     /// per cluster by the slice's `channel_placement_group_token_key` -> the
     /// group it created. PRIVATE for the same reason as [`Self::channel_tokens`].
     channel_placement_group_tokens: IdempotencyTokens,
-    /// The account's MediaLive configuration in each region an
-    /// `UpdateAccountConfiguration` has written one in, keyed by the region the
-    /// writing request was signed for. A `BTreeMap` so a debug dump of the store
-    /// is in region order rather than in write order.
-    ///
-    /// There is no mint counter and no token map beside it: the configuration is
-    /// not a resource a caller creates, it is the account's own settings, so a
-    /// region nothing has configured yet reads as the unset configuration rather
-    /// than as missing (see the [`account_configuration`] slice).
-    ///
-    /// PRIVATE, so the partial-update rule, the blank-clears-the-key rule and
-    /// the store's bound stay invariants of
-    /// [`Self::update_account_configuration`] and
-    /// [`Self::account_configuration`] rather than of each handler.
-    account_configurations: BTreeMap<String, AccountConfigurationRecord>,
     /// Every node that exists, in every cluster, keyed by its minted `Id`, in id
     /// order for the same reason as [`Self::channels`]. The cluster a node
     /// belongs to is on the record, and every node lookup matches it
     /// ([`Self::node`]), because a node's id is unique in its cluster.
     pub nodes: BTreeMap<String, NodeRecord>,
-    /// Mint counter behind the node slice's `mint_node_id`.
-    pub next_node_id: u64,
     /// `CreateNode`'s `RequestId` (`@idempotencyToken`) -> the node it created,
     /// keyed by the node slice's `node_token_key` because a node is created
     /// against one cluster's endpoint. PRIVATE for the same reason as
@@ -2436,9 +2404,6 @@ pub struct ComAmazonawsMedialiveMedialiveState {
     /// rather than of each handler. The operation reports a script's TEXT and no
     /// id, so nothing outside that slice resolves a record.
     node_registration_scripts: BTreeMap<String, NodeRegistrationScriptRecord>,
-    /// Mint counter behind the registration script slice's
-    /// `mint_node_registration_script_id`.
-    next_node_registration_script_id: u64,
     /// `CreateNodeRegistrationScript`'s `RequestId` (`@idempotencyToken`) -> the
     /// script it issued, keyed per cluster by that slice's
     /// `node_registration_script_token_key` because a script is issued against
@@ -2449,9 +2414,6 @@ pub struct ComAmazonawsMedialiveMedialiveState {
     /// id order for the same reason as [`Self::channels`]: a reader walks it in
     /// id order on every call.
     pub reservations: BTreeMap<String, ReservationRecord>,
-    /// Mint counter behind the reservation slice's `mint_reservation_id`.
-    /// PRIVATE: only that slice mints a reservation id.
-    next_reservation_id: u64,
     /// `PurchaseOffering`'s `RequestId` (`@idempotencyToken`) -> the reservation
     /// it purchased. PRIVATE for the same reason as [`Self::channel_tokens`].
     reservation_tokens: IdempotencyTokens,
@@ -2466,6 +2428,17 @@ pub struct ComAmazonawsMedialiveMedialiveState {
 }
 
 impl ComAmazonawsMedialiveMedialiveState {
+    /// An empty partition of one region's resources, minting them out of
+    /// `mints` — the store's own set, which every partition shares, so no two
+    /// regions hand out the same id. The [`regions`] slice is what calls this;
+    /// `Default` (which gives a set of its own) is for a standalone store.
+    fn with_mints(mints: ::std::sync::Arc<IdMints>) -> Self {
+        Self {
+            mints,
+            ..Self::default()
+        }
+    }
+
     /// Materialise every transition the clock had already made due as of `now`,
     /// then answer from the result.
     ///
@@ -2535,16 +2508,14 @@ impl ComAmazonawsMedialiveMedialiveState {
 
     /// The next channel id, as AWS shapes them: a numeric string.
     pub fn mint_channel_id(&mut self) -> String {
-        let id = FIRST_CHANNEL_ID + self.next_channel_id;
-        self.next_channel_id += 1;
-        id.to_string()
+        (FIRST_CHANNEL_ID + self.mints.next(|mints| &mut mints.channel)).to_string()
     }
 
     /// The next input security group id, as AWS shapes them: a numeric string.
     pub fn mint_input_security_group_id(&mut self) -> String {
-        let id = FIRST_INPUT_SECURITY_GROUP_ID + self.next_input_security_group_id;
-        self.next_input_security_group_id += 1;
-        id.to_string()
+        (FIRST_INPUT_SECURITY_GROUP_ID
+            + self.mints.next(|mints| &mut mints.input_security_group))
+            .to_string()
     }
 
     /// Whether the input security group store is full, so
@@ -2675,9 +2646,7 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// The next SdiSource id, as AWS shapes MediaLive resource ids: a numeric
     /// string.
     pub fn mint_sdi_source_id(&mut self) -> String {
-        let id = FIRST_SDI_SOURCE_ID + self.next_sdi_source_id;
-        self.next_sdi_source_id += 1;
-        id.to_string()
+        (FIRST_SDI_SOURCE_ID + self.mints.next(|mints| &mut mints.sdi_source)).to_string()
     }
 
     /// Record `token` as having created `sdi_source_id`.
@@ -2779,9 +2748,7 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// The next network id, as AWS shapes MediaLive resource ids: a numeric
     /// string, which `Id` documents as "the resource-id portion of the ARN".
     pub fn mint_network_id(&mut self) -> String {
-        let id = FIRST_NETWORK_ID + self.next_network_id;
-        self.next_network_id += 1;
-        id.to_string()
+        (FIRST_NETWORK_ID + self.mints.next(|mints| &mut mints.network)).to_string()
     }
 
     /// Record `token` as having created `network_id`.
@@ -2979,8 +2946,9 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// `aws-` prefix AWS reserves for the groups it provides itself.
     pub fn mint_event_bridge_rule_template_group_id(&mut self) -> String {
         let id = FIRST_EVENT_BRIDGE_RULE_TEMPLATE_GROUP_ID
-            + self.next_event_bridge_rule_template_group_id;
-        self.next_event_bridge_rule_template_group_id += 1;
+            + self
+                .mints
+                .next(|mints| &mut mints.event_bridge_rule_template_group);
         id.to_string()
     }
 
@@ -3302,9 +3270,7 @@ impl ComAmazonawsMedialiveMedialiveState {
 
     /// The next input id, as AWS shapes them: a numeric string.
     pub fn mint_input_id(&mut self) -> String {
-        let id = FIRST_INPUT_ID + self.next_input_id;
-        self.next_input_id += 1;
-        id.to_string()
+        (FIRST_INPUT_ID + self.mints.next(|mints| &mut mints.input)).to_string()
     }
 
     /// The message refusing the configuration `input` carries, or `None` when it
@@ -3459,8 +3425,7 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// most two pipelines, so the wrap is the pool's last-resort bound rather
     /// than a path a client can reach.
     fn allocate_pool_address(&mut self) -> String {
-        let offset = self.next_pool_ip % IP_POOL_LEN;
-        self.next_pool_ip = self.next_pool_ip.wrapping_add(1);
+        let offset = (self.mints.next(|mints| &mut mints.pool_ip) % u64::from(IP_POOL_LEN)) as u32;
         ::std::net::Ipv4Addr::from(IP_POOL_BASE + offset).to_string()
     }
 
@@ -3794,9 +3759,7 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// The next signal map id: a numeric string of the length the model's
     /// `__stringMin7Max11PatternAws097` allows.
     pub fn mint_signal_map_id(&mut self) -> String {
-        let id = FIRST_SIGNAL_MAP_ID + self.next_signal_map_id;
-        self.next_signal_map_id += 1;
-        id.to_string()
+        (FIRST_SIGNAL_MAP_ID + self.mints.next(|mints| &mut mints.signal_map)).to_string()
     }
 
     /// Record `token` as having created `signal_map_id`.
@@ -6187,23 +6150,11 @@ pub fn new_event_bridge_rule_template_group(
     }
 }
 
-/// The region this request was signed for, which is the region every ARN this
-/// request mints names. Falls back to the emulator's default region when the
-/// request carries no SigV4 credential scope, or an empty region in it.
-pub fn request_region(parts: &::http::request::Parts) -> String {
-    ::emulator_server::sigv4_credential_scope(&parts.headers)
-        .map(|scope| scope.region)
-        .filter(|region| !region.is_empty())
-        .unwrap_or_else(|| DEFAULT_REGION.to_string())
-}
-
-/// The region a request that names none is treated as being in (`emulator_arn`'s
-/// documented default).
-const DEFAULT_REGION: &str = "us-east-1";
-
-/// The message for the one failure that is not about the request: this service
-/// was mounted on an engine that holds no store for it. One constant, so the
-/// service's operations cannot word it several ways.
+/// The message for the failures that are not about the request: this service was
+/// mounted on an engine that holds no store for it, or the store keeps no
+/// partition for the region the request was signed for and has no room for
+/// another ([`MAX_RESOURCE_REGIONS`]). One constant, so the service's operations
+/// cannot word it several ways.
 pub const NO_STORE: &str = "medialive service state is unavailable";
 
 /// Project a `Channel` onto one of the structurally identical per-operation
@@ -6373,15 +6324,100 @@ macro_rules! template_group_output {
 
 pub(crate) use template_group_output;
 
-/// This service's store in the shared engine: call it with a handler's `&*self.engine`.
+/// The REGION slice: the store the engine holds, the per-region partition of
+/// resources a handler is handed, the ceiling on how many of those partitions
+/// the store keeps, and the decode that says which region a request is for — in
+/// one module of its own for the same reason as [`account_configuration`]. What
+/// stays in this file is the part the rest of the state needs: the records
+/// themselves, and the [`IdMints`] every partition shares.
+pub mod regions;
+
+pub use regions::{
+    request_region, service_state, service_state_in, service_store,
+    ComAmazonawsMedialiveMedialiveStore, RegionState, MAX_RESOURCE_REGIONS,
+};
+
+/// The counters this service mints every resource id out of, one per kind of id.
 ///
-/// Answer `None` with a modelled server error, never with a fresh engine.
-pub fn service_state<Eng: Send + Sync + 'static>(
-    engine: &Eng,
-) -> Option<::engine::ServiceState<ComAmazonawsMedialiveMedialiveState>> {
-    (engine as &dyn ::std::any::Any)
-        .downcast_ref::<::engine::InMemoryEngine>()
-        .map(::engine::InMemoryEngine::state::<ComAmazonawsMedialiveMedialiveState>)
+/// Held behind one lock rather than one per counter, so a mint is a single
+/// critical section and the whole set can be handed to every region partition of
+/// a store as one shared value. `Mints` itself is the counters; [`Self::next`] is
+/// the only way to move one.
+#[derive(Debug, Default)]
+pub struct IdMints(::std::sync::Mutex<Mints>);
+
+impl IdMints {
+    /// The next value of the counter `pick` names — the offset the caller adds
+    /// its own kind's first id to — which no later call hands out again.
+    ///
+    /// Recovers from a poisoned lock for the same reason the state guard does:
+    /// one panicking handler must not stop every later request from being able
+    /// to mint an id.
+    fn next(&self, pick: fn(&mut Mints) -> &mut u64) -> u64 {
+        let mut mints = self
+            .0
+            .lock()
+            .unwrap_or_else(::std::sync::PoisonError::into_inner);
+        let counter = pick(&mut mints);
+        let minted = *counter;
+        *counter += 1;
+        minted
+    }
+}
+
+/// One counter per kind of id this service hands out, each the number of ids of
+/// that kind minted so far: the id itself is that offset past the kind's first
+/// id (`FIRST_CHANNEL_ID` and the constants beside it), which is what keeps one
+/// kind's ids out of another's range.
+#[derive(Debug, Default)]
+struct Mints {
+    /// Behind [`ComAmazonawsMedialiveMedialiveState::mint_channel_id`].
+    channel: u64,
+    /// Behind [`ComAmazonawsMedialiveMedialiveState::mint_input_id`].
+    input: u64,
+    /// Behind
+    /// [`ComAmazonawsMedialiveMedialiveState::mint_input_security_group_id`].
+    input_security_group: u64,
+    /// Behind [`ComAmazonawsMedialiveMedialiveState::mint_sdi_source_id`].
+    sdi_source: u64,
+    /// Behind [`ComAmazonawsMedialiveMedialiveState::mint_network_id`].
+    network: u64,
+    /// Behind [`ComAmazonawsMedialiveMedialiveState::mint_signal_map_id`].
+    signal_map: u64,
+    /// Behind the multiplex slice's `mint_multiplex_id`.
+    multiplex: u64,
+    /// Behind the alert ids the multiplex slice's `apply_alerts` hands out:
+    /// `MultiplexAlert$Id` is "The unique ID for this alert instance", so two
+    /// multiplexes cannot raise an alert under the same id.
+    multiplex_alert: u64,
+    /// Behind the cluster slice's `mint_cluster_id`.
+    cluster: u64,
+    /// Behind the channel placement group slice's
+    /// `mint_channel_placement_group_id`.
+    channel_placement_group: u64,
+    /// Behind the node slice's `mint_node_id`.
+    node: u64,
+    /// Behind the registration script slice's
+    /// `mint_node_registration_script_id`.
+    node_registration_script: u64,
+    /// Behind the reservation slice's `mint_reservation_id`.
+    reservation: u64,
+    /// Behind the alarm template group slice's `mint_alarm_template_group_id`.
+    alarm_template_group: u64,
+    /// Behind the alarm template slice's `mint_alarm_template_id`.
+    alarm_template: u64,
+    /// Behind
+    /// [`ComAmazonawsMedialiveMedialiveState::mint_event_bridge_rule_template_group_id`].
+    event_bridge_rule_template_group: u64,
+    /// Behind the eventbridge rule template slice's
+    /// `mint_event_bridge_rule_template_id`.
+    event_bridge_rule_template: u64,
+    /// The offset into the emulated public address pool
+    /// ([`ComAmazonawsMedialiveMedialiveState::allocate_pool_address`]), so no
+    /// two endpoints this service reports — a push input's ingest address, a
+    /// channel pipeline's egress address — are the same, in one region or
+    /// across two.
+    pool_ip: u64,
 }
 
 // ---------------------------------------------------------------------------

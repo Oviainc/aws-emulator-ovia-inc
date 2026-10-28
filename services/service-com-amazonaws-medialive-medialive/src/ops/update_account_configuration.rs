@@ -24,12 +24,12 @@
 //!
 //! The engine is held on `self` (constructor-injected), NOT passed per request — so
 //! engine access is guaranteed by the time any request runs. Reach the store through
-//! [`crate::state::service_state`] and read and write it through the guard it hands back:
+//! [`crate::state::service_store`] and read and write it through the guard it hands back:
 //!
 //! ```ignore
-//!     let state = crate::state::service_state(&*self.engine)
+//!     let store = crate::state::service_store(&*self.engine)
 //!         .ok_or(/* a modelled server error */)?;
-//!     state.lock().your_field = /* ... */;
+//!     store.lock().your_field = /* ... */;
 //! ```
 //!
 //! `ctx` ([`smithy_server_runtime::OperationContext`]) carries request metadata only —
@@ -154,7 +154,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        // The ACCOUNT's configuration is the store's own, region-keyed, rather
+        // than one region's resource, so this write reaches the whole store
+        // rather than the partition every resource operation is handed.
+        let store = crate::state::service_store(&*self.engine).ok_or_else(unavailable)?;
 
         // What this request asks to SET, as against what it leaves alone: bound
         // once, because both the syntax check and the store's bound turn on it.
@@ -178,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ONE lock for the write and the read-back, so the configuration this
         // call reports is the one it committed rather than one a concurrent
         // update replaced in between.
-        let mut state = state.lock();
+        let mut store = store.lock();
 
         // The store keeps one record per region and is bounded, so an update loop
         // over made-up region names cannot grow the emulator's heap without
@@ -189,7 +192,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // blanks it, both leave the region without a record, so neither needs
         // room.
         let sets_a_parameter = requested_kms_key_id.is_some_and(|key| !key.is_empty());
-        if sets_a_parameter && state.account_configurations_full(&region) {
+        if sets_a_parameter && store.account_configurations_full(&region) {
             return Err(too_many_regions());
         }
 
@@ -201,7 +204,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // back out of the store, never built from `input`, so what this update
         // answers is what the next `DescribeAccountConfiguration` answers.
         let configuration =
-            state.update_account_configuration(&region, input.account_configuration.as_ref());
+            store.update_account_configuration(&region, input.account_configuration.as_ref());
 
         Ok(UpdateAccountConfigurationOutput {
             account_configuration: Some(configuration),

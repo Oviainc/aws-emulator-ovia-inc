@@ -18,8 +18,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_medialive_medialive::state::MAX_INPUT_DEVICES;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::input_device_maintenance_window::{describe_device, device};
-use crate::wire::{call, call_in_region, error_code, medialive, ACCOUNT, DEFAULT_REGION};
+use crate::input_device_maintenance_window::{describe_device_in, device_in};
+use crate::wire::{call_in_region, error_code, medialive, ACCOUNT, DEFAULT_REGION};
 
 /// The URI `ClaimDevice` is bound to
 /// (`smithy_query(query="operation", operation="ClaimDevice")`: POST
@@ -40,15 +40,15 @@ async fn claim(
     call_in_region(router, region, "POST", CLAIM_DEVICE, Some(json!({ "id": id }))).await
 }
 
-/// The device ids this account holds, as `ListInputDevices` reports them in one
-/// page. The pagination rule is the listing suite's; this suite reads a single
-/// page (the store's own bound is below the largest page), to see WHICH devices
-/// a claim registered.
-async fn claimed_ids(router: &MultiServiceRouter, case: &str) -> Vec<String> {
-    let (status, body) = call(router, "GET", DEVICES, None).await;
+/// The device ids this account holds IN `region`, as `ListInputDevices` reports
+/// them in one page. The pagination rule is the listing suite's; this suite reads
+/// a single page (the store's own bound is below the largest page), to see WHICH
+/// devices a claim registered, and where.
+async fn claimed_ids_in(router: &MultiServiceRouter, case: &str, region: &str) -> Vec<String> {
+    let (status, body) = call_in_region(router, region, "GET", DEVICES, None).await;
     assert_eq!(
         status, 200,
-        "case {case:?}: ListInputDevices: expected 200, got {status}: {body}"
+        "case {case:?}: ListInputDevices in {region}: expected 200, got {status}: {body}"
     );
     assert!(
         body["nextToken"].is_null(),
@@ -71,11 +71,13 @@ struct Row {
     device_type: &'static str,
 }
 
-/// Rule: `ClaimDevice` registers, in the account, the device its `Id` names and
-/// nothing else — the id is the unit's own, so it is persisted exactly as the
-/// request spelled it, the device's `Type` is the one its documented id prefix
-/// names, its ARN names the region the request was signed for, and the response
-/// itself carries no members (`ClaimDeviceResponse` models none).
+/// Rule: `ClaimDevice` registers, in the region the request was signed for, the
+/// device its `Id` names and nothing else — the id is the unit's own, so it is
+/// persisted exactly as the request spelled it, the device's `Type` is the one
+/// its documented id prefix names, its ARN names that region, and the response
+/// itself carries no members (`ClaimDeviceResponse` models none). The device
+/// belongs to that region alone: no other region's endpoint reads it or lists
+/// it.
 ///
 /// The rows differ along what the rule generalises over: both
 /// `InputDeviceType`s, the case the id prefix is spelled in, the length and
@@ -125,7 +127,7 @@ async fn a_claim_registers_the_device_its_id_names_in_the_region_it_was_signed_f
 
         // Nothing holds the device before the claim, so what a later read
         // reports is what the claim persisted.
-        let (status, before) = describe_device(&router, id).await;
+        let (status, before) = describe_device_in(&router, region, id).await;
         assert_eq!(
             status, 404,
             "case {case:?}: expected the id to name no device before the claim, got {status}: {before}"
@@ -141,7 +143,7 @@ async fn a_claim_registers_the_device_its_id_names_in_the_region_it_was_signed_f
             "case {case:?}: expected a response with no members, got {claimed}"
         );
 
-        let stored = device(&router, case, id).await;
+        let stored = device_in(&router, case, region, id).await;
         assert_eq!(
             stored["id"],
             json!(id),
@@ -162,10 +164,34 @@ async fn a_claim_registers_the_device_its_id_names_in_the_region_it_was_signed_f
         );
 
         assert_eq!(
-            claimed_ids(&router, case).await,
+            claimed_ids_in(&router, case, region).await,
             vec![id.to_string()],
             "case {case:?}: expected the claim to register exactly the device it named"
         );
+
+        // The claim registered the device in ITS region, so another region's
+        // endpoint neither reads it nor lists it.
+        let elsewhere = other_region(region);
+        let (status, described) = describe_device_in(&router, elsewhere, id).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected {elsewhere} to hold no device {id}, got {status}: {described}"
+        );
+        assert_eq!(
+            claimed_ids_in(&router, case, elsewhere).await,
+            Vec::<String>::new(),
+            "case {case:?}: expected {elsewhere} to list no device of {region}"
+        );
+    }
+}
+
+/// A region that is not `region`, for an assertion about what one region's
+/// endpoint cannot see of another's.
+fn other_region(region: &str) -> &'static str {
+    if region == "eu-west-3" {
+        "ca-central-1"
+    } else {
+        "eu-west-3"
     }
 }
 
@@ -178,11 +204,14 @@ struct Repeat {
     second_region: &'static str,
 }
 
-/// Rule: a claim of a device the account already owns is IDEMPOTENT — the
-/// promise that you own the device already holds for it, so the second claim
-/// succeeds and leaves the stored device exactly as it is (ARN included, so the
-/// region the first claim recorded is not re-written) and registers no second
-/// device.
+/// Rule: a claim of a device the account already owns IN THE REGION the claim is
+/// signed for is IDEMPOTENT — the promise that you own the device already holds
+/// there, so the second claim succeeds and leaves the stored device exactly as it
+/// is (ARN included, so the region the first claim recorded is not re-written)
+/// and registers no second device in that region. A claim signed for ANOTHER
+/// region registers the device in that region instead, under that region's ARN,
+/// and leaves the first region's device exactly as it was: a regional endpoint
+/// answers out of its own region's resources and has no view of another's.
 ///
 /// The rows differ in the device's type and in whether the repeat is signed for
 /// the same region as the first claim, because the rule is about a device the
@@ -224,7 +253,7 @@ async fn a_repeated_claim_leaves_the_device_the_account_already_owns_as_it_is() 
             status, 200,
             "case {case:?}: ClaimDevice({id}): expected 200, got {status}: {claimed}"
         );
-        let stored = device(&router, case, id).await;
+        let stored = device_in(&router, case, first_region, id).await;
 
         let (status, repeated) = claim(&router, second_region, id).await;
         assert_eq!(
@@ -232,14 +261,31 @@ async fn a_repeated_claim_leaves_the_device_the_account_already_owns_as_it_is() 
             "case {case:?}: expected a repeated claim to succeed, got {status}: {repeated}"
         );
         assert_eq!(
-            device(&router, case, id).await,
+            device_in(&router, case, first_region, id).await,
             stored,
-            "case {case:?}: expected the repeated claim to change nothing about the device"
+            "case {case:?}: expected the repeated claim to change nothing about the device the first region holds"
         );
         assert_eq!(
-            claimed_ids(&router, case).await,
+            claimed_ids_in(&router, case, first_region).await,
             vec![id.to_string()],
             "case {case:?}: expected the repeated claim to register no second device"
+        );
+        // The second claim's own region holds the device it claimed, under an
+        // ARN naming that region — the same device id in the region whose
+        // endpoint took the claim.
+        let second = device_in(&router, case, second_region, id).await;
+        assert_eq!(
+            second["arn"],
+            json!(format!(
+                "arn:aws:medialive:{second_region}:{ACCOUNT}:inputDevice:{id}"
+            )),
+            "case {case:?}: expected the device the second region holds to carry its own region's ARN, got {:?}",
+            second["arn"]
+        );
+        assert_eq!(
+            claimed_ids_in(&router, case, second_region).await,
+            vec![id.to_string()],
+            "case {case:?}: expected the second region to hold exactly the device it claimed"
         );
     }
 }
@@ -269,7 +315,7 @@ async fn a_claim_past_the_stores_bound_is_refused_and_registers_nothing() {
         );
     }
 
-    let full = claimed_ids(&router, case).await;
+    let full = claimed_ids_in(&router, case, DEFAULT_REGION).await;
     assert_eq!(
         full.len(),
         MAX_INPUT_DEVICES,
@@ -289,7 +335,7 @@ async fn a_claim_past_the_stores_bound_is_refused_and_registers_nothing() {
             "TooManyRequestsException",
             "case {case:?}: expected the operation's modelled TooManyRequestsException, got {refused}"
         );
-        let (status, described) = describe_device(&router, id).await;
+        let (status, described) = describe_device_in(&router, DEFAULT_REGION, id).await;
         assert_eq!(
             status, 404,
             "case {case:?}: expected the refused claim to register nothing, got {status}: {described}"
@@ -298,19 +344,19 @@ async fn a_claim_past_the_stores_bound_is_refused_and_registers_nothing() {
 
     // A device already owned is still claimable, and still unchanged.
     let owned = &ids[0];
-    let stored = device(&router, case, owned).await;
+    let stored = device_in(&router, case, DEFAULT_REGION, owned).await;
     let (status, repeated) = claim(&router, DEFAULT_REGION, owned).await;
     assert_eq!(
         status, 200,
         "case {case:?}: expected a claim of an owned device to succeed with the store full, got {status}: {repeated}"
     );
     assert_eq!(
-        device(&router, case, owned).await,
+        device_in(&router, case, DEFAULT_REGION, owned).await,
         stored,
         "case {case:?}: expected the owned device to be left as it is"
     );
     assert_eq!(
-        claimed_ids(&router, case).await,
+        claimed_ids_in(&router, case, DEFAULT_REGION).await,
         full,
         "case {case:?}: expected the refused and repeated claims to leave the store as it was"
     );

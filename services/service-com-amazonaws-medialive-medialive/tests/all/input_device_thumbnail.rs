@@ -106,7 +106,7 @@ fn offer_thumbnail(
     id: &str,
     thumbnail: InputDeviceThumbnailRecord,
 ) -> bool {
-    let store = state::service_state(engine).expect("the medialive store");
+    let store = state::service_state_in(engine, DEFAULT_REGION).expect("the medialive store");
     let mut store = store.lock();
     store.record_input_device_thumbnail(id, thumbnail)
 }

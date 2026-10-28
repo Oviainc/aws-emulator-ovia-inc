@@ -137,7 +137,7 @@ fn end_the_lease(
     id: &str,
     end: SystemTime,
 ) {
-    let store = state::service_state(&**engine).expect("the medialive store");
+    let store = state::service_state_in(&**engine, DEFAULT_REGION).expect("the medialive store");
     let mut store = store.lock();
     let reservation = store
         .reservations

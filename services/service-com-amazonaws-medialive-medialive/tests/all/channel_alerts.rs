@@ -26,14 +26,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 use serde_json::json;
 use service_com_amazonaws_medialive_medialive::state::{
-    channel_alert_state, not_found_message, service_state, CHANNEL_ALERT_FILTERS,
+    channel_alert_state, not_found_message, service_state_in, CHANNEL_ALERT_FILTERS,
     MAX_CHANNEL_ALERTS, MAX_LIST_PAGE_SIZE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::channel_lifecycle::wait_for_the_clock;
 use crate::support::{epoch_seconds, member, percent_encoded, timestamp, unix_seconds};
-use crate::wire::{call, error_code, error_message, medialive_with_engine};
+use crate::wire::{call, error_code, error_message, medialive_with_engine, DEFAULT_REGION};
 
 /// The engine the router under test was built on, so a suite can record on it
 /// the alerts no operation of this emulator produces.
@@ -78,7 +78,7 @@ fn try_raise(
     pipeline: Option<i32>,
     set_at: SystemTime,
 ) -> Option<String> {
-    let store = service_state(&**engine).expect("the medialive store");
+    let store = service_state_in(&**engine, DEFAULT_REGION).expect("the medialive store");
     let mut store = store.lock();
     let channel = store
         .channels
@@ -104,7 +104,7 @@ fn raise(
 /// Clear a recorded alert — "the alert is no longer happening" — as of
 /// `cleared_at`.
 fn clear(engine: &Engine, channel_id: &str, alert_id: &str, cleared_at: SystemTime) {
-    let store = service_state(&**engine).expect("the medialive store");
+    let store = service_state_in(&**engine, DEFAULT_REGION).expect("the medialive store");
     let mut store = store.lock();
     let channel = store
         .channels
@@ -118,7 +118,7 @@ fn clear(engine: &Engine, channel_id: &str, alert_id: &str, cleared_at: SystemTi
 
 /// How many alerts the channel's log holds, whatever state they are in.
 fn logged(engine: &Engine, channel_id: &str) -> usize {
-    let store = service_state(&**engine).expect("the medialive store");
+    let store = service_state_in(&**engine, DEFAULT_REGION).expect("the medialive store");
     let store = store.lock();
     store
         .channels

@@ -145,9 +145,9 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// The next registration script id, as AWS shapes MediaLive resource ids: a
     /// numeric string.
     fn mint_node_registration_script_id(&mut self) -> String {
-        let id = FIRST_NODE_REGISTRATION_SCRIPT_ID + self.next_node_registration_script_id;
-        self.next_node_registration_script_id += 1;
-        id.to_string()
+        (FIRST_NODE_REGISTRATION_SCRIPT_ID
+            + self.mints.next(|mints| &mut mints.node_registration_script))
+            .to_string()
     }
 
     /// Issue one registration script for the cluster `cluster_id`, store it and

@@ -42,7 +42,9 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::channel_lifecycle::wait_for_the_clock;
 use crate::support::{epoch_seconds, member, resolved_network_ids, timestamp, unix_seconds};
-use crate::wire::{call, error_code, error_message, medialive, medialive_with_engine, ACCOUNT};
+use crate::wire::{
+    call, error_code, error_message, medialive, medialive_with_engine, ACCOUNT, DEFAULT_REGION,
+};
 
 /// The cluster collection URI
 /// (`smithy_query(query="operation",operation="CreateCluster")`: POST
@@ -101,7 +103,7 @@ fn raise(
     cluster_id: &str,
     alerts: impl IntoIterator<Item = ClusterAlertRecord>,
 ) {
-    let store = state::service_state(engine).expect("the medialive store");
+    let store = state::service_state_in(engine, DEFAULT_REGION).expect("the medialive store");
     let mut store = store.lock();
     for alert in alerts {
         assert!(

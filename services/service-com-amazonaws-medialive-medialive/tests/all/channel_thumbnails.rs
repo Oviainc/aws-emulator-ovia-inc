@@ -38,7 +38,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::channel_lifecycle::{describe, wait_for_the_clock};
 use crate::support::{epoch_seconds, timestamp};
-use crate::wire::{call, error_code, medialive_with_engine};
+use crate::wire::{call, error_code, medialive_with_engine, DEFAULT_REGION};
 
 /// The modelled `ThumbnailType` values (`smithy_query(query="shape",
 /// shape="ThumbnailType")`: UNSPECIFIED | CURRENT_ACTIVE) — the whole set of
@@ -191,7 +191,7 @@ fn try_capture(
     channel_id: &str,
     frames: impl IntoIterator<Item = ThumbnailRecord>,
 ) -> Vec<bool> {
-    let store = state::service_state(engine).expect("the medialive store");
+    let store = state::service_state_in(engine, DEFAULT_REGION).expect("the medialive store");
     let mut store = store.lock();
     frames
         .into_iter()

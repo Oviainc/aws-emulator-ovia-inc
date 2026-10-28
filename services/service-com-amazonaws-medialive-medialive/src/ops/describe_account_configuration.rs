@@ -23,12 +23,12 @@
 //!
 //! The engine is held on `self` (constructor-injected), NOT passed per request — so
 //! engine access is guaranteed by the time any request runs. Reach the store through
-//! [`crate::state::service_state`] and read and write it through the guard it hands back:
+//! [`crate::state::service_store`] and read and write it through the guard it hands back:
 //!
 //! ```ignore
-//!     let state = crate::state::service_state(&*self.engine)
+//!     let store = crate::state::service_store(&*self.engine)
 //!         .ok_or(/* a modelled server error */)?;
-//!     state.lock().your_field = /* ... */;
+//!     store.lock().your_field = /* ... */;
 //! ```
 //!
 //! `ctx` ([`smithy_server_runtime::OperationContext`]) carries request metadata only —
@@ -148,7 +148,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The request carries no members at all (`DescribeAccountConfigurationRequest`
         // is empty); the region it was signed for is what selects the configuration.
         let _ = input;
-        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        // The ACCOUNT's configuration is the store's own, region-keyed, rather
+        // than one region's resource, so this read reaches the whole store
+        // rather than the partition every resource operation is handed.
+        let store = crate::state::service_store(&*self.engine).ok_or_else(unavailable)?;
 
         let region = crate::state::request_region(ctx.parts());
 
@@ -157,7 +160,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // read and the update that preceded it cannot report the same stored
         // configuration differently. Nothing is written — a read of the account's
         // settings leaves them exactly as the next caller would have found them.
-        let configuration = state.lock().account_configuration(&region);
+        let configuration = store.lock().account_configuration(&region);
 
         Ok(DescribeAccountConfigurationOutput {
             account_configuration: Some(configuration),

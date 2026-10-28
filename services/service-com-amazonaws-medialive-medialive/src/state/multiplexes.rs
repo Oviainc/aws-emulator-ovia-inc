@@ -965,13 +965,13 @@ impl MultiplexRecord {
     /// `SetTimestamp` it was raised with, and a condition that holds again after
     /// clearing raises a NEW instance with a new id.
     ///
-    /// `next_alert_id` is the store's mint counter, passed in because an alert's
-    /// id is unique across the account rather than within one multiplex.
+    /// `mints` is the store's own mint set, passed in because an alert's id is
+    /// unique across the account rather than within one multiplex.
     fn apply_alerts(
         &mut self,
         observed: &[MultiplexAlertCondition],
         now: SystemTime,
-        next_alert_id: &mut u64,
+        mints: &super::IdMints,
     ) {
         // Clear first, so a condition that stopped holding frees its alert
         // before this instant's conditions are matched against what is SET.
@@ -989,8 +989,7 @@ impl MultiplexRecord {
             {
                 continue;
             }
-            let id = FIRST_MULTIPLEX_ALERT_ID + *next_alert_id;
-            *next_alert_id += 1;
+            let id = FIRST_MULTIPLEX_ALERT_ID + mints.next(|mints| &mut mints.multiplex_alert);
             self.alerts.insert(
                 id,
                 MultiplexAlertRecord {
@@ -1125,13 +1124,15 @@ impl ComAmazonawsMedialiveMedialiveState {
                 .collect()
         };
 
-        let mut next_alert_id = self.next_multiplex_alert_id;
+        // The mint set is reached through its own handle rather than through
+        // `self`, so the walk below can hold the multiplex store mutably while
+        // each raised alert takes its id out of the account's one counter.
+        let mints = ::std::sync::Arc::clone(&self.mints);
         for (id, conditions) in observed {
             if let Some(multiplex) = self.multiplexes.get_mut(&id) {
-                multiplex.apply_alerts(&conditions, now, &mut next_alert_id);
+                multiplex.apply_alerts(&conditions, now, &mints);
             }
         }
-        self.next_multiplex_alert_id = next_alert_id;
     }
 
     /// The channel feeding each multiplex program the live channels name, in ONE
@@ -1197,9 +1198,7 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// The next multiplex id, as AWS shapes MediaLive resource ids: a numeric
     /// string.
     fn mint_multiplex_id(&mut self) -> String {
-        let id = FIRST_MULTIPLEX_ID + self.next_multiplex_id;
-        self.next_multiplex_id += 1;
-        id.to_string()
+        (FIRST_MULTIPLEX_ID + self.mints.next(|mints| &mut mints.multiplex)).to_string()
     }
 
     /// Store a multiplex created in `region` and answer its minted id, or

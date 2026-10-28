@@ -6,7 +6,7 @@
 //! it accepts and the store's methods — so the slice can be read, and merged, on
 //! its own, exactly as the [`super::alarm_template_groups`] slice is. The store
 //! itself is the `account_configurations` member of
-//! [`ComAmazonawsMedialiveMedialiveState`] in the parent module.
+//! [`ComAmazonawsMedialiveMedialiveStore`] in the parent module.
 //!
 //! There is no resource to mint here and none to delete: an account always HAS a
 //! configuration, so `DescribeAccountConfiguration` answers for an account that
@@ -20,11 +20,13 @@
 //! signed for ([`super::request_region`]): MediaLive is a regional service, so
 //! each regional endpoint answers for the account's configuration in its own
 //! region, and configuring a key through one endpoint is not visible through
-//! another.
+//! another. It is keyed on the STORE rather than held inside a region's
+//! resource partition because it is the account's settings and not a resource,
+//! so the bound below is on the configurations the whole store keeps.
 
 use crate::ops::types::AccountConfiguration;
 
-use super::ComAmazonawsMedialiveMedialiveState;
+use super::ComAmazonawsMedialiveMedialiveStore;
 
 /// The most regions this emulator keeps an account configuration for.
 ///
@@ -69,7 +71,7 @@ impl AccountConfigurationRecord {
     }
 }
 
-impl ComAmazonawsMedialiveMedialiveState {
+impl ComAmazonawsMedialiveMedialiveStore {
     /// The account's configuration in `region`, as the modelled shape every
     /// operation that reports one answers with.
     ///
